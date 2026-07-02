@@ -151,18 +151,21 @@ pub struct ServerConfig {
     /// all instruments) per account. New submissions are rejected with
     /// `ExceedsMaxOpenOrders` once an account hits this cap. `0` means
     /// unlimited. Bounds the per-account contribution to engine memory
-    /// (SEC-03). Must be set to the same value on the primary and every
-    /// replica — the cap shapes Rejected reports, so a mismatch causes
-    /// replay divergence.
+    /// (SEC-03). Journaled as part of the operator policy: this flag sets the
+    /// value written at genesis (and used to migrate a pre-v19 journal), so
+    /// the primary's value propagates to every replica by replay — no need to
+    /// keep flags in sync across nodes. On a primary with an existing journal
+    /// the flag is inert; the journaled value is authoritative.
     #[arg(long, default_value_t = 10_000)]
     pub max_orders_per_account: u32,
     /// Per-account sustained order-submission rate (orders/sec). Token
     /// bucket refills at this rate; clients exceeding it (after burning
     /// the burst) are rejected with `ExceedsOrderRate`. `0` disables the
     /// limiter. Prevents a single client from monopolizing matching
-    /// throughput (SEC-04). Must match across primary and every replica
-    /// — same determinism caveat as `--max-orders-per-account`. Default
-    /// (1000/s) is a conservative mid-tier ceiling: comfortable for
+    /// throughput (SEC-04). Journaled with the operator policy — same as
+    /// `--max-orders-per-account`: the primary's value propagates to every
+    /// replica by replay and is authoritative on an existing journal.
+    /// Default (1000/s) is a conservative mid-tier ceiling: comfortable for
     /// algorithmic and retail flow, but tight for active market-makers
     /// who routinely re-quote past 1k/s on liquid instruments. Operators
     /// running with significant MM presence should raise this (and the
@@ -171,10 +174,11 @@ pub struct ServerConfig {
     pub max_orders_per_second: u32,
     /// Per-account burst capacity (max consecutive orders allowed after a
     /// quiet period). Paired with `--max-orders-per-second`. `0` disables
-    /// the limiter. Default (5000) lets normal trading bursts through —
-    /// e.g. a market open or a strategy initialization batch — without
-    /// false positives, while still capping the absolute spike a single
-    /// account can produce.
+    /// the limiter. Journaled with the operator policy — the primary's value
+    /// is authoritative cluster-wide (see `--max-orders-per-account`).
+    /// Default (5000) lets normal trading bursts through — e.g. a market
+    /// open or a strategy initialization batch — without false positives,
+    /// while still capping the absolute spike a single account can produce.
     #[arg(long, default_value_t = 5_000)]
     pub max_orders_burst: u32,
 
@@ -897,6 +901,13 @@ where
                     flag.store(false, Ordering::Release);
                 }
 
+                // Normally the replayed stream already carries the primary's
+                // operator policy, so no migration is needed. Guard the rare
+                // case where a promoted node's lineage predates journaled
+                // policy (e.g. the ex-primary never migrated): it now injects
+                // one from its own CLI. Read before `exchange` is moved.
+                let needs_policy_migration = !exchange.operator_policy_present();
+
                 return run_as_primary::<A, L, W>(
                     exchange,
                     writer,
@@ -909,6 +920,7 @@ where
                     shutdown,
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
+                    needs_policy_migration,
                     rotate_flag,
                     durability_mode_atomic,
                     fence_state,
@@ -944,8 +956,13 @@ where
 
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — seed events will flow through the pipeline later.
-    let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, W>(&config, &*factory)?;
+    let EngineInit {
+        app: mut exchange,
+        writer,
+        needs_seeding,
+        recovered_epoch,
+        needs_policy_migration,
+    } = init_engine::<A, W>(&config, &*factory)?;
 
     // Pre-fault any application-owned memory (slabs, indices) so page
     // faults happen now, not on the hot path. Default trait impl is a
@@ -980,6 +997,7 @@ where
         shutdown,
         authorized_keys,
         needs_seeding,
+        needs_policy_migration,
         rotate_flag,
         durability_mode_atomic,
         fence_state,
@@ -1100,6 +1118,7 @@ fn run_as_primary<A, L, W>(
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
+    needs_policy_migration: bool,
     rotate_flag: Option<Arc<AtomicBool>>,
     durability_mode_atomic: Arc<AtomicU8>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
@@ -1628,6 +1647,36 @@ where
         );
     }
 
+    // Operator-policy migration: a recovered lineage that predates journaled
+    // operator policy (pre-v19) has no `SetOperatorPolicy` in its history, so
+    // after `apply_operator_policy` was removed it would run with the engine
+    // defaults (rate limiter OFF). Inject one from the CLI flags as the
+    // primary's first journaled entry so the config is captured once and
+    // replicated to every replica. Rides the input ring like a seed event
+    // (connection_id == 0). No drain needed: the input ring is single-producer
+    // and the reader (the only other producer) is not spawned until below, so
+    // this event is strictly ordered before every client event on the primary
+    // and before every replicated event — replicas apply it first too.
+    if needs_policy_migration {
+        use melin_app::unix_epoch_nanos;
+        use melin_journal::JournalEvent;
+        use melin_transport_core::trace::mono_trace_ns;
+
+        if let Some(policy) = factory.operator_policy_event() {
+            info!("migrating pre-v19 lineage: injecting operator policy from CLI flags");
+            input_producer.publish(InputSlot {
+                connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
+                sequence: 0,
+                timestamp_ns: unix_epoch_nanos(),
+                event: JournalEvent::App(policy),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
+            });
+        }
+    }
+
     // Promotion fencing: a node that reached primary via promotion injects
     // an `EpochBump` as the first journaled entry of its tenure, raising the
     // cluster epoch so a paused/partitioned ex-primary self-demotes when a
@@ -2107,6 +2156,10 @@ where
                 // kernel TCP primary after promotion.
                 warn!("DPDK primary promotion not yet implemented — falling back to kernel TCP");
                 let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
+                // See the kernel-TCP promotion path: migrate only if the
+                // promoted lineage predates journaled operator policy. Read
+                // before `exchange` is moved into the call.
+                let needs_policy_migration = !exchange.operator_policy_present();
                 return run_as_primary::<A, _, W>(
                     exchange,
                     writer,
@@ -2119,6 +2172,7 @@ where
                     shutdown,
                     authorized_keys,
                     false,
+                    needs_policy_migration,
                     rotate_flag,
                     durability_mode_atomic,
                     fence_state,
@@ -2158,8 +2212,13 @@ where
     );
 
     // Initialize or recover the exchange.
-    let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, W>(&config, &*factory)?;
+    let EngineInit {
+        app: mut exchange,
+        writer,
+        needs_seeding,
+        recovered_epoch,
+        needs_policy_migration,
+    } = init_engine::<A, W>(&config, &*factory)?;
     <A as Application>::prefault(&mut exchange);
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.
@@ -2577,6 +2636,30 @@ where
         );
     }
 
+    // Operator-policy migration for a pre-v19 lineage — see the kernel-TCP
+    // path for the rationale. Injected here (before the poll thread takes
+    // the producer) so it is strictly ordered ahead of every client and
+    // replicated event; no drain required.
+    if needs_policy_migration {
+        use melin_app::unix_epoch_nanos;
+        use melin_journal::JournalEvent;
+        use melin_transport_core::trace::mono_trace_ns;
+
+        if let Some(policy) = factory.operator_policy_event() {
+            info!("migrating pre-v19 lineage: injecting operator policy from CLI flags");
+            input_producer.publish(InputSlot {
+                connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
+                sequence: 0,
+                timestamp_ns: unix_epoch_nanos(),
+                event: JournalEvent::App(policy),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
+            });
+        }
+    }
+
     // Note: the DPDK poll threads are spawned BELOW, after this seed-drain
     // block. That ordering is what keeps the input ring single-producer
     // during seeding — the same property the TCP path achieves by deferring
@@ -2715,18 +2798,37 @@ fn choose_bootstrap(
 
 /// Initialize or recover the journaled application from disk.
 ///
-/// Returns `(app, writer, needs_seeding, recovered_epoch)`. `needs_seeding`
-/// is true on first startup (fresh journal) — the caller must publish seed
-/// events through the pipeline. `recovered_epoch` is the fencing epoch
-/// recovered from the snapshot + journal (0 for a genesis node); the caller
-/// seeds the node's `FenceState` with it. The recovery paths
+/// Returns an [`EngineInit`] carrying the recovered app + writer and the
+/// startup flags: `needs_seeding` (fresh journal — the caller publishes seed
+/// events), `recovered_epoch` (fencing epoch from the snapshot + journal, 0
+/// at genesis; seeds the node's `FenceState`), and `needs_policy_migration`
+/// (a recovered lineage predates journaled operator policy, pre-v19 — the
+/// primary injects a one-time `SetOperatorPolicy` from the CLI flags). The
+/// recovery paths
 /// (snapshot+journal, snapshot only, journal only, fresh) are
 /// transport-level concerns and work uniformly for any `A: Application`
 /// via `JournaledApp<A>`. Same engine initialization the TCP / DPDK paths use.
+/// Outcome of [`init_engine`]: the recovered application and journal writer
+/// plus the startup flags the caller acts on. A named struct rather than a
+/// tuple so the five fields stay legible at the (two) call sites.
+pub(crate) struct EngineInit<A, W> {
+    pub(crate) app: A,
+    pub(crate) writer: W,
+    /// True on a genuinely fresh start (empty journal, no archives) — the
+    /// caller publishes seed events through the pipeline.
+    pub(crate) needs_seeding: bool,
+    /// Fencing epoch recovered from the snapshot + journal (0 at genesis).
+    pub(crate) recovered_epoch: u64,
+    /// True when a recovered lineage predates journaled operator policy
+    /// (pre-v19) — the primary injects a one-time `SetOperatorPolicy` from
+    /// the CLI flags to migrate it.
+    pub(crate) needs_policy_migration: bool,
+}
+
 pub(crate) fn init_engine<A, W>(
     config: &ServerConfig,
     factory: &dyn AppFactory<App = A>,
-) -> Result<(A, W, bool, u64), Box<dyn std::error::Error>>
+) -> Result<EngineInit<A, W>, Box<dyn std::error::Error>>
 where
     A: Application,
     W: JournalWrite<A::Event>,
@@ -2797,23 +2899,6 @@ where
     // (live or archived) already contains the seed events.
     let needs_seeding = !journal_exists && !archives_exist;
 
-    // Apply runtime config knobs that the snapshot doesn't carry. The
-    // SEC-03 cap and the SEC-04 rate-limit `(rate, burst)` pair are
-    // operator policy — replica and primary converge on them via
-    // `ServerConfig`, not replay. Two notes specific to SEC-04 (v18+):
-    //   * Per-account bucket *state* (`tokens` / `last_refill_ns`) IS
-    //     journaled in the snapshot and was already restored above; this
-    //     call only re-applies the *configuration*.
-    //   * `set_max_orders_per_second` clears buckets only when the new
-    //     `(rate, burst)` differs from the existing values. A snapshot
-    //     restore leaves the engine with whatever rate-limit config the
-    //     primary had at snapshot time, so reapplying the operator's
-    //     matching config here is a no-op for buckets — the freshly
-    //     restored state is preserved. An operator mis-set that differs
-    //     from the primary's config will silently clear those buckets;
-    //     primary and replica must run with matching values.
-    factory.apply_operator_policy(engine.app_mut());
-
     // Archive the live journal segment if it exceeds the configured
     // size threshold. The shadow exchange owns snapshot writes; here we
     // only rotate the segment so disk usage stays bounded across
@@ -2835,7 +2920,23 @@ where
 
     let recovered_epoch = engine.recovered_epoch();
     let (app, writer) = engine.into_parts();
-    Ok((app, writer, needs_seeding, recovered_epoch))
+
+    // A recovered lineage that carries no operator policy predates journaled
+    // operator config (pre-v19). On a fresh start the seed events carry the
+    // policy, so migration never applies there; the caller (primary only)
+    // injects a one-time `SetOperatorPolicy` from the CLI flags for the
+    // pre-feature case so the config becomes journaled and replicated
+    // instead of silently reverting to the engine defaults (rate limiter
+    // OFF) on every node.
+    let needs_policy_migration = !needs_seeding && !app.operator_policy_present();
+
+    Ok(EngineInit {
+        app,
+        writer,
+        needs_seeding,
+        recovered_epoch,
+        needs_policy_migration,
+    })
 }
 
 // ---------------------------------------------------------------------------

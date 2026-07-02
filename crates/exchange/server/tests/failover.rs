@@ -738,6 +738,15 @@ impl TestCluster {
     /// two engines must run with matching operator policy (e.g. SEC-04
     /// rate-limit knobs).
     fn start_with_extra_args(extra_args: &[&str]) -> Self {
+        Self::start_with_split_args(extra_args, extra_args)
+    }
+
+    /// Like [`start_with_extra_args`], but pass **different** args to the
+    /// primary and the replica. Used to prove that operator policy is now
+    /// journaled: a replica started with mismatched `--max-orders-*` flags
+    /// must still converge on the primary's journaled values rather than
+    /// its own CLI.
+    fn start_with_split_args(primary_args: &[&str], replica_args: &[&str]) -> Self {
         let bin = server_bin();
         assert!(
             bin.exists(),
@@ -766,7 +775,7 @@ impl TestCluster {
             primary_client_port,
             primary_health_port,
             primary_repl_port,
-            extra_args,
+            primary_args,
         );
 
         // Wait for the primary to be ready to accept replica connections.
@@ -782,7 +791,7 @@ impl TestCluster {
             replica_health_port,
             replica_admin_port,
             "replica",
-            extra_args,
+            replica_args,
         );
 
         wait_healthy(primary.health_addr, Duration::from_secs(30));
@@ -1731,6 +1740,76 @@ fn sec04_rate_limit_replicates_to_replica() {
     // convergence. As a final liveness check, wait for lag = 0 — would
     // only fail if replication had since halted.
     cluster.wait_replicated();
+}
+
+/// Operator policy is now journaled (`SetOperatorPolicy`), so a replica
+/// must converge on the primary's policy even when its own CLI flags
+/// disagree. This is the core guarantee of the change: before it, each
+/// node reapplied its local `--max-orders-*` flags after recovery, so a
+/// mismatch silently diverged replay — invisible until the replica was
+/// promoted and started making different accept/reject decisions.
+///
+/// Uses the SEC-03 open-order cap rather than the SEC-04 rate limit
+/// because the cap is time-independent: the divergence persists across the
+/// promotion window regardless of how long it takes, so the test can't go
+/// flaky on token refill. Primary cap = 2; replica CLI cap = 1_000_000. We
+/// rest two orders (cap reached on the primary), then kill+promote the
+/// replica and submit a third. A converged replica rejects it
+/// (`ExceedsMaxOpenOrders`); a replica that had applied its own huge CLI
+/// cap would accept it (`Placed`).
+#[test]
+#[serial]
+fn journaled_operator_policy_overrides_mismatched_replica_cli() {
+    let mut cluster = TestCluster::start_with_split_args(
+        &["--max-orders-per-account", "2"],
+        &["--max-orders-per-account", "1000000"],
+    );
+    let mut client = cluster.connect_primary();
+
+    // Two non-matching buy limits for account 1 — both rest (no sells to
+    // cross), taking the account to the primary's cap of 2.
+    for id in 1..=2u64 {
+        let r = submit_order(&mut client, id, 1, 1, Side::Buy, 100, 1);
+        assert!(
+            has_report(&r, |rep| matches!(
+                rep,
+                melin_protocol::types::ExecutionReport::Placed { .. }
+            )),
+            "order {id} should rest, got: {r:?}",
+        );
+    }
+
+    // Third order exceeds the primary's cap.
+    let r = submit_order(&mut client, 3, 1, 1, Side::Buy, 100, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::ExceedsMaxOpenOrders,
+                ..
+            }
+        )),
+        "order 3 should hit the primary's cap, got: {r:?}",
+    );
+
+    // Ensure the two resting orders are on the replica before promotion.
+    cluster.wait_replicated();
+    drop(client);
+
+    // Promote the replica and probe its reconstructed cap state directly.
+    let mut promoted = cluster.kill_and_promote();
+    let r = submit_order(&mut promoted, 4, 1, 1, Side::Buy, 100, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::ExceedsMaxOpenOrders,
+                ..
+            }
+        )),
+        "promoted replica must enforce the journaled cap of 2, not its own \
+         CLI cap of 1_000_000 — got: {r:?}",
+    );
 }
 
 // ---------------------------------------------------------------------------

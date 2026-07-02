@@ -47,6 +47,7 @@ const TAG_REMOVE_INSTRUMENT: u8 = 15;
 const TAG_QUERY_STATS: u8 = 16;
 const TAG_QUERY_POSITION: u8 = 17;
 const TAG_QUERY_REQUEST_SEQ: u8 = 18;
+const TAG_SET_OPERATOR_POLICY: u8 = 19;
 
 // Per-OrderType nested tag space inside SubmitOrder's payload.
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -132,6 +133,20 @@ pub enum TradingEvent {
     /// engine's dedup HWM and avoid spurious `DuplicateRequest`
     /// rejections of legitimate post-reconnect orders.
     QueryRequestSeq,
+    /// Set the operator policy: SEC-03 per-account open-order cap and
+    /// SEC-04 `(rate, burst)` submission rate limit. These shape Rejected
+    /// reports (observable state), so they must be identical across the
+    /// cluster or replay diverges — journaling them here is what makes
+    /// that automatic instead of relying on matching CLI flags on every
+    /// node. Genesis-seeded from the CLI on a fresh primary and, for
+    /// pre-feature journals, injected once as a migration event on
+    /// recovery. `u32` for all three: matches the engine's field types
+    /// and the realistic operator range.
+    SetOperatorPolicy {
+        max_open_orders_per_account: u32,
+        max_orders_per_second: u32,
+        max_orders_burst: u32,
+    },
 }
 
 impl AppEvent for TradingEvent {
@@ -163,6 +178,7 @@ impl AppEvent for TradingEvent {
             TradingEvent::QueryStats => 0,
             TradingEvent::QueryPosition { .. } => 4,
             TradingEvent::QueryRequestSeq => 0,
+            TradingEvent::SetOperatorPolicy { .. } => 4 + 4 + 4,
         }
     }
 
@@ -274,6 +290,16 @@ impl AppEvent for TradingEvent {
                 (TAG_QUERY_POSITION, 4)
             }
             TradingEvent::QueryRequestSeq => (TAG_QUERY_REQUEST_SEQ, 0),
+            TradingEvent::SetOperatorPolicy {
+                max_open_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            } => {
+                le::put_u32(&mut buf[1..], *max_open_orders_per_account);
+                le::put_u32(&mut buf[5..], *max_orders_per_second);
+                le::put_u32(&mut buf[9..], *max_orders_burst);
+                (TAG_SET_OPERATOR_POLICY, 12)
+            }
         };
         buf[0] = tag;
         1 + payload_len
@@ -446,6 +472,14 @@ impl AppEvent for TradingEvent {
                 })
             }
             TAG_QUERY_REQUEST_SEQ => Ok(TradingEvent::QueryRequestSeq),
+            TAG_SET_OPERATOR_POLICY => {
+                need(payload, 12)?;
+                Ok(TradingEvent::SetOperatorPolicy {
+                    max_open_orders_per_account: le::get_u32(&payload[0..]),
+                    max_orders_per_second: le::get_u32(&payload[4..]),
+                    max_orders_burst: le::get_u32(&payload[8..]),
+                })
+            }
             other => Err(CodecError::UnknownTag(other)),
         }
     }
@@ -859,6 +893,34 @@ mod tests {
             account: AccountId(1),
             amount: 10_000,
         });
+    }
+
+    #[test]
+    fn round_trip_set_operator_policy() {
+        // Active limiter config, and the all-zero "disabled" config, both
+        // round-trip byte-for-byte.
+        round_trip(TradingEvent::SetOperatorPolicy {
+            max_open_orders_per_account: 10_000,
+            max_orders_per_second: 1_000,
+            max_orders_burst: 100,
+        });
+        round_trip(TradingEvent::SetOperatorPolicy {
+            max_open_orders_per_account: 0,
+            max_orders_per_second: 0,
+            max_orders_burst: 0,
+        });
+    }
+
+    #[test]
+    fn set_operator_policy_is_not_a_query() {
+        assert!(
+            !TradingEvent::SetOperatorPolicy {
+                max_open_orders_per_account: 1,
+                max_orders_per_second: 2,
+                max_orders_burst: 3,
+            }
+            .is_query()
+        );
     }
 
     #[test]

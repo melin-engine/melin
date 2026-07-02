@@ -240,6 +240,23 @@ impl Application for ServerApp {
                     hwm: self.0.request_seq_hwm(ctx.key_hash),
                 })
             }
+            TradingEvent::SetOperatorPolicy {
+                max_open_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            } => {
+                // Journaled operator policy (SEC-03 cap + SEC-04 rate).
+                // Deterministic: the rate limiter meters off the journaled
+                // `ctx.now_ns` stamped above, and every node applies this
+                // event identically, so primary and replicas converge
+                // without depending on matching CLI flags.
+                self.0.set_operator_policy(
+                    max_open_orders_per_account,
+                    max_orders_per_second,
+                    max_orders_burst,
+                );
+                None
+            }
         }
     }
 
@@ -251,6 +268,14 @@ impl Application for ServerApp {
     #[inline]
     fn check_request_seq(&mut self, key_hash: u64, seq: u64) -> bool {
         Exchange::check_request_seq(&mut self.0, key_hash, seq)
+    }
+
+    /// True once a `SetOperatorPolicy` has been applied (replayed event or
+    /// v19+ snapshot restore). The runtime reads this after recovery to
+    /// detect a pre-feature lineage that needs a one-time policy migration
+    /// injected from the CLI flags.
+    fn operator_policy_present(&self) -> bool {
+        self.0.operator_policy_set()
     }
 
     /// Route through `Exchange::prefault`, which walks the pre-allocated

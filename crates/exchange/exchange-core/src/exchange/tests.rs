@@ -5,6 +5,24 @@ use super::*;
 use crate::types::{Order, OrderType, Price, Quantity, SelfTradeProtection, TimeInForce};
 
 #[test]
+fn operator_policy_latch_drives_migration_detection() {
+    // A fresh (or replayed-without-policy) engine reports no operator
+    // policy — the exact signal the runtime uses to inject a one-time
+    // migration event for a pre-v19 lineage. Applying the policy latches
+    // it on and sets the underlying limits.
+    let mut exchange = Exchange::new();
+    assert!(
+        !exchange.operator_policy_set(),
+        "a fresh engine must report no operator policy so migration can fire"
+    );
+
+    exchange.set_operator_policy(2, 1_000, 50);
+    assert!(exchange.operator_policy_set());
+    assert_eq!(exchange.max_open_orders_per_account(), 2);
+    assert_eq!(exchange.max_orders_per_second(), (1_000, 50));
+}
+
+#[test]
 fn execute_on_unknown_symbol_rejects() {
     let mut exchange = Exchange::new();
     let mut reports = Vec::new();

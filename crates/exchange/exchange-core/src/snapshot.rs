@@ -98,7 +98,15 @@ type StopLevels = Vec<(Price, Vec<PendingStopSnapshot>)>;
 ///            restore. v18 carries the bucket map (`account`, `tokens`,
 ///            `last_refill_ns`) so primary and replica converge bit-for-
 ///            bit on the very next event after restore.
-pub const PAYLOAD_VERSION: u16 = 18;
+/// v18 → v19: operator policy (SEC-03 open-order cap + SEC-04 rate/burst)
+///            is now journaled as `SetOperatorPolicy` instead of reapplied
+///            per node from the CLI after every restore. Snapshots elide
+///            pre-snapshot events, so the 12-byte policy section carries
+///            the three values a snapshot-recovered node would otherwise
+///            lose — without it, recovery would silently fall back to the
+///            engine defaults (rate limiter OFF) and diverge from the
+///            primary. Old snapshots are rejected at the frame level.
+pub const PAYLOAD_VERSION: u16 = 19;
 
 /// Encode the Exchange's full state (the "payload" portion of a snapshot —
 /// everything between the header and the CRC) into a freshly allocated
@@ -156,6 +164,19 @@ pub(crate) struct ExchangeSnapshot {
     /// divergence window — see the version-history comment on
     /// `PAYLOAD_VERSION` for the v17 → v18 motivation.
     pub(crate) order_buckets: Vec<(AccountId, u64, u64)>,
+    /// Operator policy: SEC-03 per-account open-order cap and SEC-04
+    /// `(rate, burst)` rate limit (v19+). Previously reapplied per node
+    /// from the CLI after every restore (`apply_operator_policy`), which
+    /// silently diverged replay when the flags differed across the
+    /// cluster. Now journaled as `SetOperatorPolicy` and carried here so a
+    /// snapshot-recovered node — whose policy event was elided with the
+    /// rest of the pre-snapshot history — restores the exact configuration
+    /// the primary held at snapshot time. Three plain `u32`s (not an
+    /// `Option`): every v19+ snapshot is taken from a running engine that
+    /// always has a concrete policy, so there is no "absent" case to model.
+    pub(crate) max_open_orders_per_account: u32,
+    pub(crate) max_orders_per_second: u32,
+    pub(crate) max_orders_burst: u32,
 }
 
 /// Serialized order book state for a single instrument.
@@ -332,6 +353,20 @@ fn encode_order_buckets(buf: &mut Vec<u8>, buckets: &[OrderBucketEntry]) {
     }
 }
 
+// Operator policy (v19): SEC-03 cap + SEC-04 (rate, burst) as three
+// fixed u32s. No length prefix — the section is a fixed 12 bytes, always
+// present in v19+.
+fn encode_operator_policy(
+    buf: &mut Vec<u8>,
+    max_open_orders_per_account: u32,
+    max_orders_per_second: u32,
+    max_orders_burst: u32,
+) {
+    le::push_u32(buf, max_open_orders_per_account);
+    le::push_u32(buf, max_orders_per_second);
+    le::push_u32(buf, max_orders_burst);
+}
+
 fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     // Exhaustive destructure (no `..`): if a new field is added to
     // `ExchangeSnapshot`, the compiler errors here, forcing us to update
@@ -350,6 +385,9 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
         disabled_instruments,
         fee_account_deficits,
         order_buckets,
+        max_open_orders_per_account,
+        max_orders_per_second,
+        max_orders_burst,
     } = state;
     encode_instruments(buf, instruments);
     encode_balances(buf, balances);
@@ -363,6 +401,12 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     encode_disabled_instruments(buf, disabled_instruments);
     encode_fee_account_deficits(buf, fee_account_deficits);
     encode_order_buckets(buf, order_buckets);
+    encode_operator_policy(
+        buf,
+        *max_open_orders_per_account,
+        *max_orders_per_second,
+        *max_orders_burst,
+    );
 }
 
 fn encode_book_snapshot(book: &BookSnapshot, buf: &mut Vec<u8>) {
@@ -823,6 +867,23 @@ fn decode_order_buckets(buf: &[u8]) -> Result<(usize, Vec<OrderBucketEntry>), Sn
     Ok((pos, out))
 }
 
+// Operator policy (v19): fixed 12-byte section, no length prefix. Returns
+// `(bytes_consumed, (cap, rate, burst))`.
+fn decode_operator_policy(buf: &[u8]) -> Result<(usize, (u32, u32, u32)), SnapshotDecodeError> {
+    check(buf, 0, 12)?;
+    let max_open_orders_per_account = le::get_u32(&buf[0..]);
+    let max_orders_per_second = le::get_u32(&buf[4..]);
+    let max_orders_burst = le::get_u32(&buf[8..]);
+    Ok((
+        12,
+        (
+            max_open_orders_per_account,
+            max_orders_per_second,
+            max_orders_burst,
+        ),
+    ))
+}
+
 fn decode_exchange_state(
     buf: &[u8],
     version: u16,
@@ -890,6 +951,22 @@ fn decode_exchange_state(
         Vec::new()
     };
 
+    // Operator policy (v19+). Older snapshots are rejected at the frame
+    // level (APP_VERSION mismatch) before reaching here, so this branch
+    // effectively always runs; the fallback to engine defaults keeps any
+    // version-parameterised test decode well-defined.
+    let (max_open_orders_per_account, max_orders_per_second, max_orders_burst) = if version >= 19 {
+        let (consumed, v) = decode_operator_policy(&buf[pos..])?;
+        pos += consumed;
+        v
+    } else {
+        (
+            crate::exchange::DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
+            crate::exchange::DEFAULT_MAX_ORDERS_PER_SECOND,
+            crate::exchange::DEFAULT_MAX_ORDERS_BURST,
+        )
+    };
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -905,6 +982,9 @@ fn decode_exchange_state(
             disabled_instruments,
             fee_account_deficits,
             order_buckets,
+            max_open_orders_per_account,
+            max_orders_per_second,
+            max_orders_burst,
         },
     ))
 }
@@ -1335,6 +1415,8 @@ impl Exchange {
         let disabled_instruments = self.snapshot_disabled_instruments();
         let fee_account_deficits = self.accounts().snapshot_fee_deficits();
         let order_buckets = self.snapshot_order_buckets();
+        let (max_orders_per_second, max_orders_burst) = self.max_orders_per_second();
+        let max_open_orders_per_account = self.max_open_orders_per_account();
 
         ExchangeSnapshot {
             instruments,
@@ -1349,6 +1431,9 @@ impl Exchange {
             disabled_instruments,
             fee_account_deficits,
             order_buckets,
+            max_open_orders_per_account,
+            max_orders_per_second,
+            max_orders_burst,
         }
     }
 
@@ -1379,6 +1464,9 @@ impl Exchange {
             disabled_instruments,
             fee_account_deficits,
             order_buckets,
+            max_open_orders_per_account,
+            max_orders_per_second,
+            max_orders_burst,
         } = state;
 
         let mut instruments = build_indexed_instruments(
@@ -1418,11 +1506,26 @@ impl Exchange {
         // Restore per-account rate-limiter bucket state (v18+). Empty
         // for older snapshots, in which case the limiter starts with
         // every account at full burst — same shape as a fresh start.
-        // The operator-config knobs (`max_orders_per_second`,
-        // `max_orders_burst`) are reapplied separately by the receiver
-        // wiring; the bucket state restored here will only be observed
-        // by the limiter once those knobs are non-zero.
+        // The operator-config knobs are applied from the snapshot's
+        // v19 policy section immediately below; the bucket state restored
+        // here is preserved by that call (initial activation from the
+        // engine's default disabled state never clears buckets — see
+        // `set_max_orders_per_second`).
         exchange.restore_order_buckets(order_buckets);
+
+        // Operator policy (v19+): the SEC-03 cap and SEC-04 rate limit are
+        // now journaled (`SetOperatorPolicy`) rather than reapplied per
+        // node from the CLI, and carried in the snapshot so a
+        // snapshot-recovered node restores exactly what the primary held.
+        // `set_operator_policy` also latches `operator_policy_set`, so the
+        // runtime's migration check sees this as an already-configured
+        // lineage. Ordered after `restore_order_buckets` so the restored
+        // bucket state is preserved through the activation.
+        exchange.set_operator_policy(
+            max_open_orders_per_account,
+            max_orders_per_second,
+            max_orders_burst,
+        );
 
         // Snapshot-corruption detector: the rebuilt books must produce the
         // same `order_sides` set the snapshot serialized. A mismatch means
@@ -2273,17 +2376,41 @@ mod tests {
             &mut reports,
         );
 
-        // Encode, then strip the trailing rate-limiter bucket section
-        // (length u32 + 1 entry of 20 bytes = 24 bytes). The truncated
-        // payload looks valid up to the bucket boundary, mirroring a
-        // real on-disk truncation.
+        // Encode, then strip the trailing 12-byte v19 operator-policy
+        // section plus the rate-limiter bucket section (length u32 + 1
+        // entry of 20 bytes = 24 bytes), leaving the payload truncated
+        // exactly at the bucket boundary — mirroring a real on-disk
+        // truncation of the bucket section.
+        const POLICY_LEN: usize = 12;
         let full = encode_exchange_payload(&exchange);
-        let truncated = &full[..full.len() - 24];
+        let truncated = &full[..full.len() - 24 - POLICY_LEN];
         match decode_exchange_payload(truncated) {
             Err(SnapshotDecodeError::Truncated) => {}
             Err(other) => panic!("expected TruncatedEntry, got {other:?}"),
             Ok(_) => panic!("truncated v18 payload must not decode silently as empty"),
         }
+    }
+
+    /// v19: the operator policy (SEC-03 cap + SEC-04 rate/burst) round-trips
+    /// through the snapshot, and the restored engine reports the policy as
+    /// set — the signal the runtime uses to skip a migration injection. A
+    /// snapshot-recovered node must NOT fall back to the engine defaults
+    /// (which would silently disable the rate limiter and diverge).
+    #[test]
+    fn snapshot_preserves_operator_policy() {
+        let mut exchange = Exchange::new();
+        exchange.set_operator_policy(4_242, 7_000, 250);
+        assert!(exchange.operator_policy_set());
+
+        let bytes = encode_exchange_payload(&exchange);
+        let restored = decode_exchange_payload(&bytes).expect("decode");
+
+        assert_eq!(restored.max_open_orders_per_account(), 4_242);
+        assert_eq!(restored.max_orders_per_second(), (7_000, 250));
+        assert!(
+            restored.operator_policy_set(),
+            "restore must latch operator_policy_set so no migration is injected"
+        );
     }
 
     /// SEC-04 v18+: the decoder must reject a payload that contains the
@@ -2307,9 +2434,15 @@ mod tests {
         );
 
         let mut payload = encode_exchange_payload(&exchange);
-        // Bucket section is the trailing run: [u32 count][entry × count],
+        // v19 appends a fixed 12-byte operator-policy section after the
+        // bucket section, so the bucket run is no longer trailing. Split the
+        // policy suffix off, tamper the (now-trailing) bucket section, then
+        // re-append the policy so the rest of the payload stays valid.
+        const POLICY_LEN: usize = 12;
+        let policy = payload.split_off(payload.len() - POLICY_LEN);
+        // Bucket section is now the trailing run: [u32 count][entry × count],
         // entry = AccountId(u32) + tokens(u64) + last_refill_ns(u64) = 20 B.
-        // Bump the count by one and append a duplicate of the existing entry.
+        // Bump the count by one and insert a duplicate of the existing entry.
         let entry_start = payload.len() - 20;
         let dup_entry = payload[entry_start..].to_vec();
         let count_pos = entry_start - 4;
@@ -2321,6 +2454,7 @@ mod tests {
             .expect("test fixture must keep count within u32");
         payload[count_pos..count_pos + 4].copy_from_slice(&new_count.to_le_bytes());
         payload.extend_from_slice(&dup_entry);
+        payload.extend_from_slice(&policy);
 
         match decode_exchange_payload(&payload) {
             Err(SnapshotDecodeError::Corrupt { reason, .. }) => {

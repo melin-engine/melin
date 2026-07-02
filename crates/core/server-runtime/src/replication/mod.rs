@@ -558,8 +558,11 @@ where
     // Seed the observed epoch from the replica's own recovered journal.
     // Streaming `EpochBump`s and the snapshot-resync path raise it later.
     fence_state.observe_epoch(engine.recovered_epoch());
-    let (mut exchange, writer) = engine.into_parts();
-    factory.apply_operator_policy(&mut exchange);
+    let (exchange, writer) = engine.into_parts();
+    // Operator policy is journaled now (SetOperatorPolicy), so it arrives
+    // through the replicated stream / snapshot like all other state — the
+    // replica must not reapply local CLI values, which is exactly what used
+    // to diverge replay when the flags differed from the primary's.
     Ok((Some(exchange), Some(writer), last, hash))
 }
 

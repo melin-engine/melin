@@ -1,8 +1,8 @@
 //! Trading-side [`AppFactory`] implementation.
 //!
 //! Owns the trading-domain construction recipe: empty / pre-sized
-//! exchange, SEC-03/SEC-04 operator policy, and the bulk-seed
-//! `AddInstrument` / `ProvisionAccount` events. Moves all four out
+//! exchange, the SEC-03/SEC-04 operator-policy event, and the bulk-seed
+//! `AddInstrument` / `ProvisionAccount` events. Moves all of it out
 //! of `runtime/server.rs` so the runtime never references trading
 //! event variants by name.
 
@@ -58,52 +58,31 @@ impl AppFactory for Factory {
         );
     }
 
-    fn apply_operator_policy(&self, app: &mut ServerApp) {
-        // SEC-04 mismatch detection (must run BEFORE we apply the
-        // new config). Non-empty bucket map paired with a disabled
-        // limiter means we just restored a snapshot whose primary
-        // had the limiter active, but the local operator forgot to
-        // wire matching `--max-orders-per-second` / `--max-orders-burst`
-        // flags. The engine will continue accepting all orders
-        // unthrottled — silent until the replica is promoted and
-        // starts diverging from the primary's accept/reject
-        // decisions. Surface the misconfig loudly so operators catch
-        // it at startup, not on incident.
-        let restored_buckets = app.order_bucket_count();
-        let limiter_disabled =
-            self.config.max_orders_per_second == 0 || self.config.max_orders_burst == 0;
-        if limiter_disabled && restored_buckets > 0 {
-            tracing::warn!(
-                restored_buckets,
-                max_orders_per_second = self.config.max_orders_per_second,
-                max_orders_burst = self.config.max_orders_burst,
-                "config mismatch: snapshot carries rate-limit buckets but local limiter \
-                 is disabled — primary and replica must run with matching values"
-            );
-        }
-
-        app.set_max_open_orders_per_account(self.config.max_orders_per_account);
-        app.set_max_orders_per_second(
-            self.config.max_orders_per_second,
-            self.config.max_orders_burst,
-        );
-
-        // Visibility for operators verifying primary↔replica parity
-        // at a glance. SEC-03 cap and SEC-04 rate-limit knobs are
-        // operator policy (not journaled), so logging the applied
-        // values is the only way to confirm both processes started
-        // with the same config.
-        tracing::info!(
-            max_orders_per_account = self.config.max_orders_per_account,
-            max_orders_per_second = self.config.max_orders_per_second,
-            max_orders_burst = self.config.max_orders_burst,
-            "applied per-account order limits (SEC-03 cap, SEC-04 rate)"
-        );
+    fn operator_policy_event(&self) -> Option<TradingEvent> {
+        // The SEC-03 cap and SEC-04 rate limit are journaled as a single
+        // event so primary and replica converge by replay. The runtime
+        // seeds this onto a fresh journal (via `seed_events`) and injects
+        // it once when migrating a pre-feature lineage — see
+        // `Application::operator_policy_present`. Always `Some`: the CLI
+        // supplies concrete values (a `0` rate is a valid "disabled"
+        // policy, still worth journaling so replicas match).
+        Some(TradingEvent::SetOperatorPolicy {
+            max_open_orders_per_account: self.config.max_orders_per_account,
+            max_orders_per_second: self.config.max_orders_per_second,
+            max_orders_burst: self.config.max_orders_burst,
+        })
     }
 
     fn seed_events(&self) -> Vec<TradingEvent> {
-        let mut events =
-            Vec::with_capacity(self.config.instruments as usize + self.config.accounts as usize);
+        let mut events = Vec::with_capacity(
+            // +1 for the operator-policy event prepended below.
+            1 + self.config.instruments as usize + self.config.accounts as usize,
+        );
+        // Operator policy first, so the rate-limit config is in force
+        // before any seeded/inbound order is metered.
+        if let Some(policy) = self.operator_policy_event() {
+            events.push(policy);
+        }
         for i in 0..self.config.instruments {
             events.push(TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
@@ -141,38 +120,55 @@ mod tests {
     fn seed_events_count_matches_config() {
         let factory = Factory::new(cfg(5, 3));
         let events = factory.seed_events();
-        // 3 instruments + 5 accounts.
-        assert_eq!(events.len(), 8);
+        // 1 operator policy + 3 instruments + 5 accounts.
+        assert_eq!(events.len(), 9);
     }
 
     #[test]
-    fn seed_events_order_is_instruments_then_accounts() {
+    fn seed_events_order_is_policy_then_instruments_then_accounts() {
         let factory = Factory::new(cfg(2, 2));
         let events = factory.seed_events();
-        assert!(matches!(events[0], TradingEvent::AddInstrument { .. }));
+        assert!(matches!(events[0], TradingEvent::SetOperatorPolicy { .. }));
         assert!(matches!(events[1], TradingEvent::AddInstrument { .. }));
-        assert!(matches!(events[2], TradingEvent::ProvisionAccount { .. }));
+        assert!(matches!(events[2], TradingEvent::AddInstrument { .. }));
         assert!(matches!(events[3], TradingEvent::ProvisionAccount { .. }));
+        assert!(matches!(events[4], TradingEvent::ProvisionAccount { .. }));
     }
 
     #[test]
-    fn seed_events_empty_when_no_accounts_or_instruments() {
+    fn seed_events_carry_only_policy_when_no_accounts_or_instruments() {
         let factory = Factory::new(cfg(0, 0));
-        assert!(factory.seed_events().is_empty());
+        let events = factory.seed_events();
+        // Even an empty cluster journals the operator policy so a
+        // later-joining replica converges on it by replay.
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], TradingEvent::SetOperatorPolicy { .. }));
     }
 
     #[test]
     fn empty_does_not_apply_policy() {
         let factory = Factory::new(cfg(2, 2));
         let app = factory.empty();
+        // A blank exchange holds the engine default cap, not the CLI value —
+        // the policy reaches the engine only through the journaled event.
         assert_ne!(app.max_open_orders_per_account(), 100);
+        assert!(!app.operator_policy_set());
     }
 
     #[test]
-    fn apply_operator_policy_overrides_default() {
+    fn operator_policy_event_carries_config() {
         let factory = Factory::new(cfg(2, 2));
-        let mut app = factory.empty();
-        factory.apply_operator_policy(&mut app);
-        assert_eq!(app.max_open_orders_per_account(), 100);
+        match factory.operator_policy_event() {
+            Some(TradingEvent::SetOperatorPolicy {
+                max_open_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            }) => {
+                assert_eq!(max_open_orders_per_account, 100);
+                assert_eq!(max_orders_per_second, 1_000);
+                assert_eq!(max_orders_burst, 100);
+            }
+            other => panic!("expected SetOperatorPolicy, got {other:?}"),
+        }
     }
 }

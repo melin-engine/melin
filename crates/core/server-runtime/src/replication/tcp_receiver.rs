@@ -650,8 +650,11 @@ where
         if pipeline.is_none() && journal_writer.is_none() {
             let (lineage_start, lineage_anchor) = stream_lineage;
             let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
-            let mut fresh = factory.empty();
-            factory.apply_operator_policy(&mut fresh);
+            // A fresh replica starts empty and receives the operator policy
+            // through the replicated stream (SetOperatorPolicy is journaled),
+            // so it must not apply local CLI values — that mismatch is what
+            // used to diverge replay across the cluster.
+            let fresh = factory.empty();
             exchange = Some(fresh);
             journal_writer = Some(writer);
         }

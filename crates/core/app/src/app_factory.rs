@@ -7,14 +7,14 @@
 //! parallel copy for snapshotting). All share [`AppFactory::empty`].
 //! The primary startup path additionally calls
 //! [`AppFactory::prefault`] to pre-size collections before the
-//! bulk-seed phase, then [`AppFactory::apply_operator_policy`] for
-//! non-journaled config.
+//! bulk-seed phase.
 //!
-//! Operator-controlled policy (rate limits, caps, ...) is kept
-//! separate from journaled state. [`AppFactory::apply_operator_policy`]
-//! reapplies these knobs after snapshot restore so primary and
-//! replica converge on matching values even though the journal
-//! carries no record of them.
+//! Operator-controlled policy (rate limits, caps, ...) is now part of
+//! journaled state: the factory yields it as
+//! [`AppFactory::operator_policy_event`], which the runtime seeds into a
+//! fresh journal (or injects once when migrating a pre-feature lineage)
+//! so primary and replica converge by replay rather than by each node
+//! reapplying matching CLI flags.
 
 use crate::Application;
 
@@ -42,14 +42,18 @@ pub trait AppFactory: Send + Sync {
     /// stalls as collections grow.
     fn prefault(&self, app: &mut Self::App);
 
-    /// Reapply operator-controlled policy (rate limits, caps, ...)
-    /// to an existing app. The policy is NOT journaled — primary
-    /// and replica must apply matching values independently — so
-    /// this is called after every snapshot restore (which
-    /// reconstructs state but not policy) and after every replica
-    /// reconnect that reuses an existing pipeline. Default impl is
-    /// a no-op for applications that have no operator policy.
-    fn apply_operator_policy(&self, _app: &mut Self::App) {}
+    /// The operator-policy event (rate limits, caps, ...) built from this
+    /// factory's CLI-level config, if the application has one. Journaled so
+    /// primary and replica converge by replay rather than by each node
+    /// independently reapplying matching CLI flags. The runtime uses it in
+    /// two places: prepended to [`seed_events`](AppFactory::seed_events) on
+    /// a fresh primary, and injected once as a migration event on a primary
+    /// whose recovered journal predates journaled operator policy (see
+    /// [`Application::operator_policy_present`]). Default `None` for
+    /// applications that carry no operator policy.
+    fn operator_policy_event(&self) -> Option<<Self::App as Application>::Event> {
+        None
+    }
 
     /// Yield the bulk-seed events the runtime should journal at
     /// startup. Called once on a fresh primary (empty journal, no

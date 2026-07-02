@@ -1434,8 +1434,11 @@ where
         // boundaries keep it that way across rotations (bitwise mirror).
         if pipeline.is_none() && journal_writer.is_none() {
             let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
-            let mut fresh = factory.empty();
-            factory.apply_operator_policy(&mut fresh);
+            // Fresh replica: operator policy arrives through the replicated
+            // stream (SetOperatorPolicy is journaled), so it must not apply
+            // local CLI values — see the TCP receiver for the divergence
+            // rationale.
+            let fresh = factory.empty();
             exchange = Some(fresh);
             journal_writer = Some(writer);
         }

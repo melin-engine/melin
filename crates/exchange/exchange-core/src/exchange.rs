@@ -126,6 +126,16 @@ pub struct Exchange {
     /// `TokenBucket` row.
     max_orders_per_second: u32,
     max_orders_burst: u32,
+    /// Whether an operator policy (the SEC-03 cap + SEC-04 rate/burst above)
+    /// has ever been applied to this engine via [`Self::set_operator_policy`]
+    /// — i.e. a `SetOperatorPolicy` event was replayed, or the value was
+    /// carried in a v19+ snapshot. Used by the runtime to decide whether a
+    /// recovered lineage predates journaled operator policy and needs a
+    /// one-time migration event injected from the CLI flags. `bool` because
+    /// this is a one-way latch (never cleared once set); it is deliberately
+    /// NOT serialised in the snapshot struct — `restore_state` sets it
+    /// directly, since any v19+ snapshot necessarily carries a real policy.
+    operator_policy_set: bool,
     /// Per-account token-bucket state for the rate limiter. Lazily inserted
     /// on the first *submission attempt* (not first rest) per account, and
     /// evicted on the close path (`release_open_order`) once the account's
@@ -219,6 +229,7 @@ impl Exchange {
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
             max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
             max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
+            operator_policy_set: false,
             order_buckets: HashMap4::default(),
             current_event_ts_ns: 0,
             // Match OrderBook::consumed_slots's 64-element pre-alloc so
@@ -252,6 +263,7 @@ impl Exchange {
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
             max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
             max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
+            operator_policy_set: false,
             // Same 1M sizing as `order_counts` — bucket count tracks the
             // active-account count.
             order_buckets: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
@@ -326,6 +338,10 @@ impl Exchange {
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
             max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
             max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
+            // Snapshot restore leaves this false; `restore_state` flips it
+            // true after applying the snapshot's operator-policy values (a
+            // v19+ snapshot always carries them).
+            operator_policy_set: false,
             // Snapshot restore: limiter starts disabled by default and
             // the bucket map starts empty. `restore_state` calls
             // `restore_order_buckets` after `from_parts` to repopulate
@@ -402,6 +418,38 @@ impl Exchange {
     /// Test/admin only.
     pub fn max_orders_per_second(&self) -> (u32, u32) {
         (self.max_orders_per_second, self.max_orders_burst)
+    }
+
+    /// Apply a full operator policy (SEC-03 open-order cap + SEC-04 rate
+    /// limit) in one deterministic mutation. This is the sink for the
+    /// journaled `SetOperatorPolicy` event and the snapshot-restore path:
+    /// both must land identically on primary and every replica, which is
+    /// exactly why the policy is now journaled rather than reapplied per
+    /// node from the CLI. Marks the engine as having a policy set (see
+    /// [`Self::operator_policy_set`]).
+    ///
+    /// Delegates to the individual setters, so the bucket-clearing rule on
+    /// [`Self::set_max_orders_per_second`] applies unchanged: an online
+    /// reconfiguration between two active rate configs drops stale tokens,
+    /// while initial activation (from a restored snapshot) preserves them.
+    pub fn set_operator_policy(
+        &mut self,
+        max_open_orders_per_account: u32,
+        max_orders_per_second: u32,
+        max_orders_burst: u32,
+    ) {
+        self.set_max_open_orders_per_account(max_open_orders_per_account);
+        self.set_max_orders_per_second(max_orders_per_second, max_orders_burst);
+        self.operator_policy_set = true;
+    }
+
+    /// Whether an operator policy has ever been applied to this engine (via
+    /// a replayed `SetOperatorPolicy` event or a v19+ snapshot restore).
+    /// The runtime reads this after recovery: a recovered lineage that
+    /// reports `false` predates journaled operator policy and gets a
+    /// one-time migration event injected from the CLI flags.
+    pub fn operator_policy_set(&self) -> bool {
+        self.operator_policy_set
     }
 
     /// Stash the current event's `now_ns` so per-event methods (`execute`,

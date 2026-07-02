@@ -300,6 +300,18 @@ pub trait Application: Sized {
     /// default impl.
     fn check_request_seq(&mut self, key_hash: u64, seq: u64) -> bool;
 
+    /// Whether operator policy (throttles, caps, and any other config that
+    /// shapes observable output) has been established for this application
+    /// from its journaled history — a replayed policy event or a snapshot
+    /// that carried the values. The runtime consults this after recovery:
+    /// a lineage that reports `false` predates journaled operator policy
+    /// and gets a one-time migration event injected so the config becomes
+    /// part of the journal going forward. Default `true` — applications
+    /// with no journaled operator policy never need migration.
+    fn operator_policy_present(&self) -> bool {
+        true
+    }
+
     /// Synthesise a rejection report for a transport-originated reject.
     /// Called by the transport before `apply` has observed the event.
     /// No access to `&self` — the reject must be constructible from the
