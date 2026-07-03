@@ -1069,6 +1069,7 @@ mod tests {
             chain_hash: [0xAB; 32],
             // Non-zero so a dropped/zeroed epoch field is caught.
             epoch: 9,
+            config_hash: [0xCD; 32],
         };
         let mut buf = Vec::new();
         encode_handshake(&handshake, &mut buf);
@@ -1081,6 +1082,7 @@ mod tests {
                 assert_eq!(h.last_sequence, 42);
                 assert_eq!(h.chain_hash, [0xAB; 32]);
                 assert_eq!(h.epoch, 9);
+                assert_eq!(h.config_hash, [0xCD; 32]);
             }
             _ => panic!("expected Handshake"),
         }
@@ -1549,6 +1551,7 @@ mod tests {
                 last_sequence: 0,
                 chain_hash: [0u8; 32],
                 epoch: 0,
+                config_hash: [0u8; 32],
             };
             encode_handshake(&handshake, &mut buf);
             writer.write_all(&buf).unwrap();
@@ -1686,6 +1689,7 @@ mod tests {
                     last_sequence: 0,
                     chain_hash: [0u8; 32],
                     epoch: 0,
+                    config_hash: [0u8; 32],
                 },
                 &mut buf,
             );
@@ -1804,6 +1808,7 @@ mod tests {
                     last_sequence: 100,
                     chain_hash: [0xBB; 32],
                     epoch: 0,
+                    config_hash: [0u8; 32],
                 },
                 &mut buf,
             );
@@ -1921,6 +1926,7 @@ mod tests {
                 last_sequence: 0,
                 chain_hash: [0u8; 32],
                 epoch: fence_state.epoch(),
+                config_hash: [0u8; 32],
             },
             &mut buf,
         );

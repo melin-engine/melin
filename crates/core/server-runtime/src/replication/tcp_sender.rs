@@ -478,6 +478,25 @@ fn handle_replica_connection<A: Application>(
         return Err(io::Error::other("fenced by higher-epoch replica"));
     }
 
+    // Config tripwire: compare the replica's advertised authorized_keys
+    // fingerprint with our own. A mismatch means the two nodes were
+    // deployed with divergent access-control config — a promotion would
+    // silently carry the replica's policy into production. Advisory only:
+    // auth runs before journaling so it can't diverge replay, and refusing
+    // the replica would break replication during a legitimate rolling key
+    // update. So warn + expose the `melin_replica_config_fingerprint_mismatch`
+    // gauge, but stream on.
+    let config_mismatch = authorized_keys.fingerprint() != handshake.config_hash;
+    metrics.config_fingerprint_mismatch[slot_idx].store(config_mismatch, Ordering::Relaxed);
+    if config_mismatch {
+        warn!(
+            slot = slot_idx,
+            "replica authorized_keys fingerprint differs from this primary's — access-control \
+             config has drifted between the nodes; a promotion would carry the replica's config \
+             into production. Reconcile authorized_keys across the cluster."
+        );
+    }
+
     // Mark this slot as catching up. Cleared when entering the live loop.
     metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
 

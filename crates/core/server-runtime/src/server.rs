@@ -880,6 +880,7 @@ where
             config.replication_pipeline_depth,
             !config.yield_idle,
             Arc::clone(&factory),
+            authorized_keys.fingerprint(),
             Arc::clone(&fence_state),
             &tip_ready,
         )? {
@@ -2132,6 +2133,7 @@ where
             config.replication_pipeline_depth,
             !config.yield_idle,
             Arc::clone(&factory),
+            authorized_keys.fingerprint(),
             Arc::clone(&fence_state),
             &tip_ready,
         )? {

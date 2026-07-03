@@ -1582,6 +1582,7 @@ name = "melin-app"
 version = "0.11.0"
 dependencies = [
  "base64 0.22.1",
+ "blake3",
  "libc",
  "tempfile",
  "tracing",

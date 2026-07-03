@@ -1889,6 +1889,130 @@ fn runtime_operator_policy_retune_propagates_to_replica() {
     );
 }
 
+/// 2c config tripwire: the primary flags a replica whose `authorized_keys`
+/// fingerprint differs from its own via
+/// `melin_replica_config_fingerprint_mismatch`. It's advisory — auth runs
+/// before journaling so drift can't diverge replay, and refusing the
+/// replica would break replication during a legitimate rolling key update.
+/// So replication still converges; the primary only warns and raises the
+/// gauge for operators to reconcile.
+#[test]
+#[serial]
+fn replica_config_fingerprint_mismatch_is_flagged() {
+    use base64::Engine as _;
+    let b64 = |k: &SigningKey| {
+        base64::engine::general_purpose::STANDARD.encode(k.verifying_key().to_bytes())
+    };
+
+    let bin = server_bin();
+    assert!(bin.exists(), "melin-server binary not found at {bin:?}");
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let key = SigningKey::from_bytes(&[0xFA; 32]);
+    let key2 = SigningKey::from_bytes(&[0xFB; 32]);
+    let extra = SigningKey::from_bytes(&[0xBE; 32]); // replica-only trader
+    let operator_key = SigningKey::from_bytes(&[0xFD; 32]);
+    let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
+
+    // Primary keys: two traders + operator + replication.
+    let primary_keys = tmp.path().join("primary_authorized_keys");
+    std::fs::write(
+        &primary_keys,
+        format!(
+            "trader {} mm-1\ntrader {} mm-2\noperator {} ops\nreplication {} repl\n",
+            b64(&key),
+            b64(&key2),
+            b64(&operator_key),
+            b64(&repl_key),
+        ),
+    )
+    .expect("write primary keys");
+
+    // Replica keys: the same set PLUS one extra trader, so its fingerprint
+    // differs. Replication auth still succeeds — the primary checks the
+    // replica's replication key against ITS OWN file, which carries the
+    // replication pubkey; the replica's own file is irrelevant to the
+    // outbound connection.
+    let replica_keys = tmp.path().join("replica_authorized_keys");
+    std::fs::write(
+        &replica_keys,
+        format!(
+            "trader {} mm-1\ntrader {} mm-2\ntrader {} mm-3\noperator {} ops\nreplication {} repl\n",
+            b64(&key),
+            b64(&key2),
+            b64(&extra),
+            b64(&operator_key),
+            b64(&repl_key),
+        ),
+    )
+    .expect("write replica keys");
+
+    let repl_key_path = tmp.path().join("replication.key");
+    std::fs::write(&repl_key_path, repl_key.to_bytes()).expect("write repl key");
+
+    let p_client = free_port();
+    let p_health = free_port();
+    let p_repl = free_port();
+    let r_client = free_port();
+    let r_health = free_port();
+    let r_admin = free_port();
+
+    let primary = spawn_primary_with_extra(
+        &bin,
+        tmp.path(),
+        &primary_keys,
+        p_client,
+        p_health,
+        p_repl,
+        &[],
+    );
+    wait_for_primary_repl_ready(primary.health_addr, Duration::from_secs(10));
+
+    let _replica = spawn_replica_named_with_extra(
+        &bin,
+        tmp.path(),
+        &replica_keys,
+        &repl_key_path,
+        p_repl,
+        r_client,
+        r_health,
+        r_admin,
+        "replica",
+        &[],
+    );
+    wait_healthy(primary.health_addr, Duration::from_secs(30));
+
+    // The replica connects (replication auth is one-directional), so the
+    // primary evaluates the tripwire at handshake and raises the slot's
+    // gauge to 1.
+    wait_metric(
+        primary.health_addr,
+        "melin_replica_config_fingerprint_mismatch{slot=\"0\"} ",
+        Duration::from_secs(15),
+        "config fingerprint mismatch flagged on slot 0",
+        |v| v == 1,
+    );
+
+    // Advisory: replication still converges despite the drift. Push a few
+    // orders and confirm lag reaches 0.
+    let mut client = connect_with_timeout(primary.client_addr, &key);
+    for i in 1..=5u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 1);
+        assert!(!r.is_empty(), "order {i}: no response");
+    }
+    let start = Instant::now();
+    loop {
+        if let Ok((_, _, 0, _)) = query_health(primary.health_addr) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "replication must still converge despite the advisory config tripwire"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dual replication tests
 // ---------------------------------------------------------------------------

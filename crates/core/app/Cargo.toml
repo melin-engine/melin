@@ -14,6 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 base64 = { workspace = true }
+blake3 = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 

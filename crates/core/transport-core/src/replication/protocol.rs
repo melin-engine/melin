@@ -51,8 +51,9 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// trailing field — zerocopy prefix parsing accepts longer frames).
 /// History: 1 = pre-fencing (41-byte handshake, no epoch);
 /// 2 = fencing epochs (epoch on handshake/StreamStart) + this field;
-/// 3 = primary-driven rotation (`Rotate`) + chain validation (`ChainCheck`).
-pub const REPL_PROTOCOL_VERSION: u16 = 3;
+/// 3 = primary-driven rotation (`Rotate`) + chain validation (`ChainCheck`);
+/// 4 = config fingerprint (`config_hash`) on the handshake.
+pub const REPL_PROTOCOL_VERSION: u16 = 4;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -77,6 +78,14 @@ pub struct Handshake {
     /// the primary hasn't, so the primary is stale and self-demotes (see
     /// `crate::fence`).
     pub epoch: u64,
+    /// The replica's `authorized_keys` fingerprint (see
+    /// `melin_app::auth::AuthorizedKeys::fingerprint`). The primary compares
+    /// it against its own as a config tripwire: a mismatch means the two
+    /// nodes were deployed with divergent access-control config, which a
+    /// promotion would silently carry into production. Advisory only — it
+    /// does not affect replay determinism (auth runs before journaling), so
+    /// the primary warns and streams on rather than rejecting the replica.
+    pub config_hash: [u8; 32],
 }
 
 /// Ack message sent by the replica.
@@ -198,10 +207,13 @@ struct HandshakeFrame {
     last_sequence: U64,
     chain_hash: [u8; 32],
     epoch: U64,
-    /// [`REPL_PROTOCOL_VERSION`] — appended *last* deliberately: prefix
-    /// parsing on an older peer still reads the fields it knows, and the
-    /// new decoder rejects a mismatch with an explicit version error.
+    /// [`REPL_PROTOCOL_VERSION`] — appended *before* `config_hash` so the
+    /// decoder can check it first: a version mismatch (older peer) is
+    /// reported explicitly rather than being misread as a config drift.
     protocol_version: U16,
+    /// The replica's `authorized_keys` fingerprint (config tripwire).
+    /// Appended last — any future additive field goes after this.
+    config_hash: [u8; 32],
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -280,7 +292,7 @@ struct SeqHashFrame {
     hash: [u8; 32],
 }
 
-const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 51);
+const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 83);
 const _: () = assert!(core::mem::size_of::<AckFrame>() == 17);
 const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
 const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
@@ -308,6 +320,7 @@ pub fn encode_handshake(h: &Handshake, buf: &mut Vec<u8>) {
         chain_hash: h.chain_hash,
         epoch: U64::new(h.epoch),
         protocol_version: U16::new(REPL_PROTOCOL_VERSION),
+        config_hash: h.config_hash,
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -581,6 +594,7 @@ pub fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessage> {
                 last_sequence: frame.last_sequence.get(),
                 chain_hash: frame.chain_hash,
                 epoch: frame.epoch.get(),
+                config_hash: frame.config_hash,
             }))
         }
         MSG_ACK => {

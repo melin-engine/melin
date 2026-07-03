@@ -263,6 +263,9 @@ struct HealthSnapshot {
     per_replica_acks_received: [u64; 2],
     /// Per-replica catch-up state.
     per_replica_catching_up: [bool; 2],
+    /// Per-replica config tripwire: true when the connected replica's
+    /// `authorized_keys` fingerprint differs from this primary's.
+    per_replica_config_mismatch: [bool; 2],
     /// Per-replica last acked sequence number.
     per_replica_acked_sequence: [u64; 2],
     /// Per-replica last in-memory sequence number (highest seq the
@@ -383,6 +386,7 @@ impl HealthSnapshot {
             [u64; 2],
             [u64; 2],
             [bool; 2],
+            [bool; 2],
             u64,
         );
         let (
@@ -393,6 +397,7 @@ impl HealthSnapshot {
             per_replica_ack_latency_us,
             per_replica_acks_received,
             per_replica_catching_up,
+            per_replica_config_mismatch,
             evictions_total,
         ): ReplMetricsTuple = if let Some(ref rm) = state.replication_metrics {
             let acked = [
@@ -447,9 +452,21 @@ impl HealthSnapshot {
                 rm.catching_up[0].load(Ordering::Relaxed),
                 rm.catching_up[1].load(Ordering::Relaxed),
             ];
+            let config_mismatch = [
+                rm.config_fingerprint_mismatch[0].load(Ordering::Relaxed),
+                rm.config_fingerprint_mismatch[1].load(Ordering::Relaxed),
+            ];
             let evictions = rm.evictions_total.load(Ordering::Relaxed);
             (
-                acked, in_memory, lag, bytes, latency, acks, catching, evictions,
+                acked,
+                in_memory,
+                lag,
+                bytes,
+                latency,
+                acks,
+                catching,
+                config_mismatch,
+                evictions,
             )
         } else {
             (
@@ -459,6 +476,7 @@ impl HealthSnapshot {
                 [0, 0],
                 [0, 0],
                 [0, 0],
+                [false, false],
                 [false, false],
                 0,
             )
@@ -508,6 +526,7 @@ impl HealthSnapshot {
             per_replica_ack_latency_us,
             per_replica_acks_received,
             per_replica_catching_up,
+            per_replica_config_mismatch,
             per_replica_acked_sequence,
             per_replica_in_memory_sequence,
             per_replica_ring_depth,
@@ -588,6 +607,16 @@ impl HealthSnapshot {
         } else {
             0
         };
+        let config_mismatch_0: u8 = if self.per_replica_config_mismatch[0] {
+            1
+        } else {
+            0
+        };
+        let config_mismatch_1: u8 = if self.per_replica_config_mismatch[1] {
+            1
+        } else {
+            0
+        };
         let mut c = Cursor::new(buf);
         let _ = write!(
             c,
@@ -646,6 +675,10 @@ impl HealthSnapshot {
              # TYPE melin_replica_catching_up gauge\n\
              melin_replica_catching_up{{slot=\"0\"}} {}\n\
              melin_replica_catching_up{{slot=\"1\"}} {}\n\
+             # HELP melin_replica_config_fingerprint_mismatch Whether the connected replica's authorized_keys fingerprint differs from this primary's (1 = drift, 0 = match or no replica). Advisory: streaming continues, but a promotion would carry the replica's access-control config into production.\n\
+             # TYPE melin_replica_config_fingerprint_mismatch gauge\n\
+             melin_replica_config_fingerprint_mismatch{{slot=\"0\"}} {}\n\
+             melin_replica_config_fingerprint_mismatch{{slot=\"1\"}} {}\n\
              # HELP melin_replica_evictions_total Total replica evictions due to ring backpressure.\n\
              # TYPE melin_replica_evictions_total counter\n\
              melin_replica_evictions_total {}\n\
@@ -707,6 +740,8 @@ impl HealthSnapshot {
             self.per_replica_acks_received[1],
             catching_0,
             catching_1,
+            config_mismatch_0,
+            config_mismatch_1,
             self.evictions_total,
             self.divergence_total,
             self.per_replica_ring_depth[0],

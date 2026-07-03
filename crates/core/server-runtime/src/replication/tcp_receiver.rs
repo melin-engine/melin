@@ -414,6 +414,11 @@ pub fn run_receiver<A, W>(
     pipeline_depth: usize,
     busy_spin: bool,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
+    // This replica's `authorized_keys` fingerprint, advertised in the
+    // handshake so the primary can flag config drift (see
+    // `melin_app::auth::AuthorizedKeys::fingerprint`). Precomputed by the
+    // caller — `run_receiver` has no auth state of its own.
+    config_fingerprint: [u8; 32],
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
     // Flipped `true` once the fence epoch reflects this replica's
     // recovered journal, so the control-plane raft driver knows the tip
@@ -556,6 +561,7 @@ where
             last_sequence,
             chain_hash,
             epoch: fence_state.epoch(),
+            config_hash: config_fingerprint,
         };
         send_buf.clear();
         encode_handshake(&handshake, &mut send_buf);
@@ -1070,6 +1076,9 @@ mod tests {
                         64,
                         false,
                         Arc::new(Factory),
+                        // Config fingerprint: this test's mock primary
+                        // ignores it, so any value works.
+                        [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         // Raft is not exercised in this test; a throwaway flag.
                         &AtomicBool::new(false),
@@ -1244,6 +1253,9 @@ mod tests {
                         64,
                         false,
                         Arc::new(Factory),
+                        // Config fingerprint: this test's mock primary
+                        // ignores it, so any value works.
+                        [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         // Raft is not exercised in this test; a throwaway flag.
                         &AtomicBool::new(false),
@@ -1433,6 +1445,9 @@ mod tests {
                         64,
                         false,
                         Arc::new(Factory),
+                        // Config fingerprint: this test's mock primary
+                        // ignores it, so any value works.
+                        [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         // Raft is not exercised in this test; a throwaway flag.
                         &AtomicBool::new(false),

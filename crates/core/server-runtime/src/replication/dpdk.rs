@@ -803,6 +803,24 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         continue;
                                     }
 
+                                    // Config tripwire — see the kernel-TCP
+                                    // sender for the rationale. Advisory: warn
+                                    // + set the gauge, but stream on (auth
+                                    // can't diverge replay).
+                                    let config_mismatch =
+                                        authorized_keys.fingerprint() != h.config_hash;
+                                    metrics.config_fingerprint_mismatch[slot_idx]
+                                        .store(config_mismatch, Ordering::Relaxed);
+                                    if config_mismatch {
+                                        warn!(
+                                            slot = slot_idx,
+                                            "replica authorized_keys fingerprint differs from this \
+                                             primary's — access-control config has drifted between \
+                                             the nodes; a promotion would carry the replica's \
+                                             config into production (DPDK)"
+                                        );
+                                    }
+
                                     metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
 
                                     // The handshake frame is consumed here;
@@ -1054,6 +1072,9 @@ pub fn run_receiver_dpdk<A, W>(
     // shape and rationale. Carries operator policy (rate limits, caps,
     // ...) alongside the empty-app constructor.
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
+    // This replica's `authorized_keys` fingerprint (config tripwire) — see
+    // the kernel-TCP `run_receiver`. Precomputed by the caller.
+    config_fingerprint: [u8; 32],
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     // Flipped `true` once recovery has seeded the fence epoch — see the
     // kernel-TCP `run_receiver` and `RaftDriverContext::tip_ready`.
@@ -1285,6 +1306,7 @@ where
             last_sequence,
             chain_hash,
             epoch: fence_state.epoch(),
+            config_hash: config_fingerprint,
         };
         encode_handshake(&handshake, &mut send_buf);
         transport.queue_send(handle, &send_buf);

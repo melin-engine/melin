@@ -75,6 +75,20 @@ impl Permission {
     pub fn is_replication(self) -> bool {
         matches!(self, Permission::Replication)
     }
+
+    /// Stable 1-byte encoding used by [`AuthorizedKeys::fingerprint`].
+    /// Assigned explicitly (not via the enum discriminant) so reordering
+    /// or inserting variants can never silently change a node's config
+    /// fingerprint and mask real `authorized_keys` drift.
+    fn fingerprint_byte(self) -> u8 {
+        match self {
+            Permission::Operator => 1,
+            Permission::Trader => 2,
+            Permission::Custodian => 3,
+            Permission::ReadOnly => 4,
+            Permission::Replication => 5,
+        }
+    }
 }
 
 /// Maps Ed25519 public keys to permission levels.
@@ -171,6 +185,43 @@ impl AuthorizedKeys {
     /// Whether the keys file is empty (no authorized keys).
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// Canonical BLAKE3 fingerprint of the authorized-key set: a digest
+    /// over every `(public key, permission)` pair.
+    ///
+    /// Used as the replication config tripwire — a primary and replica
+    /// deployed with divergent `authorized_keys` produce different
+    /// fingerprints, surfacing un-journaled access-control drift that
+    /// would otherwise only bite after a failover promotes the replica.
+    /// The keys don't affect deterministic replay (auth runs before
+    /// journaling), so this is a posture check, not a determinism one.
+    ///
+    /// The pairs are sorted by key bytes before hashing so the result is
+    /// independent of file line order and `HashMap` iteration order; a
+    /// domain-separation prefix and an entry count guard against
+    /// cross-protocol collisions and any ambiguity from concatenating
+    /// fixed-width records.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        // (key, permission-byte) pairs, sorted by key for a canonical,
+        // order-independent digest. Vec (not the HashMap) because sorting
+        // is required and the key set is tiny (operator-managed, not a
+        // hot path).
+        let mut entries: Vec<([u8; 32], u8)> = self
+            .keys
+            .iter()
+            .map(|(key, perm)| (*key, perm.fingerprint_byte()))
+            .collect();
+        entries.sort_unstable_by_key(|entry| entry.0);
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"melin.authorized_keys.fingerprint.v1");
+        hasher.update(&(entries.len() as u64).to_le_bytes());
+        for (key, perm) in &entries {
+            hasher.update(key);
+            hasher.update(std::slice::from_ref(perm));
+        }
+        *hasher.finalize().as_bytes()
     }
 }
 
@@ -354,5 +405,58 @@ readonly AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= second
         .unwrap();
         let keys = AuthorizedKeys::load(&path).unwrap();
         assert_eq!(keys.len(), 1);
+    }
+
+    // --- fingerprint (config tripwire) ---
+
+    #[test]
+    fn fingerprint_is_order_independent() {
+        // Same entries, different file line order → identical fingerprint
+        // (the sort makes it independent of line/HashMap order).
+        let a = AuthorizedKeys::parse(
+            "operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= x\n\
+             trader AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE= y\n",
+        )
+        .unwrap();
+        let b = AuthorizedKeys::parse(
+            "trader AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE= y\n\
+             operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= x\n",
+        )
+        .unwrap();
+        assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_differs_on_permission_change() {
+        // Same key, different role → different fingerprint. This is the
+        // drift the tripwire exists to catch.
+        let a = AuthorizedKeys::parse("trader AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= x\n")
+            .unwrap();
+        let b = AuthorizedKeys::parse("readonly AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= x\n")
+            .unwrap();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_differs_on_added_key() {
+        let a = AuthorizedKeys::parse("trader AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= x\n")
+            .unwrap();
+        let b = AuthorizedKeys::parse(
+            "trader AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= x\n\
+             trader AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE= y\n",
+        )
+        .unwrap();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_empty_is_stable_and_distinct() {
+        let empty = AuthorizedKeys::parse("").unwrap();
+        let comments_only = AuthorizedKeys::parse("# just a comment\n").unwrap();
+        assert_eq!(empty.fingerprint(), comments_only.fingerprint());
+        let nonempty =
+            AuthorizedKeys::parse("trader AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= x\n")
+                .unwrap();
+        assert_ne!(empty.fingerprint(), nonempty.fingerprint());
     }
 }
