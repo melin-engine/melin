@@ -1726,6 +1726,26 @@ where
     // epochs — the newer one fences the older.
     if let Some(requested_epoch) = promotion {
         let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
+        // Re-validate the term↔epoch alignment at the moment the epoch is
+        // minted, not just at the driver's request-time check: a streamed
+        // `EpochBump` from a concurrent promotion elsewhere can raise the
+        // fence during the drain, in which case `max` allocates `epoch+1`
+        // instead of the election term. Fencing still converges (the
+        // epochs stay distinct and the higher one wins), but the skew
+        // makes later "epochs outran raft terms" refusals — so say what
+        // actually happened while the evidence exists. Manual promotions
+        // (requested == MANUAL) are exempt: they never claimed alignment.
+        if requested_epoch > crate::promotion::PromotionRequest::MANUAL
+            && new_epoch != requested_epoch
+        {
+            warn!(
+                new_epoch,
+                requested_epoch,
+                "promotion epoch does not match its election term — a concurrent \
+                 promotion advanced the fencing epoch mid-drain; auto-promotion \
+                 refusals may report term/epoch misalignment until a newer election"
+            );
+        }
         info!(
             new_epoch,
             requested_epoch, "promotion: injecting epoch bump"
