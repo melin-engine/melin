@@ -425,6 +425,12 @@ pub fn run_receiver<A, W>(
     // it advertises (and the votes it grants) are trustworthy. See
     // `RaftDriverContext::tip_ready`.
     tip_ready: &AtomicBool,
+    // Sequence half of the control-plane advertised tip. This receiver
+    // owns it for the replica phase of the process (seeded from recovery,
+    // advanced to the in-memory accepted position while streaming); after
+    // a promotion the new primary's journal stage takes over the same
+    // handle. See `AdvertisedJournalTip`.
+    journal_tip: melin_transport_core::AdvertisedJournalTip,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -445,9 +451,11 @@ where
             &fence_state,
         )?;
     // The fence epoch now reflects the recovered journal (a fresh
-    // replica legitimately recovers epoch 0). Release-store so the raft
-    // driver's Acquire-load sees the seeded epoch before it trusts the
-    // flag.
+    // replica legitimately recovers epoch 0). Seed the advertised
+    // sequence from the same recovery before releasing the flag, so the
+    // first tip the driver trusts is already the recovered high-water
+    // mark. Release-store so the raft driver's Acquire-load sees both.
+    journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
     tip_ready.store(true, Ordering::Release);
 
     let mut backoff = std::time::Duration::from_secs(1);
@@ -624,6 +632,7 @@ where
                     journal_path,
                     &snapshot_path,
                     &fence_state,
+                    &journal_tip,
                     &mut last_sequence,
                     &mut chain_hash,
                 )
@@ -716,6 +725,7 @@ where
                             None,
                             stream_marks,
                             journal_failed,
+                            &journal_tip,
                         )
                     })
                     .expect("spawn replica-receiver thread");
@@ -1080,8 +1090,12 @@ mod tests {
                         // ignores it, so any value works.
                         [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
-                        // Raft is not exercised in this test; a throwaway flag.
+                        // Raft is not exercised in this test; throwaway
+                        // tip-ready flag and advertised-tip handle.
                         &AtomicBool::new(false),
+                        melin_transport_core::AdvertisedJournalTip::new(
+                            melin_transport_core::WireSeq::new(0),
+                        ),
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())
@@ -1257,8 +1271,12 @@ mod tests {
                         // ignores it, so any value works.
                         [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
-                        // Raft is not exercised in this test; a throwaway flag.
+                        // Raft is not exercised in this test; throwaway
+                        // tip-ready flag and advertised-tip handle.
                         &AtomicBool::new(false),
+                        melin_transport_core::AdvertisedJournalTip::new(
+                            melin_transport_core::WireSeq::new(0),
+                        ),
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())
@@ -1449,8 +1467,12 @@ mod tests {
                         // ignores it, so any value works.
                         [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
-                        // Raft is not exercised in this test; a throwaway flag.
+                        // Raft is not exercised in this test; throwaway
+                        // tip-ready flag and advertised-tip handle.
                         &AtomicBool::new(false),
+                        melin_transport_core::AdvertisedJournalTip::new(
+                            melin_transport_core::WireSeq::new(0),
+                        ),
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())

@@ -437,15 +437,20 @@ existing replication path and the durability modes are unchanged. The
 control plane is deliberately unhurried: ~200 ms heartbeats, 1–2 s
 election timeouts.
 
-Election prefers a more-recent node's lineage: a candidate whose
-fencing epoch is behind a voter's is refused that vote. In this phase
-the comparison is **epoch-only** — it distinguishes primary tenures
-but not how far along within one, so two nodes on the same epoch are
-treated as equally current. Journal-sequence recency (so the
-furthest-along node within an epoch wins) arrives with automatic
-promotion; until then do **not** read `melin_raft_leader_id` as "the
-most-caught-up node" when choosing a manual `PROMOTE` target — verify
-the target's journal tip as the existing playbook directs.
+Election prefers the most-caught-up node: every node advertises its
+journal tip — its fencing epoch plus the highest journal sequence it
+holds (on a replica this includes events accepted but not yet synced
+to disk, because a promotion journals those before serving) — and a
+voter refuses a candidate whose tip is behind its own. The epoch
+dominates the comparison (a newer primary tenure always outranks a
+longer journal from an older one); within an epoch the higher
+sequence wins. A lagging node can therefore never assemble a quorum
+while a more-current node is reachable. Note the guarantee is about
+who *wins elections*: when choosing a **manual** `PROMOTE` target,
+still verify the target's journal tip as the existing playbook
+directs rather than reading `melin_raft_leader_id` as "the
+most-caught-up node" — the current leader may have been elected
+before a lag developed.
 
 In this phase election is **observational**: it does not trigger
 promotion, and the manual `PROMOTE` playbook (including the

@@ -846,13 +846,19 @@ where
         // property of the node, not of its current data-plane role).
         // The tip isn't trustworthy until journal recovery seeds the
         // fence epoch, so start `false` and let the receiver flip it —
-        // until then the driver refuses to grant votes.
+        // until then the driver refuses to grant votes. The advertised
+        // sequence starts at 0 for the same reason; the receiver seeds
+        // it from recovery and owns it until a promotion hands it to
+        // the new primary's journal stage.
         let tip_ready = Arc::new(AtomicBool::new(false));
+        let journal_tip =
+            melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0));
         let raft_status = spawn_raft_driver(
             &config,
             &authorized_keys,
             &fence_state,
             Arc::clone(&tip_ready),
+            journal_tip.clone(),
             &shutdown,
         )?;
 
@@ -883,6 +889,7 @@ where
             authorized_keys.fingerprint(),
             Arc::clone(&fence_state),
             &tip_ready,
+            journal_tip.clone(),
         )? {
             None => {
                 stop_replica_health(replica_health);
@@ -930,6 +937,7 @@ where
                     durability_mode_atomic,
                     fence_state,
                     raft_status,
+                    journal_tip,
                     true, // promoted — inject an EpochBump before serving
                 );
             }
@@ -981,12 +989,18 @@ where
     ));
 
     // A primary's fence epoch is already recovered here, so its tip is
-    // trustworthy from the moment the driver starts.
+    // trustworthy from the moment the driver starts. Seed the advertised
+    // sequence from the recovered journal for the same reason — the
+    // pipeline's journal stage takes the handle over once it runs.
+    let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
+        melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
+    );
     let raft_status = spawn_raft_driver(
         &config,
         &authorized_keys,
         &fence_state,
         Arc::new(AtomicBool::new(true)),
+        journal_tip.clone(),
         &shutdown,
     )?;
 
@@ -1007,6 +1021,7 @@ where
         durability_mode_atomic,
         fence_state,
         raft_status,
+        journal_tip,
         false, // not promoted — no EpochBump injection
     )
 }
@@ -1147,6 +1162,10 @@ fn run_as_primary<A, L, W>(
     durability_mode_atomic: Arc<AtomicU8>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
+    // Control-plane advertised tip. This primary's journal stage becomes
+    // its writer (the raft driver keeps reading the same handle across a
+    // promotion) — see `AdvertisedJournalTip`.
+    journal_tip: melin_transport_core::AdvertisedJournalTip,
     promoted: bool,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -1228,6 +1247,11 @@ where
         enable_shadow,
         Arc::clone(&fence_state),
     );
+    // On a primary the journal stage owns the control-plane advertised
+    // tip (durable cursor after each fsync batch). On the promotion path
+    // this takes over the handle the receiver was advancing.
+    let mut journal_stage = journal_stage;
+    journal_stage.set_advertised_tip_publisher(journal_tip);
     // Ring-position cursors for the seed-drain gate below (Acquire loads,
     // stronger than the bundle's monitoring reads). The durability gate and
     // the replication sender pull their typed handles straight from
@@ -2085,11 +2109,14 @@ where
         // independently of the DPDK data path. Tip not trustworthy until
         // recovery seeds the epoch (see the kernel replica path).
         let tip_ready = Arc::new(AtomicBool::new(false));
+        let journal_tip =
+            melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0));
         let raft_status = spawn_raft_driver(
             &config,
             &authorized_keys,
             &fence_state,
             Arc::clone(&tip_ready),
+            journal_tip.clone(),
             &shutdown,
         )?;
 
@@ -2136,6 +2163,7 @@ where
             authorized_keys.fingerprint(),
             Arc::clone(&fence_state),
             &tip_ready,
+            journal_tip.clone(),
         )? {
             None => {
                 stop_replica_health(replica_health);
@@ -2180,6 +2208,7 @@ where
                     durability_mode_atomic,
                     fence_state,
                     raft_status,
+                    journal_tip,
                     true, // promoted — inject an EpochBump before serving
                 );
             }
@@ -2231,12 +2260,18 @@ where
 
     // Control-plane raft runs on kernel TCP even on DPDK nodes — see
     // the DPDK replica path for the rationale. Primary epoch already
-    // recovered, so the tip is trustworthy immediately.
+    // recovered, so the tip is trustworthy immediately. Advertised
+    // sequence seeded from the recovered journal; the journal stage
+    // takes the handle over below.
+    let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
+        melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
+    );
     let raft_status = spawn_raft_driver(
         &config,
         &authorized_keys,
         &fence_state,
         Arc::new(AtomicBool::new(true)),
+        journal_tip.clone(),
         &shutdown,
     )?;
 
@@ -2353,6 +2388,9 @@ where
     // PROMOTE is rejected on a primary (no flag wired); ROTATE shares the
     // same flag the journal stage observes.
     let mut journal_stage = journal_stage;
+    // Primary journal stage owns the control-plane advertised tip (see
+    // the kernel-TCP path).
+    journal_stage.set_advertised_tip_publisher(journal_tip);
     let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
     let _admin_handle = config.admin_bind.map(|addr| {
         crate::admin::spawn(
@@ -3199,6 +3237,7 @@ fn spawn_raft_driver(
     authorized_keys: &Arc<AuthorizedKeys>,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
     tip_ready: Arc<AtomicBool>,
+    journal_tip: melin_transport_core::AdvertisedJournalTip,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<Option<Arc<melin_transport_core::health::RaftStatus>>, Box<dyn std::error::Error>> {
     let Some((bind, driver_config)) = build_raft_config(config)? else {
@@ -3220,6 +3259,7 @@ fn spawn_raft_driver(
             signing_key,
             authorized_keys: Arc::clone(authorized_keys),
             fence_state: Arc::clone(fence_state),
+            journal_tip,
             tip_ready,
             status: Arc::clone(&status),
             shutdown: Arc::clone(shutdown),

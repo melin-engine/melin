@@ -54,6 +54,7 @@ use melin_app::auth::AuthorizedKeys;
 use melin_raft::recency::{JournalTip, candidate_is_current, is_vote_request};
 use melin_raft::wire::{FrameScan, encode_frame, scan_frame};
 use melin_raft::{ControlNode, StateRole};
+use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::health::RaftStatus;
 
@@ -129,10 +130,14 @@ pub struct RaftDriverContext {
     /// permission required).
     pub authorized_keys: Arc<AuthorizedKeys>,
     /// Fencing state — supplies the epoch half of the journal tip
-    /// advertised on every frame. The sequence half is wired in the
-    /// auto-promotion step; until then all nodes advertise sequence 0
-    /// and the recency filter degrades to epoch-only comparison.
+    /// advertised on every frame ([`local_tip`]).
     pub fence_state: Arc<FenceState>,
+    /// Sequence half of the advertised journal tip: the highest
+    /// contiguous wire seq this node would carry into a promotion.
+    /// Maintained by the replication receiver (replica) or the journal
+    /// stage (primary) — see [`AdvertisedJournalTip`] for the ownership
+    /// rules and why the two roles advertise different cursors.
+    pub journal_tip: AdvertisedJournalTip,
     /// `true` once this node's fence epoch reflects its own recovered
     /// journal, so the tip it advertises (and votes it grants) are
     /// trustworthy. A primary knows its epoch before the driver starts,
@@ -681,9 +686,10 @@ fn drain_node(
     context: &RaftDriverContext,
 ) -> bool {
     let tip = local_tip(context);
-    // Chain hash rides the envelope for step-3 divergence diagnostics;
-    // zero until the journal cursor is plumbed through (with sequence 0
-    // it carries no information yet).
+    // Chain hash rides the envelope for divergence *diagnostics* only (it
+    // never affects vote filtering). Publishing the per-fsync BLAKE3 hash
+    // to the control plane cheaply needs a seqlock hook the journal stage
+    // doesn't expose yet, so it stays zeroed for now.
     let chain_hash = [0u8; 32];
     while node.has_ready() {
         let drained = match node.drain_ready() {
@@ -783,13 +789,14 @@ fn vote_request_admitted(tip_ready: bool, candidate: JournalTip, local: JournalT
     tip_ready && candidate_is_current(candidate, local)
 }
 
-/// The journal tip this node advertises. Sequence is 0 until the
-/// auto-promotion step wires the durable journal cursor through; the
-/// epoch half is already live via the fencing state.
+/// The journal tip this node advertises: the fencing epoch plus the
+/// advertised journal sequence (see [`RaftDriverContext::journal_tip`]).
+/// Trustworthy only once `tip_ready` is set — the vote filter checks
+/// that flag separately ([`vote_request_admitted`]).
 fn local_tip(context: &RaftDriverContext) -> JournalTip {
     JournalTip {
         epoch: context.fence_state.epoch(),
-        last_sequence: 0,
+        last_sequence: context.journal_tip.load().get(),
     }
 }
 
@@ -899,8 +906,17 @@ mod tests {
     }
 
     /// Boot a full in-process cluster of raft drivers over loopback
-    /// TCP.
+    /// TCP, every node advertising journal tip 0.
     fn boot_cluster(ids: &[u64]) -> HashMap<u64, TestNode> {
+        let tips: Vec<(u64, u64)> = ids.iter().map(|&id| (id, 0)).collect();
+        boot_cluster_with_tips(&tips)
+    }
+
+    /// Boot a cluster with a fixed advertised journal tip per node
+    /// (`(node_id, last_sequence)`), for recency-steering tests.
+    fn boot_cluster_with_tips(tips: &[(u64, u64)]) -> HashMap<u64, TestNode> {
+        let ids: Vec<u64> = tips.iter().map(|&(id, _)| id).collect();
+        let ids = ids.as_slice();
         let (signing, authorized) = cluster_keys(ids);
 
         // Bind all listeners first so every node knows every address.
@@ -913,7 +929,7 @@ mod tests {
         }
 
         let mut nodes = HashMap::new();
-        for &id in ids {
+        for &(id, tip) in tips {
             let dir = tempfile::tempdir().expect("tempdir");
             let status = Arc::new(RaftStatus::new(id));
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -935,6 +951,7 @@ mod tests {
                 signing_key: signing[&id].clone(),
                 authorized_keys: Arc::clone(&authorized),
                 fence_state: Arc::new(FenceState::new(0)),
+                journal_tip: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(tip)),
                 // These test nodes act as always-recovered primaries.
                 tip_ready: Arc::new(AtomicBool::new(true)),
                 status: Arc::clone(&status),
@@ -1019,6 +1036,31 @@ mod tests {
             second_term > first_term,
             "new tenure must carry a higher term ({second_term} vs {first_term})"
         );
+
+        for (_, node) in nodes {
+            node.kill();
+        }
+    }
+
+    /// Recency steering over real sockets: a node whose advertised
+    /// journal tip is behind can never assemble a quorum, so leadership
+    /// always lands on a most-caught-up node — including across a
+    /// re-election after the leader dies. This is the property
+    /// auto-promotion relies on to never promote a lagging replica.
+    #[test]
+    fn behind_node_never_wins_an_election() {
+        // Nodes 1 and 2 hold seq 100; node 3 is behind at seq 10. Node 3
+        // can only win with a grant from 1 or 2, and both drop its vote
+        // requests (candidate tip 10 < local tip 100).
+        let mut nodes = boot_cluster_with_tips(&[(1, 100), (2, 100), (3, 10)]);
+        let first = wait_for_single_leader(&nodes, &[], Duration::from_secs(15));
+        assert_ne!(first, 3, "the behind node must not win the first election");
+
+        // Kill the leader: the survivors are one caught-up node and the
+        // behind node — only the caught-up one can win.
+        nodes.remove(&first).expect("leader node").kill();
+        let second = wait_for_single_leader(&nodes, &[first], Duration::from_secs(20));
+        assert_ne!(second, 3, "the behind node must not win the re-election");
 
         for (_, node) in nodes {
             node.kill();

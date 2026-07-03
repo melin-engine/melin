@@ -147,6 +147,67 @@ impl DurableWireSeqCursor {
     }
 }
 
+/// The journal tip a node advertises on the control plane: the highest
+/// contiguous wire seq this node is guaranteed to carry into a promotion.
+/// The raft driver pairs it with the fencing epoch to filter vote requests
+/// (`melin_raft::recency`), which is what makes an election pick the
+/// most-caught-up node.
+///
+/// The writer changes with the node's data-plane role, which is why this is
+/// its own handle rather than an alias of [`DurableWireSeqCursor`]:
+///
+/// - **Replica** — the replication receiver owns it and advances it to its
+///   in-memory *accepted* position (everything published into the input
+///   ring), NOT its durable cursor. A promotion drains the ring into the
+///   journal before serving, so accepted events survive; advertising only
+///   the fsynced position would understate the tip and let a
+///   less-caught-up candidate win an election and drop acked orders.
+/// - **Primary** — the journal stage publishes its durable cursor into it
+///   after each fsync batch (a primary's ring holds client requests that
+///   are not yet acked, so the durable cursor is the honest tip).
+///
+/// `advance` is a monotonic max: phase handoffs (recovery → streaming →
+/// promotion → primary tenure) may briefly re-derive a *lower* value (e.g.
+/// a reconnect handshake reads the journal before the ring settles), and
+/// regressing the advertised tip in that window would grant votes to
+/// candidates behind data this node still holds. The one legitimate
+/// regression — snapshot resync discarding a *divergent* suffix — goes
+/// through the explicit [`reset`](Self::reset) instead: a divergent suffix
+/// was never acked (divergence is detected precisely because it left the
+/// acked lineage), so dropping it from the tip cannot lose acked data.
+#[derive(Clone)]
+pub struct AdvertisedJournalTip(Arc<AtomicU64>);
+
+impl AdvertisedJournalTip {
+    /// Fresh handle, seeded at `start` (0 for a node with no journal yet;
+    /// the recovered high-water mark otherwise).
+    pub fn new(start: WireSeq) -> Self {
+        Self(Arc::new(AtomicU64::new(start.get())))
+    }
+
+    /// Current advertised tip. `Acquire` to pair with the writers'
+    /// `Release` — the control-plane reader is off the hot path.
+    #[inline]
+    pub fn load(&self) -> WireSeq {
+        WireSeq::new(self.0.load(Ordering::Acquire))
+    }
+
+    /// Raise the tip to `seq` if higher (monotonic max — see the type docs
+    /// for why plain stores are not offered on the advance path).
+    #[inline]
+    pub fn advance(&self, seq: WireSeq) {
+        self.0.fetch_max(seq.get(), Ordering::Release);
+    }
+
+    /// Deliberately regress the tip to `seq`. Only for the snapshot-resync
+    /// path, where the previously-advertised suffix is known-divergent and
+    /// the node's holdings genuinely shrank to the transferred position.
+    #[inline]
+    pub fn reset(&self, seq: WireSeq) {
+        self.0.store(seq.get(), Ordering::Release);
+    }
+}
+
 /// The journal-progress cursors, bundled with one space-typed accessor each.
 ///
 /// All fields are `Arc`, so the struct is cheap to [`Clone`] for the readers
@@ -321,6 +382,31 @@ mod tests {
             Ordering::Relaxed,
         );
         assert_eq!(c.load_replica_quorum_acked(), Some(WireSeq::new(100)));
+    }
+
+    #[test]
+    fn advertised_tip_advance_is_monotonic_and_reset_is_not() {
+        let tip = AdvertisedJournalTip::new(WireSeq::new(10));
+        assert_eq!(tip.load(), WireSeq::new(10));
+        tip.advance(WireSeq::new(50));
+        assert_eq!(tip.load(), WireSeq::new(50));
+        // A phase handoff re-deriving a lower value must not regress the
+        // tip (see the type docs — a regression would grant votes to
+        // candidates behind data this node still holds).
+        tip.advance(WireSeq::new(30));
+        assert_eq!(tip.load(), WireSeq::new(50));
+        // Snapshot resync of a divergent suffix is the one legitimate
+        // regression, and it must be explicit.
+        tip.reset(WireSeq::new(20));
+        assert_eq!(tip.load(), WireSeq::new(20));
+    }
+
+    #[test]
+    fn advertised_tip_clones_share_the_cursor() {
+        let tip = AdvertisedJournalTip::new(WireSeq::new(0));
+        let writer = tip.clone();
+        writer.advance(WireSeq::new(7));
+        assert_eq!(tip.load(), WireSeq::new(7));
     }
 
     #[test]

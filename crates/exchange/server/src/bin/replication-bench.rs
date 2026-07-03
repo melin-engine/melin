@@ -266,8 +266,12 @@ fn main() {
                 )),
                 replica_keys_fingerprint,
                 replica_fence,
-                // Control-plane raft is not run in the replication bench.
+                // Control-plane raft is not run in the replication bench:
+                // throwaway tip-ready flag and advertised-tip handle.
                 &std::sync::atomic::AtomicBool::new(false),
+                melin_transport_core::AdvertisedJournalTip::new(
+                    melin_transport_core::WireSeq::new(0),
+                ),
             );
         })
         .expect("spawn run_receiver");
