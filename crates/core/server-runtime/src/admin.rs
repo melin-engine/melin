@@ -295,7 +295,10 @@ fn handle_connection(
                 if request.request(PromotionRequest::MANUAL) {
                     info!("promotion triggered by operator");
                 } else {
-                    info!("PROMOTE received but a promotion is already in flight");
+                    // debug!, not info!: an operator-caused no-op, not
+                    // a lifecycle event (the in-flight promotion was
+                    // already info-logged by whoever filed it).
+                    debug!("PROMOTE received but a promotion is already in flight");
                 }
                 send_best_effort(&mut stream, b"OK\n");
             }

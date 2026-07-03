@@ -952,14 +952,13 @@ where
                     fence_state,
                     raft_status,
                     control.journal_tip.clone(),
-                    // `pending()` is always filed here — the receiver only
-                    // returns state on a request. MANUAL is a safe floor if
-                    // that invariant ever broke (plain `epoch + 1` bump).
+                    // Infallible: the receiver only returns state on a
+                    // filed request, and requests are never cleared.
                     Some(
                         control
                             .promote
                             .pending()
-                            .unwrap_or(crate::promotion::PromotionRequest::MANUAL),
+                            .expect("receiver returned promotion state without a filed request"),
                     ),
                 );
             }
@@ -1250,7 +1249,7 @@ where
     let enable_event_publisher = event_publisher.is_some() && config.event_bind.is_some();
     let Pipeline {
         input_producer,
-        journal_stage,
+        mut journal_stage,
         matching_stage,
         mut output_consumers,
         events_processed,
@@ -1277,7 +1276,6 @@ where
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
-    let mut journal_stage = journal_stage;
     journal_stage.set_advertised_tip_publisher(journal_tip);
     // Ring-position cursors for the seed-drain gate below (Acquire loads,
     // stronger than the bundle's monitoring reads). The durability gate and
@@ -1331,7 +1329,6 @@ where
     // ROTATE on a freshly-promoted node still drives rotation against
     // the new primary's stage. The size threshold uses the same
     // `max_journal_mib` knob that drives startup rotation.
-    let mut journal_stage = journal_stage;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     if config.max_journal_mib > 0 {
@@ -2248,12 +2245,12 @@ where
                     fence_state,
                     raft_status,
                     control.journal_tip.clone(),
-                    // See the kernel-TCP promotion path for the fallback.
+                    // Infallible — see the kernel-TCP promotion path.
                     Some(
                         control
                             .promote
                             .pending()
-                            .unwrap_or(crate::promotion::PromotionRequest::MANUAL),
+                            .expect("receiver returned promotion state without a filed request"),
                     ),
                 );
             }
@@ -2361,7 +2358,7 @@ where
     let enable_shadow = config.snapshot_interval_ms > 0;
     let Pipeline {
         input_producer,
-        journal_stage,
+        mut journal_stage,
         matching_stage,
         mut output_consumers,
         events_processed,
@@ -2434,7 +2431,6 @@ where
     // Wire runtime rotation into the journal stage (DPDK primary path).
     // PROMOTE is rejected on a primary (no flag wired); ROTATE shares the
     // same flag the journal stage observes.
-    let mut journal_stage = journal_stage;
     // Primary journal stage owns the control-plane advertised tip (see
     // the kernel-TCP path).
     journal_stage.set_advertised_tip_publisher(journal_tip);

@@ -122,6 +122,15 @@ fn free_port() -> u16 {
 /// Write an authorized_keys file for multiple test keys, an operator key
 /// (for promotion auth), plus a replication key.
 /// Returns (authorized_keys_path, replication_key_path).
+/// Base64 of a signing key's public half — the `authorized_keys` /
+/// `--raft-peer` encoding.
+fn pubkey_b64(key: &SigningKey) -> String {
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        key.verifying_key().to_bytes(),
+    )
+}
+
 fn write_auth_keys_multi(
     dir: &Path,
     keys: &[&SigningKey],
@@ -131,25 +140,16 @@ fn write_auth_keys_multi(
     let path = dir.join("authorized_keys");
     let mut content = String::new();
     for (i, key) in keys.iter().enumerate() {
-        let pub_key_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            key.verifying_key().to_bytes(),
-        );
         // Use trader permission so orders can be submitted.
-        content.push_str(&format!("trader {pub_key_b64} test-key-{i}\n"));
+        content.push_str(&format!("trader {} test-key-{i}\n", pubkey_b64(key)));
     }
-    // Add operator key (used for authenticated promotion).
-    let ops_pub_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        operator_key.verifying_key().to_bytes(),
-    );
-    content.push_str(&format!("operator {ops_pub_b64} ops\n"));
-    // Add replication key.
-    let repl_pub_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        repl_key.verifying_key().to_bytes(),
-    );
-    content.push_str(&format!("replication {repl_pub_b64} replication\n"));
+    // Add operator key (used for authenticated promotion) and the
+    // replication key.
+    content.push_str(&format!("operator {} ops\n", pubkey_b64(operator_key)));
+    content.push_str(&format!(
+        "replication {} replication\n",
+        pubkey_b64(repl_key)
+    ));
     std::fs::write(&path, content).expect("write authorized_keys");
 
     // Write the replication private key seed to a file.
@@ -4058,6 +4058,53 @@ fn fetch_raft_gauge(addr: SocketAddr, gauge: &str) -> Option<u64> {
 /// Spawn a standalone (no data-plane replication) server with the
 /// control-plane raft driver enabled. All nodes share one replication
 /// key — peer auth identifies the cluster, node identity is the raft id.
+/// Per-node signing keys, key files, and the shared `authorized_keys`
+/// file for a raft cluster test. `extra_auth_lines` carries any
+/// non-replication entries (operator, trader, ...).
+struct RaftClusterKeys {
+    node_keys: std::collections::HashMap<u64, SigningKey>,
+    key_paths: std::collections::HashMap<u64, PathBuf>,
+    keys_path: PathBuf,
+}
+
+fn raft_cluster_keys(dir: &Path, ids: &[u64], extra_auth_lines: &str) -> RaftClusterKeys {
+    // Each node has its own replication key (identity pinning requires
+    // distinct keys), and every node's public key is authorized so any
+    // peer can authenticate to any other.
+    let node_keys: std::collections::HashMap<u64, SigningKey> = ids
+        .iter()
+        .map(|&id| (id, SigningKey::from_bytes(&[id as u8; 32])))
+        .collect();
+    let mut auth_content = String::from(extra_auth_lines);
+    for &id in ids {
+        auth_content.push_str(&format!(
+            "replication {} node-{id}\n",
+            pubkey_b64(&node_keys[&id])
+        ));
+    }
+    let keys_path = dir.join("authorized_keys");
+    std::fs::write(&keys_path, auth_content).expect("write authorized_keys");
+    let key_paths: std::collections::HashMap<u64, PathBuf> = ids
+        .iter()
+        .map(|&id| {
+            let p = dir.join(format!("repl-{id}.key"));
+            std::fs::write(&p, node_keys[&id].to_bytes()).expect("write key");
+            (id, p)
+        })
+        .collect();
+    RaftClusterKeys {
+        node_keys,
+        key_paths,
+        keys_path,
+    }
+}
+
+/// One `--raft-peer` value. The wire format lives here so the raft
+/// tests and `spawn_raft_standalone` cannot drift on it.
+fn raft_peer_arg(id: u64, port: u16, pubkey_b64: &str) -> String {
+    format!("{id}@127.0.0.1:{port}@{pubkey_b64}")
+}
+
 /// One peer's raft identity, as `spawn_raft_standalone` needs it:
 /// id, RPC port, and base64 public key (for `--raft-peer` pinning).
 struct RaftPeerArg {
@@ -4109,10 +4156,7 @@ fn spawn_raft_standalone(
     ];
     for peer in peers {
         args.push("--raft-peer".into());
-        args.push(format!(
-            "{}@127.0.0.1:{}@{}",
-            peer.id, peer.port, peer.pubkey_b64
-        ));
+        args.push(raft_peer_arg(peer.id, peer.port, &peer.pubkey_b64));
     }
     let child = Command::new(bin)
         .args(&args)
@@ -4168,42 +4212,11 @@ fn raft_elects_leader_and_reelects_after_kill() {
     let operator_key = SigningKey::from_bytes(&[8u8; 32]);
 
     let ids = [1u64, 2, 3];
-    // Each node has its own replication key (identity pinning requires
-    // distinct keys), and every node's public key is authorized so any
-    // peer can authenticate to any other.
-    let node_keys: std::collections::HashMap<u64, SigningKey> = ids
-        .iter()
-        .map(|&id| (id, SigningKey::from_bytes(&[id as u8; 32])))
-        .collect();
-    let pubkey_b64 = |id: u64| {
-        base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            node_keys[&id].verifying_key().to_bytes(),
-        )
-    };
-
-    // authorized_keys: an operator key plus every node's replication key.
-    let mut auth_content = format!(
-        "operator {} ops\n",
-        base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            operator_key.verifying_key().to_bytes(),
-        )
+    let cluster = raft_cluster_keys(
+        tmp.path(),
+        &ids,
+        &format!("operator {} ops\n", pubkey_b64(&operator_key)),
     );
-    for &id in &ids {
-        auth_content.push_str(&format!("replication {} node-{id}\n", pubkey_b64(id)));
-    }
-    let keys_path = tmp.path().join("authorized_keys");
-    std::fs::write(&keys_path, auth_content).expect("write authorized_keys");
-    // Per-node key files.
-    let key_paths: std::collections::HashMap<u64, PathBuf> = ids
-        .iter()
-        .map(|&id| {
-            let p = tmp.path().join(format!("repl-{id}.key"));
-            std::fs::write(&p, node_keys[&id].to_bytes()).expect("write key");
-            (id, p)
-        })
-        .collect();
 
     let client_ports: Vec<u16> = ids.iter().map(|_| free_port()).collect();
     let health_ports: Vec<u16> = ids.iter().map(|_| free_port()).collect();
@@ -4220,14 +4233,14 @@ fn raft_elects_leader_and_reelects_after_kill() {
                 .map(|(j, &p)| RaftPeerArg {
                     id: p,
                     port: raft_ports[j],
-                    pubkey_b64: pubkey_b64(p),
+                    pubkey_b64: pubkey_b64(&cluster.node_keys[&p]),
                 })
                 .collect();
             let process = spawn_raft_standalone(
                 &bin,
                 tmp.path(),
-                &keys_path,
-                &key_paths[&id],
+                &cluster.keys_path,
+                &cluster.key_paths[&id],
                 id,
                 client_ports[i],
                 health_ports[i],
@@ -4294,40 +4307,17 @@ fn raft_auto_promotes_surviving_replica_after_primary_kill() {
     let operator_key = SigningKey::from_bytes(&[8u8; 32]);
     let trader_key = SigningKey::from_bytes(&[9u8; 32]);
 
-    // Node 1 = primary; nodes 2 and 3 = replicas. Each node has its own
-    // replication key (raft identity pinning requires distinct keys).
+    // Node 1 = primary; nodes 2 and 3 = replicas.
     let ids = [1u64, 2, 3];
-    let node_keys: std::collections::HashMap<u64, SigningKey> = ids
-        .iter()
-        .map(|&id| (id, SigningKey::from_bytes(&[id as u8; 32])))
-        .collect();
-    let b64 = |key: &SigningKey| {
-        base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            key.verifying_key().to_bytes(),
-        )
-    };
-
-    // authorized_keys: a trader, the operator, and every node's
-    // replication key.
-    let mut auth_content = format!(
-        "trader {} trader\noperator {} ops\n",
-        b64(&trader_key),
-        b64(&operator_key)
+    let cluster = raft_cluster_keys(
+        tmp.path(),
+        &ids,
+        &format!(
+            "trader {} trader\noperator {} ops\n",
+            pubkey_b64(&trader_key),
+            pubkey_b64(&operator_key)
+        ),
     );
-    for &id in &ids {
-        auth_content.push_str(&format!("replication {} node-{id}\n", b64(&node_keys[&id])));
-    }
-    let keys_path = tmp.path().join("authorized_keys");
-    std::fs::write(&keys_path, auth_content).expect("write authorized_keys");
-    let key_paths: std::collections::HashMap<u64, PathBuf> = ids
-        .iter()
-        .map(|&id| {
-            let p = tmp.path().join(format!("repl-{id}.key"));
-            std::fs::write(&p, node_keys[&id].to_bytes()).expect("write key");
-            (id, p)
-        })
-        .collect();
 
     let raft_ports: std::collections::HashMap<u64, u16> =
         ids.iter().map(|&id| (id, free_port())).collect();
@@ -4343,14 +4333,19 @@ fn raft_auto_promotes_surviving_replica_after_primary_kill() {
         ];
         if with_key {
             args.push("--replication-key".to_string());
-            args.push(key_paths[&id].to_str().expect("valid path").to_string());
+            args.push(
+                cluster.key_paths[&id]
+                    .to_str()
+                    .expect("valid path")
+                    .to_string(),
+            );
         }
         for &peer in ids.iter().filter(|&&p| p != id) {
             args.push("--raft-peer".to_string());
-            args.push(format!(
-                "{peer}@127.0.0.1:{}@{}",
+            args.push(raft_peer_arg(
+                peer,
                 raft_ports[&peer],
-                b64(&node_keys[&peer])
+                &pubkey_b64(&cluster.node_keys[&peer]),
             ));
         }
         args
@@ -4364,7 +4359,7 @@ fn raft_auto_promotes_surviving_replica_after_primary_kill() {
     let primary = spawn_primary_with_extra(
         &bin,
         tmp.path(),
-        &keys_path,
+        &cluster.keys_path,
         free_port(),
         free_port(),
         repl_port,
@@ -4379,8 +4374,8 @@ fn raft_auto_promotes_surviving_replica_after_primary_kill() {
         spawn_replica_named_with_extra(
             &bin,
             tmp.path(),
-            &keys_path,
-            &key_paths[&id],
+            &cluster.keys_path,
+            &cluster.key_paths[&id],
             repl_port,
             free_port(),
             free_port(),

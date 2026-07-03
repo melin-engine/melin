@@ -58,11 +58,14 @@ impl PromotionRequest {
     /// ignored, so a manual `PROMOTE` racing an auto-promotion cannot
     /// retarget an in-flight transition.
     pub fn request(&self, min_epoch: u64) -> bool {
+        // Both callers pass ≥ 1 by construction (`MANUAL` = 1; the raft
+        // driver passes an elected leader's term). No release-mode
+        // clamp: it could only mask the caller bug the assert names.
         debug_assert!(min_epoch >= 1, "a promotion request must be non-zero");
         // AcqRel success ordering: pairs with the consumers'
         // `Acquire` polls, same convention as the old bool flag.
         self.0
-            .compare_exchange(0, min_epoch.max(1), Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(0, min_epoch, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 

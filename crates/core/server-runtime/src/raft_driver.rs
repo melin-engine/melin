@@ -671,8 +671,11 @@ fn read_inbound(
                         );
                         continue;
                     }
+                    // The supersession predicate itself lives inside
+                    // `fence_if_superseded` (returns `None` for a
+                    // non-superseding peer) so this call site cannot
+                    // drift from the data-plane senders'.
                     if fence_on_supersession
-                        && envelope.tip.epoch > context.fence_state.epoch()
                         && let Some(first) = context
                             .fence_state
                             .fence_if_superseded(envelope.tip.epoch, &context.shutdown)

@@ -1086,9 +1086,11 @@ where
                 epoch,
                 "streaming resumed after snapshot transfer"
             );
-            // The transfer is installed and validated: the node's holdings
-            // are exactly the snapshot position again.
-            journal_tip.reset(melin_transport_core::WireSeq::new(snap_sequence));
+            // No tip write here: `resume_sequence` becomes the streaming
+            // session's start, and the loop's entry `advance` raises the
+            // tip from the archive-time 0 to the snapshot position. The
+            // brief understatement until then only makes this node's
+            // vote grants more conservative.
             Ok(ResyncDecision::Ready {
                 segment_start_sequence,
                 anchor_hash,
