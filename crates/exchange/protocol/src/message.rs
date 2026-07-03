@@ -69,6 +69,17 @@ pub enum Request {
         symbol: Symbol,
         schedule: FeeSchedule,
     },
+    /// Retune the exchange-wide operator policy at runtime: the SEC-03
+    /// open-order cap and the SEC-04 order-rate limiter. Journaled as a
+    /// single event so every node converges by deterministic replay — the
+    /// live counterpart to the `--max-orders-*` startup flags, which are
+    /// inert once a journal exists. A `0` rate or burst disables the
+    /// limiter; a `0` cap disables the open-order limit.
+    SetOperatorPolicy {
+        max_open_orders_per_account: u32,
+        max_orders_per_second: u32,
+        max_orders_burst: u32,
+    },
 
     /// Cancel all resting orders and pending stops with `TimeInForce::Day`
     /// across all instruments. Triggered by an operator at end-of-session.
@@ -139,6 +150,7 @@ impl Request {
                 | Request::SetRiskLimits { .. }
                 | Request::SetCircuitBreaker { .. }
                 | Request::SetFeeSchedule { .. }
+                | Request::SetOperatorPolicy { .. }
                 | Request::EndOfDay
                 | Request::DisableInstrument { .. }
                 | Request::EnableInstrument { .. }

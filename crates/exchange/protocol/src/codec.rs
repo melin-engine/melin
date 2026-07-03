@@ -101,6 +101,7 @@ const TAG_SUBSCRIBE: u8 = 0x1F;
 const TAG_QUERY_STATS: u8 = 0x20;
 const TAG_QUERY_POSITION: u8 = 0x21;
 const TAG_QUERY_REQUEST_SEQ: u8 = 0x22;
+const TAG_SET_OPERATOR_POLICY: u8 = 0x23;
 
 // --- Domain response tags (0x30–0x4F) ---
 // Transport-level response tags (0x01–0x0F) imported from wire-protocol above.
@@ -310,6 +311,20 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 2;
             le::put_i16(&mut buf[pos..], schedule.taker_fee_bps);
             pos += 2;
+        }
+        Request::SetOperatorPolicy {
+            max_open_orders_per_account,
+            max_orders_per_second,
+            max_orders_burst,
+        } => {
+            buf[pos] = TAG_SET_OPERATOR_POLICY;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], *max_open_orders_per_account);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], *max_orders_per_second);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], *max_orders_burst);
+            pos += 4;
         }
         Request::QueryStats => {
             buf[pos] = TAG_QUERY_STATS;
@@ -585,6 +600,20 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
                     order_id,
                     new_price: Price(new_price),
                     new_quantity: Quantity(new_quantity),
+                },
+            ))
+        }
+        TAG_SET_OPERATOR_POLICY => {
+            // cap(4) + rate(4) + burst(4) = 12
+            if payload.len() < 12 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok((
+                seq,
+                Request::SetOperatorPolicy {
+                    max_open_orders_per_account: le::get_u32(&payload[0..]),
+                    max_orders_per_second: le::get_u32(&payload[4..]),
+                    max_orders_burst: le::get_u32(&payload[8..]),
                 },
             ))
         }
@@ -1644,6 +1673,17 @@ mod tests {
                     maker_fee_bps: 5,
                     taker_fee_bps: 10,
                 },
+            },
+            Request::SetOperatorPolicy {
+                max_open_orders_per_account: 500,
+                max_orders_per_second: 10_000,
+                max_orders_burst: 250,
+            },
+            // Zero fields exercise the "limiter disabled" encoding.
+            Request::SetOperatorPolicy {
+                max_open_orders_per_account: 0,
+                max_orders_per_second: 0,
+                max_orders_burst: 0,
             },
             Request::QueryStats,
             Request::QueryRequestSeq,

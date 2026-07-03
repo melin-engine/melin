@@ -1812,6 +1812,83 @@ fn journaled_operator_policy_overrides_mismatched_replica_cli() {
     );
 }
 
+/// Phase 2b: the operator policy is retunable on a *live* cluster via
+/// `Request::SetOperatorPolicy`, journaled like any other operator
+/// command and propagated to replicas by replication/replay — the runtime
+/// counterpart to the startup `--max-orders-*` flags (which are inert once
+/// a journal exists).
+///
+/// Both nodes boot with a lax CLI cap (1_000_000), so the genesis-seeded
+/// policy would let any order rest. An operator connection then retunes the
+/// cap down to 2 at runtime. We prove the retune (a) takes effect on the
+/// live primary and (b) survives kill+promote on the replica — i.e. the
+/// live request travelled reader → journal → replication → replay. Uses the
+/// time-independent SEC-03 cap for the same anti-flake reason as
+/// `journaled_operator_policy_overrides_mismatched_replica_cli`.
+#[test]
+#[serial]
+fn runtime_operator_policy_retune_propagates_to_replica() {
+    let mut cluster = TestCluster::start_with_extra_args(&["--max-orders-per-account", "1000000"]);
+
+    // Retune the live policy down to cap = 2 over an operator connection.
+    // The apply arm produces no report, so we only assert the request was
+    // accepted (an operator is permitted; a trader would be denied).
+    let mut operator = connect_with_timeout(cluster.primary.client_addr, &cluster.operator_key);
+    operator
+        .send_request(&Request::SetOperatorPolicy {
+            max_open_orders_per_account: 2,
+            max_orders_per_second: 0,
+            max_orders_burst: 0,
+        })
+        .expect("operator retune of open-order cap");
+    drop(operator);
+
+    // The retune is in force on the primary: two orders rest, the third
+    // trips the freshly-lowered cap.
+    let mut client = cluster.connect_primary();
+    for id in 1..=2u64 {
+        let r = submit_order(&mut client, id, 1, 1, Side::Buy, 100, 1);
+        assert!(
+            has_report(&r, |rep| matches!(
+                rep,
+                melin_protocol::types::ExecutionReport::Placed { .. }
+            )),
+            "order {id} should rest under the retuned cap, got: {r:?}",
+        );
+    }
+    let r = submit_order(&mut client, 3, 1, 1, Side::Buy, 100, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::ExceedsMaxOpenOrders,
+                ..
+            }
+        )),
+        "order 3 should hit the retuned cap of 2 on the primary, got: {r:?}",
+    );
+
+    // Ensure the retune + the two resting orders are on the replica.
+    cluster.wait_replicated();
+    drop(client);
+
+    // Promote the replica; it must enforce the retuned cap, proving the
+    // live request propagated by replication — not just the CLI seed.
+    let mut promoted = cluster.kill_and_promote();
+    let r = submit_order(&mut promoted, 4, 1, 1, Side::Buy, 100, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::ExceedsMaxOpenOrders,
+                ..
+            }
+        )),
+        "promoted replica must enforce the runtime-retuned cap of 2, not its \
+         lax CLI cap of 1_000_000 — got: {r:?}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Dual replication tests
 // ---------------------------------------------------------------------------

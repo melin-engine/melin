@@ -156,7 +156,10 @@ pub struct ServerConfig {
     /// value written at genesis (and used to migrate a pre-v19 journal), so
     /// the primary's value propagates to every replica by replay — no need to
     /// keep flags in sync across nodes. On a primary with an existing journal
-    /// the flag is inert; the journaled value is authoritative.
+    /// the flag is inert; the journaled value is authoritative. To change the
+    /// policy on a running cluster, an operator sends a `SetOperatorPolicy`
+    /// request (see `melin-admin`), which is journaled and replayed like any
+    /// other operator command.
     #[arg(long, default_value_t = 10_000)]
     pub max_orders_per_account: u32,
     /// Per-account sustained order-submission rate (orders/sec). Token

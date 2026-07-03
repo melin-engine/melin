@@ -54,6 +54,8 @@ const ACTIONS: &[&str] = &[
     "Disable Instrument",
     "Enable Instrument",
     "Remove Instrument",
+    // Operator policy (20)
+    "Set Operator Policy",
 ];
 
 const TIF_OPTIONS: &[(&str, TimeInForce)] = &[
@@ -234,6 +236,12 @@ enum NextStep {
     EnableInstrumentSymbol,
     /// Remove instrument: enter symbol ID.
     RemoveInstrumentSymbol,
+    /// Operator policy: enter max open orders / account (0 = no limit).
+    OperatorPolicyCap,
+    /// Operator policy: entered cap, enter max orders / second (0 = disabled).
+    OperatorPolicyRate { cap: u32 },
+    /// Operator policy: entered rate, enter max orders burst (0 = disabled).
+    OperatorPolicyBurst { cap: u32, rate: u32 },
     /// GTD expiry: after TIF selection, enter expiry timestamp_ns.
     AfterTifExpiry { collected: OrderFields },
 }
@@ -510,6 +518,19 @@ impl App {
                     NextStep::DisableInstrumentSymbol => Screen::ActionMenu,
                     NextStep::EnableInstrumentSymbol => Screen::ActionMenu,
                     NextStep::RemoveInstrumentSymbol => Screen::ActionMenu,
+                    // Operator policy: cap is the first step; rate/burst
+                    // step back to the previous input.
+                    NextStep::OperatorPolicyCap => Screen::ActionMenu,
+                    NextStep::OperatorPolicyRate { .. } => Screen::NumberInput {
+                        label: "Max Open Orders / Account (0 = no limit)",
+                        buf: String::new(),
+                        next: NextStep::OperatorPolicyCap,
+                    },
+                    NextStep::OperatorPolicyBurst { cap, .. } => Screen::NumberInput {
+                        label: "Max Orders / Second (0 = disabled)",
+                        buf: String::new(),
+                        next: NextStep::OperatorPolicyRate { cap: *cap },
+                    },
                     NextStep::AfterTifExpiry { collected } => Screen::TifMenu {
                         collected: collected.clone(),
                     },
@@ -626,6 +647,14 @@ impl App {
                             next: NextStep::RemoveInstrumentSymbol,
                         };
                     }
+                    20 => {
+                        // Set Operator Policy — ask for the open-order cap.
+                        self.screen = Screen::NumberInput {
+                            label: "Max Open Orders / Account (0 = no limit)",
+                            buf: String::new(),
+                            next: NextStep::OperatorPolicyCap,
+                        };
+                    }
                     _ => {}
                 }
             }
@@ -670,6 +699,9 @@ impl App {
                         | NextStep::CircuitBreakerHalted { .. }
                         | NextStep::FeeScheduleMakerBps { .. }
                         | NextStep::FeeScheduleTakerBps { .. }
+                        | NextStep::OperatorPolicyCap
+                        | NextStep::OperatorPolicyRate { .. }
+                        | NextStep::OperatorPolicyBurst { .. }
                 );
                 if val == 0 && !allows_zero {
                     self.log.push("Value must be > 0.".into());
@@ -1096,6 +1128,39 @@ impl App {
                         self.cursor = 0;
                     }
 
+                    // --- Operator policy flow (SEC-03 cap + SEC-04 rate) ---
+                    NextStep::OperatorPolicyCap => {
+                        self.screen = Screen::NumberInput {
+                            label: "Max Orders / Second (0 = disabled)",
+                            buf: String::new(),
+                            next: NextStep::OperatorPolicyRate { cap: val as u32 },
+                        };
+                    }
+                    NextStep::OperatorPolicyRate { cap } => {
+                        self.screen = Screen::NumberInput {
+                            label: "Max Orders Burst (0 = disabled)",
+                            buf: String::new(),
+                            next: NextStep::OperatorPolicyBurst {
+                                cap,
+                                rate: val as u32,
+                            },
+                        };
+                    }
+                    NextStep::OperatorPolicyBurst { cap, rate } => {
+                        let burst = val as u32;
+                        let request = Request::SetOperatorPolicy {
+                            max_open_orders_per_account: cap,
+                            max_orders_per_second: rate,
+                            max_orders_burst: burst,
+                        };
+                        self.log.push(format!(
+                            "→ SET OPERATOR POLICY cap:{cap} rate:{rate}/s burst:{burst}"
+                        ));
+                        let _ = self.request_tx.send(request);
+                        self.screen = Screen::ActionMenu;
+                        self.cursor = 0;
+                    }
+
                     // --- GTD expiry input after TIF selection ---
                     NextStep::AfterTifExpiry { mut collected } => {
                         collected.expiry_ns = val;
@@ -1266,8 +1331,19 @@ fn parse_text_command(input: &str) -> Result<Request, String> {
                 account: AccountId(acct),
             })
         }
+        "operator-policy" if parts.len() >= 4 => {
+            let cap: u32 = parts[1].parse().map_err(|_| "invalid cap")?;
+            let rate: u32 = parts[2].parse().map_err(|_| "invalid rate")?;
+            let burst: u32 = parts[3].parse().map_err(|_| "invalid burst")?;
+            Ok(Request::SetOperatorPolicy {
+                max_open_orders_per_account: cap,
+                max_orders_per_second: rate,
+                max_orders_burst: burst,
+            })
+        }
         _ => Err(format!(
-            "unknown command: {} (try: cancel <sym> <id>, cancel-all <acct>)",
+            "unknown command: {} (try: cancel <sym> <acct> <id>, cancel-all <acct>, \
+             operator-policy <cap> <rate> <burst>)",
             parts[0]
         )),
     }

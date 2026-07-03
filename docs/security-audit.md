@@ -40,7 +40,7 @@ No limit on resting orders, pending stops, or price levels per instrument. An at
 
 **Impact**: Memory exhaustion (OOM kill) or latency spikes from HashMap resizes.
 **Exploitable remotely**: Yes — submit many resting orders.
-**Status**: **PARTIALLY FIXED** — added `--max-orders-per-account` flag (default 10 000). Submissions beyond the cap reject with `ExceedsMaxOpenOrders` before reservation. The cap is operator policy and must match across primary and replicas (replay determinism). Remaining: per-instrument max price levels, and a global ceiling on total resting orders so a horde of accounts can't collectively exhaust the maps.
+**Status**: **PARTIALLY FIXED** — added `--max-orders-per-account` flag (default 10 000). Submissions beyond the cap reject with `ExceedsMaxOpenOrders` before reservation. The cap is operator policy carried in the journal, so the primary's value propagates to every replica by replay (no need to keep flags in sync), and it can be retuned on a running cluster from the admin console without a restart. Remaining: per-instrument max price levels, and a global ceiling on total resting orders so a horde of accounts can't collectively exhaust the maps.
 
 ---
 
@@ -52,7 +52,7 @@ No per-account or per-connection rate limiting on order submissions. A single cl
 
 **Impact**: One client monopolizes matching throughput.
 **Exploitable remotely**: Yes.
-**Status**: **FIXED** — added `--max-orders-per-second` (default 1000) and `--max-orders-burst` (default 5000). Per-account token bucket runs inside the matching engine using the journaled event timestamp, so primary and replicas see identical accept/reject decisions. Submissions beyond the bucket reject with `ExceedsOrderRate` before reservation. `0` for either knob disables the limiter. Both values are operator policy and must match across the cluster (same shape as `--max-orders-per-account`). Snapshot format v18 carries per-account bucket state, so a replica restoring from a snapshot taken mid-throttle converges bit-for-bit on the very next event — closing the divergence window the initial landing left open.
+**Status**: **FIXED** — added `--max-orders-per-second` (default 1000) and `--max-orders-burst` (default 5000). Per-account token bucket runs inside the matching engine using the journaled event timestamp, so primary and replicas see identical accept/reject decisions. Submissions beyond the bucket reject with `ExceedsOrderRate` before reservation. `0` for either knob disables the limiter. Both values are operator policy carried in the journal (same shape as `--max-orders-per-account`): the primary's values propagate to every replica by replay and are retunable at runtime from the admin console. The snapshot carries per-account bucket state, so a replica restoring from a snapshot taken mid-throttle converges bit-for-bit on the very next event — closing the divergence window the initial landing left open.
 
 **Operator note — defaults are conservative**: the 1000/s sustained rate and 5000-order burst are sized for retail and algo flow. Market-maker accounts typically require limits an order of magnitude higher than this, or more. Operators onboarding market-maker flow must raise these limits accordingly — or set either knob to `0` to disable per-account throttling and apply controls at an external gateway in front of Melin. Per-account scoping (rather than per-session) means a single account with multiple gateway sessions draws from one shared bucket; size for the aggregate.
 

@@ -161,6 +161,15 @@ fn to_trading_event(request: &Request) -> TradingEvent {
         Request::SetFeeSchedule { symbol, schedule } => {
             TradingEvent::SetFeeSchedule { symbol, schedule }
         }
+        Request::SetOperatorPolicy {
+            max_open_orders_per_account,
+            max_orders_per_second,
+            max_orders_burst,
+        } => TradingEvent::SetOperatorPolicy {
+            max_open_orders_per_account,
+            max_orders_per_second,
+            max_orders_burst,
+        },
         Request::QueryStats => TradingEvent::QueryStats,
         Request::QueryPosition { account } => TradingEvent::QueryPosition { account },
         Request::QueryRequestSeq => TradingEvent::QueryRequestSeq,
@@ -544,6 +553,43 @@ mod tests {
         assert!(matches!(
             to_trading_event(&req),
             TradingEvent::SetFeeSchedule { symbol, .. } if symbol == Symbol(3)
+        ));
+    }
+
+    #[test]
+    fn maps_set_operator_policy() {
+        let req = Request::SetOperatorPolicy {
+            max_open_orders_per_account: 500,
+            max_orders_per_second: 10_000,
+            max_orders_burst: 250,
+        };
+        assert!(matches!(
+            to_trading_event(&req),
+            TradingEvent::SetOperatorPolicy {
+                max_open_orders_per_account: 500,
+                max_orders_per_second: 10_000,
+                max_orders_burst: 250,
+            }
+        ));
+    }
+
+    #[test]
+    fn set_operator_policy_requires_operator() {
+        let req = Request::SetOperatorPolicy {
+            max_open_orders_per_account: 1,
+            max_orders_per_second: 0,
+            max_orders_burst: 0,
+        };
+        let bytes = encode(&req, 9);
+        // Operator may retune the live policy...
+        assert!(matches!(
+            RequestDecoder.decode(&bytes, Permission::Operator),
+            Decoded::Permitted { .. }
+        ));
+        // ...a plain trader may not.
+        assert!(matches!(
+            RequestDecoder.decode(&bytes, Permission::Trader),
+            Decoded::PermissionDenied(_)
         ));
     }
 
