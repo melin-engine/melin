@@ -194,9 +194,20 @@ impl AdvertisedJournalTip {
 
     /// Raise the tip to `seq` if higher (monotonic max — see the type docs
     /// for why plain stores are not offered on the advance path).
+    ///
+    /// Test-and-test-and-set: the replication receive loop calls this
+    /// every iteration, almost always with an unchanged value, so a
+    /// plain load guards the `fetch_max` — the common no-change case
+    /// reads a shared cache line instead of paying a locked RMW per
+    /// poll cycle. `Relaxed` on the guard is sound because it is an
+    /// optimization only: a stale-low read just falls through to the
+    /// `fetch_max`, which owns correctness; a higher read means the
+    /// max is already past `seq` and skipping is exactly right.
     #[inline]
     pub fn advance(&self, seq: WireSeq) {
-        self.0.fetch_max(seq.get(), Ordering::Release);
+        if seq.get() > self.0.load(Ordering::Relaxed) {
+            self.0.fetch_max(seq.get(), Ordering::Release);
+        }
     }
 
     /// Deliberately regress the tip to `seq`. Only for the snapshot-resync
