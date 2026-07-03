@@ -24,6 +24,13 @@ pub use melin_transport_core::durability_policy::{
 /// See `docs/replication.md` for the three-tier menu in operational
 /// terms.
 ///
+/// Sentinel for "no primary acking mode observed yet" in the
+/// replica-side gauge the replication stream feeds (see
+/// `ReplicaControlPlane::primary_acking_mode`). Deliberately outside
+/// the `as_u8` range so `from_u8` maps it to `None`; `u8::MAX` leaves
+/// the low values free for future modes.
+pub const ACKING_MODE_UNKNOWN: u8 = u8::MAX;
+
 /// `clap::ValueEnum` derives `--durability-mode <local|hybrid|durably-replicated>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum DurabilityMode {

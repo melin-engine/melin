@@ -282,6 +282,9 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// `authorized_keys.fingerprint()`, computed once at construction (the
     /// key set is immutable per process) for the handshake tripwire.
     authorized_keys_fingerprint: [u8; 32],
+    /// The primary's active acking mode — stamped on `StreamStart` and
+    /// `Heartbeat` (see the kernel-TCP `Sender::durability_mode`).
+    durability_mode: Arc<std::sync::atomic::AtomicU8>,
     // Anchors the `A` type parameter — the struct holds no app-typed
     // state, but `tick`'s journal-catchup and snapshot-transfer paths
     // do, and we want the type system to enforce that the same `A`
@@ -306,6 +309,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         heartbeat_secs: u64,
         fence_state: Arc<melin_transport_core::fence::FenceState>,
         authorized_keys: Arc<AuthorizedKeys>,
+        durability_mode: Arc<std::sync::atomic::AtomicU8>,
     ) -> Self {
         let [consumer_0, consumer_1] = repl_consumers;
         let now = std::time::Instant::now();
@@ -354,6 +358,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             fence_state,
             authorized_keys_fingerprint: authorized_keys.fingerprint(),
             authorized_keys,
+            durability_mode,
             _app: PhantomData,
         }
     }
@@ -435,6 +440,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let fence_state = &self.fence_state;
         let authorized_keys = &self.authorized_keys;
         let authorized_keys_fingerprint = self.authorized_keys_fingerprint;
+        let durability_mode = &self.durability_mode;
         let batch_size = self.batch_size;
         let heartbeat_interval = self.heartbeat_interval;
 
@@ -647,6 +653,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         lineage_start,
                                         lineage_anchor,
                                         fence_state.epoch(),
+                                        durability_mode.load(Ordering::Relaxed),
                                         &mut slot.send_buf,
                                     );
                                     dpdk_publish(&slot.send_buf)
@@ -696,6 +703,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         journal_path,
                                         &mut dpdk_publish,
                                         shutdown,
+                                        durability_mode.load(Ordering::Relaxed),
                                     )
                                 }) {
                                 Ok(CatchUpResult::Ok(end)) => {
@@ -1023,7 +1031,11 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // 3. Heartbeat if idle.
                     if batches_sent == 0 && slot.last_send.elapsed() >= heartbeat_interval {
                         slot.send_buf.clear();
-                        encode_heartbeat(slot.sent.get(), &mut slot.send_buf);
+                        encode_heartbeat(
+                            slot.sent.get(),
+                            durability_mode.load(Ordering::Relaxed),
+                            &mut slot.send_buf,
+                        );
                         transport.queue_send(handle, &slot.send_buf);
                         slot.last_send = std::time::Instant::now();
                     }
@@ -1100,6 +1112,7 @@ where
         tip_ready,
         journal_tip,
         primary_link_up,
+        primary_acking_mode,
     } = control;
 
     if leader_follow.is_some() {
@@ -1382,6 +1395,7 @@ where
                             segment_start_sequence,
                             anchor_hash,
                             epoch,
+                            durability_mode,
                         } => {
                             // Fence: refuse a primary behind our epoch — its
                             // divergent lineage must not overwrite our more
@@ -1401,7 +1415,11 @@ where
                                 break 'handshake None; // caught by the None check below
                             }
                             fence_state.observe_epoch(epoch);
-                            info!(start_sequence, epoch, "streaming started (DPDK)");
+                            primary_acking_mode.store(durability_mode, Ordering::Release);
+                            info!(
+                                start_sequence,
+                                epoch, durability_mode, "streaming started (DPDK)"
+                            );
                             break 'handshake Some((segment_start_sequence, anchor_hash));
                         }
                         ref resync @ (PrimaryMessage::NeedSnapshot
@@ -1421,7 +1439,7 @@ where
                                 journal_path,
                                 &snapshot_path,
                                 &fence_state,
-                                journal_tip,
+                                control,
                                 &mut last_sequence,
                                 &mut chain_hash,
                             );
@@ -1559,7 +1577,7 @@ where
                 input_producer,
                 journal_cursor,
                 shutdown,
-                promote,
+                control,
                 pipeline_depth,
                 busy_spin,
                 last_sequence,
@@ -1567,7 +1585,6 @@ where
                 None,
                 stream_marks,
                 journal_failed,
-                journal_tip,
             );
             send_buf = dpdk_transport.send_buf;
             r

@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -208,6 +208,10 @@ fn main() {
         heartbeat_secs: HEARTBEAT_SECS,
         busy_spin,
         fence_state: Arc::clone(&primary_fence),
+        // The bench acks under `hybrid` semantics (one replica in RAM).
+        durability_mode: Arc::new(AtomicU8::new(
+            melin_server_runtime::durability_policy::DurabilityMode::Hybrid.as_u8(),
+        )),
     };
 
     let s = Arc::clone(&shutdown);

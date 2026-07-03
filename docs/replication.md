@@ -474,13 +474,24 @@ cluster acts on elections:
   self-promote while journal recovery is still running, while its
   replication link to the primary is alive (leadership can land on a
   connected replica when a *different* node's control plane dies —
-  deposing a healthy primary would be wrong), when the cluster runs
-  `--durability-mode local` (acks never waited for any replica, so no
+  deposing a healthy primary would be wrong), when the primary acks
+  under `local` durability (acks never waited for any replica, so no
   election can prove the winner holds every acked order — failover
   stays a manual decision in that mode), and when the fencing epoch
   has outrun the raft terms (a history of manual promotions; the
   alignment heals as terms advance). Every refusal is logged with its
   reason at warn level, once per term.
+- The `local`-durability refusal judges the mode the **primary**
+  actually acks under, not this replica's own configuration: the
+  primary advertises its active mode when a replica attaches and on
+  every replication heartbeat, so a runtime `DURABILITY` retune on the
+  primary reaches the replicas within a heartbeat (default 5 s) —
+  including a mid-incident drop to `local`, which then correctly vetoes
+  auto-promotion. A replica that has never reached any primary falls
+  back to its own configured mode. Pre-staging `DURABILITY local` on a
+  replica for a planned failover therefore does **not** disable
+  auto-promotion — the pre-staged value only takes effect on the
+  node's own response gate after it promotes.
 
 With auto-promotion enabled the cluster also maintains a replicated
 **membership registry**: each node announces its identity — raft

@@ -901,6 +901,7 @@ where
             Some(crate::raft_driver::ReplicaSignals {
                 promote: control.promote.clone(),
                 primary_link_up: Arc::clone(&control.primary_link_up),
+                primary_acking_mode: Arc::clone(&control.primary_acking_mode),
             }),
             &shutdown,
         )? {
@@ -1532,6 +1533,7 @@ where
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
+        let sender_durability = Arc::clone(&durability_mode_atomic);
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -1553,6 +1555,7 @@ where
                         heartbeat_secs,
                         busy_spin,
                         fence_state: sender_fence,
+                        durability_mode: sender_durability,
                     },
                     &s_repl,
                     &ready_flag,
@@ -2208,6 +2211,7 @@ where
             Some(crate::raft_driver::ReplicaSignals {
                 promote: control.promote.clone(),
                 primary_link_up: Arc::clone(&control.primary_link_up),
+                primary_acking_mode: Arc::clone(&control.primary_acking_mode),
             }),
             &shutdown,
         )? {
@@ -2679,6 +2683,7 @@ where
             heartbeat_secs,
             Arc::clone(&fence_state),
             Arc::clone(&authorized_keys),
+            Arc::clone(&durability_mode_atomic),
         );
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
         // off "DPDK replication sender started" to know the primary

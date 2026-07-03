@@ -442,6 +442,7 @@ where
         tip_ready,
         journal_tip,
         primary_link_up,
+        primary_acking_mode,
     } = control;
 
     // Recover whenever any journal segment survives — live OR archived;
@@ -628,6 +629,7 @@ where
                 segment_start_sequence,
                 anchor_hash,
                 epoch,
+                durability_mode,
             } => {
                 // Fence: refuse to follow a primary whose epoch is behind
                 // ours — following its (divergent) lineage on top of our
@@ -648,9 +650,11 @@ where
                     continue;
                 }
                 // Adopt the primary's epoch immediately; streamed `EpochBump`s
-                // keep it current thereafter.
+                // keep it current thereafter. Likewise the acking mode
+                // (heartbeats keep it current mid-session).
                 fence_state.observe_epoch(epoch);
-                info!(start_sequence, epoch, "streaming started");
+                primary_acking_mode.store(durability_mode, Ordering::Release);
+                info!(start_sequence, epoch, durability_mode, "streaming started");
                 ((segment_start_sequence, anchor_hash), last_sequence)
             }
             ref resync @ (PrimaryMessage::NeedSnapshot | PrimaryMessage::HashMismatch) => {
@@ -669,7 +673,7 @@ where
                     journal_path,
                     &snapshot_path,
                     &fence_state,
-                    journal_tip,
+                    control,
                     &mut last_sequence,
                     &mut chain_hash,
                 )
@@ -754,7 +758,7 @@ where
                             input_producer,
                             journal_cursor,
                             shutdown,
-                            promote,
+                            control,
                             pipeline_depth,
                             busy_spin,
                             session_start,
@@ -762,7 +766,6 @@ where
                             None,
                             stream_marks,
                             journal_failed,
-                            journal_tip,
                         )
                     })
                     .expect("spawn replica-receiver thread");
@@ -1154,7 +1157,7 @@ mod tests {
                 other => panic!("expected Handshake, got {other:?}"),
             }
             let mut buf = Vec::new();
-            encode_stream_start(0, lineage_start, lineage_anchor, 0, &mut buf);
+            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
             s1.write_all(&buf).expect("StreamStart 1");
             buf.clear();
             melin_transport_core::replication_wire::encode_input_batch(
@@ -1206,6 +1209,7 @@ mod tests {
                 &primary_journal,
                 &mut publish,
                 &transfer_shutdown,
+                1,
             )
             .expect("snapshot transfer");
             assert_eq!(
@@ -1327,7 +1331,7 @@ mod tests {
             // session and wait for its ack.
             let stream_one = |s: &mut TcpStream, buf: &mut Vec<u8>| {
                 buf.clear();
-                encode_stream_start(0, lineage_start, lineage_anchor, 0, buf);
+                encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, buf);
                 s.write_all(buf).expect("StreamStart");
                 buf.clear();
                 melin_transport_core::replication_wire::encode_input_batch(
@@ -1529,7 +1533,7 @@ mod tests {
                 other => panic!("expected Handshake, got {other:?}"),
             }
             let mut buf = Vec::new();
-            encode_stream_start(0, lineage_start, lineage_anchor, 0, &mut buf);
+            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
             s1.write_all(&buf).expect("StreamStart 1");
             buf.clear();
             melin_transport_core::replication_wire::encode_input_batch(
@@ -1573,6 +1577,7 @@ mod tests {
                     &primary_journal,
                     &mut publish,
                     &transfer_shutdown,
+                    1,
                 )
                 .expect("snapshot transfer");
             }

@@ -52,8 +52,9 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// History: 1 = pre-fencing (41-byte handshake, no epoch);
 /// 2 = fencing epochs (epoch on handshake/StreamStart) + this field;
 /// 3 = primary-driven rotation (`Rotate`) + chain validation (`ChainCheck`);
-/// 4 = authorized_keys fingerprint (`authorized_keys_hash`) on the handshake.
-pub const REPL_PROTOCOL_VERSION: u16 = 4;
+/// 4 = authorized_keys fingerprint (`authorized_keys_hash`) on the handshake;
+/// 5 = primary durability (acking) mode on `StreamStart` and `Heartbeat`.
+pub const REPL_PROTOCOL_VERSION: u16 = 5;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -123,6 +124,13 @@ pub enum PrimaryMessage {
         /// a replica behind it adopts the epoch as the stream's `EpochBump`s
         /// replay. See `crate::fence`.
         epoch: u64,
+        /// The primary's active durability (acking) mode, in the
+        /// server-runtime `DurabilityMode::as_u8` encoding — opaque at
+        /// this layer. Refreshed by every `Heartbeat`; the replica's
+        /// auto-promotion refusal reads the last-observed value, so it
+        /// judges the mode the dead primary actually acked under
+        /// instead of its own locally-configured one.
+        durability_mode: u8,
     },
     NeedSnapshot,
     HashMismatch,
@@ -143,6 +151,9 @@ pub enum PrimaryMessage {
     },
     Heartbeat {
         sequence: u64,
+        /// See `StreamStart::durability_mode` — heartbeats keep the
+        /// replica's view current across runtime `DURABILITY` retunes.
+        durability_mode: u8,
     },
     /// Primary-driven segment rotation. Sent in-stream, after the last
     /// entry of the outgoing segment (`boundary_seq`) and before the
@@ -263,6 +274,7 @@ struct SnapshotEndFrame {
 struct HeartbeatFrame {
     tag: u8,
     sequence: U64,
+    durability_mode: u8,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -282,6 +294,7 @@ struct StreamStartFrame {
     segment_start_sequence: U64,
     anchor_hash: [u8; 32],
     epoch: U64,
+    durability_mode: u8,
 }
 
 /// Shared layout for the two `(sequence, hash)` stream-control frames:
@@ -301,8 +314,8 @@ const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
 const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
 const _: () = assert!(core::mem::size_of::<SnapshotBeginFrame>() == 49);
 const _: () = assert!(core::mem::size_of::<SnapshotEndFrame>() == 5);
-const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 9);
-const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 57);
+const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 10);
+const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 58);
 const _: () = assert!(core::mem::size_of::<SeqHashFrame>() == 41);
 const _: () = assert!(core::mem::size_of::<SegmentSeedBeginFrame>() == 9);
 
@@ -393,6 +406,7 @@ pub fn encode_stream_start(
     segment_start_sequence: u64,
     anchor_hash: [u8; 32],
     epoch: u64,
+    durability_mode: u8,
     buf: &mut Vec<u8>,
 ) {
     let frame = StreamStartFrame {
@@ -401,6 +415,7 @@ pub fn encode_stream_start(
         segment_start_sequence: U64::new(segment_start_sequence),
         anchor_hash,
         epoch: U64::new(epoch),
+        durability_mode,
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -459,11 +474,13 @@ pub fn encode_hash_mismatch(buf: &mut Vec<u8>) {
     buf.push(MSG_HASH_MISMATCH);
 }
 
-/// Encode a Heartbeat message. Carries only the last-sent sequence.
-pub fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
+/// Encode a Heartbeat message: the last-sent sequence plus the
+/// primary's current acking mode.
+pub fn encode_heartbeat(sequence: u64, durability_mode: u8, buf: &mut Vec<u8>) {
     let frame = HeartbeatFrame {
         tag: MSG_HEARTBEAT,
         sequence: U64::new(sequence),
+        durability_mode,
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -635,6 +652,7 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
                 segment_start_sequence: frame.segment_start_sequence.get(),
                 anchor_hash: frame.anchor_hash,
                 epoch: frame.epoch.get(),
+                durability_mode: frame.durability_mode,
             })
         }
         MSG_NEED_SNAPSHOT => Ok(PrimaryMessage::NeedSnapshot),
@@ -661,6 +679,7 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
                 .map_err(|_| io::Error::other("Heartbeat too short"))?;
             Ok(PrimaryMessage::Heartbeat {
                 sequence: frame.sequence.get(),
+                durability_mode: frame.durability_mode,
             })
         }
         MSG_ROTATE => {

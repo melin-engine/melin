@@ -158,6 +158,10 @@ pub struct ReplicaSignals {
     /// connection to its primary — see
     /// `replication::ReplicaControlPlane::primary_link_up`.
     pub primary_link_up: Arc<AtomicBool>,
+    /// The durability mode last advertised by the primary
+    /// (`ACKING_MODE_UNKNOWN` until first contact) — see
+    /// `replication::ReplicaControlPlane::primary_acking_mode`.
+    pub primary_acking_mode: Arc<AtomicU8>,
 }
 
 /// Data-plane view of the applied membership registry: which address
@@ -995,6 +999,22 @@ fn vote_request_admitted(tip_ready: bool, candidate: JournalTip, local: JournalT
     tip_ready && candidate_is_current(candidate, local)
 }
 
+/// The durability mode the auto-promotion refusal judges: the mode
+/// the *primary* last advertised on the replication stream — that is
+/// the gate acked orders actually passed through — falling back to
+/// this node's own configured mode while no primary has ever been
+/// observed (`ACKING_MODE_UNKNOWN`), which is exactly the
+/// pre-propagation behavior. `None` for an unrecognised byte (e.g. a
+/// newer node's mode) — the caller refuses on it.
+fn effective_acking_mode(observed: u8, local_fallback: u8) -> Option<DurabilityMode> {
+    let byte = if observed == crate::durability_policy::ACKING_MODE_UNKNOWN {
+        local_fallback
+    } else {
+        observed
+    };
+    DurabilityMode::from_u8(byte)
+}
+
 /// Everything the auto-promotion rule looks at, snapshotted from the
 /// shared atomics so the decision itself is a pure function
 /// ([`auto_promotion_decision`]) the tests can drive exhaustively.
@@ -1003,7 +1023,8 @@ struct AutoPromotionInputs {
     tip_ready: bool,
     /// This node has been fenced (superseded) — it must never lead.
     fenced: bool,
-    /// Active durability mode, `None` for an unrecognised byte.
+    /// The acking durability mode ([`effective_acking_mode`]), `None`
+    /// for an unrecognised byte.
     durability_mode: Option<DurabilityMode>,
     /// The replication link to the primary is authenticated and live.
     primary_link_up: bool,
@@ -1050,11 +1071,11 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
     match inputs.durability_mode {
         Some(DurabilityMode::Local) => {
             return Err(
-                "durability mode is `local` — an election win cannot prove this node holds \
-                 every acked order; promote manually if the lag is acceptable",
+                "the primary acks under `local` durability — an election win cannot prove \
+                 this node holds every acked order; promote manually if the lag is acceptable",
             );
         }
-        None => return Err("active durability mode is unrecognised"),
+        None => return Err("acking durability mode is unrecognised"),
         Some(DurabilityMode::Hybrid | DurabilityMode::DurablyReplicated) => {}
     }
     if inputs.term <= inputs.fence_epoch {
@@ -1089,7 +1110,10 @@ fn consider_auto_promotion(
     let inputs = AutoPromotionInputs {
         tip_ready: context.tip_ready.load(Ordering::Acquire),
         fenced: context.fence_state.is_fenced(),
-        durability_mode: DurabilityMode::from_u8(context.durability_mode.load(Ordering::Relaxed)),
+        durability_mode: effective_acking_mode(
+            replica.primary_acking_mode.load(Ordering::Acquire),
+            context.durability_mode.load(Ordering::Relaxed),
+        ),
         primary_link_up: replica.primary_link_up.load(Ordering::Acquire),
         term,
         fence_epoch: context.fence_state.epoch(),
@@ -1312,6 +1336,35 @@ mod tests {
             ..promotable()
         };
         assert!(auto_promotion_decision(&inputs).is_err());
+    }
+
+    #[test]
+    fn effective_acking_mode_prefers_the_observed_primary_mode() {
+        use crate::durability_policy::ACKING_MODE_UNKNOWN;
+        let local = DurabilityMode::Local.as_u8();
+        let hybrid = DurabilityMode::Hybrid.as_u8();
+        // Observed wins over the local fallback in both directions:
+        // a primary retuned to `local` must veto promotion even though
+        // this node is configured `hybrid` (the acked-order-loss case),
+        // and a pre-staged `local` on this node must not veto when the
+        // primary provably acked under `hybrid`.
+        assert_eq!(
+            effective_acking_mode(local, hybrid),
+            Some(DurabilityMode::Local)
+        );
+        assert_eq!(
+            effective_acking_mode(hybrid, local),
+            Some(DurabilityMode::Hybrid)
+        );
+        // Never observed a primary: fall back to the local mode — the
+        // pre-propagation behavior.
+        assert_eq!(
+            effective_acking_mode(ACKING_MODE_UNKNOWN, hybrid),
+            Some(DurabilityMode::Hybrid)
+        );
+        // An unrecognised observed byte (newer node's mode) maps to
+        // `None`, which the decision refuses on.
+        assert_eq!(effective_acking_mode(200, hybrid), None);
     }
 
     #[test]
