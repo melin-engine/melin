@@ -418,7 +418,7 @@ pub fn run_receiver<A, W>(
     // handshake so the primary can flag config drift (see
     // `melin_app::auth::AuthorizedKeys::fingerprint`). Precomputed by the
     // caller — `run_receiver` has no auth state of its own.
-    config_fingerprint: [u8; 32],
+    authorized_keys_fingerprint: [u8; 32],
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
     // Flipped `true` once the fence epoch reflects this replica's
     // recovered journal, so the control-plane raft driver knows the tip
@@ -561,7 +561,7 @@ where
             last_sequence,
             chain_hash,
             epoch: fence_state.epoch(),
-            config_hash: config_fingerprint,
+            authorized_keys_hash: authorized_keys_fingerprint,
         };
         send_buf.clear();
         encode_handshake(&handshake, &mut send_buf);

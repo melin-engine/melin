@@ -44,12 +44,13 @@ pub struct ReplicationMetrics {
     /// Per-slot config tripwire: true when the connected replica's
     /// `authorized_keys` fingerprint differs from this primary's (see
     /// `melin_app::auth::AuthorizedKeys::fingerprint`). Set once at
-    /// handshake, cleared when a matching replica takes the slot. A `1`
-    /// means the two nodes were deployed with divergent access-control
-    /// config — a promotion would silently carry the replica's policy
-    /// into production, so it's worth an operator alert. Advisory: the
-    /// stream still runs (auth doesn't affect replay determinism).
-    pub config_fingerprint_mismatch: [AtomicBool; 2],
+    /// handshake, cleared on slot teardown and when a matching replica
+    /// takes the slot. A `1` means the two nodes were deployed with
+    /// divergent access-control config — a promotion would silently
+    /// carry the replica's policy into production, so it's worth an
+    /// operator alert. Advisory: the stream still runs (auth doesn't
+    /// affect replay determinism).
+    pub authorized_keys_mismatch: [AtomicBool; 2],
     /// Total eviction count (both slots combined). Incremented when
     /// the journal stage's backpressure timeout fires.
     pub evictions_total: AtomicU64,
@@ -74,7 +75,7 @@ impl Default for ReplicationMetrics {
             ack_latency_us: [AtomicU64::new(0), AtomicU64::new(0)],
             acks_received: [AtomicU64::new(0), AtomicU64::new(0)],
             catching_up: [AtomicBool::new(false), AtomicBool::new(false)],
-            config_fingerprint_mismatch: [AtomicBool::new(false), AtomicBool::new(false)],
+            authorized_keys_mismatch: [AtomicBool::new(false), AtomicBool::new(false)],
             evictions_total: AtomicU64::new(0),
             divergence_total: AtomicU64::new(0),
         }

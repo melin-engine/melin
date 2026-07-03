@@ -197,6 +197,30 @@ pub(super) fn log_tcp_info(fd: std::os::unix::io::RawFd, tag: &str, slot: usize)
     );
 }
 
+/// Config tripwire, shared by the kernel-TCP and DPDK senders: record on
+/// the per-slot gauge whether the replica's advertised `authorized_keys`
+/// fingerprint matches this primary's, and warn on drift. Advisory only —
+/// auth runs before journaling so key drift cannot diverge replay, and
+/// refusing the replica would break replication during a legitimate
+/// rolling key update. The gauge is cleared again on slot teardown.
+fn flag_authorized_keys_drift(
+    metrics: &ReplicationMetrics,
+    slot_idx: usize,
+    local_fingerprint: &[u8; 32],
+    advertised: &[u8; 32],
+) {
+    let mismatch = local_fingerprint != advertised;
+    metrics.authorized_keys_mismatch[slot_idx].store(mismatch, Ordering::Relaxed);
+    if mismatch {
+        tracing::warn!(
+            slot = slot_idx,
+            "replica authorized_keys fingerprint differs from this primary's — access-control \
+             config has drifted between the nodes; a promotion would carry the replica's config \
+             into production. Reconcile authorized_keys across the cluster."
+        );
+    }
+}
+
 /// Sleep for the given duration in 100ms increments, checking shutdown
 /// and promote flags between increments. Returns early if either is set.
 pub(super) fn sleep_checking_flags(
@@ -1069,7 +1093,7 @@ mod tests {
             chain_hash: [0xAB; 32],
             // Non-zero so a dropped/zeroed epoch field is caught.
             epoch: 9,
-            config_hash: [0xCD; 32],
+            authorized_keys_hash: [0xCD; 32],
         };
         let mut buf = Vec::new();
         encode_handshake(&handshake, &mut buf);
@@ -1082,7 +1106,7 @@ mod tests {
                 assert_eq!(h.last_sequence, 42);
                 assert_eq!(h.chain_hash, [0xAB; 32]);
                 assert_eq!(h.epoch, 9);
-                assert_eq!(h.config_hash, [0xCD; 32]);
+                assert_eq!(h.authorized_keys_hash, [0xCD; 32]);
             }
             _ => panic!("expected Handshake"),
         }
@@ -1551,7 +1575,7 @@ mod tests {
                 last_sequence: 0,
                 chain_hash: [0u8; 32],
                 epoch: 0,
-                config_hash: [0u8; 32],
+                authorized_keys_hash: [0u8; 32],
             };
             encode_handshake(&handshake, &mut buf);
             writer.write_all(&buf).unwrap();
@@ -1689,7 +1713,7 @@ mod tests {
                     last_sequence: 0,
                     chain_hash: [0u8; 32],
                     epoch: 0,
-                    config_hash: [0u8; 32],
+                    authorized_keys_hash: [0u8; 32],
                 },
                 &mut buf,
             );
@@ -1808,7 +1832,7 @@ mod tests {
                     last_sequence: 100,
                     chain_hash: [0xBB; 32],
                     epoch: 0,
-                    config_hash: [0u8; 32],
+                    authorized_keys_hash: [0u8; 32],
                 },
                 &mut buf,
             );
@@ -1926,7 +1950,7 @@ mod tests {
                 last_sequence: 0,
                 chain_hash: [0u8; 32],
                 epoch: fence_state.epoch(),
-                config_hash: [0u8; 32],
+                authorized_keys_hash: [0u8; 32],
             },
             &mut buf,
         );

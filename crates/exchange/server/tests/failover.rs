@@ -1891,14 +1891,14 @@ fn runtime_operator_policy_retune_propagates_to_replica() {
 
 /// 2c config tripwire: the primary flags a replica whose `authorized_keys`
 /// fingerprint differs from its own via
-/// `melin_replica_config_fingerprint_mismatch`. It's advisory — auth runs
+/// `melin_replica_authorized_keys_mismatch`. It's advisory — auth runs
 /// before journaling so drift can't diverge replay, and refusing the
 /// replica would break replication during a legitimate rolling key update.
 /// So replication still converges; the primary only warns and raises the
 /// gauge for operators to reconcile.
 #[test]
 #[serial]
-fn replica_config_fingerprint_mismatch_is_flagged() {
+fn replica_authorized_keys_mismatch_is_flagged() {
     use base64::Engine as _;
     let b64 = |k: &SigningKey| {
         base64::engine::general_purpose::STANDARD.encode(k.verifying_key().to_bytes())
@@ -1987,9 +1987,9 @@ fn replica_config_fingerprint_mismatch_is_flagged() {
     // gauge to 1.
     wait_metric(
         primary.health_addr,
-        "melin_replica_config_fingerprint_mismatch{slot=\"0\"} ",
+        "melin_replica_authorized_keys_mismatch{slot=\"0\"} ",
         Duration::from_secs(15),
-        "config fingerprint mismatch flagged on slot 0",
+        "authorized_keys mismatch flagged on slot 0",
         |v| v == 1,
     );
 
@@ -2018,9 +2018,9 @@ fn replica_config_fingerprint_mismatch_is_flagged() {
     drop(replica); // SIGKILL + wait (ServerProcess::drop)
     wait_metric(
         primary.health_addr,
-        "melin_replica_config_fingerprint_mismatch{slot=\"0\"} ",
+        "melin_replica_authorized_keys_mismatch{slot=\"0\"} ",
         Duration::from_secs(15),
-        "config fingerprint gauge cleared after replica disconnect",
+        "authorized_keys mismatch gauge cleared after replica disconnect",
         |v| v == 0,
     );
 }

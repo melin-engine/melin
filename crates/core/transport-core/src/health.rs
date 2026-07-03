@@ -265,7 +265,7 @@ struct HealthSnapshot {
     per_replica_catching_up: [bool; 2],
     /// Per-replica config tripwire: true when the connected replica's
     /// `authorized_keys` fingerprint differs from this primary's.
-    per_replica_config_mismatch: [bool; 2],
+    per_replica_authorized_keys_mismatch: [bool; 2],
     /// Per-replica last acked sequence number.
     per_replica_acked_sequence: [u64; 2],
     /// Per-replica last in-memory sequence number (highest seq the
@@ -378,28 +378,23 @@ impl HealthSnapshot {
             .as_ref()
             .map_or(0, |c| c.load(Ordering::Relaxed));
 
-        type ReplMetricsTuple = (
-            [u64; 2],
-            [u64; 2],
-            [u64; 2],
-            [u64; 2],
-            [u64; 2],
-            [u64; 2],
-            [bool; 2],
-            [bool; 2],
-            u64,
-        );
-        let (
-            per_replica_acked_sequence,
-            per_replica_in_memory_sequence,
-            per_replica_lag,
-            per_replica_bytes_sent,
-            per_replica_ack_latency_us,
-            per_replica_acks_received,
-            per_replica_catching_up,
-            per_replica_config_mismatch,
-            evictions_total,
-        ): ReplMetricsTuple = if let Some(ref rm) = state.replication_metrics {
+        // Named struct rather than a tuple: nine positional fields of
+        // mostly-identical `[_; 2]` types made silent transposition too
+        // easy as the gauge set grew. `Default` doubles as the
+        // "replication disabled" all-zero snapshot.
+        #[derive(Default)]
+        struct ReplSenderGauges {
+            acked_sequence: [u64; 2],
+            in_memory_sequence: [u64; 2],
+            lag: [u64; 2],
+            bytes_sent: [u64; 2],
+            ack_latency_us: [u64; 2],
+            acks_received: [u64; 2],
+            catching_up: [bool; 2],
+            authorized_keys_mismatch: [bool; 2],
+            evictions_total: u64,
+        }
+        let repl: ReplSenderGauges = if let Some(ref rm) = state.replication_metrics {
             let acked = [
                 rm.acked_sequence[0].load(Ordering::Relaxed),
                 rm.acked_sequence[1].load(Ordering::Relaxed),
@@ -452,34 +447,23 @@ impl HealthSnapshot {
                 rm.catching_up[0].load(Ordering::Relaxed),
                 rm.catching_up[1].load(Ordering::Relaxed),
             ];
-            let config_mismatch = [
-                rm.config_fingerprint_mismatch[0].load(Ordering::Relaxed),
-                rm.config_fingerprint_mismatch[1].load(Ordering::Relaxed),
+            let keys_mismatch = [
+                rm.authorized_keys_mismatch[0].load(Ordering::Relaxed),
+                rm.authorized_keys_mismatch[1].load(Ordering::Relaxed),
             ];
-            let evictions = rm.evictions_total.load(Ordering::Relaxed);
-            (
-                acked,
-                in_memory,
+            ReplSenderGauges {
+                acked_sequence: acked,
+                in_memory_sequence: in_memory,
                 lag,
-                bytes,
-                latency,
-                acks,
-                catching,
-                config_mismatch,
-                evictions,
-            )
+                bytes_sent: bytes,
+                ack_latency_us: latency,
+                acks_received: acks,
+                catching_up: catching,
+                authorized_keys_mismatch: keys_mismatch,
+                evictions_total: rm.evictions_total.load(Ordering::Relaxed),
+            }
         } else {
-            (
-                [0, 0],
-                [0, 0],
-                [0, 0],
-                [0, 0],
-                [0, 0],
-                [0, 0],
-                [false, false],
-                [false, false],
-                0,
-            )
+            ReplSenderGauges::default()
         };
 
         // Per-slot replication ring depth: producer_cursor - consumer.processed.
@@ -521,17 +505,17 @@ impl HealthSnapshot {
             input_queue_depth,
             trading,
             replicas_connected: replicas_connected_val,
-            per_replica_lag,
-            per_replica_bytes_sent,
-            per_replica_ack_latency_us,
-            per_replica_acks_received,
-            per_replica_catching_up,
-            per_replica_config_mismatch,
-            per_replica_acked_sequence,
-            per_replica_in_memory_sequence,
+            per_replica_lag: repl.lag,
+            per_replica_bytes_sent: repl.bytes_sent,
+            per_replica_ack_latency_us: repl.ack_latency_us,
+            per_replica_acks_received: repl.acks_received,
+            per_replica_catching_up: repl.catching_up,
+            per_replica_authorized_keys_mismatch: repl.authorized_keys_mismatch,
+            per_replica_acked_sequence: repl.acked_sequence,
+            per_replica_in_memory_sequence: repl.in_memory_sequence,
             per_replica_ring_depth,
             fastest_replica_cursor,
-            evictions_total,
+            evictions_total: repl.evictions_total,
             divergence_total: state
                 .replication_metrics
                 .as_ref()
@@ -607,12 +591,12 @@ impl HealthSnapshot {
         } else {
             0
         };
-        let config_mismatch_0: u8 = if self.per_replica_config_mismatch[0] {
+        let keys_mismatch_0: u8 = if self.per_replica_authorized_keys_mismatch[0] {
             1
         } else {
             0
         };
-        let config_mismatch_1: u8 = if self.per_replica_config_mismatch[1] {
+        let keys_mismatch_1: u8 = if self.per_replica_authorized_keys_mismatch[1] {
             1
         } else {
             0
@@ -675,10 +659,10 @@ impl HealthSnapshot {
              # TYPE melin_replica_catching_up gauge\n\
              melin_replica_catching_up{{slot=\"0\"}} {}\n\
              melin_replica_catching_up{{slot=\"1\"}} {}\n\
-             # HELP melin_replica_config_fingerprint_mismatch Whether the connected replica's authorized_keys fingerprint differs from this primary's (1 = drift, 0 = match or no replica). Advisory: streaming continues, but a promotion would carry the replica's access-control config into production.\n\
-             # TYPE melin_replica_config_fingerprint_mismatch gauge\n\
-             melin_replica_config_fingerprint_mismatch{{slot=\"0\"}} {}\n\
-             melin_replica_config_fingerprint_mismatch{{slot=\"1\"}} {}\n\
+             # HELP melin_replica_authorized_keys_mismatch Whether the connected replica's authorized_keys fingerprint differs from this primary's (1 = drift, 0 = match or no replica). Advisory: streaming continues, but a promotion would carry the replica's access-control config into production.\n\
+             # TYPE melin_replica_authorized_keys_mismatch gauge\n\
+             melin_replica_authorized_keys_mismatch{{slot=\"0\"}} {}\n\
+             melin_replica_authorized_keys_mismatch{{slot=\"1\"}} {}\n\
              # HELP melin_replica_evictions_total Total replica evictions due to ring backpressure.\n\
              # TYPE melin_replica_evictions_total counter\n\
              melin_replica_evictions_total {}\n\
@@ -740,8 +724,8 @@ impl HealthSnapshot {
             self.per_replica_acks_received[1],
             catching_0,
             catching_1,
-            config_mismatch_0,
-            config_mismatch_1,
+            keys_mismatch_0,
+            keys_mismatch_1,
             self.evictions_total,
             self.divergence_total,
             self.per_replica_ring_depth[0],

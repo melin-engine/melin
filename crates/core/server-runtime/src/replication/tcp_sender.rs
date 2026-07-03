@@ -80,6 +80,9 @@ pub fn run_sender<A: Application>(
         busy_spin,
         fence_state,
     } = config;
+    // Computed once — the key set is immutable for the process lifetime,
+    // so there's no reason to re-hash it on every replica connection.
+    let authorized_keys_fingerprint = authorized_keys.fingerprint();
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
         Err(e) => {
@@ -197,7 +200,7 @@ pub fn run_sender<A: Application>(
             // The config tripwire describes the *connected* replica; with the
             // slot empty the gauge must read 0 ("match or no replica"), not
             // hold the departed replica's verdict.
-            metrics.config_fingerprint_mismatch[slot_idx].store(false, Ordering::Relaxed);
+            metrics.authorized_keys_mismatch[slot_idx].store(false, Ordering::Relaxed);
             // Journal stage stops publishing to this ring.
             active_flags[slot_idx].store(false, Ordering::Release);
         };
@@ -329,6 +332,7 @@ pub fn run_sender<A: Application>(
                                 cursors: &slot_cursors,
                                 journal_path: &jpath,
                                 authorized_keys: &auth_keys,
+                                authorized_keys_fingerprint,
                                 shutdown: shutdown_ref,
                                 replica_ready: ready_ref,
                                 active_flag: &slot_active,
@@ -370,6 +374,9 @@ struct SlotContext<'a> {
     cursors: &'a Arc<ReplicaCursors>,
     journal_path: &'a std::path::Path,
     authorized_keys: &'a melin_app::auth::AuthorizedKeys,
+    /// `authorized_keys.fingerprint()`, precomputed in `run_sender` (the
+    /// key set is immutable per process) for the handshake tripwire.
+    authorized_keys_fingerprint: [u8; 32],
     shutdown: &'a AtomicBool,
     replica_ready: &'a AtomicBool,
     active_flag: &'a AtomicBool,
@@ -411,6 +418,7 @@ fn handle_replica_connection<A: Application>(
         cursors,
         journal_path,
         authorized_keys,
+        authorized_keys_fingerprint,
         shutdown,
         replica_ready,
         active_flag,
@@ -482,24 +490,14 @@ fn handle_replica_connection<A: Application>(
         return Err(io::Error::other("fenced by higher-epoch replica"));
     }
 
-    // Config tripwire: compare the replica's advertised authorized_keys
-    // fingerprint with our own. A mismatch means the two nodes were
-    // deployed with divergent access-control config — a promotion would
-    // silently carry the replica's policy into production. Advisory only:
-    // auth runs before journaling so it can't diverge replay, and refusing
-    // the replica would break replication during a legitimate rolling key
-    // update. So warn + expose the `melin_replica_config_fingerprint_mismatch`
-    // gauge, but stream on.
-    let config_mismatch = authorized_keys.fingerprint() != handshake.config_hash;
-    metrics.config_fingerprint_mismatch[slot_idx].store(config_mismatch, Ordering::Relaxed);
-    if config_mismatch {
-        warn!(
-            slot = slot_idx,
-            "replica authorized_keys fingerprint differs from this primary's — access-control \
-             config has drifted between the nodes; a promotion would carry the replica's config \
-             into production. Reconcile authorized_keys across the cluster."
-        );
-    }
+    // Config tripwire — warn + gauge on authorized_keys drift, stream on.
+    // Rationale lives on `flag_authorized_keys_drift`.
+    super::flag_authorized_keys_drift(
+        metrics,
+        slot_idx,
+        authorized_keys_fingerprint,
+        &handshake.authorized_keys_hash,
+    );
 
     // Mark this slot as catching up. Cleared when entering the live loop.
     metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
@@ -691,6 +689,7 @@ fn live_stream_uring(
         // Only used during handshake/catch-up (handle_replica_connection).
         journal_path: _,
         authorized_keys: _,
+        authorized_keys_fingerprint: _,
         replica_ready: _,
         active_flag: _,
         heartbeat_secs: _,

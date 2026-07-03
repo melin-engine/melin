@@ -239,7 +239,7 @@ fn main() {
     let replica_fence = Arc::new(melin_transport_core::fence::FenceState::new(0));
     // Both ends of the bench share one key set, so the fingerprint matches
     // and the primary's config tripwire stays quiet.
-    let replica_config_fingerprint = authorized_keys.fingerprint();
+    let replica_keys_fingerprint = authorized_keys.fingerprint();
     let receiver_handle = std::thread::Builder::new()
         .name("bench-repl-receiver".into())
         .spawn(move || {
@@ -264,7 +264,7 @@ fn main() {
                         max_orders_burst: 0,
                     },
                 )),
-                replica_config_fingerprint,
+                replica_keys_fingerprint,
                 replica_fence,
                 // Control-plane raft is not run in the replication bench.
                 &std::sync::atomic::AtomicBool::new(false),

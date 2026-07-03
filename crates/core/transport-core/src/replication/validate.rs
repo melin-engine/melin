@@ -213,7 +213,7 @@ mod tests {
             last_sequence,
             chain_hash,
             epoch: 0,
-            config_hash: [0u8; 32],
+            authorized_keys_hash: [0u8; 32],
         }
     }
 

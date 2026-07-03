@@ -233,7 +233,7 @@ impl DpdkReplicaSlot {
             // The config tripwire describes the *connected* replica; with the
             // slot empty the gauge must read 0 ("match or no replica"), not
             // hold the departed replica's verdict.
-            metrics.config_fingerprint_mismatch[slot_idx].store(false, Ordering::Relaxed);
+            metrics.authorized_keys_mismatch[slot_idx].store(false, Ordering::Relaxed);
             if was_authenticated {
                 ReplicaGate::new(replicas_connected).lower();
             }
@@ -279,6 +279,9 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// (not threaded per-call) so the `Authenticating` tick arm can verify
     /// without the caller re-supplying it each poll.
     authorized_keys: Arc<AuthorizedKeys>,
+    /// `authorized_keys.fingerprint()`, computed once at construction (the
+    /// key set is immutable per process) for the handshake tripwire.
+    authorized_keys_fingerprint: [u8; 32],
     // Anchors the `A` type parameter — the struct holds no app-typed
     // state, but `tick`'s journal-catchup and snapshot-transfer paths
     // do, and we want the type system to enforce that the same `A`
@@ -349,6 +352,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             batch_size,
             heartbeat_interval: std::time::Duration::from_secs(heartbeat_secs),
             fence_state,
+            authorized_keys_fingerprint: authorized_keys.fingerprint(),
             authorized_keys,
             _app: PhantomData,
         }
@@ -430,6 +434,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let metrics = &self.metrics;
         let fence_state = &self.fence_state;
         let authorized_keys = &self.authorized_keys;
+        let authorized_keys_fingerprint = self.authorized_keys_fingerprint;
         let batch_size = self.batch_size;
         let heartbeat_interval = self.heartbeat_interval;
 
@@ -807,23 +812,16 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         continue;
                                     }
 
-                                    // Config tripwire — see the kernel-TCP
-                                    // sender for the rationale. Advisory: warn
-                                    // + set the gauge, but stream on (auth
-                                    // can't diverge replay).
-                                    let config_mismatch =
-                                        authorized_keys.fingerprint() != h.config_hash;
-                                    metrics.config_fingerprint_mismatch[slot_idx]
-                                        .store(config_mismatch, Ordering::Relaxed);
-                                    if config_mismatch {
-                                        warn!(
-                                            slot = slot_idx,
-                                            "replica authorized_keys fingerprint differs from this \
-                                             primary's — access-control config has drifted between \
-                                             the nodes; a promotion would carry the replica's \
-                                             config into production (DPDK)"
-                                        );
-                                    }
+                                    // Config tripwire — warn + gauge on
+                                    // authorized_keys drift, stream on.
+                                    // Rationale lives on
+                                    // `flag_authorized_keys_drift`.
+                                    super::flag_authorized_keys_drift(
+                                        metrics,
+                                        slot_idx,
+                                        &authorized_keys_fingerprint,
+                                        &h.authorized_keys_hash,
+                                    );
 
                                     metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
 
@@ -1078,7 +1076,7 @@ pub fn run_receiver_dpdk<A, W>(
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     // This replica's `authorized_keys` fingerprint (config tripwire) — see
     // the kernel-TCP `run_receiver`. Precomputed by the caller.
-    config_fingerprint: [u8; 32],
+    authorized_keys_fingerprint: [u8; 32],
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     // Flipped `true` once recovery has seeded the fence epoch — see the
     // kernel-TCP `run_receiver` and `RaftDriverContext::tip_ready`.
@@ -1310,7 +1308,7 @@ where
             last_sequence,
             chain_hash,
             epoch: fence_state.epoch(),
-            config_hash: config_fingerprint,
+            authorized_keys_hash: authorized_keys_fingerprint,
         };
         encode_handshake(&handshake, &mut send_buf);
         transport.queue_send(handle, &send_buf);
