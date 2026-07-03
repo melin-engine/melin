@@ -234,8 +234,9 @@ fn main() {
         repl_handler_1: 0,
     };
     let s = Arc::clone(&shutdown);
-    let promote = Arc::new(AtomicBool::new(false));
-    let p = Arc::clone(&promote);
+    // Raft is not run in the bench; the bundle's defaults are all
+    // throwaway handles.
+    let control = melin_server_runtime::replication::ReplicaControlPlane::default();
     let replica_fence = Arc::new(melin_transport_core::fence::FenceState::new(0));
     // Both ends of the bench share one key set, so the fingerprint matches
     // and the primary's config tripwire stays quiet.
@@ -248,7 +249,6 @@ fn main() {
                 &replica_journal,
                 &replica_key,
                 &s,
-                &p,
                 3_000_000, // snapshot_interval_ms (effectively never)
                 replica_snapshot,
                 cores,
@@ -266,12 +266,7 @@ fn main() {
                 )),
                 replica_keys_fingerprint,
                 replica_fence,
-                // Control-plane raft is not run in the replication bench:
-                // throwaway tip-ready flag and advertised-tip handle.
-                &std::sync::atomic::AtomicBool::new(false),
-                melin_transport_core::AdvertisedJournalTip::new(
-                    melin_transport_core::WireSeq::new(0),
-                ),
+                &control,
             );
         })
         .expect("spawn run_receiver");

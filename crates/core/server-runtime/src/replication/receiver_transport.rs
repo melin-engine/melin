@@ -560,7 +560,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
     journal_cursor: &melin_pipeline::padding::Sequence,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
     pipeline_depth: usize,
     busy_spin: bool,
     initial_sequence: u64,
@@ -637,7 +637,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 "replica journal stage failed — tearing down for reconnect/resync".into(),
             );
         }
-        if promote.load(Ordering::Acquire) {
+        if promote.is_requested() {
             info!("promotion triggered — stopping replication, transitioning to primary");
             // Drain remaining data from the transport.
             loop {
@@ -1006,6 +1006,14 @@ mod tests {
         melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0))
     }
 
+    /// A promotion request already filed (manually) — for the promote
+    /// drain tests.
+    fn requested_promotion() -> crate::promotion::PromotionRequest {
+        let r = crate::promotion::PromotionRequest::new();
+        r.request(crate::promotion::PromotionRequest::MANUAL);
+        r
+    }
+
     // ---------------------------------------------------------------
     // streaming_loop tests
     // ---------------------------------------------------------------
@@ -1015,7 +1023,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(0);
         let shutdown = AtomicBool::new(true);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
 
         let result = streaming_loop::<MockTransport, TestEvent>(
@@ -1043,7 +1051,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(true);
+        let promote = requested_promotion();
         let mut transport = MockTransport::new();
 
         // Queue one InputBatch that the promote drain should flush.
@@ -1078,7 +1086,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(0);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
         transport.disconnect_after_data();
 
@@ -1107,7 +1115,7 @@ mod tests {
         // Journal cursor at u64::MAX so pending acks are immediately durable.
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1152,7 +1160,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
         transport.disconnect_after_data();
 
@@ -1187,7 +1195,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
         transport.simulate_in_flight = true;
 
@@ -1235,7 +1243,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(0);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1267,7 +1275,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1322,7 +1330,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1821,7 +1829,7 @@ mod tests {
         // durable — ack content is what's under test, not flush timing.
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
 
         let mut data1 = Vec::new();
@@ -1889,7 +1897,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1943,7 +1951,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();

@@ -1063,7 +1063,6 @@ pub fn run_receiver_dpdk<A, W>(
     signing_key: &ed25519_dalek::SigningKey,
     journal_path: &std::path::Path,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
@@ -1078,12 +1077,9 @@ pub fn run_receiver_dpdk<A, W>(
     // the kernel-TCP `run_receiver`. Precomputed by the caller.
     authorized_keys_fingerprint: [u8; 32],
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    // Flipped `true` once recovery has seeded the fence epoch — see the
-    // kernel-TCP `run_receiver` and `RaftDriverContext::tip_ready`.
-    tip_ready: &AtomicBool,
-    // Sequence half of the control-plane advertised tip — see the
-    // kernel-TCP `run_receiver` for the ownership rules.
-    journal_tip: melin_transport_core::AdvertisedJournalTip,
+    // The handles this loop shares with the admin endpoint and the
+    // control-plane raft driver — see [`super::ReplicaControlPlane`].
+    control: &super::ReplicaControlPlane,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -1093,6 +1089,13 @@ where
     W: JournalWrite<A::Event> + Send + 'static,
     JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
+    let super::ReplicaControlPlane {
+        promote,
+        tip_ready,
+        journal_tip,
+        primary_link_up,
+    } = control;
+
     // Recover local state from journal whenever any segment survives —
     // live OR archived; fresh replicas get `(None, None, 0, zeros)`.
     // See `recover_replica_state` for the lineage rules.
@@ -1140,6 +1143,10 @@ where
     // reconnect. Only `Promote` / `Shutdown` / snapshot-transfer / fatal
     // error tear it down.
     loop {
+        // No authenticated session while (re)connecting — the raft
+        // driver may auto-promote from here on if it wins an election.
+        primary_link_up.store(false, Ordering::Release);
+
         // Refresh handshake state from the running pipeline, if any.
         // The (last_sequence, chain_hash) pair must come from ONE
         // FsyncState snapshot — a torn pair read from two sources while
@@ -1162,7 +1169,7 @@ where
             }
             return Ok(None);
         }
-        if promote.load(Ordering::Acquire) {
+        if promote.is_requested() {
             info!("promotion triggered while disconnected");
             return take_pipeline_for_promotion(&mut pipeline, &mut exchange, &mut journal_writer);
         }
@@ -1241,7 +1248,7 @@ where
                 }
                 return Ok(None);
             }
-            if promote.load(Ordering::Acquire) {
+            if promote.is_requested() {
                 info!("promotion triggered during reconnect backoff");
                 return take_pipeline_for_promotion(
                     &mut pipeline,
@@ -1270,6 +1277,11 @@ where
             };
             authenticate_with_primary(&mut auth_stream, signing_key)
         };
+        if auth_result.is_ok() {
+            // The primary is demonstrably alive from here until this
+            // session ends — the raft driver must not auto-promote past it.
+            primary_link_up.store(true, Ordering::Release);
+        }
         if let Err(e) = auth_result {
             transport.close(handle);
             // A shutdown racing the auth window surfaces here as an auth error
@@ -1293,7 +1305,7 @@ where
                 }
                 return Ok(None);
             }
-            if promote.load(Ordering::Acquire) {
+            if promote.is_requested() {
                 info!("promotion triggered during reconnect backoff");
                 return take_pipeline_for_promotion(
                     &mut pipeline,
@@ -1396,7 +1408,7 @@ where
                                 journal_path,
                                 &snapshot_path,
                                 &fence_state,
-                                &journal_tip,
+                                journal_tip,
                                 &mut last_sequence,
                                 &mut chain_hash,
                             );
@@ -1542,12 +1554,13 @@ where
                 None,
                 stream_marks,
                 journal_failed,
-                &journal_tip,
+                journal_tip,
             );
             send_buf = dpdk_transport.send_buf;
             r
         };
 
+        primary_link_up.store(false, Ordering::Release);
         match handle_session_exit(
             result,
             &mut pipeline,

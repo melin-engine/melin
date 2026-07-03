@@ -156,10 +156,12 @@ impl HealthState {
 pub struct RaftStatus {
     /// This node's raft id (static once configured).
     pub node_id: u64,
-    /// Current raft term. A later step will tie the term to the
-    /// replication fencing epoch (so an election allocates the epoch a
-    /// promotion journals); today it is election bookkeeping only and
-    /// does not track the journaled `EpochBump` epoch.
+    /// Current raft term. Under auto-promotion the term doubles as the
+    /// fencing-epoch allocator: a replica elected at term `T` journals
+    /// its tenure's `EpochBump` with `epoch = T` (the driver refuses to
+    /// auto-promote unless `T` is strictly above the epoch in force).
+    /// Manual promotions still bump `epoch + 1`, so the gauge tracks
+    /// the journaled epoch only for election-driven tenures.
     pub term: AtomicU64,
     /// The leader this node currently believes in; 0 while unknown
     /// (mid-election).

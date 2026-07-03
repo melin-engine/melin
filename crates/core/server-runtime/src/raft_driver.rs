@@ -42,7 +42,7 @@ use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -58,6 +58,8 @@ use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::health::RaftStatus;
 
+use crate::durability_policy::DurabilityMode;
+use crate::promotion::PromotionRequest;
 use crate::replication::auth::{authenticate_replica_identified, authenticate_with_primary};
 
 /// Driver loop granularity. Bounds tick jitter and message latency;
@@ -119,6 +121,28 @@ pub struct RaftDriverConfig {
     pub peers: Vec<RaftPeer>,
     /// Directory for the durable raft state file.
     pub dir: PathBuf,
+    /// Act on elections instead of only observing them
+    /// (`--raft-auto-promote`): a replica that wins leadership files a
+    /// promotion request (subject to [`auto_promotion_decision`]), and
+    /// a node still acting as primary fences itself when a peer's tip
+    /// carries a higher fencing epoch. Off = election stays purely
+    /// observational, exactly as before.
+    pub auto_promote: bool,
+}
+
+/// Handles present only on a node that booted as a replica — the
+/// levers auto-promotion pulls. A genesis primary has none (there is
+/// nothing to promote).
+pub struct ReplicaSignals {
+    /// Promotion request shared with the admin endpoint and the
+    /// replica's receive loop. Also how the driver knows the node's
+    /// current data-plane role: a filed request means this node is
+    /// (becoming) a primary.
+    pub promote: PromotionRequest,
+    /// `true` while the replica holds an authenticated replication
+    /// connection to its primary — see
+    /// `replication::ReplicaControlPlane::primary_link_up`.
+    pub primary_link_up: Arc<AtomicBool>,
 }
 
 /// Everything the driver thread borrows from the server.
@@ -151,6 +175,15 @@ pub struct RaftDriverContext {
     pub tip_ready: Arc<AtomicBool>,
     /// Election observability published to the health endpoint.
     pub status: Arc<RaftStatus>,
+    /// The active durability mode (`DurabilityMode::as_u8` encoding,
+    /// runtime-retunable via the admin `DURABILITY` command). Read by
+    /// the auto-promotion refusal rule: in `local` mode an election win
+    /// proves nothing about acked orders, so the driver never
+    /// auto-promotes past it.
+    pub durability_mode: Arc<AtomicU8>,
+    /// Present iff this node booted as a replica — see
+    /// [`ReplicaSignals`]. `None` on a genesis primary.
+    pub replica: Option<ReplicaSignals>,
     /// Process-wide shutdown flag.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -298,6 +331,10 @@ fn run(
 
     let mut next_tick = Instant::now() + TICK_INTERVAL;
     publish_status(&node, &context.status);
+    // Term of the last logged auto-promotion refusal, so a standing
+    // refusal (e.g. `local` durability) warns once per tenure instead
+    // of every 10 ms poll.
+    let mut last_refused_term: u64 = 0;
 
     loop {
         if context.shutdown.load(Ordering::Relaxed) {
@@ -340,7 +377,7 @@ fn run(
         dial_due_peers(&mut links, &config, &context, &authed_tx, now);
 
         // 5. Ingress: read peers, extract frames, filter, step raft.
-        read_inbound(&mut inbound, &mut node, &context);
+        read_inbound(&mut inbound, &mut node, &config, &context);
         poll_outbound_liveness(&mut links);
 
         // 6. Drain raft readies (fsyncs inside) and route the egress.
@@ -351,6 +388,7 @@ fn run(
         }
 
         publish_status(&node, &context.status);
+        consider_auto_promotion(&node, &config, &context, &mut last_refused_term);
         std::thread::sleep(POLL_INTERVAL);
     }
 
@@ -555,10 +593,24 @@ fn dial_and_auth(addr: SocketAddr, key: &SigningKey) -> io::Result<TcpStream> {
 fn read_inbound(
     inbound: &mut Vec<InboundConn>,
     node: &mut ControlNode,
+    config: &RaftDriverConfig,
     context: &RaftDriverContext,
 ) {
     let local_tip = local_tip(context);
     let tip_ready = context.tip_ready.load(Ordering::Acquire);
+    // Control-plane fencing (auto-promote deployments only): a peer
+    // whose envelope tip carries a higher fencing epoch has seen a
+    // newer promotion. If this node still acts as a primary it has
+    // been superseded and must stop acking. The data-plane handshake
+    // fences too, but only when a connection crosses — a deposed
+    // primary whose replicas all moved to the new one would otherwise
+    // keep serving clients indefinitely; raft heartbeats reach it
+    // regardless.
+    let fence_on_supersession = config.auto_promote
+        && context
+            .replica
+            .as_ref()
+            .is_none_or(|r| r.promote.is_requested());
     let now = Instant::now();
     inbound.retain_mut(|conn| {
         let mut chunk = [0u8; 16 * 1024];
@@ -618,6 +670,23 @@ fn read_inbound(
                             "dropping raft frame with mismatched sender id"
                         );
                         continue;
+                    }
+                    if fence_on_supersession
+                        && envelope.tip.epoch > context.fence_state.epoch()
+                        && let Some(first) = context
+                            .fence_state
+                            .fence_if_superseded(envelope.tip.epoch, &context.shutdown)
+                        && first
+                    {
+                        // warn!, not error!: an authenticated peer
+                        // reporting a newer promotion is the cluster
+                        // working as designed, not a malfunction.
+                        warn!(
+                            peer_epoch = envelope.tip.epoch,
+                            our_epoch = context.fence_state.epoch(),
+                            "fenced: a raft peer advertises a higher fencing epoch — this \
+                             primary has been superseded; self-demoting and shutting down"
+                        );
                     }
                     if is_vote_request(msg.msg_type())
                         && !vote_request_admitted(tip_ready, envelope.tip, local_tip)
@@ -789,6 +858,128 @@ fn vote_request_admitted(tip_ready: bool, candidate: JournalTip, local: JournalT
     tip_ready && candidate_is_current(candidate, local)
 }
 
+/// Everything the auto-promotion rule looks at, snapshotted from the
+/// shared atomics so the decision itself is a pure function
+/// ([`auto_promotion_decision`]) the tests can drive exhaustively.
+struct AutoPromotionInputs {
+    /// Journal recovery has seeded the fence epoch and advertised tip.
+    tip_ready: bool,
+    /// This node has been fenced (superseded) — it must never lead.
+    fenced: bool,
+    /// Active durability mode, `None` for an unrecognised byte.
+    durability_mode: Option<DurabilityMode>,
+    /// The replication link to the primary is authenticated and live.
+    primary_link_up: bool,
+    /// The term this node was elected at.
+    term: u64,
+    /// The fencing epoch currently in force.
+    fence_epoch: u64,
+}
+
+/// Should a replica that just won a control-plane election promote
+/// itself? `Err` carries the operator-facing refusal reason.
+///
+/// The election itself is the data-safety proof: the recency filter
+/// means a quorum of voters held no more data than this node
+/// ([`vote_request_admitted`]). The rules here cover what an election
+/// cannot prove:
+///
+/// - `tip_ready` / `fenced` — the tip that won the election must be
+///   real, and a superseded node must stay down.
+/// - `primary_link_up` — a live authenticated link means the primary
+///   is alive; leadership may still land here (e.g. the previous raft
+///   leader was a *replica* whose process died), and promoting would
+///   depose a healthy primary.
+/// - `local` durability — acks in `local` mode never waited for this
+///   replica, so no election can prove it holds every acked order.
+///   Failover stays a manual, eyes-on decision.
+/// - `term > fence_epoch` — the promotion journals `epoch = term`, so
+///   the term must be strictly newer than every epoch already in
+///   force; two auto-promotions from different elections then always
+///   allocate distinct epochs and the newer fences the older. Epochs
+///   outrunning terms (a history of manual promotions) breaks the
+///   alignment until enough elections pass — refuse rather than risk
+///   an epoch collision.
+fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static str> {
+    if !inputs.tip_ready {
+        return Err("journal recovery has not seeded this node's tip yet");
+    }
+    if inputs.fenced {
+        return Err("node is fenced (superseded by a newer primary)");
+    }
+    if inputs.primary_link_up {
+        return Err("replication link to the primary is up — refusing to depose a live primary");
+    }
+    match inputs.durability_mode {
+        Some(DurabilityMode::Local) => {
+            return Err(
+                "durability mode is `local` — an election win cannot prove this node holds \
+                 every acked order; promote manually if the lag is acceptable",
+            );
+        }
+        None => return Err("active durability mode is unrecognised"),
+        Some(DurabilityMode::Hybrid | DurabilityMode::DurablyReplicated) => {}
+    }
+    if inputs.term <= inputs.fence_epoch {
+        return Err(
+            "election term is not above the fencing epoch (manual promotions outran raft \
+             terms) — promote manually; the alignment heals as terms advance",
+        );
+    }
+    Ok(())
+}
+
+/// Act on leadership: if this node is a replica, currently leads, and
+/// [`auto_promotion_decision`] allows it, file a promotion request
+/// carrying the election term (the new tenure's fencing epoch).
+/// Standing refusals are logged once per term, not once per poll.
+fn consider_auto_promotion(
+    node: &ControlNode,
+    config: &RaftDriverConfig,
+    context: &RaftDriverContext,
+    last_refused_term: &mut u64,
+) {
+    if !config.auto_promote {
+        return;
+    }
+    let Some(replica) = &context.replica else {
+        return; // genesis primary — nothing to promote
+    };
+    if node.role() != StateRole::Leader || replica.promote.is_requested() {
+        return;
+    }
+    let term = node.term();
+    let inputs = AutoPromotionInputs {
+        tip_ready: context.tip_ready.load(Ordering::Acquire),
+        fenced: context.fence_state.is_fenced(),
+        durability_mode: DurabilityMode::from_u8(context.durability_mode.load(Ordering::Relaxed)),
+        primary_link_up: replica.primary_link_up.load(Ordering::Acquire),
+        term,
+        fence_epoch: context.fence_state.epoch(),
+    };
+    match auto_promotion_decision(&inputs) {
+        Ok(()) => {
+            // `request` can only lose to a racing manual PROMOTE; either
+            // way a promotion is now in flight.
+            if replica.promote.request(term) {
+                info!(
+                    node_id = node.id(),
+                    term, "elected leader — auto-promoting this replica"
+                );
+            }
+        }
+        Err(reason) => {
+            if *last_refused_term != term {
+                *last_refused_term = term;
+                warn!(
+                    node_id = node.id(),
+                    term, reason, "elected leader but refusing auto-promotion"
+                );
+            }
+        }
+    }
+}
+
 /// The journal tip this node advertises: the fencing epoch plus the
 /// advertised journal sequence (see [`RaftDriverContext::journal_tip`]).
 /// Trustworthy only once `tip_ready` is set — the vote filter checks
@@ -859,6 +1050,89 @@ mod tests {
         // Not ready: refused regardless of the candidate — a replica
         // mid-recovery advertising epoch 0 must not grant votes.
         assert!(!vote_request_admitted(false, ahead, ours));
+    }
+
+    /// Baseline inputs that PASS every auto-promotion rule; each test
+    /// flips exactly one field to isolate the refusal it exercises.
+    fn promotable() -> AutoPromotionInputs {
+        AutoPromotionInputs {
+            tip_ready: true,
+            fenced: false,
+            durability_mode: Some(DurabilityMode::Hybrid),
+            primary_link_up: false,
+            term: 7,
+            fence_epoch: 3,
+        }
+    }
+
+    #[test]
+    fn auto_promotion_allowed_at_baseline() {
+        assert_eq!(auto_promotion_decision(&promotable()), Ok(()));
+        assert_eq!(
+            auto_promotion_decision(&AutoPromotionInputs {
+                durability_mode: Some(DurabilityMode::DurablyReplicated),
+                ..promotable()
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn auto_promotion_refused_mid_recovery() {
+        let inputs = AutoPromotionInputs {
+            tip_ready: false,
+            ..promotable()
+        };
+        assert!(auto_promotion_decision(&inputs).is_err());
+    }
+
+    #[test]
+    fn auto_promotion_refused_when_fenced() {
+        let inputs = AutoPromotionInputs {
+            fenced: true,
+            ..promotable()
+        };
+        assert!(auto_promotion_decision(&inputs).is_err());
+    }
+
+    #[test]
+    fn auto_promotion_refused_while_primary_link_is_up() {
+        // Leadership can land on a connected replica (e.g. the previous
+        // raft leader was another replica whose process died); a live
+        // link to the primary must veto the promotion.
+        let inputs = AutoPromotionInputs {
+            primary_link_up: true,
+            ..promotable()
+        };
+        assert!(auto_promotion_decision(&inputs).is_err());
+    }
+
+    #[test]
+    fn auto_promotion_refused_in_local_durability() {
+        let inputs = AutoPromotionInputs {
+            durability_mode: Some(DurabilityMode::Local),
+            ..promotable()
+        };
+        assert!(auto_promotion_decision(&inputs).is_err());
+        let unknown = AutoPromotionInputs {
+            durability_mode: None,
+            ..promotable()
+        };
+        assert!(auto_promotion_decision(&unknown).is_err());
+    }
+
+    #[test]
+    fn auto_promotion_refused_when_epochs_outran_terms() {
+        // epoch == term collides with the tenure the epoch came from;
+        // epoch > term would collide with a future one. Only a strictly
+        // newer term may promote.
+        for fence_epoch in [7, 8] {
+            let inputs = AutoPromotionInputs {
+                fence_epoch,
+                ..promotable()
+            };
+            assert!(auto_promotion_decision(&inputs).is_err(), "{fence_epoch}");
+        }
     }
 
     #[test]
@@ -946,6 +1220,7 @@ mod tests {
                     })
                     .collect(),
                 dir: dir.path().to_path_buf(),
+                auto_promote: false,
             };
             let context = RaftDriverContext {
                 signing_key: signing[&id].clone(),
@@ -955,6 +1230,8 @@ mod tests {
                 // These test nodes act as always-recovered primaries.
                 tip_ready: Arc::new(AtomicBool::new(true)),
                 status: Arc::clone(&status),
+                durability_mode: Arc::new(AtomicU8::new(DurabilityMode::Hybrid.as_u8())),
+                replica: None,
                 shutdown: Arc::clone(&shutdown),
             };
             let handle =

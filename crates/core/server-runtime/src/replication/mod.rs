@@ -141,6 +141,54 @@ pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
 pub use tcp_receiver::{ReceiverResult, run_receiver};
 pub use tcp_sender::{Sender, run_sender};
 
+/// The handles a replica's receive loop shares with the rest of the
+/// node — the admin endpoint and the control-plane raft driver.
+/// Bundled (rather than four positional parameters) because they
+/// always travel together through the kernel-TCP and DPDK receiver
+/// signatures, and a `[u8; 32]`-style transposition between same-typed
+/// flags is exactly the bug a bundle prevents.
+#[derive(Clone)]
+pub struct ReplicaControlPlane {
+    /// Promotion request: polled by the receive loop; filed by the
+    /// admin `PROMOTE` command or the raft driver (auto-promotion).
+    pub promote: crate::promotion::PromotionRequest,
+    /// Flipped `true` once journal recovery has seeded the fence epoch,
+    /// so the raft driver can trust this node's advertised tip — see
+    /// `RaftDriverContext::tip_ready`.
+    pub tip_ready: std::sync::Arc<AtomicBool>,
+    /// Sequence half of the advertised journal tip — see
+    /// [`melin_transport_core::AdvertisedJournalTip`].
+    pub journal_tip: melin_transport_core::AdvertisedJournalTip,
+    /// `true` while this replica holds an authenticated replication
+    /// connection to its primary. The raft driver refuses to
+    /// auto-promote while set: a live link means the primary is
+    /// demonstrably alive, and winning a control-plane election (e.g.
+    /// because a *different* node's raft died) must not depose a
+    /// healthy primary.
+    pub primary_link_up: std::sync::Arc<AtomicBool>,
+}
+
+impl ReplicaControlPlane {
+    /// Fresh handles for a replica boot: nothing requested, tip not
+    /// trustworthy yet, tip sequence 0, primary link down.
+    pub fn new() -> Self {
+        Self {
+            promote: crate::promotion::PromotionRequest::new(),
+            tip_ready: std::sync::Arc::new(AtomicBool::new(false)),
+            journal_tip: melin_transport_core::AdvertisedJournalTip::new(
+                melin_transport_core::WireSeq::new(0),
+            ),
+            primary_link_up: std::sync::Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Default for ReplicaControlPlane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Diagnostic: emit a `tcp_info` span at debug level describing the
 /// kernel's view of the socket (rtt, cwnd, retrans, unacked, rcv_space,
 /// rto). Guarded internally with `tracing::enabled!` so the
@@ -226,11 +274,11 @@ fn flag_authorized_keys_drift(
 pub(super) fn sleep_checking_flags(
     duration: std::time::Duration,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
 ) {
     let deadline = std::time::Instant::now() + duration;
     while std::time::Instant::now() < deadline {
-        if shutdown.load(Ordering::Relaxed) || promote.load(Ordering::Acquire) {
+        if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -651,7 +699,7 @@ pub(in crate::replication) fn handle_session_exit<A, W>(
     factory: &dyn melin_app::app_factory::AppFactory<App = A>,
     fence_state: &melin_transport_core::fence::FenceState,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
     mut close: impl FnMut(),
 ) -> AfterSession<A, W>
 where

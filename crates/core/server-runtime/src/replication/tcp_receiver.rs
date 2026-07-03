@@ -406,7 +406,6 @@ pub fn run_receiver<A, W>(
     journal_path: &std::path::Path,
     signing_key: &ed25519_dalek::SigningKey,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
@@ -420,17 +419,10 @@ pub fn run_receiver<A, W>(
     // caller — `run_receiver` has no auth state of its own.
     authorized_keys_fingerprint: [u8; 32],
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
-    // Flipped `true` once the fence epoch reflects this replica's
-    // recovered journal, so the control-plane raft driver knows the tip
-    // it advertises (and the votes it grants) are trustworthy. See
-    // `RaftDriverContext::tip_ready`.
-    tip_ready: &AtomicBool,
-    // Sequence half of the control-plane advertised tip. This receiver
-    // owns it for the replica phase of the process (seeded from recovery,
-    // advanced to the in-memory accepted position while streaming); after
-    // a promotion the new primary's journal stage takes over the same
-    // handle. See `AdvertisedJournalTip`.
-    journal_tip: melin_transport_core::AdvertisedJournalTip,
+    // The handles this loop shares with the admin endpoint and the
+    // control-plane raft driver — see [`super::ReplicaControlPlane`]
+    // for each field's contract.
+    control: &super::ReplicaControlPlane,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -440,6 +432,13 @@ where
     W: JournalWrite<A::Event> + Send + 'static,
     JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
+    let super::ReplicaControlPlane {
+        promote,
+        tip_ready,
+        journal_tip,
+        primary_link_up,
+    } = control;
+
     // Recover whenever any journal segment survives — live OR archived;
     // fresh replicas get `(None, None, 0, zeros)`. See
     // `recover_replica_state` for the lineage rules.
@@ -469,6 +468,10 @@ where
 
     // --- Outer reconnect loop ---
     loop {
+        // No authenticated session while (re)connecting — the raft
+        // driver may auto-promote from here on if it wins an election.
+        primary_link_up.store(false, Ordering::Release);
+
         if let Some(p) = pipeline.as_ref() {
             // The handshake pair (last_sequence, chain_hash) must come
             // from ONE FsyncState snapshot — the journal stage keeps
@@ -495,7 +498,7 @@ where
             }
             return Ok(None);
         }
-        if promote.load(Ordering::Acquire) {
+        if promote.is_requested() {
             info!("promotion triggered while disconnected");
             return take_pipeline_for_promotion(&mut pipeline, &mut exchange, &mut journal_writer);
         }
@@ -515,7 +518,7 @@ where
                 if shutdown.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
-                if promote.load(Ordering::Acquire) {
+                if promote.is_requested() {
                     info!("promotion triggered during reconnect backoff");
                     return take_pipeline_for_promotion(
                         &mut pipeline,
@@ -560,6 +563,9 @@ where
             continue;
         }
         info!("authenticated with primary");
+        // The primary is demonstrably alive from here until this
+        // session ends — the raft driver must not auto-promote past it.
+        primary_link_up.store(true, Ordering::Release);
 
         // --- Handshake ---
         // Advertise our fencing epoch. If we are ahead of the primary it
@@ -632,7 +638,7 @@ where
                     journal_path,
                     &snapshot_path,
                     &fence_state,
-                    &journal_tip,
+                    journal_tip,
                     &mut last_sequence,
                     &mut chain_hash,
                 )
@@ -725,7 +731,7 @@ where
                             None,
                             stream_marks,
                             journal_failed,
-                            &journal_tip,
+                            journal_tip,
                         )
                     })
                     .expect("spawn replica-receiver thread");
@@ -733,6 +739,7 @@ where
             })
         };
 
+        primary_link_up.store(false, Ordering::Release);
         match handle_session_exit(
             result,
             &mut pipeline,
@@ -1055,7 +1062,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let promote = Arc::new(AtomicBool::new(false));
+            let promote = crate::promotion::PromotionRequest::new();
             let cores = crate::server::PipelineCores {
                 // 0 = unpinned sentinel for every stage.
                 journal: 0,
@@ -1071,14 +1078,16 @@ mod tests {
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let promote = Arc::clone(&promote);
+                let control = crate::replication::ReplicaControlPlane {
+                    promote: promote.clone(),
+                    ..Default::default()
+                };
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
                         &shutdown,
-                        &promote,
                         3_600_000,
                         replica_snapshot,
                         cores,
@@ -1090,12 +1099,9 @@ mod tests {
                         // ignores it, so any value works.
                         [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
-                        // Raft is not exercised in this test; throwaway
-                        // tip-ready flag and advertised-tip handle.
-                        &AtomicBool::new(false),
-                        melin_transport_core::AdvertisedJournalTip::new(
-                            melin_transport_core::WireSeq::new(0),
-                        ),
+                        // Raft is not exercised in these tests; the
+                        // bundle's defaults are all throwaway handles.
+                        &control,
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())
@@ -1237,7 +1243,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let promote = Arc::new(AtomicBool::new(false));
+            let promote = crate::promotion::PromotionRequest::new();
             let cores = crate::server::PipelineCores {
                 journal: 0,
                 matching: 0,
@@ -1252,14 +1258,16 @@ mod tests {
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let promote = Arc::clone(&promote);
+                let control = crate::replication::ReplicaControlPlane {
+                    promote: promote.clone(),
+                    ..Default::default()
+                };
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
                         &shutdown,
-                        &promote,
                         3_600_000,
                         replica_snapshot,
                         cores,
@@ -1271,12 +1279,9 @@ mod tests {
                         // ignores it, so any value works.
                         [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
-                        // Raft is not exercised in this test; throwaway
-                        // tip-ready flag and advertised-tip handle.
-                        &AtomicBool::new(false),
-                        melin_transport_core::AdvertisedJournalTip::new(
-                            melin_transport_core::WireSeq::new(0),
-                        ),
+                        // Raft is not exercised in these tests; the
+                        // bundle's defaults are all throwaway handles.
+                        &control,
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())
@@ -1433,7 +1438,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let promote = Arc::new(AtomicBool::new(false));
+            let promote = crate::promotion::PromotionRequest::new();
             let cores = crate::server::PipelineCores {
                 journal: 0,
                 matching: 0,
@@ -1448,14 +1453,16 @@ mod tests {
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let promote = Arc::clone(&promote);
+                let control = crate::replication::ReplicaControlPlane {
+                    promote: promote.clone(),
+                    ..Default::default()
+                };
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
                         &shutdown,
-                        &promote,
                         3_600_000,
                         replica_snapshot,
                         cores,
@@ -1467,12 +1474,9 @@ mod tests {
                         // ignores it, so any value works.
                         [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
-                        // Raft is not exercised in this test; throwaway
-                        // tip-ready flag and advertised-tip handle.
-                        &AtomicBool::new(false),
-                        melin_transport_core::AdvertisedJournalTip::new(
-                            melin_transport_core::WireSeq::new(0),
-                        ),
+                        // Raft is not exercised in these tests; the
+                        // bundle's defaults are all throwaway handles.
+                        &control,
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())

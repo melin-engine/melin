@@ -4279,3 +4279,202 @@ fn raft_elects_leader_and_reelects_after_kill() {
     // `nodes` dropping SIGKILLs the survivors.
     drop(nodes);
 }
+
+/// Full automatic failover: a primary with two raft-enabled replicas
+/// (`--raft-auto-promote`) is SIGKILLed; the surviving pair elects a
+/// leader which promotes itself — no operator `PROMOTE` — and serves
+/// trading after the operator drops durability to `local` (the losing
+/// replica still dials the dead primary's address, so no replica can
+/// reattach until follow-the-leader lands). The loser must stay a
+/// replica.
+#[test]
+fn raft_auto_promotes_surviving_replica_after_primary_kill() {
+    let bin = server_bin();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let operator_key = SigningKey::from_bytes(&[8u8; 32]);
+    let trader_key = SigningKey::from_bytes(&[9u8; 32]);
+
+    // Node 1 = primary; nodes 2 and 3 = replicas. Each node has its own
+    // replication key (raft identity pinning requires distinct keys).
+    let ids = [1u64, 2, 3];
+    let node_keys: std::collections::HashMap<u64, SigningKey> = ids
+        .iter()
+        .map(|&id| (id, SigningKey::from_bytes(&[id as u8; 32])))
+        .collect();
+    let b64 = |key: &SigningKey| {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            key.verifying_key().to_bytes(),
+        )
+    };
+
+    // authorized_keys: a trader, the operator, and every node's
+    // replication key.
+    let mut auth_content = format!(
+        "trader {} trader\noperator {} ops\n",
+        b64(&trader_key),
+        b64(&operator_key)
+    );
+    for &id in &ids {
+        auth_content.push_str(&format!("replication {} node-{id}\n", b64(&node_keys[&id])));
+    }
+    let keys_path = tmp.path().join("authorized_keys");
+    std::fs::write(&keys_path, auth_content).expect("write authorized_keys");
+    let key_paths: std::collections::HashMap<u64, PathBuf> = ids
+        .iter()
+        .map(|&id| {
+            let p = tmp.path().join(format!("repl-{id}.key"));
+            std::fs::write(&p, node_keys[&id].to_bytes()).expect("write key");
+            (id, p)
+        })
+        .collect();
+
+    let raft_ports: std::collections::HashMap<u64, u16> =
+        ids.iter().map(|&id| (id, free_port())).collect();
+    // `--raft-*` args for one node; `with_key` adds `--replication-key`
+    // for the primary (the replica spawner passes its own).
+    let raft_args = |id: u64, with_key: bool| -> Vec<String> {
+        let mut args = vec![
+            "--raft-bind".to_string(),
+            format!("127.0.0.1:{}", raft_ports[&id]),
+            "--raft-node-id".to_string(),
+            id.to_string(),
+            "--raft-auto-promote".to_string(),
+        ];
+        if with_key {
+            args.push("--replication-key".to_string());
+            args.push(key_paths[&id].to_str().expect("valid path").to_string());
+        }
+        for &peer in ids.iter().filter(|&&p| p != id) {
+            args.push("--raft-peer".to_string());
+            args.push(format!(
+                "{peer}@127.0.0.1:{}@{}",
+                raft_ports[&peer],
+                b64(&node_keys[&peer])
+            ));
+        }
+        args
+    };
+    fn as_refs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    let repl_port = free_port();
+    let primary_args = raft_args(1, true);
+    let primary = spawn_primary_with_extra(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        free_port(),
+        free_port(),
+        repl_port,
+        &as_refs(&primary_args),
+    );
+    wait_for_primary_repl_ready(primary.health_addr, Duration::from_secs(30));
+
+    let replica_admin: std::collections::HashMap<u64, u16> =
+        [(2u64, free_port()), (3u64, free_port())].into();
+    let spawn_one_replica = |id: u64| -> ServerProcess {
+        let args = raft_args(id, false);
+        spawn_replica_named_with_extra(
+            &bin,
+            tmp.path(),
+            &keys_path,
+            &key_paths[&id],
+            repl_port,
+            free_port(),
+            free_port(),
+            replica_admin[&id],
+            &format!("replica-{id}"),
+            &as_refs(&args),
+        )
+    };
+    let replicas: std::collections::HashMap<u64, ServerProcess> =
+        [(2u64, spawn_one_replica(2)), (3u64, spawn_one_replica(3))].into();
+
+    // Both replicas attach (primary trades under the default `hybrid`
+    // durability once at least one is connected).
+    wait_metric(
+        primary.health_addr,
+        "melin_replicas_connected ",
+        Duration::from_secs(30),
+        "both replicas connected",
+        |v| v == 2,
+    );
+    wait_ready(primary.health_addr, Duration::from_secs(30));
+
+    // Trade a little so the replicated journal is non-trivial.
+    let mut client = connect_with_timeout(primary.client_addr, &trader_key);
+    for i in 1..=5u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        assert!(
+            has_report(&r, |rep| matches!(
+                rep,
+                melin_protocol::types::ExecutionReport::Placed { .. }
+            )),
+            "expected Placed, got: {r:?}"
+        );
+    }
+    drop(client);
+
+    // A single agreed leader across all three nodes.
+    let all_health: Vec<(u64, SocketAddr)> = vec![
+        (1, primary.health_addr),
+        (2, replicas[&2].health_addr),
+        (3, replicas[&3].health_addr),
+    ];
+    wait_for_raft_leader(&all_health, Duration::from_secs(30));
+
+    // Kill the primary. Whichever replica ends up leading must promote
+    // itself: if the primary led, the survivors elect; if a replica
+    // already led (refused while its link was up), the link drop
+    // unblocks the standing refusal.
+    let mut primary = primary;
+    unsafe {
+        libc::kill(primary.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = primary.child.wait();
+
+    let survivors: Vec<(u64, SocketAddr)> = all_health[1..].to_vec();
+    let (winner, _term) = wait_for_raft_leader(&survivors, Duration::from_secs(60));
+    let loser = if winner == 2 { 3 } else { 2 };
+
+    // The winner auto-promotes and rebinds the primary health endpoint;
+    // `hybrid` cannot ack with zero replicas attached, so the operator
+    // drops durability to `local` — the same runbook step as a manual
+    // failover (`kill_and_promote`), minus the PROMOTE itself.
+    let winner_admin: SocketAddr = format!("127.0.0.1:{}", replica_admin[&winner])
+        .parse()
+        .unwrap();
+    assert_eq!(
+        admin_command(winner_admin, &operator_key, "DURABILITY local"),
+        "OK"
+    );
+    wait_ready(replicas[&winner].health_addr, Duration::from_secs(60));
+
+    // End-to-end liveness: the promoted node accepts a trader and fills
+    // against the replicated book.
+    let mut client = connect_with_timeout(replicas[&winner].client_addr, &trader_key);
+    let r = submit_order(&mut client, 100, 1, 1, Side::Sell, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Fill { .. }
+        )),
+        "promoted primary must match against the replicated book: {r:?}"
+    );
+    drop(client);
+
+    // The losing replica must NOT have promoted: not leader, still
+    // halted (a replica reports `trading == false` until promotion).
+    assert_eq!(
+        fetch_raft_gauge(replicas[&loser].health_addr, "is_leader"),
+        Some(0),
+        "losing replica must not report leadership"
+    );
+    let (_, _, _, trading) = wait_healthy(replicas[&loser].health_addr, Duration::from_secs(5));
+    assert!(!trading, "losing replica must still be a replica");
+
+    // `replicas` dropping SIGKILLs the survivors.
+    drop(replicas);
+}

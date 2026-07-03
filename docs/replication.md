@@ -410,32 +410,34 @@ normal-case post-recovery state.
 
 ## Limitations
 
-### Fencing cannot distinguish concurrent promotions
+### Fencing cannot distinguish concurrent *manual* promotions
 
 Epoch fencing (see above) demotes a stale primary as soon as any
-higher-epoch node contacts it, but two replicas promoted independently
-during the same outage land on the *same* epoch and neither fences the
-other. Until coordinated election lands (next item), the operator
-playbook is: promote exactly one replica per failover. A stale primary
-that never hears from a higher-epoch node (e.g. fully partitioned with
-its own replica set) also keeps trading until the partition heals —
-fencing triggers on contact, not on a timer.
+higher-epoch node contacts it, but two replicas **manually** promoted
+independently during the same outage land on the *same* epoch and
+neither fences the other — the manual playbook remains: promote
+exactly one replica per failover. Election-driven promotions
+(`--raft-auto-promote`, next item) close this gap: each tenure's
+epoch is allocated from its election term, so concurrent promotions
+always carry distinct epochs and the newer fences the older. A stale
+primary that never hears from a higher-epoch node (e.g. fully
+partitioned with its own replica set) still keeps trading until the
+partition heals — fencing triggers on contact, not on a timer —
+though under `hybrid`/`durably-replicated` durability it cannot ack
+new orders without its replicas.
 
-### No automatic failover (election shipped, promotion still manual)
+### Automatic failover (opt-in via `--raft-auto-promote`)
 
-Promotion is operator-driven via the `--admin-bind` endpoint. The
-first phase of the control-plane Raft integration has landed: nodes
-configured with `--raft-bind`, `--raft-node-id`, and `--raft-peer`
-run leader election among themselves and expose the outcome through
-the metrics endpoint (`melin_raft_term`, `melin_raft_leader_id`,
-`melin_raft_role`, `melin_raft_is_leader`, and
-`melin_raft_driver_running`), on primaries and replicas alike, so
-monitoring can observe the elected leader — including on the surviving
-nodes during a failover. Raft carries election, membership, and (in a
-later phase) fencing-epoch allocation only — order flow stays on the
-existing replication path and the durability modes are unchanged. The
-control plane is deliberately unhurried: ~200 ms heartbeats, 1–2 s
-election timeouts.
+Nodes configured with `--raft-bind`, `--raft-node-id`, and
+`--raft-peer` run control-plane leader election among themselves and
+expose the outcome through the metrics endpoint (`melin_raft_term`,
+`melin_raft_leader_id`, `melin_raft_role`, `melin_raft_is_leader`,
+and `melin_raft_driver_running`), on primaries and replicas alike —
+including on the surviving nodes during a failover. Raft carries
+election, promotion, and fencing-epoch allocation only — order flow
+stays on the existing replication path and the durability modes are
+unchanged. The control plane is deliberately unhurried: ~200 ms
+heartbeats, 1–2 s election timeouts.
 
 Election prefers the most-caught-up node: every node advertises its
 journal tip — its fencing epoch plus the highest journal sequence it
@@ -445,17 +447,49 @@ voter refuses a candidate whose tip is behind its own. The epoch
 dominates the comparison (a newer primary tenure always outranks a
 longer journal from an older one); within an epoch the higher
 sequence wins. A lagging node can therefore never assemble a quorum
-while a more-current node is reachable. Note the guarantee is about
-who *wins elections*: when choosing a **manual** `PROMOTE` target,
-still verify the target's journal tip as the existing playbook
-directs rather than reading `melin_raft_leader_id` as "the
-most-caught-up node" — the current leader may have been elected
-before a lag developed.
+while a more-current node is reachable.
 
-In this phase election is **observational**: it does not trigger
-promotion, and the manual `PROMOTE` playbook (including the
-"promote exactly one replica" rule above) remains authoritative.
-Configuration propagation and automatic promotion build on it next.
+Without `--raft-auto-promote`, election is **observational**: it does
+not trigger promotion, and the manual `PROMOTE` playbook (including
+the "promote exactly one replica" rule above) remains authoritative.
+When choosing a manual `PROMOTE` target, still verify the target's
+journal tip as the playbook directs rather than reading
+`melin_raft_leader_id` as "the most-caught-up node" — the current
+leader may have been elected before a lag developed.
+
+With `--raft-auto-promote` (set it on every node or none), the
+cluster acts on elections:
+
+- A **replica that wins leadership promotes itself** — it drains its
+  in-flight stream and journals the new tenure's epoch, allocated
+  from the election term, so concurrent promotions from different
+  elections always carry distinct epochs and the newer fences the
+  older. This closes the "concurrent promotions land on the same
+  epoch" gap described above for the manual playbook.
+- A **superseded primary fences itself on contact over the control
+  plane**: raft heartbeats carry each node's fencing epoch, so an
+  ex-primary that missed the failover halts as soon as any peer's
+  raft frames reach it, even if no replica ever redials it.
+- **Refusal rules** keep the automation honest. A leader refuses to
+  self-promote while journal recovery is still running, while its
+  replication link to the primary is alive (leadership can land on a
+  connected replica when a *different* node's control plane dies —
+  deposing a healthy primary would be wrong), when the cluster runs
+  `--durability-mode local` (acks never waited for any replica, so no
+  election can prove the winner holds every acked order — failover
+  stays a manual decision in that mode), and when the fencing epoch
+  has outrun the raft terms (a history of manual promotions; the
+  alignment heals as terms advance). Every refusal is logged with its
+  reason at warn level, once per term.
+
+After an automatic promotion the surviving replica does **not** yet
+re-point to the new primary — `--replica-of` is static, so the new
+primary starts its tenure with zero replicas attached and `hybrid` /
+`durably-replicated` durability keeps client acks gated until a
+replica reattaches. The operator step is the same as after a manual
+promotion: either restart the surviving replica against the new
+primary's address, or drop durability (`DURABILITY local`) until it
+reattaches. Follow-the-leader reconnection is the next roadmap item.
 
 Each raft node needs its **own distinct** `--replication-key`, and
 every node's public key must carry `replication` permission in every

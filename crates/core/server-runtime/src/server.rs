@@ -383,6 +383,20 @@ pub struct ServerConfig {
     #[arg(long)]
     pub raft_dir: Option<PathBuf>,
 
+    /// Act on raft elections instead of only observing them: a replica
+    /// that wins leadership promotes itself to primary (draining and
+    /// journaling an `EpochBump` allocated from the election term), and
+    /// a superseded primary fences itself when a raft peer advertises a
+    /// newer epoch. Refusal rules keep it safe — no auto-promotion
+    /// while journal recovery is running, while the replication link to
+    /// the primary is alive, or under `--durability-mode local` (an
+    /// election cannot prove a `local`-mode replica holds every acked
+    /// order). Requires `--raft-bind`; off by default — automatic
+    /// failover is an explicit operator decision. Set it on every node
+    /// of the cluster or none.
+    #[arg(long)]
+    pub raft_auto_promote: bool,
+
     /// Interval in milliseconds between automatic shadow snapshots. The
     /// shadow stage replays journaled events on a cloned `A` and saves a
     /// consistent snapshot at this cadence — no hot-path stall. Set to 0
@@ -493,6 +507,7 @@ impl Default for ServerConfig {
             raft_node_id: None,
             raft_peer: Vec::new(),
             raft_dir: None,
+            raft_auto_promote: false,
             snapshot_interval_ms: 3_000_000,
             snapshot_path: None,
             tick_interval_ms: 250,
@@ -815,17 +830,18 @@ where
             "loaded authorized keys (replica mode)"
         );
 
-        // Shared admin flags: constructed before mode-detection so they
-        // survive a replica → primary transition. The promote flag is
-        // consumed by the replica's receive loop and becomes a stale
-        // pointer post-promotion (harmless); the rotate flag is re-wired
-        // into the new primary's journal stage by `run_as_primary`.
-        let promote_flag = Arc::new(AtomicBool::new(false));
+        // Control-plane handles shared between the receive loop, the
+        // admin endpoint, and the raft driver — constructed before
+        // mode-detection so they survive a replica → primary
+        // transition. The promotion request is consumed by the receive
+        // loop and stays filed post-promotion (which is how the raft
+        // driver knows this node now acts as a primary).
+        let control = crate::replication::ReplicaControlPlane::new();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
                 addr,
-                Some(Arc::clone(&promote_flag)),
+                Some(control.promote.clone()),
                 rotate_flag.clone(),
                 Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
@@ -845,20 +861,20 @@ where
         // across a replica → primary promotion (leadership is a
         // property of the node, not of its current data-plane role).
         // The tip isn't trustworthy until journal recovery seeds the
-        // fence epoch, so start `false` and let the receiver flip it —
-        // until then the driver refuses to grant votes. The advertised
-        // sequence starts at 0 for the same reason; the receiver seeds
-        // it from recovery and owns it until a promotion hands it to
-        // the new primary's journal stage.
-        let tip_ready = Arc::new(AtomicBool::new(false));
-        let journal_tip =
-            melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0));
+        // fence epoch (`control.tip_ready` starts `false` and the
+        // receiver flips it) — until then the driver refuses to grant
+        // votes.
         let raft_status = spawn_raft_driver(
             &config,
             &authorized_keys,
             &fence_state,
-            Arc::clone(&tip_ready),
-            journal_tip.clone(),
+            Arc::clone(&control.tip_ready),
+            control.journal_tip.clone(),
+            &durability_mode_atomic,
+            Some(crate::raft_driver::ReplicaSignals {
+                promote: control.promote.clone(),
+                primary_link_up: Arc::clone(&control.primary_link_up),
+            }),
             &shutdown,
         )?;
 
@@ -878,7 +894,6 @@ where
             &config.journal,
             &signing_key,
             &shutdown,
-            &promote_flag,
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
@@ -888,8 +903,7 @@ where
             Arc::clone(&factory),
             authorized_keys.fingerprint(),
             Arc::clone(&fence_state),
-            &tip_ready,
-            journal_tip.clone(),
+            &control,
         )? {
             None => {
                 stop_replica_health(replica_health);
@@ -937,8 +951,16 @@ where
                     durability_mode_atomic,
                     fence_state,
                     raft_status,
-                    journal_tip,
-                    true, // promoted — inject an EpochBump before serving
+                    control.journal_tip.clone(),
+                    // `pending()` is always filed here — the receiver only
+                    // returns state on a request. MANUAL is a safe floor if
+                    // that invariant ever broke (plain `epoch + 1` bump).
+                    Some(
+                        control
+                            .promote
+                            .pending()
+                            .unwrap_or(crate::promotion::PromotionRequest::MANUAL),
+                    ),
                 );
             }
         }
@@ -1001,6 +1023,8 @@ where
         &fence_state,
         Arc::new(AtomicBool::new(true)),
         journal_tip.clone(),
+        &durability_mode_atomic,
+        None, // genesis primary — nothing to promote
         &shutdown,
     )?;
 
@@ -1022,7 +1046,7 @@ where
         fence_state,
         raft_status,
         journal_tip,
-        false, // not promoted — no EpochBump injection
+        None, // not promoted — no EpochBump injection
     )
 }
 
@@ -1166,7 +1190,10 @@ fn run_as_primary<A, L, W>(
     // its writer (the raft driver keeps reading the same handle across a
     // promotion) — see `AdvertisedJournalTip`.
     journal_tip: melin_transport_core::AdvertisedJournalTip,
-    promoted: bool,
+    // `Some(min_epoch)` when this node reached primary via promotion:
+    // the consumed `PromotionRequest`'s value, floor for the tenure's
+    // `EpochBump`. `None` on a genesis primary (no bump).
+    promotion: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -1692,9 +1719,20 @@ where
     // flows through journal + replication to every replica. We wait for the
     // matching stage to apply it (epoch advanced) before serving so the first
     // handshake already advertises the new epoch.
-    if promoted {
-        let new_epoch = fence_state.epoch().saturating_add(1);
-        info!(new_epoch, "promotion: injecting epoch bump");
+    //
+    // The new epoch honours the promotion request's floor: a manual
+    // `PROMOTE` carries `MANUAL` (= 1) and resolves to the classic
+    // `epoch + 1`; a raft auto-promotion carries its election term
+    // (strictly above the old epoch by the driver's request rule), so
+    // tenure epochs align with raft terms and two overlapping
+    // promotions from different elections always allocate distinct
+    // epochs — the newer one fences the older.
+    if let Some(requested_epoch) = promotion {
+        let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
+        info!(
+            new_epoch,
+            requested_epoch, "promotion: injecting epoch bump"
+        );
         input_producer.publish(system_input_slot(JournalEvent::EpochBump {
             epoch: new_epoch,
         }));
@@ -2082,14 +2120,15 @@ where
         })?;
         let signing_key = load_replication_key(replication_key_path)?;
 
-        // Shared admin flags, same shape as the kernel TCP replica path
-        // — see `run` for the rationale on lifetime.
-        let promote_flag = Arc::new(AtomicBool::new(false));
+        // Control-plane handles shared with the admin endpoint and the
+        // raft driver, same shape as the kernel TCP replica path — see
+        // `run` for the rationale on lifetime.
+        let control = crate::replication::ReplicaControlPlane::new();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
                 addr,
-                Some(Arc::clone(&promote_flag)),
+                Some(control.promote.clone()),
                 rotate_flag.clone(),
                 Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
@@ -2108,15 +2147,17 @@ where
         // the control plane is latency-insensitive and must survive
         // independently of the DPDK data path. Tip not trustworthy until
         // recovery seeds the epoch (see the kernel replica path).
-        let tip_ready = Arc::new(AtomicBool::new(false));
-        let journal_tip =
-            melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0));
         let raft_status = spawn_raft_driver(
             &config,
             &authorized_keys,
             &fence_state,
-            Arc::clone(&tip_ready),
-            journal_tip.clone(),
+            Arc::clone(&control.tip_ready),
+            control.journal_tip.clone(),
+            &durability_mode_atomic,
+            Some(crate::raft_driver::ReplicaSignals {
+                promote: control.promote.clone(),
+                primary_link_up: Arc::clone(&control.primary_link_up),
+            }),
             &shutdown,
         )?;
 
@@ -2152,7 +2193,6 @@ where
             &signing_key,
             &config.journal,
             &shutdown,
-            &promote_flag,
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
@@ -2162,8 +2202,7 @@ where
             Arc::clone(&factory),
             authorized_keys.fingerprint(),
             Arc::clone(&fence_state),
-            &tip_ready,
-            journal_tip.clone(),
+            &control,
         )? {
             None => {
                 stop_replica_health(replica_health);
@@ -2208,8 +2247,14 @@ where
                     durability_mode_atomic,
                     fence_state,
                     raft_status,
-                    journal_tip,
-                    true, // promoted — inject an EpochBump before serving
+                    control.journal_tip.clone(),
+                    // See the kernel-TCP promotion path for the fallback.
+                    Some(
+                        control
+                            .promote
+                            .pending()
+                            .unwrap_or(crate::promotion::PromotionRequest::MANUAL),
+                    ),
                 );
             }
         }
@@ -2272,6 +2317,8 @@ where
         &fence_state,
         Arc::new(AtomicBool::new(true)),
         journal_tip.clone(),
+        &durability_mode_atomic,
+        None, // genesis primary — nothing to promote
         &shutdown,
     )?;
 
@@ -3131,10 +3178,11 @@ fn build_raft_config(
         if config.raft_node_id.is_some()
             || !config.raft_peer.is_empty()
             || config.raft_dir.is_some()
+            || config.raft_auto_promote
         {
             return Err(
-                "--raft-node-id/--raft-peer/--raft-dir require --raft-bind (control-plane \
-                 raft is enabled by binding its RPC address)"
+                "--raft-node-id/--raft-peer/--raft-dir/--raft-auto-promote require --raft-bind \
+                 (control-plane raft is enabled by binding its RPC address)"
                     .into(),
             );
         }
@@ -3219,6 +3267,7 @@ fn build_raft_config(
             voters,
             peers,
             dir,
+            auto_promote: config.raft_auto_promote,
         },
     )))
 }
@@ -3238,6 +3287,8 @@ fn spawn_raft_driver(
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
     tip_ready: Arc<AtomicBool>,
     journal_tip: melin_transport_core::AdvertisedJournalTip,
+    durability_mode: &Arc<AtomicU8>,
+    replica: Option<crate::raft_driver::ReplicaSignals>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<Option<Arc<melin_transport_core::health::RaftStatus>>, Box<dyn std::error::Error>> {
     let Some((bind, driver_config)) = build_raft_config(config)? else {
@@ -3262,6 +3313,8 @@ fn spawn_raft_driver(
             journal_tip,
             tip_ready,
             status: Arc::clone(&status),
+            durability_mode: Arc::clone(durability_mode),
+            replica,
             shutdown: Arc::clone(shutdown),
         },
     )?;
