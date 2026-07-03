@@ -423,6 +423,11 @@ pub fn run_receiver<A, W>(
     // control-plane raft driver — see [`super::ReplicaControlPlane`]
     // for each field's contract.
     control: &super::ReplicaControlPlane,
+    // When following the leader is enabled (`--raft-auto-promote`),
+    // resolves the control-plane leader's replication address so this
+    // replica re-targets a newly promoted primary instead of dialing
+    // the dead one's static address forever. `None` = static target.
+    leader_follow: Option<crate::raft_driver::LeaderFollow>,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -458,6 +463,13 @@ where
     tip_ready.store(true, Ordering::Release);
 
     let mut backoff = std::time::Duration::from_secs(1);
+
+    // The address the previous connect attempt targeted, for logging
+    // re-targets exactly once per change.
+    let mut last_target: Option<SocketAddr> = None;
+    // Alternation counter between the control-plane target and the
+    // static one — see the target resolution below.
+    let mut reconnect_attempt: u64 = 0;
 
     // Consecutive mid-stream divergence resyncs this process has
     // attempted — see `MAX_INPROCESS_DIVERGENCE_RESYNCS`.
@@ -504,9 +516,28 @@ where
         }
 
         // --- Connect and authenticate ---
-        info!(primary = %primary_addr, "connecting to primary as replica");
+        // Follow the leader: the control plane may know a newer
+        // primary than the static `--replica-of` (an auto-promotion
+        // elsewhere). But control-plane leadership is not proof of a
+        // serving primary — a *replica* can hold leadership while the
+        // primary is healthy — so alternate between the leader's
+        // announced address and the static target across attempts: a
+        // refused follow attempt costs one dial, never a wedged loop.
+        let follow_target = leader_follow
+            .as_ref()
+            .and_then(|f| f.leader_replication_addr())
+            .filter(|t| *t != primary_addr);
+        let target = match follow_target {
+            Some(t) if reconnect_attempt.is_multiple_of(2) => t,
+            _ => primary_addr,
+        };
+        reconnect_attempt = reconnect_attempt.wrapping_add(1);
+        if last_target != Some(target) {
+            info!(primary = %target, "connecting to primary as replica");
+            last_target = Some(target);
+        }
 
-        let stream = match TcpStream::connect(primary_addr) {
+        let stream = match TcpStream::connect(target) {
             Ok(s) => s,
             Err(e) => {
                 warn!(
@@ -1100,8 +1131,10 @@ mod tests {
                         [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         // Raft is not exercised in these tests; the
-                        // bundle's defaults are all throwaway handles.
+                        // bundle's defaults are all throwaway handles,
+                        // and no leader-follow means the static target.
                         &control,
+                        None,
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())
@@ -1280,8 +1313,10 @@ mod tests {
                         [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         // Raft is not exercised in these tests; the
-                        // bundle's defaults are all throwaway handles.
+                        // bundle's defaults are all throwaway handles,
+                        // and no leader-follow means the static target.
                         &control,
+                        None,
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())
@@ -1475,8 +1510,10 @@ mod tests {
                         [0u8; 32],
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                         // Raft is not exercised in these tests; the
-                        // bundle's defaults are all throwaway handles.
+                        // bundle's defaults are all throwaway handles,
+                        // and no leader-follow means the static target.
                         &control,
+                        None,
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())

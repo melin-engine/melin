@@ -373,6 +373,11 @@ pub struct ServerConfig {
     /// needs its own distinct `--replication-key`. Every node must be
     /// configured with the same total membership (its own id plus its
     /// peers); the initial voter set is derived from it on first boot.
+    /// Once the cluster is up these entries are the *bootstrap hint*
+    /// only: nodes announce their identity through the replicated
+    /// membership registry, and an applied record supersedes the
+    /// static entry for that node id (addresses and keys follow the
+    /// log, not the flags).
     #[arg(long, value_delimiter = ',')]
     pub raft_peer: Vec<String>,
 
@@ -385,9 +390,11 @@ pub struct ServerConfig {
 
     /// Act on raft elections instead of only observing them: a replica
     /// that wins leadership promotes itself to primary (draining and
-    /// journaling an `EpochBump` allocated from the election term), and
-    /// a superseded primary fences itself when a raft peer advertises a
-    /// newer epoch. Refusal rules keep it safe — no auto-promotion
+    /// journaling an `EpochBump` allocated from the election term), a
+    /// superseded primary fences itself when a raft peer advertises a
+    /// newer epoch, and replicas follow the current leader's announced
+    /// replication address across failovers instead of their static
+    /// `--replica-of`. Refusal rules keep it safe — no auto-promotion
     /// while journal recovery is running, while the replication link to
     /// the primary is alive, or under `--durability-mode local` (an
     /// election cannot prove a `local`-mode replica holds every acked
@@ -396,6 +403,21 @@ pub struct ServerConfig {
     /// of the cluster or none.
     #[arg(long)]
     pub raft_auto_promote: bool,
+
+    /// The raft RPC address this node announces to its peers through
+    /// the replicated membership registry. Defaults to `--raft-bind`;
+    /// required when `--raft-bind` is a wildcard address (peers cannot
+    /// dial `0.0.0.0`).
+    #[arg(long)]
+    pub raft_advertise: Option<SocketAddr>,
+
+    /// The replication address this node announces through the
+    /// membership registry — where replicas dial to follow it when it
+    /// leads. Defaults to `--replication-bind` when that is routable;
+    /// set this when binding a wildcard. A node announcing no
+    /// replication address cannot be followed after it promotes.
+    #[arg(long)]
+    pub replication_advertise: Option<SocketAddr>,
 
     /// Interval in milliseconds between automatic shadow snapshots. The
     /// shadow stage replays journaled events on a cloned `A` and saves a
@@ -508,6 +530,8 @@ impl Default for ServerConfig {
             raft_peer: Vec::new(),
             raft_dir: None,
             raft_auto_promote: false,
+            raft_advertise: None,
+            replication_advertise: None,
             snapshot_interval_ms: 3_000_000,
             snapshot_path: None,
             tick_interval_ms: 250,
@@ -864,7 +888,10 @@ where
         // fence epoch (`control.tip_ready` starts `false` and the
         // receiver flips it) — until then the driver refuses to grant
         // votes.
-        let raft_status = spawn_raft_driver(
+        // Follow-the-leader is part of acting on elections, so it is
+        // gated behind the same opt-in as auto-promotion; without it
+        // the replica keeps dialing its static `--replica-of`.
+        let (raft_status, leader_follow) = match spawn_raft_driver(
             &config,
             &authorized_keys,
             &fence_state,
@@ -876,7 +903,10 @@ where
                 primary_link_up: Arc::clone(&control.primary_link_up),
             }),
             &shutdown,
-        )?;
+        )? {
+            Some(h) => (Some(h.status), config.raft_auto_promote.then_some(h.follow)),
+            None => (None, None),
+        };
 
         // Expose the replica's election gauges + liveness (a replica has
         // no pipeline health endpoint of its own). Torn down before
@@ -904,6 +934,7 @@ where
             authorized_keys.fingerprint(),
             Arc::clone(&fence_state),
             &control,
+            leader_follow,
         )? {
             None => {
                 stop_replica_health(replica_health);
@@ -1016,6 +1047,7 @@ where
     let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
         melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
     );
+    // A genesis primary never follows anyone — only the status is kept.
     let raft_status = spawn_raft_driver(
         &config,
         &authorized_keys,
@@ -1025,7 +1057,8 @@ where
         &durability_mode_atomic,
         None, // genesis primary — nothing to promote
         &shutdown,
-    )?;
+    )?
+    .map(|h| h.status);
 
     run_as_primary::<A, L, W>(
         exchange,
@@ -2164,7 +2197,8 @@ where
         // the control plane is latency-insensitive and must survive
         // independently of the DPDK data path. Tip not trustworthy until
         // recovery seeds the epoch (see the kernel replica path).
-        let raft_status = spawn_raft_driver(
+        // Follow-the-leader gating: see the kernel replica path.
+        let (raft_status, leader_follow) = match spawn_raft_driver(
             &config,
             &authorized_keys,
             &fence_state,
@@ -2176,7 +2210,10 @@ where
                 primary_link_up: Arc::clone(&control.primary_link_up),
             }),
             &shutdown,
-        )?;
+        )? {
+            Some(h) => (Some(h.status), config.raft_auto_promote.then_some(h.follow)),
+            None => (None, None),
+        };
 
         // Replica election/liveness endpoint (kernel TCP even on DPDK
         // nodes); torn down before promotion. See the kernel path.
@@ -2220,6 +2257,7 @@ where
             authorized_keys.fingerprint(),
             Arc::clone(&fence_state),
             &control,
+            leader_follow,
         )? {
             None => {
                 stop_replica_health(replica_health);
@@ -2328,6 +2366,7 @@ where
     let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
         melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
     );
+    // A genesis primary never follows anyone — only the status is kept.
     let raft_status = spawn_raft_driver(
         &config,
         &authorized_keys,
@@ -2337,7 +2376,8 @@ where
         &durability_mode_atomic,
         None, // genesis primary — nothing to promote
         &shutdown,
-    )?;
+    )?
+    .map(|h| h.status);
 
     // Clone exchange state for the shadow snapshot stage before moving
     // exchange into the pipeline (same as the kernel TCP path).
@@ -3195,10 +3235,11 @@ fn build_raft_config(
             || !config.raft_peer.is_empty()
             || config.raft_dir.is_some()
             || config.raft_auto_promote
+            || config.raft_advertise.is_some()
         {
             return Err(
-                "--raft-node-id/--raft-peer/--raft-dir/--raft-auto-promote require --raft-bind \
-                 (control-plane raft is enabled by binding its RPC address)"
+                "--raft-node-id/--raft-peer/--raft-dir/--raft-auto-promote/--raft-advertise \
+                 require --raft-bind (control-plane raft is enabled by binding its RPC address)"
                     .into(),
             );
         }
@@ -3268,6 +3309,33 @@ fn build_raft_config(
     // initial membership regardless of flag order.
     voters.sort_unstable();
 
+    // The addresses this node announces into the membership registry.
+    // Explicit advertise flags win; the bind addresses are usable
+    // defaults only when routable (a wildcard bind means "everywhere
+    // locally", which is an address peers cannot dial).
+    let advertise_raft_addr = config.raft_advertise.unwrap_or(bind);
+    if advertise_raft_addr.ip().is_unspecified() {
+        return Err(
+            "--raft-bind on a wildcard address requires --raft-advertise (peers cannot dial \
+             0.0.0.0/[::]); give the address the other nodes reach this one at"
+                .into(),
+        );
+    }
+    let advertise_replication_addr = match (config.replication_advertise, config.replication_bind) {
+        (Some(addr), _) if addr.ip().is_unspecified() => {
+            return Err(
+                "--replication-advertise must be a routable address, not a wildcard".into(),
+            );
+        }
+        (Some(addr), _) => Some(addr),
+        (None, Some(bind)) if !bind.ip().is_unspecified() => Some(bind),
+        // Wildcard replication bind without an advertise override, or
+        // no replication listener at all: announce nothing — the node
+        // cannot be followed after promoting (logged by the driver's
+        // consumers when it matters).
+        (None, _) => None,
+    };
+
     // Default raft dir: a sibling of the journal, so the durable vote
     // lives on the same volume/backup policy as the journal itself.
     let dir = config.raft_dir.clone().unwrap_or_else(|| {
@@ -3283,6 +3351,8 @@ fn build_raft_config(
             voters,
             peers,
             dir,
+            advertise_raft_addr,
+            advertise_replication_addr,
             auto_promote: config.raft_auto_promote,
         },
     )))
@@ -3306,7 +3376,7 @@ fn spawn_raft_driver(
     durability_mode: &Arc<AtomicU8>,
     replica: Option<crate::raft_driver::ReplicaSignals>,
     shutdown: &Arc<AtomicBool>,
-) -> Result<Option<Arc<melin_transport_core::health::RaftStatus>>, Box<dyn std::error::Error>> {
+) -> Result<Option<crate::raft_driver::RaftHandles>, Box<dyn std::error::Error>> {
     let Some((bind, driver_config)) = build_raft_config(config)? else {
         return Ok(None);
     };
@@ -3319,6 +3389,12 @@ fn spawn_raft_driver(
     let status = Arc::new(melin_transport_core::health::RaftStatus::new(
         driver_config.node_id,
     ));
+    let directory = Arc::new(crate::raft_driver::ClusterDirectory::default());
+    let follow = crate::raft_driver::LeaderFollow {
+        self_node_id: driver_config.node_id,
+        status: Arc::clone(&status),
+        directory: Arc::clone(&directory),
+    };
     crate::raft_driver::spawn(
         bind,
         driver_config,
@@ -3329,12 +3405,13 @@ fn spawn_raft_driver(
             journal_tip,
             tip_ready,
             status: Arc::clone(&status),
+            directory,
             durability_mode: Arc::clone(durability_mode),
             replica,
             shutdown: Arc::clone(shutdown),
         },
     )?;
-    Ok(Some(status))
+    Ok(Some(crate::raft_driver::RaftHandles { status, follow }))
 }
 
 /// A running replica health endpoint: its thread plus a dedicated stop

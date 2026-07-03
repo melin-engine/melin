@@ -267,6 +267,8 @@ fn main() {
                 replica_keys_fingerprint,
                 replica_fence,
                 &control,
+                // No raft in the bench — static target only.
+                None,
             );
         })
         .expect("spawn run_receiver");

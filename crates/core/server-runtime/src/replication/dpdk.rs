@@ -1080,6 +1080,12 @@ pub fn run_receiver_dpdk<A, W>(
     // The handles this loop shares with the admin endpoint and the
     // control-plane raft driver — see [`super::ReplicaControlPlane`].
     control: &super::ReplicaControlPlane,
+    // Accepted for signature parity with the kernel receiver, but not
+    // acted on yet: re-targeting a smoltcp connection needs a neighbor
+    // (ARP) entry for the new primary, which this path only seeds for
+    // the configured target. Follow-the-leader on DPDK arrives with
+    // DPDK promotion (both are the same "role moves at runtime" gap).
+    leader_follow: Option<crate::raft_driver::LeaderFollow>,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -1095,6 +1101,13 @@ where
         journal_tip,
         primary_link_up,
     } = control;
+
+    if leader_follow.is_some() {
+        warn!(
+            "follow-the-leader is not yet wired on the DPDK receive path — this replica keeps \
+             its static --replica-of target across failovers"
+        );
+    }
 
     // Recover local state from journal whenever any segment survives —
     // live OR archived; fresh replicas get `(None, None, 0, zeros)`.

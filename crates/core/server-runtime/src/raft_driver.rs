@@ -41,9 +41,9 @@ use std::collections::HashMap;
 use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -53,7 +53,7 @@ use tracing::{debug, error, info, warn};
 use melin_app::auth::AuthorizedKeys;
 use melin_raft::recency::{JournalTip, candidate_is_current, is_vote_request};
 use melin_raft::wire::{FrameScan, encode_frame, scan_frame};
-use melin_raft::{ControlNode, StateRole};
+use melin_raft::{ControlNode, MemberRecord, Registry, StateRole};
 use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::health::RaftStatus;
@@ -95,6 +95,13 @@ const INBOUND_CAP_FLOOR: usize = 8;
 /// peer that vanished without a FIN/RST — which raft's own timers never
 /// close on their own.
 const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cadence for re-proposing this node's membership record while the
+/// applied registry does not yet reflect it. Proposals are cheap but
+/// can be lost to leader churn (raft gives no ack), so the announce
+/// loop retries until it *sees* its record applied; a couple of
+/// seconds keeps convergence prompt without spamming leaderless
+/// clusters.
+const ANNOUNCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// One other cluster node, as configured on this node.
 #[derive(Debug, Clone)]
@@ -121,6 +128,14 @@ pub struct RaftDriverConfig {
     pub peers: Vec<RaftPeer>,
     /// Directory for the durable raft state file.
     pub dir: PathBuf,
+    /// The raft RPC address this node announces into the membership
+    /// registry — its `--raft-bind`, or the `--raft-advertise`
+    /// override when binding a wildcard.
+    pub advertise_raft_addr: SocketAddr,
+    /// The replication data-plane address this node announces —
+    /// where a replica dials to follow it when it leads. `None` when
+    /// the node cannot serve replicas (no usable `--replication-bind`).
+    pub advertise_replication_addr: Option<SocketAddr>,
     /// Act on elections instead of only observing them
     /// (`--raft-auto-promote`): a replica that wins leadership files a
     /// promotion request (subject to [`auto_promotion_decision`]), and
@@ -143,6 +158,71 @@ pub struct ReplicaSignals {
     /// connection to its primary — see
     /// `replication::ReplicaControlPlane::primary_link_up`.
     pub primary_link_up: Arc<AtomicBool>,
+}
+
+/// Data-plane view of the applied membership registry: which address
+/// to dial to follow a given node. Written by the driver on registry
+/// changes, read by the replica receiver on reconnect attempts — both
+/// control-plane-cold, so a `RwLock` (not a lock-free scheme) keeps
+/// each update atomic across the whole directory with no cleverness.
+#[derive(Debug, Default)]
+pub struct ClusterDirectory {
+    inner: RwLock<Registry>,
+}
+
+impl ClusterDirectory {
+    /// Replace the directory with the latest applied registry.
+    fn update(&self, registry: &Registry) {
+        match self.inner.write() {
+            Ok(mut guard) => *guard = registry.clone(),
+            // Poisoning requires a panic under the lock; the driver is
+            // the only writer and reads are infallible clones — warn so
+            // a stale directory is at least visible.
+            Err(_) => warn!("cluster directory lock poisoned — directory not updated"),
+        }
+    }
+
+    /// The announced replication address of `node_id`, if known.
+    pub fn replication_addr(&self, node_id: u64) -> Option<SocketAddr> {
+        match self.inner.read() {
+            Ok(guard) => guard.get(node_id).and_then(|r| r.replication_addr),
+            Err(_) => None,
+        }
+    }
+}
+
+/// A replica's handle for following the control-plane leader on the
+/// data plane: resolves "whom should I be replicating from right now".
+#[derive(Clone)]
+pub struct LeaderFollow {
+    /// This node's own raft id — a leader never follows itself (a
+    /// replica that wins an election is about to promote instead).
+    pub self_node_id: u64,
+    /// Election gauges (the current leader id).
+    pub status: Arc<RaftStatus>,
+    /// The membership directory the leader id resolves through.
+    pub directory: Arc<ClusterDirectory>,
+}
+
+impl LeaderFollow {
+    /// The current leader's announced replication address — `None`
+    /// while leaderless, while this node itself leads, or while the
+    /// leader has not announced a followable address.
+    pub fn leader_replication_addr(&self) -> Option<SocketAddr> {
+        match self.status.leader_id.load(Ordering::Relaxed) {
+            0 => None,
+            id if id == self.self_node_id => None,
+            id => self.directory.replication_addr(id),
+        }
+    }
+}
+
+/// What the server wiring gets back from spawning the driver: the
+/// election gauges for health, and the data-plane leader-follow handle
+/// (given to replicas when `--raft-auto-promote` is set).
+pub struct RaftHandles {
+    pub status: Arc<RaftStatus>,
+    pub follow: LeaderFollow,
 }
 
 /// Everything the driver thread borrows from the server.
@@ -175,6 +255,10 @@ pub struct RaftDriverContext {
     pub tip_ready: Arc<AtomicBool>,
     /// Election observability published to the health endpoint.
     pub status: Arc<RaftStatus>,
+    /// Membership directory exported to the data plane (see
+    /// [`ClusterDirectory`]); the driver refreshes it whenever the
+    /// applied registry changes.
+    pub directory: Arc<ClusterDirectory>,
     /// The active durability mode (`DurabilityMode::as_u8` encoding,
     /// runtime-retunable via the admin `DURABILITY` command). Read by
     /// the auto-promotion refusal rule: in `local` mode an election win
@@ -309,9 +393,13 @@ fn run(
     let conn_cap = inbound_cap(config.peers.len());
     let inflight_auth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Pinned identity map: an inbound connection authenticated with a
-    // peer's public key may only speak for that peer's id.
-    let pubkey_to_id: Arc<HashMap<[u8; 32], u64>> =
-        Arc::new(config.peers.iter().map(|p| (p.public_key, p.id)).collect());
+    // peer's public key may only speak for that peer's id. `RwLock`
+    // (not the previous immutable map): applied registry records can
+    // move or add peers at runtime; auth helper threads take a read
+    // snapshot per handshake (cold), the driver is the only writer.
+    let pubkey_to_id: Arc<RwLock<HashMap<[u8; 32], u64>>> = Arc::new(RwLock::new(
+        config.peers.iter().map(|p| (p.public_key, p.id)).collect(),
+    ));
     let mut links: HashMap<u64, PeerLink> = config
         .peers
         .iter()
@@ -328,6 +416,29 @@ fn run(
             )
         })
         .collect();
+
+    // The record this node announces into the registry. Re-proposed
+    // until the applied registry reflects it (proposals can be lost to
+    // leader churn), and again whenever a stale record for this id
+    // shows up (e.g. this node restarted at a new address).
+    let self_record = MemberRecord {
+        node_id: config.node_id,
+        raft_addr: config.advertise_raft_addr,
+        replication_addr: config.advertise_replication_addr,
+        public_key: context.signing_key.verifying_key().to_bytes(),
+    };
+    let mut next_announce = Instant::now();
+
+    // The persisted registry may already know peers (or newer
+    // addresses) the static flags don't — wire them in before the
+    // first dial round.
+    sync_registry(
+        &node,
+        &config,
+        &mut links,
+        &pubkey_to_id,
+        &context.directory,
+    );
 
     let mut next_tick = Instant::now() + TICK_INTERVAL;
     publish_status(&node, &context.status);
@@ -381,10 +492,35 @@ fn run(
         poll_outbound_liveness(&mut links);
 
         // 6. Drain raft readies (fsyncs inside) and route the egress.
-        if !drain_node(&mut node, &mut links, &context) {
-            // Storage failure: raft is inoperable by contract. The
-            // control plane stops; trading continues on the data plane.
-            break;
+        match drain_node(&mut node, &mut links, &context) {
+            None => {
+                // Storage failure: raft is inoperable by contract. The
+                // control plane stops; trading continues on the data
+                // plane.
+                break;
+            }
+            Some(true) => {
+                // The applied registry changed — refresh dial targets,
+                // identity pins, and the data-plane directory.
+                sync_registry(
+                    &node,
+                    &config,
+                    &mut links,
+                    &pubkey_to_id,
+                    &context.directory,
+                );
+            }
+            Some(false) => {}
+        }
+
+        // 7. Announce this node's record until the registry reflects
+        // it. The comparison is a tiny map lookup; the timer only
+        // paces the re-proposals.
+        if now >= next_announce && node.registry().get(config.node_id) != Some(&self_record) {
+            // Dropped proposals (no leader yet) debug-log inside and
+            // are retried on the next interval either way.
+            node.propose_member(&self_record);
+            next_announce = now + ANNOUNCE_RETRY_INTERVAL;
         }
 
         publish_status(&node, &context.status);
@@ -409,7 +545,7 @@ fn accept_inbound(
     context: &RaftDriverContext,
     authed_tx: &Sender<AuthedSocket>,
     inflight_auth: &Arc<std::sync::atomic::AtomicUsize>,
-    pubkey_to_id: &Arc<HashMap<[u8; 32], u64>>,
+    pubkey_to_id: &Arc<RwLock<HashMap<[u8; 32], u64>>>,
     cap: usize,
 ) {
     loop {
@@ -446,8 +582,11 @@ fn accept_inbound(
                             return;
                         }
                         match authenticate_replica_identified(&mut stream, &keys) {
-                            Ok(pubkey) => match ids.get(&pubkey) {
-                                Some(&peer_id) => {
+                            // A poisoned lock (writer panicked) reads as
+                            // "unknown key" — reject rather than guess.
+                            Ok(pubkey) => match ids.read().ok().and_then(|m| m.get(&pubkey).copied())
+                            {
+                                Some(peer_id) => {
                                     // Receiver gone ⇒ the driver exited;
                                     // the socket just drops, which is the
                                     // correct teardown either way.
@@ -751,18 +890,20 @@ fn poll_outbound_liveness(links: &mut HashMap<u64, PeerLink>) {
 }
 
 /// Drain raft readies and route messages onto peer links. Returns
-/// `false` on a storage failure (raft must stop).
+/// `None` on a storage failure (raft must stop), otherwise whether the
+/// applied membership registry changed while draining.
 fn drain_node(
     node: &mut ControlNode,
     links: &mut HashMap<u64, PeerLink>,
     context: &RaftDriverContext,
-) -> bool {
+) -> Option<bool> {
     let tip = local_tip(context);
     // Chain hash rides the envelope for divergence *diagnostics* only (it
     // never affects vote filtering). Publishing the per-fsync BLAKE3 hash
     // to the control plane cheaply needs a seqlock hook the journal stage
     // doesn't expose yet, so it stays zeroed for now.
     let chain_hash = [0u8; 32];
+    let mut registry_changed = false;
     while node.has_ready() {
         let drained = match node.drain_ready() {
             Ok(d) => d,
@@ -773,9 +914,10 @@ fn drain_node(
                     error = %e,
                     "control-plane raft storage failure — raft stops; trading continues without election support"
                 );
-                return false;
+                return None;
             }
         };
+        registry_changed |= drained.registry_changed;
         for msg in drained.messages {
             let Some(link) = links.get_mut(&msg.to) else {
                 debug!(to = msg.to, "raft message for unknown peer dropped");
@@ -811,16 +953,8 @@ fn drain_node(
             }
             flush_link(to, link);
         }
-        for payload in drained.committed {
-            // Step 1 proposes nothing, so committed payloads can only
-            // appear once config propagation (step 2) lands.
-            debug!(
-                bytes = payload.len(),
-                "committed control-plane entry (unhandled in this phase)"
-            );
-        }
     }
-    true
+    Some(registry_changed)
 }
 
 /// Try to push a link's buffered egress onto the socket. Partial
@@ -992,6 +1126,76 @@ fn local_tip(context: &RaftDriverContext) -> JournalTip {
         epoch: context.fence_state.epoch(),
         last_sequence: context.journal_tip.load().get(),
     }
+}
+
+/// Fold the applied membership registry into the driver's live wiring:
+/// dial targets (`links`), the pinned-identity map, and the data-plane
+/// directory. Static `--raft-peer` flags remain the bootstrap floor;
+/// per node id, an applied record supersedes them — that is the whole
+/// point of the registry (divergent or stale static configs converge
+/// on the leader-serialized log).
+fn sync_registry(
+    node: &ControlNode,
+    config: &RaftDriverConfig,
+    links: &mut HashMap<u64, PeerLink>,
+    pubkey_to_id: &Arc<RwLock<HashMap<[u8; 32], u64>>>,
+    directory: &ClusterDirectory,
+) {
+    for record in node.registry().iter() {
+        if record.node_id == config.node_id {
+            continue;
+        }
+        match links.entry(record.node_id) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let link = e.get_mut();
+                if link.addr != record.raft_addr {
+                    // An in-flight dial to the old address may still
+                    // land a stale stream; it self-heals on the next
+                    // write failure or idle reap.
+                    info!(
+                        peer_id = record.node_id,
+                        addr = %record.raft_addr,
+                        "raft peer moved — re-dialing at its announced address"
+                    );
+                    link.addr = record.raft_addr;
+                    link.stream = None;
+                    link.out_buf.clear();
+                    link.next_dial = Instant::now();
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                info!(
+                    peer_id = record.node_id,
+                    addr = %record.raft_addr,
+                    "raft peer discovered via the membership registry"
+                );
+                v.insert(PeerLink {
+                    addr: record.raft_addr,
+                    stream: None,
+                    out_buf: Vec::new(),
+                    next_dial: Instant::now(),
+                    dialing: false,
+                });
+            }
+        }
+    }
+
+    // Identity pins: static config as the floor, applied records
+    // superseding per id (an announced key rotation replaces the
+    // boot-time pin for that node).
+    let mut map: HashMap<[u8; 32], u64> =
+        config.peers.iter().map(|p| (p.public_key, p.id)).collect();
+    for record in node.registry().iter() {
+        if record.node_id != config.node_id {
+            map.insert(record.public_key, record.node_id);
+        }
+    }
+    match pubkey_to_id.write() {
+        Ok(mut guard) => *guard = map,
+        Err(_) => warn!("raft identity map lock poisoned — pins not updated"),
+    }
+
+    directory.update(node.registry());
 }
 
 /// Publish term/leader/role to the health gauges.
@@ -1223,6 +1427,8 @@ mod tests {
                     })
                     .collect(),
                 dir: dir.path().to_path_buf(),
+                advertise_raft_addr: addrs[&id],
+                advertise_replication_addr: None,
                 auto_promote: false,
             };
             let context = RaftDriverContext {
@@ -1233,6 +1439,7 @@ mod tests {
                 // These test nodes act as always-recovered primaries.
                 tip_ready: Arc::new(AtomicBool::new(true)),
                 status: Arc::clone(&status),
+                directory: Arc::new(ClusterDirectory::default()),
                 durability_mode: Arc::new(AtomicU8::new(DurabilityMode::Hybrid.as_u8())),
                 replica: None,
                 shutdown: Arc::clone(&shutdown),

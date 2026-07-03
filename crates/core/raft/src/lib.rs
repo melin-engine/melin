@@ -29,11 +29,13 @@
 
 pub mod node;
 pub mod recency;
+pub mod registry;
 mod slog_bridge;
 pub mod storage;
 pub mod wire;
 
 pub use node::{ControlNode, Drained};
+pub use registry::{MemberRecord, Registry};
 pub use slog_bridge::tracing_logger;
 
 // Re-export the pinned raft-rs surface consumers need, so downstream

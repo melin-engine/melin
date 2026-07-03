@@ -482,14 +482,37 @@ cluster acts on elections:
   alignment heals as terms advance). Every refusal is logged with its
   reason at warn level, once per term.
 
-After an automatic promotion the surviving replica does **not** yet
-re-point to the new primary — `--replica-of` is static, so the new
-primary starts its tenure with zero replicas attached and `hybrid` /
-`durably-replicated` durability keeps client acks gated until a
-replica reattaches. The operator step is the same as after a manual
-promotion: either restart the surviving replica against the new
-primary's address, or drop durability (`DURABILITY local`) until it
-reattaches. Follow-the-leader reconnection is the next roadmap item.
+With auto-promotion enabled the cluster also maintains a replicated
+**membership registry**: each node announces its identity — raft
+address, replication address, public key — into the raft log, and
+every node applies the committed records. The registry supersedes the
+static `--raft-peer` entries per node (they remain the bootstrap
+hint), so a node that restarts at a new address is re-dialed at its
+announced one, and divergent static configurations converge on the
+leader-serialized log. Nodes binding wildcard addresses must say what
+to announce via `--raft-advertise` (raft RPC) and
+`--replication-advertise` (data plane); a node announcing no
+replication address cannot be followed after it promotes.
+
+The registry is what makes failover **hands-off end to end**: after
+an automatic promotion, the surviving replica looks up the new
+leader's announced replication address and reattaches to it — its
+static `--replica-of` only serves as the fallback while no leader is
+known. Because control-plane leadership is not proof of a serving
+primary (a replica can hold leadership while the primary is healthy),
+a reconnecting replica alternates between the leader's address and
+its static target, so a bad hint costs one dial rather than a stalled
+reconnect. Once the survivor reattaches, `hybrid` /
+`durably-replicated` durability is satisfied again and trading
+resumes at the full contract with **zero operator steps**. Give every
+replica a `--replication-bind` (and, if wildcard, an advertise
+address) so it can serve the other survivors after it promotes.
+
+DPDK-transport replicas do not re-target yet — they keep their static
+`--replica-of` across failovers (re-targeting a DPDK session needs
+neighbor discovery for the new primary; it lands together with DPDK
+promotion). Kernel-TCP replicas — including replicas of a DPDK
+primary — follow the leader as described.
 
 Each raft node needs its **own distinct** `--replication-key`, and
 every node's public key must carry `replication` permission in every

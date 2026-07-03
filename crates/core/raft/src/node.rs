@@ -16,6 +16,7 @@ use raft::eraftpb::{ConfChange, ConfChangeV2, Entry, EntryType, Message};
 use raft::{Config, RawNode, StateRole};
 use tracing::{debug, info};
 
+use crate::registry::{MemberRecord, Registry};
 use crate::storage::FileStorage;
 
 /// Raft timing, in ticks. The driver thread owns the tick length; with
@@ -38,20 +39,24 @@ const LOG_RETENTION: u64 = 512;
 /// One control-plane Raft peer.
 pub struct ControlNode {
     raw: RawNode<FileStorage>,
+    /// The applied membership registry — decoded once from the
+    /// persisted state at open, kept current by `drain_ready`'s apply
+    /// path. The storage owns its serialized durability.
+    registry: Registry,
 }
 
 /// What a drained ready handed to the caller: messages to put on the
-/// wire, plus committed application entries (none in step 1 — config
-/// payloads arrive with the config-propagation step).
+/// wire, plus whether the applied membership registry changed (new or
+/// moved records, or a snapshot install) — the driver re-derives its
+/// dial targets from [`ControlNode::registry`] when it did.
 #[derive(Debug, Default)]
 pub struct Drained {
     /// Peer messages, in send order. Every message in here is already
     /// safe to send: `drain_ready` only surfaces them after the state
     /// they depend on has been fsynced.
     pub messages: Vec<Message>,
-    /// Committed `EntryNormal` payloads (non-empty data only), in
-    /// apply order.
-    pub committed: Vec<Vec<u8>>,
+    /// The registry changed while draining.
+    pub registry_changed: bool,
 }
 
 impl ControlNode {
@@ -66,17 +71,21 @@ impl ControlNode {
             info!(id, ?voters, "bootstrapped control-plane raft membership");
         }
 
-        // Seed the applied index from the persisted commit index.
-        // `drain_ready` applies every committed entry synchronously
-        // before it returns (no async apply), so on a clean process
-        // everything committed is also applied. Without this, a restart
-        // leaves `applied` at 0 and raft re-delivers every committed
-        // entry from the truncation point — harmless for the empty
-        // election no-ops, but re-running a committed conf-change
-        // against the already-updated membership makes raft-rs error
-        // (e.g. "config is already joint"), which would permanently
-        // stop the driver on every boot.
-        let applied = storage.hard_state().commit;
+        // Seed the applied index from the storage's own record of how
+        // far applies reached — NOT from the commit index. The two
+        // differ only across a crash between a commit's persist and
+        // its applies' persist; seeding from `applied_index` makes
+        // raft re-deliver exactly that `(applied, commit]` tail, which
+        // re-applies safely (registry applies are idempotent upserts,
+        // and a conf change whose ConfState persisted also persisted
+        // its applied index — atomically, same file rewrite — so it is
+        // never re-delivered).
+        let applied = storage.applied_index();
+        let registry = Registry::decode(storage.app_state()).map_err(|e| {
+            io::Error::other(format!(
+                "persisted registry state is undecodable ({e}) — refusing to start raft"
+            ))
+        })?;
 
         let config = Config {
             id,
@@ -105,7 +114,31 @@ impl ControlNode {
 
         let raw = RawNode::new(&config, storage, &crate::tracing_logger())
             .map_err(|e| io::Error::other(format!("raft node init failed: {e}")))?;
-        Ok(Self { raw })
+        Ok(Self { raw, registry })
+    }
+
+    /// Propose `record` into the raft log. Works from any node that
+    /// knows a leader: raft forwards a follower's proposal to the
+    /// leader over the existing peer links. Returns `false` when the
+    /// proposal was dropped (no leader known yet) — and `true` is only
+    /// "accepted for forwarding/append", never "committed": proposals
+    /// can still be lost to leader churn, so callers re-propose until
+    /// the record shows up in [`Self::registry`].
+    pub fn propose_member(&mut self, record: &MemberRecord) -> bool {
+        match self.raw.propose(Vec::new(), record.encode()) {
+            Ok(()) => true,
+            Err(e) => {
+                // Expected while leaderless (ProposalDropped) — the
+                // caller's announce loop retries.
+                debug!(error = %e, node_id = record.node_id, "member record proposal dropped");
+                false
+            }
+        }
+    }
+
+    /// The applied membership registry.
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// Advance the logical clock by one tick (the driver calls this at
@@ -164,6 +197,12 @@ impl ControlNode {
         if !ready.snapshot().data.is_empty() || ready.snapshot().metadata.is_some() {
             let snapshot = ready.snapshot().clone();
             self.raw.mut_store().apply_snapshot(snapshot)?;
+            // The snapshot's data replaced the persisted application
+            // state wholesale; rebuild the in-memory registry to match
+            // before any post-snapshot entries apply on top of it.
+            self.registry = Registry::decode(self.raw.store().app_state())
+                .map_err(|e| io::Error::other(format!("snapshot registry undecodable: {e}")))?;
+            out.registry_changed = true;
         }
         if !ready.entries().is_empty() {
             let entries = ready.entries().clone();
@@ -186,6 +225,11 @@ impl ControlNode {
         let committed = light.take_committed_entries();
         self.apply_committed(committed, &mut out)?;
         self.raw.advance_apply();
+
+        // Applies whose commit was persisted by an *earlier* ready may
+        // have staged progress without any persist in this drain —
+        // make them durable before returning (no-op when clean).
+        self.raw.mut_store().flush_if_dirty()?;
 
         self.maybe_compact()?;
 
@@ -210,17 +254,23 @@ impl ControlNode {
         self.raw.mut_store().compact(target)
     }
 
-    /// Apply a batch of committed entries: conf changes mutate raft +
-    /// durable membership here; normal payloads are handed to the
-    /// caller. Empty `EntryNormal` data (the no-op a fresh leader
-    /// commits) is skipped.
+    /// Apply a batch of committed entries: registry payloads mutate
+    /// the in-memory registry and stage the serialized state; conf
+    /// changes mutate raft + durable membership. Every entry —
+    /// including a fresh leader's empty no-op — stages its index as
+    /// applied, so boot-time re-delivery resumes exactly where applies
+    /// stopped (see the module docs on `applied_index`).
     fn apply_committed(&mut self, entries: Vec<Entry>, out: &mut Drained) -> io::Result<()> {
         for entry in entries {
             match entry.entry_type() {
                 EntryType::EntryNormal => {
-                    if !entry.data.is_empty() {
-                        out.committed.push(entry.data);
-                    }
+                    let state = if !entry.data.is_empty() && self.registry.apply(&entry.data) {
+                        out.registry_changed = true;
+                        Some(self.registry.encode())
+                    } else {
+                        None
+                    };
+                    self.raw.mut_store().stage_applied(entry.index, state);
                 }
                 EntryType::EntryConfChange => {
                     let cc: ConfChange = prost_decode(&entry.data)?;
@@ -228,6 +278,10 @@ impl ControlNode {
                         .raw
                         .apply_conf_change(&cc)
                         .map_err(|e| io::Error::other(format!("conf change failed: {e}")))?;
+                    // Staged first so the ConfState persist below
+                    // carries the applied index atomically — a
+                    // re-delivered conf change would double-apply.
+                    self.raw.mut_store().stage_applied(entry.index, None);
                     self.raw.mut_store().set_conf_state(cs)?;
                 }
                 EntryType::EntryConfChangeV2 => {
@@ -236,6 +290,7 @@ impl ControlNode {
                         .raw
                         .apply_conf_change(&cc)
                         .map_err(|e| io::Error::other(format!("conf change failed: {e}")))?;
+                    self.raw.mut_store().stage_applied(entry.index, None);
                     self.raw.mut_store().set_conf_state(cs)?;
                 }
             }
@@ -473,6 +528,133 @@ mod sim {
             let leader = c.settle(400);
             assert_ne!(leader, 3, "stale node must not win the election");
         }
+    }
+
+    fn record(id: u64) -> MemberRecord {
+        MemberRecord {
+            node_id: id,
+            raft_addr: format!("127.0.0.1:{}", 7000 + id).parse().expect("addr"),
+            replication_addr: Some(format!("10.0.0.{}:9877", id % 250).parse().expect("addr")),
+            public_key: [id as u8; 32],
+        }
+    }
+
+    impl Cluster {
+        /// Step until every live node's registry contains `rec`, up to
+        /// `max` rounds.
+        fn settle_record(&mut self, rec: &MemberRecord, max: usize) {
+            for _ in 0..max {
+                self.step_all();
+                if self
+                    .nodes
+                    .iter()
+                    .filter(|(id, _)| !self.down.contains(id))
+                    .all(|(_, n)| n.registry().get(rec.node_id) == Some(rec))
+                {
+                    return;
+                }
+            }
+            panic!(
+                "record {} did not replicate within {max} rounds",
+                rec.node_id
+            );
+        }
+    }
+
+    #[test]
+    fn member_records_replicate_from_leader_and_followers() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+
+        // Leader proposes its own record.
+        let leader_rec = record(leader);
+        assert!(
+            c.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .propose_member(&leader_rec)
+        );
+        c.settle_record(&leader_rec, 100);
+
+        // A follower's proposal is forwarded to the leader by raft
+        // itself — no application-level forwarding machinery.
+        let follower = *c.nodes.keys().find(|id| **id != leader).unwrap();
+        let follower_rec = record(follower);
+        assert!(
+            c.nodes
+                .get_mut(&follower)
+                .unwrap()
+                .propose_member(&follower_rec)
+        );
+        c.settle_record(&follower_rec, 100);
+
+        // A moved address (changed record, same id) replaces the old one.
+        let moved = MemberRecord {
+            raft_addr: "127.0.0.1:9999".parse().expect("addr"),
+            ..follower_rec
+        };
+        assert!(c.nodes.get_mut(&follower).unwrap().propose_member(&moved));
+        c.settle_record(&moved, 100);
+    }
+
+    #[test]
+    fn registry_survives_restart() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+        let rec = record(leader);
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_member(&rec));
+        c.settle_record(&rec, 100);
+
+        // Crash-reopen a follower from its own directory: the registry
+        // must come back from the persisted state, before any peer
+        // traffic.
+        let follower = *c.nodes.keys().find(|id| **id != leader).unwrap();
+        let dir = c.dirs[&follower].path().to_path_buf();
+        c.nodes.remove(&follower);
+        let reopened = ControlNode::open(follower, &dir, &[]).unwrap();
+        assert_eq!(reopened.registry().get(rec.node_id), Some(&rec));
+    }
+
+    /// A node that falls behind past the log-retention window catches
+    /// up via a raft snapshot — whose data must carry the registry, or
+    /// the compacted-away records would be silently lost on that node.
+    #[test]
+    fn snapshot_carries_registry_to_lagging_node() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+
+        let lagger = *c.nodes.keys().find(|id| **id != leader).unwrap();
+        c.down.push(lagger);
+
+        // Push enough records through to compact the early log away
+        // (LOG_RETENTION entries behind applied are discarded).
+        let count = LOG_RETENTION + 40;
+        for i in 0..count {
+            let rec = record(100 + i);
+            assert!(c.nodes.get_mut(&leader).unwrap().propose_member(&rec));
+            // Step a couple of rounds per proposal so the log advances
+            // steadily rather than in one giant append.
+            c.step_all();
+        }
+        let last = record(100 + count - 1);
+        c.settle_record(&last, 200);
+
+        // The lagging node rejoins and must converge — necessarily via
+        // snapshot: the entries it missed are compacted on the leader.
+        c.down.retain(|id| *id != lagger);
+        for _ in 0..400 {
+            c.step_all();
+            if c.nodes[&lagger].registry().len() == count as usize {
+                break;
+            }
+        }
+        let lagger_reg = c.nodes[&lagger].registry();
+        let leader_reg = c.nodes[&leader].registry();
+        assert_eq!(
+            lagger_reg, leader_reg,
+            "lagging node must converge on the full registry"
+        );
+        assert_eq!(lagger_reg.get(last.node_id), Some(&last));
     }
 
     #[test]

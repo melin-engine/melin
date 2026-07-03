@@ -4293,12 +4293,12 @@ fn raft_elects_leader_and_reelects_after_kill() {
     drop(nodes);
 }
 
-/// Full automatic failover: a primary with two raft-enabled replicas
+/// Full hands-off failover: a primary with two raft-enabled replicas
 /// (`--raft-auto-promote`) is SIGKILLed; the surviving pair elects a
-/// leader which promotes itself — no operator `PROMOTE` — and serves
-/// trading after the operator drops durability to `local` (the losing
-/// replica still dials the dead primary's address, so no replica can
-/// reattach until follow-the-leader lands). The loser must stay a
+/// leader which promotes itself — no operator `PROMOTE` — and the
+/// losing replica re-targets the new primary through the membership
+/// registry, so `hybrid` durability is satisfied again and trading
+/// resumes with **zero operator steps**. The loser must stay a
 /// replica.
 #[test]
 fn raft_auto_promotes_surviving_replica_after_primary_kill() {
@@ -4369,8 +4369,14 @@ fn raft_auto_promotes_surviving_replica_after_primary_kill() {
 
     let replica_admin: std::collections::HashMap<u64, u16> =
         [(2u64, free_port()), (3u64, free_port())].into();
+    // Each replica binds its own replication listener so it can serve
+    // the other one after promoting; the registry announces it.
+    let replica_repl: std::collections::HashMap<u64, u16> =
+        [(2u64, free_port()), (3u64, free_port())].into();
     let spawn_one_replica = |id: u64| -> ServerProcess {
-        let args = raft_args(id, false);
+        let mut args = raft_args(id, false);
+        args.push("--replication-bind".to_string());
+        args.push(format!("127.0.0.1:{}", replica_repl[&id]));
         spawn_replica_named_with_extra(
             &bin,
             tmp.path(),
@@ -4434,16 +4440,17 @@ fn raft_auto_promotes_surviving_replica_after_primary_kill() {
     let (winner, _term) = wait_for_raft_leader(&survivors, Duration::from_secs(60));
     let loser = if winner == 2 { 3 } else { 2 };
 
-    // The winner auto-promotes and rebinds the primary health endpoint;
-    // `hybrid` cannot ack with zero replicas attached, so the operator
-    // drops durability to `local` — the same runbook step as a manual
-    // failover (`kill_and_promote`), minus the PROMOTE itself.
-    let winner_admin: SocketAddr = format!("127.0.0.1:{}", replica_admin[&winner])
-        .parse()
-        .unwrap();
-    assert_eq!(
-        admin_command(winner_admin, &operator_key, "DURABILITY local"),
-        "OK"
+    // The winner auto-promotes; the loser learns the new primary's
+    // replication address from the membership registry and reattaches
+    // (its static --replica-of points at the dead node). No operator
+    // involvement — `hybrid` durability is satisfied by the reattached
+    // replica and trading resumes at the full contract.
+    wait_metric(
+        replicas[&winner].health_addr,
+        "melin_replicas_connected ",
+        Duration::from_secs(90),
+        "losing replica reattached to the promoted primary",
+        |v| v == 1,
     );
     wait_ready(replicas[&winner].health_addr, Duration::from_secs(60));
 
