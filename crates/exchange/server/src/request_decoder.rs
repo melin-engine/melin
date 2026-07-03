@@ -76,8 +76,23 @@ fn should_filter(request: &Request) -> bool {
 ///   (heartbeats / handshakes / subscribe never reach this function;
 ///   any other request from a ReadOnly connection falls into the final
 ///   clause and is denied for lacking `can_trade`).
+///
+/// `QueryRequestSeq` is exempt from all three role checks: it is
+/// connection-scoped self-introspection (the engine reports only the
+/// calling key's own dedup HWM, read from the connection registration —
+/// never from the request), so it leaks nothing across keys and mutates no
+/// state. Every `Client` issues it automatically on connect to sync its
+/// request sequence, so it must succeed for any authenticated role —
+/// including Operator / Custodian / ReadOnly, which lack `can_trade`.
+/// Without the exemption an operator-only key could never finish the
+/// connect handshake (the auto-sync would be silently dropped as denied,
+/// hanging the client), which would make `melin-admin` unusable by its
+/// intended operator.
 #[inline]
 fn check_permission(request: &Request, permission: Permission) -> Result<(), &'static str> {
+    if matches!(request, Request::QueryRequestSeq) {
+        return Ok(());
+    }
     if request.requires_operator() && !permission.is_operator() {
         return Err("non-operator attempted operator command");
     }
@@ -342,6 +357,32 @@ mod tests {
                 assert!(event.is_query());
             }
             other => panic!("expected Permitted, got {:?}", debug_variant(&other)),
+        }
+    }
+
+    #[test]
+    fn query_request_seq_permitted_for_every_role() {
+        // The client library auto-issues QueryRequestSeq on connect to sync
+        // its request sequence, so it must be permitted regardless of role —
+        // including Operator/Custodian/ReadOnly, which lack `can_trade`. A
+        // regression here silently hangs the connect handshake for those
+        // keys (the denied request gets no response).
+        let bytes = encode(&Request::QueryRequestSeq, 1);
+        for permission in [
+            Permission::Trader,
+            Permission::Operator,
+            Permission::Custodian,
+            Permission::ReadOnly,
+        ] {
+            match RequestDecoder.decode(&bytes, permission) {
+                Decoded::Permitted { event, .. } => {
+                    assert!(matches!(event, TradingEvent::QueryRequestSeq));
+                }
+                other => panic!(
+                    "QueryRequestSeq must be permitted for {permission:?}, got {:?}",
+                    debug_variant(&other)
+                ),
+            }
         }
     }
 
