@@ -1968,7 +1968,7 @@ fn replica_config_fingerprint_mismatch_is_flagged() {
     );
     wait_for_primary_repl_ready(primary.health_addr, Duration::from_secs(10));
 
-    let _replica = spawn_replica_named_with_extra(
+    let replica = spawn_replica_named_with_extra(
         &bin,
         tmp.path(),
         &replica_keys,
@@ -2011,6 +2011,18 @@ fn replica_config_fingerprint_mismatch_is_flagged() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    // The gauge describes the *connected* replica: killing it must clear
+    // the flag on slot teardown ("0 = match or no replica"), not leave the
+    // departed replica's verdict latched.
+    drop(replica); // SIGKILL + wait (ServerProcess::drop)
+    wait_metric(
+        primary.health_addr,
+        "melin_replica_config_fingerprint_mismatch{slot=\"0\"} ",
+        Duration::from_secs(15),
+        "config fingerprint gauge cleared after replica disconnect",
+        |v| v == 0,
+    );
 }
 
 // ---------------------------------------------------------------------------

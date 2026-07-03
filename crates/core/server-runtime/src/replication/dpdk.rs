@@ -230,6 +230,10 @@ impl DpdkReplicaSlot {
             cursors.clear_on_disconnect(slot_idx);
             self.active_flag.store(false, Ordering::Release);
             metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+            // The config tripwire describes the *connected* replica; with the
+            // slot empty the gauge must read 0 ("match or no replica"), not
+            // hold the departed replica's verdict.
+            metrics.config_fingerprint_mismatch[slot_idx].store(false, Ordering::Relaxed);
             if was_authenticated {
                 ReplicaGate::new(replicas_connected).lower();
             }
