@@ -2114,6 +2114,49 @@ mod tests {
     }
 
     #[test]
+    fn clone_after_warm_prefault_keeps_reservations() {
+        // Regression: replica promotion calls `prefault` on the warm
+        // exchange before cloning it for the new shadow stage. The old
+        // `OrderBook::prefault` cleared `order_index` unconditionally,
+        // so the clone's snapshot carried zero reservations and the
+        // shadow's first fill against a recovered maker indexed the
+        // reservation slab with `ReservationSlot::DUMMY` and panicked.
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 500);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10),
+            &mut reports,
+        );
+        reports.clear();
+
+        // The promotion path's warm prefault, then the shadow clone.
+        exchange.prefault();
+        let mut shadow = exchange.clone_via_snapshot();
+
+        // The taker's fill against the recovered maker must settle both
+        // reservations — this is the exact event the shadow replays
+        // first after a promotion under live traffic.
+        shadow.execute(
+            Symbol(1),
+            limit_order(2, ACCT_B, Side::Sell, 100, 10),
+            &mut reports,
+        );
+        assert!(
+            matches!(reports[0], ExecutionReport::Fill { .. }),
+            "expected Fill on the shadow clone, got {:?}",
+            reports[0]
+        );
+        // The maker's USD reservation must be consumed, not leaked.
+        assert_eq!(shadow.accounts().balance(ACCT_A, USD).reserved, 0);
+        assert_eq!(shadow.accounts().balance(ACCT_A, BTC).available, 10);
+    }
+
+    #[test]
     #[should_panic(expected = "snapshot corruption: order_sides mismatch")]
     fn restore_detects_order_sides_mismatch() {
         // Build an exchange with one resting order so `order_sides` is

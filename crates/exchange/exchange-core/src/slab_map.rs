@@ -157,6 +157,12 @@ impl<V> SlabMap<V> {
         self.lookup.len()
     }
 
+    /// `true` when no entries are live. Guards warm-state checks (e.g.
+    /// `OrderBook::prefault` must not touch a map that holds live orders).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lookup.is_empty()
+    }
+
     /// Capacity of the underlying lookup hashmap (peak slot count). Used
     /// by the bench's capacity-report diagnostic to detect growth past
     /// the prefaulted region.

@@ -1025,9 +1025,13 @@ fn replace_order_to_different_price_relocates() {
 }
 
 /// `prefault` must be a no-op on a non-empty book. `Exchange::prefault`
-/// can be called after snapshot restore has placed orders, so wiping
-/// the slab would leave `LevelHead` indices pointing at empty memory
-/// and crash the next operation that touches them.
+/// can be called after snapshot restore has placed orders (and after a
+/// replica promotion, on a fully warm book), so wiping the slab would
+/// leave `LevelHead` indices pointing at empty memory and crash the next
+/// operation that touches them — and wiping the order/stop indices would
+/// orphan resting orders from cancels and from snapshot reservation
+/// tracking (a clone of such a book fills against `ReservationSlot::DUMMY`
+/// and panics in the shadow stage).
 #[test]
 fn prefault_on_populated_book_is_noop() {
     let mut book = OrderBook::with_capacity(TEST_SYMBOL);
@@ -1035,17 +1039,58 @@ fn prefault_on_populated_book_is_noop() {
     book.execute(
         limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
         None,
-        ReservationSlot::DUMMY,
+        ReservationSlot(7),
+        &mut reports,
+    );
+    book.execute(
+        limit_order(2, Side::Sell, 101, 5, TimeInForce::GTC),
+        None,
+        ReservationSlot(8),
+        &mut reports,
+    );
+    book.execute(
+        stop_order(3, Side::Sell, 90, 5, TimeInForce::GTC),
+        None,
+        ReservationSlot(9),
         &mut reports,
     );
 
-    // Calling prefault now must NOT clear the slab.
+    // Calling prefault now must NOT clear the slab or the indices.
     book.prefault();
 
-    // The resting order must still match.
+    // The order index must still track every resting order with its
+    // real reservation slot — this is what snapshot reservation
+    // collection and cancel lookups walk.
+    let slots: Vec<_> = book.active_order_slots().collect();
+    assert_eq!(slots.len(), 2, "live order_index entries wiped by prefault");
+    assert!(
+        slots
+            .iter()
+            .any(|&((_, id), (_, slot))| id == OrderId(1) && slot == ReservationSlot(7)),
+        "order 1 lost its index entry or reservation slot: {slots:?}"
+    );
+
+    // Cancels go through the order/stop indices — both must still find
+    // their entries.
+    reports.clear();
+    book.cancel(TEST_ACCOUNT, OrderId(2), &mut reports);
+    assert!(
+        matches!(reports[0], ExecutionReport::Cancelled { .. }),
+        "cancel after warm prefault must find the resting order: {:?}",
+        reports[0]
+    );
+    reports.clear();
+    book.cancel(TEST_ACCOUNT, OrderId(3), &mut reports);
+    assert!(
+        matches!(reports[0], ExecutionReport::Cancelled { .. }),
+        "stop cancel after warm prefault must find the pending stop: {:?}",
+        reports[0]
+    );
+
+    // The remaining resting order must still match.
     reports.clear();
     book.execute(
-        limit_order(2, Side::Buy, 100, 5, TimeInForce::IOC),
+        limit_order(4, Side::Buy, 100, 5, TimeInForce::IOC),
         None,
         ReservationSlot::DUMMY,
         &mut reports,

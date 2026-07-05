@@ -147,33 +147,45 @@ impl OrderBook {
 
     /// Touch all pre-allocated HashMap pages so page faults happen at startup,
     /// not on the hot path. Insert dummy entries up to capacity, then clear.
+    ///
+    /// Warm-safe: each structure is only prefaulted when empty. On a warm
+    /// book (replica promotion, snapshot/journal recovery) the dummy-fill
+    /// and `clear()` would wipe the live index entries, silently orphaning
+    /// resting orders from their reservations — cancels stop finding them
+    /// and the next snapshot drops their reservations, so a clone fills
+    /// against `ReservationSlot::DUMMY` and panics. Same guard as
+    /// `BookSide::prefault` / `StopSide::prefault`.
     pub fn prefault(&mut self) {
-        let cap = self.order_index.capacity();
-        for i in 0..cap {
-            self.order_index.insert(
-                (AccountId(0), OrderId(i as u64)),
-                (
-                    Side::Buy,
-                    Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
-                    ReservationSlot::DUMMY,
-                    INVALID_NODE,
-                ),
-            );
+        if self.order_index.is_empty() {
+            let cap = self.order_index.capacity();
+            for i in 0..cap {
+                self.order_index.insert(
+                    (AccountId(0), OrderId(i as u64)),
+                    (
+                        Side::Buy,
+                        Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
+                        ReservationSlot::DUMMY,
+                        INVALID_NODE,
+                    ),
+                );
+            }
+            self.order_index.clear();
         }
-        self.order_index.clear();
 
-        let cap = self.stop_index.capacity();
-        for i in 0..cap {
-            self.stop_index.insert(
-                (AccountId(0), OrderId(i as u64)),
-                (
-                    Side::Buy,
-                    Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
-                    INVALID_NODE,
-                ),
-            );
+        if self.stop_index.is_empty() {
+            let cap = self.stop_index.capacity();
+            for i in 0..cap {
+                self.stop_index.insert(
+                    (AccountId(0), OrderId(i as u64)),
+                    (
+                        Side::Buy,
+                        Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
+                        INVALID_NODE,
+                    ),
+                );
+            }
+            self.stop_index.clear();
         }
-        self.stop_index.clear();
 
         // Touch every slab page on both sides so the first matching
         // pop / cancel after warmup doesn't pay a page-fault stall.
