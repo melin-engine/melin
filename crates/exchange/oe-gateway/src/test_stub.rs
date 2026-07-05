@@ -54,11 +54,33 @@ pub struct MelinStub {
     errors: Arc<Mutex<Vec<String>>>,
 }
 
+/// What the stub answers once the challenge handshake completes.
+#[derive(Clone, Copy)]
+enum StubMode {
+    /// Behave as a serving primary: `ServerReady`, request-seq sync,
+    /// then the channel-driven request/response loop.
+    Serve,
+    /// Behave as a replica: authenticate, answer with a `Redirect` to
+    /// the given address, then wait for the gateway to hang up.
+    RedirectTo(std::net::SocketAddr),
+}
+
 impl MelinStub {
     /// Bind a listener on `127.0.0.1:0`, spawn the stub thread, and
     /// return a handle. The thread blocks waiting for one inbound
     /// connection (the gateway).
     pub fn start() -> Self {
+        Self::start_with_mode(StubMode::Serve)
+    }
+
+    /// Like [`MelinStub::start`], but the stub plays a replica: it
+    /// authenticates the gateway and answers `Redirect { addr }`
+    /// instead of `ServerReady`, then expects the gateway to close.
+    pub fn start_redirecting_to(addr: std::net::SocketAddr) -> Self {
+        Self::start_with_mode(StubMode::RedirectTo(addr))
+    }
+
+    fn start_with_mode(mode: StubMode) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let port = listener.local_addr().unwrap().port();
 
@@ -74,6 +96,7 @@ impl MelinStub {
         let join = std::thread::spawn(move || {
             if let Err(e) = run_stub(
                 listener,
+                mode,
                 req_tx,
                 resp_rx,
                 shutdown_clone,
@@ -148,6 +171,7 @@ impl Drop for MelinStub {
 /// unexpected happens — the test Drop surface will then fail.
 fn run_stub(
     listener: TcpListener,
+    mode: StubMode,
     requests: Sender<(u64, Request)>,
     responses: Receiver<ResponseKind>,
     shutdown: Arc<AtomicBool>,
@@ -183,6 +207,39 @@ fn run_stub(
         Request::ChallengeResponse { .. } => {}
         other => return Err(format!("expected ChallengeResponse, got {other:?}")),
     }
+
+    // Replica mode: answer with the redirect and wait for the gateway
+    // to hang up (it reconnects to the target, not to us).
+    if let StubMode::RedirectTo(addr) = mode {
+        write_response(&mut stream, &ResponseKind::Redirect { addr })?;
+        let mut tmp = [0u8; 64];
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            match stream.read(&mut tmp) {
+                Ok(0) => {
+                    disconnected.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Ok(_) => {
+                    return Err("gateway sent data after a Redirect".to_string());
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                    disconnected.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(e) => return Err(format!("post-redirect read: {e}")),
+            }
+        }
+    }
+
     write_response(&mut stream, &ResponseKind::ServerReady)?;
 
     // Production-side, the gateway issues `QueryRequestSeq` immediately

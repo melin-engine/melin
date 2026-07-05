@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::GatewayConfig;
 use crate::session::{Session, SessionState};
@@ -54,7 +54,16 @@ const OP_SEND_FIX: u64 = 0x03 << 56;
 const OP_SEND_MELIN: u64 = 0x04 << 56;
 const OP_CONNECT: u64 = 0x05 << 56;
 const OP_MASK: u64 = 0xFF << 56;
-const IDX_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+/// Melin connection generation, encoded in bits 40..56 of user_data for
+/// Melin-side ops. A redirect closes the Melin socket and reconnects on
+/// the same session slot; CQEs still in flight for the old socket carry
+/// the old generation and are dropped instead of being misattributed to
+/// the replacement connection. FIX-side ops always carry generation 0 —
+/// the FIX socket never reconnects within a session.
+const GEN_SHIFT: u32 = 40;
+const GEN_MASK: u64 = 0xFFFF << GEN_SHIFT;
+/// 40 bits of session index — far beyond any realistic session count.
+const IDX_MASK: u64 = (1 << GEN_SHIFT) - 1;
 
 /// User data sentinel for ProvideBuffers CQEs.
 const PROVIDE_BUFS_TOKEN: u64 = u64::MAX;
@@ -79,6 +88,17 @@ fn op_type(token: u64) -> u64 {
 #[inline(always)]
 fn slab_idx(token: u64) -> usize {
     (token & IDX_MASK) as usize
+}
+
+#[inline(always)]
+fn token_gen(token: u64) -> u16 {
+    ((token & GEN_MASK) >> GEN_SHIFT) as u16
+}
+
+/// Build a Melin-side user_data token: op | generation | session index.
+#[inline(always)]
+fn melin_token(op: u64, generation: u16, idx: usize) -> u64 {
+    op | ((generation as u64) << GEN_SHIFT) | idx as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +187,13 @@ pub struct Gateway {
     session_map: HashMap<String, usize>,
     /// Coarse timer for heartbeat scanning.
     last_heartbeat_check: Instant,
+    /// Last primary address learned from a Melin redirect. New Melin
+    /// connects prefer it over the configured seed address so every
+    /// session after the first skips the redirect hop; cleared when a
+    /// connect to it fails so the gateway falls back to the seed
+    /// (mirrors the replica receiver's leader/static alternation —
+    /// a stale hint costs one dial, never a wedged loop).
+    melin_target: Option<std::net::SocketAddr>,
 }
 
 impl Gateway {
@@ -214,6 +241,7 @@ impl Gateway {
             symbol_map,
             session_map,
             last_heartbeat_check: Instant::now(),
+            melin_target: None,
         })
     }
 
@@ -269,11 +297,11 @@ impl Gateway {
                     OP_ACCEPT => self.handle_accept(result, now),
                     OP_FIX_RECV => self.handle_fix_recv(slab_idx(token), result, flags, now),
                     OP_MELIN_RECV => {
-                        self.handle_melin_recv(slab_idx(token), result, flags, now);
+                        self.handle_melin_recv(token, result, flags, now);
                     }
                     OP_SEND_FIX => self.handle_fix_send_complete(slab_idx(token), result),
-                    OP_SEND_MELIN => self.handle_melin_send_complete(slab_idx(token), result),
-                    OP_CONNECT => self.handle_melin_connected(slab_idx(token), result, now),
+                    OP_SEND_MELIN => self.handle_melin_send_complete(token, result),
+                    OP_CONNECT => self.handle_melin_connected(token, result, now),
                     _ => {
                         debug!(token, "unknown op type in CQE");
                     }
@@ -450,6 +478,11 @@ impl Gateway {
                 SessionAction::ConnectMelin => {
                     self.start_melin_connect(idx);
                 }
+                SessionAction::RedirectMelin(addr) => {
+                    // Should not happen from the FIX recv path (redirects
+                    // arrive on the Melin side), but honor it regardless.
+                    self.redirect_melin(idx, addr);
+                }
                 SessionAction::SendFix => {
                     self.dirty_fix.push(idx);
                 }
@@ -470,8 +503,14 @@ impl Gateway {
     // -----------------------------------------------------------------------
 
     fn start_melin_connect(&mut self, idx: usize) {
-        let server_addr = self.config.server_addr;
+        // Prefer the last redirect-learned primary over the configured
+        // seed: after a failover, the first session pays the redirect
+        // hop and every later one dials the primary directly.
+        let server_addr = self.melin_target.unwrap_or(self.config.server_addr);
+        self.start_melin_connect_to(idx, server_addr);
+    }
 
+    fn start_melin_connect_to(&mut self, idx: usize, server_addr: std::net::SocketAddr) {
         // Create a non-blocking TCP socket.
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
         if fd < 0 {
@@ -504,14 +543,66 @@ impl Gateway {
 
         let sqe = opcode::Connect::new(types::Fd(fd), addr_ptr, sockaddr_len)
             .build()
-            .user_data(OP_CONNECT | idx as u64);
+            .user_data(melin_token(OP_CONNECT, session.melin_gen, idx));
 
         unsafe {
             self.ring.submission().push(&sqe).expect("io_uring SQ full");
         }
     }
 
-    fn handle_melin_connected(&mut self, idx: usize, result: i32, now: Instant) {
+    /// Replace a session's Melin connection with one to the redirect
+    /// target: close the old socket (its in-flight CQEs are dropped by
+    /// the generation guard), remember the target as the cluster's
+    /// serving primary, and reconnect. The session re-enters the
+    /// handshake from `ConnectingMelin`.
+    fn redirect_melin(&mut self, idx: usize, addr: std::net::SocketAddr) {
+        // The io_uring connect path is AF_INET-only (sockaddr_in); a v6
+        // order-entry advertisement can't be followed. Close with a
+        // descriptive Logout rather than panicking in the sockaddr
+        // conversion.
+        if !addr.is_ipv4() {
+            if let Some(session) = self.sessions.get_mut(idx) {
+                warn!(
+                    sender = %session.sender_comp_id,
+                    target = %addr,
+                    "Melin redirect names an IPv6 address — gateway supports IPv4 upstreams only"
+                );
+                session.queue_logout_for_redirect_failure(self.config);
+            }
+            self.dirty_fix.push(idx);
+            self.to_remove.push(idx);
+            return;
+        }
+
+        self.melin_target = Some(addr);
+
+        let Some(session) = self.sessions.get_mut(idx) else {
+            return;
+        };
+        if let Some(old_fd) = session.begin_melin_redirect() {
+            // shutdown() before close(): the pending multishot recv
+            // holds a kernel reference to the socket, so close() alone
+            // would neither send FIN nor complete the recv — the old
+            // node would keep a zombie connection. shutdown() tears the
+            // TCP stream down immediately and flushes the pending recv
+            // out as a terminal CQE, which carries the old generation
+            // and is dropped by the guards.
+            unsafe {
+                libc::shutdown(old_fd, libc::SHUT_RDWR);
+                libc::close(old_fd);
+            }
+        }
+        self.start_melin_connect_to(idx, addr);
+    }
+
+    fn handle_melin_connected(&mut self, token: u64, result: i32, now: Instant) {
+        let idx = slab_idx(token);
+        // Stale generation: a redirect already replaced this connection
+        // attempt's socket. Nothing to clean up — the fd was closed by
+        // the redirect.
+        if !self.melin_gen_current(token) {
+            return;
+        }
         if result < 0 {
             let err = std::io::Error::from_raw_os_error(-result);
             if let Some(session) = self.sessions.get(idx) {
@@ -521,6 +612,10 @@ impl Gateway {
                     "Melin connect failed"
                 );
             }
+            // A learned redirect target that stopped answering must not
+            // poison every future session — fall back to the configured
+            // seed address (harmless no-op when already unset).
+            self.melin_target = None;
             self.to_remove.push(idx);
             return;
         }
@@ -535,6 +630,16 @@ impl Gateway {
 
         // Start multishot RECV on the Melin socket to receive the Challenge.
         self.push_melin_recv_multi(idx);
+    }
+
+    /// `true` when the token's Melin connection generation matches the
+    /// session's current one. Stale CQEs (from a socket a redirect
+    /// closed) must be dropped, not attributed to the replacement
+    /// connection. A missing session also reports stale.
+    fn melin_gen_current(&self, token: u64) -> bool {
+        self.sessions
+            .get(slab_idx(token))
+            .is_some_and(|s| s.melin_gen == token_gen(token))
     }
 
     // -----------------------------------------------------------------------
@@ -556,7 +661,7 @@ impl Gateway {
 
         let sqe = opcode::RecvMulti::new(types::Fd(melin_fd), BUF_GROUP_ID)
             .build()
-            .user_data(OP_MELIN_RECV | idx as u64);
+            .user_data(melin_token(OP_MELIN_RECV, session.melin_gen, idx));
 
         unsafe {
             self.ring.submission().push(&sqe).expect("io_uring SQ full");
@@ -564,7 +669,19 @@ impl Gateway {
         session.melin_multishot_active = true;
     }
 
-    fn handle_melin_recv(&mut self, idx: usize, result: i32, flags: u32, now: Instant) {
+    fn handle_melin_recv(&mut self, token: u64, result: i32, flags: u32, now: Instant) {
+        let idx = slab_idx(token);
+        // Stale generation: this CQE belongs to a socket a redirect
+        // closed. Return any provided buffer to the pool, but do not
+        // touch the session — a stale error/EOF here must not tear down
+        // the replacement connection, and a stale terminal CQE must not
+        // clear the new multishot's active flag.
+        if !self.melin_gen_current(token) {
+            if result > 0 && (flags & IORING_CQE_F_BUFFER) != 0 {
+                self.re_provide_buffer((flags >> IORING_CQE_BUFFER_SHIFT) as usize);
+            }
+            return;
+        }
         let has_more = (flags & IORING_CQE_F_MORE) != 0;
 
         if result <= 0 {
@@ -630,6 +747,14 @@ impl Gateway {
                 SessionAction::Close => {
                     self.dirty_fix.push(idx);
                     self.to_remove.push(idx);
+                    return;
+                }
+                SessionAction::RedirectMelin(addr) => {
+                    // The Melin connection is being replaced: any frames
+                    // still buffered came from the node we are leaving,
+                    // so stop processing and let the new connection's
+                    // handshake produce fresh ones.
+                    self.redirect_melin(idx, addr);
                     return;
                 }
                 SessionAction::ConnectMelin => {
@@ -713,7 +838,7 @@ impl Gateway {
                 session.melin_inflight.len() as u32,
             )
             .build()
-            .user_data(OP_SEND_MELIN | idx as u64);
+            .user_data(melin_token(OP_SEND_MELIN, session.melin_gen, idx));
 
             unsafe {
                 self.ring.submission().push(&sqe).expect("io_uring SQ full");
@@ -764,7 +889,18 @@ impl Gateway {
         }
     }
 
-    fn handle_melin_send_complete(&mut self, idx: usize, result: i32) {
+    fn handle_melin_send_complete(&mut self, token: u64, result: i32) {
+        let idx = slab_idx(token);
+        // Stale generation: the send belonged to a socket a redirect
+        // closed. The kernel is done with the parked buffer — release
+        // it — and the (likely error) result must not remove the
+        // session serving the replacement connection.
+        if !self.melin_gen_current(token) {
+            if let Some(session) = self.sessions.get_mut(idx) {
+                session.stale_melin_inflight = Vec::new();
+            }
+            return;
+        }
         if result < 0 {
             // See comment in handle_fix_send_complete: clear the
             // inflight buffer so drain_removals can actually remove
@@ -886,6 +1022,10 @@ pub enum SessionAction {
     None,
     /// Initiate Melin TCP connect.
     ConnectMelin,
+    /// Replace the Melin connection: the dialed node is a replica and
+    /// named the serving primary. Close the current Melin socket and
+    /// reconnect to the carried address.
+    RedirectMelin(std::net::SocketAddr),
     /// Flush FIX send buffer.
     SendFix,
     /// Flush Melin send buffer.
@@ -1261,12 +1401,67 @@ lot_size_inverse = 1
         session.melin_inflight = b"PENDING SEND".to_vec();
         let idx = gw.sessions.insert(session);
 
-        gw.handle_melin_send_complete(idx, -104); // ECONNRESET
+        gw.handle_melin_send_complete(melin_token(OP_SEND_MELIN, 0, idx), -104); // ECONNRESET
 
         let session = gw.sessions.get(idx).expect("session still in slab");
         assert!(
             session.melin_inflight.is_empty(),
             "melin inflight must be cleared on send error"
+        );
+        assert!(gw.to_remove.contains(&idx));
+    }
+
+    #[test]
+    fn stale_generation_melin_cqes_do_not_touch_the_session() {
+        // After a redirect bumps the connection generation, CQEs from
+        // the closed socket (recv EOF/errors, send failures) carry the
+        // old generation and must be dropped — a stale error must not
+        // remove the session now serving the replacement connection.
+        use crate::session::Session;
+        use std::os::unix::io::IntoRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = make_config("FIRM_A", "MELIN");
+        let metrics = crate::metrics::GatewayMetrics::leak_default();
+        let mut gw = Gateway::new(listener, config, metrics).expect("gateway new");
+
+        let dummy_fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let mut session = Session::new(dummy_fd, Instant::now(), metrics);
+        session.melin_inflight = b"OLD NODE HANDSHAKE".to_vec();
+        let old_gen = session.melin_gen;
+        let _ = session.begin_melin_redirect(); // bumps the generation
+        session.stale_melin_inflight = b"OLD NODE HANDSHAKE".to_vec();
+        session.melin_multishot_active = true; // as if the new recv is armed
+        let idx = gw.sessions.insert(session);
+
+        // Stale recv error (old socket closed): session must survive
+        // and the new multishot flag must stay armed.
+        gw.handle_melin_recv(
+            melin_token(OP_MELIN_RECV, old_gen, idx),
+            -104,
+            0,
+            Instant::now(),
+        );
+        assert!(gw.sessions.get(idx).is_some(), "session must survive");
+        assert!(!gw.to_remove.contains(&idx));
+        assert!(gw.sessions.get(idx).unwrap().melin_multishot_active);
+
+        // Stale send completion: releases the parked buffer, nothing else.
+        gw.handle_melin_send_complete(melin_token(OP_SEND_MELIN, old_gen, idx), -32);
+        let session = gw.sessions.get(idx).expect("session still in slab");
+        assert!(
+            session.stale_melin_inflight.is_empty(),
+            "parked buffer must be released once its CQE fires"
+        );
+        assert!(!gw.to_remove.contains(&idx));
+
+        // Current-generation error still removes as before.
+        let cur_gen = gw.sessions.get(idx).unwrap().melin_gen;
+        gw.handle_melin_recv(
+            melin_token(OP_MELIN_RECV, cur_gen, idx),
+            -104,
+            0,
+            Instant::now(),
         );
         assert!(gw.to_remove.contains(&idx));
     }
@@ -1393,6 +1588,66 @@ lot_size_inverse = 1
         drop(client);
         gw.shutdown();
         drop(stub);
+    }
+
+    #[test]
+    fn gateway_follows_melin_redirect_to_the_primary() {
+        use crate::test_stub::MelinStub;
+        use melin_protocol::message::Request;
+
+        // "Primary" stub serves normally; "replica" stub authenticates
+        // and answers Redirect naming the primary. The gateway is
+        // configured at the replica — exactly the post-failover
+        // topology where ops haven't repointed the gateway yet.
+        let primary = MelinStub::start();
+        let primary_addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", primary.port()).parse().unwrap();
+        let replica = MelinStub::start_redirecting_to(primary_addr);
+        let config = make_config_with_port("FIRM_A", "MELIN", replica.port());
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // The Logon must complete even though the configured upstream
+        // is a replica: gateway dials replica → authenticates → gets
+        // Redirect → reconnects to primary → full handshake → Logon ack.
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+        let raw = read_fix_message(&mut client);
+        let msg = FixMessage::parse(&raw).expect("valid FIX Logon ack");
+        assert_eq!(msg.msg_type(), tags::MSG_LOGON);
+
+        // The replica saw the gateway hang up after the redirect.
+        assert!(
+            replica.wait_for_disconnect(Duration::from_secs(5)),
+            "gateway must close the replica connection it was redirected away from"
+        );
+
+        // Traffic flows to the primary: a NewOrderSingle reaches it.
+        let nos = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ORD1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "2")
+            .str_tag(tags::PRICE, "50000.00")
+            .str_tag(tags::ORDER_QTY, "10")
+            .str_tag(tags::TIME_IN_FORCE, "1")
+            .build("FIRM_A", "MELIN", 2);
+        client.write_all(&nos).unwrap();
+        let (_seq, req) = primary.next_request(Duration::from_secs(5));
+        assert!(
+            matches!(req, Request::SubmitOrder { .. }),
+            "order must reach the redirect target, got {req:?}"
+        );
+
+        drop(client);
+        gw.shutdown();
+        drop(replica);
+        drop(primary);
     }
 
     #[test]

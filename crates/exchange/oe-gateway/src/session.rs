@@ -32,6 +32,12 @@ use melin_gateway_core::fix::tags;
 /// preventing unbounded growth from a peer that never reads.
 const MAX_OUTBOUND_STORE_MSGS: usize = 10_000;
 
+/// Maximum Melin redirect hops one session handshake may follow.
+/// Matches the native TCP client's bound: one hop covers the real case
+/// (a replica naming the promoted primary), the rest is slack for an
+/// election settling mid-handshake.
+const MAX_MELIN_REDIRECT_HOPS: u8 = 3;
+
 // ---------------------------------------------------------------------------
 // Order → symbol mapping for exec report translation
 // ---------------------------------------------------------------------------
@@ -128,6 +134,24 @@ pub struct Session {
     /// tag + 64 sig + 32 pubkey + slack).
     melin_encode_buf: [u8; 128],
     pub melin_multishot_active: bool,
+    /// Melin connection generation, encoded into io_uring user_data for
+    /// every Melin-side SQE. Bumped when a redirect replaces the Melin
+    /// connection so CQEs from the closed socket (multishot recv
+    /// errors, send failures) are recognized as stale and dropped
+    /// instead of tearing down the replacement connection.
+    /// u16: wraps after 65k redirects on one session — a session that
+    /// bounces that often has long since hit the hop bound and closed.
+    pub melin_gen: u16,
+    /// Parking spot for a send buffer that was in flight when a
+    /// redirect closed the Melin socket: the kernel may still read the
+    /// allocation until the (stale) send CQE arrives, so it must stay
+    /// alive — it is dropped with the session or overwritten by a later
+    /// redirect (by which time the earlier CQE has long fired).
+    pub stale_melin_inflight: Vec<u8>,
+    /// Redirect hops consumed by this session's Melin handshake.
+    /// Bounded so two confused nodes pointing at each other surface as
+    /// an error instead of a reconnect loop; reset when auth completes.
+    melin_redirect_hops: u8,
 
     // ── Outbound message store (FIX 4.4 §4.6/4.7 ResendRequest) ──
     /// Every outbound FIX message is retained here, keyed by the
@@ -220,6 +244,9 @@ impl Session {
             melin_seq: 0,
             melin_encode_buf: [0u8; 128],
             melin_multishot_active: false,
+            melin_gen: 0,
+            stale_melin_inflight: Vec::new(),
+            melin_redirect_hops: 0,
 
             outbound_store: VecDeque::with_capacity(64),
 
@@ -516,6 +543,7 @@ impl Session {
                 // which it sits in memory after use.
                 self.auth_nonce = None;
                 self.signing_key = None;
+                self.melin_redirect_hops = 0;
 
                 self.state = SessionState::SyncingRequestSeq;
                 SessionAction::SendMelin
@@ -525,12 +553,75 @@ impl Session {
                 self.queue_fix_logout(config, "authentication failed");
                 SessionAction::Close
             }
+            // The node we dialed is a replica: it authenticated us and
+            // named the serving primary. Follow the hop — the event
+            // loop replaces the Melin connection and the handshake
+            // reruns against the new address (the signing key is only
+            // cleared on success above, so it is still available).
+            ResponseKind::Redirect { addr } => {
+                if self.melin_redirect_hops >= MAX_MELIN_REDIRECT_HOPS {
+                    warn!(
+                        sender = %self.sender_comp_id,
+                        target = %addr,
+                        "Melin redirect hop limit reached — cluster has no settled primary"
+                    );
+                    self.queue_fix_logout(config, "exchange unavailable, retry later");
+                    return SessionAction::Close;
+                }
+                self.melin_redirect_hops += 1;
+                info!(
+                    sender = %self.sender_comp_id,
+                    target = %addr,
+                    hop = self.melin_redirect_hops,
+                    "Melin node is a replica — following redirect to the primary"
+                );
+                SessionAction::RedirectMelin(addr)
+            }
+            // The cluster is mid-failover (no elected primary yet).
+            // Close with a descriptive Logout; the FIX client's standard
+            // reconnect-and-retry loop lands once the election settles.
+            // warn, not error: upstream degradation, not a gateway bug.
+            ResponseKind::ServerBusy => {
+                warn!(
+                    sender = %self.sender_comp_id,
+                    "Melin cluster has no serving primary (failover in progress)"
+                );
+                self.queue_fix_logout(config, "exchange failing over, retry shortly");
+                SessionAction::Close
+            }
             other => {
                 error!(response = ?other, "unexpected Melin auth response");
                 self.queue_fix_logout(config, "internal error");
                 SessionAction::Close
             }
         }
+    }
+
+    /// Queue a FIX Logout for a redirect the event loop could not
+    /// follow (e.g. an IPv6 target on the IPv4-only connect path).
+    pub fn queue_logout_for_redirect_failure(&mut self, config: &GatewayConfig) {
+        self.queue_fix_logout(config, "exchange unavailable, retry later");
+    }
+
+    /// Reset the Melin-side connection state ahead of a redirect
+    /// reconnect, returning the old socket fd for the event loop to
+    /// close. Bumps the connection generation so CQEs still in flight
+    /// for the old socket are recognized as stale, and parks any
+    /// in-flight send buffer the kernel may still be reading.
+    pub fn begin_melin_redirect(&mut self) -> Option<RawFd> {
+        let old_fd = self.melin_fd.take();
+        self.melin_gen = self.melin_gen.wrapping_add(1);
+        self.melin_parse_buf.clear();
+        self.melin_send_buf.clear();
+        if !self.melin_inflight.is_empty() {
+            // The kernel may still read this allocation until the old
+            // send's CQE fires — park it instead of clearing in place.
+            self.stale_melin_inflight = std::mem::take(&mut self.melin_inflight);
+        }
+        self.melin_multishot_active = false;
+        self.auth_nonce = None;
+        self.state = SessionState::ConnectingMelin;
+        old_fd
     }
 
     /// Handle the `RequestSeqHwm` response that follows our
@@ -2091,6 +2182,110 @@ lot_size_inverse = 1
         let melin_payload = &s.melin_send_buf[4..]; // strip length prefix
         let (_seq, req) = codec::decode_request(melin_payload).unwrap();
         assert!(matches!(req, Request::QueryRequestSeq));
+    }
+
+    /// Fresh session parked in AwaitingAuthResult, as if a
+    /// ChallengeResponse had just been sent.
+    fn session_awaiting_auth() -> Session {
+        let mut s = new_session(Instant::now());
+        s.state = SessionState::AwaitingAuthResult;
+        s.sender_comp_id = "FIRM_A".to_owned();
+        s.heartbeat_interval = Duration::from_secs(30);
+        s.signing_key = Some(SigningKey::from_bytes(&[0u8; 32]));
+        s.auth_nonce = Some([0u8; 32]);
+        s
+    }
+
+    #[test]
+    fn redirect_returns_redirect_action_and_keeps_signing_key() {
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = session_awaiting_auth();
+
+        let target: std::net::SocketAddr = "10.0.0.9:4567".parse().unwrap();
+        let payload = encode_response_payload(&ResponseKind::Redirect { addr: target });
+        let action = s.handle_auth_result(&payload, &config);
+
+        assert_eq!(action, SessionAction::RedirectMelin(target));
+        // The signing key must survive: the handshake reruns against
+        // the redirect target and has to sign its challenge.
+        assert!(s.signing_key.is_some());
+        assert_eq!(s.melin_redirect_hops, 1);
+        // The FIX client is not bothered — no Logout queued.
+        assert!(s.fix_send_buf.is_empty());
+    }
+
+    #[test]
+    fn redirect_hop_limit_closes_with_logout() {
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = session_awaiting_auth();
+        s.melin_redirect_hops = MAX_MELIN_REDIRECT_HOPS;
+
+        let target: std::net::SocketAddr = "10.0.0.9:4567".parse().unwrap();
+        let payload = encode_response_payload(&ResponseKind::Redirect { addr: target });
+        let action = s.handle_auth_result(&payload, &config);
+
+        assert_eq!(action, SessionAction::Close);
+        assert!(matches!(s.state, SessionState::Closing));
+        assert!(!s.fix_send_buf.is_empty(), "Logout must be queued");
+    }
+
+    #[test]
+    fn server_busy_closes_with_logout() {
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = session_awaiting_auth();
+
+        let payload = encode_response_payload(&ResponseKind::ServerBusy);
+        let action = s.handle_auth_result(&payload, &config);
+
+        assert_eq!(action, SessionAction::Close);
+        assert!(matches!(s.state, SessionState::Closing));
+        assert!(!s.fix_send_buf.is_empty(), "Logout must be queued");
+    }
+
+    #[test]
+    fn server_ready_resets_redirect_hops() {
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = session_awaiting_auth();
+        s.melin_redirect_hops = 2;
+
+        let payload = encode_response_payload(&ResponseKind::ServerReady);
+        let action = s.handle_auth_result(&payload, &config);
+
+        assert_eq!(action, SessionAction::SendMelin);
+        assert_eq!(
+            s.melin_redirect_hops, 0,
+            "a completed handshake must re-arm the hop budget"
+        );
+    }
+
+    #[test]
+    fn begin_melin_redirect_resets_connection_state() {
+        let mut s = new_session(Instant::now());
+        s.state = SessionState::AwaitingAuthResult;
+        s.melin_fd = Some(42);
+        s.melin_parse_buf.extend_from_slice(b"stale frame bytes");
+        s.melin_send_buf.extend_from_slice(b"queued for old node");
+        s.melin_inflight
+            .extend_from_slice(b"kernel may still read this");
+        s.melin_multishot_active = true;
+        s.auth_nonce = Some([7u8; 32]);
+        let gen_before = s.melin_gen;
+
+        let old_fd = s.begin_melin_redirect();
+
+        assert_eq!(old_fd, Some(42), "old fd handed back for closing");
+        assert_eq!(s.melin_fd, None);
+        assert_eq!(s.melin_gen, gen_before.wrapping_add(1));
+        assert!(s.melin_parse_buf.is_empty());
+        assert!(s.melin_send_buf.is_empty());
+        assert!(
+            s.melin_inflight.is_empty(),
+            "inflight must be parked, not left for the new connection"
+        );
+        assert_eq!(s.stale_melin_inflight, b"kernel may still read this");
+        assert!(!s.melin_multishot_active);
+        assert!(s.auth_nonce.is_none());
+        assert!(matches!(s.state, SessionState::ConnectingMelin));
     }
 
     #[test]
