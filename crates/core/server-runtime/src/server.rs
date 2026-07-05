@@ -419,6 +419,13 @@ pub struct ServerConfig {
     #[arg(long)]
     pub replication_advertise: Option<SocketAddr>,
 
+    /// The client order-entry address this node announces through the
+    /// membership registry — where redirected clients reconnect when
+    /// this node leads after a failover. Defaults to `--bind` when
+    /// that is routable; set this when binding a wildcard.
+    #[arg(long)]
+    pub oe_advertise: Option<SocketAddr>,
+
     /// Interval in milliseconds between automatic shadow snapshots. The
     /// shadow stage replays journaled events on a cloned `A` and saves a
     /// consistent snapshot at this cadence — no hot-path stall. Set to 0
@@ -532,6 +539,7 @@ impl Default for ServerConfig {
             raft_auto_promote: false,
             raft_advertise: None,
             replication_advertise: None,
+            oe_advertise: None,
             snapshot_interval_ms: 3_000_000,
             snapshot_path: None,
             tick_interval_ms: 250,
@@ -914,6 +922,24 @@ where
         // promotion so `run_as_primary` can rebind the same port.
         let replica_health = spawn_replica_health(&config, &fence_state, &raft_status)?;
 
+        // With follow-the-leader enabled, the otherwise-silent client
+        // listener answers with an authenticated redirect to the
+        // current leader; the acceptor hands the listener back at
+        // promotion. Without it, the listener stays idle as before.
+        let listener = match &leader_follow {
+            Some(follow) => {
+                let stop = Arc::new(AtomicBool::new(false));
+                let handle = crate::redirect::spawn(
+                    listener,
+                    Arc::clone(&authorized_keys),
+                    follow.clone(),
+                    Arc::clone(&stop),
+                )?;
+                ReplicaListener::Redirecting(handle, stop)
+            }
+            None => ReplicaListener::Idle(listener),
+        };
+
         // No local rotation triggers on the replica side: segment
         // rotation is primary-driven (the replica adopts the boundaries
         // announced over the replication stream), so replica journals
@@ -939,6 +965,8 @@ where
         )? {
             None => {
                 stop_replica_health(replica_health);
+                // Reclaimed only to stop the acceptor thread cleanly.
+                let _listener = listener.reclaim()?;
                 return Ok(()); // clean shutdown
             }
             Some((mut exchange, writer)) => {
@@ -946,8 +974,10 @@ where
                 // paused/partitioned ex-primary is fenced when it reconnects.
                 info!("replica promoted — transitioning to primary");
                 // Free the replica health port before `run_as_primary`
-                // rebinds `--health-bind`.
+                // rebinds `--health-bind`, and take the client listener
+                // back from the redirect acceptor.
                 stop_replica_health(replica_health);
+                let listener = listener.reclaim()?;
                 <A as Application>::prefault(&mut exchange);
 
                 // A ROTATE received while this node was a replica latched
@@ -3341,6 +3371,15 @@ fn build_raft_config(
         (None, _) => None,
     };
 
+    let advertise_order_entry_addr = match (config.oe_advertise, config.bind) {
+        (Some(addr), _) if addr.ip().is_unspecified() => {
+            return Err("--oe-advertise must be a routable address, not a wildcard".into());
+        }
+        (Some(addr), _) => Some(addr),
+        (None, bind) if !bind.ip().is_unspecified() => Some(bind),
+        (None, _) => None,
+    };
+
     // Default raft dir: a sibling of the journal, so the durable vote
     // lives on the same volume/backup policy as the journal itself.
     let dir = config.raft_dir.clone().unwrap_or_else(|| {
@@ -3358,6 +3397,7 @@ fn build_raft_config(
             dir,
             advertise_raft_addr,
             advertise_replication_addr,
+            advertise_order_entry_addr,
             auto_promote: config.raft_auto_promote,
         },
     )))
@@ -3462,6 +3502,29 @@ fn spawn_replica_health(
 /// Stop the replica health endpoint and join its thread so the listen
 /// socket is released — called on the promotion path before
 /// `run_as_primary` rebinds `--health-bind`, and on clean shutdown.
+/// The replica-phase custody of the client listener: either lent to
+/// the redirect acceptor (follow-the-leader deployments) or held idle
+/// exactly as before. `reclaim` funnels both back into a plain `L` for
+/// `run_as_primary` / teardown.
+enum ReplicaListener<L> {
+    Redirecting(std::thread::JoinHandle<L>, Arc<AtomicBool>),
+    Idle(L),
+}
+
+impl<L> ReplicaListener<L> {
+    fn reclaim(self) -> Result<L, Box<dyn std::error::Error>> {
+        match self {
+            ReplicaListener::Idle(listener) => Ok(listener),
+            ReplicaListener::Redirecting(handle, stop) => {
+                stop.store(true, Ordering::Release);
+                handle
+                    .join()
+                    .map_err(|_| "client redirect acceptor thread panicked".into())
+            }
+        }
+    }
+}
+
 fn stop_replica_health(health: Option<ReplicaHealth>) {
     if let Some((handle, stop)) = health {
         stop.store(true, Ordering::Release);

@@ -189,6 +189,9 @@ pub enum ResponseKind {
     /// sending requests. Used for readiness synchronization in LAN
     /// benchmarks where the client can't observe server startup.
     ServerReady,
+    /// This node is not the serving primary — reconnect to `addr`
+    /// (the cluster's current leader). Sent post-auth by replicas.
+    Redirect { addr: std::net::SocketAddr },
     /// Keepalive heartbeat sent during idle periods. Tag-only, no payload.
     Heartbeat,
     /// Challenge sent by the server after accepting a connection.

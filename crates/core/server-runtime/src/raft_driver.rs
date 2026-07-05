@@ -136,6 +136,10 @@ pub struct RaftDriverConfig {
     /// where a replica dials to follow it when it leads. `None` when
     /// the node cannot serve replicas (no usable `--replication-bind`).
     pub advertise_replication_addr: Option<SocketAddr>,
+    /// The client order-entry address this node announces — where a
+    /// redirected client reconnects when this node leads. `None` when
+    /// no routable client address is available.
+    pub advertise_order_entry_addr: Option<SocketAddr>,
     /// Act on elections instead of only observing them
     /// (`--raft-auto-promote`): a replica that wins leadership files a
     /// promotion request (subject to [`auto_promotion_decision`]), and
@@ -193,6 +197,14 @@ impl ClusterDirectory {
             Err(_) => None,
         }
     }
+
+    /// The announced client order-entry address of `node_id`, if known.
+    pub fn order_entry_addr(&self, node_id: u64) -> Option<SocketAddr> {
+        match self.inner.read() {
+            Ok(guard) => guard.get(node_id).and_then(|r| r.order_entry_addr),
+            Err(_) => None,
+        }
+    }
 }
 
 /// A replica's handle for following the control-plane leader on the
@@ -217,6 +229,21 @@ impl LeaderFollow {
             0 => None,
             id if id == self.self_node_id => None,
             id => self.directory.replication_addr(id),
+        }
+    }
+
+    /// The current leader's announced client order-entry address —
+    /// what a replica's redirect acceptor points clients at. Same
+    /// `None` cases as [`Self::leader_replication_addr`]. Under
+    /// `--raft-auto-promote` the post-failover leader IS the serving
+    /// primary, which is when redirects matter; pre-failover a client
+    /// pointed at a replica may bounce once via a replica-leader and
+    /// then sees "busy" — bounded on the client side.
+    pub fn leader_order_entry_addr(&self) -> Option<SocketAddr> {
+        match self.status.leader_id.load(Ordering::Relaxed) {
+            0 => None,
+            id if id == self.self_node_id => None,
+            id => self.directory.order_entry_addr(id),
         }
     }
 }
@@ -429,6 +456,7 @@ fn run(
         node_id: config.node_id,
         raft_addr: config.advertise_raft_addr,
         replication_addr: config.advertise_replication_addr,
+        order_entry_addr: config.advertise_order_entry_addr,
         public_key: context.signing_key.verifying_key().to_bytes(),
     };
     let mut next_announce = Instant::now();
@@ -1482,6 +1510,7 @@ mod tests {
                 dir: dir.path().to_path_buf(),
                 advertise_raft_addr: addrs[&id],
                 advertise_replication_addr: None,
+                advertise_order_entry_addr: None,
                 auto_promote: false,
             };
             let context = RaftDriverContext {

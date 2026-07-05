@@ -495,8 +495,8 @@ cluster acts on elections:
 
 With auto-promotion enabled the cluster also maintains a replicated
 **membership registry**: each node announces its identity — raft
-address, replication address, public key — into the raft log, and
-every node applies the committed records. The registry supersedes the
+address, replication address, order-entry address, public key — into
+the raft log, and every node applies the committed records. The registry supersedes the
 static `--raft-peer` entries per node (they remain the bootstrap
 hint), so a node that restarts at a new address is re-dialed at its
 announced one, and divergent static configurations converge on the
@@ -519,11 +519,32 @@ resumes at the full contract with **zero operator steps**. Give every
 replica a `--replication-bind` (and, if wildcard, an advertise
 address) so it can serve the other survivors after it promotes.
 
+**Clients follow the leader too.** A client that connects to a
+replica (a stale DNS entry, an ops mistake, or a gateway that hasn't
+learned about a failover yet) is not silently ignored: the replica
+authenticates the client with the normal challenge handshake, then
+answers with a redirect carrying the current leader's order-entry
+address, and the native TCP client reconnects there transparently
+(bounded to a few hops, so a stale hint can never loop forever).
+Authentication comes first deliberately — cluster topology is never
+disclosed to an unauthenticated connection. While the cluster has no
+elected leader — mid-election, or before the new primary has
+announced itself — the replica answers "busy, retry shortly" instead,
+so the client knows to back off and try again rather than fail hard.
+The redirect target is the address each node announces in the
+membership registry; nodes binding a wildcard client address must say
+what to advertise via `--oe-advertise`. Combined with follow-the-leader
+above, this completes the hands-off story: kill the primary, the
+winner promotes, the survivor reattaches, and a client pointed at
+**any** surviving node lands on the new primary with zero
+reconfiguration.
+
 DPDK-transport replicas do not re-target yet — they keep their static
 `--replica-of` across failovers (re-targeting a DPDK session needs
 neighbor discovery for the new primary; it lands together with DPDK
 promotion). Kernel-TCP replicas — including replicas of a DPDK
-primary — follow the leader as described.
+primary — follow the leader as described. Client redirects are
+likewise kernel-TCP only for now.
 
 Each raft node needs its **own distinct** `--replication-key`, and
 every node's public key must carry `replication` permission in every

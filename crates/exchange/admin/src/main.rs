@@ -1501,6 +1501,7 @@ fn client_thread(
                         ResponseKind::ServerBusy => "SERVER BUSY (pipeline full)".into(),
                         ResponseKind::BatchEnd
                         | ResponseKind::ServerReady
+                        | ResponseKind::Redirect { .. }
                         | ResponseKind::Heartbeat
                         | ResponseKind::Challenge { .. }
                         | ResponseKind::AuthFailed

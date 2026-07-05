@@ -19,6 +19,7 @@ pub const TAG_CHALLENGE: u8 = 0x05;
 pub const TAG_CHALLENGE_RESPONSE: u8 = 0x06;
 pub const TAG_AUTH_FAILED: u8 = 0x07;
 pub const TAG_SERVER_READY: u8 = 0x08;
+pub const TAG_REDIRECT: u8 = 0x09;
 
 /// Encode a transport-level response into `buf`.
 ///
@@ -29,9 +30,11 @@ pub fn encode_transport_response(
     response: &TransportResponse,
     buf: &mut [u8],
 ) -> Result<usize, ProtocolError> {
-    // 4-byte length prefix + 1-byte tag; Challenge adds 32 nonce bytes.
+    // 4-byte length prefix + 1-byte tag; Challenge adds 32 nonce
+    // bytes, Redirect a fixed 19-byte address block.
     let needed = match response {
         TransportResponse::Challenge { .. } => 4 + 1 + 32,
+        TransportResponse::Redirect { .. } => 4 + 1 + 19,
         _ => 4 + 1,
     };
     if buf.len() < needed {
@@ -70,6 +73,23 @@ pub fn encode_transport_response(
         TransportResponse::ServerReady => {
             buf[pos] = TAG_SERVER_READY;
             pos += 1;
+        }
+        TransportResponse::Redirect { addr } => {
+            // Fixed layout — family(1) + ip(16, v4 zero-padded) +
+            // port(2 LE) — so the frame stays fixed-size like every
+            // other control variant (no string parsing on either end).
+            buf[pos] = TAG_REDIRECT;
+            pos += 1;
+            let (family, octets) = match addr.ip() {
+                std::net::IpAddr::V4(ip) => (4u8, ip.to_ipv6_mapped().octets()),
+                std::net::IpAddr::V6(ip) => (6u8, ip.octets()),
+            };
+            buf[pos] = family;
+            pos += 1;
+            buf[pos..pos + 16].copy_from_slice(&octets);
+            pos += 16;
+            buf[pos..pos + 2].copy_from_slice(&addr.port().to_le_bytes());
+            pos += 2;
         }
     }
 
@@ -118,6 +138,22 @@ pub fn decode_challenge_response(buf: &[u8]) -> Result<(u64, ChallengeResponse),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_encodes_fixed_family_ip_port() {
+        for (addr, family) in [("127.0.0.1:9876", 4u8), ("[2001:db8::1]:19876", 6u8)] {
+            let addr: std::net::SocketAddr = addr.parse().expect("addr");
+            let mut buf = [0u8; 32];
+            let written =
+                encode_transport_response(&TransportResponse::Redirect { addr }, &mut buf)
+                    .expect("encode");
+            assert_eq!(written, 4 + 1 + 19, "{addr}");
+            assert_eq!(buf[4], TAG_REDIRECT);
+            assert_eq!(buf[5], family);
+            let port = u16::from_le_bytes(buf[22..24].try_into().expect("len 2"));
+            assert_eq!(port, addr.port());
+        }
+    }
 
     #[test]
     fn round_trip_tag_only_variants() {

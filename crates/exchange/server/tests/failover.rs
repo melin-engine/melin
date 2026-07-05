@@ -4467,6 +4467,21 @@ fn raft_auto_promotes_surviving_replica_after_primary_kill() {
     );
     drop(client);
 
+    // A client pointed at the LOSING replica authenticates and is
+    // redirected to the winner — the cluster is its own service
+    // discovery, no VIP/DNS step. `Client::connect` follows the hop;
+    // the resting order proves it landed on the serving primary.
+    let mut redirected = connect_with_timeout(replicas[&loser].client_addr, &trader_key);
+    let r = submit_order(&mut redirected, 101, 1, 1, Side::Buy, 90, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "redirected client must trade on the promoted primary: {r:?}"
+    );
+    drop(redirected);
+
     // The losing replica must NOT have promoted: not leader, still
     // halted (a replica reports `trading == false` until promotion).
     assert_eq!(

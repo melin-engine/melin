@@ -19,6 +19,7 @@ pub mod process;
 pub mod promotion;
 pub mod raft_driver;
 pub mod reader;
+mod redirect;
 pub mod replication;
 pub mod response;
 pub mod server;

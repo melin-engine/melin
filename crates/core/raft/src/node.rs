@@ -535,6 +535,7 @@ mod sim {
             node_id: id,
             raft_addr: format!("127.0.0.1:{}", 7000 + id).parse().expect("addr"),
             replication_addr: Some(format!("10.0.0.{}:9877", id % 250).parse().expect("addr")),
+            order_entry_addr: None,
             public_key: [id as u8; 32],
         }
     }

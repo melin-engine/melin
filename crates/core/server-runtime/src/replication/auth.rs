@@ -33,7 +33,7 @@ use super::receiver_transport::{FrameResult, compact_recv_buf, try_extract_frame
 ///
 /// Shared by the blocking [`authenticate_replica`] and the non-blocking DPDK
 /// sender state machine so both issue challenges identically.
-pub(super) fn generate_challenge_nonce() -> io::Result<[u8; 32]> {
+pub(crate) fn generate_challenge_nonce() -> io::Result<[u8; 32]> {
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
     Ok(nonce)

@@ -61,7 +61,7 @@ impl Client {
     /// replica attached) will hang here forever. Callers that need a
     /// bounded wait should use [`Client::connect_with_timeout`].
     pub fn connect(addr: SocketAddr, key: &SigningKey) -> Result<Self, ClientError> {
-        Self::connect_inner(addr, key, None)
+        Self::connect_following_redirects(addr, key, None)
     }
 
     /// Like [`Client::connect`], but bounds every read on the
@@ -82,7 +82,32 @@ impl Client {
         key: &SigningKey,
         timeout: std::time::Duration,
     ) -> Result<Self, ClientError> {
-        Self::connect_inner(addr, key, Some(timeout))
+        Self::connect_following_redirects(addr, key, Some(timeout))
+    }
+
+    /// Follow `Redirect` responses from non-primary nodes, bounded so
+    /// a confused cluster (e.g. two replicas pointing at each other
+    /// mid-election) surfaces [`ClientError::Redirected`] instead of
+    /// looping. Two hops cover the real case — a replica naming the
+    /// newly promoted primary — with one spare.
+    fn connect_following_redirects(
+        addr: SocketAddr,
+        key: &SigningKey,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Self, ClientError> {
+        const MAX_REDIRECT_HOPS: usize = 3;
+        let mut target = addr;
+        let mut last = None;
+        for _ in 0..MAX_REDIRECT_HOPS {
+            match Self::connect_inner(target, key, timeout) {
+                Err(ClientError::Redirected(next)) => {
+                    last = Some(next);
+                    target = next;
+                }
+                other => return other,
+            }
+        }
+        Err(ClientError::Redirected(last.unwrap_or(target)))
     }
 
     /// Shared body for [`Client::connect`] and
@@ -137,6 +162,15 @@ impl Client {
             ResponseKind::ServerReady => {}
             ResponseKind::AuthFailed => {
                 return Err(ClientError::AuthFailed);
+            }
+            // A replica naming the serving primary — the caller
+            // (`connect_following_redirects`) reconnects there.
+            ResponseKind::Redirect { addr } => {
+                return Err(ClientError::Redirected(addr));
+            }
+            // A replica that knows no primary yet (mid-election).
+            ResponseKind::ServerBusy => {
+                return Err(ClientError::ServerBusy);
             }
             _ => {
                 return Err(ClientError::Protocol(ProtocolError::InvalidField(

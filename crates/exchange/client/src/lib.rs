@@ -22,6 +22,10 @@ pub enum ClientError {
     AuthFailed,
     /// Server pipeline is full. The caller should retry after a brief backoff.
     ServerBusy,
+    /// The contacted node is not the serving primary and redirected to
+    /// `addr` too many times (`connect` follows a bounded number of
+    /// hops automatically before surfacing this).
+    Redirected(std::net::SocketAddr),
 }
 
 impl std::fmt::Display for ClientError {
@@ -32,6 +36,9 @@ impl std::fmt::Display for ClientError {
             Self::Disconnected => write!(f, "disconnected from server"),
             Self::AuthFailed => write!(f, "authentication failed"),
             Self::ServerBusy => write!(f, "server busy (pipeline full), retry after backoff"),
+            Self::Redirected(addr) => {
+                write!(f, "node is not the serving primary (redirected to {addr})")
+            }
         }
     }
 }

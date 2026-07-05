@@ -3,6 +3,8 @@
 //! they exist for connection management, auth handshakes, and pipeline
 //! control — not for business messages.
 
+use std::net::SocketAddr;
+
 /// Connection identifier assigned by the server.
 ///
 /// `u64` — monotonically increasing, never reused within a server
@@ -35,6 +37,11 @@ pub enum TransportResponse {
     AuthFailed,
     /// Auth handshake: server → client success.
     ServerReady,
+    /// Auth handshake: server → client "not here" — this node is not
+    /// the serving primary; reconnect to `addr` (the cluster's current
+    /// leader). Sent only *after* the challenge-response verifies, so
+    /// an unauthenticated scanner cannot map the cluster topology.
+    Redirect { addr: SocketAddr },
 }
 
 /// Auth handshake: client → server response to a [`TransportResponse::Challenge`].

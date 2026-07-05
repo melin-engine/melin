@@ -37,6 +37,10 @@ pub struct MemberRecord {
     /// (`--replication-bind`) — where a replica dials to follow this
     /// node when it leads. `None` when the node cannot serve replicas.
     pub replication_addr: Option<SocketAddr>,
+    /// The node's client order-entry address (`--bind`) — where a
+    /// redirected client reconnects when this node leads. `None` when
+    /// the node has no routable client address to announce.
+    pub order_entry_addr: Option<SocketAddr>,
     /// The node's Ed25519 replication public key, pinning its identity
     /// on control-plane connections.
     pub public_key: [u8; 32],
@@ -58,6 +62,7 @@ impl MemberRecord {
         buf.extend_from_slice(&self.node_id.to_le_bytes());
         encode_addr(&mut buf, Some(self.raft_addr));
         encode_addr(&mut buf, self.replication_addr);
+        encode_addr(&mut buf, self.order_entry_addr);
         buf.extend_from_slice(&self.public_key);
         buf
     }
@@ -75,6 +80,7 @@ impl MemberRecord {
         let raft_addr = take_addr(&mut r)?
             .ok_or_else(|| io::Error::other("member record without a raft address"))?;
         let replication_addr = take_addr(&mut r)?;
+        let order_entry_addr = take_addr(&mut r)?;
         let public_key: [u8; 32] = take_bytes(&mut r, 32)?
             .try_into()
             .map_err(|_| io::Error::other("short public key"))?;
@@ -85,6 +91,7 @@ impl MemberRecord {
             node_id,
             raft_addr,
             replication_addr,
+            order_entry_addr,
             public_key,
         }))
     }
@@ -243,6 +250,7 @@ mod tests {
             node_id: id,
             raft_addr: format!("127.0.0.1:{}", 7000 + id).parse().expect("addr"),
             replication_addr: Some(format!("10.0.0.{id}:9877").parse().expect("addr")),
+            order_entry_addr: Some(format!("10.0.0.{id}:9876").parse().expect("addr")),
             public_key: [id as u8; 32],
         }
     }
