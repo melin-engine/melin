@@ -180,7 +180,9 @@ pub struct ClusterDirectory {
 
 impl ClusterDirectory {
     /// Replace the directory with the latest applied registry.
-    fn update(&self, registry: &Registry) {
+    /// pub(crate) so the redirect acceptor's tests can stage a
+    /// directory without a live raft driver.
+    pub(crate) fn update(&self, registry: &Registry) {
         match self.inner.write() {
             Ok(mut guard) => *guard = registry.clone(),
             // Poisoning requires a panic under the lock; the driver is
@@ -190,20 +192,32 @@ impl ClusterDirectory {
         }
     }
 
-    /// The announced replication address of `node_id`, if known.
-    pub fn replication_addr(&self, node_id: u64) -> Option<SocketAddr> {
+    /// One field of `node_id`'s committed record, selected by `pick` —
+    /// the shared read for every per-node address accessor so the
+    /// lock-poisoning policy lives in one place. A poisoned lock (a
+    /// panic under the writer — see `update`, the only writer) reads as
+    /// "unknown": callers treat a missing address and an unreadable
+    /// directory identically, and `update` already warns when the
+    /// directory goes stale.
+    fn member_field(
+        &self,
+        node_id: u64,
+        pick: impl Fn(&MemberRecord) -> Option<SocketAddr>,
+    ) -> Option<SocketAddr> {
         match self.inner.read() {
-            Ok(guard) => guard.get(node_id).and_then(|r| r.replication_addr),
+            Ok(guard) => guard.get(node_id).and_then(pick),
             Err(_) => None,
         }
     }
 
+    /// The announced replication address of `node_id`, if known.
+    pub fn replication_addr(&self, node_id: u64) -> Option<SocketAddr> {
+        self.member_field(node_id, |r| r.replication_addr)
+    }
+
     /// The announced client order-entry address of `node_id`, if known.
     pub fn order_entry_addr(&self, node_id: u64) -> Option<SocketAddr> {
-        match self.inner.read() {
-            Ok(guard) => guard.get(node_id).and_then(|r| r.order_entry_addr),
-            Err(_) => None,
-        }
+        self.member_field(node_id, |r| r.order_entry_addr)
     }
 }
 
@@ -221,15 +235,27 @@ pub struct LeaderFollow {
 }
 
 impl LeaderFollow {
+    /// The leader guard shared by every leader-address accessor: `None`
+    /// while leaderless (id 0 sentinel) or while this node itself
+    /// leads; otherwise the leader's record field selected by `pick`.
+    /// One place for the sentinel/self-exclusion subtlety so a future
+    /// correction cannot land on one address kind and miss the other.
+    fn leader_field(
+        &self,
+        pick: impl Fn(&ClusterDirectory, u64) -> Option<SocketAddr>,
+    ) -> Option<SocketAddr> {
+        match self.status.leader_id.load(Ordering::Relaxed) {
+            0 => None,
+            id if id == self.self_node_id => None,
+            id => pick(&self.directory, id),
+        }
+    }
+
     /// The current leader's announced replication address — `None`
     /// while leaderless, while this node itself leads, or while the
     /// leader has not announced a followable address.
     pub fn leader_replication_addr(&self) -> Option<SocketAddr> {
-        match self.status.leader_id.load(Ordering::Relaxed) {
-            0 => None,
-            id if id == self.self_node_id => None,
-            id => self.directory.replication_addr(id),
-        }
+        self.leader_field(|d, id| d.replication_addr(id))
     }
 
     /// The current leader's announced client order-entry address —
@@ -240,11 +266,7 @@ impl LeaderFollow {
     /// pointed at a replica may bounce once via a replica-leader and
     /// then sees "busy" — bounded on the client side.
     pub fn leader_order_entry_addr(&self) -> Option<SocketAddr> {
-        match self.status.leader_id.load(Ordering::Relaxed) {
-            0 => None,
-            id if id == self.self_node_id => None,
-            id => self.directory.order_entry_addr(id),
-        }
+        self.leader_field(|d, id| d.order_entry_addr(id))
     }
 }
 

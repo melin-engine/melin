@@ -3356,29 +3356,13 @@ fn build_raft_config(
                 .into(),
         );
     }
-    let advertise_replication_addr = match (config.replication_advertise, config.replication_bind) {
-        (Some(addr), _) if addr.ip().is_unspecified() => {
-            return Err(
-                "--replication-advertise must be a routable address, not a wildcard".into(),
-            );
-        }
-        (Some(addr), _) => Some(addr),
-        (None, Some(bind)) if !bind.ip().is_unspecified() => Some(bind),
-        // Wildcard replication bind without an advertise override, or
-        // no replication listener at all: announce nothing — the node
-        // cannot be followed after promoting (logged by the driver's
-        // consumers when it matters).
-        (None, _) => None,
-    };
-
-    let advertise_order_entry_addr = match (config.oe_advertise, config.bind) {
-        (Some(addr), _) if addr.ip().is_unspecified() => {
-            return Err("--oe-advertise must be a routable address, not a wildcard".into());
-        }
-        (Some(addr), _) => Some(addr),
-        (None, bind) if !bind.ip().is_unspecified() => Some(bind),
-        (None, _) => None,
-    };
+    let advertise_replication_addr = resolve_advertise(
+        config.replication_advertise,
+        config.replication_bind,
+        "--replication-advertise",
+    )?;
+    let advertise_order_entry_addr =
+        resolve_advertise(config.oe_advertise, Some(config.bind), "--oe-advertise")?;
 
     // Default raft dir: a sibling of the journal, so the durable vote
     // lives on the same volume/backup policy as the journal itself.
@@ -3401,6 +3385,28 @@ fn build_raft_config(
             auto_promote: config.raft_auto_promote,
         },
     )))
+}
+
+/// Resolve one registry-announced address: an explicit advertise flag
+/// wins (but must be routable — announcing a wildcard would hand peers
+/// an address they cannot dial), else a routable bind address is a
+/// usable default, else announce nothing (a wildcard bind means
+/// "everywhere locally"; the driver's consumers log the absence when
+/// it matters). One resolver for every advertised address so the
+/// validation policy cannot drift between flags.
+fn resolve_advertise(
+    advertise: Option<SocketAddr>,
+    bind: Option<SocketAddr>,
+    flag: &str,
+) -> Result<Option<SocketAddr>, Box<dyn std::error::Error>> {
+    match (advertise, bind) {
+        (Some(addr), _) if addr.ip().is_unspecified() => {
+            Err(format!("{flag} must be a routable address, not a wildcard").into())
+        }
+        (Some(addr), _) => Ok(Some(addr)),
+        (None, Some(bind)) if !bind.ip().is_unspecified() => Ok(Some(bind)),
+        (None, _) => Ok(None),
+    }
 }
 
 /// Spawn the control-plane raft driver if configured. Returns the
@@ -3499,11 +3505,8 @@ fn spawn_replica_health(
     Ok(Some((handle, stop)))
 }
 
-/// Stop the replica health endpoint and join its thread so the listen
-/// socket is released — called on the promotion path before
-/// `run_as_primary` rebinds `--health-bind`, and on clean shutdown.
-/// The replica-phase custody of the client listener: either lent to
-/// the redirect acceptor (follow-the-leader deployments) or held idle
+/// Replica-phase custody of the client listener: either lent to the
+/// redirect acceptor (follow-the-leader deployments) or held idle
 /// exactly as before. `reclaim` funnels both back into a plain `L` for
 /// `run_as_primary` / teardown.
 enum ReplicaListener<L> {
@@ -3512,6 +3515,13 @@ enum ReplicaListener<L> {
 }
 
 impl<L> ReplicaListener<L> {
+    /// Take the listener back. The acceptor thread only accepts and
+    /// spawns (client handshakes run on their own detached threads), so
+    /// the join is bounded by its accept-poll tick — promotion never
+    /// waits on a client. A join error means the acceptor panicked and
+    /// the listener unwound with it; without a client listener the node
+    /// cannot serve as primary, so propagating the error (and exiting
+    /// for the supervisor to restart) is deliberate.
     fn reclaim(self) -> Result<L, Box<dyn std::error::Error>> {
         match self {
             ReplicaListener::Idle(listener) => Ok(listener),
@@ -3525,6 +3535,9 @@ impl<L> ReplicaListener<L> {
     }
 }
 
+/// Stop the replica health endpoint and join its thread so the listen
+/// socket is released — called on the promotion path before
+/// `run_as_primary` rebinds `--health-bind`, and on clean shutdown.
 fn stop_replica_health(health: Option<ReplicaHealth>) {
     if let Some((handle, stop)) = health {
         stop.store(true, Ordering::Release);
@@ -3610,6 +3623,52 @@ where
     Ok(Some(event_handle))
 }
 
+/// Maximum accepted client auth-frame length. ChallengeResponse is
+/// 8 (seq) + 1 (tag) + 64 (signature) + 32 (public key) = 105 bytes
+/// today; the slack tolerates frame growth (e.g. real ephemeral keys)
+/// without a lockstep client upgrade. Shared with the replica-side
+/// redirect acceptor so both paths accept identical frames.
+pub(crate) const MAX_CLIENT_AUTH_FRAME: usize = 256;
+
+/// Verify a client's `ChallengeResponse` frame against the `nonce` we
+/// issued: decode, look the key up in the operator's `AuthorizedKeys`,
+/// and check the Ed25519 signature. Returns the key's permission and
+/// bytes on success.
+///
+/// Pure (no I/O) on purpose — the primary's accept loop and the
+/// replica-side redirect acceptor both call this, so the
+/// security-critical verification can never diverge between the
+/// serving and redirecting paths (same rationale as the replication
+/// transport's `verify_challenge_response`).
+pub(crate) fn verify_client_challenge_response(
+    nonce: &[u8; 32],
+    frame: &[u8],
+    authorized_keys: &AuthorizedKeys,
+) -> std::io::Result<(Permission, [u8; 32])> {
+    use std::io;
+
+    use ed25519_dalek::{Verifier, VerifyingKey};
+    use melin_wire_protocol::control_codec;
+
+    let (_seq, cr) = control_codec::decode_challenge_response(frame)
+        .map_err(|e| io::Error::other(format!("decode ChallengeResponse: {e}")))?;
+
+    let permission = authorized_keys
+        .lookup(&cr.public_key)
+        .ok_or_else(|| io::Error::other("unknown public key"))?;
+
+    // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
+    // client_eph`. TCP path's ephs are zeros — see the Challenge send.
+    let verifying_key = VerifyingKey::from_bytes(&cr.public_key)
+        .map_err(|e| io::Error::other(format!("invalid public key: {e}")))?;
+    let signature = ed25519_dalek::Signature::from_bytes(&cr.signature);
+    verifying_key
+        .verify(nonce, &signature)
+        .map_err(|e| io::Error::other(format!("signature verification failed: {e}")))?;
+
+    Ok((permission, cr.public_key))
+}
+
 /// Perform challenge-response authentication on a new connection.
 ///
 /// Runs on the accept thread (cold path, blocking). The caller must set
@@ -3629,7 +3688,6 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
 ) -> Result<(Permission, [u8; 32]), Box<dyn std::error::Error>> {
     use std::io;
 
-    use ed25519_dalek::{Verifier, VerifyingKey};
     use melin_wire_protocol::control::TransportResponse;
     use melin_wire_protocol::control_codec;
 
@@ -3654,46 +3712,23 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         .read_exact(&mut len_buf)
         .map_err(|e| io::Error::other(format!("read auth frame length: {e}")))?;
     let frame_len = u32::from_le_bytes(len_buf) as usize;
-    // ChallengeResponse is 1 (tag) + 64 (signature) + 32 (public key) = 97 bytes.
-    if frame_len > 256 {
+    if frame_len > MAX_CLIENT_AUTH_FRAME {
         send_auth_failed(writer);
         return Err(io::Error::other(format!("auth frame too large: {frame_len}")).into());
     }
-    let mut frame_buf = [0u8; 256];
+    let mut frame_buf = [0u8; MAX_CLIENT_AUTH_FRAME];
     reader
         .read_exact(&mut frame_buf[..frame_len])
         .map_err(|e| io::Error::other(format!("read auth frame payload: {e}")))?;
 
-    let (_seq, cr) = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
-        Ok(pair) => pair,
-        Err(e) => {
-            send_auth_failed(writer);
-            return Err(io::Error::other(format!("decode ChallengeResponse: {e}")).into());
-        }
-    };
-
-    let (signature_bytes, public_key_bytes) = (cr.signature, cr.public_key);
-
-    // Look up the public key in authorized_keys.
-    let permission = match authorized_keys.lookup(&public_key_bytes) {
-        Some(perm) => perm,
-        None => {
-            send_auth_failed(writer);
-            return Err("unknown public key".into());
-        }
-    };
-
-    // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
-    // client_eph`. TCP path's ephs are zeros — see Challenge above.
-    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-        send_auth_failed(writer);
-        io::Error::other(format!("invalid public key: {e}"))
-    })?;
-    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    verifying_key.verify(&nonce, &signature).map_err(|e| {
-        send_auth_failed(writer);
-        io::Error::other(format!("signature verification failed: {e}"))
-    })?;
+    let (permission, public_key_bytes) =
+        match verify_client_challenge_response(&nonce, &frame_buf[..frame_len], authorized_keys) {
+            Ok(pair) => pair,
+            Err(e) => {
+                send_auth_failed(writer);
+                return Err(e.into());
+            }
+        };
 
     // Auth succeeded — send ServerReady.
     let written =
