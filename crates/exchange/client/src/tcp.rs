@@ -83,6 +83,13 @@ impl Client {
     /// `TimedOut` error wrapped in [`ClientError::Io`] instead of
     /// hanging.
     ///
+    /// Granularity: the budget is re-armed before every frame read, so
+    /// the bound can overshoot by at most one in-progress frame — a
+    /// pathological peer dribbling bytes *within* a single frame can
+    /// stretch that final frame. The nodes this dials are the venue's
+    /// own authenticated infrastructure, so the per-frame granularity
+    /// is deliberate; it is not a defense against a hostile server.
+    ///
     /// The read timeout on the returned socket is cleared before
     /// return, so post-connect calls (`send_request`, etc.) behave
     /// exactly like the untimed [`Client::connect`] path. Callers that
@@ -125,10 +132,13 @@ impl Client {
         loop {
             match Self::connect_inner(target, key, deadline) {
                 Err(ClientError::Redirected(next)) => {
-                    hops += 1;
+                    // Check before counting so exactly
+                    // MAX_REDIRECT_HOPS redirects are *followed* —
+                    // the surplus one is returned unfollowed.
                     if hops >= MAX_REDIRECT_HOPS {
                         return Err(ClientError::Redirected(next));
                     }
+                    hops += 1;
                     target = next;
                 }
                 Err(ClientError::ServerBusy) => {
@@ -146,8 +156,11 @@ impl Client {
 
     /// Remaining budget until `deadline`, as a `Duration` suitable for
     /// socket-timeout arming. `Ok(None)` when no deadline is set;
-    /// `TimedOut` once the budget is spent (zero would mean "no
-    /// timeout" to the socket APIs, silently unbounding the wait).
+    /// `TimedOut` once within a millisecond of the deadline — the
+    /// socket APIs treat a zero (or truncated-to-zero) timeout as "no
+    /// timeout", so a sub-millisecond remainder must round to expiry,
+    /// never to an unbounded wait. Same floor as the server-side
+    /// redirect acceptor's budget check.
     fn remaining(
         deadline: Option<std::time::Instant>,
     ) -> Result<Option<std::time::Duration>, ClientError> {
@@ -155,7 +168,7 @@ impl Client {
             None => Ok(None),
             Some(d) => {
                 let rem = d.saturating_duration_since(std::time::Instant::now());
-                if rem.is_zero() {
+                if rem < std::time::Duration::from_millis(1) {
                     return Err(ClientError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "connect deadline exceeded",
@@ -204,6 +217,9 @@ impl Client {
         let response = codec::decode_response(frame)?;
         let nonce = match response {
             ResponseKind::Challenge { nonce } => nonce,
+            // A replica shedding load answers busy before the
+            // challenge — re-enters the caller's backoff loop.
+            ResponseKind::ServerBusy => return Err(ClientError::ServerBusy),
             _ => {
                 return Err(ClientError::Protocol(ProtocolError::InvalidField(
                     "expected Challenge",
@@ -258,8 +274,7 @@ impl Client {
         // Step 5: Adopt the engine's per-key request_seq HWM so the next
         // request lands at HWM + 1 instead of 1 (which would dedup if a
         // prior session under this key already advanced the counter).
-        Self::arm_read_deadline(client.reader.get_ref(), deadline)?;
-        client.synchronize_request_seq()?;
+        client.synchronize_request_seq_with_deadline(deadline)?;
 
         // Restore the default (untimed) read behaviour before handing
         // the client back, so post-connect calls match `connect`'s
@@ -287,6 +302,19 @@ impl Client {
     ///
     /// Returns the list of responses (excluding the BatchEnd marker itself).
     pub fn send_request(&mut self, request: &Request) -> Result<Vec<ResponseKind>, ClientError> {
+        self.send_request_with_deadline(request, None)
+    }
+
+    /// [`Client::send_request`] under the connect deadline: the read
+    /// timeout is re-armed with the *remaining* budget before every
+    /// frame, so a server streaming heartbeats (consumed silently
+    /// below) cannot hold a bounded connect open past its deadline.
+    /// A `None` deadline makes the arming a no-op.
+    fn send_request_with_deadline(
+        &mut self,
+        request: &Request,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<ResponseKind>, ClientError> {
         // Increment the per-connection request sequence before each send.
         // The server uses (key_hash, request_seq) for idempotency dedup.
         self.next_seq += 1;
@@ -300,6 +328,7 @@ impl Client {
         // idle periods are silently consumed (not part of a request batch).
         let mut responses = Vec::new();
         loop {
+            Self::arm_read_deadline(self.reader.get_ref(), deadline)?;
             let frame = self.reader.read_frame()?.ok_or(ClientError::Disconnected)?;
 
             let response = codec::decode_response(frame)?;
@@ -335,7 +364,16 @@ impl Client {
     /// bypasses dedup for it — the query goes through even though our
     /// local seq is stale.
     pub fn synchronize_request_seq(&mut self) -> Result<u64, ClientError> {
-        let responses = self.send_request(&Request::QueryRequestSeq)?;
+        self.synchronize_request_seq_with_deadline(None)
+    }
+
+    /// Deadline-carrying body of [`Client::synchronize_request_seq`],
+    /// used by the bounded connect path.
+    fn synchronize_request_seq_with_deadline(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<u64, ClientError> {
+        let responses = self.send_request_with_deadline(&Request::QueryRequestSeq, deadline)?;
         for resp in &responses {
             if let ResponseKind::RequestSeqHwm { hwm } = resp {
                 self.next_seq = *hwm;
@@ -392,32 +430,9 @@ mod tests {
         writer: &mut BlockingFrameWriter<std::net::TcpStream>,
         sync_hwm: u64,
     ) {
-        use ed25519_dalek::{Verifier, VerifyingKey};
-
-        // Send Challenge.
-        let nonce = [0xBB; 32];
+        // Challenge/verify, then ServerReady.
+        mock_challenge_verify(reader, writer);
         let mut buf = [0u8; 128];
-        let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
-        writer.write_frame(&buf[4..written]).unwrap();
-        writer.flush().unwrap();
-
-        // Read ChallengeResponse.
-        let frame = reader.read_frame().unwrap().unwrap();
-        let (_seq, request) = codec::decode_request(frame).unwrap();
-        let (sig_bytes, pk_bytes) = match request {
-            Request::ChallengeResponse {
-                signature,
-                public_key,
-            } => (signature, public_key),
-            _ => panic!("expected ChallengeResponse"),
-        };
-
-        // Verify signature over the nonce.
-        let vk = VerifyingKey::from_bytes(&pk_bytes).unwrap();
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        vk.verify(&nonce, &sig).unwrap();
-
-        // Send ServerReady.
         let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
         writer.flush().unwrap();
@@ -439,14 +454,15 @@ mod tests {
         writer.flush().unwrap();
     }
 
-    /// Serve one connection: run the challenge/verify steps, then
-    /// answer with `response` instead of `ServerReady` (a replica
-    /// answering `Redirect` or `ServerBusy`).
-    fn mock_auth_then(stream: std::net::TcpStream, response: &ResponseKind) {
+    /// The challenge/verify half of the server-side handshake, shared
+    /// by every mock server so the (evolving) handshake exists once in
+    /// the test suite: send a Challenge, read the ChallengeResponse,
+    /// verify the signature over the nonce.
+    fn mock_challenge_verify(
+        reader: &mut BlockingFrameReader<std::net::TcpStream>,
+        writer: &mut BlockingFrameWriter<std::net::TcpStream>,
+    ) {
         use ed25519_dalek::{Verifier, VerifyingKey};
-
-        let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
-        let mut writer = BlockingFrameWriter::new(stream);
 
         let nonce = [0xBB; 32];
         let mut buf = [0u8; 128];
@@ -466,7 +482,18 @@ mod tests {
         let vk = VerifyingKey::from_bytes(&public_key).unwrap();
         vk.verify(&nonce, &ed25519_dalek::Signature::from_bytes(&signature))
             .unwrap();
+    }
 
+    /// Serve one connection: run the challenge/verify steps, then
+    /// answer with `response` instead of `ServerReady` (a replica
+    /// answering `Redirect` or `ServerBusy`).
+    fn mock_auth_then(stream: std::net::TcpStream, response: &ResponseKind) {
+        let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+        let mut writer = BlockingFrameWriter::new(stream);
+
+        mock_challenge_verify(&mut reader, &mut writer);
+
+        let mut buf = [0u8; 128];
         let written = codec::encode_response(response, &mut buf).unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
         writer.flush().unwrap();

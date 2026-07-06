@@ -48,13 +48,16 @@ fn server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_melin-server"))
 }
 
-/// Connect a TCP client with a 60s socket read timeout so the test
-/// suite fails fast when a server stalls instead of soaking the host
-/// indefinitely. 60s sits well above every in-test wait
-/// (`wait_ready` / `wait_for_replacement_catchup` cap at 30s), so a
-/// healthy run never trips it.
+/// Connect a TCP client with a 60s bound on the connect itself (busy
+/// retries included — the untimed connect waits out elections forever)
+/// and a 60s socket read timeout after, so the test suite fails fast
+/// when a server stalls instead of soaking the host indefinitely. 60s
+/// sits well above every in-test wait (`wait_ready` /
+/// `wait_for_replacement_catchup` cap at 30s), so a healthy run never
+/// trips it.
 fn connect_with_timeout(addr: SocketAddr, key: &SigningKey) -> Client {
-    let client = Client::connect(addr, key).expect("client connect");
+    let client =
+        Client::connect_with_timeout(addr, key, Duration::from_secs(60)).expect("client connect");
     client
         .set_read_timeout(Some(Duration::from_secs(60)))
         .expect("set read timeout");

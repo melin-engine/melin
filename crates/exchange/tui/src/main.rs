@@ -549,16 +549,20 @@ fn client_thread(
     request_rx: mpsc::Receiver<Request>,
     response_tx: mpsc::Sender<String>,
 ) {
-    let mut client = match Client::connect(addr, key) {
-        Ok(c) => {
-            let _ = response_tx.send(format!("Connected to {addr}"));
-            c
-        }
-        Err(e) => {
-            let _ = response_tx.send(format!("Connection failed: {e}"));
-            return;
-        }
-    };
+    // Bounded connect — see the admin CLI's client_thread for why the
+    // untimed variant (which waits out failovers indefinitely) is the
+    // wrong fit for an interactive tool.
+    let mut client =
+        match Client::connect_with_timeout(addr, key, std::time::Duration::from_secs(10)) {
+            Ok(c) => {
+                let _ = response_tx.send(format!("Connected to {addr}"));
+                c
+            }
+            Err(e) => {
+                let _ = response_tx.send(format!("Connection failed: {e}"));
+                return;
+            }
+        };
 
     while let Ok(request) = request_rx.recv() {
         let start = std::time::Instant::now();

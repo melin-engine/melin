@@ -1475,16 +1475,22 @@ fn client_thread(
     response_tx: mpsc::Sender<String>,
     stats_tx: mpsc::Sender<StatsSnapshot>,
 ) {
-    let mut client = match Client::connect(addr, key) {
-        Ok(c) => {
-            let _ = response_tx.send(format!("Connected to {addr}"));
-            c
-        }
-        Err(e) => {
-            let _ = response_tx.send(format!("Connection failed: {e}"));
-            return;
-        }
-    };
+    // Bounded connect: the untimed variant retries a mid-election
+    // "busy" answer indefinitely, which for an interactive operator
+    // tool means hanging with no feedback — exactly when the operator
+    // opened it to investigate a failover. 10s covers any settled
+    // election; past that, fail with the reason.
+    let mut client =
+        match Client::connect_with_timeout(addr, key, std::time::Duration::from_secs(10)) {
+            Ok(c) => {
+                let _ = response_tx.send(format!("Connected to {addr}"));
+                c
+            }
+            Err(e) => {
+                let _ = response_tx.send(format!("Connection failed: {e}"));
+                return;
+            }
+        };
 
     while let Ok(request) = request_rx.recv() {
         let start = std::time::Instant::now();
