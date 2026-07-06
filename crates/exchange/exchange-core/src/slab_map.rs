@@ -163,6 +163,29 @@ impl<V> SlabMap<V> {
         self.lookup.is_empty()
     }
 
+    /// Touch every pre-allocated page by inserting `dummy` under
+    /// synthetic keys up to capacity, then clearing — so page faults
+    /// happen at startup, not on the hot path.
+    ///
+    /// Warm-safe: a no-op when the map holds live entries. The guard
+    /// lives HERE, inside the structure (like `BookSide::prefault` /
+    /// `StopSide::prefault`), not at call sites — the original
+    /// warm-prefault bug happened precisely because sibling structures
+    /// self-guarded while this one relied on its callers.
+    pub(crate) fn prefault(&mut self, dummy: V)
+    where
+        V: Clone,
+    {
+        if !self.is_empty() {
+            return;
+        }
+        let cap = self.capacity();
+        for i in 0..cap {
+            self.insert((AccountId(0), OrderId(i as u64)), dummy.clone());
+        }
+        self.clear();
+    }
+
     /// Capacity of the underlying lookup hashmap (peak slot count). Used
     /// by the bench's capacity-report diagnostic to detect growth past
     /// the prefaulted region.
