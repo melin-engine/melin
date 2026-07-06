@@ -75,21 +75,10 @@ pub fn encode_transport_response(
             pos += 1;
         }
         TransportResponse::Redirect { addr } => {
-            // Fixed layout — family(1) + ip(16, v4 zero-padded) +
-            // port(2 LE) — so the frame stays fixed-size like every
-            // other control variant (no string parsing on either end).
             buf[pos] = TAG_REDIRECT;
             pos += 1;
-            let (family, octets) = match addr.ip() {
-                std::net::IpAddr::V4(ip) => (4u8, ip.to_ipv6_mapped().octets()),
-                std::net::IpAddr::V6(ip) => (6u8, ip.octets()),
-            };
-            buf[pos] = family;
-            pos += 1;
-            buf[pos..pos + 16].copy_from_slice(&octets);
-            pos += 16;
-            buf[pos..pos + 2].copy_from_slice(&addr.port().to_le_bytes());
-            pos += 2;
+            encode_redirect_addr(&mut buf[pos..pos + REDIRECT_ADDR_LEN], *addr);
+            pos += REDIRECT_ADDR_LEN;
         }
     }
 
@@ -98,6 +87,58 @@ pub fn encode_transport_response(
     buf[..4].copy_from_slice(&payload_len.to_le_bytes());
 
     Ok(pos)
+}
+
+/// Byte length of the fixed redirect address block.
+pub const REDIRECT_ADDR_LEN: usize = 19;
+
+/// Encode the `Redirect` address block into `buf[..REDIRECT_ADDR_LEN]`.
+///
+/// Fixed layout — family(1) + ip(16, v4 carried v4-mapped-v6) +
+/// port(2 LE) — so the frame stays fixed-size like every other control
+/// variant (no string parsing on either end). This is the single
+/// definition of the layout: the exchange-protocol codec mirrors the
+/// `Redirect` variant for its app-level enum and calls these helpers,
+/// so the encoder a replica uses and the decoder a client uses can
+/// never drift apart.
+///
+/// # Panics
+///
+/// Panics if `buf` is shorter than [`REDIRECT_ADDR_LEN`] — callers
+/// size their frame buffers against the same constant.
+pub fn encode_redirect_addr(buf: &mut [u8], addr: std::net::SocketAddr) {
+    let (family, octets) = match addr.ip() {
+        std::net::IpAddr::V4(ip) => (4u8, ip.to_ipv6_mapped().octets()),
+        std::net::IpAddr::V6(ip) => (6u8, ip.octets()),
+    };
+    buf[0] = family;
+    buf[1..17].copy_from_slice(&octets);
+    buf[17..19].copy_from_slice(&addr.port().to_le_bytes());
+}
+
+/// Decode a `Redirect` address block (see [`encode_redirect_addr`] for
+/// the layout). `Truncated` when fewer than [`REDIRECT_ADDR_LEN`] bytes
+/// remain; `InvalidField` for a family byte this codec doesn't know or
+/// a family-4 block whose ip bytes are not a v4-mapped-v6 address.
+pub fn decode_redirect_addr(buf: &[u8]) -> Result<std::net::SocketAddr, ProtocolError> {
+    if buf.len() < REDIRECT_ADDR_LEN {
+        return Err(ProtocolError::Truncated);
+    }
+    let octets = <[u8; 16]>::try_from(&buf[1..17]).expect("len checked above");
+    let v6 = std::net::Ipv6Addr::from(octets);
+    let ip = match buf[0] {
+        4 => std::net::IpAddr::V4(v6.to_ipv4_mapped().ok_or(ProtocolError::InvalidField(
+            "redirect family-4 address is not v4-mapped",
+        ))?),
+        6 => std::net::IpAddr::V6(v6),
+        _ => {
+            return Err(ProtocolError::InvalidField(
+                "unknown redirect address family",
+            ));
+        }
+    };
+    let port = u16::from_le_bytes(buf[17..19].try_into().expect("len checked above"));
+    Ok(std::net::SocketAddr::new(ip, port))
 }
 
 /// Decode a client's auth challenge-response from a wire frame.

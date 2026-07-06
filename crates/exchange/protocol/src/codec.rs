@@ -75,10 +75,12 @@ struct RequestSeqHeader {
 const REQUEST_SEQ_HEADER_LEN: usize = core::mem::size_of::<RequestSeqHeader>();
 const _: () = assert!(REQUEST_SEQ_HEADER_LEN == 8);
 
-// Transport-level tags — imported from wire-protocol (single source of truth).
+// Transport-level tags and the redirect address block — imported from
+// wire-protocol (single source of truth for both).
 use melin_wire_protocol::control_codec::{
-    TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_ENGINE_ERROR,
-    TAG_REDIRECT, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
+    REDIRECT_ADDR_LEN, TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE,
+    TAG_ENGINE_ERROR, TAG_REDIRECT, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
+    decode_redirect_addr, encode_redirect_addr,
 };
 
 // --- Domain request tags (0x10–0x2F) ---
@@ -732,21 +734,12 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             pos += 1;
         }
         ResponseKind::Redirect { addr } => {
-            // Same fixed family/ip/port layout as the transport-level
-            // codec (single source of truth for the wire format lives
-            // there; this mirrors it for the app-level enum).
+            // The address block layout is owned by the transport-level
+            // codec; this mirrors only the app-level enum variant.
             buf[pos] = TAG_REDIRECT;
             pos += 1;
-            let (family, octets) = match addr.ip() {
-                std::net::IpAddr::V4(ip) => (4u8, ip.to_ipv6_mapped().octets()),
-                std::net::IpAddr::V6(ip) => (6u8, ip.octets()),
-            };
-            buf[pos] = family;
-            pos += 1;
-            buf[pos..pos + 16].copy_from_slice(&octets);
-            pos += 16;
-            buf[pos..pos + 2].copy_from_slice(&addr.port().to_le_bytes());
-            pos += 2;
+            encode_redirect_addr(&mut buf[pos..pos + REDIRECT_ADDR_LEN], *addr);
+            pos += REDIRECT_ADDR_LEN;
         }
         ResponseKind::Heartbeat => {
             buf[pos] = TAG_RESPONSE_HEARTBEAT;
@@ -877,27 +870,9 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
         TAG_ENGINE_ERROR => Ok(ResponseKind::EngineError),
         TAG_BATCH_END => Ok(ResponseKind::BatchEnd),
         TAG_SERVER_READY => Ok(ResponseKind::ServerReady),
-        TAG_REDIRECT => {
-            if payload.len() < 19 {
-                return Err(ProtocolError::Truncated);
-            }
-            let ip = match payload[0] {
-                4 => {
-                    let v6 = std::net::Ipv6Addr::from(
-                        <[u8; 16]>::try_from(&payload[1..17]).expect("len 16"),
-                    );
-                    std::net::IpAddr::V4(v6.to_ipv4_mapped().ok_or(ProtocolError::Truncated)?)
-                }
-                6 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-                    <[u8; 16]>::try_from(&payload[1..17]).expect("len 16"),
-                )),
-                other => return Err(ProtocolError::UnknownTag(other)),
-            };
-            let port = u16::from_le_bytes(payload[17..19].try_into().expect("len 2"));
-            Ok(ResponseKind::Redirect {
-                addr: std::net::SocketAddr::new(ip, port),
-            })
-        }
+        TAG_REDIRECT => Ok(ResponseKind::Redirect {
+            addr: decode_redirect_addr(payload)?,
+        }),
         TAG_RESPONSE_HEARTBEAT => Ok(ResponseKind::Heartbeat),
         TAG_CHALLENGE => {
             if payload.len() < 32 {
@@ -2001,6 +1976,58 @@ mod tests {
                 addr: "[2001:db8::42]:4567".parse().unwrap(),
             },
         ]
+    }
+
+    #[test]
+    fn transport_encoded_redirect_decodes_here() {
+        // The production wire pair: a replica encodes Redirect with the
+        // transport-level codec (server-runtime side) and the client
+        // decodes it with THIS codec. The address block is shared code
+        // now, but this pins the full frame (tag byte included) so any
+        // future divergence between the two encoders fails a unit test
+        // instead of a live failover.
+        use melin_wire_protocol::control::TransportResponse;
+        use melin_wire_protocol::control_codec::encode_transport_response;
+
+        for addr in [
+            "203.0.113.9:4567".parse::<std::net::SocketAddr>().unwrap(),
+            "[2001:db8::42]:4567".parse().unwrap(),
+        ] {
+            let mut buf = [0u8; 64];
+            let written =
+                encode_transport_response(&TransportResponse::Redirect { addr }, &mut buf).unwrap();
+            let decoded = decode_response(&buf[4..written]).unwrap();
+            assert_eq!(decoded, ResponseKind::Redirect { addr });
+        }
+    }
+
+    #[test]
+    fn malformed_redirect_address_is_invalid_field_not_truncated() {
+        // family 4 whose ip bytes are NOT v4-mapped: the frame length
+        // is fine, so the error must say "invalid field", not
+        // "truncated" (which sends the operator hunting framing bugs).
+        let mut frame = vec![TAG_REDIRECT, 4u8];
+        frame.extend_from_slice(
+            &"2001:db8::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        frame.extend_from_slice(&4567u16.to_le_bytes());
+        assert!(matches!(
+            decode_response(&frame),
+            Err(ProtocolError::InvalidField(_))
+        ));
+
+        // Unknown family byte: also a field error — reporting it as
+        // UnknownTag would conflate the address-family namespace with
+        // the frame-tag namespace (family 5 aliasing TAG_CHALLENGE).
+        let mut frame = vec![TAG_REDIRECT, 5u8];
+        frame.extend_from_slice(&[0u8; 18]);
+        assert!(matches!(
+            decode_response(&frame),
+            Err(ProtocolError::InvalidField(_))
+        ));
     }
 
     #[test]
