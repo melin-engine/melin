@@ -60,18 +60,29 @@ impl Client {
     /// policy is unsatisfiable (e.g. `primary-needs-replica` with no
     /// replica attached) will hang here forever. Callers that need a
     /// bounded wait should use [`Client::connect_with_timeout`].
+    ///
+    /// # Cluster awareness
+    ///
+    /// Dialing a replica is handled transparently: a `Redirect` answer
+    /// is followed to the named primary (bounded hops), and a "busy,
+    /// retry" answer (cluster mid-election) is retried with backoff
+    /// until the election settles — so, like the pre-redirect behaviour
+    /// of parking in a promoting replica's accept backlog, this call
+    /// waits out a failover rather than failing.
     pub fn connect(addr: SocketAddr, key: &SigningKey) -> Result<Self, ClientError> {
         Self::connect_following_redirects(addr, key, None)
     }
 
-    /// Like [`Client::connect`], but bounds every read on the
-    /// connection (handshake frames *and* the auto-sync
-    /// `QueryRequestSeq` response) by `timeout`. A handshake that
-    /// stalls — e.g. against a halted primary — returns an
-    /// `io::ErrorKind::WouldBlock` / `TimedOut` error wrapped in
-    /// [`ClientError::Io`] instead of hanging.
+    /// Like [`Client::connect`], but the **whole** connect — TCP dial,
+    /// every handshake read (including the auto-sync `QueryRequestSeq`
+    /// response), redirect hops, and busy retries — runs under one
+    /// overall `timeout`: each operation is armed with the remaining
+    /// budget, so the call returns (client or error) within roughly
+    /// `timeout` regardless of how many hops or retries it took. A
+    /// handshake that stalls returns an `io::ErrorKind::WouldBlock` /
+    /// `TimedOut` error wrapped in [`ClientError::Io`] instead of
+    /// hanging.
     ///
-    /// The TCP connect itself is also subject to the same `timeout`.
     /// The read timeout on the returned socket is cleared before
     /// return, so post-connect calls (`send_request`, etc.) behave
     /// exactly like the untimed [`Client::connect`] path. Callers that
@@ -85,49 +96,106 @@ impl Client {
         Self::connect_following_redirects(addr, key, Some(timeout))
     }
 
-    /// Follow `Redirect` responses from non-primary nodes, bounded so
-    /// a confused cluster (e.g. two replicas pointing at each other
-    /// mid-election) surfaces [`ClientError::Redirected`] instead of
-    /// looping. Two hops cover the real case — a replica naming the
-    /// newly promoted primary — with one spare.
+    /// Follow `Redirect` responses from non-primary nodes (bounded so a
+    /// confused cluster — e.g. two replicas pointing at each other
+    /// mid-election — surfaces [`ClientError::Redirected`] instead of
+    /// looping) and retry `ServerBusy` answers with backoff (a replica
+    /// that knows no primary yet; the election settles within seconds).
+    /// One `deadline` covers everything; without one, busy retries
+    /// continue indefinitely — deliberately matching [`Client::connect`]'s
+    /// wait-forever contract from before redirects existed, when the
+    /// same client would have parked in the accept backlog instead.
     fn connect_following_redirects(
         addr: SocketAddr,
         key: &SigningKey,
         timeout: Option<std::time::Duration>,
     ) -> Result<Self, ClientError> {
+        /// Redirects *followed* per connect. One hop covers the real
+        /// case (a replica naming the promoted primary); the slack
+        /// absorbs an election settling mid-connect.
         const MAX_REDIRECT_HOPS: usize = 3;
+        /// Pause between busy retries — long enough not to hammer a
+        /// mid-election replica, short against the seconds-scale
+        /// election timeout.
+        const BUSY_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
         let mut target = addr;
-        let mut last = None;
-        for _ in 0..MAX_REDIRECT_HOPS {
-            match Self::connect_inner(target, key, timeout) {
+        let mut hops = 0;
+        loop {
+            match Self::connect_inner(target, key, deadline) {
                 Err(ClientError::Redirected(next)) => {
-                    last = Some(next);
+                    hops += 1;
+                    if hops >= MAX_REDIRECT_HOPS {
+                        return Err(ClientError::Redirected(next));
+                    }
                     target = next;
+                }
+                Err(ClientError::ServerBusy) => {
+                    if let Some(d) = deadline
+                        && std::time::Instant::now() + BUSY_RETRY_BACKOFF >= d
+                    {
+                        return Err(ClientError::ServerBusy);
+                    }
+                    std::thread::sleep(BUSY_RETRY_BACKOFF);
                 }
                 other => return other,
             }
         }
-        Err(ClientError::Redirected(last.unwrap_or(target)))
+    }
+
+    /// Remaining budget until `deadline`, as a `Duration` suitable for
+    /// socket-timeout arming. `Ok(None)` when no deadline is set;
+    /// `TimedOut` once the budget is spent (zero would mean "no
+    /// timeout" to the socket APIs, silently unbounding the wait).
+    fn remaining(
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<std::time::Duration>, ClientError> {
+        match deadline {
+            None => Ok(None),
+            Some(d) => {
+                let rem = d.saturating_duration_since(std::time::Instant::now());
+                if rem.is_zero() {
+                    return Err(ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "connect deadline exceeded",
+                    )));
+                }
+                Ok(Some(rem))
+            }
+        }
+    }
+
+    /// Re-arm the socket read timeout with the budget remaining until
+    /// `deadline` (no-op without one). Called before each handshake
+    /// step so elapsed time shrinks later steps' waits instead of each
+    /// step enjoying the full budget anew.
+    fn arm_read_deadline(
+        stream: &std::net::TcpStream,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), ClientError> {
+        if let Some(rem) = Self::remaining(deadline)? {
+            stream.set_read_timeout(Some(rem))?;
+        }
+        Ok(())
     }
 
     /// Shared body for [`Client::connect`] and
-    /// [`Client::connect_with_timeout`]. When `timeout` is `Some`, both
-    /// the TCP connect and every subsequent read run under that bound;
-    /// the timeout is cleared before the constructed client is
+    /// [`Client::connect_with_timeout`]. When `deadline` is `Some`, the
+    /// TCP connect and every subsequent read run under the *remaining*
+    /// budget; the timeout is cleared before the constructed client is
     /// returned so the caller sees the same defaults either way.
     fn connect_inner(
         addr: SocketAddr,
         key: &SigningKey,
-        timeout: Option<std::time::Duration>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<Self, ClientError> {
-        let stream = match timeout {
+        let stream = match Self::remaining(deadline)? {
             Some(t) => std::net::TcpStream::connect_timeout(&addr, t)?,
             None => std::net::TcpStream::connect(addr)?,
         };
         stream.set_nodelay(true)?;
-        if let Some(t) = timeout {
-            stream.set_read_timeout(Some(t))?;
-        }
+        Self::arm_read_deadline(&stream, deadline)?;
         let mut reader = BlockingFrameReader::new(stream.try_clone()?);
         let mut writer = BlockingFrameWriter::new(stream);
 
@@ -156,6 +224,7 @@ impl Client {
         writer.flush()?;
 
         // Step 3: Wait for ServerReady or AuthFailed.
+        Self::arm_read_deadline(reader.get_ref(), deadline)?;
         let frame = reader.read_frame()?.ok_or(ClientError::Disconnected)?;
         let response = codec::decode_response(frame)?;
         match response {
@@ -189,12 +258,13 @@ impl Client {
         // Step 5: Adopt the engine's per-key request_seq HWM so the next
         // request lands at HWM + 1 instead of 1 (which would dedup if a
         // prior session under this key already advanced the counter).
+        Self::arm_read_deadline(client.reader.get_ref(), deadline)?;
         client.synchronize_request_seq()?;
 
         // Restore the default (untimed) read behaviour before handing
         // the client back, so post-connect calls match `connect`'s
         // contract regardless of which entry point was used.
-        if timeout.is_some() {
+        if deadline.is_some() {
             client.set_read_timeout(None)?;
         }
 
@@ -367,6 +437,148 @@ mod tests {
         let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
         writer.flush().unwrap();
+    }
+
+    /// Serve one connection: run the challenge/verify steps, then
+    /// answer with `response` instead of `ServerReady` (a replica
+    /// answering `Redirect` or `ServerBusy`).
+    fn mock_auth_then(stream: std::net::TcpStream, response: &ResponseKind) {
+        use ed25519_dalek::{Verifier, VerifyingKey};
+
+        let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+        let mut writer = BlockingFrameWriter::new(stream);
+
+        let nonce = [0xBB; 32];
+        let mut buf = [0u8; 128];
+        let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+        writer.write_frame(&buf[4..written]).unwrap();
+        writer.flush().unwrap();
+
+        let frame = reader.read_frame().unwrap().unwrap();
+        let (_seq, request) = codec::decode_request(frame).unwrap();
+        let Request::ChallengeResponse {
+            signature,
+            public_key,
+        } = request
+        else {
+            panic!("expected ChallengeResponse");
+        };
+        let vk = VerifyingKey::from_bytes(&public_key).unwrap();
+        vk.verify(&nonce, &ed25519_dalek::Signature::from_bytes(&signature))
+            .unwrap();
+
+        let written = codec::encode_response(response, &mut buf).unwrap();
+        writer.write_frame(&buf[4..written]).unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn redirect_is_followed_to_the_primary() {
+        // "Replica" answers with a redirect naming the "primary";
+        // Client::connect must land on the primary transparently.
+        let primary = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let primary_addr = primary.local_addr().unwrap();
+        let replica = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let replica_addr = replica.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (stream, _) = replica.accept().unwrap();
+            mock_auth_then(stream, &ResponseKind::Redirect { addr: primary_addr });
+        });
+        std::thread::spawn(move || mock_batch_end_server(primary));
+
+        let key = test_key();
+        let mut client = Client::connect(replica_addr, &key).expect("redirect must be followed");
+        // The connection works end-to-end against the primary: the
+        // batch-end mock answers one request with an empty batch.
+        let responses = client
+            .send_request(&Request::QueryStats)
+            .expect("request on redirected connection");
+        assert!(responses.is_empty(), "batch-end mock sends no reports");
+    }
+
+    #[test]
+    fn server_busy_is_retried_until_the_election_settles() {
+        // First connection: busy (mid-election). Second: full handshake.
+        // connect() must absorb the busy answer and succeed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            mock_auth_then(stream, &ResponseKind::ServerBusy);
+            mock_batch_end_server(listener);
+        });
+
+        let key = test_key();
+        let started = std::time::Instant::now();
+        Client::connect(addr, &key).expect("busy answer must be retried");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "a busy retry must back off, not hammer"
+        );
+    }
+
+    #[test]
+    fn overall_deadline_bounds_busy_retries() {
+        // A cluster that never settles: every connection gets busy.
+        // connect_with_timeout must give up within (roughly) its budget
+        // instead of retrying forever.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            loop {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                mock_auth_then(stream, &ResponseKind::ServerBusy);
+            }
+        });
+
+        let key = test_key();
+        let started = std::time::Instant::now();
+        let err =
+            match Client::connect_with_timeout(addr, &key, std::time::Duration::from_millis(600)) {
+                Ok(_) => panic!("must give up at the deadline"),
+                Err(e) => e,
+            };
+        assert!(
+            matches!(err, ClientError::ServerBusy | ClientError::Io(_)),
+            "expected busy/timeout, got {err:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "deadline must bound the whole connect (took {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn redirect_loop_is_bounded() {
+        // A confused node redirecting to itself: the client must stop
+        // after the hop bound and surface Redirected, not loop.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            loop {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                mock_auth_then(stream, &ResponseKind::Redirect { addr });
+            }
+        });
+
+        let key = test_key();
+        let err = match Client::connect(addr, &key) {
+            Ok(_) => panic!("must not follow redirects forever"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ClientError::Redirected(a) if a == addr),
+            "expected Redirected, got {err:?}"
+        );
     }
 
     /// Mock server that authenticates, reads one request, responds with BatchEnd.
