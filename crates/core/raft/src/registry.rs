@@ -47,9 +47,14 @@ pub struct MemberRecord {
 }
 
 /// Registry entry-payload version. Bump when the record layout
-/// changes; unknown versions are skipped by appliers (a newer node's
-/// record must not brick an older one — see [`Registry::apply`]).
-const RECORD_VERSION: u8 = 1;
+/// changes; newer versions are skipped by appliers (a newer node's
+/// record must not brick an older one — see [`Registry::apply`]) and
+/// older ones decode with their layout's fields (missing fields
+/// default, and the node's next re-announce upgrades its record).
+///
+/// v1: node_id + raft_addr + replication_addr + public_key.
+/// v2: + order_entry_addr (before public_key).
+const RECORD_VERSION: u8 = 2;
 
 impl MemberRecord {
     /// Serialize for a raft log entry. Little-endian, length-prefixed
@@ -80,7 +85,13 @@ impl MemberRecord {
         let raft_addr = take_addr(&mut r)?
             .ok_or_else(|| io::Error::other("member record without a raft address"))?;
         let replication_addr = take_addr(&mut r)?;
-        let order_entry_addr = take_addr(&mut r)?;
+        // v1 records predate the order-entry address; the node's next
+        // re-announce (always current-version) fills it in.
+        let order_entry_addr = if version >= 2 {
+            take_addr(&mut r)?
+        } else {
+            None
+        };
         let public_key: [u8; 32] = take_bytes(&mut r, 32)?
             .try_into()
             .map_err(|_| io::Error::other("short public key"))?;
@@ -272,6 +283,28 @@ mod tests {
         let mut bytes = record(1).encode();
         bytes[0] = RECORD_VERSION + 1;
         assert_eq!(MemberRecord::decode(&bytes).expect("decode"), None);
+    }
+
+    #[test]
+    fn v1_record_decodes_without_order_entry_addr() {
+        // A record persisted before the order-entry address existed
+        // (raft log entries, FileStorage app_state, snapshots) must
+        // keep decoding: same fields, order_entry_addr defaults to
+        // None until the node's next re-announce upgrades it.
+        let expected = MemberRecord {
+            order_entry_addr: None,
+            ..record(5)
+        };
+        // Hand-build the v1 layout: version, node_id, raft_addr,
+        // replication_addr, public_key — no order-entry address.
+        let mut v1 = Vec::new();
+        v1.push(1u8);
+        v1.extend_from_slice(&expected.node_id.to_le_bytes());
+        encode_addr(&mut v1, Some(expected.raft_addr));
+        encode_addr(&mut v1, expected.replication_addr);
+        v1.extend_from_slice(&expected.public_key);
+
+        assert_eq!(MemberRecord::decode(&v1).expect("decode"), Some(expected));
     }
 
     #[test]
