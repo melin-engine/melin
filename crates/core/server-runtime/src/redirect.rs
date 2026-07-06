@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use melin_app::auth::AuthorizedKeys;
 use melin_wire_protocol::control::TransportResponse;
@@ -48,16 +48,35 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// stop flag is honoured promptly at promotion).
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 /// Concurrent handshake budget. Connections accepted while the budget
-/// is exhausted are dropped without a byte — the client retries. Sized
-/// for a post-failover reconnect storm (handshakes are one round trip,
-/// so slots recycle in milliseconds for honest clients) while capping
-/// what a flood of half-open connections can pin: at most this many
-/// threads for at most the handshake deadline each.
+/// is exhausted are answered with a quick "busy, retry" and dropped.
+/// Sized for a post-failover reconnect storm (handshakes are one round
+/// trip, so slots recycle in milliseconds for honest clients) while
+/// capping what a flood of half-open connections can pin: at most this
+/// many threads for at most the handshake deadline each.
 const MAX_CONCURRENT_HANDSHAKES: usize = 32;
+/// Deadline for the pre-auth busy answer sent to shed connections. It
+/// runs on the acceptor thread, so it is deliberately tight — see the
+/// shed branch in [`spawn`] for why that is safe.
+const SHED_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Decrements the shared handshake counter on drop, so a slot is
-/// released however its thread ends — success, error, or panic.
+/// RAII handle on one concurrent-handshake slot: acquired against the
+/// budget, released on drop however its thread ends — success, error,
+/// or panic. Acquire and release live in the same type so no code path
+/// can take the counter without pairing the give-back.
 struct SlotGuard(Arc<AtomicUsize>);
+
+impl SlotGuard {
+    /// Claim a slot if the budget allows. Check-then-add is not atomic,
+    /// but only the single acceptor thread acquires — the atomic exists
+    /// for the handshake threads' releases.
+    fn try_acquire(active: &Arc<AtomicUsize>, budget: usize) -> Option<Self> {
+        if active.load(Ordering::Relaxed) >= budget {
+            return None;
+        }
+        active.fetch_add(1, Ordering::Relaxed);
+        Some(Self(Arc::clone(active)))
+    }
+}
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
@@ -86,15 +105,27 @@ pub(crate) fn spawn<L: BlockingTransportListener>(
                     return listener;
                 }
                 match listener.accept() {
-                    Ok((read, write, peer)) => {
-                        if active.load(Ordering::Relaxed) >= MAX_CONCURRENT_HANDSHAKES {
-                            // Dropping the halves closes the connection;
-                            // the client retries against a recycled slot.
-                            debug!(peer = %peer, "redirect handshake budget exhausted — dropping connection");
+                    Ok((read, mut write, peer)) => {
+                        let Some(slot) = SlotGuard::try_acquire(&active, MAX_CONCURRENT_HANDSHAKES)
+                        else {
+                            // Answer "busy, retry" before dropping — a
+                            // bare close surfaces as a Disconnected
+                            // error that clients do NOT retry, whereas
+                            // ServerBusy re-enters their backoff loop.
+                            // Written on the acceptor thread under a
+                            // tight deadline: the 5-byte frame fits any
+                            // real socket buffer instantly, so only a
+                            // deliberately zero-window peer can burn
+                            // the budget — and such a flood degrades
+                            // exactly the path it already saturates.
+                            debug!(peer = %peer, "redirect handshake budget exhausted — answering busy");
+                            send_response(
+                                &mut write,
+                                &TransportResponse::ServerBusy,
+                                Instant::now() + SHED_BUSY_TIMEOUT,
+                            );
                             continue;
-                        }
-                        active.fetch_add(1, Ordering::Relaxed);
-                        let slot = SlotGuard(Arc::clone(&active));
+                        };
                         let keys = Arc::clone(&authorized_keys);
                         let follow = follow.clone();
                         debug!(peer = %peer, "redirecting client connection");
@@ -117,7 +148,11 @@ pub(crate) fn spawn<L: BlockingTransportListener>(
                                 }
                             })
                         {
-                            debug!(peer = %peer, error = %e, "could not spawn redirect handshake thread");
+                            // warn: thread exhaustion is host-level
+                            // resource starvation, not a client event —
+                            // the budget cap means a client flood alone
+                            // cannot trigger this.
+                            warn!(peer = %peer, error = %e, "could not spawn redirect handshake thread");
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -226,29 +261,13 @@ fn remaining_budget(deadline: Instant) -> std::io::Result<Duration> {
     Ok(remaining)
 }
 
-/// Arm one socket timeout option with `dur` (sub-second precision
-/// preserved — see `remaining_budget` for the zero-timeval hazard).
-/// The accepted halves are generic over the transport, so this goes
-/// through `setsockopt` directly.
+/// Arm one socket timeout option with `dur`. Callers must pass a
+/// `remaining_budget`-vetted duration — the shared helper preserves
+/// sub-second precision, and the budget's 1ms floor is what keeps a
+/// near-expired remainder from truncating to the zero timeval the
+/// kernel reads as "no timeout".
 fn arm_timeout(fd: std::os::fd::RawFd, opt: libc::c_int, dur: Duration) -> std::io::Result<()> {
-    let tv = libc::timeval {
-        tv_sec: dur.as_secs() as libc::time_t,
-        tv_usec: dur.subsec_micros() as libc::suseconds_t,
-    };
-    // SAFETY: `tv` is a valid timeval for the duration of the call.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            opt,
-            &tv as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    crate::server::set_socket_timeout(fd, opt, Some(dur))
 }
 
 /// `read_exact` under a whole-transfer deadline: the socket timeout is

@@ -3347,15 +3347,15 @@ fn build_raft_config(
     // The addresses this node announces into the membership registry.
     // Explicit advertise flags win; the bind addresses are usable
     // defaults only when routable (a wildcard bind means "everywhere
-    // locally", which is an address peers cannot dial).
-    let advertise_raft_addr = config.raft_advertise.unwrap_or(bind);
-    if advertise_raft_addr.ip().is_unspecified() {
-        return Err(
+    // locally", which is an address peers cannot dial). All three go
+    // through the same resolver so the validation policy cannot drift
+    // between flags; the raft address alone is mandatory (peers must
+    // be able to dial it to hold elections).
+    let advertise_raft_addr =
+        resolve_advertise(config.raft_advertise, Some(bind), "--raft-advertise")?.ok_or(
             "--raft-bind on a wildcard address requires --raft-advertise (peers cannot dial \
-             0.0.0.0/[::]); give the address the other nodes reach this one at"
-                .into(),
-        );
-    }
+             0.0.0.0/[::]); give the address the other nodes reach this one at",
+        )?;
     let advertise_replication_addr = resolve_advertise(
         config.replication_advertise,
         config.replication_bind,
@@ -3623,12 +3623,10 @@ where
     Ok(Some(event_handle))
 }
 
-/// Maximum accepted client auth-frame length. ChallengeResponse is
-/// 8 (seq) + 1 (tag) + 64 (signature) + 32 (public key) = 105 bytes
-/// today; the slack tolerates frame growth (e.g. real ephemeral keys)
-/// without a lockstep client upgrade. Shared with the replica-side
-/// redirect acceptor so both paths accept identical frames.
-pub(crate) const MAX_CLIENT_AUTH_FRAME: usize = 256;
+/// Maximum accepted client auth-frame length — owned by the codec that
+/// owns the frame layout, re-exported so the accept loop and the
+/// replica-side redirect acceptor share one cap.
+pub(crate) use melin_wire_protocol::control_codec::MAX_CHALLENGE_RESPONSE_FRAME as MAX_CLIENT_AUTH_FRAME;
 
 /// Verify a client's `ChallengeResponse` frame against the `nonce` we
 /// issued: decode, look the key up in the operator's `AuthorizedKeys`,
@@ -3755,6 +3753,23 @@ fn set_read_timeout<F: std::os::unix::io::AsRawFd>(
     fd: &F,
     timeout: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
+    set_socket_timeout(fd.as_raw_fd(), libc::SO_RCVTIMEO, timeout)
+}
+
+/// Arm one socket timeout option (`SO_RCVTIMEO` / `SO_SNDTIMEO`) on a
+/// raw fd. `None` clears the timeout (a zero timeval means "no
+/// timeout" to the kernel — which is also why a caller arming a
+/// computed remainder must floor sub-millisecond values itself, as the
+/// redirect acceptor's budget check does: a `Some` duration that
+/// truncates to a zero timeval would silently unbound the wait).
+/// Works for both TCP and UDS since both are sockets. One definition
+/// for the whole crate so the timeval conversion and its zero hazard
+/// live in exactly one place.
+pub(crate) fn set_socket_timeout(
+    fd: std::os::unix::io::RawFd,
+    opt: libc::c_int,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
     let tv = match timeout {
         Some(d) => libc::timeval {
             tv_sec: d.as_secs() as libc::time_t,
@@ -3765,11 +3780,12 @@ fn set_read_timeout<F: std::os::unix::io::AsRawFd>(
             tv_usec: 0,
         },
     };
+    // SAFETY: `tv` is a valid timeval for the duration of the call.
     let ret = unsafe {
         libc::setsockopt(
-            fd.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
+            opt,
             &tv as *const libc::timeval as *const libc::c_void,
             std::mem::size_of::<libc::timeval>() as libc::socklen_t,
         )
@@ -3831,29 +3847,7 @@ fn set_write_timeout<F: std::os::unix::io::AsRawFd>(
     fd: &F,
     timeout: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
-    let tv = match timeout {
-        Some(d) => libc::timeval {
-            tv_sec: d.as_secs() as libc::time_t,
-            tv_usec: d.subsec_micros() as libc::suseconds_t,
-        },
-        None => libc::timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-    };
-    let ret = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDTIMEO,
-            &tv as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    set_socket_timeout(fd.as_raw_fd(), libc::SO_SNDTIMEO, timeout)
 }
 
 /// Best-effort send of AuthFailed before dropping a connection.
@@ -3879,7 +3873,33 @@ mod tests {
     use melin_app::auth::AuthorizedKeys;
     use melin_app::auth::Permission;
 
-    use super::{build_raft_config, parse_ed25519_pubkey_b64};
+    use super::{build_raft_config, parse_ed25519_pubkey_b64, resolve_advertise};
+
+    #[test]
+    fn resolve_advertise_policy() {
+        let routable: std::net::SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let wildcard: std::net::SocketAddr = "0.0.0.0:9000".parse().unwrap();
+
+        // Explicit advertise wins over any bind.
+        assert_eq!(
+            resolve_advertise(Some(routable), Some(wildcard), "--x").unwrap(),
+            Some(routable)
+        );
+        // An explicit wildcard advertise is rejected, naming the flag.
+        let err = resolve_advertise(Some(wildcard), Some(routable), "--x").unwrap_err();
+        assert!(err.to_string().contains("--x"), "error must name the flag");
+        // A routable bind is a usable default.
+        assert_eq!(
+            resolve_advertise(None, Some(routable), "--x").unwrap(),
+            Some(routable)
+        );
+        // A wildcard bind (or no bind) announces nothing.
+        assert_eq!(
+            resolve_advertise(None, Some(wildcard), "--x").unwrap(),
+            None
+        );
+        assert_eq!(resolve_advertise(None, None, "--x").unwrap(), None);
+    }
 
     fn pubkey_b64(seed: u8) -> String {
         base64::Engine::encode(

@@ -141,6 +141,14 @@ pub fn decode_redirect_addr(buf: &[u8]) -> Result<std::net::SocketAddr, Protocol
     Ok(std::net::SocketAddr::new(ip, port))
 }
 
+/// Largest `ChallengeResponse` frame a server accepts. The frame is
+/// 105 bytes today (see [`decode_challenge_response`]); the slack
+/// tolerates layout growth — e.g. real ephemeral keys — without a
+/// lockstep client upgrade. Lives beside the codec that owns the
+/// layout so growing the frame past this cap is visible in the same
+/// file that changes it.
+pub const MAX_CHALLENGE_RESPONSE_FRAME: usize = 256;
+
 /// Decode a client's auth challenge-response from a wire frame.
 ///
 /// `buf` must contain the frame payload *after* the 4-byte length
