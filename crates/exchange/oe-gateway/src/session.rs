@@ -134,20 +134,41 @@ pub struct Session {
     /// tag + 64 sig + 32 pubkey + slack).
     melin_encode_buf: [u8; 128],
     pub melin_multishot_active: bool,
+    /// Generation this session occupies its slab slot under, encoded
+    /// into io_uring user_data for every FIX-side SQE. Minted by the
+    /// slab's per-slot monotonic counter at insert, so a stale CQE from
+    /// a *previous* occupant of the same recycled slot can never be
+    /// misattributed to this session. Never changes for the life of
+    /// the session (the FIX socket never reconnects).
+    /// u16: a stale CQE would need to survive 65k occupancy/reconnect
+    /// turnovers of one slot to collide — kernel completions post long
+    /// before that.
+    pub slot_gen: u16,
     /// Melin connection generation, encoded into io_uring user_data for
-    /// every Melin-side SQE. Bumped when a redirect replaces the Melin
-    /// connection so CQEs from the closed socket (multishot recv
-    /// errors, send failures) are recognized as stale and dropped
-    /// instead of tearing down the replacement connection.
-    /// u16: wraps after 65k redirects on one session — a session that
-    /// bounces that often has long since hit the hop bound and closed.
+    /// every Melin-side SQE. Re-minted from the same per-slot counter
+    /// when a redirect replaces the Melin connection, so CQEs from the
+    /// closed socket (multishot recv errors, send failures) are
+    /// recognized as stale and dropped instead of being attributed to
+    /// the replacement connection (or, via the shared counter, to a
+    /// later occupant of the slot).
     pub melin_gen: u16,
-    /// Parking spot for a send buffer that was in flight when a
-    /// redirect closed the Melin socket: the kernel may still read the
-    /// allocation until the (stale) send CQE arrives, so it must stay
-    /// alive — it is dropped with the session or overwritten by a later
-    /// redirect (by which time the earlier CQE has long fired).
-    pub stale_melin_inflight: Vec<u8>,
+    /// `true` while a Melin send SQE is in flight (submitted, CQE not
+    /// yet reaped). Gates `flush_dirty_sends` from submitting a second
+    /// SQE over the same inflight buffer — new outbound data queued
+    /// while a send is pending stays in `melin_send_buf` until the
+    /// completion hands the buffer back.
+    pub melin_send_pending: bool,
+    /// FIX-side twin of `melin_send_pending`.
+    pub fix_send_pending: bool,
+    /// Buffers whose send SQE was still in flight when a redirect
+    /// closed their Melin socket, keyed by the connection generation
+    /// that submitted them: the kernel may still read the allocation
+    /// until the stale send CQE arrives, so each parked buffer stays
+    /// alive until the CQE carrying its generation releases it (and
+    /// `drain_removals` defers session removal while any are parked).
+    /// Vec of pairs, not a map: at most a couple of entries ever exist
+    /// (one per redirect with a send in flight).
+    pub stale_melin_inflight: Vec<(u16, Vec<u8>)>,
     /// Redirect hops consumed by this session's Melin handshake.
     /// Bounded so two confused nodes pointing at each other surface as
     /// an error instead of a reconnect loop; reset when auth completes.
@@ -244,7 +265,12 @@ impl Session {
             melin_seq: 0,
             melin_encode_buf: [0u8; 128],
             melin_multishot_active: false,
+            // Both generations are seeded by Slab::insert from the
+            // slot's counter; 0 here means "not yet inserted".
+            slot_gen: 0,
             melin_gen: 0,
+            melin_send_pending: false,
+            fix_send_pending: false,
             stale_melin_inflight: Vec::new(),
             melin_redirect_hops: 0,
 
@@ -559,6 +585,19 @@ impl Session {
             // reruns against the new address (the signing key is only
             // cleared on success above, so it is still available).
             ResponseKind::Redirect { addr } => {
+                // The gateway's io_uring connect path is IPv4-only
+                // (sockaddr_in), so a v6 order-entry advertisement is
+                // as unfollowable as an exhausted hop budget — same
+                // terminal handling.
+                if !addr.is_ipv4() {
+                    warn!(
+                        sender = %self.sender_comp_id,
+                        target = %addr,
+                        "Melin redirect names an IPv6 address — gateway supports IPv4 upstreams only"
+                    );
+                    self.queue_fix_logout(config, "exchange unavailable, retry later");
+                    return SessionAction::Close;
+                }
                 if self.melin_redirect_hops >= MAX_MELIN_REDIRECT_HOPS {
                     warn!(
                         sender = %self.sender_comp_id,
@@ -597,26 +636,31 @@ impl Session {
         }
     }
 
-    /// Queue a FIX Logout for a redirect the event loop could not
-    /// follow (e.g. an IPv6 target on the IPv4-only connect path).
-    pub fn queue_logout_for_redirect_failure(&mut self, config: &GatewayConfig) {
-        self.queue_fix_logout(config, "exchange unavailable, retry later");
-    }
-
     /// Reset the Melin-side connection state ahead of a redirect
     /// reconnect, returning the old socket fd for the event loop to
-    /// close. Bumps the connection generation so CQEs still in flight
-    /// for the old socket are recognized as stale, and parks any
-    /// in-flight send buffer the kernel may still be reading.
-    pub fn begin_melin_redirect(&mut self) -> Option<RawFd> {
+    /// close. `new_gen` is the replacement connection's generation
+    /// (minted by the slab's per-slot counter) — CQEs still in flight
+    /// for the old socket carry the old one and are recognized as
+    /// stale. A send buffer whose SQE is still pending is parked under
+    /// the old generation until its CQE releases it.
+    pub fn begin_melin_redirect(&mut self, new_gen: u16) -> Option<RawFd> {
         let old_fd = self.melin_fd.take();
-        self.melin_gen = self.melin_gen.wrapping_add(1);
+        let old_gen = self.melin_gen;
+        self.melin_gen = new_gen;
         self.melin_parse_buf.clear();
         self.melin_send_buf.clear();
-        if !self.melin_inflight.is_empty() {
+        if self.melin_send_pending {
             // The kernel may still read this allocation until the old
-            // send's CQE fires — park it instead of clearing in place.
-            self.stale_melin_inflight = std::mem::take(&mut self.melin_inflight);
+            // send's CQE fires — park it under the generation that
+            // submitted it instead of clearing in place.
+            self.stale_melin_inflight
+                .push((old_gen, std::mem::take(&mut self.melin_inflight)));
+            self.melin_send_pending = false;
+        } else {
+            // No SQE outstanding (any partial-send remainder's CQE has
+            // already been reaped) — the bytes were destined for the
+            // node we are leaving, drop them.
+            self.melin_inflight.clear();
         }
         self.melin_multishot_active = false;
         self.auth_nonce = None;
@@ -2157,15 +2201,8 @@ lot_size_inverse = 1
 
     #[test]
     fn server_ready_queues_query_request_seq_and_holds_fix_logon() {
-        // Fresh session in AwaitingAuthResult, as if ChallengeResponse
-        // had just been sent.
         let config = make_config("FIRM_A", "MELIN");
-        let mut s = new_session(Instant::now());
-        s.state = SessionState::AwaitingAuthResult;
-        s.sender_comp_id = "FIRM_A".to_owned();
-        s.heartbeat_interval = Duration::from_secs(30);
-        s.signing_key = Some(SigningKey::from_bytes(&[0u8; 32]));
-        s.auth_nonce = Some([0u8; 32]);
+        let mut s = session_awaiting_auth();
 
         let payload = encode_response_payload(&ResponseKind::ServerReady);
         let action = s.handle_auth_result(&payload, &config);
@@ -2212,6 +2249,23 @@ lot_size_inverse = 1
         assert_eq!(s.melin_redirect_hops, 1);
         // The FIX client is not bothered — no Logout queued.
         assert!(s.fix_send_buf.is_empty());
+    }
+
+    #[test]
+    fn ipv6_redirect_closes_with_logout() {
+        // The io_uring connect path is IPv4-only; an unfollowable v6
+        // target must terminate like an exhausted hop budget, not
+        // reach the event loop's sockaddr conversion.
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = session_awaiting_auth();
+
+        let target: std::net::SocketAddr = "[2001:db8::9]:4567".parse().unwrap();
+        let payload = encode_response_payload(&ResponseKind::Redirect { addr: target });
+        let action = s.handle_auth_result(&payload, &config);
+
+        assert_eq!(action, SessionAction::Close);
+        assert!(matches!(s.state, SessionState::Closing));
+        assert!(!s.fix_send_buf.is_empty(), "Logout must be queued");
     }
 
     #[test]
@@ -2263,29 +2317,53 @@ lot_size_inverse = 1
         let mut s = new_session(Instant::now());
         s.state = SessionState::AwaitingAuthResult;
         s.melin_fd = Some(42);
+        s.melin_gen = 7;
         s.melin_parse_buf.extend_from_slice(b"stale frame bytes");
         s.melin_send_buf.extend_from_slice(b"queued for old node");
         s.melin_inflight
             .extend_from_slice(b"kernel may still read this");
+        s.melin_send_pending = true; // send SQE still in flight
         s.melin_multishot_active = true;
         s.auth_nonce = Some([7u8; 32]);
-        let gen_before = s.melin_gen;
 
-        let old_fd = s.begin_melin_redirect();
+        let old_fd = s.begin_melin_redirect(8);
 
         assert_eq!(old_fd, Some(42), "old fd handed back for closing");
         assert_eq!(s.melin_fd, None);
-        assert_eq!(s.melin_gen, gen_before.wrapping_add(1));
+        assert_eq!(s.melin_gen, 8);
         assert!(s.melin_parse_buf.is_empty());
         assert!(s.melin_send_buf.is_empty());
         assert!(
             s.melin_inflight.is_empty(),
             "inflight must be parked, not left for the new connection"
         );
-        assert_eq!(s.stale_melin_inflight, b"kernel may still read this");
+        assert_eq!(
+            s.stale_melin_inflight,
+            vec![(7u16, b"kernel may still read this".to_vec())],
+            "kernel-owned buffer parked under the generation that submitted it"
+        );
+        assert!(!s.melin_send_pending, "new connection starts idle");
         assert!(!s.melin_multishot_active);
         assert!(s.auth_nonce.is_none());
         assert!(matches!(s.state, SessionState::ConnectingMelin));
+    }
+
+    #[test]
+    fn begin_melin_redirect_drops_completed_inflight() {
+        // No SQE outstanding (its CQE was already reaped): the leftover
+        // bytes were destined for the node being left — dropped, not
+        // parked, so nothing pins the session at removal time.
+        let mut s = new_session(Instant::now());
+        s.melin_fd = Some(42);
+        s.melin_inflight.extend_from_slice(b"already completed");
+        s.melin_send_pending = false;
+
+        let _ = s.begin_melin_redirect(3);
+        assert!(s.melin_inflight.is_empty());
+        assert!(
+            s.stale_melin_inflight.is_empty(),
+            "a buffer the kernel is done with must not be parked"
+        );
     }
 
     #[test]

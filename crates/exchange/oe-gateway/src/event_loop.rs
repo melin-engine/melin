@@ -54,12 +54,13 @@ const OP_SEND_FIX: u64 = 0x03 << 56;
 const OP_SEND_MELIN: u64 = 0x04 << 56;
 const OP_CONNECT: u64 = 0x05 << 56;
 const OP_MASK: u64 = 0xFF << 56;
-/// Melin connection generation, encoded in bits 40..56 of user_data for
-/// Melin-side ops. A redirect closes the Melin socket and reconnects on
-/// the same session slot; CQEs still in flight for the old socket carry
-/// the old generation and are dropped instead of being misattributed to
-/// the replacement connection. FIX-side ops always carry generation 0 —
-/// the FIX socket never reconnects within a session.
+/// Session/connection generation, encoded in bits 40..56 of user_data
+/// for every per-session op. Minted by the slab's per-slot counter: a
+/// new occupant of a recycled index gets a fresh generation (guards
+/// FIX- and Melin-side ops against stale CQEs from the previous
+/// occupant), and a redirect re-mints the Melin connection generation
+/// (guards against CQEs from the replaced socket). Handlers drop any
+/// CQE whose generation does not match the session's current one.
 const GEN_SHIFT: u32 = 40;
 const GEN_MASK: u64 = 0xFFFF << GEN_SHIFT;
 /// 40 bits of session index — far beyond any realistic session count.
@@ -95,9 +96,9 @@ fn token_gen(token: u64) -> u16 {
     ((token & GEN_MASK) >> GEN_SHIFT) as u16
 }
 
-/// Build a Melin-side user_data token: op | generation | session index.
+/// Build a per-session user_data token: op | generation | session index.
 #[inline(always)]
-fn melin_token(op: u64, generation: u16, idx: usize) -> u64 {
+fn op_token(op: u64, generation: u16, idx: usize) -> u64 {
     op | ((generation as u64) << GEN_SHIFT) | idx as u64
 }
 
@@ -112,6 +113,14 @@ pub struct Slab {
     entries: Vec<Option<Session>>,
     /// Recycled indices for O(1) allocation.
     free: Vec<usize>,
+    /// Per-slot monotonic generation counter, parallel to `entries`.
+    /// Bumped on every insert into the slot and on every Melin
+    /// reconnect within a session, and stamped into each SQE's
+    /// user_data — so a stale CQE from a previous occupant of a
+    /// recycled index (or a previous Melin connection) can never be
+    /// misattributed to the current session. Survives removal on
+    /// purpose: that is what makes cross-occupancy values distinct.
+    gens: Vec<u16>,
 }
 
 impl Slab {
@@ -119,18 +128,35 @@ impl Slab {
         Self {
             entries: Vec::with_capacity(64),
             free: Vec::new(),
+            gens: Vec::with_capacity(64),
         }
     }
 
-    fn insert(&mut self, session: Session) -> usize {
-        if let Some(idx) = self.free.pop() {
-            self.entries[idx] = Some(session);
-            idx
-        } else {
-            let idx = self.entries.len();
-            self.entries.push(Some(session));
-            idx
-        }
+    /// Store a session, minting its slot generation from the slot's
+    /// counter (seeding both the FIX-side `slot_gen` and the initial
+    /// Melin connection generation).
+    fn insert(&mut self, mut session: Session) -> usize {
+        let idx = match self.free.pop() {
+            Some(idx) => idx,
+            None => {
+                self.entries.push(None);
+                self.gens.push(0);
+                self.entries.len() - 1
+            }
+        };
+        self.gens[idx] = self.gens[idx].wrapping_add(1);
+        session.slot_gen = self.gens[idx];
+        session.melin_gen = self.gens[idx];
+        self.entries[idx] = Some(session);
+        idx
+    }
+
+    /// Mint the next generation for `idx` (a Melin reconnect within
+    /// the current session). Shares the slot counter with `insert` so
+    /// a generation value can never repeat across occupancies.
+    fn bump_gen(&mut self, idx: usize) -> u16 {
+        self.gens[idx] = self.gens[idx].wrapping_add(1);
+        self.gens[idx]
     }
 
     fn remove(&mut self, idx: usize) -> Option<Session> {
@@ -193,6 +219,13 @@ pub struct Gateway {
     /// connect to it fails so the gateway falls back to the seed
     /// (mirrors the replica receiver's leader/static alternation —
     /// a stale hint costs one dial, never a wedged loop).
+    /// Gateway-global, last-writer-wins on purpose: the cluster has one
+    /// serving primary, so per-session state would only re-pay the
+    /// redirect hop per session. During a contested election two nodes
+    /// can briefly name different primaries and concurrent sessions
+    /// flip this back and forth — bounded behavior (each session's hop
+    /// budget converts the flapping into a Logout-and-retry), not a
+    /// reason to make the hint per-session.
     melin_target: Option<std::net::SocketAddr>,
 }
 
@@ -295,11 +328,11 @@ impl Gateway {
 
                 match op_type(token) {
                     OP_ACCEPT => self.handle_accept(result, now),
-                    OP_FIX_RECV => self.handle_fix_recv(slab_idx(token), result, flags, now),
+                    OP_FIX_RECV => self.handle_fix_recv(token, result, flags, now),
                     OP_MELIN_RECV => {
                         self.handle_melin_recv(token, result, flags, now);
                     }
-                    OP_SEND_FIX => self.handle_fix_send_complete(slab_idx(token), result),
+                    OP_SEND_FIX => self.handle_fix_send_complete(token, result),
                     OP_SEND_MELIN => self.handle_melin_send_complete(token, result),
                     OP_CONNECT => self.handle_melin_connected(token, result, now),
                     _ => {
@@ -397,7 +430,7 @@ impl Gateway {
 
         let sqe = opcode::RecvMulti::new(types::Fd(session.fix_fd), BUF_GROUP_ID)
             .build()
-            .user_data(OP_FIX_RECV | idx as u64);
+            .user_data(op_token(OP_FIX_RECV, session.slot_gen, idx));
 
         unsafe {
             self.ring.submission().push(&sqe).expect("io_uring SQ full");
@@ -405,7 +438,17 @@ impl Gateway {
         session.fix_multishot_active = true;
     }
 
-    fn handle_fix_recv(&mut self, idx: usize, result: i32, flags: u32, now: Instant) {
+    fn handle_fix_recv(&mut self, token: u64, result: i32, flags: u32, now: Instant) {
+        let idx = slab_idx(token);
+        // Stale generation: a CQE from a removed session whose slot was
+        // recycled. Return any provided buffer; the current occupant
+        // must not be touched (a stale EOF would tear it down).
+        if !self.slot_gen_current(token) {
+            if result > 0 && (flags & IORING_CQE_F_BUFFER) != 0 {
+                self.re_provide_buffer((flags >> IORING_CQE_BUFFER_SHIFT) as usize);
+            }
+            return;
+        }
         let has_more = (flags & IORING_CQE_F_MORE) != 0;
 
         if result <= 0 {
@@ -479,9 +522,13 @@ impl Gateway {
                     self.start_melin_connect(idx);
                 }
                 SessionAction::RedirectMelin(addr) => {
-                    // Should not happen from the FIX recv path (redirects
-                    // arrive on the Melin side), but honor it regardless.
-                    self.redirect_melin(idx, addr);
+                    // Redirects arrive on the Melin side only; honoring
+                    // one from here would tear down a live Melin
+                    // connection in an arbitrary session state. Same
+                    // convention as ConnectMelin on the Melin path:
+                    // log loudly enough to surface the bug, act on
+                    // nothing.
+                    debug!(idx, target = %addr, "unexpected RedirectMelin from FIX recv");
                 }
                 SessionAction::SendFix => {
                     self.dirty_fix.push(idx);
@@ -543,7 +590,7 @@ impl Gateway {
 
         let sqe = opcode::Connect::new(types::Fd(fd), addr_ptr, sockaddr_len)
             .build()
-            .user_data(melin_token(OP_CONNECT, session.melin_gen, idx));
+            .user_data(op_token(OP_CONNECT, session.melin_gen, idx));
 
         unsafe {
             self.ring.submission().push(&sqe).expect("io_uring SQ full");
@@ -556,30 +603,28 @@ impl Gateway {
     /// serving primary, and reconnect. The session re-enters the
     /// handshake from `ConnectingMelin`.
     fn redirect_melin(&mut self, idx: usize, addr: std::net::SocketAddr) {
-        // The io_uring connect path is AF_INET-only (sockaddr_in); a v6
-        // order-entry advertisement can't be followed. Close with a
-        // descriptive Logout rather than panicking in the sockaddr
-        // conversion.
+        // Backstop for the session-level IPv4 policy check (the
+        // sockaddr conversion below would panic on v6): should be
+        // unreachable, so no Logout niceties — just drop the session.
         if !addr.is_ipv4() {
-            if let Some(session) = self.sessions.get_mut(idx) {
-                warn!(
-                    sender = %session.sender_comp_id,
-                    target = %addr,
-                    "Melin redirect names an IPv6 address — gateway supports IPv4 upstreams only"
-                );
-                session.queue_logout_for_redirect_failure(self.config);
-            }
-            self.dirty_fix.push(idx);
+            debug!(idx, target = %addr, "unfollowable redirect reached the event loop");
             self.to_remove.push(idx);
             return;
         }
 
         self.melin_target = Some(addr);
 
+        if self.sessions.get(idx).is_none() {
+            return;
+        }
+        // Mint the replacement connection's generation from the slot
+        // counter, so it can never collide with any generation a
+        // previous occupant or connection used.
+        let new_gen = self.sessions.bump_gen(idx);
         let Some(session) = self.sessions.get_mut(idx) else {
             return;
         };
-        if let Some(old_fd) = session.begin_melin_redirect() {
+        if let Some(old_fd) = session.begin_melin_redirect(new_gen) {
             // shutdown() before close(): the pending multishot recv
             // holds a kernel reference to the socket, so close() alone
             // would neither send FIN nor complete the recv — the old
@@ -587,6 +632,9 @@ impl Gateway {
             // TCP stream down immediately and flushes the pending recv
             // out as a terminal CQE, which carries the old generation
             // and is dropped by the guards.
+            // Return codes discarded: this is best-effort teardown of a
+            // socket we are abandoning — the only failure mode for a
+            // valid fd is "already shut down", which is the goal.
             unsafe {
                 libc::shutdown(old_fd, libc::SHUT_RDWR);
                 libc::close(old_fd);
@@ -606,7 +654,10 @@ impl Gateway {
         if result < 0 {
             let err = std::io::Error::from_raw_os_error(-result);
             if let Some(session) = self.sessions.get(idx) {
-                error!(
+                // warn, not error: an unreachable upstream is a network
+                // condition the very next line handles (fall back to
+                // the seed address), not a gateway bug.
+                warn!(
                     sender = %session.sender_comp_id,
                     error = %err,
                     "Melin connect failed"
@@ -621,6 +672,15 @@ impl Gateway {
         }
 
         if let Some(session) = self.sessions.get_mut(idx) {
+            // A connect completing on a dying session must not
+            // resurrect it: Closing is what lets the pending-send
+            // completion handlers finish the removal, and overwriting
+            // it would leave a zombie that completes the Melin auth
+            // handshake under a disconnected client's key. The fd is
+            // released by Session::Drop when the removal lands.
+            if matches!(session.state, SessionState::Closing) {
+                return;
+            }
             info!(
                 sender = %session.sender_comp_id,
                 "connected to Melin server"
@@ -634,12 +694,22 @@ impl Gateway {
 
     /// `true` when the token's Melin connection generation matches the
     /// session's current one. Stale CQEs (from a socket a redirect
-    /// closed) must be dropped, not attributed to the replacement
-    /// connection. A missing session also reports stale.
+    /// closed, or from a previous occupant of a recycled slot) must be
+    /// dropped, not attributed to the current connection. A missing
+    /// session also reports stale.
     fn melin_gen_current(&self, token: u64) -> bool {
         self.sessions
             .get(slab_idx(token))
             .is_some_and(|s| s.melin_gen == token_gen(token))
+    }
+
+    /// FIX-side twin of [`Gateway::melin_gen_current`]: the FIX socket
+    /// never reconnects, so only slot recycling can produce a stale
+    /// FIX-op CQE.
+    fn slot_gen_current(&self, token: u64) -> bool {
+        self.sessions
+            .get(slab_idx(token))
+            .is_some_and(|s| s.slot_gen == token_gen(token))
     }
 
     // -----------------------------------------------------------------------
@@ -661,7 +731,7 @@ impl Gateway {
 
         let sqe = opcode::RecvMulti::new(types::Fd(melin_fd), BUF_GROUP_ID)
             .build()
-            .user_data(melin_token(OP_MELIN_RECV, session.melin_gen, idx));
+            .user_data(op_token(OP_MELIN_RECV, session.melin_gen, idx));
 
         unsafe {
             self.ring.submission().push(&sqe).expect("io_uring SQ full");
@@ -785,6 +855,14 @@ impl Gateway {
                 None => continue,
             };
 
+            // A send SQE is already in flight: submitting another over
+            // the same inflight buffer would transmit the bytes twice
+            // and let the two completions desync the buffer swap. New
+            // data waits in send_buf; the completion handler re-queues
+            // this session as dirty.
+            if session.fix_send_pending {
+                continue;
+            }
             if !session.fix_inflight.is_empty() {
                 // Previous send partially completed — resubmit the
                 // remaining bytes. The buffer is stable (untouched
@@ -805,11 +883,12 @@ impl Gateway {
                 session.fix_inflight.len() as u32,
             )
             .build()
-            .user_data(OP_SEND_FIX | idx as u64);
+            .user_data(op_token(OP_SEND_FIX, session.slot_gen, idx));
 
             unsafe {
                 self.ring.submission().push(&sqe).expect("io_uring SQ full");
             }
+            session.fix_send_pending = true;
         }
 
         // Flush Melin outbound.
@@ -824,6 +903,10 @@ impl Gateway {
                 None => continue,
             };
 
+            // Same single-SQE-in-flight rule as the FIX side above.
+            if session.melin_send_pending {
+                continue;
+            }
             if !session.melin_inflight.is_empty() {
                 // Partial send remainder — resubmit.
             } else if !session.melin_send_buf.is_empty() {
@@ -838,15 +921,30 @@ impl Gateway {
                 session.melin_inflight.len() as u32,
             )
             .build()
-            .user_data(melin_token(OP_SEND_MELIN, session.melin_gen, idx));
+            .user_data(op_token(OP_SEND_MELIN, session.melin_gen, idx));
 
             unsafe {
                 self.ring.submission().push(&sqe).expect("io_uring SQ full");
             }
+            session.melin_send_pending = true;
         }
     }
 
-    fn handle_fix_send_complete(&mut self, idx: usize, result: i32) {
+    fn handle_fix_send_complete(&mut self, token: u64, result: i32) {
+        let idx = slab_idx(token);
+        // Stale generation: the send belonged to a previous occupant of
+        // this slot. Its buffers were freed with that session (the
+        // removal gate guarantees no send SQE was pending), so there is
+        // nothing to release — just keep the CQE away from the current
+        // occupant.
+        if !self.slot_gen_current(token) {
+            return;
+        }
+        // The SQE this CQE answers is done — the slot is free for the
+        // next submission whatever the outcome below.
+        if let Some(session) = self.sessions.get_mut(idx) {
+            session.fix_send_pending = false;
+        }
         if result < 0 {
             // Clear the inflight buffer before queueing removal.
             // drain_removals refuses to remove sessions whose inflight
@@ -876,7 +974,8 @@ impl Gateway {
                 // either side, it can be removed.
                 let remove = !requeue
                     && matches!(session.state, SessionState::Closing)
-                    && session.melin_inflight.is_empty();
+                    && session.melin_inflight.is_empty()
+                    && session.stale_melin_inflight.is_empty();
                 (requeue, remove)
             }
             None => (false, false),
@@ -892,14 +991,35 @@ impl Gateway {
     fn handle_melin_send_complete(&mut self, token: u64, result: i32) {
         let idx = slab_idx(token);
         // Stale generation: the send belonged to a socket a redirect
-        // closed. The kernel is done with the parked buffer — release
-        // it — and the (likely error) result must not remove the
-        // session serving the replacement connection.
+        // closed. The kernel is done with the buffer parked under that
+        // generation — release exactly that one (a cross-occupancy
+        // stale send CQE cannot exist: the removal gate holds sessions
+        // until every send SQE has completed, so a generation found
+        // here always belongs to the current session's graveyard). The
+        // (likely error) result must not remove the session serving
+        // the replacement connection.
         if !self.melin_gen_current(token) {
             if let Some(session) = self.sessions.get_mut(idx) {
-                session.stale_melin_inflight = Vec::new();
+                let stale_gen = token_gen(token);
+                session
+                    .stale_melin_inflight
+                    .retain(|(parked_gen, _)| *parked_gen != stale_gen);
+                // A Closing session may have been waiting on this very
+                // buffer — re-check removability now that it is gone.
+                if matches!(session.state, SessionState::Closing)
+                    && session.stale_melin_inflight.is_empty()
+                    && session.fix_inflight.is_empty()
+                    && session.melin_inflight.is_empty()
+                {
+                    self.to_remove.push(idx);
+                }
             }
             return;
+        }
+        // The SQE this CQE answers is done — the slot is free for the
+        // next submission whatever the outcome below.
+        if let Some(session) = self.sessions.get_mut(idx) {
+            session.melin_send_pending = false;
         }
         if result < 0 {
             // See comment in handle_fix_send_complete: clear the
@@ -925,7 +1045,8 @@ impl Gateway {
                     !session.melin_inflight.is_empty() || !session.melin_send_buf.is_empty();
                 let remove = !requeue
                     && matches!(session.state, SessionState::Closing)
-                    && session.fix_inflight.is_empty();
+                    && session.fix_inflight.is_empty()
+                    && session.stale_melin_inflight.is_empty();
                 (requeue, remove)
             }
             None => (false, false),
@@ -939,15 +1060,17 @@ impl Gateway {
     }
 
     /// Remove sessions from the slab, deferring any that still have
-    /// io_uring SEND SQEs in flight (their inflight buffers are
-    /// non-empty and the kernel may still be reading from them).
+    /// io_uring SEND SQEs in flight — live inflight buffers or
+    /// redirect-parked ones — since the kernel may still be reading
+    /// from those allocations.
     fn drain_removals(&mut self) {
         let pending: Vec<usize> = self.to_remove.drain(..).collect();
         for idx in pending {
-            let can_remove = self
-                .sessions
-                .get(idx)
-                .is_none_or(|s| s.fix_inflight.is_empty() && s.melin_inflight.is_empty());
+            let can_remove = self.sessions.get(idx).is_none_or(|s| {
+                s.fix_inflight.is_empty()
+                    && s.melin_inflight.is_empty()
+                    && s.stale_melin_inflight.is_empty()
+            });
             if can_remove {
                 if let Some(session) = self.sessions.remove(idx) {
                     debug!(sender = %session.sender_comp_id, "session removed");
@@ -1373,7 +1496,8 @@ lot_size_inverse = 1
         session.fix_inflight = b"PENDING SEND".to_vec();
         let idx = gw.sessions.insert(session);
 
-        gw.handle_fix_send_complete(idx, -32); // EPIPE
+        let slot_gen = gw.sessions.get(idx).unwrap().slot_gen;
+        gw.handle_fix_send_complete(op_token(OP_SEND_FIX, slot_gen, idx), -32); // EPIPE
 
         let session = gw.sessions.get(idx).expect("session still in slab");
         assert!(
@@ -1401,7 +1525,8 @@ lot_size_inverse = 1
         session.melin_inflight = b"PENDING SEND".to_vec();
         let idx = gw.sessions.insert(session);
 
-        gw.handle_melin_send_complete(melin_token(OP_SEND_MELIN, 0, idx), -104); // ECONNRESET
+        let melin_gen = gw.sessions.get(idx).unwrap().melin_gen;
+        gw.handle_melin_send_complete(op_token(OP_SEND_MELIN, melin_gen, idx), -104); // ECONNRESET
 
         let session = gw.sessions.get(idx).expect("session still in slab");
         assert!(
@@ -1428,16 +1553,26 @@ lot_size_inverse = 1
         let dummy_fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
         let mut session = Session::new(dummy_fd, Instant::now(), metrics);
         session.melin_inflight = b"OLD NODE HANDSHAKE".to_vec();
-        let old_gen = session.melin_gen;
-        let _ = session.begin_melin_redirect(); // bumps the generation
-        session.stale_melin_inflight = b"OLD NODE HANDSHAKE".to_vec();
-        session.melin_multishot_active = true; // as if the new recv is armed
+        session.melin_send_pending = true; // SQE still in flight
         let idx = gw.sessions.insert(session);
+        let old_gen = gw.sessions.get(idx).unwrap().melin_gen;
+
+        // Redirect: parks the pending buffer under the old generation.
+        let new_gen = gw.sessions.bump_gen(idx);
+        let session = gw.sessions.get_mut(idx).unwrap();
+        let _ = session.begin_melin_redirect(new_gen);
+        assert_eq!(
+            session.stale_melin_inflight,
+            vec![(old_gen, b"OLD NODE HANDSHAKE".to_vec())],
+            "pending inflight must be parked under the submitting generation"
+        );
+        assert!(!session.melin_send_pending, "new connection starts idle");
+        session.melin_multishot_active = true; // as if the new recv is armed
 
         // Stale recv error (old socket closed): session must survive
         // and the new multishot flag must stay armed.
         gw.handle_melin_recv(
-            melin_token(OP_MELIN_RECV, old_gen, idx),
+            op_token(OP_MELIN_RECV, old_gen, idx),
             -104,
             0,
             Instant::now(),
@@ -1447,7 +1582,7 @@ lot_size_inverse = 1
         assert!(gw.sessions.get(idx).unwrap().melin_multishot_active);
 
         // Stale send completion: releases the parked buffer, nothing else.
-        gw.handle_melin_send_complete(melin_token(OP_SEND_MELIN, old_gen, idx), -32);
+        gw.handle_melin_send_complete(op_token(OP_SEND_MELIN, old_gen, idx), -32);
         let session = gw.sessions.get(idx).expect("session still in slab");
         assert!(
             session.stale_melin_inflight.is_empty(),
@@ -1458,12 +1593,162 @@ lot_size_inverse = 1
         // Current-generation error still removes as before.
         let cur_gen = gw.sessions.get(idx).unwrap().melin_gen;
         gw.handle_melin_recv(
-            melin_token(OP_MELIN_RECV, cur_gen, idx),
+            op_token(OP_MELIN_RECV, cur_gen, idx),
             -104,
             0,
             Instant::now(),
         );
         assert!(gw.to_remove.contains(&idx));
+    }
+
+    /// Shared boilerplate for the lifecycle tests below: a Gateway plus
+    /// one inserted session backed by a dummy fd.
+    fn gateway_with_session() -> (Gateway, usize) {
+        use crate::session::Session;
+        use std::os::unix::io::IntoRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = make_config("FIRM_A", "MELIN");
+        let metrics = crate::metrics::GatewayMetrics::leak_default();
+        let mut gw = Gateway::new(listener, config, metrics).expect("gateway new");
+        let dummy_fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let session = Session::new(dummy_fd, Instant::now(), metrics);
+        let idx = gw.sessions.insert(session);
+        (gw, idx)
+    }
+
+    #[test]
+    fn recycled_slot_gets_a_fresh_generation() {
+        // A stale CQE from a removed session must not be attributed to
+        // the new occupant of the recycled slab index — both FIX- and
+        // Melin-side.
+        use crate::session::Session;
+        use std::os::unix::io::IntoRawFd;
+
+        let (mut gw, idx) = gateway_with_session();
+        let old_slot_gen = gw.sessions.get(idx).unwrap().slot_gen;
+        let old_melin_gen = gw.sessions.get(idx).unwrap().melin_gen;
+        gw.sessions.remove(idx).expect("occupied");
+
+        let dummy_fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let session = Session::new(dummy_fd, Instant::now(), gw.metrics);
+        let idx2 = gw.sessions.insert(session);
+        assert_eq!(idx2, idx, "slab must recycle the index (LIFO free list)");
+        assert_ne!(
+            gw.sessions.get(idx).unwrap().slot_gen,
+            old_slot_gen,
+            "new occupant must not share the old generation"
+        );
+
+        // Stale terminal CQEs from the previous occupant: dropped.
+        gw.handle_fix_recv(
+            op_token(OP_FIX_RECV, old_slot_gen, idx),
+            0,
+            0,
+            Instant::now(),
+        );
+        gw.handle_melin_recv(
+            op_token(OP_MELIN_RECV, old_melin_gen, idx),
+            -104,
+            0,
+            Instant::now(),
+        );
+        assert!(
+            !gw.to_remove.contains(&idx),
+            "stale CQEs from the previous occupant must not tear down the new session"
+        );
+    }
+
+    #[test]
+    fn no_second_send_while_one_is_pending() {
+        // New outbound data queued while a send SQE is in flight must
+        // wait in send_buf — a second submission over the same inflight
+        // buffer would duplicate bytes on the wire.
+        let (mut gw, idx) = gateway_with_session();
+        {
+            let session = gw.sessions.get_mut(idx).unwrap();
+            session.melin_fd = Some(session.fix_fd); // any valid fd
+            session.melin_inflight = b"IN FLIGHT".to_vec();
+            session.melin_send_pending = true;
+            session.melin_send_buf = b"QUEUED".to_vec();
+            session.fix_send_pending = true;
+            session.fix_inflight = b"FIX IN FLIGHT".to_vec();
+            session.fix_send_buf = b"FIX QUEUED".to_vec();
+        }
+        gw.dirty_melin.push(idx);
+        gw.dirty_fix.push(idx);
+        gw.flush_dirty_sends();
+
+        let session = gw.sessions.get(idx).unwrap();
+        assert_eq!(
+            session.melin_send_buf, b"QUEUED",
+            "queued data must stay in send_buf while a send is pending"
+        );
+        assert_eq!(session.melin_inflight, b"IN FLIGHT");
+        assert_eq!(session.fix_send_buf, b"FIX QUEUED");
+
+        // Completion frees the slot; the requeue path then swaps.
+        let melin_gen = session.melin_gen;
+        gw.handle_melin_send_complete(op_token(OP_SEND_MELIN, melin_gen, idx), 9);
+        let session = gw.sessions.get(idx).unwrap();
+        assert!(!session.melin_send_pending, "completion must free the slot");
+        assert!(session.melin_inflight.is_empty());
+        assert!(
+            gw.dirty_melin.contains(&idx),
+            "queued data must be re-flushed after completion"
+        );
+    }
+
+    #[test]
+    fn late_connect_cqe_does_not_resurrect_a_closing_session() {
+        let (mut gw, idx) = gateway_with_session();
+        {
+            let session = gw.sessions.get_mut(idx).unwrap();
+            session.state = SessionState::Closing;
+        }
+        let melin_gen = gw.sessions.get(idx).unwrap().melin_gen;
+        gw.handle_melin_connected(op_token(OP_CONNECT, melin_gen, idx), 0, Instant::now());
+        assert!(
+            matches!(gw.sessions.get(idx).unwrap().state, SessionState::Closing),
+            "a late connect must not flip Closing back to AwaitingChallenge"
+        );
+    }
+
+    #[test]
+    fn removal_waits_for_parked_send_buffers() {
+        // A session queued for removal while a redirect-parked send is
+        // still un-reaped must survive until the stale CQE releases the
+        // buffer the kernel may be reading.
+        let (mut gw, idx) = gateway_with_session();
+        let old_gen = gw.sessions.get(idx).unwrap().melin_gen;
+        {
+            let session = gw.sessions.get_mut(idx).unwrap();
+            session.melin_inflight = b"KERNEL MAY READ".to_vec();
+            session.melin_send_pending = true;
+        }
+        let new_gen = gw.sessions.bump_gen(idx);
+        let _ = gw
+            .sessions
+            .get_mut(idx)
+            .unwrap()
+            .begin_melin_redirect(new_gen);
+
+        gw.to_remove.push(idx);
+        gw.drain_removals();
+        assert!(
+            gw.sessions.get(idx).is_some(),
+            "removal must defer while a parked buffer awaits its CQE"
+        );
+        assert!(matches!(
+            gw.sessions.get(idx).unwrap().state,
+            SessionState::Closing
+        ));
+
+        // The stale CQE releases the buffer and completes the removal.
+        gw.handle_melin_send_complete(op_token(OP_SEND_MELIN, old_gen, idx), -32);
+        assert!(gw.to_remove.contains(&idx), "now removable");
+        gw.drain_removals();
+        assert!(gw.sessions.get(idx).is_none(), "session removed");
     }
 
     #[test]
