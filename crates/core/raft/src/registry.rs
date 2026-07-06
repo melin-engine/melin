@@ -86,8 +86,13 @@ impl MemberRecord {
             .ok_or_else(|| io::Error::other("member record without a raft address"))?;
         let replication_addr = take_addr(&mut r)?;
         // v1 records predate the order-entry address; the node's next
-        // re-announce (always current-version) fills it in.
-        let order_entry_addr = if version >= 2 {
+        // re-announce (always current-version) fills it in. One
+        // wrinkle: an interim build shipped the three-address layout
+        // still tagged v1, so persisted state may hold either v1
+        // shape. The remainder length disambiguates exactly — a true
+        // v1 record has only the 32 public-key bytes left here, the
+        // interim one has an address block first.
+        let order_entry_addr = if version >= 2 || r.len() > 32 {
             take_addr(&mut r)?
         } else {
             None
@@ -283,6 +288,47 @@ mod tests {
         let mut bytes = record(1).encode();
         bytes[0] = RECORD_VERSION + 1;
         assert_eq!(MemberRecord::decode(&bytes).expect("decode"), None);
+    }
+
+    #[test]
+    fn interim_v1_record_with_order_entry_addr_decodes() {
+        // One branch build wrote the three-address layout still tagged
+        // version 1. Persisted raft state from those machines must keep
+        // loading: the remainder length (address block + key vs bare
+        // key) disambiguates the two v1 shapes.
+        let expected = record(6);
+        let mut interim = Vec::new();
+        interim.push(1u8);
+        interim.extend_from_slice(&expected.node_id.to_le_bytes());
+        encode_addr(&mut interim, Some(expected.raft_addr));
+        encode_addr(&mut interim, expected.replication_addr);
+        encode_addr(&mut interim, expected.order_entry_addr);
+        interim.extend_from_slice(&expected.public_key);
+
+        assert_eq!(
+            MemberRecord::decode(&interim).expect("decode"),
+            Some(expected)
+        );
+
+        // Interim shape with an ABSENT order-entry address (a node
+        // without a routable bind): one presence byte more than bare
+        // v1 — still disambiguated by length.
+        let expected = MemberRecord {
+            order_entry_addr: None,
+            ..record(7)
+        };
+        let mut interim = Vec::new();
+        interim.push(1u8);
+        interim.extend_from_slice(&expected.node_id.to_le_bytes());
+        encode_addr(&mut interim, Some(expected.raft_addr));
+        encode_addr(&mut interim, expected.replication_addr);
+        encode_addr(&mut interim, None);
+        interim.extend_from_slice(&expected.public_key);
+
+        assert_eq!(
+            MemberRecord::decode(&interim).expect("decode"),
+            Some(expected)
+        );
     }
 
     #[test]
