@@ -227,6 +227,13 @@ pub struct Gateway {
     /// budget converts the flapping into a Logout-and-retry), not a
     /// reason to make the hint per-session.
     melin_target: Option<std::net::SocketAddr>,
+    /// Round-robin index into `config.seeds`, used only when no primary
+    /// has been learned (`melin_target` is `None`). Gateway-global, not
+    /// per-session: upstream reachability is a cluster-wide fact, so N
+    /// sessions must not each re-probe the same dead seed N times.
+    /// Advanced when a connect to the current seed fails; wraps at the
+    /// end of the list.
+    seed_cursor: usize,
 }
 
 impl Gateway {
@@ -275,6 +282,7 @@ impl Gateway {
             session_map,
             last_heartbeat_check: Instant::now(),
             melin_target: None,
+            seed_cursor: 0,
         })
     }
 
@@ -549,12 +557,36 @@ impl Gateway {
     // MELIN CONNECT
     // -----------------------------------------------------------------------
 
+    /// Pick the address the next Melin connect should dial: the learned
+    /// primary if we have one (best information — skips the redirect hop),
+    /// else the seed the cursor currently points at. `config.seeds` is
+    /// guaranteed non-empty by config validation, so the index is sound.
+    fn connect_target(&self) -> std::net::SocketAddr {
+        self.melin_target
+            .unwrap_or_else(|| self.config.seeds[self.seed_cursor])
+    }
+
     fn start_melin_connect(&mut self, idx: usize) {
         // Prefer the last redirect-learned primary over the configured
-        // seed: after a failover, the first session pays the redirect
+        // seeds: after a failover, the first session pays the redirect
         // hop and every later one dials the primary directly.
-        let server_addr = self.melin_target.unwrap_or(self.config.server_addr);
+        let server_addr = self.connect_target();
         self.start_melin_connect_to(idx, server_addr);
+    }
+
+    /// Rotate the upstream candidate after a failed Melin connect. A
+    /// dead learned primary is cleared (a redirect from any live node
+    /// re-teaches it); a dead seed advances the round-robin cursor so
+    /// the next session tries the next node. Either way the *next*
+    /// connect picks a fresh candidate — see [`Gateway::connect_target`].
+    fn on_connect_failed(&mut self, failed: Option<std::net::SocketAddr>) {
+        if failed.is_some() && failed == self.melin_target {
+            self.melin_target = None;
+        } else {
+            // `seeds` is non-empty (config validation), so the modulo is
+            // well-defined and the cursor stays in range.
+            self.seed_cursor = (self.seed_cursor + 1) % self.config.seeds.len();
+        }
     }
 
     fn start_melin_connect_to(&mut self, idx: usize, server_addr: std::net::SocketAddr) {
@@ -581,6 +613,9 @@ impl Gateway {
             return;
         };
         session.melin_fd = Some(fd);
+        // Remember where this attempt is dialing so the failure path can
+        // tell a dead learned-primary from a dead seed.
+        session.melin_connect_target = Some(server_addr);
         // The kernel reads this address asynchronously after we submit the
         // connect SQE, so it must outlive the call — the session owns it
         // until the connection completes.
@@ -653,20 +688,18 @@ impl Gateway {
         }
         if result < 0 {
             let err = std::io::Error::from_raw_os_error(-result);
+            let failed = self.sessions.get(idx).and_then(|s| s.melin_connect_target);
             if let Some(session) = self.sessions.get(idx) {
                 // warn, not error: an unreachable upstream is a network
-                // condition the very next line handles (fall back to
-                // the seed address), not a gateway bug.
+                // condition the rotation below handles (clear the dead
+                // primary or step to the next seed), not a gateway bug.
                 warn!(
                     sender = %session.sender_comp_id,
                     error = %err,
                     "Melin connect failed"
                 );
             }
-            // A learned redirect target that stopped answering must not
-            // poison every future session — fall back to the configured
-            // seed address (harmless no-op when already unset).
-            self.melin_target = None;
+            self.on_connect_failed(failed);
             self.to_remove.push(idx);
             return;
         }
@@ -1319,8 +1352,51 @@ lot_size_inverse = 1
 "#,
             key_path.display()
         );
-        let config: GatewayConfig = toml::from_str(&toml).unwrap();
+        let mut config: GatewayConfig = toml::from_str(&toml).unwrap();
+        // Normalize `seeds` exactly as production load does — the event
+        // loop indexes `config.seeds`, which `toml::from_str` leaves empty.
+        config.validate().unwrap();
         Box::leak(Box::new(config))
+    }
+
+    /// Like `make_config_with_port` but seeds a whole `server_addrs`
+    /// list (all on 127.0.0.1), for the multi-seed rotation tests.
+    fn make_config_with_ports(sender: &str, target: &str, ports: &[u16]) -> &'static GatewayConfig {
+        let key_path = make_key_file();
+        let addrs: Vec<String> = ports.iter().map(|p| format!("\"127.0.0.1:{p}\"")).collect();
+        let toml = format!(
+            r#"
+server_addrs = [{}]
+listen_addr = "127.0.0.1:1"
+target_comp_id = "{target}"
+
+[[session]]
+sender_comp_id = "{sender}"
+account_id = 7
+key_path = "{}"
+
+[[symbol]]
+fix_symbol = "BTC/USD"
+melin_symbol = 1
+tick_size_inverse = 100
+lot_size_inverse = 1
+"#,
+            addrs.join(", "),
+            key_path.display()
+        );
+        let mut config: GatewayConfig = toml::from_str(&toml).unwrap();
+        config.validate().unwrap();
+        Box::leak(Box::new(config))
+    }
+
+    /// Reserve a 127.0.0.1 port and immediately release it, so a connect
+    /// to it refuses fast. A theoretical race (something else grabbing
+    /// the port) is acceptable for a test.
+    fn dead_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
     }
 
     /// Default config for tests that never reach the Melin connect
@@ -1615,6 +1691,61 @@ lot_size_inverse = 1
         let session = Session::new(dummy_fd, Instant::now(), metrics);
         let idx = gw.sessions.insert(session);
         (gw, idx)
+    }
+
+    /// Build a gateway whose config lists `ports` as seeds (all on
+    /// 127.0.0.1). Nothing is dialed — these tests exercise only the
+    /// pure target-selection / rotation helpers.
+    fn gateway_with_seeds(ports: &[u16]) -> Gateway {
+        let config = make_config_with_ports("FIRM_A", "MELIN", ports);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let metrics = crate::metrics::GatewayMetrics::leak_default();
+        Gateway::new(listener, config, metrics).expect("gateway new")
+    }
+
+    fn addr(port: u16) -> std::net::SocketAddr {
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    #[test]
+    fn connect_target_prefers_learned_primary_over_seeds() {
+        let mut gw = gateway_with_seeds(&[1, 2, 3]);
+        // Cursor starts at 0 → the first seed.
+        assert_eq!(gw.connect_target(), addr(1));
+        // A learned primary wins over any seed.
+        gw.melin_target = Some(addr(99));
+        assert_eq!(gw.connect_target(), addr(99));
+    }
+
+    #[test]
+    fn connect_failure_on_seed_advances_cursor() {
+        let mut gw = gateway_with_seeds(&[1, 2, 3]);
+        assert_eq!(gw.connect_target(), addr(1));
+        gw.on_connect_failed(Some(addr(1)));
+        assert_eq!(gw.connect_target(), addr(2));
+        gw.on_connect_failed(Some(addr(2)));
+        assert_eq!(gw.connect_target(), addr(3));
+    }
+
+    #[test]
+    fn connect_failure_on_learned_target_clears_it_not_the_cursor() {
+        let mut gw = gateway_with_seeds(&[1, 2]);
+        gw.melin_target = Some(addr(99));
+        // A dead learned primary is cleared; the seed cursor is untouched
+        // (still 0), so the next dial falls back to the first seed.
+        gw.on_connect_failed(Some(addr(99)));
+        assert_eq!(gw.melin_target, None);
+        assert_eq!(gw.seed_cursor, 0);
+        assert_eq!(gw.connect_target(), addr(1));
+    }
+
+    #[test]
+    fn seed_cursor_wraps_past_end_of_list() {
+        let mut gw = gateway_with_seeds(&[1, 2]);
+        gw.on_connect_failed(Some(addr(1))); // cursor → 1
+        gw.on_connect_failed(Some(addr(2))); // cursor wraps → 0
+        assert_eq!(gw.seed_cursor, 0);
+        assert_eq!(gw.connect_target(), addr(1));
     }
 
     #[test]
@@ -1930,6 +2061,71 @@ lot_size_inverse = 1
         );
 
         drop(client);
+        gw.shutdown();
+        drop(replica);
+        drop(primary);
+    }
+
+    #[test]
+    fn gateway_walks_past_dead_seed_to_live_seed_redirect() {
+        use crate::test_stub::MelinStub;
+        use melin_protocol::message::Request;
+
+        // seed 0 = dead (nothing listening); seed 1 = a replica that
+        // redirects to the primary. The dead seed is the only hint at
+        // boot, so the gateway must walk to seed 1 and follow its
+        // redirect — the failure this whole task exists to fix.
+        let primary = MelinStub::start();
+        let primary_addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", primary.port()).parse().unwrap();
+        let replica = MelinStub::start_redirecting_to(primary_addr);
+        let config = make_config_with_ports("FIRM_A", "MELIN", &[dead_port(), replica.port()]);
+        let gw = spawn_gateway(config);
+
+        // First attempt lands on the dead seed: the upstream connect is
+        // refused, so the gateway tears the FIX session down. That
+        // failure advances the seed cursor to seed 1.
+        let mut c1 = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        c1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c1.write_all(&logon_bytes("FIRM_A", "MELIN", 1)).unwrap();
+        let mut buf = [0u8; 64];
+        let n = c1.read(&mut buf).unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "gateway must drop the FIX session when its only seed is dead"
+        );
+        drop(c1);
+
+        // Retry (a FIX client always reconnects): the cursor now points
+        // at the live replica, which redirects to the primary.
+        let mut c2 = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c2.write_all(&logon_bytes("FIRM_A", "MELIN", 1)).unwrap();
+        let raw = read_fix_message(&mut c2);
+        assert_eq!(
+            FixMessage::parse(&raw).unwrap().msg_type(),
+            tags::MSG_LOGON,
+            "second attempt must complete Logon via the live seed's redirect"
+        );
+
+        // Orders reach the primary the replica pointed at.
+        let nos = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ORD1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "2")
+            .str_tag(tags::PRICE, "50000.00")
+            .str_tag(tags::ORDER_QTY, "10")
+            .str_tag(tags::TIME_IN_FORCE, "1")
+            .build("FIRM_A", "MELIN", 2);
+        c2.write_all(&nos).unwrap();
+        let (_seq, req) = primary.next_request(Duration::from_secs(5));
+        assert!(
+            matches!(req, Request::SubmitOrder { .. }),
+            "order must reach the primary, got {req:?}"
+        );
+
+        drop(c2);
         gw.shutdown();
         drop(replica);
         drop(primary);

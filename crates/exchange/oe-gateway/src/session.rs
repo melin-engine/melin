@@ -234,6 +234,11 @@ pub struct Session {
     // ── Connect state ──
     /// Stored sockaddr for the io_uring CONNECT SQE lifetime.
     pub connect_addr: Option<libc::sockaddr_in>,
+    /// The address this session's in-flight connect is dialing. Read
+    /// when the connect fails so the gateway knows whether to clear the
+    /// learned primary (this was it) or advance the seed cursor (this
+    /// was a seed) — see `Gateway::start_melin_connect`.
+    pub melin_connect_target: Option<std::net::SocketAddr>,
 
     /// Process-wide metrics surface. Shared across all sessions.
     pub metrics: &'static GatewayMetrics,
@@ -292,6 +297,7 @@ impl Session {
 
             auth_nonce: None,
             connect_addr: None,
+            melin_connect_target: None,
             metrics,
         }
     }

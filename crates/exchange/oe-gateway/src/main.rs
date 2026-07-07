@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         listen = %config.listen_addr,
-        server = %config.server_addr,
+        seeds = ?config.seeds,
         sessions = config.sessions.len(),
         symbols = config.symbols.len(),
         "FIX gateway starting"

@@ -146,7 +146,26 @@ start if any of the following hold:
 - Duplicate `sender_comp_id` across sessions
 - Duplicate `fix_symbol` across symbols
 - `tick_size_inverse` or `lot_size_inverse` is `0` for any symbol
-- `server_addr` is not IPv4
+- An upstream address is not IPv4
+- Neither `server_addr` nor `server_addrs` is set, or both are
 
 See [admin-guide.md](admin-guide.md) for the full configuration
 schema.
+
+## Upstream addresses and failover
+
+The gateway needs to reach whichever cluster node is currently the
+serving primary. Give it every node's order-entry address:
+
+```toml
+server_addrs = ["10.0.0.1:9876", "10.0.0.2:9876", "10.0.0.3:9876"]
+```
+
+`server_addr = "10.0.0.1:9876"` remains accepted as a single-address
+shorthand, but list every node so the gateway survives a failover
+unattended: when a session's connect to one node fails, the gateway
+tries the next; any live node redirects it to the current primary, and
+every later session dials that primary directly. With only one address
+configured — the node that just died — the gateway has nowhere to turn
+and an operator must repoint it by hand. Set `server_addr` **or**
+`server_addrs`, never both.

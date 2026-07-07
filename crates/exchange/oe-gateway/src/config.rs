@@ -8,8 +8,23 @@ use serde::Deserialize;
 /// Top-level gateway configuration.
 #[derive(Debug, Deserialize)]
 pub struct GatewayConfig {
-    /// Address of the Melin server to connect to.
-    pub server_addr: SocketAddr,
+    /// Single upstream Melin server address. Compatibility alias for a
+    /// one-entry `server_addrs`; exactly one of the two must be set.
+    /// Normalized into `seeds` at load time — the event loop only ever
+    /// reads `seeds`, never this field.
+    #[serde(default)]
+    pub server_addr: Option<SocketAddr>,
+    /// Upstream Melin server seed addresses. List every cluster node's
+    /// order-entry address so the gateway can reach the primary through
+    /// any live node after a failover (a dead configured seed with no
+    /// other hint is otherwise the last manual step in FIX failover).
+    #[serde(default)]
+    pub server_addrs: Vec<SocketAddr>,
+    /// Normalized, non-empty seed list built from `server_addr` /
+    /// `server_addrs` during `validate`. `Vec` because the event loop
+    /// rotates through it by index; never present in the TOML.
+    #[serde(skip)]
+    pub seeds: Vec<SocketAddr>,
     /// Address to listen for FIX client connections.
     pub listen_addr: SocketAddr,
     /// Optional address for the Prometheus `/metrics` endpoint.
@@ -70,21 +85,33 @@ impl GatewayConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
+        let mut config: Self = toml::from_str(&content)?;
         config.validate()?;
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn validate(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.sessions.is_empty() {
             return Err("at least one [[session]] is required".into());
         }
         if self.symbols.is_empty() {
             return Err("at least one [[symbol]] is required".into());
         }
+        // Normalize the upstream seeds. `server_addr` and `server_addrs`
+        // are two spellings of the same thing; setting both is ambiguous.
+        match (self.server_addr, self.server_addrs.is_empty()) {
+            (Some(_), false) => {
+                return Err("set either server_addr or server_addrs, not both".into());
+            }
+            (Some(addr), true) => self.seeds = vec![addr],
+            (None, false) => self.seeds = self.server_addrs.clone(),
+            (None, true) => {
+                return Err("at least one upstream: set server_addr or server_addrs".into());
+            }
+        }
         // IPv6 Melin server addresses are not yet supported.
-        if self.server_addr.is_ipv6() {
-            return Err("server_addr must be IPv4 (IPv6 not yet supported)".into());
+        if let Some(addr) = self.seeds.iter().find(|a| a.is_ipv6()) {
+            return Err(format!("upstream {addr} must be IPv4 (IPv6 not yet supported)").into());
         }
         // Check for duplicate SenderCompIDs.
         let mut seen = std::collections::HashSet::new();
@@ -219,7 +246,7 @@ fix_symbol = "BTC/USD"
 melin_symbol = 1
 tick_size_inverse = 100
 "#;
-        let config: GatewayConfig = toml::from_str(toml).unwrap();
+        let mut config: GatewayConfig = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate sender_comp_id"));
     }
@@ -246,7 +273,7 @@ fix_symbol = "BTC/USD"
 melin_symbol = 2
 tick_size_inverse = 100
 "#;
-        let config: GatewayConfig = toml::from_str(toml).unwrap();
+        let mut config: GatewayConfig = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate fix_symbol"));
     }
@@ -268,7 +295,7 @@ fix_symbol = "BTC/USD"
 melin_symbol = 1
 tick_size_inverse = 0
 "#;
-        let config: GatewayConfig = toml::from_str(toml).unwrap();
+        let mut config: GatewayConfig = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("tick_size_inverse"));
     }
@@ -292,5 +319,80 @@ tick_size_inverse = 100
 "#;
         let config: GatewayConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.symbols[0].lot_size_inverse, 1);
+    }
+
+    /// Minimal valid session+symbol tail so the seed-normalization tests
+    /// exercise only the upstream logic.
+    const TAIL: &str = r#"
+listen_addr = "0.0.0.0:9100"
+target_comp_id = "MELIN"
+
+[[session]]
+sender_comp_id = "FIRM_A"
+account_id = 1
+key_path = "keys/firm_a.key"
+
+[[symbol]]
+fix_symbol = "BTC/USD"
+melin_symbol = 1
+tick_size_inverse = 100
+"#;
+
+    fn load_str(toml: &str) -> Result<GatewayConfig, Box<dyn std::error::Error>> {
+        let mut config: GatewayConfig = toml::from_str(toml)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn single_server_addr_normalizes_to_one_seed() {
+        let config = load_str(&format!("server_addr = \"127.0.0.1:9876\"\n{TAIL}")).unwrap();
+        assert_eq!(config.seeds, vec!["127.0.0.1:9876".parse().unwrap()]);
+    }
+
+    #[test]
+    fn server_addrs_list_normalizes_to_seeds_in_order() {
+        let config = load_str(&format!(
+            "server_addrs = [\"127.0.0.1:1\", \"127.0.0.1:2\", \"127.0.0.1:3\"]\n{TAIL}"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.seeds,
+            vec![
+                "127.0.0.1:1".parse().unwrap(),
+                "127.0.0.1:2".parse().unwrap(),
+                "127.0.0.1:3".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn both_server_addr_and_addrs_is_error() {
+        let err = load_str(&format!(
+            "server_addr = \"127.0.0.1:1\"\nserver_addrs = [\"127.0.0.1:2\"]\n{TAIL}"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("not both"));
+    }
+
+    #[test]
+    fn no_upstream_is_error() {
+        let err = load_str(TAIL).unwrap_err();
+        assert!(err.to_string().contains("at least one upstream"));
+    }
+
+    #[test]
+    fn empty_server_addrs_list_is_error() {
+        let err = load_str(&format!("server_addrs = []\n{TAIL}")).unwrap_err();
+        assert!(err.to_string().contains("at least one upstream"));
+    }
+
+    #[test]
+    fn ipv6_seed_anywhere_is_error() {
+        let err = load_str(&format!(
+            "server_addrs = [\"127.0.0.1:1\", \"[::1]:2\"]\n{TAIL}"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("IPv4"));
     }
 }
