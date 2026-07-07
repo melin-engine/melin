@@ -232,7 +232,7 @@ pub struct Gateway {
     /// per-session: upstream reachability is a cluster-wide fact, so N
     /// sessions must not each re-probe the same dead seed N times.
     /// Advanced when a connect to the current seed fails; wraps at the
-    /// end of the list.
+    /// end of the list. `usize` because it indexes a `Vec`.
     seed_cursor: usize,
 }
 
@@ -574,19 +574,33 @@ impl Gateway {
         self.start_melin_connect_to(idx, server_addr);
     }
 
-    /// Rotate the upstream candidate after a failed Melin connect. A
-    /// dead learned primary is cleared (a redirect from any live node
-    /// re-teaches it); a dead seed advances the round-robin cursor so
-    /// the next session tries the next node. Either way the *next*
-    /// connect picks a fresh candidate — see [`Gateway::connect_target`].
+    /// Rotate the upstream candidate after a failed Melin connect,
+    /// keyed on the address the attempt actually dialed. A dead learned
+    /// primary is cleared (a redirect from any live node re-teaches it);
+    /// a dead *current-cursor* seed advances the round-robin cursor so
+    /// the next session tries the next node.
+    ///
+    /// The cursor only advances when `failed` is the seed the cursor
+    /// currently points at. This is load-bearing under concurrency:
+    /// several sessions dial the same seed before any failure lands, so
+    /// their failures arrive in a batch. Advancing on every failure
+    /// would step the cursor once per session and skip right past the
+    /// live seeds (with an even batch it can even wrap back onto the
+    /// dead seed and wedge). Gating on the current seed collapses a
+    /// batch of failures against one dead seed into a single advance;
+    /// stale failures for a seed the cursor already moved off of are
+    /// no-ops.
     fn on_connect_failed(&mut self, failed: Option<std::net::SocketAddr>) {
-        if failed.is_some() && failed == self.melin_target {
+        let Some(failed) = failed else { return };
+        if Some(failed) == self.melin_target {
             self.melin_target = None;
-        } else {
-            // `seeds` is non-empty (config validation), so the modulo is
-            // well-defined and the cursor stays in range.
+        } else if failed == self.config.seeds[self.seed_cursor] {
+            // `seeds` is non-empty (config validation), so both the index
+            // above and the modulo below are well-defined.
             self.seed_cursor = (self.seed_cursor + 1) % self.config.seeds.len();
         }
+        // else: a stale attempt (a seed the cursor already advanced past,
+        // or a former primary) — leave the rotation state untouched.
     }
 
     fn start_melin_connect_to(&mut self, idx: usize, server_addr: std::net::SocketAddr) {
@@ -1322,45 +1336,22 @@ mod tests {
         path
     }
 
-    /// Build and leak a `GatewayConfig` for the lifetime of the test
-    /// process. The listen_addr is a placeholder — `Gateway::new` takes
-    /// the `TcpListener` directly and never reads this field.
-    /// `server_port` is the port the Melin stub (or a bogus unused
-    /// port) is listening on.
+    /// Single-seed convenience over [`make_config_with_ports`]:
+    /// `server_port` is where the Melin stub (or a bogus unused port) is
+    /// listening. One seed normalizes to the same single-entry `seeds`
+    /// the `server_addr` alias would produce.
     fn make_config_with_port(
         sender: &str,
         target: &str,
         server_port: u16,
     ) -> &'static GatewayConfig {
-        let key_path = make_key_file();
-        let toml = format!(
-            r#"
-server_addr = "127.0.0.1:{server_port}"
-listen_addr = "127.0.0.1:1"
-target_comp_id = "{target}"
-
-[[session]]
-sender_comp_id = "{sender}"
-account_id = 7
-key_path = "{}"
-
-[[symbol]]
-fix_symbol = "BTC/USD"
-melin_symbol = 1
-tick_size_inverse = 100
-lot_size_inverse = 1
-"#,
-            key_path.display()
-        );
-        let mut config: GatewayConfig = toml::from_str(&toml).unwrap();
-        // Normalize `seeds` exactly as production load does — the event
-        // loop indexes `config.seeds`, which `toml::from_str` leaves empty.
-        config.validate().unwrap();
-        Box::leak(Box::new(config))
+        make_config_with_ports(sender, target, &[server_port])
     }
 
-    /// Like `make_config_with_port` but seeds a whole `server_addrs`
-    /// list (all on 127.0.0.1), for the multi-seed rotation tests.
+    /// Build and leak a `GatewayConfig` seeding `server_addrs` from the
+    /// given ports (all on 127.0.0.1), for the lifetime of the test
+    /// process. The listen_addr is a placeholder — `Gateway::new` takes
+    /// the `TcpListener` directly and never reads it.
     fn make_config_with_ports(sender: &str, target: &str, ports: &[u16]) -> &'static GatewayConfig {
         let key_path = make_key_file();
         let addrs: Vec<String> = ports.iter().map(|p| format!("\"127.0.0.1:{p}\"")).collect();
@@ -1744,6 +1735,31 @@ lot_size_inverse = 1
         let mut gw = gateway_with_seeds(&[1, 2]);
         gw.on_connect_failed(Some(addr(1))); // cursor → 1
         gw.on_connect_failed(Some(addr(2))); // cursor wraps → 0
+        assert_eq!(gw.seed_cursor, 0);
+        assert_eq!(gw.connect_target(), addr(1));
+    }
+
+    #[test]
+    fn concurrent_failures_on_one_dead_seed_advance_cursor_once() {
+        // Several sessions dial the same seed before any failure lands,
+        // so their failures arrive as a batch. The cursor must advance
+        // exactly once — advancing per-failure would step past the live
+        // seed (and with an even batch wrap back onto the dead one).
+        let mut gw = gateway_with_seeds(&[1, 2]);
+        gw.on_connect_failed(Some(addr(1))); // real advance: 0 → 1
+        gw.on_connect_failed(Some(addr(1))); // stale dup: no-op
+        gw.on_connect_failed(Some(addr(1))); // stale dup: no-op
+        assert_eq!(gw.seed_cursor, 1);
+        assert_eq!(gw.connect_target(), addr(2), "must land on the live seed");
+    }
+
+    #[test]
+    fn failure_for_a_non_cursor_seed_is_ignored() {
+        // A failure whose address is neither the learned primary nor the
+        // current cursor seed (a stale in-flight attempt) leaves rotation
+        // state untouched.
+        let mut gw = gateway_with_seeds(&[1, 2, 3]);
+        gw.on_connect_failed(Some(addr(3))); // cursor is at seed 1
         assert_eq!(gw.seed_cursor, 0);
         assert_eq!(gw.connect_target(), addr(1));
     }
