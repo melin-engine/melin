@@ -12,9 +12,9 @@
 use std::io;
 use std::path::Path;
 
-use raft::eraftpb::{ConfChange, ConfChangeV2, Entry, EntryType, Message};
+use raft::eraftpb::{ConfChange, ConfChangeV2, ConfState, Entry, EntryType, Message};
 use raft::{Config, RawNode, StateRole};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::registry::{MemberRecord, Registry};
 use crate::storage::FileStorage;
@@ -274,25 +274,49 @@ impl ControlNode {
                 }
                 EntryType::EntryConfChange => {
                     let cc: ConfChange = prost_decode(&entry.data)?;
-                    let cs = self
-                        .raw
-                        .apply_conf_change(&cc)
-                        .map_err(|e| io::Error::other(format!("conf change failed: {e}")))?;
-                    // Staged first so the ConfState persist below
-                    // carries the applied index atomically — a
-                    // re-delivered conf change would double-apply.
-                    self.raw.mut_store().stage_applied(entry.index, None);
-                    self.raw.mut_store().set_conf_state(cs)?;
+                    let applied = self.raw.apply_conf_change(&cc);
+                    self.absorb_conf_change(entry.index, applied)?;
                 }
                 EntryType::EntryConfChangeV2 => {
                     let cc: ConfChangeV2 = prost_decode(&entry.data)?;
-                    let cs = self
-                        .raw
-                        .apply_conf_change(&cc)
-                        .map_err(|e| io::Error::other(format!("conf change failed: {e}")))?;
-                    self.raw.mut_store().stage_applied(entry.index, None);
-                    self.raw.mut_store().set_conf_state(cs)?;
+                    let applied = self.raw.apply_conf_change(&cc);
+                    self.absorb_conf_change(entry.index, applied)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Land the outcome of applying a committed conf change entry.
+    ///
+    /// On success the entry is staged applied *before* the `ConfState`
+    /// persists, so both land in the same whole-file rewrite — a
+    /// re-delivered conf change then never double-applies.
+    ///
+    /// On an `apply_conf_change` **rejection** we skip rather than halt.
+    /// A committed entry was already durably agreed by a quorum, so the
+    /// rejection means our pre-proposal validation (the driver's safety
+    /// rails) missed a case — a bug on our side, hence `error!`. Every
+    /// node applies the same committed entry and would reject it
+    /// identically, so returning the error here would brick the control
+    /// plane on *every* node, deterministically and permanently. Staging
+    /// the entry applied (without touching `ConfState`) lets all nodes
+    /// converge past it; the driver observes `voters()` unchanged and
+    /// reports the change as failed. A storage error from the persist
+    /// itself is a genuine local I/O failure and still propagates.
+    fn absorb_conf_change(
+        &mut self,
+        index: u64,
+        applied: raft::Result<ConfState>,
+    ) -> io::Result<()> {
+        match applied {
+            Ok(cs) => {
+                self.raw.mut_store().stage_applied(index, None);
+                self.raw.mut_store().set_conf_state(cs)?;
+            }
+            Err(e) => {
+                error!(index, error = %e, "committed conf change rejected on apply — skipping to keep the control plane live");
+                self.raw.mut_store().stage_applied(index, None);
             }
         }
         Ok(())
@@ -560,6 +584,55 @@ mod sim {
                 rec.node_id
             );
         }
+    }
+
+    #[test]
+    fn committed_conf_change_that_fails_to_apply_does_not_halt() {
+        use raft::Storage;
+        use raft::eraftpb::ConfChangeType;
+
+        // Single node: it elects itself and commits instantly, so a
+        // proposed conf change reaches apply within a couple of steps.
+        let mut c = Cluster::new(&[1]);
+        c.settle(200);
+
+        // Propose removing the sole voter. raft happily appends and
+        // commits it — the "removed all voters" rejection only fires at
+        // apply time, inside our apply_committed. Before the hardening
+        // that Err propagated out of drain_ready and bricked the node
+        // (and, cluster-wide, every node deterministically).
+        {
+            let node = c.nodes.get_mut(&1).unwrap();
+            let mut cc = ConfChange::default();
+            cc.set_change_type(ConfChangeType::RemoveNode);
+            cc.node_id = 1;
+            node.raw
+                .propose_conf_change(Vec::new(), cc)
+                .expect("leader accepts the conf-change proposal");
+        }
+
+        // With the old code, step_all's `drain_ready().unwrap()` would
+        // panic here. The hardening absorbs the rejection, so this runs
+        // clean.
+        for _ in 0..20 {
+            c.step_all();
+        }
+
+        // The rejected change left ConfState untouched...
+        let node = c.nodes.get(&1).unwrap();
+        let voters = node.raw.store().initial_state().unwrap().conf_state.voters;
+        assert_eq!(
+            voters,
+            vec![1],
+            "a rejected conf change must not alter ConfState"
+        );
+        assert_eq!(node.role(), StateRole::Leader, "node must still lead");
+
+        // ...and the node still commits and applies normal entries,
+        // proving the control plane is live rather than wedged.
+        let rec = record(7);
+        assert!(c.nodes.get_mut(&1).unwrap().propose_member(&rec));
+        c.settle_record(&rec, 20);
     }
 
     #[test]
