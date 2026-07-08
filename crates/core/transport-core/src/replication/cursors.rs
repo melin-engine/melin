@@ -48,7 +48,7 @@
 //!   `docs/durability-policy-followups.md`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::error;
 
@@ -101,15 +101,31 @@ impl std::error::Error for AckViolation {}
 ///
 /// Shared across the per-slot sender threads (TCP path) or borrowed by
 /// the single-threaded driver loop (DPDK path). All state is atomic;
-/// per-slot writers never store to another slot's entry, and the
-/// shared min/max recompute tolerates concurrent recomputes because
-/// each per-slot cursor is monotonic within a connection.
+/// per-slot writers never store to another slot's entry, and the shared
+/// min/max recompute runs under [`Self::recompute_lock`] so concurrent
+/// recomputes cannot interleave into a stale aggregate.
 pub struct ReplicaCursors {
     /// Per-slot acked position in slot-acked space (`acked_sequence + 1`),
     /// `u64::MAX` when disengaged. `[AtomicU64; 2]` rather than per-slot
     /// `Arc`s: both slots live on one cache line of a single shared
     /// allocation, and the recompute needs both values anyway.
     slot_acked: [AtomicU64; SLOTS],
+    /// Serializes [`recompute_shared`](Self::recompute_shared). That routine
+    /// snapshots both `slot_acked` entries and publishes `min`/`max` to
+    /// `cursor_min`/`cursor_max` — a multi-atomic read-modify-write. The two
+    /// `repl-{slot}` sender threads (`record_ack`) and the accept loop's
+    /// disconnect path (`clear_on_disconnect`) all call it concurrently, so
+    /// without mutual exclusion two recomputes race their plain stores
+    /// last-writer-wins: a reconnecting replica's lower `min` can be lost to
+    /// a same-instant ack on the other slot, leaving `cursor_min`
+    /// over-reporting durability *permanently* until the next ack triggers a
+    /// fresh recompute. `fetch_min`/`fetch_max` cannot substitute — the
+    /// cursors must be able to *decrease* (a reconnect lowers min, a
+    /// disconnect lowers max). A spinlock rather than a `Mutex`: the critical
+    /// section is four atomic ops on a cold path (per ack frame, never per
+    /// order), it keeps the struct free of mutex poisoning, and `AtomicBool`
+    /// stays `const`-constructible.
+    recompute_lock: AtomicBool,
     /// `min` over the per-slot cursors — every connected replica has
     /// durably confirmed up to here. Shared with the response stage and
     /// health endpoint (created at server startup), hence `Arc` rather
@@ -134,6 +150,7 @@ impl ReplicaCursors {
     ) -> Self {
         let cursors = Self {
             slot_acked: [AtomicU64::new(DISENGAGED), AtomicU64::new(DISENGAGED)],
+            recompute_lock: AtomicBool::new(false),
             cursor_min,
             cursor_max,
             metrics,
@@ -245,7 +262,23 @@ impl ReplicaCursors {
     /// disengaged slots explicitly — otherwise one parked slot's sentinel
     /// masquerades as the fastest replica whenever fewer than two replicas
     /// are connected.
+    ///
+    /// Held under [`recompute_lock`](Self::recompute_lock): the snapshot of
+    /// both slots and the two plain stores must be atomic as a group against
+    /// other recomputes, or a concurrent caller's update is lost
+    /// last-writer-wins. Each mutating method stores its slot value *before*
+    /// calling this, so the recompute that runs last in the lock order
+    /// observes every committed slot store (the acquiring load pairs with the
+    /// previous holder's releasing unlock) and publishes the correct
+    /// aggregate. The section is uncontended in steady state.
     fn recompute_shared(&self) {
+        while self
+            .recompute_lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
         let a = self.slot_acked[0].load(Ordering::Acquire);
         let b = self.slot_acked[1].load(Ordering::Acquire);
         self.cursor_min.store(a.min(b), Ordering::Release);
@@ -256,6 +289,9 @@ impl ReplicaCursors {
             (false, false) => a.max(b),
         };
         self.cursor_max.store(max, Ordering::Release);
+        // Release: hand both stores off to the next lock holder, whose
+        // Acquire on the flag then observes this recompute's writes.
+        self.recompute_lock.store(false, Ordering::Release);
     }
 }
 
@@ -431,6 +467,71 @@ mod tests {
         assert_eq!(violation.acked_sequence, 50);
         assert_eq!(violation.in_memory_sequence, 40);
         assert_eq!(metrics.acked_sequence[0].load(Ordering::Relaxed), 0);
+    }
+
+    /// Two `repl-{slot}` threads recomputing the shared cursors at the same
+    /// instant must not lose an update: after each concurrent round settles,
+    /// `cursor_min`/`cursor_max` equal min/max over the two slots. Before the
+    /// `recompute_lock` serialization, the two plain stores raced
+    /// last-writer-wins and a round's aggregate could be left permanently
+    /// stale — this test caught that within a few rounds.
+    #[test]
+    fn concurrent_recompute_does_not_lose_updates() {
+        use std::sync::Barrier;
+
+        let (min, max, _metrics, cursors) = store();
+        let cursors = Arc::new(cursors);
+        // Engage both slots so every round has two live cursors.
+        cursors.seed_on_handshake(0, 0);
+        cursors.seed_on_handshake(1, 0);
+
+        const ROUNDS: u64 = 2_000;
+        // 2 workers + the checker (main): all three rendezvous each round so
+        // the two record_ack calls overlap, then the checker reads only once
+        // both recomputes have returned (quiescent, so no transient lag).
+        let start = Arc::new(Barrier::new(3));
+        let done = Arc::new(Barrier::new(3));
+
+        let workers: Vec<_> = (0..2usize)
+            .map(|slot| {
+                let cursors = Arc::clone(&cursors);
+                let start = Arc::clone(&start);
+                let done = Arc::clone(&done);
+                // Distinct per-round steps keep min and max on different
+                // slots, so a lost update on either cursor is observable.
+                let step = if slot == 0 { 2 } else { 1 };
+                std::thread::spawn(move || {
+                    for round in 1..=ROUNDS {
+                        start.wait();
+                        let v = round * step;
+                        cursors
+                            .record_ack(slot, &ack(v, v), v)
+                            .expect("monotonic ack within highest_sent");
+                        done.wait();
+                    }
+                })
+            })
+            .collect();
+
+        for round in 1..=ROUNDS {
+            start.wait();
+            done.wait();
+            // Slot 0 is at 2·round, slot 1 at round (slot-acked = +1).
+            assert_eq!(
+                min.load(Ordering::Acquire),
+                round + 1,
+                "cursor_min lost an update at round {round}"
+            );
+            assert_eq!(
+                max.load(Ordering::Acquire),
+                2 * round + 1,
+                "cursor_max lost an update at round {round}"
+            );
+        }
+
+        for w in workers {
+            w.join().expect("worker thread");
+        }
     }
 
     #[test]
