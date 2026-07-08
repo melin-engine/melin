@@ -391,13 +391,28 @@ fn wait_for_replacement_catchup(primary_health: SocketAddr) {
 /// (e.g. `PROMOTE`, `ROTATE`). Returns the server's first response line
 /// trimmed of whitespace.
 fn admin_command(addr: SocketAddr, operator_key: &SigningKey, command: &str) -> String {
+    // 5 s suffices for the fire-and-forget commands (PROMOTE/ROTATE/
+    // DURABILITY answer immediately); voter changes shepherd a raft
+    // commit and use the longer-timeout variant below.
+    admin_command_with_timeout(addr, operator_key, command, Duration::from_secs(5))
+}
+
+/// Like [`admin_command`] but with a caller-chosen read timeout. Voter
+/// changes (`RAFT-ADD-VOTER` / `RAFT-REMOVE-VOTER`) block on a raft
+/// commit, so they need more headroom than the immediate commands.
+fn admin_command_with_timeout(
+    addr: SocketAddr,
+    operator_key: &SigningKey,
+    command: &str,
+    read_timeout: Duration,
+) -> String {
     use melin_protocol::codec;
     use melin_protocol::message::{Request, ResponseKind};
 
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .expect("connect to admin endpoint");
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(read_timeout))
         .expect("set read timeout");
 
     // Step 1: Receive Challenge.
@@ -4497,4 +4512,189 @@ fn raft_auto_promotes_surviving_replica_after_primary_kill() {
 
     // `replicas` dropping SIGKILLs the survivors.
     drop(replicas);
+}
+
+/// Runtime voter-set change over the admin endpoint: grow a genesis
+/// 3-voter cluster to include a `--raft-join` node 4 (`RAFT-ADD-VOTER`),
+/// then shrink it by removing a follower (`RAFT-REMOVE-VOTER`) — cluster
+/// live throughout, no restart. Also exercises two rails over the real
+/// socket path: removing the current leader is refused, and node id 0 is
+/// rejected. This is the plumbing proof (auth → driver → raft commit →
+/// reply); the deep correctness (the new set actually elects, snapshot
+/// join, crash-reopen) lives in the `melin-raft` sim tests.
+#[test]
+fn voter_changes_over_the_admin_endpoint() {
+    use std::collections::HashMap;
+
+    let bin = server_bin();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let operator_key = SigningKey::from_bytes(&[8u8; 32]);
+
+    // Provision keys for all four ids up front: node 4's replication key
+    // must already be authorized on every member before it can join
+    // (authorized_keys is loaded at boot and immutable per process).
+    let all_ids = [1u64, 2, 3, 4];
+    let cluster = raft_cluster_keys(
+        tmp.path(),
+        &all_ids,
+        &format!("operator {} ops\n", pubkey_b64(&operator_key)),
+    );
+
+    let raft_ports: HashMap<u64, u16> = all_ids.iter().map(|&id| (id, free_port())).collect();
+    let admin_ports: HashMap<u64, u16> = all_ids.iter().map(|&id| (id, free_port())).collect();
+    let health_ports: HashMap<u64, u16> = all_ids.iter().map(|&id| (id, free_port())).collect();
+
+    // `--raft-peer` args for `me` dialing everyone in `peers` but itself.
+    let peer_args = |peers: &[u64], me: u64| -> Vec<String> {
+        peers
+            .iter()
+            .filter(|&&p| p != me)
+            .flat_map(|&p| {
+                vec![
+                    "--raft-peer".to_string(),
+                    raft_peer_arg(p, raft_ports[&p], &pubkey_b64(&cluster.node_keys[&p])),
+                ]
+            })
+            .collect()
+    };
+
+    let spawn_node = |id: u64, dial: &[u64], join: bool| -> ServerProcess {
+        let journal = tmp.path().join(format!("voter-node-{id}.journal"));
+        let mut args: Vec<String> = vec![
+            "--bind".into(),
+            format!("127.0.0.1:{}", free_port()),
+            "--health-bind".into(),
+            format!("127.0.0.1:{}", health_ports[&id]),
+            "--admin-bind".into(),
+            format!("127.0.0.1:{}", admin_ports[&id]),
+            "--journal".into(),
+            journal.to_str().expect("valid path").into(),
+            "--authorized-keys".into(),
+            cluster.keys_path.to_str().expect("valid path").into(),
+            "--standalone".into(),
+            "--durability-mode".into(),
+            "local".into(),
+            "--accounts".into(),
+            "10".into(),
+            "--instruments".into(),
+            "2".into(),
+            "--connection-timeout-secs".into(),
+            "0".into(),
+            "--yield-idle".into(),
+            "--cores".into(),
+            "0,0,0,0,0,0,0,0,0".into(),
+            "--raft-bind".into(),
+            format!("127.0.0.1:{}", raft_ports[&id]),
+            "--raft-node-id".into(),
+            id.to_string(),
+            "--replication-key".into(),
+            cluster.key_paths[&id].to_str().expect("valid path").into(),
+        ];
+        if join {
+            args.push("--raft-join".into());
+        }
+        args.extend(peer_args(dial, id));
+        let child = Command::new(&bin)
+            .args(&args)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+            .spawn()
+            .expect("spawn node");
+        ServerProcess {
+            child,
+            client_addr: format!("127.0.0.1:{}", raft_ports[&id]).parse().unwrap(),
+            health_addr: format!("127.0.0.1:{}", health_ports[&id]).parse().unwrap(),
+        }
+    };
+
+    let admin_addr =
+        |id: u64| -> SocketAddr { format!("127.0.0.1:{}", admin_ports[&id]).parse().unwrap() };
+
+    // Genesis: three voters, each dialing the other two.
+    let genesis = [1u64, 2, 3];
+    let mut nodes: HashMap<u64, ServerProcess> = genesis
+        .iter()
+        .map(|&id| (id, spawn_node(id, &genesis, false)))
+        .collect();
+
+    let genesis_health: Vec<(u64, SocketAddr)> = genesis
+        .iter()
+        .map(|&id| (id, nodes[&id].health_addr))
+        .collect();
+    let (leader, _) = wait_for_raft_leader(&genesis_health, Duration::from_secs(60));
+    let follower = genesis.iter().copied().find(|&id| id != leader).unwrap();
+
+    // Node 4 joins with an empty voter set; it dials the genesis members
+    // and waits to be admitted.
+    nodes.insert(4, spawn_node(4, &genesis, true));
+    // Give the joiner a moment to establish its outbound links before the
+    // add (not required for correctness — the driver retries — but keeps
+    // the happy path within one re-propose interval).
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Grow to four voters. Sent to the leader's admin endpoint; the reply
+    // reports the applied voter set.
+    let add = admin_command_with_timeout(
+        admin_addr(leader),
+        &operator_key,
+        &format!(
+            "RAFT-ADD-VOTER 4 127.0.0.1:{} {}",
+            raft_ports[&4],
+            pubkey_b64(&cluster.node_keys[&4])
+        ),
+        Duration::from_secs(20),
+    );
+    assert_eq!(add, "OK voters=1,2,3,4", "add voter 4 failed: {add}");
+
+    // Rail: node id 0 is rejected by the driver (raft's invalid-id
+    // sentinel). A valid key + address ensures the request reaches the
+    // rail rather than tripping a parse error first.
+    let zero = admin_command(
+        admin_addr(leader),
+        &operator_key,
+        &format!(
+            "RAFT-ADD-VOTER 0 127.0.0.1:1 {}",
+            pubkey_b64(&cluster.node_keys[&4])
+        ),
+    );
+    assert!(zero.starts_with("ERR"), "id 0 must be refused: {zero}");
+
+    // Rail: removing the live leader is refused (leadership must move
+    // first). Fast — the driver answers from validation, no raft round.
+    let bad = admin_command(
+        admin_addr(leader),
+        &operator_key,
+        &format!("RAFT-REMOVE-VOTER {leader}"),
+    );
+    assert!(
+        bad.contains("currently leads"),
+        "removing the live leader must be refused: {bad}"
+    );
+
+    // Shrink: remove a follower. The reply reflects the new set (order is
+    // ascending; the removed id is gone).
+    let remove = admin_command_with_timeout(
+        admin_addr(leader),
+        &operator_key,
+        &format!("RAFT-REMOVE-VOTER {follower}"),
+        Duration::from_secs(20),
+    );
+    let mut expected: Vec<u64> = vec![1, 2, 3, 4]
+        .into_iter()
+        .filter(|&v| v != follower)
+        .collect();
+    expected.sort_unstable();
+    let expected_line = format!(
+        "OK voters={}",
+        expected
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert_eq!(remove, expected_line, "remove follower failed: {remove}");
+
+    // Dropping `nodes` SIGKILLs every survivor via `ServerProcess::drop`.
+    drop(nodes);
 }

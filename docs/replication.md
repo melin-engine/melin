@@ -281,8 +281,9 @@ requiring the full journal history.
 | `--standalone` | No | `false` | Explicitly disable replication. Requires `--durability-mode local`. |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary. |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
-| `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `DURABILITY <mode>`. |
+| `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, `DURABILITY <mode>`, and (on raft nodes) `RAFT-ADD-VOTER` / `RAFT-REMOVE-VOTER`. |
 | `--durability-mode <mode>` | Primary | `hybrid` | Active durability mode at startup. `local`, `hybrid`, or `durably-replicated`. Can be swapped at runtime via admin `DURABILITY`. |
+| `--raft-join` | No | `false` | Boot a raft node with an empty voter set so it can be admitted to a running cluster via `RAFT-ADD-VOTER`. Keep `--raft-node-id`/`--raft-bind`/`--raft-peer`. See "Changing the cluster membership at runtime". |
 
 `--replication-bind` and `--standalone` are mutually exclusive.
 `--replica-of` is mutually exclusive with both. If none are specified,
@@ -556,6 +557,74 @@ another node or forge votes. Durable election state (term, vote) lives
 in `--raft-dir` (default: `<journal>.raft/`); treat it like the
 journal — never wipe or share it on a live cluster, or a node can vote
 twice in one term.
+
+### Changing the cluster membership at runtime
+
+The voter set is fixed at boot from `--raft-peer`. Growing the cluster
+(3 → 5 for more failure tolerance), shrinking it, or replacing a node
+under a **new identity** is done live, with no cluster restart, through
+two admin commands:
+
+- `RAFT-ADD-VOTER <node-id> <raft-addr> <pubkey-b64>` — admit a new
+  node as a voter.
+- `RAFT-REMOVE-VOTER <node-id>` — drop a node from the voter set.
+
+Both are sent to the admin endpoint of any cluster node (authenticated
+with an operator key, like `PROMOTE`) and return the resulting voter
+set, e.g. `OK voters=1,2,3,4`, or a refusal, e.g.
+`ERR node 2 currently leads — stop it and let the cluster elect first`.
+Unlike the other admin commands they are not fire-and-forget: the node
+waits for the change to commit across the cluster before replying, so a
+non-error response means the new membership is durable everywhere.
+
+The bundled `melin-raftctl` CLI wraps both:
+
+```
+melin-raftctl <admin-addr> <ops.key> add-voter 4 10.0.0.4:7000 <pubkey-b64>
+melin-raftctl <admin-addr> <ops.key> remove-voter 3
+```
+
+**Adding a node** takes three steps:
+
+1. **Provision the joiner's key first.** The new node's
+   `--replication-key` public key must already carry `replication`
+   permission in **every existing member's** `authorized_keys` file.
+   That file is read once at boot, so a key added later needs a rolling
+   restart to take effect — provision spare cluster keys at deploy time
+   to avoid one. (Adding a voter solves node-identity mapping, not key
+   authorization.)
+2. **Boot the joiner with `--raft-join`.** It keeps `--raft-node-id`,
+   `--raft-bind`, and `--raft-peer` (pointing at the existing members),
+   but starts with an *empty* voter set and sits as a passive follower
+   until admitted. `--raft-join` is the only correct way to introduce a
+   node: a node booted with a guessed full voter set has a divergent
+   view of the cluster that raft never reconciles.
+3. **Run `RAFT-ADD-VOTER`.** The cluster records the joiner's address
+   and key, begins replicating the log (and a state snapshot if the
+   joiner is far behind) to it, and adds it to the voter set.
+
+**Removing a node.** `RAFT-REMOVE-VOTER` drops a node from consensus.
+The current leader cannot be removed while it is running — move
+leadership first (stop it, or `PROMOTE` another node) — and the last
+remaining voter cannot be removed (it would brick consensus). Removing
+a node is a control-plane change only: a removed node keeps serving the
+data plane until you stop its process, so stop it afterward. Once
+removed, it can no longer be elected. Both commands are idempotent:
+adding a node that is already a voter, or removing one that is already
+gone, succeeds without changing anything.
+
+**Replacing a dead node at the same id and key** needs *no* voter
+change at all: boot the replacement with the old node's id and
+replication key (at whatever new address), and the membership registry
+re-points every peer at it automatically. Use `RAFT-ADD-VOTER` /
+`RAFT-REMOVE-VOTER` only when the node **id or key** changes, or when
+the voter **count** changes.
+
+A removed node's directory entry lingers until it is added again or the
+cluster is rebuilt, so peers keep trying to reach a decommissioned
+address at a low background rate — harmless, but stop the process to
+silence it. Only one membership change is processed at a time; a second
+request while one is in flight is refused immediately.
 
 ### No offline journal inspector
 
