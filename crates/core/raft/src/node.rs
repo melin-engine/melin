@@ -12,7 +12,9 @@
 use std::io;
 use std::path::Path;
 
-use raft::eraftpb::{ConfChange, ConfChangeV2, ConfState, Entry, EntryType, Message};
+use raft::eraftpb::{
+    ConfChange, ConfChangeType, ConfChangeV2, ConfState, Entry, EntryType, Message,
+};
 use raft::{Config, RawNode, StateRole};
 use tracing::{debug, error, info};
 
@@ -43,6 +45,15 @@ pub struct ControlNode {
     /// persisted state at open, kept current by `drain_ready`'s apply
     /// path. The storage owns its serialized durability.
     registry: Registry,
+    /// Set when an applied conf change *added* a voter, cleared by the
+    /// next compaction. It forces that compaction to trim the log to the
+    /// applied index (dropping the usual retention buffer) so the fresh
+    /// voter — whose match index is 0 and whose empty bootstrap `ConfState`
+    /// carries none of the genesis membership — catches up via a snapshot
+    /// (which conveys the full `ConfState` + registry) rather than a log
+    /// replay that would only deliver the incremental `AddNode` and leave
+    /// it believing it is a lone voter. See [`Self::maybe_compact`].
+    force_snapshot_compact: bool,
 }
 
 /// What a drained ready handed to the caller: messages to put on the
@@ -114,7 +125,11 @@ impl ControlNode {
 
         let raw = RawNode::new(&config, storage, &crate::tracing_logger())
             .map_err(|e| io::Error::other(format!("raft node init failed: {e}")))?;
-        Ok(Self { raw, registry })
+        Ok(Self {
+            raw,
+            registry,
+            force_snapshot_compact: false,
+        })
     }
 
     /// Propose `record` into the raft log. Works from any node that
@@ -139,6 +154,54 @@ impl ControlNode {
     /// The applied membership registry.
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// The current voter set, ascending. Read from raft's applied
+    /// configuration (kept in lockstep with the persisted `ConfState`
+    /// by [`Self::absorb_conf_change`]). Callers poll this to observe
+    /// whether a proposed voter change has committed and applied —
+    /// proposals are ack-less, exactly like `propose_member`.
+    pub fn voters(&self) -> Vec<u64> {
+        // `to_conf_state().voters` is the incoming voter set for a
+        // simple (non-joint) config, which is all we ever run — we only
+        // ever propose single-node changes. Sorted for a stable,
+        // comparable result.
+        let mut voters = self.raw.raft.prs().conf().to_conf_state().voters;
+        voters.sort_unstable();
+        voters
+    }
+
+    /// Propose adding `node_id` to the voter set. Same contract as
+    /// [`Self::propose_member`]: `true` means "accepted for
+    /// append/forwarding", never "committed" — the caller re-proposes
+    /// and polls [`Self::voters`] until it reflects the change. The
+    /// caller is responsible for the safety rails (a seed `MemberRecord`
+    /// must already be proposed so peers can dial the joiner, the key
+    /// must be authorized, etc.); this is the raw mechanism.
+    pub fn propose_add_voter(&mut self, node_id: u64) -> bool {
+        self.propose_voter_change(node_id, ConfChangeType::AddNode)
+    }
+
+    /// Propose removing `node_id` from the voter set. Same ack-less
+    /// contract as [`Self::propose_add_voter`].
+    pub fn propose_remove_voter(&mut self, node_id: u64) -> bool {
+        self.propose_voter_change(node_id, ConfChangeType::RemoveNode)
+    }
+
+    fn propose_voter_change(&mut self, node_id: u64, change: ConfChangeType) -> bool {
+        let mut cc = ConfChange::default();
+        cc.set_change_type(change);
+        cc.node_id = node_id;
+        match self.raw.propose_conf_change(Vec::new(), cc) {
+            Ok(()) => true,
+            Err(e) => {
+                // Expected while leaderless or when a conf change is
+                // already in flight (raft admits only one) — the driver
+                // retries. Same level/rationale as `propose_member`.
+                debug!(error = %e, node_id, ?change, "voter conf-change proposal dropped");
+                false
+            }
+        }
     }
 
     /// Advance the logical clock by one tick (the driver calls this at
@@ -248,8 +311,19 @@ impl ControlNode {
     /// common path.
     fn maybe_compact(&mut self) -> io::Result<()> {
         let applied = self.raw.raft.raft_log.applied();
-        let Some(target) = applied.checked_sub(LOG_RETENTION) else {
-            return Ok(()); // fewer than a window's worth applied yet
+        // A just-added voter must catch up via snapshot, not log replay,
+        // to receive the full `ConfState` (see the field docs). Trim to
+        // the applied index so its match position (0) falls below the log
+        // start and the leader ships it a snapshot. Rare (only on
+        // `AddNode`); a briefly-lagging existing follower just gets a
+        // snapshot too, which is correct if slightly less efficient.
+        let target = if std::mem::take(&mut self.force_snapshot_compact) {
+            applied
+        } else {
+            match applied.checked_sub(LOG_RETENTION) {
+                Some(t) => t,
+                None => return Ok(()), // fewer than a window's worth applied yet
+            }
         };
         self.raw.mut_store().compact(target)
     }
@@ -274,13 +348,15 @@ impl ControlNode {
                 }
                 EntryType::EntryConfChange => {
                     let cc: ConfChange = prost_decode(&entry.data)?;
+                    let before = self.voters().len();
                     let applied = self.raw.apply_conf_change(&cc);
-                    self.absorb_conf_change(entry.index, applied)?;
+                    self.absorb_conf_change(entry.index, applied, before)?;
                 }
                 EntryType::EntryConfChangeV2 => {
                     let cc: ConfChangeV2 = prost_decode(&entry.data)?;
+                    let before = self.voters().len();
                     let applied = self.raw.apply_conf_change(&cc);
-                    self.absorb_conf_change(entry.index, applied)?;
+                    self.absorb_conf_change(entry.index, applied, before)?;
                 }
             }
         }
@@ -308,9 +384,17 @@ impl ControlNode {
         &mut self,
         index: u64,
         applied: raft::Result<ConfState>,
+        voters_before: usize,
     ) -> io::Result<()> {
         match applied {
             Ok(cs) => {
+                // A grown voter set means a fresh voter that needs the
+                // full membership via snapshot — force the next compaction
+                // to trim to applied so it takes the snapshot path (see
+                // the field docs on `force_snapshot_compact`).
+                if cs.voters.len() > voters_before {
+                    self.force_snapshot_compact = true;
+                }
                 self.raw.mut_store().stage_applied(index, None);
                 self.raw.mut_store().set_conf_state(cs)?;
             }
@@ -470,6 +554,56 @@ mod sim {
                 }
             }
             panic!("no leader after {max} rounds");
+        }
+
+        /// Open a fresh node with an **empty** voter bootstrap (the
+        /// `--raft-join` pattern) and insert it. It stays a passive
+        /// follower — raft accepts an empty `ConfState` and waits for
+        /// the leader's `AddNode` + appends to bring it in.
+        fn add_joiner(&mut self, id: u64) {
+            let dir = tempfile::tempdir().unwrap();
+            let node = ControlNode::open(id, dir.path(), &[]).unwrap();
+            self.nodes.insert(id, node);
+            self.dirs.insert(id, dir);
+        }
+
+        /// Step until every **live** node whose id is in `expected`
+        /// reports exactly `expected` as its voter set. Nodes outside
+        /// `expected` (e.g. a just-removed voter that hasn't learned it
+        /// yet) and partitioned nodes (a dead voter still in the config)
+        /// are ignored — their view is allowed to lag or diverge.
+        fn settle_voters(&mut self, expected: &[u64], max: usize) {
+            for _ in 0..max {
+                self.step_all();
+                if expected.iter().all(|id| {
+                    self.down.contains(id)
+                        || self.nodes.get(id).is_some_and(|n| n.voters() == expected)
+                }) {
+                    return;
+                }
+            }
+            let got: Vec<(u64, Vec<u64>)> =
+                self.nodes.iter().map(|(id, n)| (*id, n.voters())).collect();
+            panic!("voters did not converge to {expected:?} within {max} rounds; got {got:?}");
+        }
+
+        /// Step until every node in `ids` has `rec` in its registry.
+        /// Like `settle_record` but scoped to a subset — used while a
+        /// joiner is not yet a voter and so not yet receiving the log.
+        fn settle_record_among(&mut self, rec: &MemberRecord, ids: &[u64], max: usize) {
+            for _ in 0..max {
+                self.step_all();
+                if ids
+                    .iter()
+                    .all(|id| self.nodes[id].registry().get(rec.node_id) == Some(rec))
+                {
+                    return;
+                }
+            }
+            panic!(
+                "record {} did not replicate to {ids:?} within {max} rounds",
+                rec.node_id
+            );
         }
     }
 
@@ -633,6 +767,166 @@ mod sim {
         let rec = record(7);
         assert!(c.nodes.get_mut(&1).unwrap().propose_member(&rec));
         c.settle_record(&rec, 20);
+    }
+
+    #[test]
+    fn joiner_catches_up_via_snapshot() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+
+        // Push enough records to compact the early log away before node
+        // 4 is wired in, so it can only join via snapshot (which must
+        // carry both ConfState and the registry).
+        let count = LOG_RETENTION + 40;
+        for i in 0..count {
+            let rec = record(100 + i);
+            assert!(c.nodes.get_mut(&leader).unwrap().propose_member(&rec));
+            c.step_all();
+        }
+        let last = record(100 + count - 1);
+        c.settle_record_among(&last, &[1, 2, 3], 200);
+
+        // Now admit node 4. Its log is empty and the entries it would
+        // need are compacted, so the leader must ship a snapshot.
+        c.add_joiner(4);
+        let rec4 = record(4);
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_member(&rec4));
+        c.settle_record_among(&rec4, &[1, 2, 3], 100);
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_add_voter(4));
+        c.settle_voters(&[1, 2, 3, 4], 400);
+        // `voters()` reflects raft's in-memory config, which a snapshot
+        // restore updates during `step()` — before the snapshot has
+        // been drained and persisted. A few more rounds let node 4
+        // actually drain it and rebuild its registry from the snapshot
+        // `app_state`.
+        for _ in 0..10 {
+            c.step_all();
+        }
+
+        // The snapshot carried the whole registry, not just post-join
+        // entries.
+        assert_eq!(
+            c.nodes[&4].registry(),
+            c.nodes[&leader].registry(),
+            "joiner must converge on the full registry via snapshot"
+        );
+        assert_eq!(c.nodes[&4].registry().get(last.node_id), Some(&last));
+    }
+
+    #[test]
+    fn add_voter_grows_the_cluster_and_the_new_voter_votes() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+
+        // Admit node 4 through the two-stage flow (seed record → AddNode).
+        c.add_joiner(4);
+        let rec4 = record(4);
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_member(&rec4));
+        c.settle_record_among(&rec4, &[1, 2, 3], 100);
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_add_voter(4));
+        c.settle_voters(&[1, 2, 3, 4], 400);
+        // Let node 4 fully drain the log it now receives as a voter.
+        for _ in 0..10 {
+            c.step_all();
+        }
+
+        // Kill the old leader. Three voters remain (two originals + the
+        // joiner), and a 4-voter quorum is 3 — so the survivors can only
+        // elect if node 4 grants its vote. A successful election proves
+        // the freshly-added voter actually participates in consensus.
+        c.down.push(leader);
+        let second = c.settle(600);
+        assert_ne!(second, leader, "the dead leader must not lead");
+        assert!(
+            [1, 2, 3, 4].contains(&second) && second != leader,
+            "a live voter from the grown set must win, got {second}"
+        );
+    }
+
+    #[test]
+    fn remove_voter_shrinks_the_cluster() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+        // Remove a follower so leadership is undisturbed by the change.
+        let victim = *c.nodes.keys().find(|id| **id != leader).unwrap();
+
+        assert!(
+            c.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .propose_remove_voter(victim)
+        );
+        let remaining: Vec<u64> = [1, 2, 3].into_iter().filter(|id| *id != victim).collect();
+        c.settle_voters(&remaining, 200);
+
+        // The removed node is no longer part of consensus; the remaining
+        // pair keeps a single stable leader (a 2-voter quorum is 2, so
+        // this is the strongest liveness assertion available).
+        assert!(
+            c.leader().is_some(),
+            "the shrunk 2-voter set must keep a leader"
+        );
+    }
+
+    #[test]
+    fn duplicate_add_is_harmless() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+
+        // Re-adding an existing voter is a no-op in raft-rs (make_voter
+        // is idempotent), so the apply neither errors nor changes the
+        // set — verifies pre-implementation assumption 4.
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_add_voter(2));
+        for _ in 0..50 {
+            c.step_all();
+        }
+        c.settle_voters(&[1, 2, 3], 50);
+        assert_eq!(c.nodes[&leader].voters(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn remove_absent_is_harmless() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+
+        // Removing an id that was never a voter is a no-op (remove of an
+        // absent id changes nothing), not an error.
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_remove_voter(99));
+        for _ in 0..50 {
+            c.step_all();
+        }
+        c.settle_voters(&[1, 2, 3], 50);
+        assert_eq!(c.nodes[&leader].voters(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn conf_change_survives_restart() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+        let victim = *c.nodes.keys().find(|id| **id != leader).unwrap();
+
+        assert!(
+            c.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .propose_remove_voter(victim)
+        );
+        let remaining: Vec<u64> = [1, 2, 3].into_iter().filter(|id| *id != victim).collect();
+        c.settle_voters(&remaining, 200);
+
+        // Crash-reopen a surviving voter from its own directory: the
+        // applied ConfState must come back from persisted state, which
+        // pins the stage_applied-before-set_conf_state atomicity — the
+        // conf change and its applied index land in one file rewrite.
+        let survivor = *remaining.iter().find(|id| **id != leader).unwrap();
+        let dir = c.dirs[&survivor].path().to_path_buf();
+        c.nodes.remove(&survivor);
+        let reopened = ControlNode::open(survivor, &dir, &[]).unwrap();
+        assert_eq!(
+            reopened.voters(),
+            remaining,
+            "a removed voter must stay removed across a crash-reopen"
+        );
     }
 
     #[test]

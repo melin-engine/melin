@@ -746,6 +746,38 @@ mod tests {
         assert!(s.initialize_with_conf_state(vec![4]).is_err());
     }
 
+    /// The `--raft-join` bootstrap: an empty voter set leaves the storage
+    /// *uninitialized* (an empty `ConfState` is the default), so a joiner
+    /// that re-runs the bootstrap on every boot is a safe no-op until the
+    /// leader's `AddNode` brings it in. Pins that invariant.
+    #[test]
+    fn empty_bootstrap_stays_uninitialized_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = FileStorage::open(dir.path()).unwrap();
+        s.initialize_with_conf_state(vec![]).unwrap();
+        assert!(
+            !s.initialized(),
+            "an empty voter bootstrap must not mark the storage initialized"
+        );
+
+        // Reopen and re-bootstrap: still uninitialized, no error — the
+        // joiner's boot path must be replay-safe.
+        let mut reopened = FileStorage::open(dir.path()).unwrap();
+        assert!(!reopened.initialized());
+        reopened
+            .initialize_with_conf_state(vec![])
+            .expect("re-running the empty bootstrap must be a no-op, not an error");
+        assert!(!reopened.initialized());
+        assert!(
+            reopened
+                .initial_state()
+                .unwrap()
+                .conf_state
+                .voters
+                .is_empty()
+        );
+    }
+
     #[test]
     fn append_and_hard_state_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
