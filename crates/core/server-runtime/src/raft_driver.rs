@@ -42,7 +42,7 @@ use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -102,6 +102,12 @@ const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// seconds keeps convergence prompt without spamming leaderless
 /// clusters.
 const ANNOUNCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Overall deadline for one operator voter change. Each stage re-proposes
+/// every [`ANNOUNCE_RETRY_INTERVAL`] until observed applied; after this
+/// long the driver gives up and reports failure so the operator command
+/// returns instead of hanging. Comfortably above a few election timeouts,
+/// so a single leader churn mid-change does not trip it.
+const VOTER_CHANGE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// One other cluster node, as configured on this node.
 #[derive(Debug, Clone)]
@@ -147,6 +153,63 @@ pub struct RaftDriverConfig {
     /// carries a higher fencing epoch. Off = election stays purely
     /// observational, exactly as before.
     pub auto_promote: bool,
+}
+
+/// A runtime voter-set change an operator requests via the admin
+/// endpoint (`RAFT-ADD-VOTER` / `RAFT-REMOVE-VOTER`).
+#[derive(Debug, Clone)]
+pub enum VoterChange {
+    /// Grow the cluster: admit `node_id` as a voter. Carries the seed
+    /// identity (raft dial address + replication public key) so the
+    /// driver can propose a [`MemberRecord`] for the joiner *before* the
+    /// `ConfChange` — existing members need that record to dial and
+    /// authenticate the newcomer, and nobody else would propose it (the
+    /// joiner cannot be dialed until its key is pinned).
+    Add {
+        node_id: u64,
+        raft_addr: SocketAddr,
+        public_key: [u8; 32],
+    },
+    /// Shrink the cluster: drop `node_id` from the voter set.
+    Remove { node_id: u64 },
+}
+
+impl VoterChange {
+    /// The node id this change targets.
+    fn node_id(&self) -> u64 {
+        match self {
+            VoterChange::Add { node_id, .. } | VoterChange::Remove { node_id } => *node_id,
+        }
+    }
+
+    /// The seed [`MemberRecord`] to propose before an `AddNode`
+    /// `ConfChange` (addresses beyond the raft dial target are left
+    /// `None` — the joiner's own announce loop fills them in once it is
+    /// caught up). `None` for a removal, which proposes no record.
+    fn seed_record(&self) -> Option<MemberRecord> {
+        match self {
+            VoterChange::Add {
+                node_id,
+                raft_addr,
+                public_key,
+            } => Some(MemberRecord {
+                node_id: *node_id,
+                raft_addr: *raft_addr,
+                replication_addr: None,
+                order_entry_addr: None,
+                public_key: *public_key,
+            }),
+            VoterChange::Remove { .. } => None,
+        }
+    }
+}
+
+/// One operator request to change the voter set, with a one-shot reply
+/// channel. The driver answers exactly once: the resulting voter set on
+/// success, or a human-readable refusal.
+pub struct VoterChangeRequest {
+    pub change: VoterChange,
+    pub reply: Sender<Result<Vec<u64>, String>>,
 }
 
 /// Handles present only on a node that booted as a replica — the
@@ -321,6 +384,13 @@ pub struct RaftDriverContext {
     /// Present iff this node booted as a replica — see
     /// [`ReplicaSignals`]. `None` on a genesis primary.
     pub replica: Option<ReplicaSignals>,
+    /// Operator voter-set changes from the admin endpoint. The driver
+    /// drains this once per loop iteration and shepherds at most one
+    /// change to commitment at a time (see [`drain_voter_changes`]); the
+    /// admin handler holds the matching `Sender` as an optional
+    /// capability. Always present on a raft node — a raft-less node has
+    /// no driver and no `Sender`.
+    pub voter_changes: Receiver<VoterChangeRequest>,
     /// Process-wide shutdown flag.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -500,6 +570,10 @@ fn run(
     // refusal (e.g. `local` durability) warns once per tenure instead
     // of every 10 ms poll.
     let mut last_refused_term: u64 = 0;
+    // The operator voter change currently being shepherded to
+    // commitment, if any — at most one at a time (raft serializes conf
+    // changes; see `drain_voter_changes`).
+    let mut pending_voter: Option<PendingVoterChange> = None;
 
     loop {
         if context.shutdown.load(Ordering::Relaxed) {
@@ -577,17 +651,305 @@ fn run(
             next_announce = now + ANNOUNCE_RETRY_INTERVAL;
         }
 
+        // 8. Operator voter-set changes: accept at most one in flight and
+        // shepherd it (seed record → ConfChange) to commitment.
+        drain_voter_changes(&context.voter_changes, &mut node, &mut pending_voter, now);
+
         publish_status(&node, &context.status);
         consider_auto_promotion(&node, &config, &context, &mut last_refused_term);
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    // The driver is exiting (clean shutdown or storage failure). Clear
-    // leadership and drop the running flag so `/metrics` stops
+    // The driver is exiting (clean shutdown or storage failure). Answer
+    // any in-flight voter change so the admin handler returns at once
+    // instead of blocking to its own timeout.
+    if let Some(p) = pending_voter.take() {
+        reply_voter(
+            &p.reply,
+            Err("control plane shutting down — voter change aborted".into()),
+        );
+    }
+    // Clear leadership and drop the running flag so `/metrics` stops
     // reporting a stale leader on a node whose control plane is gone —
     // on a storage failure the process keeps serving trading and its
     // health endpoint, so these gauges would otherwise freeze forever.
     context.status.mark_stopped();
+}
+
+/// The control-node operations the voter-change state machine drives.
+/// Abstracted into a trait so the machine is unit-testable against a
+/// mock (see the `voter` tests) without a live raft cluster or sockets.
+trait VoterOps {
+    /// The current leader as this node sees it (`None` while leaderless).
+    fn leader_id(&self) -> Option<u64>;
+    /// The applied voter set, ascending.
+    fn voters(&self) -> Vec<u64>;
+    /// Whether `node_id` is in the applied voter set.
+    fn is_voter(&self, node_id: u64) -> bool {
+        self.voters().contains(&node_id)
+    }
+    /// Whether the applied registry holds a record for `node_id`.
+    fn registry_has(&self, node_id: u64) -> bool;
+    /// The id currently pinned to `key` in the applied registry, if any —
+    /// backs the "one key, one identity" rail.
+    fn registry_id_for_key(&self, key: &[u8; 32]) -> Option<u64>;
+    fn propose_member(&mut self, record: &MemberRecord) -> bool;
+    fn propose_add_voter(&mut self, node_id: u64) -> bool;
+    fn propose_remove_voter(&mut self, node_id: u64) -> bool;
+}
+
+impl VoterOps for ControlNode {
+    fn leader_id(&self) -> Option<u64> {
+        ControlNode::leader_id(self)
+    }
+    fn voters(&self) -> Vec<u64> {
+        ControlNode::voters(self)
+    }
+    fn registry_has(&self, node_id: u64) -> bool {
+        self.registry().get(node_id).is_some()
+    }
+    fn registry_id_for_key(&self, key: &[u8; 32]) -> Option<u64> {
+        self.registry()
+            .iter()
+            .find(|r| &r.public_key == key)
+            .map(|r| r.node_id)
+    }
+    fn propose_member(&mut self, record: &MemberRecord) -> bool {
+        ControlNode::propose_member(self, record)
+    }
+    fn propose_add_voter(&mut self, node_id: u64) -> bool {
+        ControlNode::propose_add_voter(self, node_id)
+    }
+    fn propose_remove_voter(&mut self, node_id: u64) -> bool {
+        ControlNode::propose_remove_voter(self, node_id)
+    }
+}
+
+/// How far a pending [`VoterChange`] has progressed. An `Add` is two
+/// staged proposals — seed the joiner's record so peers can dial it,
+/// *then* the `ConfChange` — because raft cannot deliver the log to a
+/// node the cluster cannot yet authenticate. A `Remove` is a single
+/// `ConfChange`.
+enum VoterStage {
+    /// `Add` phase 1: waiting for the seed [`MemberRecord`] to apply.
+    SeedRecord,
+    /// `Add` phase 2, or a `Remove`: waiting for the `ConfChange` to
+    /// apply into the voter set.
+    ConfChange,
+}
+
+/// An in-flight voter change the driver is shepherding to commitment.
+/// Proposals are ack-less and can be lost to leader churn, so each stage
+/// re-proposes on [`ANNOUNCE_RETRY_INTERVAL`] until the driver *observes*
+/// it applied, bounded by an overall [`VOTER_CHANGE_DEADLINE`].
+struct PendingVoterChange {
+    change: VoterChange,
+    stage: VoterStage,
+    reply: Sender<Result<Vec<u64>, String>>,
+    deadline: Instant,
+    next_propose: Instant,
+}
+
+/// Send the one-shot voter-change reply, tolerating a closed channel:
+/// the admin handler may have hit its own `recv_timeout` and dropped the
+/// receiver before the driver answers. The operator sees a timeout
+/// either way, so a failed send needs no handling beyond a debug note.
+fn reply_voter(reply: &Sender<Result<Vec<u64>, String>>, outcome: Result<Vec<u64>, String>) {
+    if reply.send(outcome).is_err() {
+        debug!("voter-change reply dropped — admin handler already gone");
+    }
+}
+
+/// Re-propose the current stage of a pending change. Idempotent: raft
+/// serializes conf changes and overwrites a superseded record, so a
+/// duplicate proposal after a leader change is harmless.
+fn propose_stage(node: &mut impl VoterOps, change: &VoterChange, stage: &VoterStage) {
+    match stage {
+        VoterStage::SeedRecord => {
+            if let Some(rec) = change.seed_record() {
+                node.propose_member(&rec);
+            }
+        }
+        VoterStage::ConfChange => match change {
+            VoterChange::Add { node_id, .. } => {
+                node.propose_add_voter(*node_id);
+            }
+            VoterChange::Remove { node_id } => {
+                node.propose_remove_voter(*node_id);
+            }
+        },
+    }
+}
+
+/// Validate a fresh request against the safety rails and either resolve
+/// it immediately — an idempotent success or a refusal, reply already
+/// sent, returns `None` — or kick off stage 1 and return the pending
+/// change to shepherd. `now` anchors the deadline and re-propose timer.
+fn begin_voter_change(
+    node: &mut impl VoterOps,
+    req: VoterChangeRequest,
+    now: Instant,
+) -> Option<PendingVoterChange> {
+    let id = req.change.node_id();
+    // Rail: raft's invalid-id sentinel is never a real node.
+    if id == 0 {
+        reply_voter(&req.reply, Err("node id 0 is reserved".into()));
+        return None;
+    }
+    match &req.change {
+        VoterChange::Add {
+            node_id,
+            public_key,
+            ..
+        } => {
+            // Rail: one key, one identity — the registry is the auth
+            // directory, so a key already speaking for a different id
+            // cannot be reused for this one.
+            if let Some(other) = node.registry_id_for_key(public_key)
+                && other != *node_id
+            {
+                reply_voter(
+                    &req.reply,
+                    Err(format!("public key already pinned to node {other}")),
+                );
+                return None;
+            }
+            // Idempotent: already a voter with a record present — the
+            // desired end state, so report success (scripting-friendly).
+            if node.is_voter(*node_id) && node.registry_has(*node_id) {
+                reply_voter(&req.reply, Ok(node.voters()));
+                return None;
+            }
+        }
+        VoterChange::Remove { node_id } => {
+            // Idempotent: not a voter → already in the desired state.
+            if !node.is_voter(*node_id) {
+                reply_voter(&req.reply, Ok(node.voters()));
+                return None;
+            }
+            // Rail: refuse removing the *live* leader — leadership must
+            // move first, else the removal races the election it forces.
+            // Removing a dead ex-leader is fine (leadership already moved).
+            if node.leader_id() == Some(*node_id) {
+                reply_voter(
+                    &req.reply,
+                    Err(format!(
+                        "node {node_id} currently leads — stop it and let the cluster elect first"
+                    )),
+                );
+                return None;
+            }
+            // Rail: never remove the last voter — it would brick consensus.
+            if node.voters().len() <= 1 {
+                reply_voter(&req.reply, Err("cannot remove the last voter".into()));
+                return None;
+            }
+        }
+    }
+
+    // Rails passed — kick off stage 1 and install the pending change.
+    let stage = match &req.change {
+        VoterChange::Add { .. } => VoterStage::SeedRecord,
+        VoterChange::Remove { .. } => VoterStage::ConfChange,
+    };
+    propose_stage(node, &req.change, &stage);
+    Some(PendingVoterChange {
+        change: req.change,
+        stage,
+        reply: req.reply,
+        deadline: now + VOTER_CHANGE_DEADLINE,
+        next_propose: now + ANNOUNCE_RETRY_INTERVAL,
+    })
+}
+
+/// Advance the pending change one step: promote `Add` phase 1→2 once the
+/// seed record applies, reply + clear once the `ConfChange` is observed
+/// applied (or the deadline passes), and re-propose the current stage on
+/// its retry cadence. A no-op when nothing is pending.
+fn advance_voter_change(
+    node: &mut impl VoterOps,
+    pending: &mut Option<PendingVoterChange>,
+    now: Instant,
+) {
+    let Some(p) = pending.as_mut() else {
+        return;
+    };
+    let id = p.change.node_id();
+
+    // Observe progress first, so a change that applies on the same tick
+    // it was proposed replies without waiting out the retry timer.
+    match p.stage {
+        VoterStage::SeedRecord => {
+            if node.registry_has(id) {
+                // Phase 1 done — propose the `ConfChange` and advance. It
+                // needs a further round-trip to apply, so return and let a
+                // later iteration observe the voter set.
+                node.propose_add_voter(id);
+                p.stage = VoterStage::ConfChange;
+                p.next_propose = now + ANNOUNCE_RETRY_INTERVAL;
+                return;
+            }
+        }
+        VoterStage::ConfChange => {
+            let applied = match &p.change {
+                VoterChange::Add { .. } => node.is_voter(id),
+                VoterChange::Remove { .. } => !node.is_voter(id),
+            };
+            if applied {
+                reply_voter(&p.reply, Ok(node.voters()));
+                *pending = None;
+                return;
+            }
+        }
+    }
+
+    // Deadline: give up so the operator command returns.
+    if now >= p.deadline {
+        reply_voter(
+            &p.reply,
+            Err(format!(
+                "voter change for node {id} not committed within {}s — check cluster health and retry",
+                VOTER_CHANGE_DEADLINE.as_secs()
+            )),
+        );
+        *pending = None;
+        return;
+    }
+
+    // Re-propose the current stage if the retry timer is due.
+    if now >= p.next_propose {
+        propose_stage(node, &p.change, &p.stage);
+        p.next_propose = now + ANNOUNCE_RETRY_INTERVAL;
+    }
+}
+
+/// Drain operator voter-change requests and advance the pending one.
+/// Installs the first request when idle; refuses the rest while one is in
+/// flight (raft admits a single pending conf change, and the two-stage
+/// add machinery assumes exclusivity). Called once per loop iteration.
+fn drain_voter_changes(
+    rx: &Receiver<VoterChangeRequest>,
+    node: &mut ControlNode,
+    pending: &mut Option<PendingVoterChange>,
+    now: Instant,
+) {
+    loop {
+        match rx.try_recv() {
+            Ok(req) => {
+                if pending.is_some() {
+                    reply_voter(&req.reply, Err("another voter change is in flight".into()));
+                } else {
+                    *pending = begin_voter_change(node, req, now);
+                }
+            }
+            // No more requests this iteration.
+            Err(TryRecvError::Empty) => break,
+            // Every `Sender` dropped (admin torn down / raft-less): nothing
+            // more will ever arrive, so stop draining.
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    advance_voter_change(node, pending, now);
 }
 
 /// Accept any pending inbound connections and hand each to a helper
@@ -1295,6 +1657,251 @@ fn publish_status(node: &ControlNode, status: &RaftStatus) {
 }
 
 #[cfg(test)]
+mod voter_change_tests {
+    //! Unit tests for the voter-change state machine, driven against a
+    //! mock [`VoterOps`] so the two-stage sequencing, safety rails, and
+    //! deadline are exercised without a live raft cluster or sockets.
+    //! Proposals only *record* the call; the test then mutates the mock
+    //! to simulate raft applying them, giving precise control over
+    //! timing.
+
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A scriptable stand-in for a `ControlNode`. Registry is a
+    /// `HashMap<node_id, public_key>` — a directory keyed by id, matching
+    /// the real registry's shape closely enough for the rails.
+    #[derive(Default)]
+    struct MockNode {
+        leader: Option<u64>,
+        voters: Vec<u64>,
+        records: HashMap<u64, [u8; 32]>,
+        proposed_members: Vec<u64>,
+        proposed_adds: Vec<u64>,
+        proposed_removes: Vec<u64>,
+    }
+
+    impl VoterOps for MockNode {
+        fn leader_id(&self) -> Option<u64> {
+            self.leader
+        }
+        fn voters(&self) -> Vec<u64> {
+            self.voters.clone()
+        }
+        fn registry_has(&self, node_id: u64) -> bool {
+            self.records.contains_key(&node_id)
+        }
+        fn registry_id_for_key(&self, key: &[u8; 32]) -> Option<u64> {
+            self.records
+                .iter()
+                .find(|(_, k)| *k == key)
+                .map(|(id, _)| *id)
+        }
+        fn propose_member(&mut self, record: &MemberRecord) -> bool {
+            self.proposed_members.push(record.node_id);
+            true
+        }
+        fn propose_add_voter(&mut self, node_id: u64) -> bool {
+            self.proposed_adds.push(node_id);
+            true
+        }
+        fn propose_remove_voter(&mut self, node_id: u64) -> bool {
+            self.proposed_removes.push(node_id);
+            true
+        }
+    }
+
+    fn add_request(
+        node_id: u64,
+        key: [u8; 32],
+    ) -> (VoterChangeRequest, Receiver<Result<Vec<u64>, String>>) {
+        let (tx, rx) = channel();
+        (
+            VoterChangeRequest {
+                change: VoterChange::Add {
+                    node_id,
+                    raft_addr: "127.0.0.1:9000".parse().unwrap(),
+                    public_key: key,
+                },
+                reply: tx,
+            },
+            rx,
+        )
+    }
+
+    fn remove_request(node_id: u64) -> (VoterChangeRequest, Receiver<Result<Vec<u64>, String>>) {
+        let (tx, rx) = channel();
+        (
+            VoterChangeRequest {
+                change: VoterChange::Remove { node_id },
+                reply: tx,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn rejects_node_id_zero() {
+        let mut node = MockNode::default();
+        let (req, rx) = remove_request(0);
+        assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
+        assert!(rx.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn rejects_key_pinned_to_a_different_id() {
+        let mut node = MockNode {
+            records: HashMap::from([(7, [0xAB; 32])]),
+            ..Default::default()
+        };
+        // Try to add id 4 with a key already pinned to id 7.
+        let (req, rx) = add_request(4, [0xAB; 32]);
+        assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
+        assert!(rx.try_recv().unwrap().is_err());
+        assert!(node.proposed_members.is_empty());
+    }
+
+    #[test]
+    fn add_is_idempotent_when_already_a_voter_with_record() {
+        let mut node = MockNode {
+            voters: vec![1, 2, 4],
+            records: HashMap::from([(4, [0xAB; 32])]),
+            ..Default::default()
+        };
+        let (req, rx) = add_request(4, [0xAB; 32]);
+        assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
+        assert_eq!(rx.try_recv().unwrap().unwrap(), vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn remove_is_idempotent_when_not_a_voter() {
+        let mut node = MockNode {
+            voters: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let (req, rx) = remove_request(9);
+        assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
+        assert_eq!(rx.try_recv().unwrap().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn refuses_to_remove_the_live_leader() {
+        let mut node = MockNode {
+            leader: Some(2),
+            voters: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let (req, rx) = remove_request(2);
+        assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
+        assert!(rx.try_recv().unwrap().is_err());
+        assert!(node.proposed_removes.is_empty());
+    }
+
+    #[test]
+    fn refuses_to_remove_the_last_voter() {
+        let mut node = MockNode {
+            leader: Some(9),
+            voters: vec![1],
+            ..Default::default()
+        };
+        let (req, rx) = remove_request(1);
+        assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
+        assert!(rx.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn add_flow_seeds_record_then_conf_change_then_replies() {
+        let mut node = MockNode {
+            voters: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let (req, rx) = add_request(4, [0xCD; 32]);
+        // Stage 1: begin proposes the seed record only.
+        let mut pending = begin_voter_change(&mut node, req, now);
+        assert!(pending.is_some());
+        assert_eq!(node.proposed_members, vec![4]);
+        assert!(node.proposed_adds.is_empty());
+        assert!(rx.try_recv().is_err(), "must not reply yet");
+
+        // Advance before the record applies: nothing changes.
+        advance_voter_change(&mut node, &mut pending, now);
+        assert!(node.proposed_adds.is_empty());
+
+        // Simulate the seed record applying → advance proposes AddNode.
+        node.records.insert(4, [0xCD; 32]);
+        advance_voter_change(&mut node, &mut pending, now);
+        assert_eq!(node.proposed_adds, vec![4]);
+        assert!(pending.is_some(), "still waiting for the conf change");
+
+        // Simulate the AddNode applying → advance replies OK and clears.
+        node.voters.push(4);
+        advance_voter_change(&mut node, &mut pending, now);
+        assert!(pending.is_none());
+        assert_eq!(rx.try_recv().unwrap().unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn remove_flow_proposes_conf_change_then_replies() {
+        let mut node = MockNode {
+            leader: Some(1),
+            voters: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let (req, rx) = remove_request(3);
+        let mut pending = begin_voter_change(&mut node, req, now);
+        assert_eq!(node.proposed_removes, vec![3]);
+        assert!(pending.is_some());
+
+        // Simulate the RemoveNode applying.
+        node.voters.retain(|v| *v != 3);
+        advance_voter_change(&mut node, &mut pending, now);
+        assert!(pending.is_none());
+        assert_eq!(rx.try_recv().unwrap().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn deadline_replies_error_and_clears() {
+        let mut node = MockNode {
+            leader: Some(1),
+            voters: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let (req, rx) = remove_request(3);
+        let mut pending = begin_voter_change(&mut node, req, now);
+        assert!(pending.is_some());
+
+        // Never applies; advance past the deadline.
+        advance_voter_change(&mut node, &mut pending, now + VOTER_CHANGE_DEADLINE);
+        assert!(pending.is_none());
+        assert!(rx.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn re_proposes_the_current_stage_on_the_retry_timer() {
+        let mut node = MockNode {
+            leader: Some(1),
+            voters: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let (req, _rx) = remove_request(3);
+        let mut pending = begin_voter_change(&mut node, req, now);
+        assert_eq!(node.proposed_removes, vec![3]);
+
+        // Before the retry interval: no re-propose.
+        advance_voter_change(&mut node, &mut pending, now);
+        assert_eq!(node.proposed_removes, vec![3]);
+
+        // After it: one more proposal.
+        advance_voter_change(&mut node, &mut pending, now + ANNOUNCE_RETRY_INTERVAL);
+        assert_eq!(node.proposed_removes, vec![3, 3]);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine as _;
@@ -1546,6 +2153,9 @@ mod tests {
                 directory: Arc::new(ClusterDirectory::default()),
                 durability_mode: Arc::new(AtomicU8::new(DurabilityMode::Hybrid.as_u8())),
                 replica: None,
+                // These nodes never receive voter changes; a disconnected
+                // receiver just makes the drain a no-op.
+                voter_changes: channel::<VoterChangeRequest>().1,
                 shutdown: Arc::clone(&shutdown),
             };
             let handle =

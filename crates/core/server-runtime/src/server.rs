@@ -404,6 +404,18 @@ pub struct ServerConfig {
     #[arg(long)]
     pub raft_auto_promote: bool,
 
+    /// Boot this node as a raft *joiner*: bootstrap an empty voter set
+    /// instead of `[self ∪ peers]`, so it stays a passive follower until
+    /// an existing leader admits it via `RAFT-ADD-VOTER`. Keep
+    /// `--raft-node-id`, `--raft-bind`, and `--raft-peer` (the joiner
+    /// still needs to dial the existing members and pin their
+    /// identities). Requires `--raft-bind` and at least one `--raft-peer`.
+    /// A node bootstrapped with a guessed voter set has a divergent
+    /// `ConfState` raft never reconciles — this flag is the only correct
+    /// way to grow a cluster past its genesis membership.
+    #[arg(long)]
+    pub raft_join: bool,
+
     /// The raft RPC address this node announces to its peers through
     /// the replicated membership registry. Defaults to `--raft-bind`;
     /// required when `--raft-bind` is a wildcard address (peers cannot
@@ -537,6 +549,7 @@ impl Default for ServerConfig {
             raft_peer: Vec::new(),
             raft_dir: None,
             raft_auto_promote: false,
+            raft_join: false,
             raft_advertise: None,
             replication_advertise: None,
             oe_advertise: None,
@@ -870,12 +883,18 @@ where
         // driver knows this node now acts as a primary).
         let control = crate::replication::ReplicaControlPlane::new();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+        // Voter-change channel: the admin endpoint holds the `Sender`
+        // (only on a raft node), the raft driver drains the `Receiver`.
+        // Created before mode detection so both survive a promotion.
+        let (voter_tx, voter_rx) = std::sync::mpsc::channel();
+        let admin_voter_tx = config.raft_bind.is_some().then_some(voter_tx);
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
                 addr,
                 Some(control.promote.clone()),
                 rotate_flag.clone(),
                 Some(Arc::clone(&durability_mode_atomic)),
+                admin_voter_tx,
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -911,6 +930,7 @@ where
                 primary_link_up: Arc::clone(&control.primary_link_up),
                 primary_acking_mode: Arc::clone(&control.primary_acking_mode),
             }),
+            voter_rx,
             &shutdown,
         )? {
             Some(h) => (Some(h.status), config.raft_auto_promote.then_some(h.follow)),
@@ -1039,12 +1059,17 @@ where
     // promotion is meaningful only on a replica. ROTATE is wired
     // whenever the admin endpoint is configured.
     let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    // Voter-change channel (see the replica path): admin holds the
+    // `Sender` on a raft node, the driver drains the `Receiver`.
+    let (voter_tx, voter_rx) = std::sync::mpsc::channel();
+    let admin_voter_tx = config.raft_bind.is_some().then_some(voter_tx);
     let _admin_handle = config.admin_bind.map(|addr| {
         crate::admin::spawn(
             addr,
             None,
             rotate_flag.clone(),
             Some(Arc::clone(&durability_mode_atomic)),
+            admin_voter_tx,
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -1087,6 +1112,7 @@ where
         journal_tip.clone(),
         &durability_mode_atomic,
         None, // genesis primary — nothing to promote
+        voter_rx,
         &shutdown,
     )?
     .map(|h| h.status);
@@ -2208,12 +2234,18 @@ where
         // `run` for the rationale on lifetime.
         let control = crate::replication::ReplicaControlPlane::new();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+        // Voter-change channel: the admin endpoint holds the `Sender`
+        // (only on a raft node), the raft driver drains the `Receiver`.
+        // Created before mode detection so both survive a promotion.
+        let (voter_tx, voter_rx) = std::sync::mpsc::channel();
+        let admin_voter_tx = config.raft_bind.is_some().then_some(voter_tx);
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
                 addr,
                 Some(control.promote.clone()),
                 rotate_flag.clone(),
                 Some(Arc::clone(&durability_mode_atomic)),
+                admin_voter_tx,
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -2243,6 +2275,7 @@ where
                 primary_link_up: Arc::clone(&control.primary_link_up),
                 primary_acking_mode: Arc::clone(&control.primary_acking_mode),
             }),
+            voter_rx,
             &shutdown,
         )? {
             Some(h) => (Some(h.status), config.raft_auto_promote.then_some(h.follow)),
@@ -2400,6 +2433,12 @@ where
     let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
         melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
     );
+    // Voter-change channel: admin holds the `Sender` on a raft node
+    // (wired at the admin listener below), the driver drains the
+    // `Receiver`. Created here because the driver spawns before the
+    // admin listener on this path.
+    let (voter_tx, voter_rx) = std::sync::mpsc::channel();
+    let admin_voter_tx = config.raft_bind.is_some().then_some(voter_tx);
     // A genesis primary never follows anyone — only the status is kept.
     let raft_status = spawn_raft_driver(
         &config,
@@ -2409,6 +2448,7 @@ where
         journal_tip.clone(),
         &durability_mode_atomic,
         None, // genesis primary — nothing to promote
+        voter_rx,
         &shutdown,
     )?
     .map(|h| h.status);
@@ -2535,6 +2575,7 @@ where
             None,
             rotate_flag.clone(),
             Some(Arc::clone(&durability_mode_atomic)),
+            admin_voter_tx,
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -3270,11 +3311,13 @@ fn build_raft_config(
             || !config.raft_peer.is_empty()
             || config.raft_dir.is_some()
             || config.raft_auto_promote
+            || config.raft_join
             || config.raft_advertise.is_some()
         {
             return Err(
-                "--raft-node-id/--raft-peer/--raft-dir/--raft-auto-promote/--raft-advertise \
-                 require --raft-bind (control-plane raft is enabled by binding its RPC address)"
+                "--raft-node-id/--raft-peer/--raft-dir/--raft-auto-promote/--raft-join/\
+                 --raft-advertise require --raft-bind (control-plane raft is enabled by \
+                 binding its RPC address)"
                     .into(),
             );
         }
@@ -3295,7 +3338,14 @@ fn build_raft_config(
     }
 
     let mut peers = Vec::with_capacity(config.raft_peer.len());
-    let mut voters = vec![node_id];
+    // A joiner bootstraps an *empty* voter set (raft admits it later via
+    // `AddNode`); a genesis node seeds `[self ∪ peers]`. Either way the
+    // peers become dial targets + identity pins below.
+    let mut voters = if config.raft_join {
+        Vec::new()
+    } else {
+        vec![node_id]
+    };
     for entry in &config.raft_peer {
         // `<id>@<host:port>@<pubkey-b64>`. The public key pins the
         // peer's identity: the driver rejects a connection that
@@ -3324,7 +3374,13 @@ fn build_raft_config(
         if peer_id == 0 {
             return Err(format!("--raft-peer `{entry}`: node id must be non-zero").into());
         }
-        if peer_id == node_id || voters.contains(&peer_id) {
+        // Check against `peers`, not `voters`: in join mode `voters` is
+        // empty, so it would miss a duplicate peer id.
+        if peer_id == node_id
+            || peers
+                .iter()
+                .any(|p: &crate::raft_driver::RaftPeer| p.id == peer_id)
+        {
             return Err(format!("--raft-peer `{entry}`: duplicate node id {peer_id}").into());
         }
         if peers
@@ -3333,12 +3389,20 @@ fn build_raft_config(
         {
             return Err(format!("--raft-peer `{entry}`: duplicate public key").into());
         }
-        voters.push(peer_id);
+        if !config.raft_join {
+            voters.push(peer_id);
+        }
         peers.push(crate::raft_driver::RaftPeer {
             id: peer_id,
             addr,
             public_key,
         });
+    }
+    // A joiner with no peers can dial no one and would sit alone forever.
+    if config.raft_join && peers.is_empty() {
+        return Err(
+            "--raft-join requires at least one --raft-peer to dial into the cluster".into(),
+        );
     }
     // Deterministic voter order so every node bootstraps the identical
     // initial membership regardless of flag order.
@@ -3418,6 +3482,7 @@ fn resolve_advertise(
 /// reflects its recovered journal: `true` on a primary (its epoch is
 /// known before the driver starts), a shared `false` flag on a replica
 /// that the receiver flips once journal recovery has seeded the epoch.
+#[allow(clippy::too_many_arguments)]
 fn spawn_raft_driver(
     config: &ServerConfig,
     authorized_keys: &Arc<AuthorizedKeys>,
@@ -3426,9 +3491,12 @@ fn spawn_raft_driver(
     journal_tip: melin_transport_core::AdvertisedJournalTip,
     durability_mode: &Arc<AtomicU8>,
     replica: Option<crate::raft_driver::ReplicaSignals>,
+    voter_changes: std::sync::mpsc::Receiver<crate::raft_driver::VoterChangeRequest>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<Option<crate::raft_driver::RaftHandles>, Box<dyn std::error::Error>> {
     let Some((bind, driver_config)) = build_raft_config(config)? else {
+        // No raft on this node — the paired admin `Sender` was never
+        // handed out, so dropping the `Receiver` here is correct.
         return Ok(None);
     };
     // Presence enforced by `build_raft_config`.
@@ -3459,6 +3527,7 @@ fn spawn_raft_driver(
             directory,
             durability_mode: Arc::clone(durability_mode),
             replica,
+            voter_changes,
             shutdown: Arc::clone(shutdown),
         },
     )?;

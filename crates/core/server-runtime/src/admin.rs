@@ -20,6 +20,13 @@
 //!   restart, no client reconnects) and restore the target mode once
 //!   replicas reattach. Available only when the spawn caller wired the
 //!   shared mode atomic.
+//! - `RAFT-ADD-VOTER <node_id> <raft_addr> <pubkey_b64>` /
+//!   `RAFT-REMOVE-VOTER <node_id>` — change the control-plane voter set
+//!   at runtime (grow, shrink, or replace a node under a new identity).
+//!   Unlike the other commands these are not fire-and-forget: the driver
+//!   shepherds the change to commitment and the handler blocks on its
+//!   reply, answering `OK voters=<list>` or `ERR <reason>`. Available
+//!   only on a node running control-plane raft.
 //!
 //! A command for which the corresponding flag is `None` is rejected
 //! with `ERR <command> not available on this node\n` so operators get
@@ -35,12 +42,15 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::durability_policy::DurabilityMode;
 use crate::promotion::PromotionRequest;
+use crate::raft_driver::{VoterChange, VoterChangeRequest};
 
+use base64::Engine;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info};
 
@@ -61,6 +71,7 @@ pub fn spawn(
     promote: Option<PromotionRequest>,
     rotate_requested: Option<Arc<AtomicBool>>,
     durability_mode: Option<Arc<AtomicU8>>,
+    voter_changes: Option<Sender<VoterChangeRequest>>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
 ) -> JoinHandle<()> {
@@ -73,6 +84,7 @@ pub fn spawn(
                     promote.as_ref(),
                     rotate_requested.as_deref(),
                     durability_mode.as_deref(),
+                    voter_changes.as_ref(),
                     &shutdown,
                     &authorized_keys,
                 )
@@ -100,6 +112,7 @@ fn run(
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
     durability_mode: Option<&AtomicU8>,
+    voter_changes: Option<&Sender<VoterChangeRequest>>,
     shutdown: &AtomicBool,
     authorized_keys: &AuthorizedKeys,
 ) {
@@ -119,6 +132,7 @@ fn run(
         promote_enabled = promote.is_some(),
         rotate_enabled = rotate_requested.is_some(),
         durability_enabled = durability_mode.is_some(),
+        voter_changes_enabled = voter_changes.is_some(),
         "admin listener started"
     );
 
@@ -135,6 +149,7 @@ fn run(
                     promote,
                     rotate_requested,
                     durability_mode,
+                    voter_changes,
                     authorized_keys,
                 );
             }
@@ -260,6 +275,7 @@ fn handle_connection(
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
     durability_mode: Option<&AtomicU8>,
+    voter_changes: Option<&Sender<VoterChangeRequest>>,
     authorized_keys: &AuthorizedKeys,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -331,6 +347,9 @@ fn handle_connection(
             let arg = parts.next().map(str::trim).unwrap_or("");
             handle_durability(&mut stream, durability_mode, arg);
         }
+        cmd if cmd.starts_with("RAFT-") => {
+            handle_voter_change(&mut stream, voter_changes, parse_voter_command(cmd));
+        }
         other => {
             debug!(received = %other, "unknown admin command");
             send_best_effort(&mut stream, b"ERR unknown command\n");
@@ -401,6 +420,133 @@ fn format_unknown_mode<'a>(buf: &'a mut [u8], arg: &str) -> &'a [u8] {
     );
     let n = cursor.position() as usize;
     &cursor.into_inner()[..n]
+}
+
+/// How long the admin handler waits for the driver's voter-change reply
+/// before giving up. The driver's own deadline ([`VOTER_CHANGE_DEADLINE`]
+/// = 10 s) is shorter, so under normal operation the driver always
+/// answers first; this is only the backstop for a driver that has died
+/// or wedged. The operator's client read timeout must exceed this.
+const VOTER_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Parse a `RAFT-ADD-VOTER` / `RAFT-REMOVE-VOTER` command line into a
+/// [`VoterChange`]. Pure (no I/O) so the parsing is unit-testable in
+/// isolation; the socket round-trip is covered by the E2E.
+fn parse_voter_command(line: &str) -> Result<VoterChange, String> {
+    let mut parts = line.split_whitespace();
+    match parts.next() {
+        Some("RAFT-ADD-VOTER") => {
+            let node_id = parse_node_id(parts.next())?;
+            let raft_addr = parts
+                .next()
+                .ok_or("RAFT-ADD-VOTER requires <node_id> <raft_addr> <pubkey_b64>")?
+                .parse::<SocketAddr>()
+                .map_err(|e| format!("invalid raft address: {e}"))?;
+            let public_key = parse_pubkey(
+                parts
+                    .next()
+                    .ok_or("RAFT-ADD-VOTER requires <node_id> <raft_addr> <pubkey_b64>")?,
+            )?;
+            Ok(VoterChange::Add {
+                node_id,
+                raft_addr,
+                public_key,
+            })
+        }
+        Some("RAFT-REMOVE-VOTER") => Ok(VoterChange::Remove {
+            node_id: parse_node_id(parts.next())?,
+        }),
+        Some(other) => Err(format!("unknown raft command `{other}`")),
+        None => Err("empty command".into()),
+    }
+}
+
+fn parse_node_id(tok: Option<&str>) -> Result<u64, String> {
+    tok.ok_or("missing node id")?
+        .parse::<u64>()
+        .map_err(|e| format!("invalid node id: {e}"))
+}
+
+fn parse_pubkey(b64: &str) -> Result<[u8; 32], String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("invalid base64 public key: {e}"))?;
+    // Ed25519 public keys are exactly 32 bytes; a wrong length is an
+    // operator typo, not a server fault.
+    bytes
+        .try_into()
+        .map_err(|_| "public key must decode to 32 bytes".to_string())
+}
+
+/// Render the driver's reply into the operator-facing response line.
+/// Pure so the OK/ERR/timeout formatting is unit-testable without a
+/// driver or a real 15 s wait.
+fn format_voter_reply(outcome: Result<Result<Vec<u64>, String>, RecvTimeoutError>) -> String {
+    match outcome {
+        Ok(Ok(voters)) => {
+            let list = voters
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("OK voters={list}")
+        }
+        Ok(Err(reason)) => format!("ERR {reason}"),
+        // The channel was answered by neither a reply nor a driver
+        // shutdown within the timeout — the control plane is wedged.
+        Err(_) => "ERR voter change timed out waiting for the control plane".to_string(),
+    }
+}
+
+/// Apply a parsed `RAFT-ADD-VOTER` / `RAFT-REMOVE-VOTER` command:
+/// forward it to the driver and block on the one-shot reply, then write
+/// the `OK voters=…` / `ERR …` line. Auth is enforced upstream in
+/// [`authenticate`], so reaching here already implies an operator-signed
+/// request.
+fn handle_voter_change(
+    stream: &mut TcpStream,
+    voter_changes: Option<&Sender<VoterChangeRequest>>,
+    parsed: Result<VoterChange, String>,
+) {
+    let Some(sender) = voter_changes else {
+        send_best_effort(
+            stream,
+            b"ERR RAFT voter changes not available on this node\n",
+        );
+        debug!("rejected voter change — channel not wired (raft-less node?)");
+        return;
+    };
+    let change = match parsed {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(error = %e, "rejected voter change — parse error");
+            send_voter_line(stream, &format!("ERR {e}"));
+            return;
+        }
+    };
+    let (reply_tx, reply_rx) = channel();
+    if sender
+        .send(VoterChangeRequest {
+            change,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        // Receiver gone ⇒ the driver has exited; report rather than block.
+        send_best_effort(stream, b"ERR control plane unavailable\n");
+        return;
+    }
+    let line = format_voter_reply(reply_rx.recv_timeout(VOTER_REPLY_TIMEOUT));
+    send_voter_line(stream, &line);
+}
+
+/// Write a voter-change response line (appending the newline). A heap
+/// allocation is fine here: this is a cold operator command path, not
+/// the trading hot path, and the voters list is variable-length.
+fn send_voter_line(stream: &mut TcpStream, line: &str) {
+    let mut out = line.to_string();
+    out.push('\n');
+    send_best_effort(stream, out.as_bytes());
 }
 
 #[cfg(test)]
@@ -509,6 +655,7 @@ mod tests {
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -534,6 +681,7 @@ mod tests {
             addr,
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
+            None,
             None,
             Arc::clone(&shutdown),
             auth_keys,
@@ -562,6 +710,7 @@ mod tests {
             None,
             Some(Arc::clone(&rotate)),
             None,
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -586,6 +735,7 @@ mod tests {
         let _h = spawn(
             addr,
             Some(promote.clone()),
+            None,
             None,
             None,
             Arc::clone(&shutdown),
@@ -616,6 +766,7 @@ mod tests {
             addr,
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
+            None,
             None,
             Arc::clone(&shutdown),
             auth_keys,
@@ -654,6 +805,7 @@ mod tests {
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -680,6 +832,7 @@ mod tests {
             addr,
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
+            None,
             None,
             Arc::clone(&shutdown),
             auth_keys,
@@ -711,6 +864,7 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&mode)),
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -779,6 +933,7 @@ mod tests {
             Some(promote.clone()),
             None,
             None,
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -787,6 +942,129 @@ mod tests {
         let resp = send_command(addr, &key, b"DURABILITY local\n");
         assert!(
             resp.starts_with("ERR DURABILITY not available"),
+            "expected not-available ERR, got {resp}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+    }
+
+    // ── Voter-change command tests ──────────────────────────────────
+
+    fn pubkey_b64(seed: u8) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [seed; 32])
+    }
+
+    #[test]
+    fn parse_voter_command_accepts_valid_add_and_remove() {
+        let key_b64 = pubkey_b64(0x11);
+        let add = parse_voter_command(&format!("RAFT-ADD-VOTER 4 127.0.0.1:9000 {key_b64}"))
+            .expect("valid add");
+        match add {
+            VoterChange::Add {
+                node_id,
+                raft_addr,
+                public_key,
+            } => {
+                assert_eq!(node_id, 4);
+                assert_eq!(raft_addr, "127.0.0.1:9000".parse().unwrap());
+                assert_eq!(public_key, [0x11; 32]);
+            }
+            other => panic!("expected Add, got {other:?}"),
+        }
+        match parse_voter_command("RAFT-REMOVE-VOTER 3").expect("valid remove") {
+            VoterChange::Remove { node_id } => assert_eq!(node_id, 3),
+            other => panic!("expected Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_voter_command_rejects_malformed_input() {
+        // Bad node id.
+        assert!(parse_voter_command("RAFT-ADD-VOTER x 127.0.0.1:9000 AAAA").is_err());
+        // Bad address.
+        assert!(
+            parse_voter_command(&format!("RAFT-ADD-VOTER 4 not-an-addr {}", pubkey_b64(1)))
+                .is_err()
+        );
+        // Bad base64 pubkey.
+        assert!(parse_voter_command("RAFT-ADD-VOTER 4 127.0.0.1:9000 not-base64!!").is_err());
+        // Right base64 but wrong length.
+        let short = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 16]);
+        assert!(parse_voter_command(&format!("RAFT-ADD-VOTER 4 127.0.0.1:9000 {short}")).is_err());
+        // Missing args.
+        assert!(parse_voter_command("RAFT-ADD-VOTER 4").is_err());
+        assert!(parse_voter_command("RAFT-REMOVE-VOTER").is_err());
+        // Unknown verb under the RAFT- prefix.
+        assert!(parse_voter_command("RAFT-FROB 4").is_err());
+    }
+
+    #[test]
+    fn format_voter_reply_renders_each_outcome() {
+        assert_eq!(
+            format_voter_reply(Ok(Ok(vec![1, 2, 3, 4]))),
+            "OK voters=1,2,3,4"
+        );
+        assert_eq!(
+            format_voter_reply(Ok(Err("node 2 currently leads".into()))),
+            "ERR node 2 currently leads"
+        );
+        assert!(format_voter_reply(Err(RecvTimeoutError::Timeout)).starts_with("ERR"));
+    }
+
+    #[test]
+    fn voter_command_round_trips_through_the_driver_channel() {
+        let (listener, addr) = ephemeral_listener();
+        drop(listener);
+
+        let (key, auth_keys) = operator_keys();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (voter_tx, voter_rx) = channel::<VoterChangeRequest>();
+        // Canned "driver": answer one request with a fixed voter set.
+        let driver = std::thread::spawn(move || {
+            if let Ok(req) = voter_rx.recv() {
+                let _ = req.reply.send(Ok(vec![1, 2, 4]));
+            }
+        });
+        let _h = spawn(
+            addr,
+            None,
+            None,
+            None,
+            Some(voter_tx),
+            Arc::clone(&shutdown),
+            auth_keys,
+        );
+        std::thread::sleep(Duration::from_millis(200));
+
+        let cmd = format!("RAFT-ADD-VOTER 4 127.0.0.1:9000 {}\n", pubkey_b64(0x22));
+        assert_eq!(send_command(addr, &key, cmd.as_bytes()), "OK voters=1,2,4");
+
+        driver.join().expect("driver thread");
+        shutdown.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn voter_command_rejected_when_not_wired() {
+        let (listener, addr) = ephemeral_listener();
+        drop(listener);
+
+        let (key, auth_keys) = operator_keys();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // No voter channel wired (raft-less node).
+        let _h = spawn(
+            addr,
+            None,
+            None,
+            None,
+            None,
+            Arc::clone(&shutdown),
+            auth_keys,
+        );
+        std::thread::sleep(Duration::from_millis(200));
+
+        let resp = send_command(addr, &key, b"RAFT-REMOVE-VOTER 3\n");
+        assert!(
+            resp.starts_with("ERR RAFT voter changes not available"),
             "expected not-available ERR, got {resp}"
         );
 
