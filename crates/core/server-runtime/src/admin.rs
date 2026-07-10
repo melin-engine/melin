@@ -50,7 +50,6 @@ use crate::durability_policy::DurabilityMode;
 use crate::promotion::PromotionRequest;
 use crate::raft_driver::{VoterChange, VoterChangeRequest};
 
-use base64::Engine;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info};
 
@@ -442,7 +441,7 @@ fn parse_voter_command(line: &str) -> Result<VoterChange, String> {
                 .ok_or("RAFT-ADD-VOTER requires <node_id> <raft_addr> <pubkey_b64>")?
                 .parse::<SocketAddr>()
                 .map_err(|e| format!("invalid raft address: {e}"))?;
-            let public_key = parse_pubkey(
+            let public_key = crate::server::parse_ed25519_pubkey_b64(
                 parts
                     .next()
                     .ok_or("RAFT-ADD-VOTER requires <node_id> <raft_addr> <pubkey_b64>")?,
@@ -465,17 +464,6 @@ fn parse_node_id(tok: Option<&str>) -> Result<u64, String> {
     tok.ok_or("missing node id")?
         .parse::<u64>()
         .map_err(|e| format!("invalid node id: {e}"))
-}
-
-fn parse_pubkey(b64: &str) -> Result<[u8; 32], String> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| format!("invalid base64 public key: {e}"))?;
-    // Ed25519 public keys are exactly 32 bytes; a wrong length is an
-    // operator typo, not a server fault.
-    bytes
-        .try_into()
-        .map_err(|_| "public key must decode to 32 bytes".to_string())
 }
 
 /// Render the driver's reply into the operator-facing response line.
@@ -950,12 +938,22 @@ mod tests {
 
     // ── Voter-change command tests ──────────────────────────────────
 
+    /// A real Ed25519 public key (base64) derived from `seed`. Must be a
+    /// valid curve point, since the parser now rejects non-points.
     fn pubkey_b64(seed: u8) -> String {
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [seed; 32])
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
     }
 
     #[test]
     fn parse_voter_command_accepts_valid_add_and_remove() {
+        let expected_key = SigningKey::from_bytes(&[0x11; 32])
+            .verifying_key()
+            .to_bytes();
         let key_b64 = pubkey_b64(0x11);
         let add = parse_voter_command(&format!("RAFT-ADD-VOTER 4 127.0.0.1:9000 {key_b64}"))
             .expect("valid add");
@@ -967,7 +965,7 @@ mod tests {
             } => {
                 assert_eq!(node_id, 4);
                 assert_eq!(raft_addr, "127.0.0.1:9000".parse().unwrap());
-                assert_eq!(public_key, [0x11; 32]);
+                assert_eq!(public_key, expected_key);
             }
             other => panic!("expected Add, got {other:?}"),
         }

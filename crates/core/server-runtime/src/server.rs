@@ -3618,7 +3618,7 @@ fn stop_replica_health(health: Option<ReplicaHealth>) {
 
 /// Decode a base64 (standard alphabet) Ed25519 public key — the same
 /// encoding `authorized_keys` uses — into raw 32 bytes.
-fn parse_ed25519_pubkey_b64(b64: &str) -> Result<[u8; 32], String> {
+pub(crate) fn parse_ed25519_pubkey_b64(b64: &str) -> Result<[u8; 32], String> {
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64.trim())
         .map_err(|e| format!("not valid base64: {e}"))?;
     let arr: [u8; 32] = bytes
