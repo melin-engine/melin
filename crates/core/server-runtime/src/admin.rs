@@ -37,11 +37,18 @@
 //! flow through the same socket. Concurrent or repeated triggers
 //! collapse via CAS in the journal stage / receive loop, so duplicate
 //! commands do not queue.
+//!
+//! Each accepted connection is served on its own short-lived thread
+//! (bounded by [`MAX_ADMIN_HANDLERS`]). The `RAFT-*` voter-change
+//! commands block until their raft commit, so serving connections
+//! inline would let a stuck voter change (e.g. a change issued while the
+//! cluster is leaderless mid-failover) stall an urgent `PROMOTE` on the
+//! same node; per-connection threads keep every command independent.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -80,12 +87,12 @@ pub fn spawn(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run(
                     bind_addr,
-                    promote.as_ref(),
-                    rotate_requested.as_deref(),
-                    durability_mode.as_deref(),
-                    voter_changes.as_ref(),
-                    &shutdown,
-                    &authorized_keys,
+                    promote,
+                    rotate_requested,
+                    durability_mode,
+                    voter_changes,
+                    shutdown,
+                    authorized_keys,
                 )
             }));
             if let Err(panic) = result {
@@ -94,6 +101,45 @@ pub fn spawn(
             }
         })
         .expect("failed to spawn admin listener thread")
+}
+
+/// Cap on concurrently-served admin connections. Each command runs on its
+/// own thread; this bounds the fan-out a burst (or a slow blocking voter
+/// change) can create. The endpoint is operator-key-gated and low-traffic
+/// — a healthy operator issues one command at a time — so this is far
+/// above any legitimate load while still capping an abusive flood. Note
+/// the driver serializes voter changes (a second concurrent one gets an
+/// instant refusal), so at most one handler is ever blocked on a raft
+/// commit at a time.
+const MAX_ADMIN_HANDLERS: usize = 16;
+
+/// RAII counter bounding concurrent admin handler threads: [`acquire`]
+/// increments the shared count (refusing once [`MAX_ADMIN_HANDLERS`] is
+/// reached) and the guard decrements it when the handler thread exits by
+/// any path. The listener sheds new connections while at the cap.
+///
+/// [`acquire`]: HandlerSlot::acquire
+struct HandlerSlot(Arc<AtomicUsize>);
+
+impl HandlerSlot {
+    fn acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
+        let mut n = counter.load(Ordering::Acquire);
+        loop {
+            if n >= MAX_ADMIN_HANDLERS {
+                return None;
+            }
+            match counter.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(HandlerSlot(Arc::clone(counter))),
+                Err(observed) => n = observed,
+            }
+        }
+    }
+}
+
+impl Drop for HandlerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -108,12 +154,12 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 
 fn run(
     bind_addr: SocketAddr,
-    promote: Option<&PromotionRequest>,
-    rotate_requested: Option<&AtomicBool>,
-    durability_mode: Option<&AtomicU8>,
-    voter_changes: Option<&Sender<VoterChangeRequest>>,
-    shutdown: &AtomicBool,
-    authorized_keys: &AuthorizedKeys,
+    promote: Option<PromotionRequest>,
+    rotate_requested: Option<Arc<AtomicBool>>,
+    durability_mode: Option<Arc<AtomicU8>>,
+    voter_changes: Option<Sender<VoterChangeRequest>>,
+    shutdown: Arc<AtomicBool>,
+    authorized_keys: Arc<AuthorizedKeys>,
 ) {
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
@@ -135,6 +181,9 @@ fn run(
         "admin listener started"
     );
 
+    // Bounds concurrent handler threads; see [`MAX_ADMIN_HANDLERS`].
+    let active = Arc::new(AtomicUsize::new(0));
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -142,15 +191,44 @@ fn run(
 
         match listener.accept() {
             Ok((stream, peer)) => {
+                let Some(slot) = HandlerSlot::acquire(&active) else {
+                    // At the concurrency cap — shed rather than queue.
+                    // The dropped stream RSTs; the operator retries.
+                    debug!(peer = %peer, "admin connection shed — handler cap reached");
+                    continue;
+                };
                 debug!(peer = %peer, "admin connection accepted");
-                handle_connection(
-                    stream,
-                    promote,
-                    rotate_requested,
-                    durability_mode,
-                    voter_changes,
-                    authorized_keys,
-                );
+                // Clone the capability handles into the handler thread so
+                // a blocking command (a voter change awaiting its raft
+                // commit) never stalls the accept loop or other commands.
+                let promote = promote.clone();
+                let rotate_requested = rotate_requested.clone();
+                let durability_mode = durability_mode.clone();
+                let voter_changes = voter_changes.clone();
+                let authorized_keys = Arc::clone(&authorized_keys);
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("admin-conn".into())
+                        .spawn(move || {
+                            // Held for the thread's lifetime: frees the slot on
+                            // exit by any path (return, error, or panic).
+                            let _slot = slot;
+                            handle_connection(
+                                stream,
+                                promote.as_ref(),
+                                rotate_requested.as_deref(),
+                                durability_mode.as_deref(),
+                                voter_changes.as_ref(),
+                                &authorized_keys,
+                            );
+                        });
+                if let Err(e) = spawned {
+                    // Thread creation failed (resource limits) — the slot
+                    // guard was moved into the closure and dropped with it,
+                    // so the counter is already restored. Drop the
+                    // connection; the operator retries.
+                    debug!(peer = %peer, error = %e, "failed to spawn admin handler thread");
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -1067,5 +1145,61 @@ mod tests {
         );
 
         shutdown.store(true, Ordering::Release);
+    }
+
+    /// A voter change blocked on its raft commit must not stall other
+    /// admin commands — the head-of-line-blocking guarantee that
+    /// per-connection handler threads provide. A canned driver holds the
+    /// voter reply until released; meanwhile a PROMOTE on a second
+    /// connection must still be served. On the old single-threaded
+    /// listener the PROMOTE would not even be accepted until the voter
+    /// change returned.
+    #[test]
+    fn a_blocked_voter_change_does_not_stall_other_commands() {
+        let (listener, addr) = ephemeral_listener();
+        drop(listener);
+
+        let (key, auth_keys) = operator_keys();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let promote = PromotionRequest::new();
+        let (voter_tx, voter_rx) = channel::<VoterChangeRequest>();
+        let (release_tx, release_rx) = channel::<()>();
+        // Driver that receives the voter request but holds its reply
+        // until released, keeping connection 1's handler blocked.
+        let driver = std::thread::spawn(move || {
+            if let Ok(req) = voter_rx.recv() {
+                let _ = release_rx.recv();
+                let _ = req.reply.send(Ok(vec![1, 2, 3, 4]));
+            }
+        });
+        let _h = spawn(
+            addr,
+            Some(promote.clone()),
+            None,
+            None,
+            Some(voter_tx),
+            Arc::clone(&shutdown),
+            auth_keys,
+        );
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Connection 1: blocks in its handler until the driver is released.
+        let key1 = key.clone();
+        let cmd = format!("RAFT-ADD-VOTER 4 127.0.0.1:9000 {}\n", pubkey_b64(0x22));
+        let conn1 = std::thread::spawn(move || send_command(addr, &key1, cmd.as_bytes()));
+        // Let connection 1 reach the blocking wait.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Connection 2: a PROMOTE must be served while connection 1 is
+        // still blocked — impossible without per-connection threads.
+        assert_eq!(send_command(addr, &key, b"PROMOTE\n"), "OK");
+        assert!(promote.is_requested());
+
+        // Release connection 1 and confirm its reply landed too.
+        release_tx.send(()).expect("release");
+        assert_eq!(conn1.join().expect("conn1"), "OK voters=1,2,3,4");
+
+        shutdown.store(true, Ordering::Release);
+        driver.join().expect("driver");
     }
 }
