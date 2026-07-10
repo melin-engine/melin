@@ -286,9 +286,13 @@ impl ClusterDirectory {
         self.member_field(node_id, |r| r.order_entry_addr)
     }
 
-    /// The cluster's current serving primary — the live record with the
-    /// highest `serving_epoch` that also announced an order-entry address
-    /// clients can reach, returned as `(node_id, order_entry_addr)`.
+    /// The live serving claim with the highest `serving_epoch` whose
+    /// record also yields an address via `pick`, as `(node_id, addr)`.
+    /// The shared resolution core: redirects want the winner's
+    /// order-entry address, a following replica wants its replication
+    /// address, but both want the *same* fencing-ordered winner that
+    /// actually published the address they need.
+    ///
     /// Fencing order (highest epoch), not announcement order, decides: a
     /// deposed primary that never learned of its supersession keeps its
     /// stale claim in the directory, but the promoted node announces a
@@ -296,18 +300,36 @@ impl ClusterDirectory {
     /// tombstones. Ties (two *manual* promotions colliding on one epoch,
     /// a pre-existing documented hazard) break deterministically to the
     /// lower node id so every node resolves identically. `None` when no
-    /// node claims to serve or the sole claimant announced no client
+    /// node claims to serve, the winning claimant published no such
     /// address, or the directory lock is poisoned (treated as unknown,
     /// matching `member_field`).
-    pub fn serving_primary(&self) -> Option<(u64, SocketAddr)> {
+    fn serving_claim_by(
+        &self,
+        pick: impl Fn(&MemberRecord) -> Option<SocketAddr>,
+    ) -> Option<(u64, SocketAddr)> {
         let guard = self.inner.read().ok()?;
         guard
             .iter()
-            .filter_map(|r| Some((r.node_id, r.serving_epoch?, r.order_entry_addr?)))
+            .filter_map(|r| Some((r.node_id, r.serving_epoch?, pick(r)?)))
             // Highest epoch wins; on a tie the lower node id wins, so the
             // reversed id comparison makes the lower id compare "greater".
             .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
             .map(|(id, _epoch, addr)| (id, addr))
+    }
+
+    /// The current serving primary and its client order-entry address —
+    /// where a replica's redirect acceptor points authenticated clients.
+    pub fn serving_primary(&self) -> Option<(u64, SocketAddr)> {
+        self.serving_claim_by(|r| r.order_entry_addr)
+    }
+
+    /// The current serving primary and its replication address — where a
+    /// following replica should dial to replicate the authoritative
+    /// journal. Distinct from [`Self::serving_primary`] only in which
+    /// announced address the winner must carry (a serving primary
+    /// normally announces both).
+    pub fn serving_primary_replication(&self) -> Option<(u64, SocketAddr)> {
+        self.serving_claim_by(|r| r.replication_addr)
     }
 }
 
@@ -369,6 +391,20 @@ impl LeaderFollow {
     /// [`Self::leader_field`]).
     pub fn serving_primary_order_entry_addr(&self) -> Option<SocketAddr> {
         match self.directory.serving_primary() {
+            Some((id, _)) if id == self.self_node_id => None,
+            Some((_, addr)) => Some(addr),
+            None => None,
+        }
+    }
+
+    /// The serving primary's replication address — the strictly better
+    /// "whom do I replicate from" hint than [`Self::leader_replication_addr`]:
+    /// control-plane leadership can sit on a replica while a different
+    /// node actually serves the authoritative journal, and a following
+    /// replica must chase the serving node, not the raft leader. Same
+    /// self-exclusion (never follow yourself) as the order-entry accessor.
+    pub fn serving_primary_replication_addr(&self) -> Option<SocketAddr> {
+        match self.directory.serving_primary_replication() {
             Some((id, _)) if id == self.self_node_id => None,
             Some((_, addr)) => Some(addr),
             None => None,
@@ -2206,12 +2242,48 @@ mod tests {
     }
 
     #[test]
+    fn serving_primary_replication_resolves_the_same_winner() {
+        // Same fencing-ordered winner as the order-entry resolution, but
+        // returns the winner's *replication* address. Build records that
+        // carry both addresses so the two resolutions agree on the node
+        // and differ only in which address they hand back.
+        let mut hi = claim_record(3, Some(9), Some("10.0.0.3:80"));
+        hi.replication_addr = Some(oe("10.0.0.3:99"));
+        let mut lo = claim_record(1, Some(4), Some("10.0.0.1:80"));
+        lo.replication_addr = Some(oe("10.0.0.1:99"));
+        let dir = directory_of(&[lo, hi]);
+        assert_eq!(dir.serving_primary(), Some((3, oe("10.0.0.3:80"))));
+        assert_eq!(
+            dir.serving_primary_replication(),
+            Some((3, oe("10.0.0.3:99")))
+        );
+
+        // The highest-epoch claimant announced no replication address —
+        // it is skipped for the replication resolution (a follower needs
+        // a reachable replication endpoint) in favour of a lower claimant
+        // that did, even though the order-entry resolution still prefers
+        // the higher one.
+        let mut top = claim_record(4, Some(99), Some("10.0.0.4:80"));
+        top.replication_addr = None;
+        let mut low = claim_record(2, Some(3), Some("10.0.0.2:80"));
+        low.replication_addr = Some(oe("10.0.0.2:99"));
+        let dir = directory_of(&[top, low]);
+        assert_eq!(dir.serving_primary(), Some((4, oe("10.0.0.4:80"))));
+        assert_eq!(
+            dir.serving_primary_replication(),
+            Some((2, oe("10.0.0.2:99")))
+        );
+    }
+
+    #[test]
     fn serving_primary_accessor_excludes_self() {
-        let records = [
-            claim_record(2, Some(8), Some("10.0.0.2:80")),
-            claim_record(3, Some(4), Some("10.0.0.3:80")),
-        ];
-        let dir = directory_of(&records);
+        // Both addresses populated so the order-entry and replication
+        // accessors can each be checked for self-exclusion.
+        let mut win = claim_record(2, Some(8), Some("10.0.0.2:80"));
+        win.replication_addr = Some(oe("10.0.0.2:99"));
+        let mut other = claim_record(3, Some(4), Some("10.0.0.3:80"));
+        other.replication_addr = Some(oe("10.0.0.3:99"));
+        let dir = directory_of(&[win, other]);
 
         // Node 3 resolves the winner (node 2) — not itself.
         let follow = LeaderFollow {
@@ -2223,15 +2295,20 @@ mod tests {
             follow.serving_primary_order_entry_addr(),
             Some(oe("10.0.0.2:80"))
         );
+        assert_eq!(
+            follow.serving_primary_replication_addr(),
+            Some(oe("10.0.0.2:99"))
+        );
 
-        // Node 2 IS the winner — a redirecting replica must never point a
-        // client at itself, so the accessor returns None.
+        // Node 2 IS the winner — a redirecting/following replica must never
+        // point at itself, so both accessors return None.
         let follow_self = LeaderFollow {
             self_node_id: 2,
             status: Arc::new(RaftStatus::new(2)),
             directory: dir,
         };
         assert_eq!(follow_self.serving_primary_order_entry_addr(), None);
+        assert_eq!(follow_self.serving_primary_replication_addr(), None);
     }
 
     #[test]

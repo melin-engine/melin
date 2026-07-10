@@ -400,6 +400,27 @@ impl ControlFrameSource for TcpFrameSource<'_> {
 /// Outcome of `run_receiver`: `None` = clean shutdown, `Some` = promotion.
 pub type ReceiverResult<A, W> = Result<Option<(A, W)>, Box<dyn std::error::Error>>;
 
+/// The "follow" candidate for a reconnect attempt: the serving primary's
+/// announced replication address when the control plane knows one, else
+/// the control-plane leader's. `None` — meaning "use the static target" —
+/// when there is no control plane, it names no better address, or the
+/// address it names IS the static target (no point alternating to the
+/// same place). The serving-primary hint wins because control-plane
+/// leadership can rest on a replica while a different node serves the
+/// authoritative journal. Pure so the preference order and the
+/// static-exclusion are unit-testable without a live receiver loop.
+fn follow_target(
+    leader_follow: Option<&crate::raft_driver::LeaderFollow>,
+    static_addr: SocketAddr,
+) -> Option<SocketAddr> {
+    leader_follow
+        .and_then(|f| {
+            f.serving_primary_replication_addr()
+                .or_else(|| f.leader_replication_addr())
+        })
+        .filter(|t| *t != static_addr)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver<A, W>(
     primary_addr: SocketAddr,
@@ -517,18 +538,16 @@ where
         }
 
         // --- Connect and authenticate ---
-        // Follow the leader: the control plane may know a newer
+        // Follow the serving primary: the control plane may know a newer
         // primary than the static `--replica-of` (an auto-promotion
-        // elsewhere). But control-plane leadership is not proof of a
-        // serving primary — a *replica* can hold leadership while the
-        // primary is healthy — so alternate between the leader's
-        // announced address and the static target across attempts: a
-        // refused follow attempt costs one dial, never a wedged loop.
-        let follow_target = leader_follow
-            .as_ref()
-            .and_then(|f| f.leader_replication_addr())
-            .filter(|t| *t != primary_addr);
-        let target = match follow_target {
+        // elsewhere). The hint prefers the announced *serving primary*
+        // over the mere control-plane leader — a replica can hold raft
+        // leadership while a different node actually serves the journal —
+        // and falls back to the leader hint when no serving claim is
+        // known yet. Either way we alternate the hint with the static
+        // target across attempts, so a stale hint costs one dial, never a
+        // wedged loop.
+        let target = match follow_target(leader_follow.as_ref(), primary_addr) {
             Some(t) if reconnect_attempt.is_multiple_of(2) => t,
             _ => primary_addr,
         };
@@ -821,6 +840,80 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use melin_transport_core::replication::protocol::{ReplicaMessage, decode_replica_message};
+
+    /// Build a `LeaderFollow` naming `leader` as the raft leader over a
+    /// directory assembled from `records` (id, serving_epoch, repl_addr).
+    fn leader_follow_with(
+        self_id: u64,
+        leader: u64,
+        records: &[(u64, Option<u64>, Option<&str>)],
+    ) -> crate::raft_driver::LeaderFollow {
+        use melin_raft::registry::{MemberRecord, Registry};
+        let status = std::sync::Arc::new(melin_transport_core::health::RaftStatus::new(self_id));
+        status
+            .leader_id
+            .store(leader, std::sync::atomic::Ordering::Relaxed);
+        let mut registry = Registry::default();
+        for &(id, serving_epoch, repl) in records {
+            let rec = MemberRecord {
+                node_id: id,
+                raft_addr: "127.0.0.1:1".parse().unwrap(),
+                replication_addr: repl.map(|s| s.parse().unwrap()),
+                order_entry_addr: None,
+                serving_epoch,
+                public_key: [id as u8; 32],
+            };
+            assert!(registry.apply(&rec.encode()));
+        }
+        let directory = std::sync::Arc::new(crate::raft_driver::ClusterDirectory::default());
+        directory.update(&registry);
+        crate::raft_driver::LeaderFollow {
+            self_node_id: self_id,
+            status,
+            directory,
+        }
+    }
+
+    #[test]
+    fn follow_target_prefers_serving_primary_then_leader_then_static() {
+        let static_addr: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+
+        // No control plane → follow the static target (None hint).
+        assert_eq!(follow_target(None, static_addr), None);
+
+        // Leader (node 5) announced a replication address but nobody
+        // claims to serve → fall back to the leader hint.
+        let f = leader_follow_with(2, 5, &[(5, None, Some("10.0.0.5:99"))]);
+        assert_eq!(
+            follow_target(Some(&f), static_addr),
+            Some("10.0.0.5:99".parse().unwrap())
+        );
+
+        // Node 5 leads, but node 4 is the serving primary → the serving
+        // primary's replication address wins over the leader's.
+        let f = leader_follow_with(
+            2,
+            5,
+            &[
+                (5, None, Some("10.0.0.5:99")),
+                (4, Some(7), Some("10.0.0.4:99")),
+            ],
+        );
+        assert_eq!(
+            follow_target(Some(&f), static_addr),
+            Some("10.0.0.4:99".parse().unwrap())
+        );
+
+        // The winning hint equals the static target → None (no point
+        // alternating to the same address).
+        let same: SocketAddr = "10.0.0.4:99".parse().unwrap();
+        assert_eq!(follow_target(Some(&f), same), None);
+
+        // This node itself holds the serving claim → never follow
+        // yourself, and with no other hint fall back to the static target.
+        let f = leader_follow_with(2, 2, &[(2, Some(9), Some("10.0.0.2:99"))]);
+        assert_eq!(follow_target(Some(&f), static_addr), None);
+    }
 
     /// Connected localhost pair: (transport side, peer side).
     fn socket_pair() -> (TcpStream, TcpStream) {
