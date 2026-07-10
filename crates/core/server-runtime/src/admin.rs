@@ -625,6 +625,31 @@ mod tests {
         TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
     };
 
+    #[test]
+    fn handler_slot_caps_at_the_limit_and_releases_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        // Fill exactly to the cap.
+        let mut slots: Vec<HandlerSlot> = (0..MAX_ADMIN_HANDLERS)
+            .map(|_| HandlerSlot::acquire(&counter).expect("acquire under the cap"))
+            .collect();
+        assert_eq!(counter.load(Ordering::Acquire), MAX_ADMIN_HANDLERS);
+        // At the cap the next acquire is shed (the listener drops the conn).
+        assert!(
+            HandlerSlot::acquire(&counter).is_none(),
+            "acquire at the cap must be refused"
+        );
+        // Releasing one frees exactly one slot.
+        slots.pop();
+        assert_eq!(counter.load(Ordering::Acquire), MAX_ADMIN_HANDLERS - 1);
+        let reacquired = HandlerSlot::acquire(&counter);
+        assert!(reacquired.is_some(), "freed capacity must be re-acquirable");
+        assert_eq!(counter.load(Ordering::Acquire), MAX_ADMIN_HANDLERS);
+        // Every guard releases its slot when dropped.
+        drop(reacquired);
+        drop(slots);
+        assert_eq!(counter.load(Ordering::Acquire), 0, "all slots released");
+    }
+
     fn operator_keys() -> (SigningKey, Arc<AuthorizedKeys>) {
         let signing_key = SigningKey::from_bytes(&[0xAD; 32]);
         let pub_b64 = base64::Engine::encode(

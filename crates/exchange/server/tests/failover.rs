@@ -4647,6 +4647,41 @@ fn voter_changes_over_the_admin_endpoint() {
     );
     assert_eq!(add, "OK voters=1,2,3,4", "add voter 4 failed: {add}");
 
+    // Idempotent: re-adding node 4 under the *same* address and key is a
+    // no-op success (scripting-friendly).
+    let readd = admin_command(
+        admin_addr(leader),
+        &operator_key,
+        &format!(
+            "RAFT-ADD-VOTER 4 127.0.0.1:{} {}",
+            raft_ports[&4],
+            pubkey_b64(&cluster.node_keys[&4])
+        ),
+    );
+    assert_eq!(
+        readd, "OK voters=1,2,3,4",
+        "idempotent re-add failed: {readd}"
+    );
+
+    // Rail: re-adding node 4 under a *different* key is a re-key, which
+    // `add` cannot do in place — it must be refused, not silently
+    // succeed. A fresh key (pinned to nobody) reaches the re-key rail
+    // rather than the "one key, one identity" rail.
+    let fresh_key = SigningKey::from_bytes(&[0x5Au8; 32]);
+    let rekey = admin_command(
+        admin_addr(leader),
+        &operator_key,
+        &format!(
+            "RAFT-ADD-VOTER 4 127.0.0.1:{} {}",
+            raft_ports[&4],
+            pubkey_b64(&fresh_key)
+        ),
+    );
+    assert!(
+        rekey.contains("different identity"),
+        "re-keying an existing voter must be refused: {rekey}"
+    );
+
     // Rail: node id 0 is rejected by the driver (raft's invalid-id
     // sentinel). A valid key + address ensures the request reaches the
     // rail rather than tripping a parse error first.
@@ -4695,6 +4730,47 @@ fn voter_changes_over_the_admin_endpoint() {
     );
     assert_eq!(remove, expected_line, "remove follower failed: {remove}");
 
-    // Dropping `nodes` SIGKILLs every survivor via `ServerProcess::drop`.
+    // The reconfigured cluster must be *functional*, not merely
+    // reconfigured. After the remove the voters are {1,2,3,4}\{follower};
+    // killing the leader leaves a quorum only if the added node 4 votes —
+    // the surviving voters are the one untouched genesis node plus 4, and
+    // a 3-voter set needs 2. A successful election therefore proves node 4
+    // is a real participant end-to-end, over sockets, not just that the
+    // add command returned OK.
+    let surviving_voters: Vec<u64> = [1u64, 2, 3, 4]
+        .into_iter()
+        .filter(|&v| v != follower && v != leader)
+        .collect();
+    assert!(
+        surviving_voters.contains(&4),
+        "sanity: the added node 4 is among the survivors"
+    );
+    {
+        let mut dead = nodes.remove(&leader).expect("leader process present");
+        // SIGKILL rather than a graceful stop: model a hard primary loss.
+        unsafe {
+            libc::kill(dead.child.id() as i32, libc::SIGKILL);
+        }
+        let _ = dead.child.wait();
+    }
+    let survivor_health: Vec<(u64, SocketAddr)> = surviving_voters
+        .iter()
+        .map(|&id| {
+            (
+                id,
+                format!("127.0.0.1:{}", health_ports[&id])
+                    .parse()
+                    .expect("valid addr"),
+            )
+        })
+        .collect();
+    let (new_leader, _) = wait_for_raft_leader(&survivor_health, Duration::from_secs(60));
+    assert!(
+        surviving_voters.contains(&new_leader),
+        "a surviving voter (the reconfigured quorum, incl. node 4) must lead, got {new_leader}"
+    );
+
+    // Dropping `nodes` SIGKILLs every remaining survivor via
+    // `ServerProcess::drop`.
     drop(nodes);
 }

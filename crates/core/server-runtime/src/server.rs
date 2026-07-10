@@ -4078,6 +4078,66 @@ mod tests {
         );
         assert!(build_raft_config(&cfg).is_err());
     }
+
+    #[test]
+    fn build_raft_config_join_mode_bootstraps_empty_voters() {
+        let key = std::env::temp_dir().join("melin-test-join.key");
+        std::fs::write(&key, [0u8; 32]).unwrap();
+        let mut cfg = raft_cfg(
+            Some("127.0.0.1:7000"),
+            Some(4),
+            vec![
+                format!("1@127.0.0.1:7001@{}", pubkey_b64(1)),
+                format!("2@127.0.0.1:7002@{}", pubkey_b64(2)),
+            ],
+            Some(key),
+        );
+        cfg.raft_join = true;
+        let (_, driver) = build_raft_config(&cfg).unwrap().expect("raft enabled");
+        assert_eq!(driver.node_id, 4);
+        // A joiner bootstraps an *empty* voter set — raft admits it later
+        // via AddNode; seeding [self ∪ peers] would diverge from the
+        // cluster's ConfState (the split-brain --raft-join exists to avoid).
+        assert!(
+            driver.voters.is_empty(),
+            "join mode must bootstrap no voters, got {:?}",
+            driver.voters
+        );
+        // Peers still become dial targets so the joiner can reach in.
+        assert_eq!(driver.peers.len(), 2);
+    }
+
+    #[test]
+    fn build_raft_config_join_requires_a_peer() {
+        let key = std::env::temp_dir().join("melin-test-join-nopeer.key");
+        std::fs::write(&key, [0u8; 32]).unwrap();
+        let mut cfg = raft_cfg(Some("127.0.0.1:7000"), Some(4), vec![], Some(key));
+        cfg.raft_join = true;
+        let err = build_raft_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("requires at least one --raft-peer"), "{err}");
+    }
+
+    #[test]
+    fn build_raft_config_join_detects_duplicate_peer_id() {
+        let key = std::env::temp_dir().join("melin-test-join-dup.key");
+        std::fs::write(&key, [0u8; 32]).unwrap();
+        // Two peers claim id 2 (distinct keys). In join mode `voters` is
+        // empty, so the duplicate check must scan `peers`; this guards
+        // that rewrite against a regression back to scanning `voters`.
+        let mut cfg = raft_cfg(
+            Some("127.0.0.1:7000"),
+            Some(4),
+            vec![
+                format!("2@127.0.0.1:7001@{}", pubkey_b64(2)),
+                format!("2@127.0.0.1:7002@{}", pubkey_b64(3)),
+            ],
+            Some(key),
+        );
+        cfg.raft_join = true;
+        let err = build_raft_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("duplicate node id 2"), "{err}");
+    }
+
     use melin_wire_protocol::control::ConnectionId;
     use melin_wire_protocol::control_codec::{
         TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT,
