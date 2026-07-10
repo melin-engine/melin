@@ -11,6 +11,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 
+use crate::blocking::DeadlineSocket;
+
 /// Blocking transport listener for the server accept loop.
 ///
 /// Accepts new connections and returns blocking read/write halves that
@@ -19,10 +21,14 @@ use std::os::unix::io::AsRawFd;
 ///
 /// `Read` requires `AsRawFd` so the io_uring reader can register
 /// connection fds for multiplexed I/O. `Write` requires `AsRawFd` so
-/// the response stage can submit SEND SQEs with the raw fd.
+/// the response stage can submit SEND SQEs with the raw fd. Both require
+/// [`DeadlineSocket`] so deadline-bounded handshakes (the replica
+/// redirect acceptor) can re-arm per-syscall read/write timeouts on the
+/// accepted halves — a blocking transport that cannot honour a deadline
+/// has no place on the control-plane handshake paths.
 pub trait BlockingTransportListener: Send + 'static {
-    type Read: io::Read + AsRawFd + Send + 'static;
-    type Write: io::Write + AsRawFd + Send + 'static;
+    type Read: io::Read + AsRawFd + DeadlineSocket + Send + 'static;
+    type Write: io::Write + AsRawFd + DeadlineSocket + Send + 'static;
 
     /// Accept a new connection, returning blocking read/write halves
     /// and the peer address.

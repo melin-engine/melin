@@ -156,26 +156,19 @@ impl Client {
 
     /// Remaining budget until `deadline`, as a `Duration` suitable for
     /// socket-timeout arming. `Ok(None)` when no deadline is set;
-    /// `TimedOut` once within a millisecond of the deadline — the
-    /// socket APIs treat a zero (or truncated-to-zero) timeout as "no
-    /// timeout", so a sub-millisecond remainder must round to expiry,
-    /// never to an unbounded wait. Same floor as the server-side
-    /// redirect acceptor's budget check.
+    /// otherwise delegates to the shared
+    /// [`melin_wire_protocol::blocking::remaining_budget`] — the single
+    /// source of truth for the 1 ms floor that keeps a sub-millisecond
+    /// remainder from truncating to the "no timeout" zero timeval (the
+    /// same check the server-side redirect acceptor uses).
     fn remaining(
         deadline: Option<std::time::Instant>,
     ) -> Result<Option<std::time::Duration>, ClientError> {
         match deadline {
             None => Ok(None),
-            Some(d) => {
-                let rem = d.saturating_duration_since(std::time::Instant::now());
-                if rem < std::time::Duration::from_millis(1) {
-                    return Err(ClientError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "connect deadline exceeded",
-                    )));
-                }
-                Ok(Some(rem))
-            }
+            Some(d) => melin_wire_protocol::blocking::remaining_budget(d)
+                .map(Some)
+                .map_err(ClientError::Io),
         }
     }
 

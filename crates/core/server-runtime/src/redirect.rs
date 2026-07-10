@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use melin_app::auth::AuthorizedKeys;
+use melin_wire_protocol::blocking::{DeadlineSocket, read_exact_deadline, write_all_deadline};
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 use melin_wire_protocol::transport::BlockingTransportListener;
@@ -178,8 +179,8 @@ fn redirect_one<R, W>(
     deadline: Instant,
 ) -> std::io::Result<()>
 where
-    R: Read + std::os::fd::AsRawFd,
-    W: Write + std::os::fd::AsRawFd,
+    R: Read + DeadlineSocket,
+    W: Write + DeadlineSocket,
 {
     // Challenge → signed response, the same handshake the reader runs.
     let nonce = crate::replication::auth::generate_challenge_nonce()?;
@@ -247,7 +248,7 @@ where
 /// here just means the peer is gone.
 fn send_response<W>(write: &mut W, response: &TransportResponse, deadline: Instant)
 where
-    W: Write + std::os::fd::AsRawFd,
+    W: Write + DeadlineSocket,
 {
     let mut buf = [0u8; 64];
     if let Ok(n) = control_codec::encode_transport_response(response, &mut buf) {
@@ -255,99 +256,6 @@ where
         // being torn down either way.
         let _ = write_all_deadline(write, &buf[..n], deadline);
     }
-}
-
-/// Budget left until `deadline`, erring once within a millisecond of
-/// it: `SO_RCVTIMEO`/`SO_SNDTIMEO` treat a zero timeval as "block
-/// forever", so a sub-millisecond remainder must round to expiry, never
-/// to zero.
-fn remaining_budget(deadline: Instant) -> std::io::Result<Duration> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining < Duration::from_millis(1) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "handshake deadline exceeded",
-        ));
-    }
-    Ok(remaining)
-}
-
-/// Arm one socket timeout option with `dur`. Callers must pass a
-/// `remaining_budget`-vetted duration — the shared helper preserves
-/// sub-second precision, and the budget's 1ms floor is what keeps a
-/// near-expired remainder from truncating to the zero timeval the
-/// kernel reads as "no timeout".
-fn arm_timeout(fd: std::os::fd::RawFd, opt: libc::c_int, dur: Duration) -> std::io::Result<()> {
-    crate::server::set_socket_timeout(fd, opt, Some(dur))
-}
-
-/// `read_exact` under a whole-transfer deadline: the socket timeout is
-/// re-armed with the *remaining* budget before every syscall, so
-/// partial progress (a byte-dribbling peer) shrinks the budget instead
-/// of resetting it — total wall time is bounded by the deadline no
-/// matter how the bytes arrive.
-fn read_exact_deadline<R>(read: &mut R, buf: &mut [u8], deadline: Instant) -> std::io::Result<()>
-where
-    R: Read + std::os::fd::AsRawFd,
-{
-    let mut filled = 0;
-    while filled < buf.len() {
-        arm_timeout(
-            read.as_raw_fd(),
-            libc::SO_RCVTIMEO,
-            remaining_budget(deadline)?,
-        )?;
-        match read.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "peer closed during handshake",
-                ));
-            }
-            Ok(n) => filled += n,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                // Timeout tick or signal — the next remaining_budget()
-                // call errors out if the deadline is spent.
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-/// `write_all` + flush under the same whole-transfer deadline contract
-/// as [`read_exact_deadline`].
-fn write_all_deadline<W>(write: &mut W, buf: &[u8], deadline: Instant) -> std::io::Result<()>
-where
-    W: Write + std::os::fd::AsRawFd,
-{
-    let mut written = 0;
-    while written < buf.len() {
-        arm_timeout(
-            write.as_raw_fd(),
-            libc::SO_SNDTIMEO,
-            remaining_budget(deadline)?,
-        )?;
-        match write.write(&buf[written..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "peer stopped accepting bytes during handshake",
-                ));
-            }
-            Ok(n) => written += n,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    write.flush()
 }
 
 #[cfg(test)]

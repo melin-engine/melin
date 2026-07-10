@@ -43,18 +43,29 @@ Shipped and pushed (roadmap items 15–17, all verified end-to-end):
   in-place re-key; an interrupted add is reclaimable via remove;
   follower-targeted commands forward to the leader. Durable cluster-wide
   before the command returns.
+- **Serving-primary registry claim (task 3)** — records carry a
+  `serving_epoch` claim (record v3); redirects and replica reconnect both
+  resolve the highest live claim (fencing order, tie-broken by node id)
+  rather than the raft leader, so a client dialing a replica — or a replica
+  choosing whom to follow — lands on the node actually serving the journal,
+  not a leader-replica that would only answer `ServerBusy`.
+- **Deadline-IO unification (task 4)** — the per-syscall deadline helpers
+  (`remaining_budget`, `DeadlineSocket`, `read_exact_deadline` /
+  `write_all_deadline` / `read_frame_deadline`) live once in
+  `melin-wire-protocol::blocking`; the redirect acceptor uses them (dropping
+  its raw-fd `setsockopt` plumbing) and the client shares `remaining_budget`
+  (the timeval-zero hazard is now defined in one place). Deferred: upgrading
+  the *client's* buffered read path from per-frame to per-syscall re-arming —
+  it needs a careful `BufReader` rework, not a mechanical swap.
 
 Remaining, in recommended order (rationale at the end):
 
 | # | Task | Size |
 |---|------|------|
-| 3 | Serving-primary registry claim (leader ≠ serving-primary redirect gap) | S–M |
-| 4 | Deadline-IO unification into `melin-wire-protocol::blocking` | M (refactor) |
 | 5 | DPDK follow-the-leader (+ DPDK promotion) | L (parked) |
 
-Tasks 1 and 2 are shipped on this branch; their design records below are
-kept for context (tasks 3–4 reference the registry/version mechanics they
-introduced) and marked ✅.
+Tasks 1–4 are shipped on this branch; their design records below are kept
+for context and marked ✅.
 
 ---
 
@@ -360,7 +371,7 @@ E2E (`failover.rs`, real processes — plumbing proof, not correctness depth):
 
 ---
 
-## Task 3 — Serving-primary registry claim (redirect gap)
+## Task 3 — Serving-primary registry claim (redirect gap) ✅ shipped
 
 ### Problem
 
@@ -471,7 +482,7 @@ E2E (failover.rs):
 
 ---
 
-## Task 4 — Deadline-IO unification
+## Task 4 — Deadline-IO unification ✅ shipped (client per-syscall upgrade deferred)
 
 ### Problem
 
