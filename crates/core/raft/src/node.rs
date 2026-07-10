@@ -324,15 +324,25 @@ impl ControlNode {
                 }
                 EntryType::EntryConfChange => {
                     let cc: ConfChange = prost_decode(&entry.data)?;
+                    let removed: Vec<u64> = (cc.change_type() == ConfChangeType::RemoveNode)
+                        .then_some(cc.node_id)
+                        .into_iter()
+                        .collect();
                     let before = self.voters().len();
                     let applied = self.raw.apply_conf_change(&cc);
-                    self.absorb_conf_change(entry.index, applied, before)?;
+                    self.absorb_conf_change(entry.index, applied, before, &removed, out)?;
                 }
                 EntryType::EntryConfChangeV2 => {
                     let cc: ConfChangeV2 = prost_decode(&entry.data)?;
+                    let removed: Vec<u64> = cc
+                        .changes
+                        .iter()
+                        .filter(|c| c.change_type() == ConfChangeType::RemoveNode)
+                        .map(|c| c.node_id)
+                        .collect();
                     let before = self.voters().len();
                     let applied = self.raw.apply_conf_change(&cc);
-                    self.absorb_conf_change(entry.index, applied, before)?;
+                    self.absorb_conf_change(entry.index, applied, before, &removed, out)?;
                 }
             }
         }
@@ -361,10 +371,30 @@ impl ControlNode {
         index: u64,
         applied: raft::Result<ConfState>,
         voters_before: usize,
+        removed: &[u64],
+        out: &mut Drained,
     ) -> io::Result<()> {
         match applied {
             Ok(cs) => {
-                self.raw.mut_store().stage_applied(index, None);
+                // A committed `RemoveNode` also prunes the departed node's
+                // directory record, deterministically on every node. This
+                // reclaims an orphaned seed too: a `RAFT-ADD-VOTER` whose
+                // record committed but whose `AddNode` never did leaves a
+                // record with no voter — re-issuing `RAFT-REMOVE-VOTER`
+                // proposes a `RemoveNode` that no-ops on `ConfState` yet
+                // still lands here to drop the record. Staged into the same
+                // rewrite as the `ConfState` below, so the prune is atomic.
+                let mut pruned = false;
+                for &id in removed {
+                    pruned |= self.registry.remove(id);
+                }
+                let state = if pruned {
+                    out.registry_changed = true;
+                    Some(self.registry.encode())
+                } else {
+                    None
+                };
+                self.raw.mut_store().stage_applied(index, state);
                 if cs.voters.len() > voters_before {
                     // A grown voter set means a fresh voter whose empty
                     // bootstrap `ConfState` carries no genesis membership;
@@ -825,6 +855,46 @@ mod sim {
     }
 
     #[test]
+    fn added_voter_and_config_survive_restart() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+
+        // Grow to four voters (seed record → AddNode; the joiner catches
+        // up via the forced snapshot + compaction on the grow path).
+        c.add_joiner(4);
+        let rec4 = record(4);
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_member(&rec4));
+        c.settle_record_among(&rec4, &[1, 2, 3], 100);
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_add_voter(4));
+        c.settle_voters(&[1, 2, 3, 4], 400);
+        for _ in 0..10 {
+            c.step_all();
+        }
+
+        // Crash-reopen an existing voter *and* the freshly-added node 4
+        // from their own directories. The grown ConfState and the
+        // registry must return from persisted state — pinning that the
+        // grow path lands the applied index, the ConfState, and the
+        // compaction in one atomic rewrite (a split would let the
+        // committed AddNode re-deliver or lose node 4's membership).
+        for id in [leader, 4] {
+            let dir = c.dirs[&id].path().to_path_buf();
+            c.nodes.remove(&id);
+            let reopened = ControlNode::open(id, &dir, &[]).unwrap();
+            assert_eq!(
+                reopened.voters(),
+                vec![1, 2, 3, 4],
+                "node {id} must reopen with the grown voter set"
+            );
+            assert!(
+                reopened.registry().get(4).is_some(),
+                "node {id} must retain node 4's record across restart"
+            );
+            c.nodes.insert(id, reopened);
+        }
+    }
+
+    #[test]
     fn remove_voter_shrinks_the_cluster() {
         let mut c = Cluster::new(&[1, 2, 3]);
         let leader = c.settle(200);
@@ -908,6 +978,69 @@ mod sim {
             remaining,
             "a removed voter must stay removed across a crash-reopen"
         );
+    }
+
+    #[test]
+    fn remove_prunes_the_departed_member_record() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+        let victim = *c.nodes.keys().find(|id| **id != leader).unwrap();
+
+        // Seed the victim's directory record and let it replicate.
+        let rec = record(victim);
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_member(&rec));
+        c.settle_record(&rec, 200);
+
+        // Removing the voter must also prune its record cluster-wide, so
+        // survivors stop dialing a decommissioned node.
+        assert!(
+            c.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .propose_remove_voter(victim)
+        );
+        let remaining: Vec<u64> = [1, 2, 3].into_iter().filter(|id| *id != victim).collect();
+        c.settle_voters(&remaining, 200);
+        for _ in 0..50 {
+            c.step_all();
+        }
+        for n in c.nodes.values() {
+            assert!(
+                n.registry().get(victim).is_none(),
+                "the removed voter's record must be pruned on {}",
+                n.id()
+            );
+        }
+    }
+
+    #[test]
+    fn orphaned_record_is_reclaimed_by_remove() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+
+        // A record for node 4 with no matching voter — the orphan an
+        // interrupted `RAFT-ADD-VOTER` (seed committed, `AddNode` did not)
+        // would leave behind.
+        let orphan = record(4);
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_member(&orphan));
+        c.settle_record(&orphan, 200);
+        assert!(c.nodes[&leader].registry().get(4).is_some());
+        assert!(!c.nodes[&leader].voters().contains(&4));
+
+        // `RAFT-REMOVE-VOTER 4`: a `RemoveNode` that no-ops on the voter
+        // set but still prunes the orphaned record so it is recoverable.
+        assert!(c.nodes.get_mut(&leader).unwrap().propose_remove_voter(4));
+        for _ in 0..80 {
+            c.step_all();
+        }
+        for n in c.nodes.values() {
+            assert!(
+                n.registry().get(4).is_none(),
+                "the orphaned record must be reclaimed on {}",
+                n.id()
+            );
+            assert_eq!(n.voters(), vec![1, 2, 3], "the voter set must be untouched");
+        }
     }
 
     #[test]

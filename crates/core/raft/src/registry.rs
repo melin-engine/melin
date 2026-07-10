@@ -147,6 +147,15 @@ impl Registry {
         }
     }
 
+    /// Drop the record for `node_id`. Returns `true` when a record was
+    /// actually removed (drives the driver's re-wiring so it stops
+    /// dialing the departed node), `false` when there was none. Applied
+    /// as the deterministic side effect of a committed `RemoveNode` conf
+    /// change, so every node prunes the same record at the same index.
+    pub fn remove(&mut self, node_id: u64) -> bool {
+        self.members.remove(&node_id).is_some()
+    }
+
     /// The committed record for `node_id`, if any.
     pub fn get(&self, node_id: u64) -> Option<&MemberRecord> {
         self.members.get(&node_id)

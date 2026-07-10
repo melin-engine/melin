@@ -609,9 +609,16 @@ leadership first (stop it, or `PROMOTE` another node) — and the last
 remaining voter cannot be removed (it would brick consensus). Removing
 a node is a control-plane change only: a removed node keeps serving the
 data plane until you stop its process, so stop it afterward. Once
-removed, it can no longer be elected. Both commands are idempotent:
-adding a node that is already a voter, or removing one that is already
-gone, succeeds without changing anything.
+removed, it can no longer be elected. Removing a voter also drops its
+directory entry, so peers stop trying to reach the decommissioned
+address.
+
+Both commands are idempotent for a no-op: removing a node that is
+already gone, or re-adding one that is already a voter **under the same
+address and key**, succeeds without changing anything. Re-adding an
+existing voter under a *different* address or key is refused — `add`
+cannot re-key a node in place; remove it first, then re-add under the
+new identity.
 
 **Replacing a dead node at the same id and key** needs *no* voter
 change at all: boot the replacement with the old node's id and
@@ -620,11 +627,13 @@ re-points every peer at it automatically. Use `RAFT-ADD-VOTER` /
 `RAFT-REMOVE-VOTER` only when the node **id or key** changes, or when
 the voter **count** changes.
 
-A removed node's directory entry lingers until it is added again or the
-cluster is rebuilt, so peers keep trying to reach a decommissioned
-address at a low background rate — harmless, but stop the process to
-silence it. Only one membership change is processed at a time; a second
-request while one is in flight is refused immediately.
+If an add is interrupted — the cluster loses its leader after recording
+the joiner's address but before admitting it as a voter — the joiner is
+left recorded but not voting, and peers keep trying to reach it at a low
+background rate. Run `RAFT-REMOVE-VOTER <node-id>` to reclaim that entry;
+it drops the record whether or not the node ever became a voter. Only
+one membership change is processed at a time; a second request while one
+is in flight is refused immediately.
 
 ### No offline journal inspector
 

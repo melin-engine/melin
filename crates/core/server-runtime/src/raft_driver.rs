@@ -689,7 +689,12 @@ trait VoterOps {
         self.voters().contains(&node_id)
     }
     /// Whether the applied registry holds a record for `node_id`.
-    fn registry_has(&self, node_id: u64) -> bool;
+    fn registry_has(&self, node_id: u64) -> bool {
+        self.registry_record(node_id).is_some()
+    }
+    /// The applied directory record for `node_id`, if any — backs the
+    /// re-key / re-address detection on add.
+    fn registry_record(&self, node_id: u64) -> Option<MemberRecord>;
     /// The id currently pinned to `key` in the applied registry, if any —
     /// backs the "one key, one identity" rail.
     fn registry_id_for_key(&self, key: &[u8; 32]) -> Option<u64>;
@@ -705,8 +710,8 @@ impl VoterOps for ControlNode {
     fn voters(&self) -> Vec<u64> {
         ControlNode::voters(self)
     }
-    fn registry_has(&self, node_id: u64) -> bool {
-        self.registry().get(node_id).is_some()
+    fn registry_record(&self, node_id: u64) -> Option<MemberRecord> {
+        self.registry().get(node_id).cloned()
     }
     fn registry_id_for_key(&self, key: &[u8; 32]) -> Option<u64> {
         self.registry()
@@ -799,8 +804,8 @@ fn begin_voter_change(
     match &req.change {
         VoterChange::Add {
             node_id,
+            raft_addr,
             public_key,
-            ..
         } => {
             // Rail: one key, one identity — the registry is the auth
             // directory, so a key already speaking for a different id
@@ -814,35 +819,60 @@ fn begin_voter_change(
                 );
                 return None;
             }
-            // Idempotent: already a voter with a record present — the
-            // desired end state, so report success (scripting-friendly).
-            if node.is_voter(*node_id) && node.registry_has(*node_id) {
-                reply_voter(&req.reply, Ok(node.voters()));
+            // Already a voter with a record: compare the recorded identity.
+            if node.is_voter(*node_id)
+                && let Some(rec) = node.registry_record(*node_id)
+            {
+                if &rec.public_key == public_key && rec.raft_addr == *raft_addr {
+                    // Same identity → idempotent success (scripting-friendly).
+                    reply_voter(&req.reply, Ok(node.voters()));
+                } else {
+                    // A different key or address is a re-key / re-address.
+                    // `Add` cannot do it in place — the seed record carries
+                    // only the raft addr, so an overwrite would wipe the
+                    // replication / order-entry addresses the joiner
+                    // announced. Steer to remove + re-add under the new
+                    // identity (the remove now reclaims the record cleanly).
+                    reply_voter(
+                        &req.reply,
+                        Err(format!(
+                            "node {node_id} is already a voter under a different identity — RAFT-REMOVE-VOTER {node_id} first, then re-add"
+                        )),
+                    );
+                }
                 return None;
             }
         }
         VoterChange::Remove { node_id } => {
-            // Idempotent: not a voter → already in the desired state.
-            if !node.is_voter(*node_id) {
+            // Idempotent only when truly gone: neither a voter nor a
+            // lingering directory record. An orphaned record (an add whose
+            // `AddNode` never committed) is *not* the desired state — fall
+            // through so a `RemoveNode` reclaims it.
+            if !node.is_voter(*node_id) && !node.registry_has(*node_id) {
                 reply_voter(&req.reply, Ok(node.voters()));
                 return None;
             }
-            // Rail: refuse removing the *live* leader — leadership must
-            // move first, else the removal races the election it forces.
-            // Removing a dead ex-leader is fine (leadership already moved).
-            if node.leader_id() == Some(*node_id) {
-                reply_voter(
-                    &req.reply,
-                    Err(format!(
-                        "node {node_id} currently leads — stop it and let the cluster elect first"
-                    )),
-                );
-                return None;
-            }
-            // Rail: never remove the last voter — it would brick consensus.
-            if node.voters().len() <= 1 {
-                reply_voter(&req.reply, Err("cannot remove the last voter".into()));
-                return None;
+            // The consensus-safety rails apply only when the target is an
+            // actual voter; reclaiming an orphaned record never touches
+            // the quorum and is always safe.
+            if node.is_voter(*node_id) {
+                // Rail: refuse removing the *live* leader — leadership must
+                // move first, else the removal races the election it
+                // forces. Removing a dead ex-leader is fine.
+                if node.leader_id() == Some(*node_id) {
+                    reply_voter(
+                        &req.reply,
+                        Err(format!(
+                            "node {node_id} currently leads — stop it and let the cluster elect first"
+                        )),
+                    );
+                    return None;
+                }
+                // Rail: never remove the last voter — it would brick consensus.
+                if node.voters().len() <= 1 {
+                    reply_voter(&req.reply, Err("cannot remove the last voter".into()));
+                    return None;
+                }
             }
         }
     }
@@ -893,7 +923,10 @@ fn advance_voter_change(
         VoterStage::ConfChange => {
             let applied = match &p.change {
                 VoterChange::Add { .. } => node.is_voter(id),
-                VoterChange::Remove { .. } => !node.is_voter(id),
+                // Done once the voter is gone *and* its directory record
+                // has been pruned — the committed `RemoveNode` does both in
+                // one apply, so this also confirms an orphan was reclaimed.
+                VoterChange::Remove { .. } => !node.is_voter(id) && !node.registry_has(id),
             };
             if applied {
                 reply_voter(&p.reply, Ok(node.voters()));
@@ -1616,6 +1649,20 @@ fn sync_registry(
         }
     }
 
+    // Prune dial targets that are neither a static bootstrap peer nor a
+    // current registry record — e.g. a runtime-added node whose record
+    // was reclaimed by `RAFT-REMOVE-VOTER` (an orphaned or decommissioned
+    // node). Static `--raft-peer`s stay the floor, so genesis dialing is
+    // untouched before any records are announced. `HashSet` for O(1)
+    // membership over the tiny peer set.
+    let live: std::collections::HashSet<u64> = config
+        .peers
+        .iter()
+        .map(|p| p.id)
+        .chain(node.registry().iter().map(|r| r.node_id))
+        .collect();
+    links.retain(|id, _| live.contains(id));
+
     // Identity pins: static config as the floor, applied records
     // superseding per id (an announced key rotation replaces the
     // boot-time pin for that node).
@@ -1669,16 +1716,28 @@ mod voter_change_tests {
     use std::collections::HashMap;
 
     /// A scriptable stand-in for a `ControlNode`. Registry is a
-    /// `HashMap<node_id, public_key>` — a directory keyed by id, matching
-    /// the real registry's shape closely enough for the rails.
+    /// `HashMap<node_id, MemberRecord>` — a directory keyed by id,
+    /// matching the real registry's shape closely enough for the rails.
     #[derive(Default)]
     struct MockNode {
         leader: Option<u64>,
         voters: Vec<u64>,
-        records: HashMap<u64, [u8; 32]>,
+        records: HashMap<u64, MemberRecord>,
         proposed_members: Vec<u64>,
         proposed_adds: Vec<u64>,
         proposed_removes: Vec<u64>,
+    }
+
+    /// A directory record with the given id/key and a fixed raft address —
+    /// the address only differs in the re-address test, which overrides it.
+    fn mock_record(node_id: u64, key: [u8; 32]) -> MemberRecord {
+        MemberRecord {
+            node_id,
+            raft_addr: "127.0.0.1:9000".parse().unwrap(),
+            replication_addr: None,
+            order_entry_addr: None,
+            public_key: key,
+        }
     }
 
     impl VoterOps for MockNode {
@@ -1688,14 +1747,14 @@ mod voter_change_tests {
         fn voters(&self) -> Vec<u64> {
             self.voters.clone()
         }
-        fn registry_has(&self, node_id: u64) -> bool {
-            self.records.contains_key(&node_id)
+        fn registry_record(&self, node_id: u64) -> Option<MemberRecord> {
+            self.records.get(&node_id).cloned()
         }
         fn registry_id_for_key(&self, key: &[u8; 32]) -> Option<u64> {
             self.records
-                .iter()
-                .find(|(_, k)| *k == key)
-                .map(|(id, _)| *id)
+                .values()
+                .find(|r| &r.public_key == key)
+                .map(|r| r.node_id)
         }
         fn propose_member(&mut self, record: &MemberRecord) -> bool {
             self.proposed_members.push(record.node_id);
@@ -1751,7 +1810,7 @@ mod voter_change_tests {
     #[test]
     fn rejects_key_pinned_to_a_different_id() {
         let mut node = MockNode {
-            records: HashMap::from([(7, [0xAB; 32])]),
+            records: HashMap::from([(7, mock_record(7, [0xAB; 32]))]),
             ..Default::default()
         };
         // Try to add id 4 with a key already pinned to id 7.
@@ -1765,16 +1824,58 @@ mod voter_change_tests {
     fn add_is_idempotent_when_already_a_voter_with_record() {
         let mut node = MockNode {
             voters: vec![1, 2, 4],
-            records: HashMap::from([(4, [0xAB; 32])]),
+            records: HashMap::from([(4, mock_record(4, [0xAB; 32]))]),
             ..Default::default()
         };
+        // Same key and address as the record → idempotent success.
         let (req, rx) = add_request(4, [0xAB; 32]);
         assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
         assert_eq!(rx.try_recv().unwrap().unwrap(), vec![1, 2, 4]);
     }
 
     #[test]
-    fn remove_is_idempotent_when_not_a_voter() {
+    fn rejects_rekey_of_an_existing_voter() {
+        // Node 4 is a voter recorded under key 0xAB; ADD-VOTER with a
+        // *different* key must be refused (not a false OK), steering the
+        // operator to remove + re-add.
+        let mut node = MockNode {
+            voters: vec![1, 2, 4],
+            records: HashMap::from([(4, mock_record(4, [0xAB; 32]))]),
+            ..Default::default()
+        };
+        let (req, rx) = add_request(4, [0xCD; 32]);
+        assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
+        let err = rx.try_recv().unwrap().unwrap_err();
+        assert!(
+            err.contains("different identity"),
+            "unexpected error: {err}"
+        );
+        assert!(node.proposed_members.is_empty(), "must not seed a record");
+        assert!(node.proposed_adds.is_empty());
+    }
+
+    #[test]
+    fn rejects_readdress_of_an_existing_voter() {
+        // Same key, different raft address → still a re-address ADD cannot
+        // perform in place; refused rather than silently succeeding.
+        let mut record = mock_record(4, [0xAB; 32]);
+        record.raft_addr = "127.0.0.1:7777".parse().unwrap();
+        let mut node = MockNode {
+            voters: vec![1, 2, 4],
+            records: HashMap::from([(4, record)]),
+            ..Default::default()
+        };
+        // add_request uses 127.0.0.1:9000 — a different address.
+        let (req, rx) = add_request(4, [0xAB; 32]);
+        assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
+        assert!(rx.try_recv().unwrap().is_err());
+        assert!(node.proposed_members.is_empty());
+    }
+
+    #[test]
+    fn remove_is_idempotent_when_absent() {
+        // Node 9 is neither a voter nor in the registry → truly gone, so
+        // the remove replies OK without proposing anything.
         let mut node = MockNode {
             voters: vec![1, 2, 3],
             ..Default::default()
@@ -1782,6 +1883,7 @@ mod voter_change_tests {
         let (req, rx) = remove_request(9);
         assert!(begin_voter_change(&mut node, req, Instant::now()).is_none());
         assert_eq!(rx.try_recv().unwrap().unwrap(), vec![1, 2, 3]);
+        assert!(node.proposed_removes.is_empty());
     }
 
     #[test]
@@ -1829,7 +1931,7 @@ mod voter_change_tests {
         assert!(node.proposed_adds.is_empty());
 
         // Simulate the seed record applying → advance proposes AddNode.
-        node.records.insert(4, [0xCD; 32]);
+        node.records.insert(4, mock_record(4, [0xCD; 32]));
         advance_voter_change(&mut node, &mut pending, now);
         assert_eq!(node.proposed_adds, vec![4]);
         assert!(pending.is_some(), "still waiting for the conf change");
@@ -1846,6 +1948,9 @@ mod voter_change_tests {
         let mut node = MockNode {
             leader: Some(1),
             voters: vec![1, 2, 3],
+            // A real voter carries a directory record; the committed
+            // `RemoveNode` prunes it, and completion waits for that.
+            records: HashMap::from([(3, mock_record(3, [0x33; 32]))]),
             ..Default::default()
         };
         let now = Instant::now();
@@ -1854,11 +1959,42 @@ mod voter_change_tests {
         assert_eq!(node.proposed_removes, vec![3]);
         assert!(pending.is_some());
 
-        // Simulate the RemoveNode applying.
+        // Voter gone but the record still lingers → not done yet.
         node.voters.retain(|v| *v != 3);
+        advance_voter_change(&mut node, &mut pending, now);
+        assert!(pending.is_some(), "waits for the record prune");
+        assert!(rx.try_recv().is_err());
+
+        // The committed RemoveNode also prunes the record → reply + clear.
+        node.records.remove(&3);
         advance_voter_change(&mut node, &mut pending, now);
         assert!(pending.is_none());
         assert_eq!(rx.try_recv().unwrap().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn remove_reclaims_an_orphaned_record() {
+        // Node 4 was seeded (record present) but its `AddNode` never
+        // committed, so it is not a voter. `RAFT-REMOVE-VOTER 4` must not
+        // short-circuit as idempotent — it proposes a `RemoveNode` that
+        // no-ops on the voter set yet prunes the orphaned record.
+        let mut node = MockNode {
+            leader: Some(1),
+            voters: vec![1, 2, 3],
+            records: HashMap::from([(4, mock_record(4, [0x44; 32]))]),
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let (req, rx) = remove_request(4);
+        let mut pending = begin_voter_change(&mut node, req, now);
+        assert!(pending.is_some(), "orphan must not short-circuit");
+        assert_eq!(node.proposed_removes, vec![4]);
+
+        // The RemoveNode prunes the record without touching the voter set.
+        node.records.remove(&4);
+        advance_voter_change(&mut node, &mut pending, now);
+        assert!(pending.is_none());
+        assert_eq!(rx.try_recv().unwrap().unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
