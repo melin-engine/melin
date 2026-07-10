@@ -855,6 +855,44 @@ mod sim {
     }
 
     #[test]
+    fn add_voter_forwarded_from_a_follower_commits_cluster_wide() {
+        // The operator may target *any* node's admin endpoint, not just
+        // the leader (docs/replication.md, "Changing the cluster
+        // membership at runtime"). That guarantee rests on raft forwarding
+        // a follower's conf-change proposal to the leader, exactly as it
+        // forwards a normal MsgPropose. Drive the whole two-stage add from
+        // a follower and assert the grown set commits — including on the
+        // leader, the only node that can actually append the change.
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let leader = c.settle(200);
+        let follower = *c.nodes.keys().find(|id| **id != leader).unwrap();
+
+        c.add_joiner(4);
+        let rec4 = record(4);
+        // Stage 1: seed record proposed on the follower, forwarded up.
+        assert!(
+            c.nodes.get_mut(&follower).unwrap().propose_member(&rec4),
+            "a follower must accept a record proposal for forwarding"
+        );
+        c.settle_record_among(&rec4, &[1, 2, 3], 100);
+        // Stage 2: AddNode conf-change proposed on the same follower.
+        assert!(
+            c.nodes.get_mut(&follower).unwrap().propose_add_voter(4),
+            "a follower must accept a conf-change proposal for forwarding"
+        );
+        c.settle_voters(&[1, 2, 3, 4], 400);
+
+        // The grow could only have been appended by the leader, yet it was
+        // initiated on a follower — forwarding worked end to end. Adding a
+        // voter must not have disturbed leadership.
+        assert_eq!(
+            c.leader(),
+            Some(leader),
+            "the follower-initiated grow must not move leadership"
+        );
+    }
+
+    #[test]
     fn added_voter_and_config_survive_restart() {
         let mut c = Cluster::new(&[1, 2, 3]);
         let leader = c.settle(200);

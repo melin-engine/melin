@@ -31,22 +31,34 @@ Shipped and pushed (roadmap items 15–17, all verified end-to-end):
   native client follows up to `MAX_REDIRECT_HOPS = 3` with one overall
   deadline; the FIX gateway follows redirects too (generation-guarded io_uring
   lifecycle). `ServerBusy` while leaderless.
+- **Gateway multi-seed upstream (task 1)** — the FIX gateway rotates
+  through `server_addrs` and prefers a learned redirect target, so a dead
+  seed no longer strands reconnects. Hands-off FIX failover with every
+  cluster node listed as a seed.
+- **Runtime voter-set changes (task 2)** — `RAFT-ADD-VOTER` /
+  `RAFT-REMOVE-VOTER` grow, shrink, or re-identity the cluster live: joiner
+  boots `--raft-join` with an empty `ConfState`, is admitted once its
+  record and the `AddNode` commit, and catches up via log or a forced
+  snapshot. Safety rails refuse the live leader, the last voter, and
+  in-place re-key; an interrupted add is reclaimable via remove;
+  follower-targeted commands forward to the leader. Durable cluster-wide
+  before the command returns.
 
 Remaining, in recommended order (rationale at the end):
 
 | # | Task | Size |
 |---|------|------|
-| 1 | Gateway multi-seed upstream addresses | S |
-| 2 | Runtime voter-set changes (`ConfChange` add/remove) | M–L |
 | 3 | Serving-primary registry claim (leader ≠ serving-primary redirect gap) | S–M |
 | 4 | Deadline-IO unification into `melin-wire-protocol::blocking` | M (refactor) |
 | 5 | DPDK follow-the-leader (+ DPDK promotion) | L (parked) |
 
-Numbering below follows this order.
+Tasks 1 and 2 are shipped on this branch; their design records below are
+kept for context (tasks 3–4 reference the registry/version mechanics they
+introduced) and marked ✅.
 
 ---
 
-## Task 1 — Gateway multi-seed upstream addresses
+## Task 1 — Gateway multi-seed upstream addresses ✅ shipped
 
 ### Problem
 
@@ -110,7 +122,7 @@ Integration (existing `test_stub.rs` infra, `StubMode::{Serve, RedirectTo}`):
 
 ---
 
-## Task 2 — Runtime voter-set changes (`ConfChange` add/remove)
+## Task 2 — Runtime voter-set changes (`ConfChange` add/remove) ✅ shipped
 
 ### Problem
 
@@ -579,12 +591,12 @@ isn't lost.
 
 ## Recommended order and commit slicing
 
-**1 → 2 → 3 → 4 → 5** as numbered above: the gateway multi-seed is small and
-completes the FIX failover story shipped by the redirect slice; voter-set
-changes are the last functional gap in roadmap item 15 and the biggest lift;
-the serving claim is a correctness fix that builds on registry versioning
-mechanics fresh from task 2; the deadline refactor is hygiene that gets
-cheaper once tasks 1–3 stop touching the same files; DPDK stays parked.
+Tasks 1 and 2 shipped in that order — the gateway multi-seed completed the
+FIX failover story from the redirect slice, and voter-set changes closed the
+last functional gap in roadmap item 15. **3 → 4 → 5** remain: the serving
+claim is a correctness fix that builds on the registry versioning mechanics
+task 2 introduced; the deadline refactor is hygiene that got cheaper once
+tasks 1–2 stopped touching the same files; DPDK stays parked.
 
 Commit slicing (each verified — `cargo fmt`, clippy-clean, full nextest, the
 DPDK/skip-order-exec feature matrix, affected E2Es — before moving on):

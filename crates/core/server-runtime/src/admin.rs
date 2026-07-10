@@ -558,9 +558,19 @@ fn format_voter_reply(outcome: Result<Result<Vec<u64>, String>, RecvTimeoutError
             format!("OK voters={list}")
         }
         Ok(Err(reason)) => format!("ERR {reason}"),
-        // The channel was answered by neither a reply nor a driver
-        // shutdown within the timeout — the control plane is wedged.
-        Err(_) => "ERR voter change timed out waiting for the control plane".to_string(),
+        // No reply arrived before the deadline: the driver is alive (it
+        // still holds the sender) but too busy or wedged to answer. The
+        // change may yet apply — the operator should re-query, not assume
+        // failure.
+        Err(RecvTimeoutError::Timeout) => {
+            "ERR voter change timed out waiting for the control plane".to_string()
+        }
+        // The driver dropped the reply sender without answering: the
+        // control plane thread has exited (shutdown or crash). Distinct
+        // from a timeout — the change definitively did not apply here.
+        Err(RecvTimeoutError::Disconnected) => {
+            "ERR control plane exited before answering the voter change".to_string()
+        }
     }
 }
 
@@ -1109,7 +1119,16 @@ mod tests {
             format_voter_reply(Ok(Err("node 2 currently leads".into()))),
             "ERR node 2 currently leads"
         );
-        assert!(format_voter_reply(Err(RecvTimeoutError::Timeout)).starts_with("ERR"));
+        // Timeout and Disconnected are distinct operator-facing outcomes:
+        // "timed out" (driver alive but slow) vs "control plane exited"
+        // (driver gone). Both are ERR but must not read identically.
+        let timed_out = format_voter_reply(Err(RecvTimeoutError::Timeout));
+        let disconnected = format_voter_reply(Err(RecvTimeoutError::Disconnected));
+        assert!(timed_out.starts_with("ERR"));
+        assert!(disconnected.starts_with("ERR"));
+        assert!(timed_out.contains("timed out"));
+        assert!(disconnected.contains("exited"));
+        assert_ne!(timed_out, disconnected);
     }
 
     #[test]
