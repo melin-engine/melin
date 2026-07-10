@@ -4444,6 +4444,24 @@ fn raft_auto_promotes_surviving_replica_after_primary_kill() {
     ];
     wait_for_raft_leader(&all_health, Duration::from_secs(30));
 
+    // Pre-failover redirect: a client pointed at a replica must land on
+    // the genesis primary (node 1) and trade — deterministically, no
+    // matter which node holds raft leadership right now. Redirects
+    // resolve the *serving primary* from its announced claim, not the
+    // control-plane leader id, so even in the healthy topology where a
+    // replica leads the control plane while node 1 keeps serving, the
+    // client is sent to node 1 rather than bounced with ServerBusy.
+    let mut pre = connect_with_timeout(replicas[&2].client_addr, &trader_key);
+    let r = submit_order(&mut pre, 50, 1, 1, Side::Buy, 80, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "pre-failover client dialing a replica must be redirected to the serving primary: {r:?}"
+    );
+    drop(pre);
+
     // Kill the primary. Whichever replica ends up leading must promote
     // itself: if the primary led, the survivors elect; if a replica
     // already led (refused while its link was up), the link drop

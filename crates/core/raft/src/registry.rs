@@ -41,6 +41,13 @@ pub struct MemberRecord {
     /// redirected client reconnects when this node leads. `None` when
     /// the node has no routable client address to announce.
     pub order_entry_addr: Option<SocketAddr>,
+    /// The fencing epoch under which this node currently acts as the
+    /// serving primary; `None` while it is a replica. Self-reported,
+    /// leader-serialized. Resolution picks the live claim with the
+    /// highest epoch (fencing order, not announcement order), so a
+    /// superseded primary's stale claim is outranked the instant the new
+    /// primary announces — no tombstones, no revocation path.
+    pub serving_epoch: Option<u64>,
     /// The node's Ed25519 replication public key, pinning its identity
     /// on control-plane connections.
     pub public_key: [u8; 32],
@@ -54,7 +61,8 @@ pub struct MemberRecord {
 ///
 /// v1: node_id + raft_addr + replication_addr + public_key.
 /// v2: + order_entry_addr (before public_key).
-const RECORD_VERSION: u8 = 2;
+/// v3: + serving_epoch (after order_entry_addr, before public_key).
+const RECORD_VERSION: u8 = 3;
 
 impl MemberRecord {
     /// Serialize for a raft log entry. Little-endian, length-prefixed
@@ -68,6 +76,7 @@ impl MemberRecord {
         encode_addr(&mut buf, Some(self.raft_addr));
         encode_addr(&mut buf, self.replication_addr);
         encode_addr(&mut buf, self.order_entry_addr);
+        encode_epoch(&mut buf, self.serving_epoch);
         buf.extend_from_slice(&self.public_key);
         buf
     }
@@ -97,6 +106,16 @@ impl MemberRecord {
         } else {
             None
         };
+        // v1/v2 predate the serving claim; those nodes announce as
+        // replicas until their next current-version re-announce fills it
+        // in. Gated on the version byte (not remainder length) — v2's
+        // tail is already an unambiguous 32-byte key, so no v1-style
+        // length disambiguation is needed here.
+        let serving_epoch = if version >= 3 {
+            take_epoch(&mut r)?
+        } else {
+            None
+        };
         let public_key: [u8; 32] = take_bytes(&mut r, 32)?
             .try_into()
             .map_err(|_| io::Error::other("short public key"))?;
@@ -108,6 +127,7 @@ impl MemberRecord {
             raft_addr,
             replication_addr,
             order_entry_addr,
+            serving_epoch,
             public_key,
         }))
     }
@@ -228,6 +248,30 @@ fn encode_addr(buf: &mut Vec<u8>, addr: Option<SocketAddr>) {
     }
 }
 
+/// Length-prefixed optional epoch: a presence byte (0 = absent,
+/// 8 = present) followed by the 8 LE bytes when present. Mirrors
+/// [`encode_addr`]'s "length 0 = absent" convention so an absent claim
+/// costs one byte and the tail stays self-describing.
+fn encode_epoch(buf: &mut Vec<u8>, epoch: Option<u64>) {
+    match epoch {
+        Some(e) => {
+            buf.push(8);
+            buf.extend_from_slice(&e.to_le_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+fn take_epoch(r: &mut &[u8]) -> io::Result<Option<u64>> {
+    match take_u8(r)? {
+        0 => Ok(None),
+        8 => Ok(Some(take_u64(r)?)),
+        other => Err(io::Error::other(format!(
+            "invalid serving-epoch length {other} in member record"
+        ))),
+    }
+}
+
 fn take_u8(r: &mut &[u8]) -> io::Result<u8> {
     Ok(take_bytes(r, 1)?[0])
 }
@@ -276,6 +320,7 @@ mod tests {
             raft_addr: format!("127.0.0.1:{}", 7000 + id).parse().expect("addr"),
             replication_addr: Some(format!("10.0.0.{id}:9877").parse().expect("addr")),
             order_entry_addr: Some(format!("10.0.0.{id}:9876").parse().expect("addr")),
+            serving_epoch: None,
             public_key: [id as u8; 32],
         }
     }
@@ -290,6 +335,54 @@ mod tests {
             ..record(4)
         };
         assert_eq!(MemberRecord::decode(&r.encode()).expect("decode"), Some(r));
+    }
+
+    #[test]
+    fn v3_serving_claim_round_trips() {
+        // A serving primary announces its fencing epoch; a replica
+        // announces none. Both must survive the codec unchanged.
+        let claim = MemberRecord {
+            serving_epoch: Some(42),
+            ..record(3)
+        };
+        assert_eq!(
+            MemberRecord::decode(&claim.encode()).expect("decode"),
+            Some(claim)
+        );
+        let no_claim = record(4); // serving_epoch: None
+        assert_eq!(
+            MemberRecord::decode(&no_claim.encode()).expect("decode"),
+            Some(no_claim)
+        );
+    }
+
+    #[test]
+    fn v2_record_decodes_without_serving_claim() {
+        // A record persisted before the serving claim existed (v2: three
+        // addresses, no epoch tail) must keep decoding, with
+        // serving_epoch defaulting to None until the node re-announces.
+        let expected = record(5); // serving_epoch: None
+        let mut v2 = Vec::new();
+        v2.push(2u8);
+        v2.extend_from_slice(&expected.node_id.to_le_bytes());
+        encode_addr(&mut v2, Some(expected.raft_addr));
+        encode_addr(&mut v2, expected.replication_addr);
+        encode_addr(&mut v2, expected.order_entry_addr);
+        v2.extend_from_slice(&expected.public_key);
+
+        assert_eq!(MemberRecord::decode(&v2).expect("decode"), Some(expected));
+    }
+
+    #[test]
+    fn invalid_serving_epoch_length_is_an_error() {
+        // A v3 record whose epoch presence byte is neither 0 nor 8 is
+        // malformed — reject rather than silently mis-parse the tail.
+        let mut bytes = record(1).encode();
+        // The epoch presence byte sits just before the 32-byte key.
+        let epoch_pos = bytes.len() - 33;
+        assert_eq!(bytes[epoch_pos], 0, "helper record has no claim");
+        bytes[epoch_pos] = 4; // an impossible epoch length
+        assert!(MemberRecord::decode(&bytes).is_err());
     }
 
     #[test]

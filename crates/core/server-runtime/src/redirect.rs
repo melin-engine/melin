@@ -217,10 +217,21 @@ where
         &frame[..len],
         authorized_keys,
     ) {
-        Ok(_) => match follow.leader_order_entry_addr() {
+        // Prefer the serving primary's address over the raft leader's:
+        // the two can differ (a replica may hold raft leadership while
+        // the old primary keeps serving under the primary-link-up
+        // promotion veto), and the serving primary is who actually
+        // accepts orders. Fall back to the leader address when no serving
+        // claim is visible yet (a v2-only directory mid-upgrade, or the
+        // brief window before the genesis primary's first announce).
+        Ok(_) => match follow
+            .serving_primary_order_entry_addr()
+            .or_else(|| follow.leader_order_entry_addr())
+        {
             Some(addr) => TransportResponse::Redirect { addr },
-            // Leaderless (mid-election) or the leader announced no
-            // client address: tell the client to back off and retry.
+            // No serving primary and leaderless (mid-election), or neither
+            // announced a client address: tell the client to back off and
+            // retry.
             None => TransportResponse::ServerBusy,
         },
         Err(_) => TransportResponse::AuthFailed,
@@ -388,6 +399,7 @@ mod tests {
                 raft_addr: "127.0.0.1:1".parse().expect("addr"),
                 replication_addr: None,
                 order_entry_addr: Some(addr),
+                serving_epoch: None,
                 public_key: [0u8; 32],
             };
             assert!(registry.apply(&record.encode()), "record must apply");
@@ -475,6 +487,88 @@ mod tests {
 
     fn far_deadline() -> Instant {
         Instant::now() + Duration::from_secs(5)
+    }
+
+    /// A follow handle with `leader` as the raft leader and a directory
+    /// assembled from `records` — for the serving-claim cases where the
+    /// leader and the serving primary differ.
+    fn follow_with(leader: u64, records: &[MemberRecord]) -> LeaderFollow {
+        let status = Arc::new(RaftStatus::new(SELF_NODE));
+        status.leader_id.store(leader, Ordering::Relaxed);
+        let mut registry = Registry::default();
+        for r in records {
+            assert!(registry.apply(&r.encode()), "record must apply");
+        }
+        let directory = Arc::new(ClusterDirectory::default());
+        directory.update(&registry);
+        LeaderFollow {
+            self_node_id: SELF_NODE,
+            status,
+            directory,
+        }
+    }
+
+    fn rec(
+        node_id: u64,
+        serving_epoch: Option<u64>,
+        order_entry: Option<SocketAddr>,
+    ) -> MemberRecord {
+        MemberRecord {
+            node_id,
+            raft_addr: "127.0.0.1:1".parse().expect("addr"),
+            replication_addr: None,
+            order_entry_addr: order_entry,
+            serving_epoch,
+            public_key: [node_id as u8; 32],
+        }
+    }
+
+    #[test]
+    fn serving_claim_beats_leader_address() {
+        // Node LEADER_NODE holds raft leadership, but node 5 is the
+        // serving primary (higher-epoch claim). A redirected client must
+        // land on the serving primary, not the leader-replica that would
+        // only answer ServerBusy.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let leader_oe: SocketAddr = "10.9.9.9:1".parse().expect("addr");
+        let serving_oe: SocketAddr = "10.1.2.3:4567".parse().expect("addr");
+        let follow = follow_with(
+            LEADER_NODE,
+            &[
+                rec(LEADER_NODE, None, Some(leader_oe)),
+                rec(5, Some(3), Some(serving_oe)),
+            ],
+        );
+        let (mut client, server) = serve_one(authorized_for(&key), follow, far_deadline());
+
+        let response = client_handshake(&mut client, &key);
+        assert_eq!(response, ClientSeen::Redirect { addr: serving_oe });
+        server.join().expect("no panic").expect("handshake ok");
+    }
+
+    #[test]
+    fn serving_claim_by_self_falls_back_to_leader() {
+        // This replica somehow holds the highest serving claim (stale
+        // self-record mid-transition). It must never redirect a client to
+        // itself; with a leader address available it falls back to that.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let leader_oe: SocketAddr = "10.9.9.9:1".parse().expect("addr");
+        let follow = follow_with(
+            LEADER_NODE,
+            &[
+                rec(LEADER_NODE, None, Some(leader_oe)),
+                rec(
+                    SELF_NODE,
+                    Some(99),
+                    Some("10.0.0.3:80".parse().expect("addr")),
+                ),
+            ],
+        );
+        let (mut client, server) = serve_one(authorized_for(&key), follow, far_deadline());
+
+        let response = client_handshake(&mut client, &key);
+        assert_eq!(response, ClientSeen::Redirect { addr: leader_oe });
+        server.join().expect("no panic").expect("handshake ok");
     }
 
     #[test]

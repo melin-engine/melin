@@ -520,25 +520,35 @@ resumes at the full contract with **zero operator steps**. Give every
 replica a `--replication-bind` (and, if wildcard, an advertise
 address) so it can serve the other survivors after it promotes.
 
-**Clients follow the leader too.** A client that connects to a
+**Clients follow the serving primary too.** A client that connects to a
 replica (a stale DNS entry, an ops mistake, or a gateway that hasn't
 learned about a failover yet) is not silently ignored: the replica
 authenticates the client with the normal challenge handshake, then
-answers with a redirect carrying the current leader's order-entry
+answers with a redirect carrying the **serving primary's** order-entry
 address, and the native TCP client reconnects there transparently
 (bounded to a few hops, so a stale hint can never loop forever).
 Authentication comes first deliberately — cluster topology is never
-disclosed to an unauthenticated connection. While the cluster has no
-elected leader — mid-election, or before the new primary has
-announced itself — the replica answers "busy, retry shortly" instead,
-so the client knows to back off and try again rather than fail hard.
-The redirect target is the address each node announces in the
-membership registry; nodes binding a wildcard client address must say
-what to advertise via `--oe-advertise`. Combined with follow-the-leader
-above, this completes the hands-off story: kill the primary, the
-winner promotes, the survivor reattaches, and a client pointed at
-**any** surviving node lands on the new primary with zero
-reconfiguration.
+disclosed to an unauthenticated connection. While no node is serving —
+mid-election, or before the new primary has announced itself — the
+replica answers "busy, retry shortly" instead, so the client knows to
+back off and try again rather than fail hard. The redirect target is
+the address each node announces in the membership registry; nodes
+binding a wildcard client address must say what to advertise via
+`--oe-advertise`. Combined with follow-the-leader above, this completes
+the hands-off story: kill the primary, the winner promotes, the
+survivor reattaches, and a client pointed at **any** surviving node
+lands on the new primary with zero reconfiguration.
+
+The redirect names the serving primary specifically, not merely the
+control-plane leader — the two are usually the same node, but need not
+be. Control-plane leadership can land on a healthy replica while the
+original primary keeps serving (for example when a *different* node's
+raft process restarts, or by election timing at boot). Each node
+announces whether it is the one serving clients, tagged with its
+fencing epoch, so redirects always resolve the node that actually
+accepts orders and a superseded primary's stale announcement is
+outranked the instant the new primary takes over — no client is ever
+bounced to a node that would only answer "busy".
 
 DPDK-transport replicas do not re-target yet — they keep their static
 `--replica-of` across failovers (re-targeting a DPDK session needs

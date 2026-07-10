@@ -197,6 +197,9 @@ impl VoterChange {
                 raft_addr: *raft_addr,
                 replication_addr: None,
                 order_entry_addr: None,
+                // A joiner is never serving at admission; its own
+                // announce loop claims an epoch only if it later promotes.
+                serving_epoch: None,
                 public_key: *public_key,
             }),
             VoterChange::Remove { .. } => None,
@@ -282,6 +285,30 @@ impl ClusterDirectory {
     pub fn order_entry_addr(&self, node_id: u64) -> Option<SocketAddr> {
         self.member_field(node_id, |r| r.order_entry_addr)
     }
+
+    /// The cluster's current serving primary — the live record with the
+    /// highest `serving_epoch` that also announced an order-entry address
+    /// clients can reach, returned as `(node_id, order_entry_addr)`.
+    /// Fencing order (highest epoch), not announcement order, decides: a
+    /// deposed primary that never learned of its supersession keeps its
+    /// stale claim in the directory, but the promoted node announces a
+    /// strictly higher epoch and outranks it — self-healing with no
+    /// tombstones. Ties (two *manual* promotions colliding on one epoch,
+    /// a pre-existing documented hazard) break deterministically to the
+    /// lower node id so every node resolves identically. `None` when no
+    /// node claims to serve or the sole claimant announced no client
+    /// address, or the directory lock is poisoned (treated as unknown,
+    /// matching `member_field`).
+    pub fn serving_primary(&self) -> Option<(u64, SocketAddr)> {
+        let guard = self.inner.read().ok()?;
+        guard
+            .iter()
+            .filter_map(|r| Some((r.node_id, r.serving_epoch?, r.order_entry_addr?)))
+            // Highest epoch wins; on a tie the lower node id wins, so the
+            // reversed id comparison makes the lower id compare "greater".
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+            .map(|(id, _epoch, addr)| (id, addr))
+    }
 }
 
 /// A replica's handle for following the control-plane leader on the
@@ -330,6 +357,22 @@ impl LeaderFollow {
     /// then sees "busy" — bounded on the client side.
     pub fn leader_order_entry_addr(&self) -> Option<SocketAddr> {
         self.leader_field(|d, id| d.order_entry_addr(id))
+    }
+
+    /// The serving primary's order-entry address — what a replica's
+    /// redirect acceptor should prefer over the raft leader's, since the
+    /// leader and the serving primary can differ (a replica may hold raft
+    /// leadership while the old primary keeps serving under the
+    /// primary-link-up promotion veto). `None` while no node claims to
+    /// serve, or when the claimant is *this* node — a redirecting replica
+    /// must never point a client at itself (same self-exclusion as
+    /// [`Self::leader_field`]).
+    pub fn serving_primary_order_entry_addr(&self) -> Option<SocketAddr> {
+        match self.directory.serving_primary() {
+            Some((id, _)) if id == self.self_node_id => None,
+            Some((_, addr)) => Some(addr),
+            None => None,
+        }
     }
 }
 
@@ -497,6 +540,25 @@ pub fn spawn_with_listener(
         .map_err(io::Error::other)
 }
 
+/// The serving claim this node should announce right now: `Some(epoch)`
+/// while it acts as the serving primary, `None` while it is a plain
+/// replica. "Acts as primary" mirrors the supersession-fence predicate
+/// in [`read_inbound`]: a genesis primary (no replica signals) always
+/// serves; a replica serves once its promotion is requested (auto or
+/// manual). Unlike that predicate this carries no `auto_promote` gate —
+/// a serving node's claim is true regardless of how it was promoted.
+///
+/// The epoch is the current fence epoch. For a freshly promoted replica
+/// the `EpochBump` can land a tick after `promote` flips, so the claim
+/// may announce at the pre-bump epoch for one iteration and upgrade on
+/// the next; the driver re-evaluates every tick and re-announces on any
+/// change, so this converges without special-casing the race.
+fn serving_claim(replica: Option<&ReplicaSignals>, fence_epoch: u64) -> Option<u64> {
+    replica
+        .is_none_or(|r| r.promote.is_requested())
+        .then_some(fence_epoch)
+}
+
 fn run(
     listener: TcpListener,
     mut node: ControlNode,
@@ -544,11 +606,15 @@ fn run(
     // until the applied registry reflects it (proposals can be lost to
     // leader churn), and again whenever a stale record for this id
     // shows up (e.g. this node restarted at a new address).
-    let self_record = MemberRecord {
+    // The static identity fields never change; only `serving_epoch` moves
+    // at runtime (on promotion), recomputed each iteration before the
+    // announce comparison below.
+    let mut self_record = MemberRecord {
         node_id: config.node_id,
         raft_addr: config.advertise_raft_addr,
         replication_addr: config.advertise_replication_addr,
         order_entry_addr: config.advertise_order_entry_addr,
+        serving_epoch: serving_claim(context.replica.as_ref(), context.fence_state.epoch()),
         public_key: context.signing_key.verifying_key().to_bytes(),
     };
     let mut next_announce = Instant::now();
@@ -642,8 +708,12 @@ fn run(
         }
 
         // 7. Announce this node's record until the registry reflects
-        // it. The comparison is a tiny map lookup; the timer only
+        // it. Refresh the serving claim first (cheap; the only field
+        // that moves at runtime) so a promotion re-announces within one
+        // interval. The comparison is a tiny map lookup; the timer only
         // paces the re-proposals.
+        self_record.serving_epoch =
+            serving_claim(context.replica.as_ref(), context.fence_state.epoch());
         if now >= next_announce && node.registry().get(config.node_id) != Some(&self_record) {
             // Dropped proposals (no leader yet) debug-log inside and
             // are retried on the next interval either way.
@@ -1736,6 +1806,7 @@ mod voter_change_tests {
             raft_addr: "127.0.0.1:9000".parse().unwrap(),
             replication_addr: None,
             order_entry_addr: None,
+            serving_epoch: None,
             public_key: key,
         }
     }
@@ -2050,6 +2121,128 @@ mod tests {
         // Scales past the floor for larger ones.
         assert_eq!(inbound_cap(5), 5 * INBOUND_SLACK);
         assert!(inbound_cap(100) >= 100);
+    }
+
+    fn oe(s: &str) -> SocketAddr {
+        s.parse().expect("addr")
+    }
+
+    fn claim_record(
+        node_id: u64,
+        serving_epoch: Option<u64>,
+        order_entry: Option<&str>,
+    ) -> MemberRecord {
+        MemberRecord {
+            node_id,
+            raft_addr: format!("127.0.0.1:{}", 7000 + node_id)
+                .parse()
+                .expect("addr"),
+            replication_addr: None,
+            order_entry_addr: order_entry.map(oe),
+            serving_epoch,
+            public_key: [node_id as u8; 32],
+        }
+    }
+
+    fn directory_of(records: &[MemberRecord]) -> Arc<ClusterDirectory> {
+        let mut registry = Registry::default();
+        for r in records {
+            assert!(registry.apply(&r.encode()), "record must apply");
+        }
+        let dir = Arc::new(ClusterDirectory::default());
+        dir.update(&registry);
+        dir
+    }
+
+    fn replica_signals(promote_requested: bool) -> ReplicaSignals {
+        let promote = PromotionRequest::new();
+        if promote_requested {
+            assert!(promote.request(PromotionRequest::MANUAL));
+        }
+        ReplicaSignals {
+            promote,
+            primary_link_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            primary_acking_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        }
+    }
+
+    #[test]
+    fn serving_primary_resolves_highest_epoch_then_lowest_id() {
+        // Empty directory: no serving primary.
+        assert_eq!(directory_of(&[]).serving_primary(), None);
+
+        // A single claim resolves to itself.
+        let dir = directory_of(&[claim_record(2, Some(5), Some("10.0.0.2:80"))]);
+        assert_eq!(dir.serving_primary(), Some((2, oe("10.0.0.2:80"))));
+
+        // Competing claims: the highest epoch wins regardless of node-id
+        // order — here the lower id holds the older epoch and must lose,
+        // so announcement/id order cannot override fencing order.
+        let dir = directory_of(&[
+            claim_record(1, Some(4), Some("10.0.0.1:80")),
+            claim_record(3, Some(9), Some("10.0.0.3:80")),
+        ]);
+        assert_eq!(dir.serving_primary(), Some((3, oe("10.0.0.3:80"))));
+
+        // Tie on epoch (two manual promotions colliding): the lower id
+        // wins so every node resolves the same primary.
+        let dir = directory_of(&[
+            claim_record(5, Some(7), Some("10.0.0.5:80")),
+            claim_record(2, Some(7), Some("10.0.0.2:80")),
+        ]);
+        assert_eq!(dir.serving_primary(), Some((2, oe("10.0.0.2:80"))));
+
+        // The highest-epoch claimant announced no client address — it is
+        // skipped in favour of a lower claimant that did.
+        let dir = directory_of(&[
+            claim_record(4, Some(99), None),
+            claim_record(1, Some(3), Some("10.0.0.1:80")),
+        ]);
+        assert_eq!(dir.serving_primary(), Some((1, oe("10.0.0.1:80"))));
+
+        // No claim anywhere: nobody serves.
+        let dir = directory_of(&[claim_record(1, None, Some("10.0.0.1:80"))]);
+        assert_eq!(dir.serving_primary(), None);
+    }
+
+    #[test]
+    fn serving_primary_accessor_excludes_self() {
+        let records = [
+            claim_record(2, Some(8), Some("10.0.0.2:80")),
+            claim_record(3, Some(4), Some("10.0.0.3:80")),
+        ];
+        let dir = directory_of(&records);
+
+        // Node 3 resolves the winner (node 2) — not itself.
+        let follow = LeaderFollow {
+            self_node_id: 3,
+            status: Arc::new(RaftStatus::new(3)),
+            directory: Arc::clone(&dir),
+        };
+        assert_eq!(
+            follow.serving_primary_order_entry_addr(),
+            Some(oe("10.0.0.2:80"))
+        );
+
+        // Node 2 IS the winner — a redirecting replica must never point a
+        // client at itself, so the accessor returns None.
+        let follow_self = LeaderFollow {
+            self_node_id: 2,
+            status: Arc::new(RaftStatus::new(2)),
+            directory: dir,
+        };
+        assert_eq!(follow_self.serving_primary_order_entry_addr(), None);
+    }
+
+    #[test]
+    fn serving_claim_tracks_role_and_epoch() {
+        // Genesis primary (no replica signals) always claims, at the
+        // current fence epoch.
+        assert_eq!(serving_claim(None, 12), Some(12));
+        // A plain replica claims nothing.
+        assert_eq!(serving_claim(Some(&replica_signals(false)), 12), None);
+        // Once promotion is requested it claims at the fence epoch.
+        assert_eq!(serving_claim(Some(&replica_signals(true)), 12), Some(12));
     }
 
     #[test]
