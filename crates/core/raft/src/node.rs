@@ -45,15 +45,6 @@ pub struct ControlNode {
     /// persisted state at open, kept current by `drain_ready`'s apply
     /// path. The storage owns its serialized durability.
     registry: Registry,
-    /// Set when an applied conf change *added* a voter, cleared by the
-    /// next compaction. It forces that compaction to trim the log to the
-    /// applied index (dropping the usual retention buffer) so the fresh
-    /// voter — whose match index is 0 and whose empty bootstrap `ConfState`
-    /// carries none of the genesis membership — catches up via a snapshot
-    /// (which conveys the full `ConfState` + registry) rather than a log
-    /// replay that would only deliver the incremental `AddNode` and leave
-    /// it believing it is a lone voter. See [`Self::maybe_compact`].
-    force_snapshot_compact: bool,
 }
 
 /// What a drained ready handed to the caller: messages to put on the
@@ -125,11 +116,7 @@ impl ControlNode {
 
         let raw = RawNode::new(&config, storage, &crate::tracing_logger())
             .map_err(|e| io::Error::other(format!("raft node init failed: {e}")))?;
-        Ok(Self {
-            raw,
-            registry,
-            force_snapshot_compact: false,
-        })
+        Ok(Self { raw, registry })
     }
 
     /// Propose `record` into the raft log. Works from any node that
@@ -311,19 +298,8 @@ impl ControlNode {
     /// common path.
     fn maybe_compact(&mut self) -> io::Result<()> {
         let applied = self.raw.raft.raft_log.applied();
-        // A just-added voter must catch up via snapshot, not log replay,
-        // to receive the full `ConfState` (see the field docs). Trim to
-        // the applied index so its match position (0) falls below the log
-        // start and the leader ships it a snapshot. Rare (only on
-        // `AddNode`); a briefly-lagging existing follower just gets a
-        // snapshot too, which is correct if slightly less efficient.
-        let target = if std::mem::take(&mut self.force_snapshot_compact) {
-            applied
-        } else {
-            match applied.checked_sub(LOG_RETENTION) {
-                Some(t) => t,
-                None => return Ok(()), // fewer than a window's worth applied yet
-            }
+        let Some(target) = applied.checked_sub(LOG_RETENTION) else {
+            return Ok(()); // fewer than a window's worth applied yet
         };
         self.raw.mut_store().compact(target)
     }
@@ -388,15 +364,20 @@ impl ControlNode {
     ) -> io::Result<()> {
         match applied {
             Ok(cs) => {
-                // A grown voter set means a fresh voter that needs the
-                // full membership via snapshot — force the next compaction
-                // to trim to applied so it takes the snapshot path (see
-                // the field docs on `force_snapshot_compact`).
-                if cs.voters.len() > voters_before {
-                    self.force_snapshot_compact = true;
-                }
                 self.raw.mut_store().stage_applied(index, None);
-                self.raw.mut_store().set_conf_state(cs)?;
+                if cs.voters.len() > voters_before {
+                    // A grown voter set means a fresh voter whose empty
+                    // bootstrap `ConfState` carries no genesis membership;
+                    // compact to this entry's index — atomically with the
+                    // `ConfState` persist — so its match position (0)
+                    // falls below the log start and the leader ships it a
+                    // snapshot instead of a log replay that would leave it
+                    // a lone voter. Tying the trim to this persist keeps
+                    // the guarantee crash-safe (see the storage method).
+                    self.raw.mut_store().set_conf_state_compacting(cs, index)?;
+                } else {
+                    self.raw.mut_store().set_conf_state(cs)?;
+                }
             }
             Err(e) => {
                 error!(index, error = %e, "committed conf change rejected on apply — skipping to keep the control plane live");

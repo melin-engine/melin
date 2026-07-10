@@ -211,6 +211,30 @@ impl FileStorage {
         self.persist()
     }
 
+    /// Record a new `ConfState` **and** compact the log to
+    /// `compact_index` in a single atomic rewrite. Used when an `AddNode`
+    /// grows the voter set: the fresh voter bootstrapped an empty
+    /// `ConfState` that carries none of the genesis membership, so it
+    /// must catch up via snapshot (which conveys the full `ConfState` +
+    /// registry) rather than log replay (which would deliver only the
+    /// incremental `AddNode` and leave it a lone voter). Trimming here —
+    /// in the same persist as the `ConfState` — makes that guarantee
+    /// crash-safe: if the process dies before the rewrite lands, nothing
+    /// is durable, the committed `AddNode` re-delivers on restart, and
+    /// the re-apply re-compacts. A separate deferred compaction could be
+    /// lost to a crash after the `ConfState` persisted, reopening the
+    /// split-brain window.
+    pub fn set_conf_state_compacting(
+        &mut self,
+        cs: ConfState,
+        compact_index: u64,
+    ) -> io::Result<()> {
+        self.raft_state.conf_state = cs;
+        // In-memory trim only; the persist below carries both changes.
+        self.trim_log(compact_index)?;
+        self.persist()
+    }
+
     /// Log index the persisted application state reflects. Seeds
     /// raft's `applied` on boot.
     pub fn applied_index(&self) -> u64 {
@@ -279,8 +303,20 @@ impl FileStorage {
     /// compacting past the applied point would lose entries that were
     /// never applied.
     pub fn compact(&mut self, compact_index: u64) -> io::Result<()> {
+        if self.trim_log(compact_index)? {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// In-memory half of [`Self::compact`]: validate and drop the
+    /// entry prefix, returning whether anything changed (so the caller
+    /// can skip a no-op persist). Split out so a compaction can be
+    /// batched into another mutation's single atomic rewrite — see
+    /// [`Self::set_conf_state_compacting`].
+    fn trim_log(&mut self, compact_index: u64) -> io::Result<bool> {
         if compact_index <= self.first_index_inner() {
-            return Ok(()); // nothing to discard — not an error
+            return Ok(false); // nothing to discard — not an error
         }
         if compact_index > self.last_index_inner() + 1 {
             return Err(io::Error::other(format!(
@@ -301,7 +337,7 @@ impl FileStorage {
         self.truncated_term = self.entries[drop - 1].term;
         self.truncated_index = new_truncated;
         self.entries.drain(..drop);
-        self.persist()
+        Ok(true)
     }
 
     /// Replace the log — and the application state — with `snapshot`
@@ -893,6 +929,46 @@ mod tests {
         let mut s = FileStorage::open(dir.path()).unwrap();
         s.append(&[entry(1, 1)]).unwrap();
         assert!(s.compact(3).is_err());
+    }
+
+    /// `set_conf_state_compacting` must land the new membership AND the
+    /// log truncation in one atomic rewrite — the crash-safety property
+    /// the added-voter snapshot path depends on. After a reopen (which
+    /// simulates a crash-restart reading only what was persisted) both
+    /// the ConfState and the compaction must be present together.
+    #[test]
+    fn conf_state_and_compaction_persist_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = FileStorage::open(dir.path()).unwrap();
+        s.initialize_with_conf_state(vec![1, 2, 3]).unwrap();
+        s.append(&[entry(1, 1), entry(2, 1), entry(3, 2)]).unwrap();
+        s.set_commit(3).unwrap();
+        s.stage_applied(3, None);
+
+        let grown = ConfState {
+            voters: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        s.set_conf_state_compacting(grown.clone(), 3).unwrap();
+        // In memory: both applied.
+        assert_eq!(
+            s.initial_state().unwrap().conf_state.voters,
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(s.first_index().unwrap(), 3);
+
+        // After reopen (what a crash-restart would see): both survive.
+        let r = FileStorage::open(dir.path()).unwrap();
+        assert_eq!(
+            r.initial_state().unwrap().conf_state.voters,
+            vec![1, 2, 3, 4],
+            "grown ConfState must survive the reopen"
+        );
+        assert_eq!(
+            r.first_index().unwrap(),
+            3,
+            "the compaction must survive the reopen together with the ConfState"
+        );
     }
 
     #[test]
