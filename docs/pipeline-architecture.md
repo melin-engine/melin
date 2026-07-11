@@ -270,7 +270,7 @@ Same adaptive spinning as the journal stage: 1,000 spin loops, then `yield_now()
 
 ## Response Stage
 
-Defined in `crates/exchange/server/src/response.rs` (io_uring-based SEND).
+Defined in `crates/core/server-runtime/src/response.rs` (io_uring-based SEND).
 
 The response stage runs on a dedicated OS thread and is the final stage in the pipeline. It consumes from the output SPSC and writes encoded responses to client sockets.
 
@@ -408,6 +408,6 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
 | `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_JOURNAL_BATCH` | `1024` | `crates/core/transport-core/src/pipeline.rs` |
-| `MAX_BATCH` (response) | `1024` | `crates/exchange/server/src/response.rs` |
-| `MAX_RESPONSE_BUF` | `128` bytes | `crates/exchange/server/src/response.rs` |
-| `NUM_BUFFERS` | `2048` | `crates/exchange/server/src/reader.rs` (io_uring provided buffer pool) |
+| `MAX_BATCH` (response) | `1024` | `crates/core/server-runtime/src/response.rs` |
+| `MAX_RESPONSE_BUF` | `512` bytes | `crates/core/server-runtime/src/response.rs` |
+| `NUM_BUFFERS` | `2048` | `crates/core/server-runtime/src/reader.rs` (io_uring provided buffer pool) |

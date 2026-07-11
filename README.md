@@ -55,7 +55,7 @@ See [`crates/examples/counter`](crates/examples/counter) for a complete working 
 
 ## Benchmarks
 
-All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](crates/exchange/README.md). Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas).
+All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://crates.io/crates/melin-exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas).
 
 ### Latency under load (1M/s)
 
@@ -69,13 +69,13 @@ All numbers are **full round-trip** (client sends → server persists + replicat
 |-----------|-----------|-----|-----|-------|--------|
 | Hybrid (1 persisted + 2 in-memory) | 45K/s | 22 µs | 27 µs | 30 µs | 36 µs |
 
-See [replication](docs/replication.md) for the full durability-mode menu, [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md) for tuning guidance.
+See [replication](docs/replication.md) for the full durability-mode menu. The benchmark harness and tuning guidance ship with the Melin Exchange Core.
 
 DPDK integration is well under way and should bring these figures noticeably lower, especially for the tail under load.
 
 ## Melin Exchange Core
 
-Melin ships with an exchange core built on the sequencer: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [the exchange core README](crates/exchange/README.md).
+A production exchange core is built on this sequencer and distributed separately: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [melin-exchange-core](https://crates.io/crates/melin-exchange-core).
 
 ## Contributing
 

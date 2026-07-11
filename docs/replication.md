@@ -434,6 +434,6 @@ replication path and keeps the durability modes unchanged.
 Determining a node's journal end sequence without starting the server
 process is not yet supported — recovery playbooks have to spin each
 node up in `--standalone` mode briefly to read `/healthz`. A
-read-only `melin-admin journal-info` subcommand that inspects the
-journal files directly is on the wishlist for the failover
-ergonomics workstream.
+read-only journal-inspection tool that reads the journal files
+directly is on the wishlist for the failover ergonomics
+workstream.
