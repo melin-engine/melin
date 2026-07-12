@@ -87,6 +87,16 @@ impl FileStorage {
     /// error — see the module docs on vote durability.
     pub fn open(dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
+        // Make the directory itself durable before any vote can be
+        // recorded inside it: fsyncing a file (or `dir` itself) does
+        // not, by POSIX, persist `dir`'s own entry in *its* parent.
+        // ext4/xfs journaling makes that incidental, but on other
+        // filesystems a post-crash reboot could find the directory
+        // gone — and a vanished directory reads as a fresh node,
+        // forgetting the vote (the double-vote hazard the module docs
+        // describe). Same discipline as `replication::archive` and
+        // etcd's WAL init.
+        fsync_dir(dir.parent().unwrap_or_else(|| Path::new("")))?;
         let path = dir.join(STATE_FILE);
         match std::fs::metadata(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
@@ -430,14 +440,21 @@ impl FileStorage {
             file.sync_all()?;
         }
         std::fs::rename(&tmp_path, &self.path)?;
-        // Empty parent means CWD — open "." so the fsync lands somewhere.
-        let parent = match self.path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        File::open(parent)?.sync_all()?;
+        fsync_dir(self.path.parent().unwrap_or_else(|| Path::new("")))?;
         Ok(())
     }
+}
+
+/// Fsync a directory so the dirents inside it (creates, renames) are
+/// durable. An empty path means CWD — open "." so the fsync lands
+/// somewhere.
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    File::open(dir)?.sync_all()
 }
 
 fn encode_id_list(buf: &mut Vec<u8>, ids: &[u64]) {
