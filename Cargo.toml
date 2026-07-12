@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/*/*"]
+# Explicit subtrees rather than `crates/*/*`: leftover ignored files from
+# other branches (e.g. the exchange branch's proptest-regressions cache)
+# can leave stray directories under crates/ that a bare glob would pick up.
+members = ["crates/core/*", "crates/examples/*"]
 resolver = "3"
 
 [workspace.package]
