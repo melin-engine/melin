@@ -43,6 +43,6 @@ pub use slog_bridge::tracing_logger;
 // crates depend on `melin-raft` alone and cannot drift onto a different
 // raft-rs rev.
 pub use raft::{
-    Config, RawNode, StateRole,
+    Config, RawNode, SnapshotStatus, StateRole,
     eraftpb::{ConfState, Entry, HardState, Message, MessageType, Snapshot},
 };

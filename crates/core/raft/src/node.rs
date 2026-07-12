@@ -38,6 +38,11 @@ const LOG_RETENTION: u64 = 512;
 /// One control-plane Raft peer.
 pub struct ControlNode {
     raw: RawNode<FileStorage>,
+    /// Compaction retention window, [`LOG_RETENTION`] in production;
+    /// `u64` to match raft's index arithmetic. A field (not the const
+    /// directly) so tests can shrink it to reach the snapshot path
+    /// without generating hundreds of entries.
+    log_retention: u64,
 }
 
 /// What a drained ready handed to the caller: messages to put on the
@@ -48,6 +53,16 @@ pub struct Drained {
     /// Peer messages, in send order. Every message in here is already
     /// safe to send: `drain_ready` only surfaces them after the state
     /// they depend on has been fsynced.
+    ///
+    /// **Delivery-report contract**: a `MsgSnapshot` in here puts the
+    /// recipient's leader-side progress into a paused snapshot state
+    /// that raft never times out on its own. If the transport fails to
+    /// deliver one, the caller **must** call
+    /// [`ControlNode::report_snapshot`] with
+    /// [`SnapshotStatus::Failure`](raft::SnapshotStatus::Failure) —
+    /// otherwise the leader stops replicating to that peer until the
+    /// next leadership change. (A *delivered* snapshot needs no report:
+    /// the follower's ack un-pauses the progress by itself.)
     pub messages: Vec<Message>,
     /// Committed `EntryNormal` payloads (non-empty data only), in
     /// apply order.
@@ -105,7 +120,24 @@ impl ControlNode {
 
         let raw = RawNode::new(&config, storage, &crate::tracing_logger())
             .map_err(|e| io::Error::other(format!("raft node init failed: {e}")))?;
-        Ok(Self { raw })
+        Ok(Self {
+            raw,
+            log_retention: LOG_RETENTION,
+        })
+    }
+
+    /// Shrink the compaction retention window so tests can reach the
+    /// snapshot catch-up path with a handful of entries.
+    #[cfg(test)]
+    fn set_log_retention(&mut self, retention: u64) {
+        self.log_retention = retention;
+    }
+
+    /// Report the delivery outcome of a `MsgSnapshot` previously handed
+    /// out via [`Drained::messages`] — see the contract there. Safe to
+    /// call with a stale peer id (raft ignores unknown ids).
+    pub fn report_snapshot(&mut self, id: u64, status: raft::SnapshotStatus) {
+        self.raw.report_snapshot(id, status);
     }
 
     /// Advance the logical clock by one tick (the driver calls this at
@@ -204,7 +236,7 @@ impl ControlNode {
     /// common path.
     fn maybe_compact(&mut self) -> io::Result<()> {
         let applied = self.raw.raft.raft_log.applied();
-        let Some(target) = applied.checked_sub(LOG_RETENTION) else {
+        let Some(target) = applied.checked_sub(self.log_retention) else {
             return Ok(()); // fewer than a window's worth applied yet
         };
         self.raw.mut_store().compact(target)
@@ -248,6 +280,12 @@ impl ControlNode {
         self.raw.raft.id
     }
 
+    /// Last raft log index this node holds (test observability).
+    #[cfg(test)]
+    fn last_log_index(&self) -> u64 {
+        self.raw.raft.raft_log.last_index()
+    }
+
     /// Current raft term. Terms are unique per leader tenure, so a
     /// later step will use the term to allocate the replication fencing
     /// epoch a promotion journals (`EpochBump { epoch: term }`) —
@@ -288,6 +326,7 @@ mod sim {
 
     use super::*;
     use crate::recency::{JournalTip, VoteFilter, is_vote_request};
+    use raft::eraftpb::MessageType;
     use std::collections::HashMap;
 
     struct Cluster {
@@ -302,6 +341,11 @@ mod sim {
         /// Per-voter stateful recency gate (one per local node, like
         /// the driver holds), lazily created while `tips` is active.
         filters: HashMap<u64, VoteFilter>,
+        /// While `true`, `MsgSnapshot` frames are silently dropped in
+        /// delivery (simulating a transport that loses them without
+        /// reporting) and counted in `snapshots_dropped`.
+        drop_snapshots: bool,
+        snapshots_dropped: u32,
         /// In-flight messages.
         inbox: Vec<Message>,
     }
@@ -321,6 +365,8 @@ mod sim {
                 down: Vec::new(),
                 tips: None,
                 filters: HashMap::new(),
+                drop_snapshots: false,
+                snapshots_dropped: 0,
                 inbox: Vec::new(),
             }
         }
@@ -346,6 +392,10 @@ mod sim {
             for msg in inbox {
                 if self.down.contains(&msg.to) || self.down.contains(&msg.from) {
                     continue;
+                }
+                if self.drop_snapshots && msg.msg_type() == MessageType::MsgSnapshot {
+                    self.snapshots_dropped += 1;
+                    continue; // lost in transit, nobody reports it
                 }
                 if let Some(tips) = &self.tips
                     && is_vote_request(msg.msg_type())
@@ -545,6 +595,64 @@ mod sim {
 
         let leader = c.settle(600);
         assert_eq!(leader, t, "log-ahead survivor must win via the escape");
+    }
+
+    #[test]
+    fn lost_snapshot_wedges_until_report_failure() {
+        let mut c = Cluster::new(&[1, 2, 3]);
+        for node in c.nodes.values_mut() {
+            node.set_log_retention(0);
+        }
+        let first = c.settle(200);
+
+        // Depose the first leader so a second no-op raises the applied
+        // index past the (shrunk) retention window and the survivors
+        // compact their logs.
+        c.down.push(first);
+        let leader = c.settle(400);
+
+        // Wipe the deposed node's state: it can now only catch up via
+        // a leader snapshot (the log entries it needs are compacted).
+        let victim = first;
+        c.nodes.remove(&victim);
+        let dir = tempfile::tempdir().unwrap();
+        c.nodes
+            .insert(victim, ControlNode::open(victim, dir.path(), &[]).unwrap());
+        c.dirs.insert(victim, dir);
+        c.down.retain(|id| *id != victim);
+
+        // Lose the MsgSnapshot in transit: the leader sends exactly one
+        // and then wedges — raft never retries a pending snapshot on
+        // its own, even after the transport heals.
+        c.drop_snapshots = true;
+        for _ in 0..80 {
+            c.step_all();
+        }
+        assert_eq!(c.snapshots_dropped, 1, "no self-retry of a lost snapshot");
+        c.drop_snapshots = false;
+        for _ in 0..80 {
+            c.step_all();
+        }
+        assert_eq!(
+            c.nodes[&victim].last_log_index(),
+            0,
+            "victim must still be empty: this is the wedge"
+        );
+
+        // The transport reports the loss — the leader re-probes, sends
+        // a fresh snapshot, and the victim finally catches up.
+        c.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .report_snapshot(victim, raft::SnapshotStatus::Failure);
+        for _ in 0..80 {
+            c.step_all();
+        }
+        assert!(
+            c.nodes[&victim].last_log_index() > 0,
+            "victim must catch up once the failure is reported"
+        );
+        assert_eq!(c.nodes[&victim].leader_id(), Some(leader));
     }
 
     #[test]
