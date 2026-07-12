@@ -287,7 +287,7 @@ mod sim {
     //! small).
 
     use super::*;
-    use crate::recency::{JournalTip, candidate_is_current, is_vote_request};
+    use crate::recency::{JournalTip, VoteFilter, is_vote_request};
     use std::collections::HashMap;
 
     struct Cluster {
@@ -299,6 +299,9 @@ mod sim {
         /// Journal tips per node for the recency filter; `None`
         /// disables filtering (default).
         tips: Option<HashMap<u64, JournalTip>>,
+        /// Per-voter stateful recency gate (one per local node, like
+        /// the driver holds), lazily created while `tips` is active.
+        filters: HashMap<u64, VoteFilter>,
         /// In-flight messages.
         inbox: Vec<Message>,
     }
@@ -317,6 +320,7 @@ mod sim {
                 dirs,
                 down: Vec::new(),
                 tips: None,
+                filters: HashMap::new(),
                 inbox: Vec::new(),
             }
         }
@@ -345,12 +349,23 @@ mod sim {
                 }
                 if let Some(tips) = &self.tips
                     && is_vote_request(msg.msg_type())
-                    && !candidate_is_current(tips[&msg.from], tips[&msg.to])
+                    && !self
+                        .filters
+                        .entry(msg.to)
+                        .or_default()
+                        .should_deliver(tips[&msg.from], tips[&msg.to])
                 {
                     continue; // voter drops the stale candidate's request
                 }
                 if let Some(node) = self.nodes.get_mut(&msg.to) {
                     node.step(msg);
+                }
+            }
+            // Mirror the driver: a node that currently sees a leader
+            // re-arms its vote filter.
+            for (id, node) in &self.nodes {
+                if !self.down.contains(id) && node.leader_id().is_some() {
+                    self.filters.entry(*id).or_default().leader_observed();
                 }
             }
         }
@@ -473,6 +488,63 @@ mod sim {
             let leader = c.settle(400);
             assert_ne!(leader, 3, "stale node must not win the election");
         }
+    }
+
+    #[test]
+    fn tip_log_conflict_escapes_deadlock_and_elects_the_log_ahead_node() {
+        // The verified liveness hazard: a control-plane-only partition
+        // deposes primary A; the pair elects a new leader whose no-op A
+        // never sees. That leader dies and A heals — the live pair is a
+        // quorum, but A holds the highest journal tip with the OLDER
+        // raft log, and survivor T the newer log with a frozen lower
+        // tip. A's filter drops T's requests; raft's log check rejects
+        // A's. Without the VoteFilter escape this sits leaderless
+        // forever (settle panics); with it, T must win.
+        let mut c = Cluster::new(&[1, 2, 3]);
+        let a = c.settle(200);
+
+        // Control-plane-only partition of A: the others elect and
+        // commit a term the deposed primary never observes.
+        c.down.push(a);
+        let l2 = c.settle(400);
+
+        // The new leader dies; A heals. Live set {A, T} is a quorum.
+        let t = *c.nodes.keys().find(|id| **id != a && **id != l2).unwrap();
+        c.down.push(l2);
+        c.down.retain(|id| *id != a);
+
+        // Journal tips frozen with the deposed primary ahead (the data
+        // plane stalled when it halted).
+        let tips = c
+            .nodes
+            .keys()
+            .map(|id| {
+                let seq = if *id == a { 1_000 } else { 900 };
+                (
+                    *id,
+                    JournalTip {
+                        epoch: 5,
+                        last_sequence: seq,
+                    },
+                )
+            })
+            .collect();
+        c.tips = Some(tips);
+
+        // A froze mid-tenure while partitioned, so it resumes as a
+        // stale term-1 leader; let it hear T's newer term and step
+        // down so the deadlock actually forms before settling.
+        for _ in 0..25 {
+            c.step_all();
+        }
+        assert_ne!(
+            c.nodes[&a].role(),
+            StateRole::Leader,
+            "deposed primary must step down on contact"
+        );
+
+        let leader = c.settle(600);
+        assert_eq!(leader, t, "log-ahead survivor must win via the escape");
     }
 
     #[test]

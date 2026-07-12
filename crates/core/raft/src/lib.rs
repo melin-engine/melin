@@ -23,9 +23,12 @@
 //! - **Journal-tip recency votes**: because order data replicates
 //!   out-of-band, the vote rule is extended at the RPC boundary —
 //!   candidates advertise their journal tip and voters drop vote
-//!   requests from candidates behind their own tip
-//!   ([`recency`]). Dropping a vote request can only delay an election
-//!   (liveness), never violate Raft safety.
+//!   requests from candidates behind their own tip ([`recency`]).
+//!   Dropping can never violate Raft safety, and a liveness escape
+//!   stops filtering after sustained leaderlessness (the tip order and
+//!   Raft's own log order can otherwise veto every candidate) — the
+//!   filter steers elections; journal safety is enforced at promotion
+//!   time.
 
 pub mod node;
 pub mod recency;
