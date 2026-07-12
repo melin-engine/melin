@@ -16,7 +16,7 @@ Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired
 - **Hybrid** (default): one node persisted, two nodes in-memory. Any single node's slow disk is masked by the others, and single-node failures cause no data-loss.
 - **Durably replicated**: two on-disk copies on separate nodes before ack, for stricter compliance regimes.
 
-**Fast.** p99 ~ 520 µs at 1M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 27 µs p99.
+**Fast.** p99 ~ 620 µs at 2.17M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 67 µs p99.
 
 ## Architecture
 
@@ -57,17 +57,17 @@ See [`crates/examples/counter`](crates/examples/counter) for a complete working 
 
 All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://crates.io/crates/melin-exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas).
 
-### Latency under load (1M/s)
+### Latency under load (closed-loop)
 
 | Durability | Throughput | p50 | p99 | p99.9 | p99.99 |
 |------------|-----------|-----|-----|-------|--------|
-| Hybrid (1 persisted + 2 in-memory) | 1M/s | 103 µs | 522 µs | 597 µs | 667 µs |
+| Hybrid (1 persisted + 2 in-memory) | 2.17M/s | 467 µs | 622 µs | 688 µs | 750 µs |
 
 ### Single-event latency (1 client, window 1)
 
 | Durability | Throughput | p50 | p99 | p99.9 | p99.99 |
 |-----------|-----------|-----|-----|-------|--------|
-| Hybrid (1 persisted + 2 in-memory) | 45K/s | 22 µs | 27 µs | 30 µs | 36 µs |
+| Hybrid (1 persisted + 2 in-memory) | 20K/s | 49 µs | 67 µs | 166 µs | 179 µs |
 
 See [replication](docs/replication.md) for the full durability-mode menu. The benchmark harness and tuning guidance ship with the Melin Exchange Core.
 
