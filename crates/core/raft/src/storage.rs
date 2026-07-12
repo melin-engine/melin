@@ -246,6 +246,14 @@ impl FileStorage {
         let meta = snapshot.metadata.take().ok_or_else(|| {
             io::Error::other("snapshot without metadata — raft contract violation")
         })?;
+        // Validate everything before touching the mirror: a half-
+        // applied snapshot must not leave memory ahead of disk.
+        let conf_state = meta.conf_state.ok_or_else(|| {
+            io::Error::other(
+                "snapshot metadata without a conf state — refusing to wipe membership \
+                 (raft contract violation)",
+            )
+        })?;
         if meta.index < self.first_index_inner() {
             return Err(io::Error::other(format!(
                 "snapshot at {} is older than our first index {} — out of date",
@@ -258,7 +266,7 @@ impl FileStorage {
         self.entries.clear();
         self.raft_state.hard_state.term = self.raft_state.hard_state.term.max(meta.term);
         self.raft_state.hard_state.commit = meta.index;
-        self.raft_state.conf_state = meta.conf_state.unwrap_or_default();
+        self.raft_state.conf_state = conf_state;
         self.persist()
     }
 
@@ -821,6 +829,26 @@ mod tests {
         let r = FileStorage::open(dir.path()).unwrap();
         assert_eq!(r.first_index().unwrap(), 11);
         assert_eq!(r.initial_state().unwrap().conf_state.voters, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn snapshot_without_conf_state_keeps_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = FileStorage::open(dir.path()).unwrap();
+        s.initialize_with_conf_state(vec![1, 2]).unwrap();
+
+        let mut snap = Snapshot::default();
+        let meta = snap.metadata.get_or_insert_with(Default::default);
+        meta.index = 10;
+        meta.term = 3;
+        // conf_state deliberately absent: applying this must not wipe
+        // the voter set to an empty default.
+        assert!(s.apply_snapshot(snap).is_err());
+        assert_eq!(s.initial_state().unwrap().conf_state.voters, vec![1, 2]);
+        assert_eq!(s.first_index().unwrap(), 1, "log untouched");
+
+        let r = FileStorage::open(dir.path()).unwrap();
+        assert_eq!(r.initial_state().unwrap().conf_state.voters, vec![1, 2]);
     }
 
     #[test]
