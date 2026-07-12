@@ -31,6 +31,21 @@
 //! `panic = "abort"`, and a control-plane bug must degrade to "raft
 //! inoperable, exchange keeps trading" — the caller logs and stops the
 //! raft driver — not abort the matching engine.
+//!
+//! ## Applied state
+//!
+//! Alongside raft's own state the file carries an opaque **application
+//! state** blob (the membership registry once config propagation
+//! lands; empty until then) and the log index its apply reached
+//! (`applied_index`). The two are staged in memory by the apply path
+//! and land in whatever persist happens next — the whole-file atomic
+//! rewrite makes `(commit, conf_state, applied_index, app_state)` move
+//! together or not at all, so a crash can never persist a commit whose
+//! applies are unrecoverable. On boot, raft's `applied` is seeded from
+//! `applied_index` (NOT from `commit`): any `(applied_index, commit]`
+//! tail re-delivers and re-applies, which is safe because normal-entry
+//! applies must be idempotent and conf-state applies persist
+//! atomically with their index.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
@@ -42,7 +57,7 @@ use raft::{Error, GetEntriesContext, RaftState, Storage, StorageError};
 
 /// `"MRFT"` little-endian.
 const MAGIC: u32 = 0x5446_524D;
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const STATE_FILE: &str = "raft-state";
 const TMP_SUFFIX: &str = ".tmp";
 
@@ -79,6 +94,16 @@ pub struct FileStorage {
     /// `MemStorage`, made explicit.
     truncated_index: u64,
     truncated_term: u64,
+    /// Log index the application state reflects (see module docs).
+    /// Invariant: `truncated_index <= applied_index <= commit`.
+    applied_index: u64,
+    /// Serialized application state at `applied_index`. Opaque here —
+    /// the node owns the decoded form; this file owns its durability
+    /// and its trip through raft snapshots.
+    app_state: Vec<u8>,
+    /// Staged-but-unpersisted apply progress; cleared by `persist`,
+    /// checked by [`Self::flush_if_dirty`] at the end of a drain.
+    app_dirty: bool,
 }
 
 impl FileStorage {
@@ -105,6 +130,9 @@ impl FileStorage {
                 entries: Vec::new(),
                 truncated_index: 0,
                 truncated_term: 0,
+                applied_index: 0,
+                app_state: Vec::new(),
+                app_dirty: false,
             }),
             Err(e) => Err(e),
             Ok(meta) => {
@@ -191,6 +219,41 @@ impl FileStorage {
         self.persist()
     }
 
+    /// Log index the persisted application state reflects. Seeds
+    /// raft's `applied` on boot.
+    pub fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    /// Serialized application state at [`Self::applied_index`].
+    pub fn app_state(&self) -> &[u8] {
+        &self.app_state
+    }
+
+    /// Stage apply progress in memory: the entry index just applied,
+    /// and the new serialized application state when it changed. Lands
+    /// durably with the next `persist` (any mutation) or an explicit
+    /// [`Self::flush_if_dirty`] — never fsyncs by itself, so staging
+    /// per entry is free.
+    pub fn stage_applied(&mut self, index: u64, state: Option<Vec<u8>>) {
+        self.applied_index = index;
+        if let Some(state) = state {
+            self.app_state = state;
+        }
+        self.app_dirty = true;
+    }
+
+    /// Persist staged apply progress if any is pending. Called at the
+    /// end of a drain so applies whose commit was persisted in an
+    /// *earlier* ready (no persist happens in this one) still become
+    /// durable before the drain returns.
+    pub fn flush_if_dirty(&mut self) -> io::Result<()> {
+        if self.app_dirty {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
     /// Durably append `ents`, truncating any conflicting suffix first
     /// (a new leader may overwrite uncommitted entries — standard raft).
     pub fn append(&mut self, ents: &[Entry]) -> io::Result<()> {
@@ -219,7 +282,10 @@ impl FileStorage {
 
     /// Discard entries up to (excluding) `compact_index`, recording the
     /// truncation marker so log-matching still answers at the boundary.
-    /// Callers must only compact applied indexes.
+    /// Only applied indexes may be compacted — boot-time re-delivery
+    /// replays `(applied_index, commit]` from the stored log, so
+    /// compacting past the applied point would lose entries that were
+    /// never applied (and persist a state `decode` rejects on reopen).
     pub fn compact(&mut self, compact_index: u64) -> io::Result<()> {
         if compact_index <= self.first_index_inner() {
             return Ok(()); // nothing to discard — not an error
@@ -230,16 +296,10 @@ impl FileStorage {
                 self.last_index_inner()
             )));
         }
-        // "Callers must only compact applied indexes" is otherwise just
-        // a comment: enforce it against the persisted commit (applied
-        // never exceeds commit), because decode() rejects any file with
-        // commit < truncated_index — an over-eager compaction would
-        // persist fine and then brick the node on its next reopen.
-        if compact_index > self.raft_state.hard_state.commit + 1 {
+        if compact_index > self.applied_index + 1 {
             return Err(io::Error::other(format!(
-                "compact {compact_index} would truncate past commit {} — the persisted \
-                 state would fail its own reopen validation",
-                self.raft_state.hard_state.commit
+                "compact {compact_index} past applied index {} — would drop unapplied entries",
+                self.applied_index
             )));
         }
         let new_truncated = compact_index - 1;
@@ -279,6 +339,11 @@ impl FileStorage {
         self.raft_state.hard_state.term = self.raft_state.hard_state.term.max(meta.term);
         self.raft_state.hard_state.commit = meta.index;
         self.raft_state.conf_state = conf_state;
+        // The snapshot's data IS the application state at its index —
+        // store it wholesale so a data-bearing snapshot round-trips
+        // instead of being silently dropped.
+        self.applied_index = meta.index;
+        self.app_state = snapshot.data.to_vec();
         self.persist()
     }
 
@@ -302,6 +367,7 @@ impl FileStorage {
     //   truncated_index u64 | truncated_term u64
     //   conf: voters, learners, voters_outgoing, learners_next
     //         (each u16 count + u64 ids) | auto_leave u8
+    //   applied_index u64 | app_state u32-len + bytes   (v2+)
     //   entry_count u32
     //   per entry: entry_type i32 | term u64 | index u64
     //              | data u32-len + bytes | context u32-len + bytes
@@ -330,6 +396,8 @@ impl FileStorage {
             encode_id_list(&mut buf, list);
         }
         buf.push(cs.auto_leave as u8);
+        buf.extend_from_slice(&self.applied_index.to_le_bytes());
+        encode_blob(&mut buf, &self.app_state);
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for e in &self.entries {
             buf.extend_from_slice(&e.entry_type.to_le_bytes());
@@ -368,9 +436,9 @@ impl FileStorage {
             return Err(io::Error::other(format!("bad magic {magic:#010x}")));
         }
         let version = r.u32()?;
-        if version != FORMAT_VERSION {
+        if !(1..=FORMAT_VERSION).contains(&version) {
             return Err(io::Error::other(format!(
-                "unsupported format version {version} (expected {FORMAT_VERSION})"
+                "unsupported format version {version} (expected 1..={FORMAT_VERSION})"
             )));
         }
         // Struct-literal field order doubles as the read order from the
@@ -388,6 +456,15 @@ impl FileStorage {
             voters_outgoing: r.id_list()?,
             learners_next: r.id_list()?,
             auto_leave: r.u8()? != 0,
+        };
+        // v1 predates the applied-state section. Its writer applied
+        // every committed entry synchronously before returning, so
+        // `applied == commit` and the application state is empty
+        // (nothing ever proposed under v1).
+        let (applied_index, app_state) = if version >= 2 {
+            (r.u64()?, r.blob()?)
+        } else {
+            (hs.commit, Vec::new())
         };
         let entry_count = r.u32()? as usize;
         // Every entry occupies at least type + term + index + two blob
@@ -435,6 +512,12 @@ impl FileStorage {
                 hs.commit
             )));
         }
+        if applied_index < truncated_index || applied_index > hs.commit {
+            return Err(io::Error::other(format!(
+                "applied index {applied_index} outside [{truncated_index}, {}]",
+                hs.commit
+            )));
+        }
 
         Ok(Self {
             path: PathBuf::new(),
@@ -445,13 +528,16 @@ impl FileStorage {
             entries,
             truncated_index,
             truncated_term,
+            applied_index,
+            app_state,
+            app_dirty: false,
         })
     }
 
     /// Atomically replace the state file: write `<path>.tmp`, fsync it,
     /// rename over `path`, fsync the parent directory. Same discipline
     /// (and rationale) as `melin-transport-core::snapshot::save`.
-    fn persist(&self) -> io::Result<()> {
+    fn persist(&mut self) -> io::Result<()> {
         let buf = self.encode();
         if buf.len() as u64 > MAX_STATE_FILE {
             return Err(io::Error::other(format!(
@@ -474,6 +560,7 @@ impl FileStorage {
         }
         std::fs::rename(&tmp_path, &self.path)?;
         fsync_dir(self.path.parent().unwrap_or_else(|| Path::new("")))?;
+        self.app_dirty = false;
         Ok(())
     }
 }
@@ -612,25 +699,26 @@ impl Storage for FileStorage {
     }
 
     fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
-        // Metadata-only snapshot at the commit index (the control-plane
-        // state machine is tiny; step 2 adds the config payload here).
+        // Snapshot at the *applied* index, carrying the application
+        // state as its data — never past it: a snapshot labeled newer
+        // than the state it carries would silently lose applies on the
+        // follower. `applied` trails `commit` only within a single
+        // drain, so a follower asking for more just retries.
         let mut snap = Snapshot::default();
+        if self.applied_index < request_index {
+            return Err(Error::Store(StorageError::SnapshotTemporarilyUnavailable));
+        }
+        snap.data = self.app_state.clone();
         let meta = snap.metadata.get_or_insert_with(Default::default);
-        let commit = self.raft_state.hard_state.commit;
-        meta.index = commit;
-        meta.term = match self.term(commit) {
+        meta.index = self.applied_index;
+        meta.term = match self.term(self.applied_index) {
             Ok(t) => t,
-            // Commit is validated against the stored log on every
+            // Applied is validated against the stored log on every
             // mutation, so this is unreachable; surface as Unavailable
             // rather than panicking.
             Err(_) => return Err(Error::Store(StorageError::SnapshotTemporarilyUnavailable)),
         };
         meta.conf_state = Some(self.raft_state.conf_state.clone());
-        if meta.index < request_index {
-            // Mirror `MemStorage`: never hand back a snapshot older
-            // than the follower asked for.
-            meta.index = request_index;
-        }
         Ok(snap)
     }
 }
@@ -764,6 +852,7 @@ mod tests {
         s.append(&[entry(1, 1), entry(2, 1), entry(3, 2), entry(4, 2)])
             .unwrap();
         s.set_commit(4).unwrap();
+        s.stage_applied(4, None);
         s.compact(3).unwrap();
 
         assert_eq!(s.first_index().unwrap(), 3);
@@ -793,26 +882,30 @@ mod tests {
         let mut s = FileStorage::open(dir.path()).unwrap();
         s.append(&[entry(1, 1), entry(2, 1)]).unwrap();
         s.set_commit(2).unwrap();
+        s.stage_applied(2, None);
         s.compact(2).unwrap();
         s.compact(1).unwrap(); // already gone — fine
         assert_eq!(s.first_index().unwrap(), 2);
     }
 
     #[test]
-    fn compact_past_commit_is_rejected() {
+    fn compact_past_applied_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = FileStorage::open(dir.path()).unwrap();
         s.append(&[entry(1, 1), entry(2, 1), entry(3, 1)]).unwrap();
-        s.set_commit(1).unwrap();
+        s.set_commit(3).unwrap();
+        s.stage_applied(2, None);
 
-        // Truncating entry 2 away (uncommitted) would persist a file
-        // decode() rejects on reopen.
-        assert!(s.compact(3).is_err());
-        // Up to the commit boundary is fine…
-        s.compact(2).unwrap();
+        // Truncating past the applied point would drop entries whose
+        // boot-time re-delivery is still owed (and persist a file
+        // decode() rejects on reopen).
+        assert!(s.compact(4).is_err());
+        // Up to the applied boundary is fine…
+        s.compact(3).unwrap();
         // …and the file it wrote still reopens.
         let r = FileStorage::open(dir.path()).unwrap();
-        assert_eq!(r.first_index().unwrap(), 2);
+        assert_eq!(r.first_index().unwrap(), 3);
+        assert_eq!(r.applied_index(), 2);
     }
 
     #[test]
@@ -886,32 +979,113 @@ mod tests {
         let mut s = FileStorage::open(dir.path()).unwrap();
         s.append(&[entry(1, 1), entry(2, 1)]).unwrap();
         s.set_commit(2).unwrap();
+        s.stage_applied(2, None);
         s.compact(3).unwrap(); // first_index now 3
 
         let mut snap = Snapshot::default();
         let meta = snap.metadata.get_or_insert_with(Default::default);
         meta.index = 1;
         meta.term = 1;
+        meta.conf_state = Some(ConfState::default());
         assert!(s.apply_snapshot(snap).is_err());
     }
 
     #[test]
-    fn snapshot_reports_commit_and_membership() {
+    fn snapshot_reports_applied_state_and_membership() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = FileStorage::open(dir.path()).unwrap();
         s.initialize_with_conf_state(vec![1, 2]).unwrap();
         s.append(&[entry(1, 1), entry(2, 1)]).unwrap();
         s.set_commit(2).unwrap();
+        s.stage_applied(2, Some(b"app".to_vec()));
 
         let snap = s.snapshot(0, 99).unwrap();
+        assert_eq!(snap.data, b"app".to_vec());
         let meta = snap.metadata.as_ref().unwrap();
         assert_eq!(meta.index, 2);
         assert_eq!(meta.term, 1);
         assert_eq!(meta.conf_state.as_ref().unwrap().voters, vec![1, 2]);
 
-        // Never hand back less than the follower asked for.
-        let bumped = s.snapshot(5, 99).unwrap();
-        assert_eq!(bumped.metadata.as_ref().unwrap().index, 5);
+        // A snapshot labeled newer than the state it carries would lose
+        // applies on the follower — refuse rather than fabricate.
+        assert!(matches!(
+            s.snapshot(5, 99),
+            Err(Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+        ));
+    }
+
+    #[test]
+    fn staged_applied_state_round_trips_through_flush_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = FileStorage::open(dir.path()).unwrap();
+        s.append(&[entry(1, 1)]).unwrap();
+        s.set_commit(1).unwrap();
+        s.stage_applied(1, Some(b"registry".to_vec()));
+        s.flush_if_dirty().unwrap();
+
+        let r = FileStorage::open(dir.path()).unwrap();
+        assert_eq!(r.applied_index(), 1);
+        assert_eq!(r.app_state(), b"registry");
+    }
+
+    #[test]
+    fn snapshot_data_round_trips_through_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = FileStorage::open(dir.path()).unwrap();
+
+        let mut snap = Snapshot {
+            data: b"state".to_vec(),
+            ..Default::default()
+        };
+        let meta = snap.metadata.get_or_insert_with(Default::default);
+        meta.index = 10;
+        meta.term = 3;
+        meta.conf_state = Some(ConfState {
+            voters: vec![1, 2, 3],
+            ..Default::default()
+        });
+        s.apply_snapshot(snap).unwrap();
+        assert_eq!(s.applied_index(), 10);
+
+        // The carried application state is preserved — on disk and back
+        // out through the next snapshot this node serves.
+        let r = FileStorage::open(dir.path()).unwrap();
+        assert_eq!(r.app_state(), b"state");
+        assert_eq!(r.snapshot(0, 99).unwrap().data, b"state".to_vec());
+    }
+
+    #[test]
+    fn v1_file_decodes_with_applied_equal_to_commit() {
+        // Hand-built v1 image (predates the applied-state section):
+        // decode must default applied to the commit index, the v1
+        // writer's synchronous-apply invariant.
+        let mut body = Vec::new();
+        body.extend_from_slice(&MAGIC.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        body.extend_from_slice(&2u64.to_le_bytes()); // term
+        body.extend_from_slice(&3u64.to_le_bytes()); // vote
+        body.extend_from_slice(&1u64.to_le_bytes()); // commit
+        body.extend_from_slice(&0u64.to_le_bytes()); // truncated_index
+        body.extend_from_slice(&0u64.to_le_bytes()); // truncated_term
+        for _ in 0..4 {
+            body.extend_from_slice(&0u16.to_le_bytes()); // empty id list
+        }
+        body.push(0); // auto_leave
+        body.extend_from_slice(&1u32.to_le_bytes()); // entry_count
+        body.extend_from_slice(&0i32.to_le_bytes()); // entry_type
+        body.extend_from_slice(&2u64.to_le_bytes()); // entry term
+        body.extend_from_slice(&1u64.to_le_bytes()); // entry index
+        body.extend_from_slice(&0u32.to_le_bytes()); // data len
+        body.extend_from_slice(&0u32.to_le_bytes()); // context len
+        let crc = crc32c::crc32c(&body);
+        body.extend_from_slice(&crc.to_le_bytes());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(STATE_FILE), &body).unwrap();
+        let s = FileStorage::open(dir.path()).unwrap();
+        assert_eq!(s.applied_index(), 1, "v1 applied defaults to commit");
+        assert!(s.app_state().is_empty());
+        assert_eq!(s.hard_state().vote, 3);
     }
 
     #[test]
@@ -1060,12 +1234,12 @@ mod tests {
         assert_eq!(reopened.initial_state().unwrap().conf_state.voters, vec![1]);
     }
 
-    /// Seeding `Config.applied` from the persisted commit index (what
-    /// `ControlNode::open` does) stops raft from re-delivering already-
-    /// applied committed entries on restart — the replay that, once
-    /// membership changes exist, re-runs a committed conf-change and
-    /// bricks the node. The single-voter leader's initial no-op entry
-    /// (index 1) stands in for any committed entry.
+    /// Seeding `Config.applied` with the applied index stops raft from
+    /// re-delivering already-applied committed entries on restart
+    /// (`ControlNode::open` seeds it from the storage's durable
+    /// `applied_index`, which its apply path keeps in step). The
+    /// single-voter leader's initial no-op entry (index 1) stands in
+    /// for any committed entry.
     #[test]
     fn seeding_applied_suppresses_committed_replay_on_restart() {
         let dir = tempfile::tempdir().unwrap();

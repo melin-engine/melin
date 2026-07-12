@@ -92,17 +92,16 @@ impl ControlNode {
             info!(id, ?voters, "bootstrapped control-plane raft membership");
         }
 
-        // Seed the applied index from the persisted commit index.
-        // `drain_ready` applies every committed entry synchronously
-        // before it returns (no async apply), so on a clean process
-        // everything committed is also applied. Without this, a restart
-        // leaves `applied` at 0 and raft re-delivers every committed
-        // entry from the truncation point — harmless for the empty
-        // election no-ops, but re-running a committed conf-change
-        // against the already-updated membership makes raft-rs error
-        // (e.g. "config is already joint"), which would permanently
-        // stop the driver on every boot.
-        let applied = storage.hard_state().commit;
+        // Seed the applied index from the storage's own record of how
+        // far applies reached — NOT from the commit index. The two
+        // differ only across a crash between a commit's persist and
+        // its applies' persist; seeding from `applied_index` makes
+        // raft re-deliver exactly that `(applied, commit]` tail, which
+        // re-applies safely (normal-entry applies must be idempotent,
+        // and a conf change whose ConfState persisted also persisted
+        // its applied index — atomically, same file rewrite — so it is
+        // never re-delivered).
+        let applied = storage.applied_index();
 
         let config = Config {
             id,
@@ -260,6 +259,11 @@ impl ControlNode {
         self.apply_committed(committed, &mut out)?;
         self.raw.advance_apply();
 
+        // Applies whose commit was persisted by an *earlier* ready may
+        // have staged progress without any persist in this drain —
+        // make them durable before returning (no-op when clean).
+        self.raw.mut_store().flush_if_dirty()?;
+
         self.maybe_compact()?;
 
         Ok(out)
@@ -284,16 +288,20 @@ impl ControlNode {
     }
 
     /// Apply a batch of committed entries: conf changes mutate raft +
-    /// durable membership here; normal payloads are handed to the
-    /// caller. Empty `EntryNormal` data (the no-op a fresh leader
-    /// commits) is skipped.
+    /// durable membership here; non-empty normal payloads are handed to
+    /// the caller. Every entry — including a fresh leader's empty
+    /// no-op — stages its index as applied, so boot-time re-delivery
+    /// resumes exactly where applies stopped (see the storage module
+    /// docs on `applied_index`).
     fn apply_committed(&mut self, entries: Vec<Entry>, out: &mut Drained) -> io::Result<()> {
         for entry in entries {
+            let index = entry.index;
             match entry.entry_type() {
                 EntryType::EntryNormal => {
                     if !entry.data.is_empty() {
                         out.committed.push(entry.data);
                     }
+                    self.raw.mut_store().stage_applied(index, None);
                 }
                 EntryType::EntryConfChange => {
                     let cc: ConfChange = prost_decode(&entry.data)?;
@@ -301,6 +309,10 @@ impl ControlNode {
                         .raw
                         .apply_conf_change(&cc)
                         .map_err(|e| io::Error::other(format!("conf change failed: {e}")))?;
+                    // Staged before the ConfState persists so both land
+                    // in the same whole-file rewrite — a re-delivered
+                    // conf change then never double-applies.
+                    self.raw.mut_store().stage_applied(index, None);
                     self.raw.mut_store().set_conf_state(cs)?;
                 }
                 EntryType::EntryConfChangeV2 => {
@@ -309,6 +321,7 @@ impl ControlNode {
                         .raw
                         .apply_conf_change(&cc)
                         .map_err(|e| io::Error::other(format!("conf change failed: {e}")))?;
+                    self.raw.mut_store().stage_applied(index, None);
                     self.raw.mut_store().set_conf_state(cs)?;
                 }
             }
