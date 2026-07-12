@@ -43,6 +43,17 @@ pub struct ControlNode {
     /// directly) so tests can shrink it to reach the snapshot path
     /// without generating hundreds of entries.
     log_retention: u64,
+    /// Latched on the first storage error out of [`Self::drain_ready`],
+    /// permanently disabling the node. This *enforces* the documented
+    /// "stop driving after an `Err`" contract rather than trusting the
+    /// caller: `ready()` irreversibly consumes committed entries from
+    /// raft's bookkeeping *before* the first storage write, so a caller
+    /// that kept driving past an error would silently skip committed
+    /// entries (conf changes included) that its peers applied — a
+    /// divergence with no crash to flag it. Halting raft is safe by
+    /// design: the control plane is not the data plane, and the
+    /// exchange keeps trading without it.
+    halted: bool,
 }
 
 /// What a drained ready handed to the caller: messages to put on the
@@ -123,6 +134,7 @@ impl ControlNode {
         Ok(Self {
             raw,
             log_retention: LOG_RETENTION,
+            halted: false,
         })
     }
 
@@ -142,15 +154,22 @@ impl ControlNode {
 
     /// Advance the logical clock by one tick (the driver calls this at
     /// a fixed cadence). Returns `true` if raft wants a ready drained.
+    /// A no-op once the node is [halted](Self::halted).
     pub fn tick(&mut self) -> bool {
+        if self.halted {
+            return false;
+        }
         self.raw.tick()
     }
 
     /// Feed one inbound peer message. The caller applies the
     /// journal-tip recency filter ([`crate::recency`]) *before* this —
     /// by the time a message reaches the state machine it is
-    /// unconditional.
+    /// unconditional. Dropped once the node is [halted](Self::halted).
     pub fn step(&mut self, msg: Message) {
+        if self.halted {
+            return;
+        }
         // A step error means raft refused the message (e.g. unknown
         // peer after a membership change, stale term chatter). That is
         // peer-input trouble, not a local invariant violation, and a
@@ -163,9 +182,16 @@ impl ControlNode {
     }
 
     /// True when raft has state to persist, messages to send, or
-    /// entries to apply.
+    /// entries to apply. `false` once the node is
+    /// [halted](Self::halted), so drivers don't spin on a dead node.
     pub fn has_ready(&self) -> bool {
-        self.raw.has_ready()
+        !self.halted && self.raw.has_ready()
+    }
+
+    /// Whether a storage error has permanently disabled this node —
+    /// see the field docs for why the latch exists.
+    pub fn halted(&self) -> bool {
+        self.halted
     }
 
     /// Drain one ready, honouring the persistence contract:
@@ -180,9 +206,24 @@ impl ControlNode {
     ///    normal entries are handed back for the caller to apply.
     ///
     /// An `Err` from storage leaves raft inoperable by contract — the
-    /// caller must stop driving this node (and keep the exchange
-    /// running; the control plane is not the data plane).
+    /// node latches [halted](Self::halted) and refuses all further
+    /// driving, so even a caller that ignores the error cannot make it
+    /// diverge (the exchange keeps running; the control plane is not
+    /// the data plane).
     pub fn drain_ready(&mut self) -> io::Result<Drained> {
+        if self.halted {
+            return Err(io::Error::other(
+                "control-plane raft node is halted after a storage error",
+            ));
+        }
+        let result = self.drain_ready_inner();
+        if result.is_err() {
+            self.halted = true;
+        }
+        result
+    }
+
+    fn drain_ready_inner(&mut self) -> io::Result<Drained> {
         let mut out = Drained::default();
         if !self.raw.has_ready() {
             return Ok(out);
@@ -653,6 +694,44 @@ mod sim {
             "victim must catch up once the failure is reported"
         );
         assert_eq!(c.nodes[&victim].leader_id(), Some(leader));
+    }
+
+    #[test]
+    fn storage_error_halts_the_node_permanently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = ControlNode::open(1, dir.path(), &[1]).unwrap();
+
+        // Every persist from here on fails: the tmp-file create needs
+        // write permission on the directory.
+        let set_readonly = |ro: bool| {
+            let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+            perms.set_readonly(ro);
+            std::fs::set_permissions(dir.path(), perms).unwrap();
+        };
+        set_readonly(true);
+
+        // A single voter self-elects after its election timeout, which
+        // forces a vote + entry persist — the failure that must latch.
+        let mut latched = false;
+        'drive: for _ in 0..100 {
+            node.tick();
+            while node.has_ready() {
+                if node.drain_ready().is_err() {
+                    latched = true;
+                    break 'drive;
+                }
+            }
+        }
+        set_readonly(false); // tempdir cleanup needs the perms back
+
+        assert!(latched, "read-only dir must surface a storage error");
+        assert!(node.halted());
+        // The latch refuses all further driving, even with storage
+        // healthy again — a Ready was abandoned, so continuing could
+        // silently skip committed entries.
+        assert!(!node.has_ready());
+        assert!(!node.tick());
+        assert!(node.drain_ready().is_err());
     }
 
     #[test]
