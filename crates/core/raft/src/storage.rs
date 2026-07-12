@@ -370,6 +370,19 @@ impl FileStorage {
             auto_leave: r.u8()? != 0,
         };
         let entry_count = r.u32()? as usize;
+        // Every entry occupies at least type + term + index + two blob
+        // length prefixes in the body. Reject counts the remaining
+        // bytes cannot hold BEFORE allocating, so a corrupt-but-CRC-
+        // valid file (re-checksummed bit rot, crafted input) fails with
+        // the clean corrupt-file error instead of an allocator abort —
+        // the same reasoning as the u16 cap on the id lists.
+        const MIN_ENTRY_BYTES: usize = 4 + 8 + 8 + 4 + 4;
+        let remaining = body.len() - r.pos;
+        if entry_count > remaining / MIN_ENTRY_BYTES {
+            return Err(io::Error::other(format!(
+                "entry count {entry_count} exceeds what the remaining {remaining} bytes can hold"
+            )));
+        }
         let mut entries = Vec::with_capacity(entry_count);
         for i in 0..entry_count {
             let e = Entry {
@@ -866,6 +879,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = FileStorage::open(dir.path()).unwrap();
         assert!(s.entries(1, 1, None, ctx()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn absurd_entry_count_is_a_clean_error_not_an_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = FileStorage::open(dir.path()).unwrap();
+        s.append(&[entry(1, 1)]).unwrap();
+        drop(s);
+
+        // Claim u32::MAX entries with a recomputed (valid) CRC: decode
+        // must reject the count against the remaining bytes instead of
+        // pre-allocating hundreds of GB. One empty entry serializes to
+        // 28 bytes; the u32 count sits just before it, and the CRC
+        // trailer ends the file.
+        let path = dir.path().join(STATE_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let count_off = bytes.len() - 4 - 28 - 4;
+        bytes[count_off..count_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let body_len = bytes.len() - 4;
+        let crc = crc32c::crc32c(&bytes[..body_len]);
+        bytes[body_len..].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = FileStorage::open(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("entry count"), "{err}");
     }
 
     #[test]
