@@ -230,6 +230,18 @@ impl FileStorage {
                 self.last_index_inner()
             )));
         }
+        // "Callers must only compact applied indexes" is otherwise just
+        // a comment: enforce it against the persisted commit (applied
+        // never exceeds commit), because decode() rejects any file with
+        // commit < truncated_index — an over-eager compaction would
+        // persist fine and then brick the node on its next reopen.
+        if compact_index > self.raft_state.hard_state.commit + 1 {
+            return Err(io::Error::other(format!(
+                "compact {compact_index} would truncate past commit {} — the persisted \
+                 state would fail its own reopen validation",
+                self.raft_state.hard_state.commit
+            )));
+        }
         let new_truncated = compact_index - 1;
         let drop = (compact_index - self.first_index_inner()) as usize;
         // `drop >= 1` here, so `entries[drop - 1]` is the entry at
@@ -784,6 +796,23 @@ mod tests {
         s.compact(2).unwrap();
         s.compact(1).unwrap(); // already gone — fine
         assert_eq!(s.first_index().unwrap(), 2);
+    }
+
+    #[test]
+    fn compact_past_commit_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = FileStorage::open(dir.path()).unwrap();
+        s.append(&[entry(1, 1), entry(2, 1), entry(3, 1)]).unwrap();
+        s.set_commit(1).unwrap();
+
+        // Truncating entry 2 away (uncommitted) would persist a file
+        // decode() rejects on reopen.
+        assert!(s.compact(3).is_err());
+        // Up to the commit boundary is fine…
+        s.compact(2).unwrap();
+        // …and the file it wrote still reopens.
+        let r = FileStorage::open(dir.path()).unwrap();
+        assert_eq!(r.first_index().unwrap(), 2);
     }
 
     #[test]
