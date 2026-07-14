@@ -16,6 +16,7 @@ pub mod admin;
 mod client_frames;
 pub mod durability_policy;
 pub mod process;
+pub mod promotion;
 mod raft;
 pub mod reader;
 pub mod replication;

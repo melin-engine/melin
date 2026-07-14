@@ -1039,7 +1039,7 @@ pub fn run_receiver_dpdk<A, W>(
     signing_key: &ed25519_dalek::SigningKey,
     journal_path: &std::path::Path,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
@@ -1124,7 +1124,7 @@ where
             }
             return Ok(None);
         }
-        if promote.load(Ordering::Acquire) {
+        if promote.is_requested() {
             info!("promotion triggered while disconnected");
             return take_pipeline_for_promotion(&mut pipeline, &mut exchange, &mut journal_writer);
         }
@@ -1203,7 +1203,7 @@ where
                 }
                 return Ok(None);
             }
-            if promote.load(Ordering::Acquire) {
+            if promote.is_requested() {
                 info!("promotion triggered during reconnect backoff");
                 return take_pipeline_for_promotion(
                     &mut pipeline,
@@ -1255,7 +1255,7 @@ where
                 }
                 return Ok(None);
             }
-            if promote.load(Ordering::Acquire) {
+            if promote.is_requested() {
                 info!("promotion triggered during reconnect backoff");
                 return take_pipeline_for_promotion(
                     &mut pipeline,

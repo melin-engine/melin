@@ -821,17 +821,18 @@ where
             "loaded authorized keys (replica mode)"
         );
 
-        // Shared admin flags: constructed before mode-detection so they
-        // survive a replica → primary transition. The promote flag is
-        // consumed by the replica's receive loop and becomes a stale
-        // pointer post-promotion (harmless); the rotate flag is re-wired
-        // into the new primary's journal stage by `run_as_primary`.
-        let promote_flag = Arc::new(AtomicBool::new(false));
+        // Shared admin state: constructed before mode-detection so it
+        // survives a replica → primary transition. The promotion request
+        // is a one-shot consumed by the replica's receive loop; its
+        // pending epoch floor feeds the tenure's `EpochBump` (see
+        // `crate::promotion`). The rotate flag is re-wired into the new
+        // primary's journal stage by `run_as_primary`.
+        let promotion_request = crate::promotion::PromotionRequest::new();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
                 addr,
-                Some(Arc::clone(&promote_flag)),
+                Some(promotion_request.clone()),
                 rotate_flag.clone(),
                 Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
@@ -869,7 +870,7 @@ where
             &config.journal,
             &signing_key,
             &shutdown,
-            &promote_flag,
+            &promotion_request,
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
@@ -917,7 +918,7 @@ where
                     rotate_flag,
                     durability_mode_atomic,
                     fence_state,
-                    true, // promoted — inject an EpochBump before serving
+                    promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     raft_status,
                 );
                 crate::raft::stop_raft_driver(raft_handles, &shutdown);
@@ -992,7 +993,7 @@ where
         rotate_flag,
         durability_mode_atomic,
         fence_state,
-        false, // not promoted — no EpochBump injection
+        None, // not promoted — no EpochBump injection
         raft_status,
     );
     crate::raft::stop_raft_driver(raft_handles, &shutdown);
@@ -1141,7 +1142,7 @@ fn run_as_primary<A, L, W>(
     rotate_flag: Option<Arc<AtomicBool>>,
     durability_mode_atomic: Arc<AtomicU8>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    promoted: bool,
+    promotion: Option<u64>,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -1665,13 +1666,44 @@ where
     // flows through journal + replication to every replica. We wait for the
     // matching stage to apply it (epoch advanced) before serving so the first
     // handshake already advertises the new epoch.
-    if promoted {
+    //
+    // The new epoch honours the promotion request's floor: a manual
+    // `PROMOTE` carries `MANUAL` (= 1) and resolves to the classic
+    // `epoch + 1`; a raft auto-promotion carries its election term
+    // (strictly above the old epoch by the driver's request rule), so
+    // tenure epochs align with raft terms and two overlapping
+    // promotions from different elections always allocate distinct
+    // epochs — the newer one fences the older.
+    if let Some(requested_epoch) = promotion {
         use melin_app::unix_epoch_nanos;
         use melin_journal::JournalEvent;
         use melin_transport_core::trace::mono_trace_ns;
 
-        let new_epoch = fence_state.epoch().saturating_add(1);
-        info!(new_epoch, "promotion: injecting epoch bump");
+        let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
+        // Re-validate the term↔epoch alignment at the moment the epoch is
+        // minted, not just at the driver's request-time check: a streamed
+        // `EpochBump` from a concurrent promotion elsewhere can raise the
+        // fence during the drain, in which case `max` allocates `epoch+1`
+        // instead of the election term. Fencing still converges (the
+        // epochs stay distinct and the higher one wins), but the skew
+        // makes later "epochs outran raft terms" refusals — so say what
+        // actually happened while the evidence exists. Manual promotions
+        // (requested == MANUAL) are exempt: they never claimed alignment.
+        if requested_epoch > crate::promotion::PromotionRequest::MANUAL
+            && new_epoch != requested_epoch
+        {
+            warn!(
+                new_epoch,
+                requested_epoch,
+                "promotion epoch does not match its election term — a concurrent \
+                 promotion advanced the fencing epoch mid-drain; auto-promotion \
+                 refusals may report term/epoch misalignment until a newer election"
+            );
+        }
+        info!(
+            new_epoch,
+            requested_epoch, "promotion: injecting epoch bump"
+        );
         input_producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
@@ -2055,12 +2087,12 @@ where
 
         // Shared admin flags, same shape as the kernel TCP replica path
         // — see `run` for the rationale on lifetime.
-        let promote_flag = Arc::new(AtomicBool::new(false));
+        let promotion_request = crate::promotion::PromotionRequest::new();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
                 addr,
-                Some(Arc::clone(&promote_flag)),
+                Some(promotion_request.clone()),
                 rotate_flag.clone(),
                 Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
@@ -2112,7 +2144,7 @@ where
             &signing_key,
             &config.journal,
             &shutdown,
-            &promote_flag,
+            &promotion_request,
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
@@ -2159,7 +2191,7 @@ where
                     rotate_flag,
                     durability_mode_atomic,
                     fence_state,
-                    true, // promoted — inject an EpochBump before serving
+                    promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     raft_status,
                 );
                 crate::raft::stop_raft_driver(raft_handles, &shutdown);

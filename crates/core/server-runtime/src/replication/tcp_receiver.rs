@@ -406,7 +406,7 @@ pub fn run_receiver<A, W>(
     journal_path: &std::path::Path,
     signing_key: &ed25519_dalek::SigningKey,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
@@ -472,7 +472,7 @@ where
             }
             return Ok(None);
         }
-        if promote.load(Ordering::Acquire) {
+        if promote.is_requested() {
             info!("promotion triggered while disconnected");
             return take_pipeline_for_promotion(&mut pipeline, &mut exchange, &mut journal_writer);
         }
@@ -492,7 +492,7 @@ where
                 if shutdown.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
-                if promote.load(Ordering::Acquire) {
+                if promote.is_requested() {
                     info!("promotion triggered during reconnect backoff");
                     return take_pipeline_for_promotion(
                         &mut pipeline,
@@ -1026,7 +1026,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let promote = Arc::new(AtomicBool::new(false));
+            let promote = crate::promotion::PromotionRequest::new();
             let cores = crate::server::PipelineCores {
                 // 0 = unpinned sentinel for every stage.
                 journal: 0,
@@ -1042,7 +1042,7 @@ mod tests {
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let promote = Arc::clone(&promote);
+                let promote = promote.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
@@ -1199,7 +1199,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let promote = Arc::new(AtomicBool::new(false));
+            let promote = crate::promotion::PromotionRequest::new();
             let cores = crate::server::PipelineCores {
                 journal: 0,
                 matching: 0,
@@ -1214,7 +1214,7 @@ mod tests {
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let promote = Arc::clone(&promote);
+                let promote = promote.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
@@ -1386,7 +1386,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let promote = Arc::new(AtomicBool::new(false));
+            let promote = crate::promotion::PromotionRequest::new();
             let cores = crate::server::PipelineCores {
                 journal: 0,
                 matching: 0,
@@ -1401,7 +1401,7 @@ mod tests {
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let promote = Arc::clone(&promote);
+                let promote = promote.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,

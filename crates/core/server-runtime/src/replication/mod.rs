@@ -194,16 +194,17 @@ pub(super) fn log_tcp_info(fd: std::os::unix::io::RawFd, tag: &str, slot: usize)
     );
 }
 
-/// Sleep for the given duration in 100ms increments, checking shutdown
-/// and promote flags between increments. Returns early if either is set.
+/// Sleep for the given duration in 100ms increments, checking the shutdown
+/// flag and the promotion request between increments. Returns early if
+/// either is set.
 pub(super) fn sleep_checking_flags(
     duration: std::time::Duration,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
 ) {
     let deadline = std::time::Instant::now() + duration;
     while std::time::Instant::now() < deadline {
-        if shutdown.load(Ordering::Relaxed) || promote.load(Ordering::Acquire) {
+        if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -621,7 +622,7 @@ pub(in crate::replication) fn handle_session_exit<A, W>(
     factory: &dyn melin_app::app_factory::AppFactory<App = A>,
     fence_state: &melin_transport_core::fence::FenceState,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
     mut close: impl FnMut(),
 ) -> AfterSession<A, W>
 where
