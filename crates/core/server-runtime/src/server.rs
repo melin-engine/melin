@@ -415,6 +415,17 @@ pub struct ServerConfig {
     /// double-grant a vote (see docs/replication.md).
     #[arg(long)]
     pub raft_dir: Option<PathBuf>,
+
+    /// Act on control-plane election wins: a replica elected leader
+    /// promotes itself (journaling the election term as its fencing
+    /// epoch), and a serving node self-fences when the raft mesh shows
+    /// it superseded. Off by default — automatic failover is an explicit
+    /// operator policy decision. Requires `--raft-bind` and at least
+    /// three configured voters (a two-node cluster cannot elect after
+    /// losing either node, so automation would be dead weight with real
+    /// misconfiguration risk; see docs/replication.md).
+    #[arg(long, default_value_t = false)]
+    pub raft_auto_promote: bool,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -485,6 +496,7 @@ impl Default for ServerConfig {
             raft_node_id: None,
             raft_peer: Vec::new(),
             raft_dir: None,
+            raft_auto_promote: false,
         }
     }
 }
@@ -866,8 +878,26 @@ where
             &fence_state,
             journal_tip.clone(),
             Arc::clone(&control.tip_ready),
+            // A replica claims to be serving once a promotion is in
+            // flight (see SupersessionPolicy).
+            {
+                let promote = control.promote.clone();
+                Arc::new(move || promote.is_requested())
+            },
             &shutdown,
         )?;
+        // Act on election wins when the operator opted in. Genesis
+        // primaries have nothing to promote — replica paths only.
+        let promotion_handle = match (&raft_handles, config.raft_auto_promote) {
+            (Some(handles), true) => Some(crate::raft_promotion::spawn_auto_promotion(
+                Arc::clone(&handles.status),
+                control.clone(),
+                Arc::clone(&fence_state),
+                Arc::clone(&durability_mode_atomic),
+                Arc::clone(&shutdown),
+            )),
+            _ => None,
+        };
         let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
         // A raft-enabled replica exposes election gauges on --health-bind;
         // torn down before promotion so run_as_primary can rebind the port.
@@ -898,6 +928,10 @@ where
             None => {
                 crate::raft::stop_replica_health(replica_health);
                 crate::raft::stop_raft_driver(raft_handles, &shutdown);
+                if let Some(h) = promotion_handle {
+                    // Exits within one poll of the (already set) shutdown flag.
+                    let _ = h.join();
+                }
                 return Ok(()); // clean shutdown
             }
             Some((mut exchange, writer)) => {
@@ -938,6 +972,11 @@ where
                     journal_tip,
                 );
                 crate::raft::stop_raft_driver(raft_handles, &shutdown);
+                if let Some(h) = promotion_handle {
+                    // Already exited: it returns the moment a promotion is
+                    // filed, which is the only way this branch is reached.
+                    let _ = h.join();
+                }
                 return result;
             }
         }
@@ -1003,6 +1042,8 @@ where
                 &fence_state,
                 journal_tip.clone(),
                 Arc::new(AtomicBool::new(true)),
+                // A primary always claims to be serving.
+                Arc::new(|| true),
                 &shutdown,
             )?
         }
@@ -2162,8 +2203,26 @@ where
             &fence_state,
             journal_tip.clone(),
             Arc::clone(&control.tip_ready),
+            // A replica claims to be serving once a promotion is in
+            // flight (see SupersessionPolicy).
+            {
+                let promote = control.promote.clone();
+                Arc::new(move || promote.is_requested())
+            },
             &shutdown,
         )?;
+        // Act on election wins when the operator opted in. Genesis
+        // primaries have nothing to promote — replica paths only.
+        let promotion_handle = match (&raft_handles, config.raft_auto_promote) {
+            (Some(handles), true) => Some(crate::raft_promotion::spawn_auto_promotion(
+                Arc::clone(&handles.status),
+                control.clone(),
+                Arc::clone(&fence_state),
+                Arc::clone(&durability_mode_atomic),
+                Arc::clone(&shutdown),
+            )),
+            _ => None,
+        };
         let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
         let replica_health =
             crate::raft::spawn_replica_health(&config, &fence_state, raft_status.as_ref())?;
@@ -2209,6 +2268,10 @@ where
             None => {
                 crate::raft::stop_replica_health(replica_health);
                 crate::raft::stop_raft_driver(raft_handles, &shutdown);
+                if let Some(h) = promotion_handle {
+                    // Exits within one poll of the (already set) shutdown flag.
+                    let _ = h.join();
+                }
                 return Ok(()); // clean shutdown
             }
             Some((mut exchange, writer)) => {
@@ -2248,6 +2311,11 @@ where
                     journal_tip,
                 );
                 crate::raft::stop_raft_driver(raft_handles, &shutdown);
+                if let Some(h) = promotion_handle {
+                    // Already exited: it returns the moment a promotion is
+                    // filed, which is the only way this branch is reached.
+                    let _ = h.join();
+                }
                 return result;
             }
         }
@@ -2310,6 +2378,8 @@ where
                 &fence_state,
                 journal_tip.clone(),
                 Arc::new(AtomicBool::new(true)),
+                // A primary always claims to be serving.
+                Arc::new(|| true),
                 &shutdown,
             )?
         }

@@ -18,6 +18,7 @@ pub mod durability_policy;
 pub mod process;
 pub mod promotion;
 mod raft;
+mod raft_promotion;
 pub mod reader;
 pub mod replication;
 pub mod response;

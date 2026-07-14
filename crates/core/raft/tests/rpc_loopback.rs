@@ -14,7 +14,7 @@ use ed25519_dalek::SigningKey;
 use melin_app::auth::AuthorizedKeys;
 use melin_raft::network::RaftClientFactory;
 use melin_raft::recency::TipSource;
-use melin_raft::rpc_server::{RaftApi, RpcServerConfig, serve};
+use melin_raft::rpc_server::{RaftApi, RpcServerConfig, SupersessionPolicy, serve};
 use melin_raft::types::{NodeId, TypeConfig};
 use melin_transport_core::cursors::AdvertisedJournalTip;
 use melin_transport_core::fence::FenceState;
@@ -93,6 +93,7 @@ async fn start_server() -> Harness {
         authorized_keys,
         peer_ids,
         tip: tip_at(0, 0),
+        supersession: None,
         vote_filter: std::sync::Mutex::new(Default::default()),
     });
     tokio::spawn(serve(listener, MockApi, cfg, Arc::clone(&shutdown)));
@@ -233,4 +234,62 @@ async fn oversized_frame_is_refused() {
     .unwrap_or(0);
     assert_eq!(n, 0, "expected EOF after oversized frame");
     h.shutdown.store(true, Ordering::Relaxed);
+}
+
+/// Fence-on-supersession over a real socket: a serving node that reads a
+/// peer envelope advertising a strictly higher fencing epoch self-fences
+/// and co-sets the shutdown flag — the raft mesh as a fencing channel.
+#[tokio::test]
+async fn serving_node_fences_on_higher_peer_epoch() {
+    let client_key = SigningKey::from_bytes(&[0x11; 32]);
+    let table = format!(
+        "replication {} node-2\n",
+        base64::engine::general_purpose::STANDARD.encode(client_key.verifying_key().to_bytes())
+    );
+    let authorized_keys = Arc::new(AuthorizedKeys::parse(&table).unwrap());
+    let peer_ids = Arc::new(HashMap::from([(
+        client_key.verifying_key().to_bytes(),
+        2u64,
+    )]));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let process_shutdown = Arc::new(AtomicBool::new(false));
+
+    // The server node serves at epoch 5.
+    let fence = Arc::new(FenceState::new(5));
+    let cfg = Arc::new(RpcServerConfig {
+        authorized_keys,
+        peer_ids,
+        tip: Arc::new(TipSource {
+            fence: Arc::clone(&fence),
+            seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0)),
+            ready: Arc::new(AtomicBool::new(true)),
+        }),
+        supersession: Some(SupersessionPolicy {
+            fence: Arc::clone(&fence),
+            shutdown: Arc::clone(&process_shutdown),
+            serving: Arc::new(|| true),
+        }),
+        vote_filter: std::sync::Mutex::new(Default::default()),
+    });
+    tokio::spawn(serve(listener, MockApi, cfg, Arc::clone(&shutdown)));
+
+    // A peer whose envelopes advertise epoch 7 — a newer tenure exists.
+    let mut factory = RaftClientFactory::new(Arc::new(client_key.clone()), tip_at(7, 100));
+    let mut client = factory.new_client(1, &BasicNode { addr }).await;
+    // The RPC itself may succeed or fail (the server may begin shutting
+    // down mid-exchange) — the assertion is the fencing side effect.
+    let _ = client.vote(vote_req_from(2), opt()).await;
+
+    assert!(
+        fence.is_fenced(),
+        "server must self-fence on a higher peer epoch"
+    );
+    assert!(
+        process_shutdown.load(Ordering::Relaxed),
+        "supersession must co-set the process shutdown flag"
+    );
+    shutdown.store(true, Ordering::Relaxed);
 }

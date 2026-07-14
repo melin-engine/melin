@@ -88,6 +88,7 @@ pub fn spawn(
     signing_key: Arc<SigningKey>,
     authorized_keys: Arc<AuthorizedKeys>,
     tip: Arc<TipSource>,
+    supersession: Option<crate::rpc_server::SupersessionPolicy>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<RaftHandles> {
     let self_peer = config
@@ -171,6 +172,7 @@ pub fn spawn(
                 authorized_keys,
                 thread_status,
                 thread_tip,
+                supersession,
                 shutdown,
             ));
         })
@@ -201,6 +203,7 @@ async fn driver_main(
     authorized_keys: Arc<AuthorizedKeys>,
     status: Arc<RaftStatus>,
     tip: Arc<TipSource>,
+    supersession: Option<crate::rpc_server::SupersessionPolicy>,
     shutdown: Arc<AtomicBool>,
 ) {
     let raft_config = Config {
@@ -252,6 +255,7 @@ async fn driver_main(
         authorized_keys,
         peer_ids: Arc::new(peer_ids),
         tip: Arc::clone(&tip),
+        supersession,
         vote_filter: std::sync::Mutex::new(Default::default()),
     });
     let rpc_task = tokio::spawn(serve(

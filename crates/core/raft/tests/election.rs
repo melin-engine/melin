@@ -97,6 +97,7 @@ fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
             Arc::new(keys[i].clone()),
             Arc::clone(&authorized_keys),
             tip,
+            None, // no supersession policy — election-only test nodes
             Arc::clone(&shutdown),
         )
         .expect("driver spawn");

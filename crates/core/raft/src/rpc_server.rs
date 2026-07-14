@@ -113,6 +113,10 @@ pub struct RpcServerConfig {
     /// Local journal tip: stamped on every response envelope, and the
     /// voter side of the recency filter below.
     pub tip: Arc<TipSource>,
+    /// Fence-on-supersession (see [`SupersessionPolicy`]); `None` when
+    /// auto-promotion is off — without automation, fencing stays a
+    /// data-plane-contact concern exactly as documented today.
+    pub supersession: Option<SupersessionPolicy>,
     /// Journal-tip vote filter (see `crate::recency`). One per node —
     /// its drop counter is *this voter's* view of election progress, so
     /// it is shared across peer connections. A `std::sync::Mutex` (not
@@ -121,7 +125,47 @@ pub struct RpcServerConfig {
     pub vote_filter: std::sync::Mutex<VoteFilter>,
 }
 
+/// The raft peer mesh as an additional fencing channel. Every inbound
+/// envelope carries the sender's journal-tip *fencing epoch*; a node
+/// that currently claims to be serving (a primary, or a replica whose
+/// promotion is already in flight) and observes a strictly higher epoch
+/// has been superseded — it self-fences and shuts down, exactly like
+/// the data-plane handshake path (`FenceState::fence_if_superseded`).
+/// This closes the split-brain window faster than waiting for a
+/// data-plane connection to cross: raft heartbeats flow continuously.
+pub struct SupersessionPolicy {
+    pub fence: Arc<melin_transport_core::fence::FenceState>,
+    /// Process shutdown flag, co-set on supersession (self-demotion).
+    pub shutdown: Arc<AtomicBool>,
+    /// Whether this node currently claims to be serving. A closure
+    /// because the claim is role-dependent and owned by the server
+    /// runtime: primaries always claim; replicas claim once a
+    /// promotion has been filed.
+    pub serving: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
 impl RpcServerConfig {
+    /// Feed an inbound envelope's advertised fencing epoch to the
+    /// supersession policy, if one is armed and this node is serving.
+    fn observe_peer_epoch(&self, peer_epoch: u64) {
+        let Some(policy) = &self.supersession else {
+            return;
+        };
+        if !(policy.serving)() {
+            return;
+        }
+        if policy
+            .fence
+            .fence_if_superseded(peer_epoch, &policy.shutdown)
+            == Some(true)
+        {
+            warn!(
+                peer_epoch,
+                "raft peer advertises a higher fencing epoch — this node is superseded; fencing"
+            );
+        }
+    }
+
     /// Recency-filter verdict for an inbound vote request whose envelope
     /// advertised `candidate_tip`. Also the tip-readiness gate: before
     /// recovery seeds the local tip, no vote may be delivered at all.
@@ -235,6 +279,10 @@ async fn handle_connection<A: RaftApi>(
             );
             return;
         }
+
+        // Fence-on-supersession: every peer envelope advertises the
+        // sender's fencing epoch (see `SupersessionPolicy`).
+        cfg.observe_peer_epoch(frame.tip_epoch);
 
         // Journal-tip recency filter (see `crate::recency`): a vote
         // request from a candidate behind our own tip is dropped before

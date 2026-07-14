@@ -62,6 +62,7 @@ pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftConf
         if config.raft_node_id.is_some()
             || !config.raft_peer.is_empty()
             || config.raft_dir.is_some()
+            || config.raft_auto_promote
         {
             return Err(
                 "raft flags (--raft-node-id/--raft-peer/--raft-dir) require --raft-bind".to_owned(),
@@ -85,6 +86,12 @@ pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftConf
     if !peers.iter().any(|p| p.id == node_id) {
         return Err(format!(
             "--raft-peer list must include this node (id {node_id}) with its dialable address"
+        ));
+    }
+    if config.raft_auto_promote && peers.len() < 3 {
+        return Err(format!(
+            "--raft-auto-promote requires at least 3 configured voters, got {} — a two-node              cluster cannot elect a leader after losing either node, so automatic failover              would never fire while inviting misconfiguration; run manual PROMOTE instead",
+            peers.len()
         ));
     }
     let dir = config
@@ -111,6 +118,10 @@ pub(crate) fn spawn_raft_driver(
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
     journal_tip: melin_transport_core::AdvertisedJournalTip,
     tip_ready: Arc<AtomicBool>,
+    // Whether this node currently claims to be serving — the
+    // fence-on-supersession trigger (see `SupersessionPolicy`).
+    // Primaries pass `|| true`; replicas pass a promotion-filed check.
+    serving_claim: Arc<dyn Fn() -> bool + Send + Sync>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<Option<RaftHandles>, Box<dyn std::error::Error>> {
     let Some(raft_config) = build_raft_config(config)? else {
@@ -128,11 +139,23 @@ pub(crate) fn spawn_raft_driver(
         seq: journal_tip,
         ready: tip_ready,
     });
+    // The raft mesh doubles as a fencing channel only under
+    // auto-promotion: without automation, a serving node's fencing
+    // stays a data-plane-contact concern exactly as documented.
+    let supersession =
+        config
+            .raft_auto_promote
+            .then(|| melin_raft::rpc_server::SupersessionPolicy {
+                fence: Arc::clone(fence_state),
+                shutdown: Arc::clone(shutdown),
+                serving: serving_claim,
+            });
     let handles = melin_raft::driver::spawn(
         raft_config,
         Arc::new(signing_key.clone()),
         Arc::clone(authorized_keys),
         tip,
+        supersession,
         Arc::clone(shutdown),
     )?;
     Ok(Some(handles))
