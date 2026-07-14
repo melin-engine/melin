@@ -1,0 +1,42 @@
+[package]
+name = "melin-raft"
+version = "0.11.0"
+edition = "2024"
+license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Control-plane consensus: leader election, membership, and fencing epochs on openraft"
+
+[lib]
+name = "melin_raft"
+path = "src/lib.rs"
+
+[dependencies]
+# Control-plane consensus engine. Pinned to the 0.9 stable line (0.10 is
+# alpha). Feature choices are load-bearing:
+#   - `single-term-leader`: standard-Raft leader IDs — at most one leader
+#     per term, terms strictly increase per leader tenure. The
+#     term-mints-fencing-epoch design depends on this; the default mode
+#     allows two leaders to share a term.
+#   - `serde`: serializable RPC/log types for our postcard wire format.
+#   - `storage-v2`: the split RaftLogStorage/RaftStateMachine traits.
+openraft = { version = "0.9", features = ["serde", "single-term-leader", "storage-v2"] }
+# Current-thread runtime confined to the single raft-driver thread —
+# openraft requires an async runtime; the data plane stays synchronous.
+# openraft already pulls every feature here except `net`.
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "io-util", "macros"] }
+serde = { version = "1", features = ["derive"] }
+# Wire/storage serialization. Postcard over bincode: compact varint
+# encoding, and no encoder/decoder configuration knobs (fixint vs varint,
+# endianness, limits) that can silently diverge between peers.
+postcard = { version = "1", features = ["use-std"] }
+crc32c = "0.6"
+ed25519-dalek = { workspace = true }
+tracing = { workspace = true }
+melin-app = { path = "../app", version = "0.11.0" }
+melin-transport-core = { path = "../transport-core", version = "0.11.0" }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
