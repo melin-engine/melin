@@ -2,7 +2,10 @@
 //! hybrid durability, raft + `--raft-auto-promote` on all three), real
 //! TCP and real Ed25519 auth throughout. Kill the primary; exactly one
 //! replica must win the election and promote itself into a serving
-//! primary, and the other must keep following.
+//! primary, and the other must keep following. Then the killed primary
+//! comes back on its stale epoch-0 journal — the raft peer mesh must
+//! fence it (fence-on-supersession) so it self-demotes rather than
+//! serving clients alongside the new primary.
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
@@ -235,6 +238,67 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
             "the losing replica must not report leadership: {m}"
         );
     }
+
+    // --- Phase 4: the killed primary comes back and must be fenced by the
+    // raft mesh. It recovers its stale epoch-0 journal and so boots as a
+    // primary that *claims to be serving* — exactly the split-brain risk
+    // fencing exists to close. It cannot disrupt the new leader: the
+    // recency filter drops its epoch-0 vote requests, and its raft log is
+    // missing the winner's post-election entry so no caught-up peer will
+    // grant it either. The leader therefore stays put, and its next append
+    // — inbound to this node — trips `fence_if_superseded`, which co-sets
+    // the process shutdown flag. That flag is the very Arc we hand to
+    // `run_with_listener` (the `SupersessionPolicy` holds a clone), so the
+    // node tears its own server down and the flag we never write to
+    // ourselves ends up set — the fingerprint of fence-on-supersession,
+    // the only thing that stops a serving node from the inside (a driver
+    // fatal leaves trading up). Requires `--raft-auto-promote` (already
+    // set), which is what arms the `SupersessionPolicy`.
+    let revived_shutdown = Arc::new(AtomicBool::new(false));
+    let revived_handle = {
+        // Reuse node 0's identity, raft address, journal, and raft dir; a
+        // fresh client/health port avoids the old ones lingering in
+        // TIME_WAIT. No replication bind — this exercises the raft-mesh
+        // fencing channel in isolation, not a data-plane handshake.
+        let mut config = make_config(0);
+        config.bind = free_addr();
+        config.health_bind = Some(free_addr());
+        let listener =
+            BlockingTcpListener::bind(config.bind).expect("bind revived primary client port");
+        let sd = Arc::clone(&revived_shutdown);
+        std::thread::spawn(move || -> Result<(), String> {
+            server::run_with_listener(
+                listener,
+                config,
+                CounterFactory,
+                RequestDecoder,
+                ResponseEncoder,
+                None,
+                sd,
+            )
+            .map_err(|e| e.to_string())
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !revived_handle.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "the revived ex-primary was never fenced by the raft mesh"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // We never write this flag ourselves, so its being set proves the
+    // node fenced itself (fence-on-supersession co-sets the process
+    // shutdown flag it shares with the runtime).
+    assert!(
+        revived_shutdown.load(Ordering::Relaxed),
+        "the revived node stopped without fencing — supersession did not fire"
+    );
+    revived_handle
+        .join()
+        .expect("revived primary thread panicked")
+        .expect("revived primary returned an error instead of fencing cleanly");
 
     // Teardown.
     replica_shutdown.store(true, Ordering::Relaxed);
