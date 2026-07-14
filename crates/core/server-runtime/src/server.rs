@@ -2871,6 +2871,9 @@ fn spawn_health_endpoint(
             journal_utilization: Arc::clone(journal_utilization),
             matching_utilization: Arc::clone(matching_utilization),
             response_utilization: Arc::clone(response_utilization),
+            // Wired by the raft driver spawn once control-plane raft lands
+            // on the primary path; None keeps the gauges absent until then.
+            raft: None,
         },
         Arc::clone(shutdown),
     )?))
