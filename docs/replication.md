@@ -171,11 +171,101 @@ directions, and enforces two rules:
   target if this fires persistently.
 
 No operator action is needed to *enable* fencing; it is always on
-when replication is configured. The remaining gap is two promotions
-issued independently during the same outage: both new primaries land
-on the same epoch and fencing cannot distinguish them. Promote exactly
-one replica per failover — coordinated election lands with the
-automatic-failover roadmap item.
+when replication is configured. Without the control plane (below), one
+gap remains: two promotions issued independently during the same outage
+land on the same epoch and fencing cannot distinguish them — promote
+exactly one replica per failover. With the control plane enabled,
+election-driven promotions stamp their (unique, strictly increasing)
+election term as the new epoch, closing that gap.
+
+## Control plane: coordinated election and automatic failover
+
+Nodes can optionally run a **control-plane consensus service** (Raft)
+that carries leader election, cluster membership, and fencing epochs —
+and nothing else. Order flow stays on the replication path above, and
+the durability modes are unchanged. The control plane is fully isolated
+from trading: losing control-plane quorum never halts or slows the
+data plane; failover simply degrades to the manual `PROMOTE` playbook
+until quorum returns.
+
+Enable it per node with:
+
+| Flag | Purpose |
+|---|---|
+| `--raft-bind <addr>` | Control-plane listener (kernel TCP, also on DPDK nodes). Enables the control plane. |
+| `--raft-node-id <id>` | This node's id (non-zero, unique per cluster). |
+| `--raft-peer <id@host:port#base64-pubkey>` | One cluster member (repeatable). Give **every node the same list, including an entry for the node itself**. The pubkey pins the peer's identity: a connection authenticated with a different key cannot speak for that id. |
+| `--raft-dir <path>` | Durable election state. Defaults to the journal path with a `.raft` extension. |
+| `--raft-auto-promote` | Act on election wins (below). Off by default. |
+
+Peer links authenticate with the same Ed25519 replication keys as the
+data plane (`replication` permission in `authorized_keys`), so
+`--replication-key` is required on every raft-enabled node, primaries
+included. Election state is observable on every node's `--health-bind`
+endpoint via the `melin_raft_*` gauges (node id, term, leader, role,
+whether the driver is running) — raft-enabled replicas serve a minimal
+`/metrics` for exactly this purpose.
+
+With `--raft-bind` alone the election is **observational**: leadership
+is elected and exported, but promotion stays operator-driven. Elections
+steer toward the most-caught-up node — candidates advertise their
+journal position and peers holding more data decline to vote for them —
+so the elected leader is the right node to `PROMOTE`.
+
+### Automatic failover (`--raft-auto-promote`)
+
+With `--raft-auto-promote`, a replica that wins an election promotes
+itself: the election term is journaled as the new fencing epoch, so any
+two election-driven promotions always mint distinct epochs and the
+newer fences the older. Expect sub-5-second failover: the election
+timeout (1–2 s) plus the promotion itself (sub-second).
+
+Auto-promotion is deliberately conservative. The elected replica
+**refuses** to promote — logging the reason — when:
+
+- its journal recovery hasn't finished (its advertised position isn't
+  trustworthy yet);
+- it has been fenced (a newer primary exists);
+- its replication link to the primary is still up (a live primary must
+  never be deposed by control-plane noise);
+- the primary was acking under `local` durability — acks never waited
+  for any replica, so no election can prove the winner holds every
+  acked order; failover stays a manual, eyes-on decision under `local`;
+- manual promotions have outrun election terms (the term must be
+  strictly above the epoch in force; the alignment heals as terms
+  advance — promote manually in the interim).
+
+Manual `PROMOTE` remains available at all times, including during a
+control-plane outage; whichever request is filed first wins, and a
+later duplicate cannot retarget an in-flight promotion.
+
+Under auto-promotion the raft peer mesh also becomes an additional
+fencing channel: a serving primary whose peers advertise a higher
+fencing epoch self-fences and shuts down immediately, without waiting
+for a data-plane connection to cross.
+
+### Deployment rules
+
+- **Three voters minimum for auto-promotion.** A two-node cluster
+  cannot elect a leader after losing either node, so automation would
+  never fire when needed; the server refuses to start with
+  `--raft-auto-promote` and fewer than three configured voters.
+  Two-node deployments keep today's manual `PROMOTE` playbook (the
+  observational election still works).
+- **`--raft-dir` is durable state.** Keep it on the same durability
+  class as the journal. Never restart a node with a wiped raft dir
+  while its peers are live — a forgotten vote can be granted twice in
+  the same term, undermining the epoch guarantee. If the dir is lost,
+  restart that node last, after a leader is established, or with the
+  raft flags off.
+- **Membership is static on this release.** The `--raft-peer` list is
+  fixed at first boot (later flag changes are ignored in favor of the
+  stored membership, with a warning). Surviving replicas do **not**
+  automatically re-point `--replica-of` at a newly promoted primary —
+  reconnecting them is still operator work after a failover.
+- **Same peer list everywhere.** Identical `--raft-peer` lists
+  (including each node's own entry) keep the first-boot membership
+  consistent across the cluster.
 
 ## Journal mirroring and divergence detection
 
@@ -407,27 +497,37 @@ normal-case post-recovery state.
   return to target.
 - Every admin `DURABILITY` swap emits an info-level audit log with
   the `prev → next` transition.
+- On raft-enabled nodes, the `melin_raft_node_id` / `melin_raft_term` /
+  `melin_raft_leader_id` / `melin_raft_role` / `melin_raft_is_leader` /
+  `melin_raft_driver_running` gauges expose control-plane election
+  state on every node, replicas included. Alert on
+  `melin_raft_driver_running` dropping to 0 (the control plane died —
+  trading continues, but automatic failover is offline) and on a
+  sustained absence of any node reporting `melin_raft_is_leader 1`
+  (control-plane quorum lost).
 
 ## Limitations
 
-### Fencing cannot distinguish concurrent promotions
+### Concurrent manual promotions on non-raft deployments
 
-Epoch fencing (see above) demotes a stale primary as soon as any
-higher-epoch node contacts it, but two replicas promoted independently
-during the same outage land on the *same* epoch and neither fences the
-other. Until coordinated election lands (next item), the operator
-playbook is: promote exactly one replica per failover. A stale primary
+With the control plane enabled, election-driven promotions mint unique
+epochs and this limitation does not apply. Without it, epoch fencing
+demotes a stale primary as soon as any higher-epoch node contacts it,
+but two replicas promoted *manually and independently* during the same
+outage land on the *same* epoch and neither fences the other — promote
+exactly one replica per failover. On every deployment, a stale primary
 that never hears from a higher-epoch node (e.g. fully partitioned with
-its own replica set) also keeps trading until the partition heals —
-fencing triggers on contact, not on a timer.
+its own replica set) keeps trading until the partition heals — fencing
+triggers on contact, not on a timer.
 
-### No automatic failover
+### Static control-plane membership
 
-Promotion is operator-driven via the `--admin-bind` endpoint. Leader
-election and automatic promotion are on the roadmap, built on a
-control-plane Raft integration: Raft carries election, membership,
-and fencing epochs only, while order flow stays on the existing
-replication path and keeps the durability modes unchanged.
+The voter set is fixed at first boot (see "Deployment rules"). Runtime
+voter add/remove/replace — and with it automatic re-pointing of
+surviving replicas at a newly promoted primary — is roadmap work.
+Replacing a dead voter today means standing up the whole cluster's
+control plane again with a fresh peer list (fresh `--raft-dir`s), while
+the data plane keeps running unaffected.
 
 ### No offline journal inspector
 
