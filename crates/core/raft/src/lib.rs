@@ -8,6 +8,7 @@
 //! the design.
 
 pub mod auth;
+pub mod driver;
 pub mod network;
 pub mod rpc_server;
 pub mod storage;

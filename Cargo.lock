@@ -1226,6 +1226,7 @@ dependencies = [
  "melin-example-counter",
  "melin-journal",
  "melin-pipeline",
+ "melin-raft",
  "melin-transport-core",
  "melin-wire-protocol",
  "proptest",
