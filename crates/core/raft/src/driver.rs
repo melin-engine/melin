@@ -257,7 +257,7 @@ async fn driver_main(
     let rpc_task = tokio::spawn(serve(
         tokio_listener,
         raft.clone(),
-        rpc_cfg,
+        Arc::clone(&rpc_cfg),
         Arc::clone(&shutdown),
     ));
 
@@ -305,6 +305,20 @@ async fn driver_main(
             .leader_id
             .store(m.current_leader.unwrap_or(0), Ordering::Relaxed);
         status.role.store(role_of(m.state), Ordering::Relaxed);
+        if m.current_leader.is_some() {
+            // A leader exists — elections are working, so re-arm the
+            // journal-tip vote filter's liveness escape. Without this a
+            // node that is *itself* the leader would never re-arm (it
+            // receives no appends), and drops accumulated across
+            // leadership churn would eventually open the escape while
+            // the cluster is healthy. See `crate::recency`.
+            // Poisoning unreachable under panic=abort.
+            rpc_cfg
+                .vote_filter
+                .lock()
+                .expect("vote filter mutex poisoned")
+                .leader_observed();
+        }
         if let Err(fatal) = &m.running_state {
             // The raft core died (e.g. persistent storage error). Trading
             // is unaffected by construction — the data plane never calls

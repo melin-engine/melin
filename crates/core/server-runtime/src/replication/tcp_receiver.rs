@@ -406,7 +406,10 @@ pub fn run_receiver<A, W>(
     journal_path: &std::path::Path,
     signing_key: &ed25519_dalek::SigningKey,
     shutdown: &AtomicBool,
-    promote: &crate::promotion::PromotionRequest,
+    // The handles this loop shares with the admin endpoint and the
+    // control-plane raft driver — see [`super::ReplicaControlPlane`]
+    // for each field's contract.
+    control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
@@ -415,16 +418,6 @@ pub fn run_receiver<A, W>(
     busy_spin: bool,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
-    // Flipped `true` once recovery has seeded the fence epoch and the
-    // advertised tip — until then the raft driver refuses to grant votes.
-    // See `melin_raft::recency::TipSource`.
-    tip_ready: &AtomicBool,
-    // Sequence half of the control-plane advertised tip. This receiver
-    // owns it for the replica phase of the process (seeded from recovery,
-    // advanced to the in-memory accepted position while streaming); after
-    // a promotion the new primary's journal stage takes over the same
-    // handle. See `AdvertisedJournalTip`.
-    journal_tip: melin_transport_core::AdvertisedJournalTip,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -434,6 +427,13 @@ where
     W: JournalWrite<A::Event> + Send + 'static,
     JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
+    let super::ReplicaControlPlane {
+        promote,
+        tip_ready,
+        journal_tip,
+        primary_link_up,
+        primary_acking_mode,
+    } = control;
     // Recover whenever any journal segment survives — live OR archived;
     // fresh replicas get `(None, None, 0, zeros)`. See
     // `recover_replica_state` for the lineage rules.
@@ -463,6 +463,10 @@ where
 
     // --- Outer reconnect loop ---
     loop {
+        // No authenticated session while (re)connecting — the raft
+        // driver may auto-promote from here on if it wins an election.
+        primary_link_up.store(false, Ordering::Release);
+
         if let Some(p) = pipeline.as_ref() {
             // The handshake pair (last_sequence, chain_hash) must come
             // from ONE FsyncState snapshot — the journal stage keeps
@@ -554,6 +558,9 @@ where
             continue;
         }
         info!("authenticated with primary");
+        // The primary is demonstrably alive from here until this
+        // session ends — the raft driver must not auto-promote past it.
+        primary_link_up.store(true, Ordering::Release);
 
         // --- Handshake ---
         // Advertise our fencing epoch. If we are ahead of the primary it
@@ -584,6 +591,7 @@ where
                 segment_start_sequence,
                 anchor_hash,
                 epoch,
+                durability_mode,
             } => {
                 // Fence: refuse to follow a primary whose epoch is behind
                 // ours — following its (divergent) lineage on top of our
@@ -605,8 +613,12 @@ where
                 }
                 // Adopt the primary's epoch immediately; streamed `EpochBump`s
                 // keep it current thereafter.
+                // Adopt the primary's epoch immediately; streamed `EpochBump`s
+                // keep it current thereafter. Likewise the acking mode
+                // (heartbeats keep it current mid-session).
                 fence_state.observe_epoch(epoch);
-                info!(start_sequence, epoch, "streaming started");
+                primary_acking_mode.store(durability_mode, Ordering::Release);
+                info!(start_sequence, epoch, durability_mode, "streaming started");
                 ((segment_start_sequence, anchor_hash), last_sequence)
             }
             ref resync @ (PrimaryMessage::NeedSnapshot | PrimaryMessage::HashMismatch) => {
@@ -625,7 +637,7 @@ where
                     journal_path,
                     &snapshot_path,
                     &fence_state,
-                    &journal_tip,
+                    control,
                     &mut last_sequence,
                     &mut chain_hash,
                 )
@@ -707,7 +719,7 @@ where
                             input_producer,
                             journal_cursor,
                             shutdown,
-                            promote,
+                            control,
                             pipeline_depth,
                             busy_spin,
                             session_start,
@@ -715,7 +727,6 @@ where
                             None,
                             stream_marks,
                             journal_failed,
-                            &journal_tip,
                         )
                     })
                     .expect("spawn replica-receiver thread");
@@ -723,6 +734,7 @@ where
             })
         };
 
+        primary_link_up.store(false, Ordering::Release);
         match handle_session_exit(
             result,
             &mut pipeline,

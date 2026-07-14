@@ -821,13 +821,15 @@ where
             "loaded authorized keys (replica mode)"
         );
 
-        // Shared admin state: constructed before mode-detection so it
-        // survives a replica → primary transition. The promotion request
-        // is a one-shot consumed by the replica's receive loop; its
-        // pending epoch floor feeds the tenure's `EpochBump` (see
-        // `crate::promotion`). The rotate flag is re-wired into the new
-        // primary's journal stage by `run_as_primary`.
-        let promotion_request = crate::promotion::PromotionRequest::new();
+        // The replica's control-plane bundle: promotion request (admin
+        // PROMOTE / raft auto-promotion), tip readiness + advertised
+        // journal tip (vote recency), primary link state, and the
+        // primary's advertised acking mode. Constructed before
+        // mode-detection so it survives a replica → primary transition.
+        // The rotate flag is re-wired into the new primary's journal
+        // stage by `run_as_primary`.
+        let control = crate::replication::ReplicaControlPlane::new();
+        let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
@@ -852,20 +854,18 @@ where
         // flags — survives a replica → primary promotion untouched: it
         // shares the process shutdown flag and runs on its own thread.
         // The advertised tip isn't trustworthy until journal recovery
-        // seeds the fence epoch and sequence, so `tip_ready` starts false
-        // and the receiver flips it — until then the driver refuses to
-        // grant votes. The receiver owns the sequence half until a
-        // promotion hands it to the new primary's journal stage.
-        let tip_ready = Arc::new(AtomicBool::new(false));
-        let journal_tip =
-            melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0));
+        // seeds the fence epoch and sequence, so `control.tip_ready`
+        // starts false and the receiver flips it — until then the driver
+        // refuses to grant votes. The receiver owns the sequence half
+        // until a promotion hands it to the new primary's journal stage.
+        let journal_tip = control.journal_tip.clone();
         let raft_handles = crate::raft::spawn_raft_driver(
             &config,
             &signing_key,
             &authorized_keys,
             &fence_state,
             journal_tip.clone(),
-            Arc::clone(&tip_ready),
+            Arc::clone(&control.tip_ready),
             &shutdown,
         )?;
         let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
@@ -885,7 +885,7 @@ where
             &config.journal,
             &signing_key,
             &shutdown,
-            &promotion_request,
+            &control,
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
@@ -894,8 +894,6 @@ where
             !config.yield_idle,
             Arc::clone(&factory),
             Arc::clone(&fence_state),
-            &tip_ready,
-            journal_tip.clone(),
         )? {
             None => {
                 crate::raft::stop_replica_health(replica_health);
@@ -1481,6 +1479,7 @@ where
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
+        let sender_durability = Arc::clone(&durability_mode_atomic);
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -1501,6 +1500,7 @@ where
                         heartbeat_secs,
                         busy_spin,
                         fence_state: sender_fence,
+                        durability_mode: sender_durability,
                     },
                     &s_repl,
                     &ready_flag,
@@ -2127,9 +2127,10 @@ where
             ed25519_dalek::SigningKey::from_bytes(&bytes)
         };
 
-        // Shared admin flags, same shape as the kernel TCP replica path
-        // — see `run` for the rationale on lifetime.
-        let promotion_request = crate::promotion::PromotionRequest::new();
+        // The replica's control-plane bundle, same shape as the kernel
+        // TCP replica path — see `run` for the rationale on lifetime.
+        let control = crate::replication::ReplicaControlPlane::new();
+        let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
@@ -2153,16 +2154,14 @@ where
         // control plane is off the hot path and must not consume a DPDK
         // queue. Same promotion-surviving placement and tip ownership as
         // the kernel replica path.
-        let tip_ready = Arc::new(AtomicBool::new(false));
-        let journal_tip =
-            melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0));
+        let journal_tip = control.journal_tip.clone();
         let raft_handles = crate::raft::spawn_raft_driver(
             &config,
             &signing_key,
             &authorized_keys,
             &fence_state,
             journal_tip.clone(),
-            Arc::clone(&tip_ready),
+            Arc::clone(&control.tip_ready),
             &shutdown,
         )?;
         let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
@@ -2197,7 +2196,7 @@ where
             &signing_key,
             &config.journal,
             &shutdown,
-            &promotion_request,
+            &control,
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
@@ -2206,8 +2205,6 @@ where
             !config.yield_idle,
             Arc::clone(&factory),
             Arc::clone(&fence_state),
-            &tip_ready,
-            journal_tip.clone(),
         )? {
             None => {
                 crate::raft::stop_replica_health(replica_health);
@@ -2613,6 +2610,7 @@ where
             batch_size,
             heartbeat_secs,
             Arc::clone(&fence_state),
+            Arc::clone(&durability_mode_atomic),
             Arc::clone(&authorized_keys),
         );
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys

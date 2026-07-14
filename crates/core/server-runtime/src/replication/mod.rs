@@ -138,6 +138,67 @@ pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
 pub use tcp_receiver::{ReceiverResult, run_receiver};
 pub use tcp_sender::{Sender, run_sender};
 
+/// The handles a replica's receive loop shares with the rest of the
+/// node — the admin endpoint and the control-plane raft driver.
+/// Bundled (rather than five positional parameters) because they
+/// always travel together through the kernel-TCP and DPDK receiver
+/// signatures, and a transposition between same-typed flags is exactly
+/// the bug a bundle prevents.
+#[derive(Clone)]
+pub struct ReplicaControlPlane {
+    /// Promotion request: polled by the receive loop; filed by the
+    /// admin `PROMOTE` command or the raft driver (auto-promotion).
+    pub promote: crate::promotion::PromotionRequest,
+    /// Flipped `true` once journal recovery has seeded the fence epoch,
+    /// so the raft driver can trust this node's advertised tip — see
+    /// `melin_raft::recency::TipSource`.
+    pub tip_ready: std::sync::Arc<AtomicBool>,
+    /// Sequence half of the advertised journal tip — see
+    /// [`melin_transport_core::AdvertisedJournalTip`].
+    pub journal_tip: melin_transport_core::AdvertisedJournalTip,
+    /// `true` while this replica holds an authenticated replication
+    /// connection to its primary. The raft driver refuses to
+    /// auto-promote while set: a live link means the primary is
+    /// demonstrably alive, and winning a control-plane election (e.g.
+    /// because a *different* node's raft died) must not depose a
+    /// healthy primary.
+    pub primary_link_up: std::sync::Arc<AtomicBool>,
+    /// The durability (acking) mode last advertised by the primary
+    /// (`DurabilityMode::as_u8`; `ACKING_MODE_UNKNOWN` until first
+    /// contact), refreshed by `StreamStart` and every `Heartbeat`. The
+    /// raft driver's auto-promotion refusal reads this — the mode the
+    /// *primary* acked under decides whether an election win proves
+    /// this replica holds every acked order, not this node's own
+    /// (possibly pre-staged) configuration. Falls back to the local
+    /// mode while unknown, which is exactly the pre-propagation
+    /// behavior.
+    pub primary_acking_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl ReplicaControlPlane {
+    /// Fresh handles for a replica boot: nothing requested, tip not
+    /// trustworthy yet, tip sequence 0, primary link down.
+    pub fn new() -> Self {
+        Self {
+            promote: crate::promotion::PromotionRequest::new(),
+            tip_ready: std::sync::Arc::new(AtomicBool::new(false)),
+            journal_tip: melin_transport_core::AdvertisedJournalTip::new(
+                melin_transport_core::WireSeq::new(0),
+            ),
+            primary_link_up: std::sync::Arc::new(AtomicBool::new(false)),
+            primary_acking_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                crate::durability_policy::ACKING_MODE_UNKNOWN,
+            )),
+        }
+    }
+}
+
+impl Default for ReplicaControlPlane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Diagnostic: emit a `tcp_info` span at debug level describing the
 /// kernel's view of the socket (rtt, cwnd, retrans, unacked, rcv_space,
 /// rto). Guarded internally with `tracing::enabled!` so the
@@ -893,7 +954,7 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     journal_path: &std::path::Path,
     snapshot_path: &std::path::Path,
     fence_state: &melin_transport_core::fence::FenceState,
-    journal_tip: &melin_transport_core::AdvertisedJournalTip,
+    control: &ReplicaControlPlane,
     last_sequence: &mut u64,
     chain_hash: &mut [u8; 32],
 ) -> Result<ResyncDecision, Box<dyn std::error::Error + Send + Sync>>
@@ -946,7 +1007,9 @@ where
     // the archived suffix is either divergent (never acked) or being
     // replaced wholesale, so this is the one legitimate tip regression
     // (see `AdvertisedJournalTip::reset`).
-    journal_tip.reset(melin_transport_core::WireSeq::new(0));
+    control
+        .journal_tip
+        .reset(melin_transport_core::WireSeq::new(0));
 
     let (snap_exchange, snap_sequence, snap_chain_hash, seed_len) =
         match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path, fence_state) {
@@ -988,6 +1051,7 @@ where
             segment_start_sequence,
             anchor_hash,
             epoch,
+            durability_mode,
         } => {
             if segment_start_sequence != seeded_info.starting_sequence
                 || anchor_hash != seeded_info.anchor_hash
@@ -1004,14 +1068,20 @@ where
             // epoch wholesale (no stale-primary refusal — our prior state
             // was discarded).
             fence_state.observe_epoch(epoch);
+            control
+                .primary_acking_mode
+                .store(durability_mode, Ordering::Release);
             tracing::info!(
                 start_sequence,
                 epoch,
+                durability_mode,
                 "streaming resumed after snapshot transfer"
             );
             // The transfer is installed and validated: the node's holdings
             // are exactly the snapshot position again.
-            journal_tip.reset(melin_transport_core::WireSeq::new(snap_sequence));
+            control
+                .journal_tip
+                .reset(melin_transport_core::WireSeq::new(snap_sequence));
             Ok(ResyncDecision::Ready {
                 segment_start_sequence,
                 anchor_hash,
@@ -1138,7 +1208,8 @@ mod tests {
     fn stream_start_encode_decode_round_trip() {
         let mut buf = Vec::new();
         // Non-zero epoch so a dropped/zeroed field is caught.
-        encode_stream_start(99, 42, [0xAA; 32], 5, &mut buf);
+        // Non-zero epoch/mode so a dropped/zeroed field is caught.
+        encode_stream_start(99, 42, [0xAA; 32], 5, 2, &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
@@ -1148,10 +1219,12 @@ mod tests {
                 segment_start_sequence,
                 anchor_hash,
                 epoch,
+                durability_mode,
             } => {
                 assert_eq!(start_sequence, 99);
                 assert_eq!(segment_start_sequence, 42);
                 assert_eq!(anchor_hash, [0xAA; 32]);
+                assert_eq!(durability_mode, 2);
                 assert_eq!(epoch, 5);
             }
             _ => panic!("expected StreamStart"),
@@ -1161,13 +1234,17 @@ mod tests {
     #[test]
     fn heartbeat_encode_decode_round_trip() {
         let mut buf = Vec::new();
-        encode_heartbeat(123, &mut buf);
+        encode_heartbeat(123, 2, &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
         match msg {
-            PrimaryMessage::Heartbeat { sequence } => {
+            PrimaryMessage::Heartbeat {
+                sequence,
+                durability_mode,
+            } => {
                 assert_eq!(sequence, 123);
+                assert_eq!(durability_mode, 2);
             }
             _ => panic!("expected Heartbeat"),
         }
@@ -1593,7 +1670,7 @@ mod tests {
 
         // Send StreamStart.
         let mut buf = Vec::new();
-        encode_stream_start(0, 1, [0u8; 32], 0, &mut buf); // fake lineage for test
+        encode_stream_start(0, 1, [0u8; 32], 0, 1, &mut buf); // fake lineage for test
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -1690,7 +1767,7 @@ mod tests {
         ));
 
         // Send StreamStart.
-        encode_stream_start(0, 1, [0u8; 32], 0, &mut buf);
+        encode_stream_start(0, 1, [0u8; 32], 0, 1, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -1722,11 +1799,11 @@ mod tests {
         // Heartbeat messages carry the last known sequence so the replica
         // can verify it hasn't missed any data.
         let mut buf = Vec::new();
-        encode_heartbeat(999, &mut buf);
+        encode_heartbeat(999, 1, &mut buf);
 
         let payload = &buf[4..];
         match decode_primary_message(payload).unwrap() {
-            PrimaryMessage::Heartbeat { sequence } => {
+            PrimaryMessage::Heartbeat { sequence, .. } => {
                 assert_eq!(sequence, 999);
             }
             other => panic!("expected Heartbeat, got {other:?}"),
@@ -1801,7 +1878,7 @@ mod tests {
         assert_eq!(handshake.chain_hash, [0xBB; 32]);
 
         // Send StreamStart echoing the replica's sequence.
-        encode_stream_start(handshake.last_sequence, 1, [0u8; 32], 0, &mut buf);
+        encode_stream_start(handshake.last_sequence, 1, [0u8; 32], 0, 1, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -1854,7 +1931,14 @@ mod tests {
             assert_eq!(handshake.epoch, 5, "replica advertises its real epoch");
 
             let mut buf = Vec::new();
-            encode_stream_start(handshake.last_sequence, 1, [0u8; 32], STALE_EPOCH, &mut buf);
+            encode_stream_start(
+                handshake.last_sequence,
+                1,
+                [0u8; 32],
+                STALE_EPOCH,
+                1,
+                &mut buf,
+            );
             writer.write_all(&buf).unwrap();
             writer.flush().unwrap();
         });

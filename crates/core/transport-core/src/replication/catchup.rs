@@ -423,6 +423,9 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     journal_path: &std::path::Path,
     publisher: CatchUpPublisher<'_>,
     shutdown: &AtomicBool,
+    // The primary's current acking mode, stamped on the post-transfer
+    // `StreamStart` (see the protocol docs). Opaque byte at this layer.
+    durability_mode: u8,
 ) -> io::Result<CatchUpResult> {
     use super::protocol::{encode_segment_seed_begin, encode_snapshot_begin, encode_stream_start};
 
@@ -526,6 +529,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
         seed_info.starting_sequence,
         seed_info.anchor_hash,
         snap_epoch,
+        durability_mode,
         &mut send_buf,
     );
     publisher(&send_buf)?;

@@ -270,6 +270,9 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// primary's epoch onto each `StreamStart` and to self-demote when a
     /// replica handshakes with a higher epoch.
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    /// The active durability (acking) mode — stamped on `StreamStart`
+    /// and `Heartbeat` (see the kernel-TCP `Sender::durability_mode`).
+    durability_mode: Arc<std::sync::atomic::AtomicU8>,
     /// Operator key table. `Arc` because it's shared, read-only, with the
     /// client-auth path and the kernel-TCP sender; the driver only ever
     /// `lookup`s during a replica's challenge/response. Held by the driver
@@ -298,6 +301,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         batch_size: usize,
         heartbeat_secs: u64,
         fence_state: Arc<melin_transport_core::fence::FenceState>,
+        durability_mode: Arc<std::sync::atomic::AtomicU8>,
         authorized_keys: Arc<AuthorizedKeys>,
     ) -> Self {
         let [consumer_0, consumer_1] = repl_consumers;
@@ -341,6 +345,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             batch_size,
             heartbeat_interval: std::time::Duration::from_secs(heartbeat_secs),
             fence_state,
+            durability_mode,
             authorized_keys,
             _app: PhantomData,
         }
@@ -421,6 +426,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let replicas_connected = &self.replicas_connected;
         let metrics = &self.metrics;
         let fence_state = &self.fence_state;
+        let durability_mode = &self.durability_mode;
         let authorized_keys = &self.authorized_keys;
         let batch_size = self.batch_size;
         let heartbeat_interval = self.heartbeat_interval;
@@ -634,6 +640,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         lineage_start,
                                         lineage_anchor,
                                         fence_state.epoch(),
+                                        durability_mode.load(std::sync::atomic::Ordering::Relaxed),
                                         &mut slot.send_buf,
                                     );
                                     dpdk_publish(&slot.send_buf)
@@ -683,6 +690,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         journal_path,
                                         &mut dpdk_publish,
                                         shutdown,
+                                        durability_mode.load(std::sync::atomic::Ordering::Relaxed),
                                     )
                                 }) {
                                 Ok(CatchUpResult::Ok(end)) => {
@@ -999,7 +1007,11 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // 3. Heartbeat if idle.
                     if batches_sent == 0 && slot.last_send.elapsed() >= heartbeat_interval {
                         slot.send_buf.clear();
-                        encode_heartbeat(slot.sent.get(), &mut slot.send_buf);
+                        encode_heartbeat(
+                            slot.sent.get(),
+                            durability_mode.load(std::sync::atomic::Ordering::Relaxed),
+                            &mut slot.send_buf,
+                        );
                         transport.queue_send(handle, &slot.send_buf);
                         slot.last_send = std::time::Instant::now();
                     }
@@ -1039,7 +1051,9 @@ pub fn run_receiver_dpdk<A, W>(
     signing_key: &ed25519_dalek::SigningKey,
     journal_path: &std::path::Path,
     shutdown: &AtomicBool,
-    promote: &crate::promotion::PromotionRequest,
+    // The handles this loop shares with the admin endpoint and the
+    // control-plane raft driver — see [`super::ReplicaControlPlane`].
+    control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
@@ -1051,12 +1065,6 @@ pub fn run_receiver_dpdk<A, W>(
     // ...) alongside the empty-app constructor.
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    // Flipped `true` once recovery has seeded the fence epoch and the
-    // advertised tip — see the kernel-TCP `run_receiver`.
-    tip_ready: &AtomicBool,
-    // Sequence half of the control-plane advertised tip — see the
-    // kernel-TCP `run_receiver` for the ownership rules.
-    journal_tip: melin_transport_core::AdvertisedJournalTip,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -1079,6 +1087,13 @@ where
     // Fence epoch now reflects the recovered journal; seed the advertised
     // sequence from the same recovery, then let the raft driver trust
     // this node's tip. See the kernel-TCP `run_receiver`.
+    let super::ReplicaControlPlane {
+        promote,
+        tip_ready,
+        journal_tip,
+        primary_link_up,
+        primary_acking_mode,
+    } = control;
     journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
     tip_ready.store(true, Ordering::Release);
 
@@ -1113,6 +1128,10 @@ where
     // reconnect. Only `Promote` / `Shutdown` / snapshot-transfer / fatal
     // error tear it down.
     loop {
+        // No authenticated session while (re)connecting — the raft
+        // driver may auto-promote from here on if it wins an election.
+        primary_link_up.store(false, Ordering::Release);
+
         // Refresh handshake state from the running pipeline, if any.
         // The (last_sequence, chain_hash) pair must come from ONE
         // FsyncState snapshot — a torn pair read from two sources while
@@ -1278,6 +1297,9 @@ where
             continue;
         }
         info!("authenticated with primary (DPDK)");
+        // The primary is demonstrably alive from here until this
+        // session ends — the raft driver must not auto-promote past it.
+        primary_link_up.store(true, Ordering::Release);
 
         // Send handshake. Advertise our fencing epoch so a stale primary
         // self-demotes when it sees we are ahead (see `crate::fence`).
@@ -1329,6 +1351,7 @@ where
                             segment_start_sequence,
                             anchor_hash,
                             epoch,
+                            durability_mode,
                         } => {
                             // Fence: refuse a primary behind our epoch — its
                             // divergent lineage must not overwrite our more
@@ -1348,6 +1371,7 @@ where
                                 break 'handshake None; // caught by the None check below
                             }
                             fence_state.observe_epoch(epoch);
+                            primary_acking_mode.store(durability_mode, Ordering::Release);
                             info!(start_sequence, epoch, "streaming started (DPDK)");
                             break 'handshake Some((segment_start_sequence, anchor_hash));
                         }
@@ -1368,7 +1392,7 @@ where
                                 journal_path,
                                 &snapshot_path,
                                 &fence_state,
-                                &journal_tip,
+                                control,
                                 &mut last_sequence,
                                 &mut chain_hash,
                             );
@@ -1503,7 +1527,7 @@ where
                 input_producer,
                 journal_cursor,
                 shutdown,
-                promote,
+                control,
                 pipeline_depth,
                 busy_spin,
                 last_sequence,
@@ -1511,12 +1535,12 @@ where
                 None,
                 stream_marks,
                 journal_failed,
-                &journal_tip,
             );
             send_buf = dpdk_transport.send_buf;
             r
         };
 
+        primary_link_up.store(false, Ordering::Release);
         match handle_session_exit(
             result,
             &mut pipeline,
