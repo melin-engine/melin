@@ -10,6 +10,7 @@
 pub mod auth;
 pub mod driver;
 pub mod network;
+pub mod recency;
 pub mod rpc_server;
 pub mod storage;
 pub mod types;

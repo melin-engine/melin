@@ -579,6 +579,12 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     // cursor never advances, so waiting on it would wedge this thread
     // forever instead of tearing down for the reconnect/resync path.
     journal_failed: &AtomicBool,
+    // Control-plane advertised tip: advanced to the in-memory accepted
+    // position (`accum_end_sequence`) as frames are published, so raft
+    // vote filtering sees everything a promotion would carry into the
+    // journal — not just the fsynced position. See
+    // `AdvertisedJournalTip` for why the two differ.
+    journal_tip: &melin_transport_core::AdvertisedJournalTip,
 ) -> StreamingResult {
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);
@@ -593,6 +599,12 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     let mut last_sent_acked_seq: u64 = initial_sequence;
     let mut last_sent_in_memory_seq: u64 = initial_sequence;
     let mut last_committed_primary_seq: u64 = initial_sequence;
+
+    // The session resume point covers this node's holdings (post-recovery
+    // journal, or the just-installed snapshot); `advance` (not a store) so
+    // a reconnect whose handshake read the journal before the ring settled
+    // cannot regress the tip below data already accepted.
+    journal_tip.advance(melin_transport_core::WireSeq::new(initial_sequence));
 
     let mut received_data = false;
     let mut idle_spins: u32 = 0;
@@ -638,6 +650,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                     journal_failed,
                 );
                 accum_end_sequence = outcome.accum_end_sequence;
+                journal_tip.advance(melin_transport_core::WireSeq::new(accum_end_sequence));
                 compact_recv_buf(&mut recv_buf, outcome.consumed);
                 if outcome.any_published && !pending_acks.is_full() {
                     pending_acks.push(outcome.last_target, accum_end_sequence);
@@ -763,6 +776,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         );
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
+        journal_tip.advance(melin_transport_core::WireSeq::new(accum_end_sequence));
         received_data |= outcome.received_data;
         compact_recv_buf(&mut recv_buf, outcome.consumed);
 
@@ -986,6 +1000,12 @@ mod tests {
         std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()))
     }
 
+    /// Throwaway control-plane tip handle — these tests don't exercise
+    /// raft, they only need `streaming_loop` to have somewhere to write.
+    fn tip0() -> melin_transport_core::AdvertisedJournalTip {
+        melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0))
+    }
+
     // ---------------------------------------------------------------
     // streaming_loop tests
     // ---------------------------------------------------------------
@@ -1011,6 +1031,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -1044,6 +1065,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(matches!(result.exit, SessionExit::Promote));
@@ -1074,6 +1096,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -1106,6 +1129,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -1150,6 +1174,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(result.received_data);
@@ -1192,6 +1217,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -1231,6 +1257,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(matches!(result.exit, SessionExit::Fatal(_)));
@@ -1278,6 +1305,7 @@ mod tests {
                 None,
                 &no_marks(),
                 &AtomicBool::new(false),
+                &tip0(),
             );
 
             assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -1318,6 +1346,7 @@ mod tests {
             Some(&utilization),
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         let busy = utilization.busy.load(Ordering::Relaxed);
@@ -1818,6 +1847,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(
@@ -1882,6 +1912,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(
@@ -1935,6 +1966,7 @@ mod tests {
             None,
             &no_marks(),
             &AtomicBool::new(false),
+            &tip0(),
         );
 
         assert!(

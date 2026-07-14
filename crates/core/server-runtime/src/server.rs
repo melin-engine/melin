@@ -851,8 +851,23 @@ where
         // receive loop so the driver — like the fence state and admin
         // flags — survives a replica → primary promotion untouched: it
         // shares the process shutdown flag and runs on its own thread.
-        let raft_handles =
-            crate::raft::spawn_raft_driver(&config, &signing_key, &authorized_keys, &shutdown)?;
+        // The advertised tip isn't trustworthy until journal recovery
+        // seeds the fence epoch and sequence, so `tip_ready` starts false
+        // and the receiver flips it — until then the driver refuses to
+        // grant votes. The receiver owns the sequence half until a
+        // promotion hands it to the new primary's journal stage.
+        let tip_ready = Arc::new(AtomicBool::new(false));
+        let journal_tip =
+            melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0));
+        let raft_handles = crate::raft::spawn_raft_driver(
+            &config,
+            &signing_key,
+            &authorized_keys,
+            &fence_state,
+            journal_tip.clone(),
+            Arc::clone(&tip_ready),
+            &shutdown,
+        )?;
         let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
         // A raft-enabled replica exposes election gauges on --health-bind;
         // torn down before promotion so run_as_primary can rebind the port.
@@ -879,6 +894,8 @@ where
             !config.yield_idle,
             Arc::clone(&factory),
             Arc::clone(&fence_state),
+            &tip_ready,
+            journal_tip.clone(),
         )? {
             None => {
                 crate::raft::stop_replica_health(replica_health);
@@ -920,6 +937,7 @@ where
                     fence_state,
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     raft_status,
+                    journal_tip,
                 );
                 crate::raft::stop_raft_driver(raft_handles, &shutdown);
                 return result;
@@ -969,11 +987,26 @@ where
     // Control-plane raft (observational election). The primary needs the
     // replication signing key only when raft is on — peer links
     // authenticate with it (build_raft_config enforces the flag).
+    // A primary's fence epoch is already recovered here, so its tip is
+    // trustworthy from the moment the driver starts. Seed the advertised
+    // sequence from the recovered journal for the same reason — the
+    // pipeline's journal stage takes the handle over once it runs.
+    let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
+        melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
+    );
     let raft_handles = match crate::raft::build_raft_config(&config)? {
         None => None,
         Some(_) => {
             let signing_key = load_replication_key(&config)?;
-            crate::raft::spawn_raft_driver(&config, &signing_key, &authorized_keys, &shutdown)?
+            crate::raft::spawn_raft_driver(
+                &config,
+                &signing_key,
+                &authorized_keys,
+                &fence_state,
+                journal_tip.clone(),
+                Arc::new(AtomicBool::new(true)),
+                &shutdown,
+            )?
         }
     };
     let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
@@ -995,6 +1028,7 @@ where
         fence_state,
         None, // not promoted — no EpochBump injection
         raft_status,
+        journal_tip,
     );
     crate::raft::stop_raft_driver(raft_handles, &shutdown);
     result
@@ -1144,6 +1178,10 @@ fn run_as_primary<A, L, W>(
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     promotion: Option<u64>,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
+    // Control-plane advertised tip. This primary's journal stage becomes
+    // its writer (the raft driver keeps reading the same handle across a
+    // promotion) — see `AdvertisedJournalTip`.
+    journal_tip: melin_transport_core::AdvertisedJournalTip,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -1272,6 +1310,10 @@ where
     let mut journal_stage = journal_stage;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    // On a primary the journal stage owns the control-plane advertised
+    // tip (durable cursor after each fsync batch). On the promotion path
+    // this takes over the handle the receiver was advancing.
+    journal_stage.set_advertised_tip_publisher(journal_tip.clone());
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,
@@ -2109,9 +2151,20 @@ where
 
         // Control-plane raft runs on kernel TCP even on DPDK nodes — the
         // control plane is off the hot path and must not consume a DPDK
-        // queue. Same promotion-surviving placement as the kernel path.
-        let raft_handles =
-            crate::raft::spawn_raft_driver(&config, &signing_key, &authorized_keys, &shutdown)?;
+        // queue. Same promotion-surviving placement and tip ownership as
+        // the kernel replica path.
+        let tip_ready = Arc::new(AtomicBool::new(false));
+        let journal_tip =
+            melin_transport_core::AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0));
+        let raft_handles = crate::raft::spawn_raft_driver(
+            &config,
+            &signing_key,
+            &authorized_keys,
+            &fence_state,
+            journal_tip.clone(),
+            Arc::clone(&tip_ready),
+            &shutdown,
+        )?;
         let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
         let replica_health =
             crate::raft::spawn_replica_health(&config, &fence_state, raft_status.as_ref())?;
@@ -2153,6 +2206,8 @@ where
             !config.yield_idle,
             Arc::clone(&factory),
             Arc::clone(&fence_state),
+            &tip_ready,
+            journal_tip.clone(),
         )? {
             None => {
                 crate::raft::stop_replica_health(replica_health);
@@ -2193,6 +2248,7 @@ where
                     fence_state,
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     raft_status,
+                    journal_tip,
                 );
                 crate::raft::stop_raft_driver(raft_handles, &shutdown);
                 return result;
@@ -2240,11 +2296,25 @@ where
 
     // Control-plane raft (kernel TCP even on DPDK — off the hot path, no
     // DPDK queue consumed). Signing key loaded only when raft is on.
+    // A DPDK primary's fence epoch is recovered here too; seed the
+    // advertised sequence from the recovered journal (see the kernel
+    // primary path). The pipeline's journal stage owns the handle below.
+    let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
+        melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
+    );
     let raft_handles = match crate::raft::build_raft_config(&config)? {
         None => None,
         Some(_) => {
             let signing_key = load_replication_key(&config)?;
-            crate::raft::spawn_raft_driver(&config, &signing_key, &authorized_keys, &shutdown)?
+            crate::raft::spawn_raft_driver(
+                &config,
+                &signing_key,
+                &authorized_keys,
+                &fence_state,
+                journal_tip.clone(),
+                Arc::new(AtomicBool::new(true)),
+                &shutdown,
+            )?
         }
     };
     let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
@@ -2370,6 +2440,10 @@ where
     });
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    // On a primary the journal stage owns the control-plane advertised
+    // tip (durable cursor after each fsync batch). On the promotion path
+    // this takes over the handle the receiver was advancing.
+    journal_stage.set_advertised_tip_publisher(journal_tip.clone());
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,

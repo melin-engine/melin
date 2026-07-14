@@ -108,6 +108,9 @@ pub(crate) fn spawn_raft_driver(
     config: &ServerConfig,
     signing_key: &ed25519_dalek::SigningKey,
     authorized_keys: &Arc<AuthorizedKeys>,
+    fence_state: &Arc<melin_transport_core::fence::FenceState>,
+    journal_tip: melin_transport_core::AdvertisedJournalTip,
+    tip_ready: Arc<AtomicBool>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<Option<RaftHandles>, Box<dyn std::error::Error>> {
     let Some(raft_config) = build_raft_config(config)? else {
@@ -120,10 +123,16 @@ pub(crate) fn spawn_raft_driver(
         dir = %raft_config.dir.display(),
         "starting control-plane raft driver"
     );
+    let tip = Arc::new(melin_raft::recency::TipSource {
+        fence: Arc::clone(fence_state),
+        seq: journal_tip,
+        ready: tip_ready,
+    });
     let handles = melin_raft::driver::spawn(
         raft_config,
         Arc::new(signing_key.clone()),
         Arc::clone(authorized_keys),
+        tip,
         Arc::clone(shutdown),
     )?;
     Ok(Some(handles))

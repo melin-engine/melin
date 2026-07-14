@@ -13,9 +13,11 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::AuthorizedKeys;
 use melin_raft::network::RaftClientFactory;
+use melin_raft::recency::TipSource;
 use melin_raft::rpc_server::{RaftApi, RpcServerConfig, serve};
 use melin_raft::types::{NodeId, TypeConfig};
-use melin_raft::wire::SharedTip;
+use melin_transport_core::cursors::AdvertisedJournalTip;
+use melin_transport_core::fence::FenceState;
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -90,9 +92,9 @@ async fn start_server() -> Harness {
     let cfg = Arc::new(RpcServerConfig {
         authorized_keys,
         peer_ids,
-        tip: SharedTip::new(),
+        tip: tip_at(0, 0),
+        vote_filter: std::sync::Mutex::new(Default::default()),
     });
-    cfg.tip.advance(9, 999);
     tokio::spawn(serve(listener, MockApi, cfg, Arc::clone(&shutdown)));
 
     Harness {
@@ -105,7 +107,7 @@ async fn start_server() -> Harness {
 }
 
 async fn client_for(h: &Harness, key: &SigningKey) -> impl RaftNetwork<TypeConfig> {
-    let mut factory = RaftClientFactory::new(Arc::new(key.clone()), SharedTip::new());
+    let mut factory = RaftClientFactory::new(Arc::new(key.clone()), tip_at(0, 0));
     factory
         .new_client(
             1,
@@ -118,6 +120,19 @@ async fn client_for(h: &Harness, key: &SigningKey) -> impl RaftNetwork<TypeConfi
 
 fn opt() -> RPCOption {
     RPCOption::new(Duration::from_secs(2))
+}
+
+/// A ready tip at (epoch, seq) — most tests want (0, 0) so nothing is
+/// filtered; the recency tests raise it.
+fn tip_at(epoch: u64, seq: u64) -> Arc<TipSource> {
+    let fence = Arc::new(FenceState::new(0));
+    fence.observe_epoch(epoch);
+    let tip = AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(seq));
+    Arc::new(TipSource {
+        fence,
+        seq: tip,
+        ready: Arc::new(AtomicBool::new(true)),
+    })
 }
 
 /// Vote request from node 2 (matches the pinned identity of its key).

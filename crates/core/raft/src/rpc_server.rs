@@ -31,11 +31,13 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::auth::authenticate_inbound;
+use crate::recency::JournalTip;
+use crate::recency::TipSource;
+use crate::recency::VoteFilter;
 use crate::types::NodeId;
 use crate::types::TypeConfig;
 use crate::wire::RpcBody;
 use crate::wire::RpcFrame;
-use crate::wire::SharedTip;
 use crate::wire::claimed_sender;
 use crate::wire::read_frame;
 use crate::wire::write_frame;
@@ -108,8 +110,30 @@ pub struct RpcServerConfig {
     /// A key that authenticates but isn't a configured peer is refused: the
     /// replication trust domain is broader than the raft voter set.
     pub peer_ids: Arc<HashMap<[u8; 32], NodeId>>,
-    /// Local journal tip stamped on every response envelope.
-    pub tip: Arc<SharedTip>,
+    /// Local journal tip: stamped on every response envelope, and the
+    /// voter side of the recency filter below.
+    pub tip: Arc<TipSource>,
+    /// Journal-tip vote filter (see `crate::recency`). One per node —
+    /// its drop counter is *this voter's* view of election progress, so
+    /// it is shared across peer connections. A `std::sync::Mutex` (not
+    /// tokio): the critical section is a couple of integer compares at
+    /// control-plane RPC rates, and no `.await` ever happens inside it.
+    pub vote_filter: std::sync::Mutex<VoteFilter>,
+}
+
+impl RpcServerConfig {
+    /// Recency-filter verdict for an inbound vote request whose envelope
+    /// advertised `candidate_tip`. Also the tip-readiness gate: before
+    /// recovery seeds the local tip, no vote may be delivered at all.
+    fn admit_vote(&self, candidate_tip: JournalTip) -> bool {
+        if !self.tip.is_ready() {
+            debug!("dropping vote request — local journal tip not recovered yet");
+            return false;
+        }
+        // Poisoning unreachable under panic=abort (no unwinding).
+        let mut filter = self.vote_filter.lock().expect("vote filter mutex poisoned");
+        filter.should_deliver(candidate_tip, self.tip.local_tip())
+    }
 }
 
 /// Accept loop. Runs until `shutdown` flips; each authenticated connection
@@ -212,8 +236,42 @@ async fn handle_connection<A: RaftApi>(
             return;
         }
 
+        // Journal-tip recency filter (see `crate::recency`): a vote
+        // request from a candidate behind our own tip is dropped before
+        // it can reach `Raft::vote` — indistinguishable from packet loss,
+        // so raft safety is untouched. Appends re-arm the filter: they
+        // prove a live leader exists.
+        match &frame.body {
+            RpcBody::VoteReq(_) => {
+                let candidate_tip = JournalTip {
+                    epoch: frame.tip_epoch,
+                    last_sequence: frame.tip_seq,
+                };
+                if !cfg.admit_vote(candidate_tip) {
+                    debug!(
+                        peer_id,
+                        candidate_epoch = frame.tip_epoch,
+                        candidate_seq = frame.tip_seq,
+                        "vote request filtered — candidate journal tip behind ours"
+                    );
+                    // Close rather than answer: to the candidate this is a
+                    // network error, exactly like a lost packet.
+                    return;
+                }
+            }
+            RpcBody::AppendReq(_) => {
+                // Poisoning unreachable under panic=abort.
+                cfg.vote_filter
+                    .lock()
+                    .expect("vote filter mutex poisoned")
+                    .leader_observed();
+            }
+            _ => {}
+        }
+
         let response = handle_body(&api, frame.body).await;
-        let (tip_epoch, tip_seq) = cfg.tip.load();
+        let local = cfg.tip.local_tip();
+        let (tip_epoch, tip_seq) = (local.epoch, local.last_sequence);
         let reply = RpcFrame {
             tip_epoch,
             tip_seq,

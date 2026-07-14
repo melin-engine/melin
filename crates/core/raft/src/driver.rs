@@ -31,12 +31,12 @@ use tracing::info;
 use tracing::warn;
 
 use crate::network::RaftClientFactory;
+use crate::recency::TipSource;
 use crate::rpc_server::RpcServerConfig;
 use crate::rpc_server::serve;
 use crate::types::Node;
 use crate::types::NodeId;
 use crate::types::TypeConfig;
-use crate::wire::SharedTip;
 
 /// Deliberately slow election tuning: control-plane latency is irrelevant
 /// (an election outcome only ever triggers a failover decision), so
@@ -74,9 +74,6 @@ pub struct RaftConfig {
 pub struct RaftHandles {
     /// Election state for the health gauges (and, later, auto-promotion).
     pub status: Arc<RaftStatus>,
-    /// Local journal tip published into peer envelopes. Zeros until the
-    /// journal-tip wiring lands.
-    pub tip: Arc<SharedTip>,
     /// The driver thread. Join on shutdown so storage I/O finishes cleanly.
     pub join: std::thread::JoinHandle<()>,
 }
@@ -90,6 +87,7 @@ pub fn spawn(
     config: RaftConfig,
     signing_key: Arc<SigningKey>,
     authorized_keys: Arc<AuthorizedKeys>,
+    tip: Arc<TipSource>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<RaftHandles> {
     let self_peer = config
@@ -140,7 +138,6 @@ pub fn spawn(
         .map_err(|e| io::Error::other(format!("raft storage open failed: {e}")))?;
 
     let status = Arc::new(RaftStatus::new(config.node_id));
-    let tip = SharedTip::new();
 
     let thread_status = Arc::clone(&status);
     let thread_tip = Arc::clone(&tip);
@@ -179,7 +176,7 @@ pub fn spawn(
         })
         .map_err(|e| io::Error::other(format!("failed to spawn raft-driver thread: {e}")))?;
 
-    Ok(RaftHandles { status, tip, join })
+    Ok(RaftHandles { status, join })
 }
 
 /// Map openraft's server state onto the gauge encoding.
@@ -203,7 +200,7 @@ async fn driver_main(
     signing_key: Arc<SigningKey>,
     authorized_keys: Arc<AuthorizedKeys>,
     status: Arc<RaftStatus>,
-    tip: Arc<SharedTip>,
+    tip: Arc<TipSource>,
     shutdown: Arc<AtomicBool>,
 ) {
     let raft_config = Config {
@@ -255,6 +252,7 @@ async fn driver_main(
         authorized_keys,
         peer_ids: Arc::new(peer_ids),
         tip: Arc::clone(&tip),
+        vote_filter: std::sync::Mutex::new(Default::default()),
     });
     let rpc_task = tokio::spawn(serve(
         tokio_listener,

@@ -415,6 +415,16 @@ pub fn run_receiver<A, W>(
     busy_spin: bool,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
+    // Flipped `true` once recovery has seeded the fence epoch and the
+    // advertised tip — until then the raft driver refuses to grant votes.
+    // See `melin_raft::recency::TipSource`.
+    tip_ready: &AtomicBool,
+    // Sequence half of the control-plane advertised tip. This receiver
+    // owns it for the replica phase of the process (seeded from recovery,
+    // advanced to the in-memory accepted position while streaming); after
+    // a promotion the new primary's journal stage takes over the same
+    // handle. See `AdvertisedJournalTip`.
+    journal_tip: melin_transport_core::AdvertisedJournalTip,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -434,6 +444,13 @@ where
             factory.as_ref(),
             &fence_state,
         )?;
+    // The fence epoch now reflects the recovered journal (a fresh replica
+    // legitimately recovers epoch 0). Seed the advertised sequence from
+    // the same recovery before releasing the flag, so the first tip the
+    // raft driver trusts is already the recovered high-water mark.
+    // Release-store so the driver's Acquire-load sees both.
+    journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
+    tip_ready.store(true, Ordering::Release);
 
     let mut backoff = std::time::Duration::from_secs(1);
 
@@ -608,6 +625,7 @@ where
                     journal_path,
                     &snapshot_path,
                     &fence_state,
+                    &journal_tip,
                     &mut last_sequence,
                     &mut chain_hash,
                 )
@@ -697,6 +715,7 @@ where
                             None,
                             stream_marks,
                             journal_failed,
+                            &journal_tip,
                         )
                     })
                     .expect("spawn replica-receiver thread");

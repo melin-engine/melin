@@ -1051,6 +1051,12 @@ pub fn run_receiver_dpdk<A, W>(
     // ...) alongside the empty-app constructor.
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // Flipped `true` once recovery has seeded the fence epoch and the
+    // advertised tip — see the kernel-TCP `run_receiver`.
+    tip_ready: &AtomicBool,
+    // Sequence half of the control-plane advertised tip — see the
+    // kernel-TCP `run_receiver` for the ownership rules.
+    journal_tip: melin_transport_core::AdvertisedJournalTip,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -1070,6 +1076,11 @@ where
             factory.as_ref(),
             &fence_state,
         )?;
+    // Fence epoch now reflects the recovered journal; seed the advertised
+    // sequence from the same recovery, then let the raft driver trust
+    // this node's tip. See the kernel-TCP `run_receiver`.
+    journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
+    tip_ready.store(true, Ordering::Release);
 
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
     // Reset to 1s on successful streaming (first InputBatch received).
@@ -1357,6 +1368,7 @@ where
                                 journal_path,
                                 &snapshot_path,
                                 &fence_state,
+                                &journal_tip,
                                 &mut last_sequence,
                                 &mut chain_hash,
                             );
@@ -1499,6 +1511,7 @@ where
                 None,
                 stream_marks,
                 journal_failed,
+                &journal_tip,
             );
             send_buf = dpdk_transport.send_buf;
             r

@@ -893,6 +893,7 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     journal_path: &std::path::Path,
     snapshot_path: &std::path::Path,
     fence_state: &melin_transport_core::fence::FenceState,
+    journal_tip: &melin_transport_core::AdvertisedJournalTip,
     last_sequence: &mut u64,
     chain_hash: &mut [u8; 32],
 ) -> Result<ResyncDecision, Box<dyn std::error::Error + Send + Sync>>
@@ -941,6 +942,11 @@ where
     // Archived — a retried handshake must present as a fresh replica.
     *last_sequence = 0;
     *chain_hash = [0u8; 32];
+    // The advertised control-plane tip must shrink with the holdings:
+    // the archived suffix is either divergent (never acked) or being
+    // replaced wholesale, so this is the one legitimate tip regression
+    // (see `AdvertisedJournalTip::reset`).
+    journal_tip.reset(melin_transport_core::WireSeq::new(0));
 
     let (snap_exchange, snap_sequence, snap_chain_hash, seed_len) =
         match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path, fence_state) {
@@ -1003,6 +1009,9 @@ where
                 epoch,
                 "streaming resumed after snapshot transfer"
             );
+            // The transfer is installed and validated: the node's holdings
+            // are exactly the snapshot position again.
+            journal_tip.reset(melin_transport_core::WireSeq::new(snap_sequence));
             Ok(ResyncDecision::Ready {
                 segment_start_sequence,
                 anchor_hash,

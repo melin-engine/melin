@@ -11,6 +11,9 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use melin_app::auth::AuthorizedKeys;
 use melin_raft::driver::{RaftConfig, RaftHandles, RaftPeer, spawn};
+use melin_raft::recency::TipSource;
+use melin_transport_core::cursors::AdvertisedJournalTip;
+use melin_transport_core::fence::FenceState;
 use melin_transport_core::health::RaftStatus;
 use tempfile::TempDir;
 
@@ -30,6 +33,14 @@ struct Node {
 const ELECTION_DEADLINE: Duration = Duration::from_secs(20);
 
 fn start_cluster(n: u64) -> Cluster {
+    // All nodes at the same (zero) journal tip: recency never filters.
+    start_cluster_with_tips(&vec![0u64; n as usize])
+}
+
+/// Boot a cluster with a fixed advertised journal tip per node (index i =
+/// node id i+1), for recency-steering tests. Every tip is `ready`.
+fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
+    let n = tips.len() as u64;
     let keys: Vec<SigningKey> = (0..n)
         .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
         .collect();
@@ -76,10 +87,16 @@ fn start_cluster(n: u64) -> Cluster {
             dir: dir.path().to_path_buf(),
             peers: peers.clone(),
         };
+        let tip = Arc::new(TipSource {
+            fence: Arc::new(FenceState::new(0)),
+            seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(tips[i])),
+            ready: Arc::new(AtomicBool::new(true)),
+        });
         let handles = spawn(
             config,
             Arc::new(keys[i].clone()),
             Arc::clone(&authorized_keys),
+            tip,
             Arc::clone(&shutdown),
         )
         .expect("driver spawn");
@@ -194,5 +211,30 @@ fn single_voter_elects_itself() {
     let mut cluster = start_cluster(1);
     let refs: Vec<&Node> = cluster.nodes.iter().collect();
     assert_eq!(await_single_leader(&refs), 1);
+    cluster.stop_all();
+}
+
+/// Recency steering over real sockets: a node whose advertised journal
+/// tip is behind can never assemble a quorum, so leadership always lands
+/// on a most-caught-up node — including across a re-election after the
+/// leader dies. This is the property auto-promotion relies on to never
+/// promote a lagging replica.
+#[test]
+fn behind_node_never_wins_an_election() {
+    // Nodes 1 and 2 hold seq 100; node 3 is behind at seq 10. Node 3 can
+    // only win with a grant from 1 or 2, and both drop its vote requests
+    // (candidate tip 10 < local tip 100).
+    let mut cluster = start_cluster_with_tips(&[100, 100, 10]);
+    let refs: Vec<&Node> = cluster.nodes.iter().collect();
+    let first = await_single_leader(&refs);
+    assert_ne!(first, 3, "the behind node must not win the first election");
+
+    // Kill the leader: the survivors are one caught-up node and the
+    // behind node — only the caught-up one can win.
+    cluster.stop_node(first);
+    let survivors: Vec<&Node> = cluster.nodes.iter().filter(|n| n.id != first).collect();
+    let second = await_single_leader(&survivors);
+    assert_ne!(second, 3, "the behind node must not win the re-election");
+
     cluster.stop_all();
 }
