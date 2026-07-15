@@ -217,8 +217,9 @@ so the elected leader is the right node to `PROMOTE`.
 With `--raft-auto-promote`, a replica that wins an election promotes
 itself: the election term is journaled as the new fencing epoch, so any
 two election-driven promotions always mint distinct epochs and the
-newer fences the older. Expect sub-5-second failover: the election
-timeout (1–2 s) plus the promotion itself (sub-second).
+newer fences the older. Expect failover within several seconds: the
+election timeout (1–2 s), a short grace period confirming the primary is
+really gone (see below), and the promotion itself (sub-second).
 
 Auto-promotion is deliberately conservative. The elected replica
 **refuses** to promote — logging the reason — when:
@@ -228,6 +229,13 @@ Auto-promotion is deliberately conservative. The elected replica
 - it has been fenced (a newer primary exists);
 - its replication link to the primary is still up (a live primary must
   never be deposed by control-plane noise);
+- its link to the primary dropped only moments ago — a replica only acts
+  once the link has been *continuously* down for a few seconds. The link
+  state is one-sided (it reflects only the winner's own socket), so a
+  transient network blip, or a primary that is simply still starting up,
+  reads the same as a real failure; requiring a sustained outage keeps a
+  brief hiccup from deposing a healthy primary, at the cost of a few
+  seconds of extra failover latency;
 - the primary was acking under `local` durability — acks never waited
   for any replica, so no election can prove the winner holds every
   acked order; failover stays a manual, eyes-on decision under `local`;

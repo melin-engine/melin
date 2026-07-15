@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use melin_transport_core::health::RaftStatus;
 use tracing::{info, warn};
@@ -23,6 +23,27 @@ use crate::replication::ReplicaControlPlane;
 /// listener-loop convention; promotion latency is bounded by this plus
 /// the driver's own 100 ms metrics bridge.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long this replica's link to the primary must be *continuously*
+/// down before auto-promotion may fire.
+///
+/// `primary_link_up` reflects only *this* node's replication socket — not
+/// whether the primary is actually dead — and the receiver clears it on
+/// every reconnect attempt. So the bare flag cannot distinguish three
+/// very different situations that all read as "link down": a real primary
+/// failure, a transient network blip, and a primary that simply hasn't
+/// finished starting up. Acting on the instantaneous flag lets a replica
+/// that happens to hold control-plane leadership depose a perfectly
+/// healthy primary the moment its own link hiccups.
+///
+/// The distinguisher is *duration*: the receiver reconnects a healthy
+/// primary in milliseconds, and even a brief unreachability retries on a
+/// 1 s → 2 s → … backoff, so a link that stays down well past the first
+/// backoff cycle is strong evidence the primary is genuinely gone. Three
+/// seconds clears one full reconnect cycle with margin. This bounds how
+/// long a real failover waits — a few seconds of extra downtime bought in
+/// exchange for never failing over on a blip (correctness first).
+const PRIMARY_DOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// The durability mode the auto-promotion refusal judges: the mode
 /// the *primary* last advertised on the replication stream — that is
@@ -53,6 +74,12 @@ struct AutoPromotionInputs {
     durability_mode: Option<DurabilityMode>,
     /// The replication link to the primary is authenticated and live.
     primary_link_up: bool,
+    /// How long that link has been *continuously* down (`ZERO` while it
+    /// is up). Auto-promotion waits for this to reach
+    /// [`PRIMARY_DOWN_GRACE`] so a transient blip — or a primary still
+    /// coming up at boot — cannot trip a failover; the link state is
+    /// one-sided (this node's socket only).
+    primary_link_down_for: Duration,
     /// The term this node was elected at.
     term: u64,
     /// The fencing epoch currently in force.
@@ -73,6 +100,11 @@ struct AutoPromotionInputs {
 ///   is alive; leadership may still land here (e.g. the previous raft
 ///   leader was a *replica* whose process died), and promoting would
 ///   depose a healthy primary.
+/// - `primary_link_down_for` — the link flag is one-sided (this node's
+///   socket only), so `link down` on its own cannot tell a transient
+///   blip, or a primary still starting up, from a real failure. Require
+///   the link to have been down continuously past [`PRIMARY_DOWN_GRACE`];
+///   a healthy primary reconnects well inside that window.
 /// - `local` durability — acks in `local` mode never waited for this
 ///   replica, so no election can prove it holds every acked order.
 ///   Failover stays a manual, eyes-on decision.
@@ -92,6 +124,12 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
     }
     if inputs.primary_link_up {
         return Err("replication link to the primary is up — refusing to depose a live primary");
+    }
+    if inputs.primary_link_down_for < PRIMARY_DOWN_GRACE {
+        return Err(
+            "the primary link dropped only moments ago — waiting out the grace period to tell \
+             a transient blip (or a still-starting primary) from a real failure before failover",
+        );
     }
     match inputs.durability_mode {
         Some(DurabilityMode::Local) => {
@@ -120,6 +158,10 @@ fn consider_auto_promotion(
     control: &ReplicaControlPlane,
     fence_state: &melin_transport_core::fence::FenceState,
     durability_mode: &AtomicU8,
+    // How long the primary link has been continuously down — tracked by
+    // the poll loop so the decision stays a pure function (see
+    // [`PRIMARY_DOWN_GRACE`]). `ZERO` while the link is up.
+    primary_link_down_for: Duration,
     last_refused_term: &mut u64,
 ) {
     if !status.running.load(Ordering::Relaxed)
@@ -137,6 +179,7 @@ fn consider_auto_promotion(
             durability_mode.load(Ordering::Relaxed),
         ),
         primary_link_up: control.primary_link_up.load(Ordering::Acquire),
+        primary_link_down_for,
         term,
         fence_epoch: fence_state.epoch(),
     };
@@ -179,12 +222,27 @@ pub(crate) fn spawn_auto_promotion(
         .name("raft-promotion".into())
         .spawn(move || {
             let mut last_refused_term = 0u64;
+            // When the primary link last went (and has since stayed) down
+            // — `None` while it is up. Tracked here, independent of raft
+            // leadership, so the grace clock reflects the true unreachable
+            // duration by the time an election win arrives. See
+            // [`PRIMARY_DOWN_GRACE`].
+            let mut primary_link_down_since: Option<Instant> = None;
             while !shutdown.load(Ordering::Relaxed) {
+                if control.primary_link_up.load(Ordering::Acquire) {
+                    primary_link_down_since = None;
+                } else if primary_link_down_since.is_none() {
+                    primary_link_down_since = Some(Instant::now());
+                }
+                let primary_link_down_for = primary_link_down_since
+                    .map(|since| since.elapsed())
+                    .unwrap_or(Duration::ZERO);
                 consider_auto_promotion(
                     &status,
                     &control,
                     &fence_state,
                     &durability_mode,
+                    primary_link_down_for,
                     &mut last_refused_term,
                 );
                 if control.promote.is_requested() {
@@ -209,6 +267,8 @@ mod tests {
             fenced: false,
             durability_mode: Some(DurabilityMode::Hybrid),
             primary_link_up: false,
+            // Well past the grace: a sustained outage, not a blip.
+            primary_link_down_for: PRIMARY_DOWN_GRACE * 10,
             term: 5,
             fence_epoch: 3,
         }
@@ -255,6 +315,35 @@ mod tests {
             auto_promotion_decision(&inputs)
                 .unwrap_err()
                 .contains("live primary")
+        );
+    }
+
+    #[test]
+    fn refuses_on_a_transient_primary_link_blip() {
+        // The link is down, but not for long enough — a blip, a brief
+        // partition, or a primary still coming up must not fail over.
+        let inputs = AutoPromotionInputs {
+            primary_link_up: false,
+            primary_link_down_for: PRIMARY_DOWN_GRACE - Duration::from_millis(1),
+            ..ok_inputs()
+        };
+        assert!(
+            auto_promotion_decision(&inputs)
+                .unwrap_err()
+                .contains("moments ago"),
+            "a sub-grace outage must be refused as a possible blip"
+        );
+
+        // Once the link has been down through the grace, a real failure
+        // is assumed and promotion proceeds.
+        let inputs = AutoPromotionInputs {
+            primary_link_up: false,
+            primary_link_down_for: PRIMARY_DOWN_GRACE,
+            ..ok_inputs()
+        };
+        assert!(
+            auto_promotion_decision(&inputs).is_ok(),
+            "a sustained outage past the grace must promote"
         );
     }
 
