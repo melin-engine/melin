@@ -61,6 +61,15 @@ const MAX_INBOUND: usize = 32;
 /// admin/health listener loops in the server runtime.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
+/// Bound on writing a single reply frame. Replies are tiny (a vote/append
+/// response, or a snapshot-chunk ack) and a healthy peer drains them
+/// instantly, so this only fires when a peer's receive window is wedged
+/// (crashed mid-read, black-holed link). Without it a stalled writer pins
+/// its task — and the [`MAX_INBOUND`] slot it holds — indefinitely; 30
+/// such peers would exhaust the accept cap. Reclaim the task instead; the
+/// peer reconnects on next use.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The slice of the raft core the RPC server needs. Implemented by
 /// [`openraft::Raft`]; mocked in tests. Errors are stringly-typed because
 /// the remote peer only logs/retries them (see `RpcBody::Error`).
@@ -325,9 +334,16 @@ async fn handle_connection<A: RaftApi>(
             tip_seq,
             body: response,
         };
-        if let Err(e) = write_frame(&mut stream, &reply).await {
-            debug!(peer_id, error = %e, "raft rpc reply failed");
-            return;
+        match tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut stream, &reply)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                debug!(peer_id, error = %e, "raft rpc reply failed");
+                return;
+            }
+            Err(_elapsed) => {
+                debug!(peer_id, "raft rpc reply write stalled — closing");
+                return;
+            }
         }
     }
 }
