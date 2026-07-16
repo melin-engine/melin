@@ -90,7 +90,9 @@ pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftConf
     }
     if config.raft_auto_promote && peers.len() < 3 {
         return Err(format!(
-            "--raft-auto-promote requires at least 3 configured voters, got {} — a two-node              cluster cannot elect a leader after losing either node, so automatic failover              would never fire while inviting misconfiguration; run manual PROMOTE instead",
+            "--raft-auto-promote requires at least 3 configured voters, got {} — a two-node \
+             cluster cannot elect a leader after losing either node, so automatic failover \
+             would never fire while inviting misconfiguration; run manual PROMOTE instead",
             peers.len()
         ));
     }
