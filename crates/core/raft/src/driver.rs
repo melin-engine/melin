@@ -284,10 +284,40 @@ async fn driver_main(
     match raft.initialize(members).await {
         Ok(()) => info!(node_id = config.node_id, "control plane initialized"),
         Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
-            info!(
-                node_id = config.node_id,
-                "control plane already initialized — using stored membership"
-            );
+            // Already initialized (any restart): the stored membership is
+            // authoritative and the CLI `--raft-peer` list is advisory.
+            // Runtime membership changes are out of scope, so if the
+            // operator edited the list their change silently has no
+            // effect — surface that instead of logging an unconditional
+            // "using stored membership" they might read as acceptance.
+            let stored = raft.metrics().borrow().membership_config.clone();
+            // id → dialable address, the two things the membership pins
+            // (pubkeys are enforced separately from the live CLI table,
+            // so a pubkey edit does take effect and isn't flagged here).
+            let stored_nodes: BTreeMap<NodeId, String> = stored
+                .nodes()
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect();
+            let configured_nodes: BTreeMap<NodeId, String> = config
+                .peers
+                .iter()
+                .map(|p| (p.id, p.addr.clone()))
+                .collect();
+            if stored_nodes == configured_nodes {
+                info!(
+                    node_id = config.node_id,
+                    "control plane already initialized — using stored membership"
+                );
+            } else {
+                warn!(
+                    node_id = config.node_id,
+                    ?configured_nodes,
+                    ?stored_nodes,
+                    "control plane already initialized — the --raft-peer list differs from the \
+                     stored membership and is being ignored (runtime membership changes are not \
+                     supported); revert the flags, or re-provision --raft-dir to apply a new set"
+                );
+            }
         }
         Err(e) => {
             error!(error = %e, "raft-driver: initialize failed");
