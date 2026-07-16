@@ -150,9 +150,9 @@ impl HealthState {
 pub struct RaftStatus {
     /// This node's raft id (static once configured).
     pub node_id: u64,
-    /// Current raft term. Under auto-promotion the term doubles as the
-    /// fencing-epoch allocator (not yet wired — see the control-plane
-    /// raft workstream).
+    /// Current raft term. Under `--raft-auto-promote` the term doubles as
+    /// the fencing-epoch allocator: a promotion journals `epoch = term`,
+    /// so an election win and the fencing epoch it mints stay aligned.
     pub term: AtomicU64,
     /// The leader this node currently believes in; 0 while unknown
     /// (mid-election).
@@ -732,7 +732,7 @@ impl HealthSnapshot {
                 "# HELP melin_raft_node_id This node's control-plane raft id.\n\
                  # TYPE melin_raft_node_id gauge\n\
                  melin_raft_node_id {}\n\
-                 # HELP melin_raft_term Current raft election term (control-plane bookkeeping; not yet tied to the journaled fencing epoch).\n\
+                 # HELP melin_raft_term Current raft election term; under auto-promotion a promotion journals this as its fencing epoch.\n\
                  # TYPE melin_raft_term gauge\n\
                  melin_raft_term {}\n\
                  # HELP melin_raft_leader_id Node id of the current raft leader (0 while unknown).\n\
