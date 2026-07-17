@@ -33,10 +33,12 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 crc32c = "0.6"
 ed25519-dalek = { workspace = true }
+getrandom = "0.4"
 tracing = { workspace = true }
 melin-app = { path = "../app", version = "0.11.0" }
 melin-transport-core = { path = "../transport-core", version = "0.11.0" }
 
 [dev-dependencies]
+base64 = { workspace = true }
 tempfile = "3"
 proptest = "1"

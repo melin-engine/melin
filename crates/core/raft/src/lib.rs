@@ -7,5 +7,9 @@
 //! contract this implements and `docs/internal/raft-control-plane.md` for
 //! the design.
 
+pub mod auth;
+pub mod network;
+pub mod rpc_server;
 pub mod storage;
 pub mod types;
+pub mod wire;

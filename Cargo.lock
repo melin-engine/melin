@@ -1194,8 +1194,10 @@ dependencies = [
 name = "melin-raft"
 version = "0.11.0"
 dependencies = [
+ "base64 0.22.1",
  "crc32c",
  "ed25519-dalek",
+ "getrandom 0.4.2",
  "melin-app",
  "melin-transport-core",
  "openraft",
