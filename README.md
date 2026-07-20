@@ -55,7 +55,7 @@ See [`crates/examples/counter`](crates/examples/counter) for a complete working 
 
 ## Benchmarks
 
-All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://crates.io/crates/melin-exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas).
+All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas).
 
 ### Latency under load (closed-loop)
 
@@ -71,11 +71,9 @@ All numbers are **full round-trip** (client sends → server persists + replicat
 
 See [replication](docs/replication.md) for the full durability-mode menu. The benchmark harness and tuning guidance ship with the Melin Exchange Core.
 
-DPDK integration is well under way and should bring these figures noticeably lower, especially for the tail under load.
-
 ## Melin Exchange Core
 
-A production exchange core is built on this sequencer and distributed separately: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [melin-exchange-core](https://crates.io/crates/melin-exchange-core).
+A production exchange core is built on this sequencer and distributed separately: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [melin-exchange-core](https://github.com/melin-engine/exchange-core).
 
 ## Contributing
 
