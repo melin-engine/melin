@@ -313,13 +313,6 @@ impl<'a> CursorView<'a> {
     }
 }
 
-/// Stack buffer bound for the maximum cluster shape we ever expect
-/// (1 primary + up to 8 replicas = 9). Replication today caps at 1+2;
-/// even with Raft (#7) this stays in single digits. Avoiding the heap
-/// allocation matters because `evaluate` runs on the response-stage
-/// hot path.
-const MAX_NODES: usize = 16;
-
 /// One node's effective cursor at `level`.
 ///
 /// A higher-level cursor implies satisfaction of all lower levels on
@@ -352,24 +345,47 @@ fn effective_cursor(node: &[u64; 2], level: Level) -> u64 {
 /// Returns `None` when the clause cannot be satisfied by the current
 /// cluster shape (`count` exceeds the node count), because then no node
 /// supplies a threshold at all.
+///
+/// Selects the top `count` rather than sorting the view, so the scratch
+/// space is bounded by [`MAX_CLUSTER_SIZE`] — which [`Policy::new`]
+/// enforces on every clause — instead of by how many nodes the caller
+/// happens to pass. A view longer than the cluster cap is then handled
+/// correctly rather than silently truncated.
 #[inline]
 fn nth_largest_with_node(view: &CursorView<'_>, level: Level, count: u8) -> Option<(u64, usize)> {
     let n = count as usize;
-    let len = view.nodes.len().min(MAX_NODES);
-    if n == 0 || n > len {
+    // `taken` holds one node index per rank, so it must cover `n`.
+    // `Policy::new` rejects `count > MAX_CLUSTER_SIZE`, making this
+    // unreachable through any policy; the guard keeps the indexing
+    // below sound for a hypothetical direct caller.
+    let mut taken = [usize::MAX; MAX_CLUSTER_SIZE as usize];
+    if n == 0 || n > view.nodes.len() || n > taken.len() {
         return None;
     }
-    debug_assert!(
-        view.nodes.len() <= MAX_NODES,
-        "cluster larger than expected"
-    );
-    let mut buf = [(0u64, 0usize); MAX_NODES];
-    for (i, node) in view.nodes.iter().take(len).enumerate() {
-        buf[i] = (effective_cursor(node, level), i);
+    // Take the running maximum `n` times, skipping nodes already
+    // claimed by an earlier rank. Strict `>` means the lowest node
+    // index wins among equal cursors, so ranking is descending by
+    // cursor with ties broken by ascending index.
+    for rank in 0..n {
+        let mut best: Option<(u64, usize)> = None;
+        for (i, node) in view.nodes.iter().enumerate() {
+            if taken[..rank].contains(&i) {
+                continue;
+            }
+            let value = effective_cursor(node, level);
+            if best.is_none_or(|(best_value, _)| value > best_value) {
+                best = Some((value, i));
+            }
+        }
+        // `rank < n <= view.nodes.len()` and only `rank` nodes are
+        // taken, so at least one candidate always remains.
+        let (value, node) = best?;
+        if rank == n - 1 {
+            return Some((value, node));
+        }
+        taken[rank] = node;
     }
-    // `len` is at most 16, so an unstable sort is cheap.
-    buf[..len].sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    Some(buf[n - 1])
+    None
 }
 
 /// Compute the `count`-th largest cursor among all nodes at `level`.
@@ -498,6 +514,29 @@ mod tests {
         assert_eq!(
             p.attribute_blocker(&CursorView::new(&nodes)),
             Some(Blocker::Replication)
+        );
+    }
+
+    #[test]
+    fn view_longer_than_the_cluster_cap_is_not_truncated() {
+        // The scratch space is sized by the clause count, not by the
+        // view, so a view carrying more nodes than MAX_CLUSTER_SIZE is
+        // still ranked over all of them. The previous implementation
+        // copied the view into a fixed 16-slot buffer and silently
+        // ignored anything past it; this pins that the ranking sees
+        // every node.
+        let p = policy(Level::Persisted, 2);
+        // 20 nodes, with the two highest cursors deliberately placed
+        // last so a truncating implementation would miss them.
+        let mut nodes = vec![[10u64, 10u64]; 18];
+        nodes.push([900, 900]);
+        nodes.push([800, 800]);
+        let view = CursorView::new(&nodes);
+        assert_eq!(p.evaluate(&view), 800, "2nd largest across all 20 nodes");
+        assert_eq!(
+            p.attribute_blocker(&view),
+            Some(Blocker::Replication),
+            "node 19 is not the primary"
         );
     }
 
