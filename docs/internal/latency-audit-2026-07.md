@@ -16,6 +16,11 @@ cache-line harness. Findings 1 and 4 are the ones worth measuring first.
 
 Ordering is by expected impact, highest first.
 
+**Read [Measured verdict](#measured-verdict) first.** The list was written
+before any measurement. Bench data from 2026-07-12 since showed that none
+of it is where this system's latency lives — the ratings below rank items
+against each other, not against anything that matters.
+
 ---
 
 ## Triage summary
@@ -358,3 +363,91 @@ Numbered to match the triage table above.
   the mid-spin auto-commits in `push_with` and `push_with_or_abort`) while
   staying untouched on the rollback path. That is a real invariant where
   today there is none — worth pinning with tests if it is ever done.
+
+---
+
+## Measured verdict
+
+Added after the fact, against the LAN bench suite of 2026-07-12
+(`exchange-core/bench-results/lan-bench-suite-20260712-*`): four runs,
+TCP with dual replication, one latency profile and three throughput
+profiles. This section supersedes the expectations set above.
+
+**The short version: everything on this list together is worth well under
+1% of client-observed latency. None of it should be scheduled as
+performance work.**
+
+### What the runs show
+
+The latency profile (`tcp-dual-repl-single`) is the one that matters —
+one request outstanding, so no queueing and no Little's Law distortion:
+
+| | |
+| --- | --- |
+| Roundtrip p50 | 48.64 µs (min 44.86, p99 67.45) |
+| Throughput | 20,133 ops/s at concurrency 1.0 |
+| Replica ack round-trip | median 24 µs — roughly half the total |
+| Ack quantum | 1.1 sequences per ack (no coalescing delay) |
+
+The throughput profiles run ~1000 requests in flight, where
+`throughput x p50` lands exactly on the offered concurrency. Their
+"latency" is `N / throughput`, a derived quantity — it moves only if
+throughput moves.
+
+Nothing on the primary is the constraint. Real utilisation, computed from
+the stage histograms rather than the busy/idle counters:
+
+- matching: 142.5 M events x 160 ns p50 execute = **~38% of one core**
+- journal: 880 k batches x 11.3 µs p50 = **~17%**
+- input ring depth: median 120 of 1,048,576
+
+Matching would not saturate until roughly 5 M ops/s, which is already past
+the replica-bound ceiling. The primary has more headroom than the cluster
+can consume, so the throughput-headroom argument for these items is weak
+too.
+
+### Why the items are noise against that
+
+Costed generously against a 48,640 ns roundtrip: finding 3 ~60 ns,
+finding 9 ~20–40 ns, finding 5 ~15 ns, and the cache-line items (1, 6, 7,
+10, 11) are contention effects with little concurrent traffic to contend
+with at concurrency 1. Finding 4 does not fire at all — queue depth median
+0, max 1 in the latency run, so the response stage reaches its idle path
+and flushes constantly.
+
+The cheap ones remain worth taking as code hygiene. Findings 2 and 10 are
+done; finding 3 is a mechanical type swap. Nothing here justifies the fix
+cost of finding 5.
+
+### Where the latency actually is
+
+1. **The replica ack round-trip — ~24 µs of 48.64 µs.** The primary
+   persists locally faster than the network turnaround, so the gate is
+   waiting to *learn* the replica's position, not waiting on remote disk.
+2. **The remaining ~24 µs floor** — two network hops, wire encode/decode,
+   primary fsync, egress. Unmeasured.
+
+### Two caveats for whoever picks this up
+
+**Do not assume the gate waits on replica fsync.** The default `Hybrid`
+policy is `persisted>=1 && in_memory>=2`: the primary supplies the
+persisted copy, the replica only needs the event in RAM. Measured replica
+`in_memory - persisted` is median 0 in all four runs anyway, so there is
+no persisted-vs-in-memory gap to reclaim.
+
+**The gate attribution counters are soft evidence, not hard.**
+`connected_persisted_min` reads `acked_sequence` (replica *persisted*),
+but under `Hybrid` the gate is satisfied by replica *in-memory*. In the
+throughput runs those cursors sit ~474 vs ~96 events behind the primary
+respectively, so the counter compares against a cursor the active policy
+never consults. It still attributes correctly when the journal genuinely
+lags, and the two coincide at concurrency 1 — so the bias inflates the
+replication share in ambiguous cases rather than inverting the verdict.
+Worth fixing as a metrics-fidelity item.
+
+**Stage histograms are mostly missing from these runs.** Three of four
+recorded none; the fourth got 4 of 8 (both journal, both matching). No
+`server e2e`, no response-stage or reader stages, and no `tick-to-trade`
+breakdown anywhere — see the dormant-recorder caveat on
+`StatsRegistry::snapshot_all`. Until that is fixed the suite cannot answer
+"where did the 48 µs go", which is the only question worth asking here.
