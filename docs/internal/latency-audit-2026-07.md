@@ -18,6 +18,68 @@ Ordering is by expected impact, highest first.
 
 ---
 
+## Triage summary
+
+Ratings are None / Low / Med / High, and are judgement calls from code
+reading — same caveat as above, nothing measured. "Regression risk" is the
+potential for the fix itself to make performance *worse*, which is not
+uniformly low and is the column most worth reading.
+
+| # | Finding | Upside potential | Regression risk | Bench effort | Fix effort |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `ReplicationMetrics` unpadded | **High** | Low | **Low** | Low–Med |
+| 2 | Hoist `connected_persisted_min` | Low–Med | None | High\* | **Trivial** |
+| 3 | SipHash → FxHash (3 sites) | Med | Low | **Low** | **Trivial** |
+| 4 | No flush while ring has work | **High** | **Med–High** | Low–Med | Med |
+| 5 | Journal 512 KiB copy | Med | Med | Med | **High** |
+| 6 | `CachePadded` 64 → 128 | Med | **Med** | Low–Med | Trivial to try |
+| 7 | `Arc<AtomicU64>` cursors unpadded | Low–Med | Low | Med | Low |
+| 8 | DPDK per-slot `flush()` | Med | Med | Med | Low |
+| 9 | Ingest double copy | Med | Low–Med | Med | Med |
+| 10 | `spsc::flush` contended load | Low | None | Low | Trivial |
+
+\* Finding 2 cannot be isolated from finding 1 — they touch the same cache
+line. Fold it into finding 1's change and measure the pair once.
+
+### Ratings that need a why
+
+**4 is the only item that can plausibly make a benchmark look worse.**
+Flushing more often means more `submit_and_wait` calls and fewer bytes per
+send — a direct trade of throughput for tail latency. Expect the LAN
+suite's throughput figure to dip while `server e2e` improves. That is the
+change working as intended, but decide which number is being optimised
+before picking the threshold.
+
+**6 could genuinely net negative, which is why it stays an experiment.**
+Editing `padding.rs` doubles padding at *every* `CachePadded` site — the
+disruptor cursor, each consumer's `Arc<Sequence>`, both SPSC counters.
+More footprint means more L1d and TLB pressure, which on a small-L3 part
+could outweigh the prefetcher win. Genuinely two-sided.
+
+**5's risk is the batch shape, not the copy.** `peek_batch` returns
+contiguous slices, so a span crossing the ring's wrap point splits. If the
+journal stage encodes per-span, write batches shrink near wraps, eating
+into the NVMe write amortisation that `MAX_JOURNAL_BATCH` exists to get.
+Combined with restructuring borrows around `sync_point` / `mark_split` in
+correctness-critical code, this is the one where the fix cost may exceed
+the win.
+
+**1's low bench effort pairs with a measurement caveat.** The microbench is
+the only place the effect will be visible; end-to-end it is likely masked
+by the replica-side `recvmsg` + `fsync` ceiling. Budget for a null result
+on the LAN suite that does *not* mean the fix is worthless.
+
+### Suggested order
+
+3 and 2 are near-free in both effort columns — worth doing regardless of
+measurement. 1 has the best effort-to-information ratio on the list. 6 is
+one line to try, so try it, but be willing to discard it. 4 is the
+highest-value fix and needs a throughput-vs-latency decision rather than a
+number. 5 is the only one where measuring first should be treated as
+mandatory.
+
+---
+
 ## 1. `ReplicationMetrics` is unpadded, and the durability gate spins on it
 
 **Where:** `crates/core/transport-core/src/replication/metrics.rs:18`
@@ -217,7 +279,9 @@ footprint, so it should not land on reasoning alone.
 
 ## Lower priority
 
-- **`Arc<AtomicU64>` cursors are unpadded.** `DurableWireSeqCursor`
+Numbered to match the triage table above.
+
+- **7 — `Arc<AtomicU64>` cursors are unpadded.** `DurableWireSeqCursor`
   (`transport-core/src/cursors.rs:123`) and `replica_quorum_cursor`
   (`cursors.rs:175`) are plain `Arc<AtomicU64>`, allocated back-to-back in
   `PipelineCursors::new`. Two 24-byte allocations from the same size class
@@ -225,7 +289,7 @@ footprint, so it should not land on reasoning alone.
   (journal stage vs. replication sender) with the response stage reading
   both. Same class as finding 1, at a much lower write rate.
 
-- **Per-slot flush on the DPDK response path.**
+- **8 — Per-slot flush on the DPDK response path.**
   `server-runtime/src/dpdk_response.rs:542` calls
   `tx_producers[tid].flush()` inside the per-slot loop — one release store
   per slot. The matching stage goes to real trouble to amortise its output
@@ -233,7 +297,7 @@ footprint, so it should not land on reasoning alone.
   gives that back one slot at a time. Hoisting the flush to the end of the
   batch trades a small visibility delay for the amortisation.
 
-- **Double copy on ingest.** `reader.rs:605` unconditionally
+- **9 — Double copy on ingest.** `reader.rs:605` unconditionally
   `extend_from_slice`s the recv payload from the io_uring provided-buffer
   pool into the connection's `parse_buf`, then `process_client_frames`
   compacts it with a `copy_within` (`client_frames.rs:155`). In the common
@@ -241,8 +305,8 @@ footprint, so it should not land on reasoning alone.
   avoidable by parsing directly out of the pool buffer and only spilling a
   trailing partial frame into `parse_buf`.
 
-- **`SpscProducer::flush` loads a contended line to decide whether to
-  store.** `pipeline/src/spsc.rs:155` reads `shared.head` (Relaxed) just to
+- **10 — `SpscProducer::flush` loads a contended line to decide whether
+  to store.** `pipeline/src/spsc.rs:155` reads `shared.head` (Relaxed) just to
   compare against `local_head`. The consumer reads that line constantly, so
   it is not reliably in M state. Tracking the last committed value in a
   local field removes the load. Minor, but `flush` is called per slot on
