@@ -20,7 +20,9 @@ use tracing::{debug, error};
 
 use melin_pipeline::ring;
 
-use crate::durability_policy::{Blocker, CursorView, DurabilityMode, EvalStatus, Policy};
+use crate::durability_policy::{
+    Blocker, CursorView, DurabilityMode, EvalStatus, MAX_CLUSTER_SIZE, Policy,
+};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -985,47 +987,37 @@ fn retry_send(
     }
 }
 
-/// Evaluate the durability policy against the live cursor state.
+/// Read the live gate cursors and lend them to `f` as a [`CursorView`].
 ///
-/// Builds a `CursorView` containing the primary plus every *currently
-/// connected* replica slot and returns the highest sequence at which
-/// the policy is satisfied. The primary's in-memory cursor is modeled
-/// as `u64::MAX` because the response stage only gates events that have
-/// already been processed by the matching engine — those are trivially
-/// in-memory on the primary by construction.
+/// The view contains the primary followed by every *currently connected*
+/// replica slot. Disconnected slots are omitted rather than entered with
+/// zero cursors, so `CursorView::len` reflects how many nodes are
+/// actually available to satisfy a clause — too few and the policy
+/// reports degraded and the gate stalls. Node 0 is always the primary;
+/// [`Policy::attribute_blocker`] relies on that index convention to tell
+/// journal from replication.
 ///
-/// Disconnected slots are *omitted from the view* rather than included
-/// with zero cursors. The view's `len()` reflects how many nodes are
-/// actually available; if it's too small to satisfy a clause, the
-/// policy reports degraded and the gate stalls.
+/// The primary's in-memory cursor is modeled as `u64::MAX` because the
+/// response stage only gates events the matching engine has already
+/// processed — those are trivially in-memory on the primary.
+///
+/// Scoped-borrow shape rather than a returned view: `CursorView` holds a
+/// slice, so it cannot outlive the array behind it. Lending it to a
+/// closure keeps that array on this frame and off every caller's
+/// signature.
 #[inline]
-pub(crate) fn evaluate_durability(
-    policy: &Policy,
+fn with_cursor_view<R>(
     journal_pos: WireSeq,
     metrics: Option<&ReplicationMetrics>,
     replica_active: Option<&[Arc<AtomicBool>; 2]>,
-) -> EvalStatus {
-    let (nodes, len) = build_cursor_nodes(journal_pos, metrics, replica_active);
-    policy.evaluate_with_status(&CursorView::new(&nodes[..len]))
-}
-
-/// Snapshot the live cursors into the node array a [`CursorView`]
-/// borrows. Node 0 is always the primary — [`Policy::attribute_blocker`]
-/// relies on that index convention to tell journal from replication.
-///
-/// Returns the array plus the number of populated entries; the caller
-/// slices it because `CursorView` borrows.
-#[inline]
-fn build_cursor_nodes(
-    journal_pos: WireSeq,
-    metrics: Option<&ReplicationMetrics>,
-    replica_active: Option<&[Arc<AtomicBool>; 2]>,
-) -> ([[u64; 2]; 3], usize) {
-    // Primary + up to 2 replica slots = 3 nodes max. The policy view is
-    // raw `u64`, all wire-seq space: `journal_pos` leaves the type system
-    // here, alongside the replica metrics gauges (the `Ack` frame's
-    // wire-seq fields verbatim).
-    let mut nodes: [[u64; 2]; 3] = [[0, 0]; 3];
+    f: impl FnOnce(&CursorView<'_>) -> R,
+) -> R {
+    // Fixed-size array rather than a `Vec`: the cluster is capped at
+    // MAX_CLUSTER_SIZE and this runs on the gate path, so a heap
+    // allocation would be pure overhead. Raw `u64` in wire-seq space —
+    // `journal_pos` leaves the type system here, alongside the replica
+    // metrics gauges (the `Ack` frame's wire-seq fields verbatim).
+    let mut nodes = [[0u64; 2]; MAX_CLUSTER_SIZE as usize];
     nodes[0] = [u64::MAX, journal_pos.get()];
     let mut len = 1;
     if let (Some(m), Some(active)) = (metrics, replica_active) {
@@ -1040,7 +1032,21 @@ fn build_cursor_nodes(
             len += 1;
         }
     }
-    (nodes, len)
+    f(&CursorView::new(&nodes[..len]))
+}
+
+/// Highest sequence at which the policy is satisfied by the live
+/// cursors, plus whether the cluster shape can satisfy it at all.
+#[inline]
+pub(crate) fn evaluate_durability(
+    policy: &Policy,
+    journal_pos: WireSeq,
+    metrics: Option<&ReplicationMetrics>,
+    replica_active: Option<&[Arc<AtomicBool>; 2]>,
+) -> EvalStatus {
+    with_cursor_view(journal_pos, metrics, replica_active, |view| {
+        policy.evaluate_with_status(view)
+    })
 }
 
 /// Which subsystem the gate was waiting on, evaluated against the
@@ -1059,8 +1065,9 @@ pub(crate) fn attribute_gate_blocker(
     metrics: Option<&ReplicationMetrics>,
     replica_active: Option<&[Arc<AtomicBool>; 2]>,
 ) -> Option<Blocker> {
-    let (nodes, len) = build_cursor_nodes(journal_pos, metrics, replica_active);
-    policy.attribute_blocker(&CursorView::new(&nodes[..len]))
+    with_cursor_view(journal_pos, metrics, replica_active, |view| {
+        policy.attribute_blocker(view)
+    })
 }
 
 /// The replica-side cursor the active policy is waiting on, for the
@@ -1074,8 +1081,9 @@ pub(crate) fn policy_replica_cursor(
     metrics: Option<&ReplicationMetrics>,
     replica_active: Option<&[Arc<AtomicBool>; 2]>,
 ) -> Option<u64> {
-    let (nodes, len) = build_cursor_nodes(journal_pos, metrics, replica_active);
-    policy.replica_gate_cursor(&CursorView::new(&nodes[..len]))
+    with_cursor_view(journal_pos, metrics, replica_active, |view| {
+        policy.replica_gate_cursor(view)
+    })
 }
 
 /// Hold-time before a state transition is committed to the log.
