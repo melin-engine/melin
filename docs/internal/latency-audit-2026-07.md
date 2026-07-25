@@ -37,6 +37,7 @@ uniformly low and is the column most worth reading.
 | 8 | DPDK per-slot `flush()` | Med | Med | Med | Low |
 | 9 | Ingest double copy | Med | Low–Med | Med | Med |
 | 10 | `spsc::flush` contended load | Low | None | Low | ~~Trivial~~ **done** |
+| 11 | `ring::Producer` cursor loads | Low | Low | Low | Low–Med |
 
 \* Finding 2 cannot be isolated from finding 1 — they touch the same cache
 line. Fold it into finding 1's change and measure the pair once.
@@ -328,3 +329,32 @@ Numbered to match the triage table above.
   touches the shared line not at all. This matters more than the rating
   suggests while item 8 stands, since the DPDK response path calls `flush`
   once per slot.
+
+- **11 — `ring::Producer` reloads its own cursor.** `try_publish`
+  (`pipeline/src/ring.rs:154`), `publish_with` (`:207`), `try_claim`
+  (`:240`) and `batch()` (`:309`) each Relaxed-load `shared.cursor` to
+  find the next sequence, rather than mirroring it locally the way
+  `spsc::Producer` now mirrors `head` (item 10). The producer is the sole
+  writer, so a mirror would be exact; the consumers read that line
+  continuously through `DependencyKind::load`.
+
+  **Scope is narrower than it first looks, and the rating reflects that.**
+  Every hot-path caller already avoids the per-event load: `Batch`
+  computes each sequence as `start_seq + count` from local state, and
+  `Batch::commit` stores without loading. Ingest
+  (`server-runtime/src/client_frames.rs:75,146`), the replica receiver
+  (`replication/receiver_transport.rs:281,459`) and the matching stage's
+  output (`pipeline.rs:2569`) all go through `Batch`. The residual is one
+  load per `batch()` construction — on ingest that is once per recv plus
+  once per `COMMIT_EVERY` (16) frames — plus one `try_claim` per fsync
+  batch on the replication ring (`journal/src/replication.rs:116`;
+  `record_slot_for_replication` only accumulates into a buffer per slot,
+  it does not publish). The remaining `publish` / `try_publish` callers
+  are cold: startup seeding, shutdown sentinels, and the 250 ms tick.
+
+  **Why the risk is Low rather than None**, unlike item 10. `Batch` rolls
+  back on drop by *not* storing, so a producer-side mirror would have to
+  be updated at three separate commit sites inside `Batch` (`commit`, and
+  the mid-spin auto-commits in `push_with` and `push_with_or_abort`) while
+  staying untouched on the rollback path. That is a real invariant where
+  today there is none — worth pinning with tests if it is ever done.
