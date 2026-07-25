@@ -398,11 +398,16 @@ pub fn run<A: Application>(
                     let journal_pos = journal_persisted_wire_seq.load();
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
-                    let repl_min =
-                        crate::response::connected_persisted_min(metrics_ref, active_ref);
 
+                    // Sampled per consumer rather than per iteration —
+                    // see `response.rs` for why these four Acquire loads
+                    // do not belong in the spin body.
                     #[cfg(feature = "tick-to-trade")]
-                    gate_tracker.observe(journal_pos.get(), repl_min, trace::mono_trace_ns());
+                    gate_tracker.observe(
+                        journal_pos.get(),
+                        crate::response::connected_persisted_min(metrics_ref, active_ref),
+                        trace::mono_trace_ns(),
+                    );
 
                     let status = crate::response::evaluate_durability(
                         &policy,
@@ -433,7 +438,11 @@ pub fn run<A: Application>(
 
                     if cached_durable_pos >= needed {
                         // Attribution: which subsystem was slowest. See
-                        // response.rs for the rationale.
+                        // response.rs for the rationale, including why
+                        // this is sampled at gate-open rather than per
+                        // iteration.
+                        let repl_min =
+                            crate::response::connected_persisted_min(metrics_ref, active_ref);
                         if journal_pos.get() <= repl_min {
                             utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
                         } else {
