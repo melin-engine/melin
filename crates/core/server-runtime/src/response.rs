@@ -591,10 +591,23 @@ pub fn run<A: Application>(
                     let journal_pos = journal_persisted_wire_seq.load();
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
-                    let repl_min = connected_persisted_min(metrics_ref, active_ref);
 
+                    // `connected_persisted_min` is wanted by exactly two
+                    // consumers: the cross-tracker below (traced builds
+                    // only) and the attribution branch at the bottom,
+                    // which runs once — on the iteration the gate opens.
+                    // Computing it unconditionally here spent four
+                    // Acquire loads per spin iteration on
+                    // `ReplicationMetrics`, the same cache line the
+                    // replication sender writes on every ack and every
+                    // completed SEND. Each consumer now samples it where
+                    // it is actually used.
                     #[cfg(feature = "tick-to-trade")]
-                    gate_tracker.observe(journal_pos.get(), repl_min, trace::mono_trace_ns());
+                    gate_tracker.observe(
+                        journal_pos.get(),
+                        connected_persisted_min(metrics_ref, active_ref),
+                        trace::mono_trace_ns(),
+                    );
 
                     let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
                     cached_durable_pos = status.durable_pos;
@@ -626,7 +639,13 @@ pub fn run<A: Application>(
                     if cached_durable_pos >= needed {
                         // Attribution: which subsystem was slowest at
                         // the moment the gate opened. Relaxed is fine —
-                        // health reads are infrequent.
+                        // health reads are infrequent. Sampled here
+                        // rather than at the top of the iteration: this
+                        // is the only reader, it runs once per gate
+                        // open, and `journal_pos` above is from the same
+                        // iteration, so the comparison stays a
+                        // like-for-like snapshot.
+                        let repl_min = connected_persisted_min(metrics_ref, active_ref);
                         if journal_pos.get() <= repl_min {
                             utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
                         } else {

@@ -28,7 +28,7 @@ uniformly low and is the column most worth reading.
 | # | Finding | Upside potential | Regression risk | Bench effort | Fix effort |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `ReplicationMetrics` unpadded | **High** | Low | **Low** | Low–Med |
-| 2 | Hoist `connected_persisted_min` | Low–Med | None | High\* | **Trivial** |
+| 2 | Hoist `connected_persisted_min` | Low–Med | None | High\* | ~~Trivial~~ **done** |
 | 3 | SipHash → FxHash (3 sites) | Med | Low | **Low** | **Trivial** |
 | 4 | No flush while ring has work | **High** | **Med–High** | Low–Med | Med |
 | 5 | Journal 512 KiB copy | Med | Med | Med | **High** |
@@ -131,11 +131,24 @@ opens. On a build without `tick-to-trade` it is otherwise dead.
 It is nonetheless computed on every spin iteration — four Acquire loads,
 on the line from finding 1.
 
-**Proposed fix.** Hoist it: compute `repl_min` once inside the
-`cached_durable_pos >= needed` branch, immediately before the attribution
-check and the `break`. The traced build keeps its per-iteration
-`gate_tracker.observe` call, which needs the per-iteration value, so this
-is a `cfg`-shaped split rather than a straight move.
+**Fixed.** Each consumer now samples `connected_persisted_min` where it is
+actually used: the attribution branch computes it inside the
+`cached_durable_pos >= needed` arm (once per gate open), and the traced
+build computes it inline at the `gate_tracker.observe` call, which
+genuinely needs a per-iteration value. The spin body no longer touches it
+at all on a build without `tick-to-trade`.
+
+Both response stages had the identical loop — `response.rs` and
+`dpdk_response.rs:398` — so both were changed.
+
+Behaviour is preserved. The attribution counters read the same
+`journal_pos` from the same iteration, so the comparison stays a
+like-for-like snapshot; with no replication configured
+`connected_persisted_min` returns `u64::MAX` and the branch still
+attributes to the journal, as before.
+
+Still worth folding into finding 1's measurement rather than measuring on
+its own — the loads it removes are on finding 1's cache line.
 
 ---
 
