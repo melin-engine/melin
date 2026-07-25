@@ -173,10 +173,11 @@ struct HealthSnapshot {
     /// Response gate-wait events where the replication cursor was the bottleneck.
     response_gate_replication: u64,
     /// Whether the durability policy was last evaluated as degraded —
-    /// at least one degrade-friendly clause was clamped below its
-    /// target node count. Trips when a replica disconnects from a
-    /// 2-of-3 cluster running `persisted>=2 best_effort`, etc. Operator alerting
-    /// should fire on this transitioning to `true`.
+    /// at least one clause requires more nodes than are currently
+    /// connected, so the response gate stalls until the cluster shape
+    /// recovers (or an operator swaps the mode). Trips when a replica
+    /// disconnects from a two-node cluster running `persisted>=2`, etc.
+    /// Operator alerting should fire on this transitioning to `true`.
     response_policy_degraded: bool,
     /// Cumulative nanoseconds the durability policy has spent degraded.
     /// Emitted as a `_seconds_total` counter (nanos / 1e9) so operators
@@ -527,7 +528,7 @@ impl HealthSnapshot {
              melin_stage_idle_total{{stage=\"journal\"}} {}\n\
              melin_stage_idle_total{{stage=\"matching\"}} {}\n\
              melin_stage_idle_total{{stage=\"response\"}} {}\n\
-             # HELP melin_response_gate_total Gate opens by which node supplied the binding cursor of the configured durability policy (journal = the local primary, replication = a replica). Does not sum to total gate opens: neither label moves while the cluster shape cannot satisfy the policy (see melin_durability_policy_degraded).\n\
+             # HELP melin_response_gate_total Gate opens by which node supplied the binding cursor of the configured durability policy (journal = the local primary, replication = a replica). While the cluster shape cannot satisfy the policy the gate does not open and neither label moves (see melin_durability_policy_degraded).\n\
              # TYPE melin_response_gate_total counter\n\
              melin_response_gate_total{{blocker=\"journal\"}} {}\n\
              melin_response_gate_total{{blocker=\"replication\"}} {}\n\
@@ -536,10 +537,10 @@ impl HealthSnapshot {
              melin_journal_rotations_total{{path=\"fast\"}} {}\n\
              melin_journal_rotations_total{{path=\"sync_fallback\"}} {}\n\
              melin_journal_rotations_total{{path=\"failed\"}} {}\n\
-             # HELP melin_durability_policy_degraded Durability policy currently clamped below its target node count (1 = degraded, 0 = healthy).\n\
+             # HELP melin_durability_policy_degraded Durability policy currently unsatisfiable by the connected cluster shape; the response gate stalls while set (1 = degraded, 0 = healthy).\n\
              # TYPE melin_durability_policy_degraded gauge\n\
              melin_durability_policy_degraded {}\n\
-             # HELP melin_durability_policy_degraded_seconds_total Cumulative seconds the durability policy has spent clamped below its target node count.\n\
+             # HELP melin_durability_policy_degraded_seconds_total Cumulative seconds the durability policy has spent unsatisfiable by the connected cluster shape.\n\
              # TYPE melin_durability_policy_degraded_seconds_total counter\n\
              melin_durability_policy_degraded_seconds_total {:.6}\n",
             self.active_connections,

@@ -417,8 +417,9 @@ pub fn run<A: Application>(
                         trace::mono_trace_ns(),
                     );
 
-                    let status = crate::response::evaluate_durability(
+                    let (status, blocker) = crate::response::evaluate_gate(
                         &policy,
+                        needed,
                         journal_pos,
                         metrics_ref,
                         active_ref,
@@ -446,16 +447,11 @@ pub fn run<A: Application>(
 
                     if cached_durable_pos >= needed {
                         // Attribution against the policy actually in
-                        // force. See response.rs for the rationale,
-                        // including why this is sampled at gate-open
-                        // rather than per iteration and why `None`
-                        // moves neither counter.
-                        match crate::response::attribute_gate_blocker(
-                            &policy,
-                            journal_pos,
-                            metrics_ref,
-                            active_ref,
-                        ) {
+                        // force, from the same snapshot that opened the
+                        // gate. See response.rs for the rationale,
+                        // including why the `None` arm is an
+                        // unreachable no-op.
+                        match blocker {
                             Some(Blocker::Journal) => {
                                 utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
                             }
