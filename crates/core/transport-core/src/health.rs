@@ -527,7 +527,7 @@ impl HealthSnapshot {
              melin_stage_idle_total{{stage=\"journal\"}} {}\n\
              melin_stage_idle_total{{stage=\"matching\"}} {}\n\
              melin_stage_idle_total{{stage=\"response\"}} {}\n\
-             # HELP melin_response_gate_total Gate-wait events by bottleneck (journal fsync vs replica ack).\n\
+             # HELP melin_response_gate_total Gate opens by which node supplied the binding cursor of the configured durability policy (journal = the local primary, replication = a replica). Does not sum to total gate opens: neither label moves while the cluster shape cannot satisfy the policy (see melin_durability_policy_degraded).\n\
              # TYPE melin_response_gate_total counter\n\
              melin_response_gate_total{{blocker=\"journal\"}} {}\n\
              melin_response_gate_total{{blocker=\"replication\"}} {}\n\

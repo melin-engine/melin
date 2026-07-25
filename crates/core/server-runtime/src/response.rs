@@ -510,10 +510,11 @@ pub fn run<A: Application>(
         //
         // Per-slot journal-wait / replica-wait tracker. See
         // `GateCrossTracker` for the rationale (only records cursors
-        // that were actually on the critical path). Attribution uses
-        // `repl_min` = min of connected-replica persisted cursors so
-        // operators see "which subsystem to optimize" the same way as
-        // before the policy refactor.
+        // that were actually on the critical path). Both the tracker's
+        // replica cursor and the attribution counters at the bottom are
+        // derived from the policy in force rather than a fixed level,
+        // so "which subsystem to optimize" answers for the deployment
+        // the operator actually configured.
         #[cfg(feature = "tick-to-trade")]
         let mut gate_tracker;
         {
@@ -703,8 +704,7 @@ pub fn run<A: Application>(
             // may have crossed their individual `input_seq+1` earlier,
             // so this systematically overestimates wait for non-last
             // slots by up to the batch's matching span. Acceptable
-            // noise for the operator-facing breakdown; documented in
-            // `docs/benchmarking.md`.
+            // noise for the operator-facing breakdown.
             #[cfg(feature = "tick-to-trade")]
             if let Some(ts) = gate_tracker.journal_crossed() {
                 journal_wait_rec.record_elapsed(slot.match_complete_ts, ts);
@@ -1304,22 +1304,28 @@ impl GateCrossTracker {
         }
     }
 
+    /// `replica_pos` is the replica-side cursor the *active policy*
+    /// gates on — see [`policy_replica_cursor`]. Passing `u64::MAX`
+    /// (which that helper's `None` maps to, e.g. under `local`) leaves
+    /// `replica_was_below` false, so no replica-wait sample is recorded
+    /// for a policy that never waits on a replica in the first place.
     pub(crate) fn observe(
         &mut self,
         journal_pos: u64,
-        repl_min: u64,
+        replica_pos: u64,
         now_ns: trace::MonoTraceInstant,
     ) {
         if self.first {
             self.journal_was_below = journal_pos < self.needed;
-            self.replica_was_below = repl_min < self.needed;
+            self.replica_was_below = replica_pos < self.needed;
             self.first = false;
         }
         if self.journal_was_below && self.journal_crossed_ts.is_none() && journal_pos >= self.needed
         {
             self.journal_crossed_ts = Some(now_ns);
         }
-        if self.replica_was_below && self.replica_crossed_ts.is_none() && repl_min >= self.needed {
+        if self.replica_was_below && self.replica_crossed_ts.is_none() && replica_pos >= self.needed
+        {
             self.replica_crossed_ts = Some(now_ns);
         }
     }

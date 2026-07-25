@@ -79,13 +79,21 @@ pub struct StageUtilization {
     pub busy: AtomicU64,
     /// Cumulative iterations where the stage was idle (no input available).
     pub idle: AtomicU64,
-    /// Cumulative gate-wait events where the journal cursor was the last
-    /// to reach the needed position (journal fsync was the bottleneck).
+    /// Cumulative gate opens where the *primary itself* supplied the
+    /// binding cursor — the local journal was the bottleneck.
     /// Only used by the response stage; always 0 for journal/matching.
     pub gate_journal: AtomicU64,
-    /// Cumulative gate-wait events where the replication cursor was the
-    /// last to reach the needed position (replica ack was the bottleneck).
+    /// Cumulative gate opens where a *replica* supplied the binding
+    /// cursor — replication was the bottleneck. Which replica cursor
+    /// counts depends on the configured durability policy: in-memory
+    /// under `hybrid`, persisted under `durably-replicated`. Under
+    /// `local` a replica can never bind, so this stays at 0.
     /// Only used by the response stage; always 0 for journal/matching.
+    ///
+    /// The two counters need not sum to the number of gate opens: when
+    /// the cluster shape cannot satisfy the policy at all, the gate is
+    /// stalled on a missing node rather than on either subsystem and
+    /// neither counter moves. `policy_degraded` covers that case.
     pub gate_replication: AtomicU64,
     /// Whether the most recent durability-gate evaluation actively
     /// clamped a degrade-friendly clause below its target count — i.e.
