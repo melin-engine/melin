@@ -179,6 +179,75 @@ impl Policy {
             degraded,
         }
     }
+
+    /// Which subsystem supplied the binding cursor — i.e. what the gate
+    /// was actually waiting on.
+    ///
+    /// Finds the clause that produced `durable_pos` (the most
+    /// constraining one) and reports whether the node at that clause's
+    /// threshold rank was the primary or a replica. This is the honest
+    /// answer to "journal or replication?" for *any* policy shape,
+    /// unlike comparing the journal cursor against a fixed replica
+    /// level: under `local` (`persisted>=1`) replicas cannot bind at
+    /// all, and under `hybrid` (`persisted>=1 && in_memory>=2`) the
+    /// binding replica cursor is in-memory, not persisted.
+    ///
+    /// Returns `None` when a clause is unsatisfiable by the current
+    /// cluster shape — the gate is stalled on missing nodes rather than
+    /// on either subsystem's progress, so no attribution is meaningful.
+    ///
+    /// Not on the hot path: the response stage calls this once per gate
+    /// open, not per spin iteration.
+    pub fn attribute_blocker(&self, cursors: &CursorView<'_>) -> Option<Blocker> {
+        let mut binding: Option<(u64, Blocker)> = None;
+        for clause in &self.clauses {
+            let (value, node) = nth_largest_with_node(cursors, clause.level, clause.count)?;
+            // Node 0 is the primary by construction of the view; every
+            // other index is a replica slot.
+            let blocker = if node == 0 {
+                Blocker::Journal
+            } else {
+                Blocker::Replication
+            };
+            if binding.is_none_or(|(best, _)| value < best) {
+                binding = Some((value, blocker));
+            }
+        }
+        binding.map(|(_, blocker)| blocker)
+    }
+
+    /// The tightest replica-supplied clause value — the replica-side
+    /// cursor this policy is actually waiting on.
+    ///
+    /// Returns `None` when no clause is supplied by a replica (e.g.
+    /// `local`, where the primary alone satisfies `persisted>=1`), or
+    /// when a clause is unsatisfiable by the current cluster shape.
+    /// Callers use this to measure replica wait against the level the
+    /// policy really gates on rather than a hardcoded one.
+    pub fn replica_gate_cursor(&self, cursors: &CursorView<'_>) -> Option<u64> {
+        let mut tightest: Option<u64> = None;
+        for clause in &self.clauses {
+            let (value, node) = nth_largest_with_node(cursors, clause.level, clause.count)?;
+            if node == 0 {
+                continue;
+            }
+            if tightest.is_none_or(|best| value < best) {
+                tightest = Some(value);
+            }
+        }
+        tightest
+    }
+}
+
+/// Which subsystem the durability gate was waiting on. Reported by
+/// [`Policy::attribute_blocker`] and surfaced through the
+/// `melin_response_gate_total_blocker_*` counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blocker {
+    /// The primary's own journal supplied the binding cursor.
+    Journal,
+    /// A replica supplied the binding cursor.
+    Replication,
 }
 
 impl fmt::Display for Policy {
@@ -244,6 +313,65 @@ impl<'a> CursorView<'a> {
     }
 }
 
+/// Stack buffer bound for the maximum cluster shape we ever expect
+/// (1 primary + up to 8 replicas = 9). Replication today caps at 1+2;
+/// even with Raft (#7) this stays in single digits. Avoiding the heap
+/// allocation matters because `evaluate` runs on the response-stage
+/// hot path.
+const MAX_NODES: usize = 16;
+
+/// One node's effective cursor at `level`.
+///
+/// A higher-level cursor implies satisfaction of all lower levels on
+/// the same node: if the node has persisted seq S, then it has
+/// trivially also "received" seq S. Taking the max over
+/// `level..=Persisted` honours that monotonicity even if the caller's
+/// cursors temporarily violate it (e.g. during the brief window where
+/// a write completes before the in-memory cursor has been republished).
+#[inline]
+fn effective_cursor(node: &[u64; 2], level: Level) -> u64 {
+    let mut v = 0u64;
+    for &c in &node[level as usize..] {
+        if c > v {
+            v = c;
+        }
+    }
+    v
+}
+
+/// The `count`-th largest cursor at `level`, together with the index of
+/// the node that supplied it.
+///
+/// That node is the *marginal* contributor to the clause: the one whose
+/// participation is what makes the count. Ranking is descending by
+/// cursor, ties broken by ascending node index — so at equal cursors the
+/// primary (index 0) sorts first and the marginal slot at rank
+/// `count - 1` falls to a replica, which is the honest reading of "whose
+/// arrival completed the quorum".
+///
+/// Returns `None` when the clause cannot be satisfied by the current
+/// cluster shape (`count` exceeds the node count), because then no node
+/// supplies a threshold at all.
+#[inline]
+fn nth_largest_with_node(view: &CursorView<'_>, level: Level, count: u8) -> Option<(u64, usize)> {
+    let n = count as usize;
+    let len = view.nodes.len().min(MAX_NODES);
+    if n == 0 || n > len {
+        return None;
+    }
+    debug_assert!(
+        view.nodes.len() <= MAX_NODES,
+        "cluster larger than expected"
+    );
+    let mut buf = [(0u64, 0usize); MAX_NODES];
+    for (i, node) in view.nodes.iter().take(len).enumerate() {
+        buf[i] = (effective_cursor(node, level), i);
+    }
+    // `len` is at most 16, so an unstable sort is cheap.
+    buf[..len].sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    Some(buf[n - 1])
+}
+
 /// Compute the `count`-th largest cursor among all nodes at `level`.
 /// That value is the highest sequence at which at least `count` nodes
 /// have reached `level`.
@@ -252,42 +380,10 @@ impl<'a> CursorView<'a> {
 /// satisfied by any sequence; the response gate must wait.
 #[inline]
 fn nth_largest_cursor(view: &CursorView<'_>, level: Level, count: u8) -> u64 {
-    let n = count as usize;
-    if n == 0 || n > view.nodes.len() {
-        return 0;
+    match nth_largest_with_node(view, level, count) {
+        Some((value, _)) => value,
+        None => 0,
     }
-    // Stack buffer sized for the maximum cluster shape we ever expect
-    // (1 primary + up to 8 replicas = 9). Replication today caps at
-    // 1+2; even with Raft (#7) this stays in single digits. Avoiding
-    // the heap allocation here matters because `evaluate` runs on the
-    // response-stage hot path.
-    const MAX_NODES: usize = 16;
-    debug_assert!(
-        view.nodes.len() <= MAX_NODES,
-        "cluster larger than expected"
-    );
-    let mut buf = [0u64; MAX_NODES];
-    let len = view.nodes.len().min(MAX_NODES);
-    let level_idx = level as usize;
-    for (i, node) in view.nodes.iter().take(len).enumerate() {
-        // A higher-level cursor implies satisfaction of all lower
-        // levels on the same node: if the node has persisted seq S,
-        // then it has trivially also "received" seq S. Take the max
-        // over `level_idx..=Persisted` to honour that monotonicity
-        // even if the caller's cursors temporarily violate it (e.g.
-        // during the brief window where a write completes before the
-        // in-memory cursor has been republished).
-        let mut v = 0u64;
-        for &c in &node[level_idx..] {
-            if c > v {
-                v = c;
-            }
-        }
-        buf[i] = v;
-    }
-    // Sort descending. `len` is at most 16, so an unstable sort is cheap.
-    buf[..len].sort_unstable_by(|a, b| b.cmp(a));
-    buf[n - 1]
 }
 
 /// Errors from [`Policy::new`].
@@ -347,6 +443,83 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    // --- attribute_blocker / replica_gate_cursor ---
+
+    #[test]
+    fn blocker_follows_the_binding_clause_not_a_fixed_level() {
+        // hybrid: primary persisted 300, replica in-memory 400 (fsync
+        // trailing at 250). The binding term is the primary's own
+        // persisted cursor.
+        let p = and_policy(&[(Level::Persisted, 1), (Level::InMemory, 2)]);
+        let nodes = [[u64::MAX, 300], [400, 250]];
+        assert_eq!(
+            p.attribute_blocker(&CursorView::new(&nodes)),
+            Some(Blocker::Journal)
+        );
+
+        // Replica in-memory now trails the primary → replication binds.
+        let nodes = [[u64::MAX, 300], [200, 100]];
+        assert_eq!(
+            p.attribute_blocker(&CursorView::new(&nodes)),
+            Some(Blocker::Replication)
+        );
+    }
+
+    #[test]
+    fn blocker_never_credits_replication_for_a_single_node_clause() {
+        // `persisted>=1` is met by whichever node is furthest along. A
+        // lagging replica cannot bind it, so the journal must be the
+        // verdict no matter how far behind the replica is.
+        let p = policy(Level::Persisted, 1);
+        let nodes = [[u64::MAX, 500], [1, 1], [1, 1]];
+        assert_eq!(
+            p.attribute_blocker(&CursorView::new(&nodes)),
+            Some(Blocker::Journal)
+        );
+    }
+
+    #[test]
+    fn blocker_is_none_when_a_clause_outruns_the_cluster() {
+        // `persisted>=2` with only the primary present: stalled on a
+        // missing node, not on either subsystem.
+        let p = policy(Level::Persisted, 2);
+        let nodes = [[u64::MAX, 500]];
+        assert_eq!(p.attribute_blocker(&CursorView::new(&nodes)), None);
+    }
+
+    #[test]
+    fn blocker_marginal_node_at_equal_cursors_is_the_replica() {
+        // Tie at the threshold: `in_memory>=2` needs a second node, and
+        // the replica is the one whose arrival completes the count.
+        let p = policy(Level::InMemory, 2);
+        let nodes = [[u64::MAX, 300], [300, 300]];
+        assert_eq!(
+            p.attribute_blocker(&CursorView::new(&nodes)),
+            Some(Blocker::Replication)
+        );
+    }
+
+    #[test]
+    fn replica_gate_cursor_reports_the_level_the_policy_uses() {
+        // hybrid gates replicas on in-memory: 400, not the fsync at 250.
+        let p = and_policy(&[(Level::Persisted, 1), (Level::InMemory, 2)]);
+        let nodes = [[u64::MAX, 300], [400, 250]];
+        assert_eq!(p.replica_gate_cursor(&CursorView::new(&nodes)), Some(400));
+
+        // durably-replicated gates them on persisted: 250.
+        let p = policy(Level::Persisted, 2);
+        assert_eq!(p.replica_gate_cursor(&CursorView::new(&nodes)), Some(250));
+    }
+
+    #[test]
+    fn replica_gate_cursor_is_none_when_no_clause_needs_a_replica() {
+        // local: the primary satisfies `persisted>=1` alone, so there is
+        // no replica wait to measure even with a replica connected.
+        let p = policy(Level::Persisted, 1);
+        let nodes = [[u64::MAX, 500], [100, 100]];
+        assert_eq!(p.replica_gate_cursor(&CursorView::new(&nodes)), None);
     }
 
     #[test]

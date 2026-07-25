@@ -20,7 +20,7 @@ use tracing::{debug, error};
 
 use melin_pipeline::ring;
 
-use crate::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
+use crate::durability_policy::{Blocker, CursorView, DurabilityMode, EvalStatus, Policy};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -592,7 +592,7 @@ pub fn run<A: Application>(
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
 
-                    // `connected_persisted_min` is wanted by exactly two
+                    // The replica cursor is wanted by exactly two
                     // consumers: the cross-tracker below (traced builds
                     // only) and the attribution branch at the bottom,
                     // which runs once — on the iteration the gate opens.
@@ -605,7 +605,14 @@ pub fn run<A: Application>(
                     #[cfg(feature = "tick-to-trade")]
                     gate_tracker.observe(
                         journal_pos.get(),
-                        connected_persisted_min(metrics_ref, active_ref),
+                        // The level the *active policy* gates replicas
+                        // on — in-memory under `hybrid`, persisted under
+                        // `durably-replicated`. `u64::MAX` when no
+                        // clause is replica-supplied (`local`), so the
+                        // tracker records no replica wait rather than a
+                        // wait on a cursor the gate never consults.
+                        policy_replica_cursor(&policy, journal_pos, metrics_ref, active_ref)
+                            .unwrap_or(u64::MAX),
                         trace::mono_trace_ns(),
                     );
 
@@ -637,19 +644,27 @@ pub fn run<A: Application>(
                     }
 
                     if cached_durable_pos >= needed {
-                        // Attribution: which subsystem was slowest at
-                        // the moment the gate opened. Relaxed is fine —
-                        // health reads are infrequent. Sampled here
-                        // rather than at the top of the iteration: this
-                        // is the only reader, it runs once per gate
-                        // open, and `journal_pos` above is from the same
-                        // iteration, so the comparison stays a
-                        // like-for-like snapshot.
-                        let repl_min = connected_persisted_min(metrics_ref, active_ref);
-                        if journal_pos.get() <= repl_min {
-                            utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            utilization.gate_replication.fetch_add(1, Ordering::Relaxed);
+                        // Attribution: which subsystem supplied the
+                        // binding cursor, evaluated against the policy
+                        // actually in force. Relaxed is fine — health
+                        // reads are infrequent. Sampled here rather than
+                        // at the top of the iteration: this is the only
+                        // reader and it runs once per gate open.
+                        //
+                        // `None` means a clause is unsatisfiable by the
+                        // current cluster shape; neither counter moves,
+                        // because the gate was stalled on missing nodes
+                        // rather than on either subsystem's progress —
+                        // `policy_degraded` is the metric for that.
+                        match attribute_gate_blocker(&policy, journal_pos, metrics_ref, active_ref)
+                        {
+                            Some(Blocker::Journal) => {
+                                utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some(Blocker::Replication) => {
+                                utilization.gate_replication.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => {}
                         }
                         break;
                     }
@@ -990,6 +1005,22 @@ pub(crate) fn evaluate_durability(
     metrics: Option<&ReplicationMetrics>,
     replica_active: Option<&[Arc<AtomicBool>; 2]>,
 ) -> EvalStatus {
+    let (nodes, len) = build_cursor_nodes(journal_pos, metrics, replica_active);
+    policy.evaluate_with_status(&CursorView::new(&nodes[..len]))
+}
+
+/// Snapshot the live cursors into the node array a [`CursorView`]
+/// borrows. Node 0 is always the primary — [`Policy::attribute_blocker`]
+/// relies on that index convention to tell journal from replication.
+///
+/// Returns the array plus the number of populated entries; the caller
+/// slices it because `CursorView` borrows.
+#[inline]
+fn build_cursor_nodes(
+    journal_pos: WireSeq,
+    metrics: Option<&ReplicationMetrics>,
+    replica_active: Option<&[Arc<AtomicBool>; 2]>,
+) -> ([[u64; 2]; 3], usize) {
     // Primary + up to 2 replica slots = 3 nodes max. The policy view is
     // raw `u64`, all wire-seq space: `journal_pos` leaves the type system
     // here, alongside the replica metrics gauges (the `Ack` frame's
@@ -1009,7 +1040,42 @@ pub(crate) fn evaluate_durability(
             len += 1;
         }
     }
-    policy.evaluate_with_status(&CursorView::new(&nodes[..len]))
+    (nodes, len)
+}
+
+/// Which subsystem the gate was waiting on, evaluated against the
+/// policy actually in force. Replaces the old "compare the journal
+/// cursor against the minimum replica *persisted* cursor" heuristic,
+/// which reported replication as the blocker under `local` — where
+/// replicas cannot bind the gate at all — and read the persisted level
+/// under `hybrid`, which gates on in-memory.
+///
+/// `None` when the cluster shape cannot satisfy the policy; the gate is
+/// then stalled on missing nodes, not on either subsystem.
+#[inline]
+pub(crate) fn attribute_gate_blocker(
+    policy: &Policy,
+    journal_pos: WireSeq,
+    metrics: Option<&ReplicationMetrics>,
+    replica_active: Option<&[Arc<AtomicBool>; 2]>,
+) -> Option<Blocker> {
+    let (nodes, len) = build_cursor_nodes(journal_pos, metrics, replica_active);
+    policy.attribute_blocker(&CursorView::new(&nodes[..len]))
+}
+
+/// The replica-side cursor the active policy is waiting on, for the
+/// `tick-to-trade` replica-wait histogram. `None` when no clause is
+/// replica-supplied (e.g. `local`).
+#[cfg(feature = "tick-to-trade")]
+#[inline]
+pub(crate) fn policy_replica_cursor(
+    policy: &Policy,
+    journal_pos: WireSeq,
+    metrics: Option<&ReplicationMetrics>,
+    replica_active: Option<&[Arc<AtomicBool>; 2]>,
+) -> Option<u64> {
+    let (nodes, len) = build_cursor_nodes(journal_pos, metrics, replica_active);
+    policy.replica_gate_cursor(&CursorView::new(&nodes[..len]))
 }
 
 /// Hold-time before a state transition is committed to the log.
@@ -1193,35 +1259,6 @@ impl DegradationLogger {
     }
 }
 
-/// Minimum persisted cursor across currently-connected replica slots.
-/// Used for gate-bottleneck attribution and the journal-wait /
-/// replica-wait histograms — *not* for durability decisions, which go
-/// through [`evaluate_durability`].
-///
-/// Returns `u64::MAX` when no replica is connected, which makes
-/// attribution always credit the journal — correct, because in
-/// standalone mode the journal is the only path.
-#[inline]
-pub(crate) fn connected_persisted_min(
-    metrics: Option<&ReplicationMetrics>,
-    replica_active: Option<&[Arc<AtomicBool>; 2]>,
-) -> u64 {
-    let (Some(m), Some(active)) = (metrics, replica_active) else {
-        return u64::MAX;
-    };
-    let mut min = u64::MAX;
-    for (i, slot_active) in active.iter().enumerate() {
-        if !slot_active.load(Ordering::Acquire) {
-            continue;
-        }
-        let v = m.acked_sequence[i].load(Ordering::Acquire);
-        if v < min {
-            min = v;
-        }
-    }
-    min
-}
-
 /// Tracks per-cursor "first observed transition from below to >= needed"
 /// inside the durability gate loop, to drive the journal-wait /
 /// replica-wait histograms in the bench's tick-to-trade decomposition.
@@ -1311,7 +1348,7 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 mod tests {
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
-    use super::{DegradationLogger, WireSeq, connected_persisted_min, evaluate_durability};
+    use super::{Blocker, DegradationLogger, WireSeq, attribute_gate_blocker, evaluate_durability};
     use crate::durability_policy::{Clause, Level, Policy};
     use crate::replication::ReplicationMetrics;
 
@@ -1533,21 +1570,132 @@ mod tests {
         );
     }
 
-    // --- connected_persisted_min — used for gate-bottleneck attribution ---
+    // --- gate-blocker attribution ---
+    //
+    // The attribution must follow the policy actually in force. The
+    // previous heuristic compared the journal cursor against the
+    // minimum replica *persisted* cursor unconditionally, which
+    // reported replication as the blocker under `local` (where
+    // replicas cannot bind the gate) and read the wrong level under
+    // `hybrid` (which gates replicas on in-memory).
 
     #[test]
-    fn attribution_min_skips_disconnected_slots() {
-        // Slot 1 disconnected via active flag.
-        let m = metrics((150, 100), (999, 999));
-        let a = flags(true, false);
-        assert_eq!(connected_persisted_min(Some(&m), Some(&a)), 100);
+    fn local_mode_never_blames_replication() {
+        // `persisted>=1` is satisfied by the highest persisted cursor
+        // in the cluster — the primary's. A connected replica lagging
+        // far behind is irrelevant to the gate, so it must not be
+        // credited as the blocker. This is the case the old heuristic
+        // got flatly wrong: journal_pos (500) > repl_min (10) sent it
+        // down the `else` branch every single time.
+        let p = parse("persisted>=1").unwrap();
+        let m = metrics((10, 10), (10, 10));
+        let a = both_active();
+        assert_eq!(
+            attribute_gate_blocker(&p, WireSeq::new(500), Some(&m), Some(&a)),
+            Some(Blocker::Journal)
+        );
     }
 
     #[test]
-    fn attribution_min_returns_max_when_standalone() {
-        // No metrics wired → u64::MAX, which makes attribution always
-        // credit the journal. Correct for a standalone deployment.
-        assert_eq!(connected_persisted_min(None, None), u64::MAX);
+    fn hybrid_reads_replica_in_memory_not_persisted() {
+        // `persisted>=1 && in_memory>=2`. The replica has the event in
+        // memory (400) well ahead of its own fsync (100), and the
+        // primary's journal is behind that in-memory cursor (300).
+        // The binding clause is therefore the primary's persisted
+        // cursor → journal. Comparing against the replica's *persisted*
+        // cursor (100) would have said replication.
+        let p = parse("persisted>=1 && in_memory>=2").unwrap();
+        let m = metrics((400, 100), (0, 0));
+        let a = flags(true, false);
+        assert_eq!(
+            attribute_gate_blocker(&p, WireSeq::new(300), Some(&m), Some(&a)),
+            Some(Blocker::Journal)
+        );
+
+        // Same policy, replica in-memory now the laggard → replication.
+        let m = metrics((200, 100), (0, 0));
+        assert_eq!(
+            attribute_gate_blocker(&p, WireSeq::new(300), Some(&m), Some(&a)),
+            Some(Blocker::Replication)
+        );
+    }
+
+    #[test]
+    fn hybrid_is_satisfied_by_the_faster_replica() {
+        // `in_memory>=2` needs the primary plus *one* replica, so the
+        // best replica binds, not the worst. Replica 0 holds the event
+        // in memory at 400 with its own fsync trailing at 250 (behind
+        // the primary, as the physical ordering requires); replica 1
+        // lags badly at 10. The gate is not held up by replication —
+        // the primary's persisted cursor (300) is the binding term.
+        // Taking the min across replicas would have blamed the slow
+        // slot.
+        let p = parse("persisted>=1 && in_memory>=2").unwrap();
+        let m = metrics((400, 250), (10, 10));
+        let a = both_active();
+        assert_eq!(
+            attribute_gate_blocker(&p, WireSeq::new(300), Some(&m), Some(&a)),
+            Some(Blocker::Journal)
+        );
+    }
+
+    #[test]
+    fn durably_replicated_uses_second_largest_persisted() {
+        // `persisted>=2` is met by the primary plus the *best* replica's
+        // persisted cursor. With the primary ahead at 900 and replicas
+        // at 400 and 10, the clause resolves at 400 — the fast replica —
+        // not at the minimum of 10.
+        let p = parse("persisted>=2").unwrap();
+        let m = metrics((400, 400), (10, 10));
+        let a = both_active();
+        assert_eq!(
+            evaluate_durability(&p, WireSeq::new(900), Some(&m), Some(&a)).durable_pos,
+            400,
+            "clause takes the second-largest persisted cursor, not the minimum"
+        );
+        // Replication binds, which is the norm for this mode: the
+        // primary persists before it ships, so it is normally ahead of
+        // every replica.
+        assert_eq!(
+            attribute_gate_blocker(&p, WireSeq::new(900), Some(&m), Some(&a)),
+            Some(Blocker::Replication)
+        );
+    }
+
+    #[test]
+    fn standalone_credits_the_journal() {
+        // No replication wired: the primary is the only node, so the
+        // journal is the only thing the gate can be waiting on.
+        let p = parse("persisted>=1").unwrap();
+        assert_eq!(
+            attribute_gate_blocker(&p, WireSeq::new(500), None, None),
+            Some(Blocker::Journal)
+        );
+    }
+
+    #[test]
+    fn unsatisfiable_shape_yields_no_attribution() {
+        // `persisted>=2` with no replica connected: the gate is stalled
+        // on a missing node, not on either subsystem's progress. Neither
+        // counter should move — `policy_degraded` is the metric for it.
+        let p = parse("persisted>=2").unwrap();
+        assert_eq!(
+            attribute_gate_blocker(&p, WireSeq::new(500), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn attribution_skips_disconnected_slots() {
+        // Slot 1 is disconnected, so its (very advanced) cursors must
+        // not satisfy `in_memory>=2`; only slot 0 counts, and it lags.
+        let p = parse("persisted>=1 && in_memory>=2").unwrap();
+        let m = metrics((100, 100), (999, 999));
+        let a = flags(true, false);
+        assert_eq!(
+            attribute_gate_blocker(&p, WireSeq::new(500), Some(&m), Some(&a)),
+            Some(Blocker::Replication)
+        );
     }
 
     /// Fresh-cluster catch-up: a replica that handshakes at sequence
@@ -1573,13 +1721,6 @@ mod tests {
             !r.degraded,
             "all 3 nodes present, view meets clause target — should not flag degraded"
         );
-    }
-
-    #[test]
-    fn attribution_min_takes_smaller_when_both_connected() {
-        let m = metrics((150, 100), (180, 80));
-        let a = both_active();
-        assert_eq!(connected_persisted_min(Some(&m), Some(&a)), 80);
     }
 
     // -- Race-window regression tests --
