@@ -1,0 +1,249 @@
+# Latency audit — July 2026
+
+Structural read of the hot paths (disruptor ring / SPSC, ingest, matching,
+journal, response gate, replication metrics) looking for costs that are
+avoidable rather than inherent.
+
+**Nothing here has been measured.** These are code-level reads: each item
+identifies a mechanism (a cache line that bounces, a copy that has no
+consumer, a syscall on the wrong side of a branch), not a quantified
+regression. Before acting on any of them, instrument first — the
+`tick-to-trade` feature gate gives the per-stage decomposition (journal-wait
+/ replica-wait / encode / egress, registered in
+`crates/core/transport-core/src/trace.rs`), and
+`crates/core/pipeline/examples/false_sharing.rs` is the ready-made
+cache-line harness. Findings 1 and 4 are the ones worth measuring first.
+
+Ordering is by expected impact, highest first.
+
+---
+
+## 1. `ReplicationMetrics` is unpadded, and the durability gate spins on it
+
+**Where:** `crates/core/transport-core/src/replication/metrics.rs:18`
+
+The struct is ~104 bytes of bare atomics with no padding, so
+`acked_sequence[2]`, `in_memory_sequence[2]`, `bytes_sent[2]` and
+`ack_latency_us[2]` all fall within roughly one cache line.
+
+Who touches that line:
+
+| Thread | Access | Frequency |
+| --- | --- | --- |
+| Replication sender | `bytes_sent[slot].fetch_add(...)` — an RMW, takes the line **exclusive** (`server-runtime/src/replication/tcp_sender.rs:936`, `replication/dpdk.rs:953,977`) | every completed SEND |
+| Replication sender | stores to `acked_sequence[slot]`, `in_memory_sequence[slot]`, `acks_received[slot]` (`transport-core/src/replication/cursors.rs:204`) | every ack |
+| Response stage | Acquire-loads `acked_sequence[0..2]` and `in_memory_sequence[0..2]` (`server-runtime/src/response.rs:591`) | **every iteration of the gate spin loop** |
+
+So the tightest wait loop in the system re-reads a line that a different
+thread invalidates at the replication send rate. On a multi-CCD part that
+is a cross-CCD miss per spin iteration where it should be an L1 hit. With
+two replicas the two senders also false-share each other's slots.
+
+The rest of the codebase is careful about exactly this — `CachePadded`,
+`#[repr(align(64))]` on `InputSlot` — this struct just missed it.
+
+**Proposed fix.** Split read-hot from write-hot and pad per slot:
+
+- A `#[repr(align(64))]` per-slot struct holding the two cursors the gate
+  reads (`acked_sequence`, `in_memory_sequence`), one cache line per
+  replica slot.
+- Move the pure telemetry counters (`bytes_sent`, `ack_latency_us`,
+  `acks_received`) off the gate's line entirely — nothing on the hot path
+  reads them, only the health endpoint does.
+
+This changes `ReplicationMetrics`'s field layout, which the health
+endpoint and its tests read directly; the accessor surface should absorb
+that rather than leaking the padding into callers.
+
+---
+
+## 2. The gate spin loop recomputes `connected_persisted_min` for nothing
+
+**Where:** `crates/core/server-runtime/src/response.rs:594`
+
+`repl_min` has exactly two consumers: the `#[cfg(feature =
+"tick-to-trade")]` cross-tracker, and the attribution branch at
+`response.rs:630` that runs **once**, on the iteration where the gate
+opens. On a build without `tick-to-trade` it is otherwise dead.
+
+It is nonetheless computed on every spin iteration — four Acquire loads,
+on the line from finding 1.
+
+**Proposed fix.** Hoist it: compute `repl_min` once inside the
+`cached_durable_pos >= needed` branch, immediately before the attribution
+check and the `break`. The traced build keeps its per-iteration
+`gate_tracker.observe` call, which needs the per-iteration value, so this
+is a `cfg`-shaped split rather than a straight move.
+
+---
+
+## 3. SipHash on the kernel-transport response path
+
+**Where:** `crates/core/server-runtime/src/response.rs:176,268`
+
+```rust
+let mut connections: HashMap<u64, ConnectionEntry> = HashMap::with_capacity(256);
+let mut dirty_connections: HashSet<u64> = HashSet::new();
+```
+
+Both use the std default hasher. Per response slot that is a
+`connections.get_mut(&connection_id)` plus a
+`dirty_connections.insert(connection_id)` **per frame** — and each request
+emits two frames (payload + `BatchEnd`). Three SipHash-1-3 hashes of a
+`u64` per request, on the egress hot path, for keys that are
+internally-generated connection IDs with no HashDoS surface.
+
+The DPDK transport already made this call and left the reasoning inline
+(`server-runtime/src/dpdk_transport.rs:162`):
+
+> FxHash instead of SipHash — u64 keys, no HashDoS surface internally.
+
+Three sites never got the same treatment:
+
+- `server-runtime/src/response.rs:176,268` — per response slot / per frame
+- `server-runtime/src/dpdk_response.rs:130` — per response slot
+- `server-runtime/src/reader.rs:331` (`fd_to_slab`) — per CQE
+
+**Proposed fix.** Switch all three to `FxHashMap` / `FxHashSet`.
+`rustc-hash` is already a `server-runtime` dependency, so this is
+mechanical. While there, give `dirty_connections` a `with_capacity` — it
+currently reallocates during warmup.
+
+---
+
+## 4. Response data never flushes while the output ring has work
+
+**Where:** `crates/core/server-runtime/src/response.rs:401`
+
+`flush_sends` is reachable from exactly three places: the idle path
+(`count == 0`), the heartbeat scan, and shutdown. There is **no flush on
+the path where slots were consumed**.
+
+Under sustained load — or, more sharply, immediately after a durability
+gate stall, during which the matching stage has been filling the output
+ring the whole time — the stage runs iteration after iteration with
+`count > 0`, appending into each connection's `send_buf` and never
+flushing. Responses sit in userspace until traffic happens to pause.
+
+The degenerate case is not just latency. `append_frame`
+(`response.rs:810`) drops the connection outright once `send_buf` would
+exceed `MAX_SEND_BUF` (64 KiB), so a client that keeps the pipeline busy
+enough gets disconnected rather than served.
+
+**Proposed fix.** Add a flush trigger on the consumed path. Either a byte
+threshold per connection (flush once a `send_buf` passes roughly one MSS)
+or a slot-count trigger, whichever profiles better. The point is to bound
+the interval between "matched" and "on the wire" by something other than
+"the next lull".
+
+**Adjacent, same area.** `flush_sends` submits with
+`submit_and_wait(pending)` and `retry_send` (`response.rs:906`) loops
+synchronously on `submit_and_wait(1)`. A single client with a full TCP
+receive window therefore head-of-line-blocks the response stage for every
+other connection. Worth separating from the flush-trigger change, but it
+belongs on the same list.
+
+---
+
+## 5. The journal stage copies every event into a 512 KiB stack buffer
+
+**Where:** `crates/core/transport-core/src/pipeline.rs:716` (sync) and
+`pipeline.rs:1918` (io_uring)
+
+```rust
+let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];  // 4096 x 128 B
+```
+
+`read_batch` then memcpys each ready slot out of the ring into it: a
+128-byte copy per event, into a working set far larger than L2, evicting
+the writer's own encode buffers on the way through.
+
+The matching stage already solved this. `Consumer::peek_batch`
+(`pipeline/src/ring.rs:601`) borrows ready slots in place as up to two
+contiguous slices, and its own doc comment gives the motivation:
+
+> Use this instead of `consume_batch` / `read_batch` when the caller would
+> otherwise copy the batch into a stack array just to iterate it — the
+> matching stage does this on every disruptor batch and the copy is pure
+> overhead.
+
+The journal stage does the identical thing and was never converted.
+
+**Proposed fix.** Move the journal stage to `peek_batch` +
+`commit_consumed`. This is the fiddliest item on the list: the encode loop
+interleaves `self.sync_point(...)`, `apply_stream_marks`, and
+`mark_split` calls with iteration, and `peek_batch` holds a borrow on
+`self.consumer` across the loop body. It likely needs the mark-split span
+loop restructured so the borrow ends before each barrier. Worth doing, but
+not a mechanical change — and correctness here is load-bearing (the
+deferred-commit-until-fsync contract).
+
+**Same shape, cheaper fix:** `response.rs:178` copies up to 1024
+`OutputSlot`s out of the SPSC per iteration, because `spsc::Consumer` has
+no `peek_batch` counterpart to the disruptor's. Adding one to
+`pipeline/src/spsc.rs` is straightforward and removes the copy from both
+response stages.
+
+---
+
+## 6. `CachePadded` is 64 bytes; on Zen the interference unit is 128
+
+**Where:** `crates/core/pipeline/src/padding.rs:16`
+
+`#[repr(align(64))]` puts two adjacent `CachePadded` fields exactly 64
+bytes apart — the same 128-byte sector. AMD's adjacent-line and L2 spatial
+prefetchers pull the pair together, reintroducing the interference the
+padding exists to prevent. This is why `crossbeam-utils` uses 128 bytes on
+x86-64.
+
+The clean instance is `spsc::Shared` (`pipeline/src/spsc.rs:29`):
+
+```rust
+head: CachePadded<AtomicU64>,   // producer writes
+tail: CachePadded<AtomicU64>,   // consumer writes
+```
+
+Adjacent fields, 64 bytes apart, opposite writers.
+
+**Proposed fix.** Try `align(128)` and measure — this is the one finding
+with a ready-made harness. `crates/core/pipeline/examples/false_sharing.rs`
+already interleaves samples to control for thermal drift; extend it to
+compare 64- vs 128-byte `CachePadded` on the SPSC head/tail pair. Given
+the target hardware is EPYC, this is a cheap experiment with a plausible
+payoff, but it is strictly an experiment — the doubled padding costs
+footprint, so it should not land on reasoning alone.
+
+---
+
+## Lower priority
+
+- **`Arc<AtomicU64>` cursors are unpadded.** `DurableWireSeqCursor`
+  (`transport-core/src/cursors.rs:123`) and `replica_quorum_cursor`
+  (`cursors.rs:175`) are plain `Arc<AtomicU64>`, allocated back-to-back in
+  `PipelineCursors::new`. Two 24-byte allocations from the same size class
+  will very likely share a line — and they have different writer threads
+  (journal stage vs. replication sender) with the response stage reading
+  both. Same class as finding 1, at a much lower write rate.
+
+- **Per-slot flush on the DPDK response path.**
+  `server-runtime/src/dpdk_response.rs:542` calls
+  `tx_producers[tid].flush()` inside the per-slot loop — one release store
+  per slot. The matching stage goes to real trouble to amortise its output
+  cursor store over a whole batch (`pipeline.rs:2569`, `out_batch`); this
+  gives that back one slot at a time. Hoisting the flush to the end of the
+  batch trades a small visibility delay for the amortisation.
+
+- **Double copy on ingest.** `reader.rs:605` unconditionally
+  `extend_from_slice`s the recv payload from the io_uring provided-buffer
+  pool into the connection's `parse_buf`, then `process_client_frames`
+  compacts it with a `copy_within` (`client_frames.rs:155`). In the common
+  case — `parse_buf` empty, recv contains whole frames — both copies are
+  avoidable by parsing directly out of the pool buffer and only spilling a
+  trailing partial frame into `parse_buf`.
+
+- **`SpscProducer::flush` loads a contended line to decide whether to
+  store.** `pipeline/src/spsc.rs:155` reads `shared.head` (Relaxed) just to
+  compare against `local_head`. The consumer reads that line constantly, so
+  it is not reliably in M state. Tracking the last committed value in a
+  local field removes the load. Minor, but `flush` is called per slot on
+  the DPDK response path today (see above).
