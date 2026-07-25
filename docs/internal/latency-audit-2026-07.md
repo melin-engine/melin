@@ -36,7 +36,7 @@ uniformly low and is the column most worth reading.
 | 7 | `Arc<AtomicU64>` cursors unpadded | Low–Med | Low | Med | Low |
 | 8 | DPDK per-slot `flush()` | Med | Med | Med | Low |
 | 9 | Ingest double copy | Med | Low–Med | Med | Med |
-| 10 | `spsc::flush` contended load | Low | None | Low | Trivial |
+| 10 | `spsc::flush` contended load | Low | None | Low | ~~Trivial~~ **done** |
 
 \* Finding 2 cannot be isolated from finding 1 — they touch the same cache
 line. Fold it into finding 1's change and measure the pair once.
@@ -319,8 +319,12 @@ Numbered to match the triage table above.
   trailing partial frame into `parse_buf`.
 
 - **10 — `SpscProducer::flush` loads a contended line to decide whether
-  to store.** `pipeline/src/spsc.rs:155` reads `shared.head` (Relaxed) just to
-  compare against `local_head`. The consumer reads that line constantly, so
-  it is not reliably in M state. Tracking the last committed value in a
-  local field removes the load. Minor, but `flush` is called per slot on
-  the DPDK response path today (see above).
+  to store.** **Fixed.** `flush` compared `local_head` against a Relaxed
+  load of `shared.head` — a line the consumer reads continuously, putting
+  a shared-line load in the dependency chain ahead of the Release store on
+  every call. `Producer` now carries a `committed_head` mirror, which is
+  exact rather than a hint: `flush` is the only writer of `shared.head`,
+  so nothing can move it underneath the producer. A no-op flush now
+  touches the shared line not at all. This matters more than the rating
+  suggests while item 8 stands, since the DPDK response path calls `flush`
+  once per slot.

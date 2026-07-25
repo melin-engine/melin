@@ -47,6 +47,16 @@ pub struct Producer<T> {
     /// a relaxed register, not an atomic store.
     // u64 — sequence counter, never wraps in any realistic uptime.
     local_head: u64,
+    /// Local mirror of the last value this producer stored into
+    /// `shared.head`. Exact, not a hint: the producer is the only writer
+    /// of `shared.head`, so nothing can move it underneath us.
+    ///
+    /// Exists so [`Self::flush`] can decide whether a store is needed
+    /// from a register instead of loading `shared.head` — a line the
+    /// consumer reads continuously, which put a shared-line load in the
+    /// dependency chain ahead of the Release store on every flush.
+    // u64 — mirrors `local_head`, same never-wraps reasoning.
+    committed_head: u64,
 }
 
 /// Consumer end of the SPSC queue.
@@ -81,6 +91,9 @@ pub fn channel<T: Copy + Default>(capacity: usize) -> (Producer<T>, Consumer<T>)
         shared: Arc::clone(&shared),
         cached_tail: 0,
         local_head: 0,
+        // Matches the `head` atomic's initial value — the mirror starts
+        // in sync and stays in sync because only `flush` writes `head`.
+        committed_head: 0,
     };
 
     let consumer = Consumer {
@@ -150,16 +163,21 @@ impl<T: Copy + Default> Producer<T> {
     /// Make all in-place writes accumulated since the last flush visible
     /// to the consumer with a single Release store on the head cursor.
     /// No-op when no writes are pending.
+    ///
+    /// The pending check reads the local `committed_head` mirror rather
+    /// than `shared.head`. A no-op flush therefore touches the shared
+    /// line not at all, and a real flush issues the Release store without
+    /// first waiting on a load of a line the consumer is reading.
     #[inline]
     pub fn flush(&mut self) {
-        let committed = self.shared.head.get().load(Ordering::Relaxed);
-        if self.local_head > committed {
+        if self.local_head > self.committed_head {
             // Release: consumer sees all in-place slot writes before the
             // updated head.
             self.shared
                 .head
                 .get()
                 .store(self.local_head, Ordering::Release);
+            self.committed_head = self.local_head;
         }
     }
 
@@ -396,6 +414,45 @@ mod tests {
         producer.flush();
         let received = consumer_thread.join().unwrap();
         assert_eq!(received, (0..20u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn repeated_flush_cycles_never_skip_a_publish() {
+        // Pins the `committed_head` mirror. `flush` decides whether to
+        // store by comparing against that local field instead of loading
+        // `shared.head`; if it ever drifted from the real head, a needed
+        // Release store would be skipped and the consumer would stall
+        // with items already written into slots. Runs well past the ring
+        // capacity so wrap-around is covered.
+        let (mut producer, mut consumer) = channel::<u64>(4);
+        for i in 0..100u64 {
+            producer.try_push_with(|s| *s = i).unwrap();
+            producer.flush();
+            // Redundant flush must be a no-op, not a lost publish.
+            producer.flush();
+            assert_eq!(consumer.try_consume(), Some((i, i)));
+            assert_eq!(consumer.try_consume(), None);
+        }
+    }
+
+    #[test]
+    fn flush_after_partial_drain_publishes_only_new_writes() {
+        // Multi-item batches across several flush rounds: each flush must
+        // advance the head to exactly `local_head`, no more and no less,
+        // with the consumer draining in between.
+        let (mut producer, mut consumer) = channel::<u64>(8);
+        let mut expected = 0u64;
+        for round in 0..10u64 {
+            for j in 0..3u64 {
+                producer.try_push_with(|s| *s = round * 3 + j).unwrap();
+            }
+            producer.flush();
+            for _ in 0..3 {
+                assert_eq!(consumer.try_consume(), Some((expected, expected)));
+                expected += 1;
+            }
+            assert_eq!(consumer.try_consume(), None);
+        }
     }
 
     #[test]
