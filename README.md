@@ -16,7 +16,7 @@ Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired
 - **Hybrid** (default): one node persisted, two nodes in-memory. Any single node's slow disk is masked by the others, and single-node failures cause no data-loss.
 - **Durably replicated**: two on-disk copies on separate nodes before ack, for stricter compliance regimes.
 
-**Fast.** p99 ~ 620 µs at 2.17M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 67 µs p99.
+**Fast.** p99 ~ 404 µs at 1.00M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 66 µs p99.
 
 ## Architecture
 
@@ -59,15 +59,17 @@ All numbers are **full round-trip** (client sends → server persists + replicat
 
 ### Latency under load (closed-loop)
 
-| Durability | Throughput | p50 | p99 | p99.9 | p99.99 |
-|------------|-----------|-----|-----|-------|--------|
-| Hybrid (1 persisted + 2 in-memory) | 2.17M/s | 467 µs | 622 µs | 688 µs | 750 µs |
+Four connections, 56 requests in flight each.
+
+| Durability | Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 |
+|------------|-----------|-----|-----|-------|--------|---------|
+| Hybrid (1 persisted + 2 in-memory) | 1.00M/s | 207 µs | 404 µs | 511 µs | 595 µs | 691 µs |
 
 ### Single-event latency (1 client, window 1)
 
 | Durability | Throughput | p50 | p99 | p99.9 | p99.99 |
 |-----------|-----------|-----|-----|-------|--------|
-| Hybrid (1 persisted + 2 in-memory) | 20K/s | 49 µs | 67 µs | 166 µs | 179 µs |
+| Hybrid (1 persisted + 2 in-memory) | 20K/s | 49 µs | 66 µs | 113 µs | 138 µs |
 
 See [replication](docs/replication.md) for the full durability-mode menu. The benchmark harness and tuning guidance ship with the Melin Exchange Core.
 
