@@ -1920,7 +1920,7 @@ fn chain_check_mark_verifies_at_exact_position() {
 fn primary_emits_chain_check_every_interval() {
     use crate::replication::protocol::{PrimaryMessage, decode_primary_message};
     use crate::replication_wire::{MSG_INPUT_BATCH, peek_frame_tag};
-    use melin_pipeline::seqlock::SeqLock;
+    use melin_pipeline::seqlock;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("checks.journal");
@@ -1949,8 +1949,8 @@ fn primary_emits_chain_check_every_interval() {
         [Arc::clone(&evict[0]), Arc::clone(&evict[1])],
         [Arc::clone(&active[0]), Arc::clone(&active[1])],
     );
-    let fsync_state = Arc::new(SeqLock::new(crate::pipeline::FsyncState::default()));
-    stage.set_chain_hash_lock(Arc::clone(&fsync_state));
+    let (fsync_writer, fsync_state) = seqlock::split(crate::pipeline::FsyncState::default());
+    stage.set_chain_hash_lock(fsync_writer);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let s = Arc::clone(&shutdown);

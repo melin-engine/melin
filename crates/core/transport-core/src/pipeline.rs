@@ -34,14 +34,14 @@ use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
 
 use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
-use melin_pipeline::seqlock::SeqLock;
+use melin_pipeline::seqlock::{SeqLockReader, SeqLockWriter};
 
 use crate::cursors::{DurableWireSeqCursor, PipelineCursors, RingPos, WireSeq};
 
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
 
 /// Post-fsync state published by the journal stage after each durable
-/// write. The [`SeqLock`] guarantees all fields are read atomically —
+/// write. The seqlock guarantees all fields are read atomically —
 /// no TOCTOU between `journal_seq` and `chain_hash`.
 ///
 /// Read by the shadow snapshot stage (`journal_seq` + `chain_hash` for
@@ -433,10 +433,12 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// flags). The Box indirection keeps the JournalStage struct the same
     /// cache layout as on main, avoiding tail latency regression.
     repl: Box<ReplicationState>,
-    /// Optional SeqLock for publishing the BLAKE3 chain hash to the shadow
-    /// snapshot stage. Updated once per fsync batch (cold path). `None` when
-    /// shadow snapshots are disabled — no allocation or write overhead.
-    chain_hash: Option<Arc<SeqLock<FsyncState>>>,
+    /// Optional seqlock writer for publishing the BLAKE3 chain hash to the
+    /// shadow snapshot stage. Updated once per fsync batch (cold path). `None`
+    /// when shadow snapshots are disabled — no allocation or write overhead.
+    /// The writer handle is unique, so the journal stage owning it is what
+    /// makes the seqlock's single-writer requirement structural.
+    chain_hash: Option<SeqLockWriter<FsyncState>>,
     /// Optional typed handle for publishing the writer's `next_sequence - 1`
     /// (the highest wire seq durably persisted) to readers outside the
     /// pipeline thread — the durability gate, health endpoint, and the
@@ -698,11 +700,12 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         self.repl.active = active_flags;
     }
 
-    /// Set the SeqLock for publishing the BLAKE3 chain hash to the shadow
-    /// snapshot stage. Called once during pipeline construction when shadow
-    /// snapshots are enabled.
-    pub fn set_chain_hash_lock(&mut self, lock: Arc<SeqLock<FsyncState>>) {
-        self.chain_hash = Some(lock);
+    /// Install the seqlock's writer half for publishing the BLAKE3 chain
+    /// hash to the shadow snapshot stage. Called once during pipeline
+    /// construction when shadow snapshots are enabled. Takes the handle by
+    /// value — the stage becomes the only thing that can publish.
+    pub fn set_chain_hash_lock(&mut self, writer: SeqLockWriter<FsyncState>) {
+        self.chain_hash = Some(writer);
     }
 
     /// Set the cursor handle for publishing the highest wire seq durably
@@ -1140,10 +1143,14 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// batch (cold path); each `if let Some` is a single branch on a small
     /// struct field.
     #[inline]
-    fn publish_fsync_state(&self) {
+    fn publish_fsync_state(&mut self) {
         let journal_seq = self.writer.next_sequence().saturating_sub(1);
-        if let Some(ref lock) = self.chain_hash {
-            lock.store(FsyncState {
+        // Disjoint field borrows: `chain_hash` mutably (the writer handle),
+        // `writer`/`consumer` immutably. Keeping the state construction
+        // inside the branch preserves the zero-overhead-when-disabled
+        // property — no chain-hash copy when shadow is off.
+        if let Some(ref mut publisher) = self.chain_hash {
+            publisher.store(FsyncState {
                 journal_seq: WireSeq::new(journal_seq),
                 chain_hash: self.writer.chain_hash().unwrap_or([0u8; 32]),
                 input_ring_seq: RingPos::new(self.consumer.next_read()),
@@ -3082,7 +3089,7 @@ pub struct Pipeline<A: Application, W: JournalWrite<A::Event>> {
     pub replication_consumers: Option<(ReplicationConsumer, ReplicationConsumer)>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
-    pub chain_hash_lock: Option<Arc<SeqLock<FsyncState>>>,
+    pub chain_hash_lock: Option<SeqLockReader<FsyncState>>,
     pub replication_ring_progress: Option<ReplicationRingProgress>,
     /// Journal-progress cursors, space-typed. Bundles the durable wire seq
     /// (the response stage's `persisted` cursor and the replica handshake
@@ -3105,7 +3112,7 @@ pub struct ReplicaPipeline<A: Application, W: JournalWrite<A::Event>> {
     /// durably persisted); the replica quorum cursor stays at the `NO_REPLICA` sentinel
     /// (no downstream replica). Updated by `JournalStage` after each fsync.
     pub cursors: PipelineCursors,
-    pub chain_hash_lock: Option<Arc<SeqLock<FsyncState>>>,
+    pub chain_hash_lock: Option<SeqLockReader<FsyncState>>,
 }
 
 /// Build the pipeline with optional replication support.
@@ -3207,19 +3214,22 @@ fn build_input_disruptor<E: AppEvent + Send + 'static>(
     }
 }
 
-/// If shadow snapshots are enabled, allocate a SeqLock for publishing the
-/// BLAKE3 chain hash to the shadow stage and wire it into `journal_stage`.
-/// Returns the lock (so the caller can return it through its pipeline
-/// handle struct) or `None` when shadow is disabled — zero overhead in
-/// that case.
+/// If shadow snapshots are enabled, allocate a seqlock for publishing the
+/// BLAKE3 chain hash to the shadow stage and move the writer half into
+/// `journal_stage`. Returns the reader half (so the caller can return it
+/// through its pipeline handle struct) or `None` when shadow is disabled —
+/// zero overhead in that case.
+///
+/// The journal stage taking the only writer handle is what makes it
+/// impossible for a second thread to publish fsync state.
 fn setup_chain_hash_publisher<E: AppEvent, W: JournalWrite<E>>(
     journal_stage: &mut JournalStage<E, W>,
     enable_shadow: bool,
-) -> Option<Arc<SeqLock<FsyncState>>> {
+) -> Option<SeqLockReader<FsyncState>> {
     if enable_shadow {
-        let lock = Arc::new(SeqLock::new(FsyncState::default()));
-        journal_stage.set_chain_hash_lock(Arc::clone(&lock));
-        Some(lock)
+        let (writer, reader) = melin_pipeline::seqlock::split(FsyncState::default());
+        journal_stage.set_chain_hash_lock(writer);
+        Some(reader)
     } else {
         None
     }

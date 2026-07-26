@@ -2788,7 +2788,7 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
     shadow_consumer: Option<Consumer<InputSlot<A::Event>>>,
     shadow_exchange: Option<A>,
     chain_hash_lock: Option<
-        Arc<melin_pipeline::seqlock::SeqLock<melin_transport_core::pipeline::FsyncState>>,
+        melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>,
     >,
     config: &ServerConfig,
     cores: &PipelineCores,

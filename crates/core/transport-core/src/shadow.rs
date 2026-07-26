@@ -3,11 +3,10 @@
 //!
 //! Generic over `A: Application`. The shadow consumer is gated on the journal
 //! stage (sees only fsynced events), so snapshots are always consistent with
-//! durable state. The chain hash is read from a SeqLock published by the
+//! durable state. The chain hash is read from a seqlock published by the
 //! journal stage after each fsync batch.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -19,7 +18,7 @@ use melin_app::amortized_timer::AmortizedTimer;
 use melin_app::{Application, ApplyCtx, WireSeq};
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
-use melin_pipeline::seqlock::SeqLock;
+use melin_pipeline::seqlock::SeqLockReader;
 
 /// Maximum events consumed per batch. Matches the journal stage batch size
 /// for consistent throughput characteristics.
@@ -41,7 +40,7 @@ fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
 /// Consumes events from the input ring (gated on journal fsync), replays them
 /// on a cloned application, and saves periodic snapshots. The snapshot's
 /// journal sequence and chain hash are read from the journal stage's
-/// [`FsyncState`] SeqLock — only saved when the shadow's ring cursor
+/// [`FsyncState`] seqlock — only saved when the shadow's ring cursor
 /// matches the fsync boundary, guaranteeing the triple (app state,
 /// journal_seq, chain_hash) is self-consistent.
 pub fn run<A: Application>(
@@ -49,7 +48,7 @@ pub fn run<A: Application>(
     mut app: A,
     snapshot_path: PathBuf,
     snapshot_interval: Duration,
-    fsync_state: Arc<SeqLock<FsyncState>>,
+    fsync_state: SeqLockReader<FsyncState>,
     shutdown: &AtomicBool,
     busy_spin: bool,
     initial_epoch: u64,
@@ -145,7 +144,7 @@ pub fn run<A: Application>(
 fn try_save_snapshot<A: Application>(
     app: &A,
     consumer: &ring::Consumer<InputSlot<A::Event>>,
-    fsync_state: &SeqLock<FsyncState>,
+    fsync_state: &SeqLockReader<FsyncState>,
     path: &std::path::Path,
     epoch: u64,
 ) {
@@ -257,6 +256,8 @@ mod tests {
     use crate::pipeline::InputSlot;
     use crate::test_support::{TestApp, TestEvent};
     use melin_pipeline::ring::DisruptorBuilder;
+    use melin_pipeline::seqlock;
+    use std::sync::Arc;
     use std::time::Instant;
 
     #[test]
@@ -267,7 +268,7 @@ mod tests {
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
-        let fsync_state = Arc::new(SeqLock::new(FsyncState::default()));
+        let (_writer, fsync_state) = seqlock::split(FsyncState::default());
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
@@ -308,11 +309,11 @@ mod tests {
         let app = TestApp::new();
         // Pre-set input_ring_seq = 2 (the ring cursor after consuming
         // both events below). Shadow only saves when aligned.
-        let fsync_state = Arc::new(SeqLock::new(FsyncState {
+        let (_writer, fsync_state) = seqlock::split(FsyncState {
             journal_seq: WireSeq::new(3),
             chain_hash: [0xAB; 32],
             input_ring_seq: RingPos::new(2),
-        }));
+        });
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
@@ -378,7 +379,7 @@ mod tests {
         // both adds are reflected in the restored app's running total.
         assert!(snap_path.exists(), "snapshot file should exist");
         let (restored, _seq, chain, _epoch) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        assert_eq!(chain, [0xAB; 32]); // chain hash from SeqLock
+        assert_eq!(chain, [0xAB; 32]); // chain hash from the seqlock
         assert_eq!(restored.total, 1500);
     }
 
@@ -640,7 +641,7 @@ mod tests {
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
-        let fsync_state = Arc::new(SeqLock::new(FsyncState::default()));
+        let (_writer, fsync_state) = seqlock::split(FsyncState::default());
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
@@ -689,12 +690,11 @@ mod tests {
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
-        let fsync_state = Arc::new(SeqLock::new(FsyncState {
+        let (mut fsync_state_writer, fsync_state) = seqlock::split(FsyncState {
             journal_seq: WireSeq::new(2),
             chain_hash: [0x11; 32],
             input_ring_seq: RingPos::new(1),
-        }));
-        let fsync_state_writer = Arc::clone(&fsync_state);
+        });
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
@@ -789,11 +789,11 @@ mod tests {
         let app = TestApp::new();
         // 5 events total (10,20,30,40,50). Pre-set input_ring_seq = 5
         // so the alignment check passes once shadow consumes all.
-        let fsync_state = Arc::new(SeqLock::new(FsyncState {
+        let (_writer, fsync_state) = seqlock::split(FsyncState {
             journal_seq: WireSeq::new(6),
             chain_hash: [0xCD; 32],
             input_ring_seq: RingPos::new(5),
-        }));
+        });
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 

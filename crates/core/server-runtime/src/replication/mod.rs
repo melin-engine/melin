@@ -300,11 +300,11 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     /// point can never be sourced from a ring-space counter (the adjacent
     /// `journal_cursor` resets to ~0 every process start).
     pub(super) last_seq: melin_transport_core::DurableWireSeqCursor,
-    /// SeqLock-published fsync state (chain hash + journal seq + ring
-    /// cursor). Option to mirror the primary-side pattern; always Some
-    /// on replicas now.
+    /// Seqlock-published fsync state (chain hash + journal seq + ring
+    /// cursor), read half. Option to mirror the primary-side pattern;
+    /// always Some on replicas now.
     pub(super) chain_hash_lock:
-        Option<Arc<melin_pipeline::seqlock::SeqLock<melin_transport_core::pipeline::FsyncState>>>,
+        Option<melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>>,
     /// Primary-announced rotation hand-off: the receiver thread pushes
     /// `Rotate` boundaries here (in stream order), the journal stage
     /// pops and rotates at exactly those sequences. Replicas have no
