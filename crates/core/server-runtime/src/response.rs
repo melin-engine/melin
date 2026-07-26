@@ -610,12 +610,13 @@ pub fn run<A: Application>(
                         journal_pos.get(),
                         // The level the *active policy* gates replicas
                         // on — in-memory under `hybrid`, persisted under
-                        // `durably-replicated`. `u64::MAX` when no
-                        // clause is replica-supplied (`local`), so the
-                        // tracker records no replica wait rather than a
-                        // wait on a cursor the gate never consults.
-                        policy_replica_cursor(&policy, journal_pos, metrics_ref, active_ref)
-                            .unwrap_or(u64::MAX),
+                        // `durably-replicated`. `None` when no clause is
+                        // replica-supplied (`local`) and, transiently,
+                        // when the binding replica drops out of the
+                        // cursor view mid-wait. Passed through as-is so
+                        // the tracker can tell "no replica wait to
+                        // measure" from "the replica caught up".
+                        policy_replica_cursor(&policy, journal_pos, metrics_ref, active_ref),
                         trace::mono_trace_ns(),
                     );
 
@@ -1325,26 +1326,37 @@ impl GateCrossTracker {
     }
 
     /// `replica_pos` is the replica-side cursor the *active policy*
-    /// gates on — see [`policy_replica_cursor`]. Passing `u64::MAX`
-    /// (which that helper's `None` maps to, e.g. under `local`) leaves
-    /// `replica_was_below` false, so no replica-wait sample is recorded
-    /// for a policy that never waits on a replica in the first place.
+    /// gates on — see [`policy_replica_cursor`]. `None` means no replica
+    /// currently supplies a binding cursor, which happens permanently
+    /// under `local` and transiently when the binding replica drops out
+    /// of the cursor view part-way through a wait.
+    ///
+    /// Both cases must leave `replica_crossed_ts` alone. Treating
+    /// `None` as an infinite cursor would satisfy the crossing test and
+    /// latch the timestamp at the *disconnect*, reporting a replica
+    /// wait that ended when the link died rather than when the replica
+    /// caught up — understating exactly the failover runs the histogram
+    /// exists to measure. On the first observe it additionally leaves
+    /// `replica_was_below` false, so a policy that never waits on a
+    /// replica records no sample at all.
     pub(crate) fn observe(
         &mut self,
         journal_pos: u64,
-        replica_pos: u64,
+        replica_pos: Option<u64>,
         now_ns: trace::MonoTraceInstant,
     ) {
         if self.first {
             self.journal_was_below = journal_pos < self.needed;
-            self.replica_was_below = replica_pos < self.needed;
+            self.replica_was_below = replica_pos.is_some_and(|p| p < self.needed);
             self.first = false;
         }
         if self.journal_was_below && self.journal_crossed_ts.is_none() && journal_pos >= self.needed
         {
             self.journal_crossed_ts = Some(now_ns);
         }
-        if self.replica_was_below && self.replica_crossed_ts.is_none() && replica_pos >= self.needed
+        if self.replica_was_below
+            && self.replica_crossed_ts.is_none()
+            && replica_pos.is_some_and(|p| p >= self.needed)
         {
             self.replica_crossed_ts = Some(now_ns);
         }
@@ -1915,8 +1927,8 @@ mod tests {
         // Journal crosses on the second observation. Replica was already
         // past at entry, so no replica sample.
         let mut t = GateCrossTracker::new(10);
-        t.observe(5, 100, 1_000);
-        t.observe(15, 100, 2_000);
+        t.observe(5, Some(100), 1_000);
+        t.observe(15, Some(100), 2_000);
         assert_eq!(t.journal_crossed(), Some(2_000));
         assert_eq!(t.replica_crossed(), None);
     }
@@ -1926,8 +1938,8 @@ mod tests {
     fn gate_cross_tracker_records_replica_when_strictly_below() {
         // Mirror image: journal already past, replica below at entry.
         let mut t = GateCrossTracker::new(10);
-        t.observe(50, 5, 1_000);
-        t.observe(50, 12, 2_000);
+        t.observe(50, Some(5), 1_000);
+        t.observe(50, Some(12), 2_000);
         assert_eq!(t.journal_crossed(), None);
         assert_eq!(t.replica_crossed(), Some(2_000));
     }
@@ -1937,9 +1949,9 @@ mod tests {
     fn gate_cross_tracker_records_both_when_both_below() {
         // Both below at entry, both cross independently.
         let mut t = GateCrossTracker::new(100);
-        t.observe(50, 60, 1_000); // both below
-        t.observe(105, 60, 2_000); // journal crosses
-        t.observe(105, 110, 3_000); // replica crosses
+        t.observe(50, Some(60), 1_000); // both below
+        t.observe(105, Some(60), 2_000); // journal crosses
+        t.observe(105, Some(110), 3_000); // replica crosses
         assert_eq!(t.journal_crossed(), Some(2_000));
         assert_eq!(t.replica_crossed(), Some(3_000));
     }
@@ -1950,9 +1962,9 @@ mod tests {
         // Both cursors already >= needed at first observation —
         // neither was on the critical path. No samples.
         let mut t = GateCrossTracker::new(10);
-        t.observe(50, 100, 1_000);
+        t.observe(50, Some(100), 1_000);
         // Even later observations don't backfill: was_below is sticky.
-        t.observe(60, 110, 2_000);
+        t.observe(60, Some(110), 2_000);
         assert_eq!(t.journal_crossed(), None);
         assert_eq!(t.replica_crossed(), None);
     }
@@ -1965,8 +1977,8 @@ mod tests {
         // verify the first-iteration snapshot is what gates the
         // sample). Journal: 50 < 10 false → was_below=false → no sample.
         let mut t = GateCrossTracker::new(10);
-        t.observe(50, 5, 1_000); // journal already past, replica below
-        t.observe(20, 12, 2_000); // both >= needed now
+        t.observe(50, Some(5), 1_000); // journal already past, replica below
+        t.observe(20, Some(12), 2_000); // both >= needed now
         // Journal: was_below=false at entry → still no sample.
         assert_eq!(t.journal_crossed(), None);
         // Replica: was_below=true at entry, crosses on iter 2 → sample.
@@ -1980,10 +1992,42 @@ mod tests {
         // overwrite — the metric is "when did it first cross", not
         // "when was it last below".
         let mut t = GateCrossTracker::new(10);
-        t.observe(5, 100, 1_000);
-        t.observe(15, 100, 2_000); // first cross
-        t.observe(25, 100, 3_000); // would otherwise re-record
+        t.observe(5, Some(100), 1_000);
+        t.observe(15, Some(100), 2_000); // first cross
+        t.observe(25, Some(100), 3_000); // would otherwise re-record
         assert_eq!(t.journal_crossed(), Some(2_000));
+    }
+
+    #[cfg(feature = "tick-to-trade")]
+    #[test]
+    fn gate_cross_tracker_ignores_replica_dropping_out_mid_wait() {
+        // The regression this signature exists for. The replica is
+        // behind at entry (was_below latches true), then disconnects
+        // part-way through the wait so no replica supplies a binding
+        // cursor. That must not be read as "caught up" — the histogram
+        // would otherwise report a wait that ended at the disconnect.
+        let mut t = GateCrossTracker::new(100);
+        t.observe(50, Some(60), 1_000); // replica behind
+        t.observe(105, None, 2_000); // replica drops out mid-wait
+        t.observe(105, None, 3_000); // still gone
+        assert_eq!(t.journal_crossed(), Some(2_000));
+        assert_eq!(t.replica_crossed(), None);
+        // Reconnecting past `needed` still records the real crossing.
+        t.observe(105, Some(150), 4_000);
+        assert_eq!(t.replica_crossed(), Some(4_000));
+    }
+
+    #[cfg(feature = "tick-to-trade")]
+    #[test]
+    fn gate_cross_tracker_records_nothing_when_no_replica_clause() {
+        // `local` never binds on a replica, so `policy_replica_cursor`
+        // returns `None` for the whole wait: was_below stays false and
+        // no replica sample is produced.
+        let mut t = GateCrossTracker::new(100);
+        t.observe(50, None, 1_000);
+        t.observe(105, None, 2_000);
+        assert_eq!(t.journal_crossed(), Some(2_000));
+        assert_eq!(t.replica_crossed(), None);
     }
 
     // -- DegradationLogger flap-suppression --

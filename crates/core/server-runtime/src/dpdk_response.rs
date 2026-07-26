@@ -412,8 +412,7 @@ pub fn run<A: Application>(
                             journal_pos,
                             metrics_ref,
                             active_ref,
-                        )
-                        .unwrap_or(u64::MAX),
+                        ),
                         trace::mono_trace_ns(),
                     );
 
