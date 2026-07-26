@@ -13,7 +13,7 @@ Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired
 **Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application logic inherits it as long as it stays pure (no I/O, no non-deterministic state).
 
 **Durable and replicated.** Every event is persisted to the journal and synchronously replicated via lock-free ring buffer before the client sees a response. CRC32C integrity checks and BLAKE3 hash chain for tamper evidence. Journal catch-up, snapshot transfer, and sub-second switchover upon promotion. Configurable durability modes let you trade latency for stronger guarantees:
-- **Hybrid** (default): one node persisted, two nodes in-memory. Any single node's slow disk is masked by the others, and single-node failures cause no data-loss.
+- **Hybrid** (default): ack once one node has persisted and two have confirmed receipt in memory. Any single node's slow disk is masked by the others, and single-node failures cause no data-loss.
 - **Durably replicated**: two on-disk copies on separate nodes before ack, for stricter compliance regimes.
 
 **Fast.** p99 ~ 404 µs at 1.00M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 66 µs p99.
@@ -61,14 +61,14 @@ All numbers are **full round-trip** (client sends → server persists + replicat
 
 Four connections, 56 requests in flight each.
 
-| Durability | Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 |
-|------------|-----------|-----|-----|-------|--------|---------|
+| Ack gate | Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 |
+|----------|-----------|-----|-----|-------|--------|---------|
 | Hybrid (1 persisted + 2 in-memory) | 1.00M/s | 207 µs | 404 µs | 511 µs | 595 µs | 691 µs |
 
 ### Single-event latency (1 client, window 1)
 
-| Durability | Throughput | p50 | p99 | p99.9 | p99.99 |
-|-----------|-----------|-----|-----|-------|--------|
+| Ack gate | Throughput | p50 | p99 | p99.9 | p99.99 |
+|----------|-----------|-----|-----|-------|--------|
 | Hybrid (1 persisted + 2 in-memory) | 20K/s | 49 µs | 66 µs | 113 µs | 138 µs |
 
 See [replication](docs/replication.md) for the full durability-mode menu. The benchmark harness and tuning guidance ship with the Melin Exchange Core.
