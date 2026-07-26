@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use melin_pipeline::ring;
 use melin_pipeline::spsc;
 
+use crate::durability_policy::Blocker;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::DurableWireSeqCursor;
@@ -400,17 +401,24 @@ pub fn run<A: Application>(
                     let active_ref = replica_active.as_ref();
 
                     // Sampled per consumer rather than per iteration —
-                    // see `response.rs` for why these four Acquire loads
-                    // do not belong in the spin body.
+                    // see `response.rs` for why these Acquire loads do
+                    // not belong in the spin body, and why the replica
+                    // cursor is derived from the active policy.
                     #[cfg(feature = "tick-to-trade")]
                     gate_tracker.observe(
                         journal_pos.get(),
-                        crate::response::connected_persisted_min(metrics_ref, active_ref),
+                        crate::response::policy_replica_cursor(
+                            &policy,
+                            journal_pos,
+                            metrics_ref,
+                            active_ref,
+                        ),
                         trace::mono_trace_ns(),
                     );
 
-                    let status = crate::response::evaluate_durability(
+                    let (status, blocker) = crate::response::evaluate_gate(
                         &policy,
+                        needed,
                         journal_pos,
                         metrics_ref,
                         active_ref,
@@ -437,16 +445,19 @@ pub fn run<A: Application>(
                     }
 
                     if cached_durable_pos >= needed {
-                        // Attribution: which subsystem was slowest. See
-                        // response.rs for the rationale, including why
-                        // this is sampled at gate-open rather than per
-                        // iteration.
-                        let repl_min =
-                            crate::response::connected_persisted_min(metrics_ref, active_ref);
-                        if journal_pos.get() <= repl_min {
-                            utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            utilization.gate_replication.fetch_add(1, Ordering::Relaxed);
+                        // Attribution against the policy actually in
+                        // force, from the same snapshot that opened the
+                        // gate. See response.rs for the rationale,
+                        // including why the `None` arm is an
+                        // unreachable no-op.
+                        match blocker {
+                            Some(Blocker::Journal) => {
+                                utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some(Blocker::Replication) => {
+                                utilization.gate_replication.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => {}
                         }
                         break;
                     }

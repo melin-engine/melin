@@ -15,7 +15,7 @@
 use std::fmt;
 
 pub use melin_transport_core::durability_policy::{
-    Clause, CursorView, EvalStatus, Level, MAX_CLUSTER_SIZE, Policy, PolicyError,
+    Blocker, Clause, CursorView, EvalStatus, Level, MAX_CLUSTER_SIZE, Policy, PolicyError,
 };
 
 /// Operator-facing durability mode. Each variant maps to one of three

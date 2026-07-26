@@ -435,15 +435,33 @@ persisted copy, the replica only needs the event in RAM. Measured replica
 `in_memory - persisted` is median 0 in all four runs anyway, so there is
 no persisted-vs-in-memory gap to reclaim.
 
-**The gate attribution counters are soft evidence, not hard.**
-`connected_persisted_min` reads `acked_sequence` (replica *persisted*),
-but under `Hybrid` the gate is satisfied by replica *in-memory*. In the
-throughput runs those cursors sit ~474 vs ~96 events behind the primary
-respectively, so the counter compares against a cursor the active policy
-never consults. It still attributes correctly when the journal genuinely
-lags, and the two coincide at concurrency 1 — so the bias inflates the
-replication share in ambiguous cases rather than inverting the verdict.
-Worth fixing as a metrics-fidelity item.
+**The gate attribution counters were soft evidence, not hard — since
+fixed.** `connected_persisted_min` read `acked_sequence` (replica
+*persisted*) regardless of the policy in force, and took the *minimum*
+across replicas regardless of how many the policy required. Under
+`local` (`persisted>=1`) that reported replication as the blocker in a
+mode where replicas cannot bind the gate at all; under `hybrid` it read
+the wrong level (those cursors sat ~474 vs ~96 events behind the primary
+in the throughput runs), and one slow-but-connected replica could drag
+the verdict to replication while the gate was being satisfied by the
+other one.
+
+Attribution now goes through `Policy::attribute_blocker`, which finds
+the binding clause and reports whether the node at that clause's
+threshold rank was the primary or a replica — correct for any policy
+shape. Counters recorded before that change are biased toward
+replication and should be treated with suspicion.
+
+The concurrency-1 figure quoted above survives, though. In that run the
+replica's in-memory and persisted cursors coincide and both sit one
+event behind the primary, so the old comparison and the policy-correct
+one return the same verdict. The throughput-run percentages are the
+ones to discard.
+
+One reading note that survives the fix: under `durably-replicated` a
+replication verdict is the *expected* steady state, not a finding. The
+primary persists before it ships, so the second-largest persisted cursor
+is normally a replica's.
 
 **Stage histograms are mostly missing from these runs.** Three of four
 recorded none; the fourth got 4 of 8 (both journal, both matching). No

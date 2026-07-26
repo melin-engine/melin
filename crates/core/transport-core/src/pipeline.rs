@@ -79,17 +79,28 @@ pub struct StageUtilization {
     pub busy: AtomicU64,
     /// Cumulative iterations where the stage was idle (no input available).
     pub idle: AtomicU64,
-    /// Cumulative gate-wait events where the journal cursor was the last
-    /// to reach the needed position (journal fsync was the bottleneck).
+    /// Cumulative gate opens where the *primary itself* supplied the
+    /// binding cursor — the local journal was the bottleneck.
     /// Only used by the response stage; always 0 for journal/matching.
     pub gate_journal: AtomicU64,
-    /// Cumulative gate-wait events where the replication cursor was the
-    /// last to reach the needed position (replica ack was the bottleneck).
+    /// Cumulative gate opens where a *replica* supplied the binding
+    /// cursor — replication was the bottleneck. Which replica cursor
+    /// counts depends on the configured durability policy: in-memory
+    /// under `hybrid`, persisted under `durably-replicated`. Under
+    /// `local` a replica can never bind, so this stays at 0.
     /// Only used by the response stage; always 0 for journal/matching.
+    ///
+    /// Exactly one of the two counters moves per gate open: attribution
+    /// is computed from the same cursor snapshot as the evaluation that
+    /// opened the gate, and an open gate implies the policy was
+    /// satisfiable by the connected nodes. While the shape *cannot*
+    /// satisfy the policy the gate does not open at all —
+    /// `policy_degraded` covers that state.
     pub gate_replication: AtomicU64,
-    /// Whether the most recent durability-gate evaluation actively
-    /// clamped a degrade-friendly clause below its target count — i.e.
-    /// the cluster is currently running with reduced redundancy.
+    /// Whether the most recent durability-gate evaluation found a
+    /// clause requiring more nodes than are currently connected. The
+    /// clause is not relaxed — the gate stalls until the cluster shape
+    /// recovers or an operator swaps the mode.
     /// Surfaced on `/healthz` so dashboards and alerting can fire on
     /// it. Only used by the response stage.
     pub policy_degraded: AtomicBool,
