@@ -1,7 +1,11 @@
 [package]
 name = "melin-raft"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
+# Unpublished until the runtime consumes it: nothing in the workspace depends
+# on melin-raft yet, and shipping it to crates.io would freeze an API that has
+# no caller to validate it.
+publish = false
 license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -35,8 +39,8 @@ crc32c = "0.6"
 ed25519-dalek = { workspace = true }
 getrandom = "0.4"
 tracing = { workspace = true }
-melin-app = { path = "../app", version = "0.11.0" }
-melin-transport-core = { path = "../transport-core", version = "0.11.0" }
+melin-app = { path = "../app", version = "0.12.0" }
+melin-transport-core = { path = "../transport-core", version = "0.12.0" }
 
 [dev-dependencies]
 base64 = { workspace = true }
