@@ -587,7 +587,57 @@ pub fn run<A: Application>(
             // behind the gated one, which is safe (no ordering
             // inversion vs. a strict-gate world).
             let needs_gate = batch[..count].iter().any(|s| !s.durability_bypass);
-            if needs_gate && cached_durable_pos < needed {
+            let will_wait = needs_gate && cached_durable_pos < needed;
+
+            // Drain buffered sends before blocking, never after.
+            //
+            // The steady-state flush happens on the `count == 0` path —
+            // once the output ring is empty. That batches many responses
+            // behind one `io_uring_enter`, which is the right trade on
+            // the fast path. But it means a response that has already
+            // cleared its own durability gate stays in `send_buf` while
+            // the loop blocks on a *later-arriving* slot's gate, so a
+            // client waits out an fsync + replica round-trip for an
+            // event whose durability was confirmed before that event was
+            // even sequenced. Head-of-line blocking between independent
+            // requests, and it shows up in the tail rather than the
+            // median because it only bites when the response stage has
+            // caught up to the durability frontier.
+            //
+            // Flushing here costs nothing in latency terms: it only
+            // fires when we are about to spin on the gate anyway, so the
+            // syscall overlaps time that would otherwise be dead. The
+            // fast path (gate already satisfied by `cached_durable_pos`)
+            // falls straight through and keeps its batching.
+            //
+            // Traced builds only: this delays the tracker's first
+            // `observe` by the flush duration, so a cursor that crosses
+            // mid-flush is attributed late (or, if it crosses past
+            // `needed`, not attributed at all). Bounded by one flush and
+            // confined to the tick-to-trade breakdown — the gate's own
+            // behaviour is unchanged.
+            if will_wait && !dirty_connections.is_empty() {
+                #[cfg(feature = "tick-to-trade")]
+                let egress_start = trace::mono_trace_ns();
+                flush_sends(
+                    &mut ring,
+                    &mut connections,
+                    &dirty_connections,
+                    &mut to_remove,
+                    &mut cqes,
+                );
+                #[cfg(feature = "tick-to-trade")]
+                egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
+                // Slots later in this batch addressed to a dropped
+                // connection are skipped by the `connections.get_mut`
+                // lookup in the dispatch loop, so removing here is safe.
+                for conn_id in to_remove.drain(..) {
+                    connections.remove(&conn_id);
+                }
+                dirty_connections.clear();
+            }
+
+            if will_wait {
                 loop {
                     // Inside the gate-wait spin loop, also observe a
                     // mode swap. Without this, a batch whose gate
