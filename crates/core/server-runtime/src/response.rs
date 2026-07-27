@@ -527,106 +527,116 @@ pub fn run<A: Application>(
 
         // Wait for durability confirmation before sending responses.
         //
-        // Each iteration: read the primary journal cursor + per-slot
-        // replica cursors (both in-memory and persisted), build a
-        // `CursorView`, and evaluate the configured policy. Spin until
-        // the durable position catches up to the batch's max input_seq.
+        // Gate on `wire_seq`, not `input_seq`. `input_seq` is in
+        // local-consumer space (the matching cursor on the input ring,
+        // starts at 0 in this process) while replica metrics and the
+        // primary's `journal_persisted_wire_seq` live in wire-seq space
+        // (allocated by the journal stage starting at
+        // `starting_sequence`). A `needed` derived from `input_seq` and
+        // compared against wire-seq cursors only works when
+        // `starting_sequence == 1`; a recovered primary (or any process
+        // whose journal already has prior content pushing
+        // `starting_sequence` above 1) would silently open the gate
+        // ahead of the replica's actual replicated state.
         //
-        // Per-slot journal-wait / replica-wait tracker. See
-        // `GateCrossTracker` for the rationale (only records cursors
-        // that were actually on the critical path). Both the tracker's
-        // replica cursor and the attribution counters at the bottom are
-        // derived from the policy in force rather than a fixed level,
-        // so "which subsystem to optimize" answers for the deployment
-        // the operator actually configured.
-        #[cfg(feature = "tick-to-trade")]
-        let mut gate_tracker;
-        {
-            // Gate on `wire_seq`, not `input_seq`. `input_seq` is in
-            // local-consumer space (the matching cursor on the input
-            // ring, starts at 0 in this process) while replica metrics
-            // and the primary's `journal_persisted_wire_seq` live in
-            // wire-seq space (allocated by the journal stage starting
-            // at `starting_sequence`). A `needed` derived from
-            // `input_seq` and compared against wire-seq cursors only
-            // works when `starting_sequence == 1`; a recovered primary
-            // (or any process whose journal already has prior content
-            // pushing `starting_sequence` above 1) would silently open
-            // the gate ahead of the replica's actual replicated state.
-            //
-            // Every cursor in the policy view (`journal_persisted_wire_seq`,
-            // `metrics.in_memory_sequence`, `metrics.acked_sequence`)
-            // carries "highest wire seq known to be in that state on
-            // node X". A batch's `needed` is therefore the *exact*
-            // wire seq the gate must see — not `+1` — for the latest
-            // event in the batch to be considered durable. The legacy
-            // `+1` was load-bearing only because `input_seq` was off
-            // by `starting_sequence - 1` from wire seq; with the
-            // wire-seq stamp it would over-shoot by one event and
-            // make the gate stall an extra round-trip per response.
-            let needed = batch[..count]
-                .iter()
-                .map(|s| s.wire_seq)
-                .max()
-                .expect("non-empty batch");
+        // Every cursor in the policy view (`journal_persisted_wire_seq`,
+        // `metrics.in_memory_sequence`, `metrics.acked_sequence`)
+        // carries "highest wire seq known to be in that state on node
+        // X". A slot's `wire_seq` is therefore the *exact* wire seq the
+        // gate must see — not `+1` — for that slot's event to be
+        // considered durable. The legacy `+1` was load-bearing only
+        // because `input_seq` was off by `starting_sequence - 1` from
+        // wire seq; with the wire-seq stamp it would over-shoot by one
+        // event and make the gate stall an extra round-trip per
+        // response.
+        //
+        // The gate is evaluated **per slot**, not once per batch against
+        // the batch's maximum `wire_seq`. Batch-max gating made every
+        // response in a batch wait for the newest event in it to become
+        // durable, so the oldest slot paid the durability latency of an
+        // event sequenced up to `MAX_BATCH` positions after it — a
+        // head-of-line block bounded only by the batch size, and one
+        // that bites hardest exactly when the stage has caught up to the
+        // durability frontier under load. Per-slot gating walks that
+        // frontier instead: each response is released as soon as its own
+        // event is durable.
+        //
+        // The extra waits are self-limiting. Slots arrive FIFO with
+        // monotonic `wire_seq`, and the journal publishes its cursor per
+        // fsync batch, so one wait typically advances the cursor past a
+        // whole run of following slots and they fall through without
+        // spinning. The number of waits (and so of flushes) tracks real
+        // durability boundaries, not the slot count. Correctness does
+        // not depend on that ordering — an unsorted batch would simply
+        // wait more often.
+        let batch_now = Instant::now();
+
+        for slot in &batch[..count] {
+            #[cfg(feature = "latency-trace")]
+            spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
+
+            // Per-slot journal-wait / replica-wait tracker. See
+            // `GateCrossTracker` for the rationale (only records cursors
+            // that were actually on the critical path). Both the
+            // tracker's replica cursor and the attribution counters
+            // below are derived from the policy in force rather than a
+            // fixed level, so "which subsystem to optimize" answers for
+            // the deployment the operator actually configured. A slot
+            // that never waits leaves the tracker unobserved, and an
+            // unobserved tracker reports no crossing — so the fast path
+            // records nothing rather than a zero-length sample.
             #[cfg(feature = "tick-to-trade")]
-            {
-                gate_tracker = GateCrossTracker::new(needed);
-            }
-            // Durability-gate carve-out for halt-state output — see
-            // `batch_needs_gate`.
-            let needs_gate = batch_needs_gate(&batch[..count]);
-            let will_wait = needs_gate && cached_durable_pos < needed;
+            let mut gate_tracker = GateCrossTracker::new(slot.wire_seq);
 
-            // Drain buffered sends before blocking, never after.
-            //
-            // The steady-state flush happens on the `count == 0` path —
-            // once the output ring is empty. That batches many responses
-            // behind one `io_uring_enter`, which is the right trade on
-            // the fast path. But it means a response that has already
-            // cleared its own durability gate stays in `send_buf` while
-            // the loop blocks on a *later-arriving* slot's gate, so a
-            // client waits out an fsync + replica round-trip for an
-            // event whose durability was confirmed before that event was
-            // even sequenced. Head-of-line blocking between independent
-            // requests, and it shows up in the tail rather than the
-            // median because it only bites when the response stage has
-            // caught up to the durability frontier.
-            //
-            // Flushing here costs nothing in latency terms: it only
-            // fires when we are about to spin on the gate anyway, so the
-            // syscall overlaps time that would otherwise be dead. The
-            // fast path (gate already satisfied by `cached_durable_pos`)
-            // falls straight through and keeps its batching.
-            //
-            // Traced builds only: this delays the tracker's first
-            // `observe` by the flush duration, so a cursor that crosses
-            // mid-flush is attributed late (or, if it crosses past
-            // `needed`, not attributed at all). Bounded by one flush and
-            // confined to the tick-to-trade breakdown — the gate's own
-            // behaviour is unchanged.
-            if will_wait && !dirty_connections.is_empty() {
-                #[cfg(feature = "tick-to-trade")]
-                let egress_start = trace::mono_trace_ns();
-                flush_sends(
-                    &mut ring,
-                    &mut connections,
-                    &dirty_connections,
-                    &mut to_remove,
-                    &mut cqes,
-                );
-                #[cfg(feature = "tick-to-trade")]
-                egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
-                // Slots later in this batch addressed to a dropped
-                // connection are skipped by the `connections.get_mut`
-                // lookup in the dispatch loop, so removing here is safe.
-                for conn_id in to_remove.drain(..) {
-                    connections.remove(&conn_id);
+            if slot_needs_gate(slot, cached_durable_pos) {
+                let needed = slot.wire_seq;
+
+                // Drain buffered sends before blocking, never after.
+                //
+                // The steady-state flush happens on the `count == 0`
+                // path — once the output ring is empty. That batches
+                // many responses behind one `io_uring_enter`, which is
+                // the right trade on the fast path. But it means a
+                // response that has already cleared its own durability
+                // gate stays in `send_buf` while the loop blocks on a
+                // later event's gate, so a client waits out an fsync +
+                // replica round-trip for an event whose durability was
+                // confirmed before that event was even sequenced.
+                //
+                // Flushing here costs nothing in latency terms: it only
+                // fires when we are about to spin on the gate anyway, so
+                // the syscall overlaps time that would otherwise be
+                // dead. Slots whose gate is already satisfied fall
+                // straight through and keep their batching.
+                //
+                // Traced builds only: this delays the tracker's first
+                // `observe` by the flush duration, so a cursor that
+                // crosses mid-flush is attributed late (or, if it
+                // crosses past `needed`, not attributed at all). Bounded
+                // by one flush and confined to the tick-to-trade
+                // breakdown — the gate's own behaviour is unchanged.
+                if !dirty_connections.is_empty() {
+                    #[cfg(feature = "tick-to-trade")]
+                    let egress_start = trace::mono_trace_ns();
+                    flush_sends(
+                        &mut ring,
+                        &mut connections,
+                        &dirty_connections,
+                        &mut to_remove,
+                        &mut cqes,
+                    );
+                    #[cfg(feature = "tick-to-trade")]
+                    egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
+                    // This slot and later ones addressed to a dropped
+                    // connection are skipped by the
+                    // `connections.get_mut` lookup below, so removing
+                    // here is safe.
+                    for conn_id in to_remove.drain(..) {
+                        connections.remove(&conn_id);
+                    }
+                    dirty_connections.clear();
                 }
-                dirty_connections.clear();
-            }
 
-            if will_wait {
                 loop {
                     // Inside the gate-wait spin loop, also observe a
                     // mode swap. Without this, a batch whose gate
@@ -739,37 +749,14 @@ pub fn run<A: Application>(
                     std::hint::spin_loop();
                 }
             }
-        }
 
-        let batch_now = Instant::now();
-
-        // Log degradation transitions / re-emit the reminder. Same
-        // logger the idle path uses; transitions are gated on a
-        // sustained-state hold so sub-second flap doesn't spam.
-        let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
-        degraded_logger.tick(
-            &policy,
-            &utilization,
-            degraded_now,
-            batch_now,
-            DEGRADED_LOG_INTERVAL,
-        );
-        // Bump the idle-path's check timestamp so we don't double-
-        // tick the logger when traffic stops.
-        last_policy_check = batch_now;
-
-        for slot in &batch[..count] {
-            #[cfg(feature = "latency-trace")]
-            spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
-
-            // Per-slot durability-gate breakdown. Recorded only when
-            // the gate actually held us up (the tracker captured a
-            // cross). Note: the cross timestamp is for the *batch's*
-            // `needed` — for slots earlier in the batch, the cursor
-            // may have crossed their individual `input_seq+1` earlier,
-            // so this systematically overestimates wait for non-last
-            // slots by up to the batch's matching span. Acceptable
-            // noise for the operator-facing breakdown.
+            // Per-slot durability-gate breakdown. Recorded only when the
+            // gate actually held us up (the tracker captured a cross).
+            // The cross timestamp is this slot's own `wire_seq`, so the
+            // sample measures the wait that slot really paid — under
+            // batch-max gating it was the batch maximum's crossing,
+            // which overstated every slot but the last by up to the
+            // batch's matching span.
             #[cfg(feature = "tick-to-trade")]
             if let Some(ts) = gate_tracker.journal_crossed() {
                 journal_wait_rec.record_elapsed(slot.match_complete_ts, ts);
@@ -862,32 +849,62 @@ pub fn run<A: Application>(
             dirty_connections.remove(&conn_id);
         }
 
+        // Log degradation transitions / re-emit the reminder. Same
+        // logger the idle path uses; transitions are gated on a
+        // sustained-state hold so sub-second flap doesn't spam.
+        //
+        // Ticked after dispatch rather than before it, and off a fresh
+        // clock read: with the gate now evaluated per slot, a batch can
+        // span several waits, and `batch_now` was taken before the first
+        // of them. The accrual inside each wait already charges degraded
+        // time as it elapses; this tick decides transitions, so it wants
+        // the state and the timestamp as of the end of the batch.
+        let ticked_at = Instant::now();
+        let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
+        degraded_logger.tick(
+            &policy,
+            &utilization,
+            degraded_now,
+            ticked_at,
+            DEGRADED_LOG_INTERVAL,
+        );
+        // Bump the idle-path's check timestamp so we don't double-
+        // tick the logger when traffic stops.
+        last_policy_check = ticked_at;
+
         #[cfg(feature = "latency-trace")]
         dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
     }
 }
 
-/// Whether a consumed batch must wait on the durability gate.
+/// Whether this slot must wait on the durability gate before its
+/// response is encoded.
 ///
-/// Durability-gate carve-out for halt-state output. Slots tagged
-/// `durability_bypass = true` at emission carry no engine state worth
-/// replicating before delivery — see [`OutputSlot::durability_bypass`]
-/// for the correctness argument. When every slot in the batch carries
-/// the flag the gate is skipped entirely, so clients receive the halt
-/// reason immediately rather than blocking on a structurally
-/// unsatisfiable policy (e.g. `Hybrid` with all replicas disconnected,
-/// which would otherwise stall the gate until peers return). If even one
-/// normal slot is present, gate the whole batch as usual — the bypass
-/// slots ride along behind the gated one, which is safe (no ordering
-/// inversion vs. a strict-gate world).
+/// Two reasons to skip the wait. First, the durability-gate carve-out
+/// for halt-state output: slots tagged `durability_bypass = true` at
+/// emission carry no engine state worth replicating before delivery —
+/// see [`OutputSlot::durability_bypass`] for the correctness argument —
+/// so clients receive the halt reason immediately rather than blocking
+/// on a structurally unsatisfiable policy (e.g. `Hybrid` with all
+/// replicas disconnected, which would otherwise stall the gate until
+/// peers return). Second, the slot's own event is already durable.
+///
+/// Applied per slot rather than per batch, so a bypass slot is released
+/// as soon as the dispatch loop reaches it instead of riding behind a
+/// gated slot earlier in the same batch. Ordering is unaffected: the
+/// loop walks slots in ring order either way, so a bypass slot still
+/// leaves after everything sequenced before it.
 ///
 /// Shared by both response stages. The matching stage that sets the flag
 /// is transport-agnostic, so the same slots reach the io_uring and DPDK
 /// paths and the two must agree; keeping the predicate in one place is
 /// what stops them drifting apart again.
 #[inline]
-pub(crate) fn batch_needs_gate<R: Copy, Q: Copy>(batch: &[OutputSlot<R, Q>]) -> bool {
-    batch.iter().any(|s| !s.durability_bypass)
+pub(crate) fn slot_needs_gate<R: Copy, Q: Copy>(
+    slot: &OutputSlot<R, Q>,
+    cached_durable_pos: u64,
+) -> bool {
+    !slot.durability_bypass && cached_durable_pos < slot.wire_seq
 }
 
 /// Submit io_uring SEND SQEs for all dirty connections and wait for completions.
@@ -1481,47 +1498,45 @@ mod tests {
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
     use super::{
-        Blocker, DegradationLogger, OutputSlot, WireSeq, batch_needs_gate, evaluate_durability,
-        evaluate_gate,
+        Blocker, DegradationLogger, OutputSlot, WireSeq, evaluate_durability, evaluate_gate,
+        slot_needs_gate,
     };
     use crate::durability_policy::{Clause, Level, Policy};
     use crate::replication::ReplicationMetrics;
 
-    /// Output slot carrying only the field the gate carve-out reads.
+    /// Output slot carrying only the fields the gate decision reads.
     /// `()` for the report/query types keeps the fixture independent of
     /// any concrete application.
-    fn slot(durability_bypass: bool) -> OutputSlot<(), ()> {
+    fn slot(wire_seq: u64, durability_bypass: bool) -> OutputSlot<(), ()> {
         OutputSlot {
+            wire_seq,
             durability_bypass,
             ..Default::default()
         }
     }
 
     #[test]
-    fn all_bypass_batch_skips_the_gate() {
-        let batch = [slot(true), slot(true), slot(true)];
-        assert!(
-            !batch_needs_gate(&batch),
-            "halt-state output must not block on a policy that may be unsatisfiable"
-        );
+    fn bypass_slot_never_gates() {
+        // Halt-state output must not block on a policy that may be
+        // structurally unsatisfiable, however far behind the cursor is.
+        assert!(!slot_needs_gate(&slot(10, true), 0));
+        assert!(!slot_needs_gate(&slot(10, true), 9));
     }
 
     #[test]
-    fn any_normal_slot_gates_the_whole_batch() {
-        // The normal slot last, first, and alone — a bypass slot riding
-        // ahead of a gated one must not open the gate for the batch.
-        assert!(batch_needs_gate(&[slot(true), slot(true), slot(false)]));
-        assert!(batch_needs_gate(&[slot(false), slot(true), slot(true)]));
-        assert!(batch_needs_gate(&[slot(false)]));
+    fn normal_slot_gates_until_its_own_sequence_is_durable() {
+        assert!(slot_needs_gate(&slot(10, false), 0));
+        assert!(slot_needs_gate(&slot(10, false), 9));
     }
 
     #[test]
-    fn empty_batch_needs_no_gate() {
-        // Unreachable from the stages (both check `count == 0` first),
-        // but `any` on an empty slice is false and the callers treat
-        // false as "skip the wait" — pinned so a future refactor that
-        // does reach here can't turn it into a spurious gate.
-        assert!(!batch_needs_gate::<(), ()>(&[]));
+    fn normal_slot_clears_at_its_own_sequence_not_the_batch_maximum() {
+        // The cursor reaching exactly this slot's `wire_seq` is enough —
+        // an off-by-one here would stall every response an extra
+        // durability round-trip. A later slot in the same batch needing
+        // more must not hold this one back.
+        assert!(!slot_needs_gate(&slot(10, false), 10));
+        assert!(!slot_needs_gate(&slot(10, false), 11));
     }
 
     /// Build a [`Policy`] from a mini DSL: one or more

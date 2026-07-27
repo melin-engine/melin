@@ -157,6 +157,82 @@ fn durable_response_is_released_before_blocking_on_a_later_gate() {
     });
 }
 
+/// The gate is per slot, not per batch: a slot whose own `wire_seq` is
+/// durable must not wait for a later slot in the *same* batch.
+///
+/// Batch-max gating took `needed` as the maximum `wire_seq` across the
+/// consumed batch, so the oldest response paid the durability latency of
+/// the newest event in it — head-of-line blocking bounded only by
+/// `MAX_BATCH`.
+///
+/// Getting two slots into one batch deterministically needs a third
+/// event to hold the stage still: while it spins on `hold`'s gate, the
+/// two under test accumulate in the ring and are consumed together.
+#[test]
+fn earlier_slot_in_a_batch_is_not_held_by_a_later_one() {
+    let (mut producer, mut consumers) =
+        DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(1024)
+            .add_consumer()
+            .build();
+    let consumer = consumers.pop().expect("one consumer was requested");
+
+    let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
+    let server_fd = server_sock.as_raw_fd();
+    let writer = BlockingFrameWriter::new(Box::new(server_sock) as Box<dyn Write + Send>);
+    client_sock
+        .set_read_timeout(Some(READ_TIMEOUT))
+        .expect("set read timeout");
+
+    let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(0));
+    let shutdown = AtomicBool::new(false);
+    let (control_tx, control_rx) = mpsc::channel();
+    let config = config_for(journal_cursor.clone());
+
+    thread::scope(|scope| {
+        let stage = scope.spawn(|| {
+            response::run::<Counter>(consumer, control_rx, config, &shutdown);
+        });
+
+        control_tx
+            .send(ControlEvent::Connected {
+                connection_id: 1,
+                fd: server_fd,
+                writer,
+            })
+            .expect("stage is running");
+        thread::sleep(SETTLE);
+
+        // Hold the stage in a gate wait.
+        producer.publish(ack_slot(1, 111));
+        thread::sleep(SETTLE);
+
+        // Both accumulate behind the held stage, so they are consumed as
+        // one batch whose maximum `wire_seq` is 3.
+        producer.publish(ack_slot(2, 222));
+        producer.publish(ack_slot(3, 333));
+        thread::sleep(SETTLE);
+
+        // Releases the hold *and* event 2, but not event 3. Batch-max
+        // gating would make 2 wait for 3; per-slot gating sends it.
+        journal_cursor.store(WireSeq::new(2));
+        let held = read_ack(&mut client_sock);
+        let early = read_ack(&mut client_sock);
+
+        journal_cursor.store(WireSeq::new(3));
+        let late = read_ack(&mut client_sock);
+
+        shutdown.store(true, Ordering::Relaxed);
+        stage.join().expect("response stage panicked");
+
+        assert_eq!(held.expect("held response never arrived"), 111);
+        assert_eq!(
+            early.expect("durable slot held behind a later slot in the same batch"),
+            222
+        );
+        assert_eq!(late.expect("last response never arrived"), 333);
+    });
+}
+
 /// Guards the other half of the trade-off: the pre-gate flush must not
 /// change delivery when the gate is already satisfied. With the cursor
 /// ahead of every event, the stage takes the fast path through the gate

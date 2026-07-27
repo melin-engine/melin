@@ -370,39 +370,44 @@ pub fn run<A: Application>(
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::mono_trace_ns();
 
-        // Per-slot journal-wait / replica-wait tracker. Same shape as
-        // the TCP response — see `crate::response::GateCrossTracker`
-        // for the rationale and edge cases.
-        #[cfg(feature = "tick-to-trade")]
-        let mut gate_tracker;
+        // One Instant::now() per batch for heartbeat tracking instead of
+        // per response — heartbeat interval is 10s, sub-ms precision is plenty.
+        let batch_now = Instant::now();
 
-        // Wait for durability (see response.rs for full explanation).
-        {
+        // Encode and queue responses. Each slot expands to at most two
+        // wire frames: the payload (Report / QueryResponse / EngineError)
+        // and an optional trailing `BatchEnd` when `is_last_in_request`
+        // is set. `OutputPayload::BatchEnd` carries no payload of its
+        // own — the wire BatchEnd is emitted purely from the flag.
+        //
+        // The durability gate is evaluated per slot, inline — see
+        // `response::run` for why batch-max gating was a head-of-line
+        // block and why the extra waits are self-limiting.
+        for slot in &batch[..count] {
+            #[cfg(feature = "latency-trace")]
+            spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
+
+            // Per-slot journal-wait / replica-wait tracker. Same shape as
+            // the TCP response — see `crate::response::GateCrossTracker`
+            // for the rationale and edge cases.
+            #[cfg(feature = "tick-to-trade")]
+            let mut gate_tracker = crate::response::GateCrossTracker::new(slot.wire_seq);
+
             // Gate on `wire_seq` (matches `response::run`) — see that
             // module's notes on the input-seq vs wire-seq space mismatch
-            // that motivated the field. With the wire-seq stamp, `needed`
-            // is the exact wire seq the gate must observe to consider
-            // the batch's latest event durable; no `+1` (the old `+1`
-            // compensated for the input-seq off-by-(starting-1), which
-            // is gone now).
-            let needed = batch[..count]
-                .iter()
-                .map(|s| s.wire_seq)
-                .max()
-                .expect("non-empty batch");
-            #[cfg(feature = "tick-to-trade")]
-            {
-                gate_tracker = crate::response::GateCrossTracker::new(needed);
-            }
-            // Durability-gate carve-out for halt-state output — the same
-            // predicate the io_uring stage uses, see
-            // `crate::response::batch_needs_gate`. Without it a halted
-            // node on DPDK stalls the halt rejection itself on a
-            // structurally unsatisfiable policy (`Hybrid` with every
-            // replica gone), so the client never learns why it was
-            // refused — precisely the wedge the flag exists to prevent.
-            let needs_gate = crate::response::batch_needs_gate(&batch[..count]);
-            if needs_gate && cached_durable_pos < needed {
+            // that motivated the field. With the wire-seq stamp, the
+            // slot's own `wire_seq` is the exact value the gate must
+            // observe for that slot's event to count as durable; no `+1`
+            // (the old `+1` compensated for the input-seq
+            // off-by-(starting-1), which is gone now).
+            //
+            // The halt-state carve-out rides inside `slot_needs_gate`.
+            // Without it a halted node on DPDK stalls the halt rejection
+            // itself on a structurally unsatisfiable policy (`Hybrid`
+            // with every replica gone), so the client never learns why
+            // it was refused.
+            if crate::response::slot_needs_gate(slot, cached_durable_pos) {
+                let needed = slot.wire_seq;
                 loop {
                     // Observe a mode swap mid-gate-wait so a stuck
                     // batch can be unblocked by an operator
@@ -492,32 +497,6 @@ pub fn run<A: Application>(
                     std::hint::spin_loop();
                 }
             }
-        }
-
-        // One Instant::now() per batch for heartbeat tracking instead of
-        // per response — heartbeat interval is 10s, sub-ms precision is plenty.
-        let batch_now = Instant::now();
-
-        // Log degradation transitions / heartbeat after the gate
-        // opens. Same scheme as the TCP response stage.
-        let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
-        degraded_logger.tick(
-            &policy,
-            &utilization,
-            degraded_now,
-            batch_now,
-            DEGRADED_LOG_INTERVAL,
-        );
-        last_policy_check = batch_now;
-
-        // Encode and queue responses. Each slot expands to at most two
-        // wire frames: the payload (Report / QueryResponse / EngineError)
-        // and an optional trailing `BatchEnd` when `is_last_in_request`
-        // is set. `OutputPayload::BatchEnd` carries no payload of its
-        // own — the wire BatchEnd is emitted purely from the flag.
-        for slot in &batch[..count] {
-            #[cfg(feature = "latency-trace")]
-            spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
             #[cfg(feature = "tick-to-trade")]
             if let Some(ts) = gate_tracker.journal_crossed() {
@@ -600,6 +579,21 @@ pub fn run<A: Application>(
                 state.last_send = batch_now;
             }
         }
+
+        // Log degradation transitions / heartbeat. Same scheme as the
+        // TCP response stage, including ticking after dispatch off a
+        // fresh clock read — with the gate evaluated per slot a batch
+        // can span several waits, and `batch_now` predates all of them.
+        let ticked_at = Instant::now();
+        let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
+        degraded_logger.tick(
+            &policy,
+            &utilization,
+            degraded_now,
+            ticked_at,
+            DEGRADED_LOG_INTERVAL,
+        );
+        last_policy_check = ticked_at;
 
         #[cfg(feature = "latency-trace")]
         dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
