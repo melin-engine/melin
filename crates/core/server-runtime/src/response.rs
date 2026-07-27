@@ -271,6 +271,27 @@ pub fn run<A: Application>(
     #[cfg(feature = "latency-trace")]
     let mut last_stats_flush = Instant::now();
 
+    // Server-side end-to-end samples awaiting a flush.
+    //
+    // The stage encodes into `send_buf` and hands the bytes to the
+    // kernel later, so closing the sample at encode time would omit
+    // every microsecond a response spends buffered — the interval this
+    // stage most needs to be honest about, since that is exactly where a
+    // deferred flush hides. Holding each frame's `recv_ts` until the
+    // flush completes measures reader-recv → kernel, which is what the
+    // stage name claims and what the DPDK path already records (it
+    // samples after `tx_producers.flush()`).
+    //
+    // `Vec` rather than a per-connection map: samples are only ever
+    // pushed and then drained wholesale, order is irrelevant, and a flat
+    // append is the cheapest thing that does that. Length is bounded by
+    // the responses encoded between two flushes.
+    //
+    // Only compiled under `latency-trace`; production builds carry
+    // neither the buffer nor the pushes.
+    #[cfg(feature = "latency-trace")]
+    let mut pending_e2e: Vec<trace::MonoTraceInstant> = Vec::with_capacity(MAX_BATCH);
+
     // Track connections with buffered (unflushed) writes across batches.
     let mut dirty_connections: HashSet<u64> = HashSet::new();
 
@@ -368,6 +389,13 @@ pub fn run<A: Application>(
                     &mut to_remove,
                     &mut cqes,
                 );
+                #[cfg(feature = "latency-trace")]
+                {
+                    let flushed_at = trace::mono_trace_ns();
+                    for recv_ts in pending_e2e.drain(..) {
+                        server_e2e_rec.record_elapsed(recv_ts, flushed_at);
+                    }
+                }
                 dirty_connections.clear();
             }
             utilization.busy.store(busy_count, Ordering::Relaxed);
@@ -423,6 +451,13 @@ pub fn run<A: Application>(
                 );
                 #[cfg(feature = "tick-to-trade")]
                 egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
+                #[cfg(feature = "latency-trace")]
+                {
+                    let flushed_at = trace::mono_trace_ns();
+                    for recv_ts in pending_e2e.drain(..) {
+                        server_e2e_rec.record_elapsed(recv_ts, flushed_at);
+                    }
+                }
                 for conn_id in to_remove.drain(..) {
                     connections.remove(&conn_id);
                 }
@@ -431,6 +466,10 @@ pub fn run<A: Application>(
 
             // Send heartbeats to idle connections. Only checked during
             // idle periods (SPSC empty) to avoid overhead on the hot path.
+            //
+            // No end-to-end samples to close here: a queued sample always
+            // accompanies a dirty connection, and the flush above cleared
+            // both, so anything dirty at this point is heartbeat frames.
             if let Some(interval) = heartbeat_interval {
                 let now = Instant::now();
                 // Coarse gate: only scan at most once per second.
@@ -627,6 +666,13 @@ pub fn run<A: Application>(
                     );
                     #[cfg(feature = "tick-to-trade")]
                     egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
+                    #[cfg(feature = "latency-trace")]
+                    {
+                        let flushed_at = trace::mono_trace_ns();
+                        for recv_ts in pending_e2e.drain(..) {
+                            server_e2e_rec.record_elapsed(recv_ts, flushed_at);
+                        }
+                    }
                     // This slot and later ones addressed to a dropped
                     // connection are skipped by the
                     // `connections.get_mut` lookup below, so removing
@@ -830,13 +876,15 @@ pub fn run<A: Application>(
                         &mut dirty_connections,
                         &mut to_remove,
                     );
-                    // Record server-side end-to-end: reader recv ->
-                    // response flush. Only the BatchEnd frame carries
-                    // this measurement; tracked here after the append
-                    // so a dropped connection doesn't skew the metric.
+                    // Queue the server-side end-to-end sample: reader
+                    // recv -> response flush. Only the BatchEnd frame
+                    // carries this measurement; queued here after the
+                    // append so a dropped connection doesn't skew the
+                    // metric, and closed by whichever flush ships the
+                    // bytes.
                     #[cfg(feature = "latency-trace")]
                     if matches!(outcome, AppendOutcome::Continue) {
-                        server_e2e_rec.record_elapsed(slot.recv_ts, trace::mono_trace_ns());
+                        pending_e2e.push(slot.recv_ts);
                     }
                     let _ = outcome;
                 }
