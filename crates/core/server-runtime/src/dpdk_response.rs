@@ -394,7 +394,15 @@ pub fn run<A: Application>(
             {
                 gate_tracker = crate::response::GateCrossTracker::new(needed);
             }
-            if cached_durable_pos < needed {
+            // Durability-gate carve-out for halt-state output — the same
+            // predicate the io_uring stage uses, see
+            // `crate::response::batch_needs_gate`. Without it a halted
+            // node on DPDK stalls the halt rejection itself on a
+            // structurally unsatisfiable policy (`Hybrid` with every
+            // replica gone), so the client never learns why it was
+            // refused — precisely the wedge the flag exists to prevent.
+            let needs_gate = crate::response::batch_needs_gate(&batch[..count]);
+            if needs_gate && cached_durable_pos < needed {
                 loop {
                     // Observe a mode swap mid-gate-wait so a stuck
                     // batch can be unblocked by an operator

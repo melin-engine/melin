@@ -573,20 +573,9 @@ pub fn run<A: Application>(
             {
                 gate_tracker = GateCrossTracker::new(needed);
             }
-            // Durability-gate carve-out for halt-state output. Slots
-            // tagged `durability_bypass = true` at emission carry no
-            // engine state worth replicating before delivery — see
-            // `OutputSlot::durability_bypass` for the correctness
-            // argument. When every slot in the batch carries the flag
-            // the gate is skipped entirely, so clients receive the halt
-            // reason immediately rather than blocking on a structurally
-            // unsatisfiable policy (e.g. `Hybrid` with all replicas
-            // disconnected, which would otherwise stall the gate until
-            // peers return). If even one normal slot is present, gate
-            // the whole batch as usual — the bypass slots ride along
-            // behind the gated one, which is safe (no ordering
-            // inversion vs. a strict-gate world).
-            let needs_gate = batch[..count].iter().any(|s| !s.durability_bypass);
+            // Durability-gate carve-out for halt-state output — see
+            // `batch_needs_gate`.
+            let needs_gate = batch_needs_gate(&batch[..count]);
             let will_wait = needs_gate && cached_durable_pos < needed;
 
             // Drain buffered sends before blocking, never after.
@@ -876,6 +865,29 @@ pub fn run<A: Application>(
         #[cfg(feature = "latency-trace")]
         dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
     }
+}
+
+/// Whether a consumed batch must wait on the durability gate.
+///
+/// Durability-gate carve-out for halt-state output. Slots tagged
+/// `durability_bypass = true` at emission carry no engine state worth
+/// replicating before delivery — see [`OutputSlot::durability_bypass`]
+/// for the correctness argument. When every slot in the batch carries
+/// the flag the gate is skipped entirely, so clients receive the halt
+/// reason immediately rather than blocking on a structurally
+/// unsatisfiable policy (e.g. `Hybrid` with all replicas disconnected,
+/// which would otherwise stall the gate until peers return). If even one
+/// normal slot is present, gate the whole batch as usual — the bypass
+/// slots ride along behind the gated one, which is safe (no ordering
+/// inversion vs. a strict-gate world).
+///
+/// Shared by both response stages. The matching stage that sets the flag
+/// is transport-agnostic, so the same slots reach the io_uring and DPDK
+/// paths and the two must agree; keeping the predicate in one place is
+/// what stops them drifting apart again.
+#[inline]
+pub(crate) fn batch_needs_gate<R: Copy, Q: Copy>(batch: &[OutputSlot<R, Q>]) -> bool {
+    batch.iter().any(|s| !s.durability_bypass)
 }
 
 /// Submit io_uring SEND SQEs for all dirty connections and wait for completions.
@@ -1468,9 +1480,49 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 mod tests {
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
-    use super::{Blocker, DegradationLogger, WireSeq, evaluate_durability, evaluate_gate};
+    use super::{
+        Blocker, DegradationLogger, OutputSlot, WireSeq, batch_needs_gate, evaluate_durability,
+        evaluate_gate,
+    };
     use crate::durability_policy::{Clause, Level, Policy};
     use crate::replication::ReplicationMetrics;
+
+    /// Output slot carrying only the field the gate carve-out reads.
+    /// `()` for the report/query types keeps the fixture independent of
+    /// any concrete application.
+    fn slot(durability_bypass: bool) -> OutputSlot<(), ()> {
+        OutputSlot {
+            durability_bypass,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn all_bypass_batch_skips_the_gate() {
+        let batch = [slot(true), slot(true), slot(true)];
+        assert!(
+            !batch_needs_gate(&batch),
+            "halt-state output must not block on a policy that may be unsatisfiable"
+        );
+    }
+
+    #[test]
+    fn any_normal_slot_gates_the_whole_batch() {
+        // The normal slot last, first, and alone — a bypass slot riding
+        // ahead of a gated one must not open the gate for the batch.
+        assert!(batch_needs_gate(&[slot(true), slot(true), slot(false)]));
+        assert!(batch_needs_gate(&[slot(false), slot(true), slot(true)]));
+        assert!(batch_needs_gate(&[slot(false)]));
+    }
+
+    #[test]
+    fn empty_batch_needs_no_gate() {
+        // Unreachable from the stages (both check `count == 0` first),
+        // but `any` on an empty slice is false and the callers treat
+        // false as "skip the wait" — pinned so a future refactor that
+        // does reach here can't turn it into a spurious gate.
+        assert!(!batch_needs_gate::<(), ()>(&[]));
+    }
 
     /// Build a [`Policy`] from a mini DSL: one or more
     /// `"<level>>=<count>"` clauses joined with `&&`. Test-only
