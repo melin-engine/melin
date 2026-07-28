@@ -77,6 +77,19 @@ pub struct BufferedWriter<E: AppEvent> {
     // Number of valid bytes in `batch_buf`. Acts as the write cursor —
     // new entries land at `batch_buf[batch_len..]`. Reset on every flush.
     batch_len: usize,
+    // How many bytes of `batch_buf[..batch_len]` the hash chain has
+    // already seen. Always <= batch_len, reset to 0 alongside it.
+    //
+    // `encode_event` appends without absorbing; the batch is absorbed in
+    // one `update()` just before it is flushed or discarded. BLAKE3 only
+    // reaches its SIMD multi-block path when fed many bytes at once, so
+    // per-entry absorption paid scalar compression plus per-call dispatch
+    // and got none of it. The chain value is defined over the
+    // concatenation of entry bytes, independent of how it is sliced
+    // across `update()` calls (see `crate::chain`), so both orderings
+    // produce byte-identical hashes.
+    #[cfg(feature = "hash-chain")]
+    chain_absorbed: usize,
     next_sequence: u64,
     // First sequence of the active segment (the header's
     // `starting_sequence`), kept in memory so emptiness / rotation-
@@ -155,6 +168,8 @@ impl<E: AppEvent> BufferedWriter<E> {
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
+            #[cfg(feature = "hash-chain")]
+            chain_absorbed: 0,
             next_sequence: starting_sequence,
             starting_sequence,
             path: path.to_path_buf(),
@@ -221,6 +236,8 @@ impl<E: AppEvent> BufferedWriter<E> {
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
+            #[cfg(feature = "hash-chain")]
+            chain_absorbed: 0,
             next_sequence: last_seq + 1,
             starting_sequence: info.starting_sequence,
             path: path.to_path_buf(),
@@ -284,11 +301,10 @@ impl<E: AppEvent> BufferedWriter<E> {
             &mut self.buffer,
         )?;
 
-        // Absorb the full on-disk bytes (incl. CRC) — see crate::chain
-        // for why the CRC is included.
-        #[cfg(feature = "hash-chain")]
-        self.hash_chain.absorb(&self.buffer[..written]);
-
+        // The full on-disk bytes (incl. CRC — see crate::chain for why)
+        // are absorbed into the hash chain from `batch_buf`, once per
+        // batch rather than once per entry; see `chain_absorbed` and
+        // `absorb_pending_into_chain`.
         self.reserve_batch(written);
         let offset = self.batch_len;
         self.last_user_entry_offset = offset;
@@ -297,6 +313,23 @@ impl<E: AppEvent> BufferedWriter<E> {
         self.batch_len += written;
 
         Ok(())
+    }
+
+    /// Feed every batch byte not yet seen by the hash chain into it.
+    ///
+    /// Must run before anything consumes or discards
+    /// `batch_buf[..batch_len]`. Idempotent: a second call with no
+    /// intervening `encode_event` absorbs nothing.
+    #[inline]
+    fn absorb_pending_into_chain(&mut self) {
+        #[cfg(feature = "hash-chain")]
+        {
+            if self.chain_absorbed < self.batch_len {
+                self.hash_chain
+                    .absorb(&self.batch_buf[self.chain_absorbed..self.batch_len]);
+                self.chain_absorbed = self.batch_len;
+            }
+        }
     }
 
     /// Grow the batch buffer if the incoming bytes wouldn't fit. The
@@ -328,6 +361,7 @@ impl<E: AppEvent> BufferedWriter<E> {
             return Ok(());
         }
         self.ensure_allocated()?;
+        self.absorb_pending_into_chain();
 
         let len = self.batch_len;
         write_all_at(&self.file, &self.batch_buf[..len], self.write_pos)?;
@@ -340,6 +374,10 @@ impl<E: AppEvent> BufferedWriter<E> {
 
         self.write_pos += len as u64;
         self.batch_len = 0;
+        #[cfg(feature = "hash-chain")]
+        {
+            self.chain_absorbed = 0;
+        }
         self.last_user_entry_len = 0;
         Ok(())
     }
@@ -348,7 +386,16 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// `no-persist` path of the journal stage to keep the buffer
     /// bounded after replication has snapshotted the bytes.
     pub fn discard_batch_buf(&mut self) {
+        // Absorb before dropping the bytes. Discarded entries were still
+        // encoded, sequenced, and (on the no-persist path) replicated, so
+        // they belong in the chain exactly as they did when absorption
+        // happened at encode time.
+        self.absorb_pending_into_chain();
         self.batch_len = 0;
+        #[cfg(feature = "hash-chain")]
+        {
+            self.chain_absorbed = 0;
+        }
         self.last_user_entry_len = 0;
     }
 
@@ -405,10 +452,18 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// Current chain value: `BLAKE3(entry bytes so far || anchor)`, or
     /// the anchor itself for an empty segment. `None` when `hash-chain`
     /// is disabled. Non-destructive (clone + finalize).
+    ///
+    /// "Entry bytes so far" spans every entry handed to `encode_event`,
+    /// including any still unabsorbed in the batch buffer — callers read
+    /// this at points that do not all coincide with a flush, so the
+    /// pending tail is folded in rather than lagging behind.
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "hash-chain")]
         {
-            Some(self.hash_chain.value())
+            Some(
+                self.hash_chain
+                    .value_with_pending(&self.batch_buf[self.chain_absorbed..self.batch_len]),
+            )
         }
         #[cfg(not(feature = "hash-chain"))]
         None
@@ -750,6 +805,148 @@ mod tests {
         writer.flush_batch_sync().unwrap();
         writer.flush_batch_sync().unwrap();
         assert_eq!(writer.write_pos(), pos_before);
+    }
+
+    /// Golden vector pinning the chain values an operator's audit trail
+    /// is verified against.
+    ///
+    /// The expected hashes were produced by the writer *before*
+    /// absorption moved from per-entry to per-batch, so this is the
+    /// direct evidence that the two schedules agree byte-for-byte —
+    /// stronger than any self-consistency check, which would pass
+    /// equally on a chain that had drifted uniformly.
+    ///
+    /// It also pins the format going forward: any future change that
+    /// alters an existing journal's chain values breaks cross-version
+    /// verification and must fail here rather than in the field. A
+    /// deliberate format change means recomputing these constants and
+    /// saying so in the commit.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn chain_values_match_golden_vector() {
+        // Fixed anchor (rather than `create`'s random salt) makes every
+        // value below deterministic.
+        let anchor = [0x5au8; 32];
+        let expected = [
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "477a8e8c2bbda68d05af04d65e8d33b046b3c289bb5c6309032abc883b1f16d5",
+            "477a8e8c2bbda68d05af04d65e8d33b046b3c289bb5c6309032abc883b1f16d5",
+            "db6dbb81db46b5008966ba54ce9a5baa2b05303581409a742ecd8ca26be84946",
+            "6fc127ee3a5665ed75c27176c4761f7579ffa117a78bd130fc5ede9c8340617b",
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let mut writer = BufferedWriter::<TestEvent>::create_continuing(&path, 1, anchor).unwrap();
+
+        // Empty segment: the anchor itself.
+        let mut probes: Vec<[u8; 32]> = vec![writer.chain_hash().unwrap()];
+
+        // Unflushed batch — the pending tail must already be folded in.
+        for i in 1..=3u64 {
+            writer
+                .batch_append_with_ts(&sample(i), i * 10, i, i * 2)
+                .unwrap();
+        }
+        probes.push(writer.chain_hash().unwrap());
+
+        // Flushing those same bytes must not move the value.
+        writer.flush_batch_sync().unwrap();
+        probes.push(writer.chain_hash().unwrap());
+
+        // A discarded batch still counts.
+        for i in 4..=6u64 {
+            writer
+                .batch_append_with_ts(&sample(i), i * 10, i, i * 2)
+                .unwrap();
+        }
+        writer.discard_batch_buf();
+        probes.push(writer.chain_hash().unwrap());
+
+        // ...and the chain continues correctly past the discard.
+        for i in 7..=9u64 {
+            writer
+                .batch_append_with_ts(&sample(i), i * 10, i, i * 2)
+                .unwrap();
+        }
+        writer.flush_batch_sync().unwrap();
+        probes.push(writer.chain_hash().unwrap());
+
+        let actual: Vec<String> = probes
+            .iter()
+            .map(|p| p.iter().map(|b| format!("{b:02x}")).collect())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    /// Entries are absorbed into the chain once per batch, not once per
+    /// entry, so a flush must be invisible to the chain value: the
+    /// pending bytes are already folded in before the flush, and must not
+    /// be folded in a second time by it.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn chain_hash_is_stable_across_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        for i in 1..=3u64 {
+            writer.batch_append_with_ts(&sample(i), 0, 0, 0).unwrap();
+        }
+        let pending = writer.chain_hash().expect("hash-chain enabled");
+        writer.flush_batch_sync().unwrap();
+        assert_eq!(writer.chain_hash(), Some(pending));
+
+        // And a second flush with nothing pending is likewise inert.
+        writer.flush_batch_sync().unwrap();
+        assert_eq!(writer.chain_hash(), Some(pending));
+    }
+
+    /// Every entry handed to the encoder counts, including one still
+    /// unflushed: the value read mid-batch must match what the reader
+    /// independently derives from the on-disk bytes after the flush.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn pending_batch_chain_matches_reader_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        for i in 1..=5u64 {
+            writer.batch_append_with_ts(&sample(i), 0, 0, 0).unwrap();
+        }
+        let pending = writer.chain_hash().expect("hash-chain enabled");
+        writer.flush_batch_sync().unwrap();
+        drop(writer);
+
+        // The reader's chain covers the entries it has consumed, so drain
+        // it before comparing.
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        let mut count = 0;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 5);
+        assert_eq!(reader.chain_hash(), Some(pending));
+    }
+
+    /// A discarded batch still advances the chain. The entries were
+    /// encoded, sequenced, and (on the no-persist path) replicated, so
+    /// dropping the buffer must not drop them from the chain.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn chain_hash_counts_discarded_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let empty = writer.chain_hash().expect("hash-chain enabled");
+        writer.batch_append_with_ts(&sample(1), 0, 0, 0).unwrap();
+        let encoded = writer.chain_hash().expect("hash-chain enabled");
+        assert_ne!(empty, encoded);
+
+        writer.discard_batch_buf();
+        assert_eq!(writer.chain_hash(), Some(encoded));
     }
 
     #[cfg(feature = "hash-chain")]

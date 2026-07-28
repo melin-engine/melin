@@ -128,6 +128,20 @@ pub struct SectorWriter<E: AppEvent> {
     /// Reset to 0 on every flush or discard. Separate from `last_user_entry_len`
     /// which tracks only the most-recent user entry's size.
     batch_len: usize,
+    /// How many bytes of `batch_buf[..batch_len]` have already been fed
+    /// to `hash_chain`. Always `<= batch_len`, and reset to 0 alongside it.
+    ///
+    /// `encode_event` appends without absorbing; the whole batch is
+    /// absorbed in one `update()` just before the buffer is consumed.
+    /// BLAKE3 only reaches its SIMD multi-block path when handed many
+    /// bytes at once, so absorbing per entry (~100 bytes) paid scalar
+    /// compression plus per-call dispatch on the hot path and got none
+    /// of it. The chain value is defined over the *concatenation* of
+    /// entry bytes and is independent of how that concatenation is
+    /// sliced across `update()` calls (see [`crate::chain`]), so the
+    /// resulting hashes are byte-identical either way.
+    #[cfg(feature = "hash-chain")]
+    chain_absorbed: usize,
     /// Byte range of the most-recent user entry within `batch_buf` —
     /// `last_user_entry_replication_slice` ships it to replication
     /// without a second encode pass. `(0, 0)` means no entry encoded yet.
@@ -330,6 +344,8 @@ impl<E: AppEvent> SectorWriter<E> {
             #[cfg(debug_assertions)]
             last_encoded_seq: 0,
             batch_len: 0,
+            #[cfg(feature = "hash-chain")]
+            chain_absorbed: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
             sector_size,
@@ -512,6 +528,8 @@ impl<E: AppEvent> SectorWriter<E> {
             #[cfg(debug_assertions)]
             last_encoded_seq: last_seq,
             batch_len: 0,
+            #[cfg(feature = "hash-chain")]
+            chain_absorbed: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
             sector_size,
@@ -573,13 +591,11 @@ impl<E: AppEvent> SectorWriter<E> {
             &mut self.buffer,
         )?;
 
-        // Absorb the full on-disk bytes (incl. CRC) — see crate::chain
-        // for why the CRC is included. Incremental update only; the
-        // value is finalized on demand (fsync publication, snapshots,
-        // rotation), never per entry.
-        #[cfg(feature = "hash-chain")]
-        self.hash_chain.absorb(&self.buffer[..written]);
-
+        // The full on-disk bytes (incl. CRC — see crate::chain for why)
+        // are absorbed into the hash chain from `batch_buf`, in one
+        // `update()` per batch rather than one per entry; see
+        // `chain_absorbed` and `absorb_pending_into_chain`. Nothing is
+        // emitted here — the chain has no in-stream metadata.
         self.warn_if_batch_overflow(written);
         let offset = self.batch_len;
         self.last_user_entry_offset = offset;
@@ -588,6 +604,24 @@ impl<E: AppEvent> SectorWriter<E> {
         self.batch_len += written;
 
         Ok(())
+    }
+
+    /// Feed every batch byte not yet seen by the hash chain into it.
+    ///
+    /// Must run before anything consumes, moves, or discards
+    /// `batch_buf[..batch_len]` — after that the bytes are either gone
+    /// or relocated, and the chain would silently skip them. Idempotent:
+    /// a second call with no intervening `encode_event` absorbs nothing.
+    #[inline]
+    fn absorb_pending_into_chain(&mut self) {
+        #[cfg(feature = "hash-chain")]
+        {
+            if self.chain_absorbed < self.batch_len {
+                self.hash_chain
+                    .absorb(&self.batch_buf[self.chain_absorbed..self.batch_len]);
+                self.chain_absorbed = self.batch_len;
+            }
+        }
     }
 
     /// Warn whenever `batch_buf` is about to grow past its current
@@ -632,7 +666,16 @@ impl<E: AppEvent> SectorWriter<E> {
     /// Used by the `no-persist` path of the journal stage so the buffer
     /// stays bounded after replication has snapshotted the bytes.
     pub fn discard_batch_buf(&mut self) {
+        // Absorb before dropping the bytes. Discarded entries were still
+        // encoded, sequenced, and (on the no-persist path) replicated, so
+        // they belong in the chain exactly as they did when absorption
+        // happened at encode time.
+        self.absorb_pending_into_chain();
         self.batch_len = 0;
+        #[cfg(feature = "hash-chain")]
+        {
+            self.chain_absorbed = 0;
+        }
         self.last_user_entry_len = 0;
     }
 
@@ -656,6 +699,9 @@ impl<E: AppEvent> SectorWriter<E> {
             return Ok(None);
         }
         self.ensure_allocated()?;
+        // Before the swap below hands `batch_buf` away — after it, these
+        // bytes live in `full_buf` and `batch_buf` is the spare.
+        self.absorb_pending_into_chain();
         let old_write_pos = self.write_pos;
         let batch_len = self.batch_len;
 
@@ -695,6 +741,10 @@ impl<E: AppEvent> SectorWriter<E> {
         let write_len = output_cursor;
         let output_buf = std::mem::replace(&mut self.batch_buf, full_buf);
         self.batch_len = 0;
+        #[cfg(feature = "hash-chain")]
+        {
+            self.chain_absorbed = 0;
+        }
         self.last_user_entry_len = 0;
 
         if write_len == 0 {
@@ -896,10 +946,19 @@ impl<E: AppEvent> SectorWriter<E> {
     /// the anchor itself for an empty segment. `None` when `hash-chain`
     /// is disabled. Non-destructive (clone + finalize, O(log absorbed
     /// bytes)).
+    ///
+    /// "Entry bytes so far" spans every entry handed to `encode_event`,
+    /// including any still sitting unabsorbed in the batch buffer — this
+    /// is read at fsync publication, snapshots, and rotation, which do
+    /// not all coincide with a flush, so the pending tail is folded in
+    /// here rather than being allowed to lag behind.
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "hash-chain")]
         {
-            Some(self.hash_chain.value())
+            Some(
+                self.hash_chain
+                    .value_with_pending(&self.batch_buf[self.chain_absorbed..self.batch_len]),
+            )
         }
         #[cfg(not(feature = "hash-chain"))]
         None
@@ -938,6 +997,11 @@ impl<E: AppEvent> SectorWriter<E> {
         if self.batch_len == 0 {
             return Ok(());
         }
+
+        // Before the `copy_within` below shifts the batch right to make
+        // room for the tail prefix — after that, `batch_buf[..batch_len]`
+        // no longer holds the entries at those offsets.
+        self.absorb_pending_into_chain();
 
         let sector_size = self.sector_size;
         let total = self.tail_sector_len + self.batch_len;
@@ -990,6 +1054,10 @@ impl<E: AppEvent> SectorWriter<E> {
         self.tail_sector_len = new_tail_len;
 
         self.batch_len = 0;
+        #[cfg(feature = "hash-chain")]
+        {
+            self.chain_absorbed = 0;
+        }
         self.last_user_entry_len = 0;
         Ok(())
     }
@@ -1565,6 +1633,82 @@ mod tests {
         let hash_after = writer.chain_hash().expect("chain active");
         // The schedule-free chain advances on every absorbed entry.
         assert_ne!(hash_before, hash_after);
+    }
+
+    /// Entries are absorbed into the chain once per batch, not once per
+    /// entry, so a flush must be invisible to the chain value: the
+    /// pending bytes are already folded in before the flush, and must not
+    /// be folded in a second time by it.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn chain_hash_is_stable_across_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        for i in 1..=3u64 {
+            writer
+                .batch_append_with_ts(&JournalEvent::App(TestEvent(i)), 0, 0, 0)
+                .unwrap();
+        }
+        let pending = writer.chain_hash().expect("chain active");
+        writer.flush_batch_sync().unwrap();
+        assert_eq!(writer.chain_hash(), Some(pending));
+
+        // And a second flush with nothing pending is likewise inert.
+        writer.flush_batch_sync().unwrap();
+        assert_eq!(writer.chain_hash(), Some(pending));
+    }
+
+    /// Every entry handed to the encoder counts, including one still
+    /// unflushed: the value read mid-batch must match what the reader
+    /// independently derives from the on-disk bytes after the flush.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn pending_batch_chain_matches_reader_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        for i in 1..=5u64 {
+            writer
+                .batch_append_with_ts(&JournalEvent::App(TestEvent(i)), 0, 0, 0)
+                .unwrap();
+        }
+        let pending = writer.chain_hash().expect("chain active");
+        writer.flush_batch_sync().unwrap();
+        drop(writer);
+
+        // The reader's chain covers the entries it has consumed, so drain
+        // it before comparing.
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        let mut count = 0;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 5);
+        assert_eq!(reader.chain_hash(), Some(pending));
+    }
+
+    /// A discarded batch still advances the chain. The entries were
+    /// encoded, sequenced, and (on the no-persist path) replicated, so
+    /// dropping the buffer must not drop them from the chain.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn chain_hash_counts_discarded_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        let empty = writer.chain_hash().expect("chain active");
+        writer
+            .batch_append_with_ts(&sample_event(), 0, 0, 0)
+            .unwrap();
+        let encoded = writer.chain_hash().expect("chain active");
+        assert_ne!(empty, encoded);
+
+        writer.discard_batch_buf();
+        assert_eq!(writer.chain_hash(), Some(encoded));
     }
 
     #[cfg(feature = "hash-chain")]

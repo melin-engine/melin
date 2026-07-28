@@ -74,10 +74,28 @@ impl SegmentChain {
     /// Current chain value: the anchor for an empty segment, otherwise
     /// `BLAKE3(absorbed bytes || anchor)`. Non-destructive.
     pub(crate) fn value(&self) -> [u8; 32] {
-        if !self.dirty {
+        self.value_with_pending(&[])
+    }
+
+    /// Chain value as if `pending` had been absorbed first.
+    ///
+    /// Writers append entries to a batch buffer and absorb the whole
+    /// batch in one `update()` at flush time (BLAKE3 only reaches its
+    /// SIMD multi-block path when fed many bytes at once). Between the
+    /// last flush and the next, `pending` holds the encoded-but-not-yet-
+    /// absorbed bytes, and the chain value must still account for them —
+    /// callers read it at fsync publication, snapshots, and rotation,
+    /// which do not all coincide with a flush.
+    ///
+    /// Equivalent to `absorb(pending)` followed by `value()`, but
+    /// non-destructive: the hasher is cloned, so the pending bytes stay
+    /// absorbable exactly once later.
+    pub(crate) fn value_with_pending(&self, pending: &[u8]) -> [u8; 32] {
+        if !self.dirty && pending.is_empty() {
             return self.anchor;
         }
         let mut h = self.hasher.clone();
+        h.update(pending);
         h.update(&self.anchor);
         *h.finalize().as_bytes()
     }
