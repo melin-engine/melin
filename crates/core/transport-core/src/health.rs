@@ -673,6 +673,10 @@ fn detect_request(stream: &mut TcpStream) -> RequestKind {
 /// than omitted, so a stage that was quiet is distinguishable from one
 /// that was never compiled in.
 ///
+/// If the stage inventory ever outgrows `buf`, the body ends with
+/// `# truncated\t<count>` rather than a half-written stage line — the
+/// dump degrades visibly instead of silently.
+///
 /// Format (one line per stage, '\n'-terminated):
 ///
 ///   stage\t<name>\t<samples>\t<min_ns>\t<p50_ns>\t<p90_ns>\t<p99_ns>\t<p99_9_ns>\t<max_ns>
@@ -689,6 +693,14 @@ fn write_stats_dump(buf: &mut [u8]) -> usize {
 
     #[cfg(feature = "latency-trace")]
     {
+        // Room held back so a truncation marker always fits. Every
+        // stage is emitted now (including zero-sample ones), so the
+        // body grows with the stage count rather than with how many
+        // stages happened to record — worth saying so out loud instead
+        // of handing the bench a half-written line.
+        const TRUNCATION_RESERVE: usize = 64;
+        let limit = c.get_ref().len().saturating_sub(TRUNCATION_RESERVE);
+
         let snaps = crate::trace::global_registry().snapshot_all();
         if snaps.is_empty() {
             // Feature on but no stage has registered yet — explicit
@@ -698,10 +710,15 @@ fn write_stats_dump(buf: &mut [u8]) -> usize {
             // row instead.
             let _ = writeln!(c, "# no samples");
         } else {
+            let total = snaps.len();
+            let mut written = 0usize;
             for s in snaps {
-                let _ = writeln!(
-                    c,
-                    "stage\t{name}\t{samples}\t{min}\t{p50}\t{p90}\t{p99}\t{p99_9}\t{max}",
+                // Format first so the length is known before committing
+                // to the buffer; a `write!` straight to the cursor can
+                // stop mid-line. Allocation is fine here — this runs
+                // once per /stats-dump request, not per event.
+                let line = format!(
+                    "stage\t{name}\t{samples}\t{min}\t{p50}\t{p90}\t{p99}\t{p99_9}\t{max}\n",
                     name = s.name,
                     samples = s.samples,
                     min = s.min_ns,
@@ -711,6 +728,16 @@ fn write_stats_dump(buf: &mut [u8]) -> usize {
                     p99_9 = s.p99_9_ns,
                     max = s.max_ns,
                 );
+                if c.position() as usize + line.len() > limit {
+                    break;
+                }
+                // Cannot fail: the bounds check above guarantees room.
+                let _ = c.write_all(line.as_bytes());
+                written += 1;
+            }
+            if written < total {
+                // Best-effort diagnostic; the reserve guarantees room.
+                let _ = writeln!(c, "# truncated\t{}", total - written);
             }
         }
     }
@@ -1615,6 +1642,50 @@ mod tests {
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
+    }
+
+    #[cfg(feature = "latency-trace")]
+    #[test]
+    fn stats_dump_marks_truncation_instead_of_cutting_a_line() {
+        // Every registered stage is emitted now, so the body scales with
+        // the stage inventory. If it ever outgrows the buffer the bench
+        // must see a marker, not a half-written record it would parse as
+        // a real stage. Driven through a deliberately tiny buffer.
+        let mut rec = crate::trace::register_stage("test::stats_dump_truncation");
+        rec.record_ns(1_234);
+        rec.flush();
+
+        // 40 bytes is shorter than any single stage line, so an
+        // unguarded `write!` straight to the cursor stops mid-record —
+        // the exact failure this guards. It is also below the shortest
+        // possible line regardless of how many stages other tests in
+        // this process have registered, so the outcome is deterministic.
+        let mut buf = [0u8; 40];
+        let n = write_stats_dump(&mut buf);
+        let body = std::str::from_utf8(&buf[..n]).expect("ascii body");
+
+        assert!(
+            n <= buf.len(),
+            "wrote {n} bytes into a {}-byte buffer",
+            buf.len()
+        );
+        assert!(
+            body.contains("# truncated\t"),
+            "expected a truncation marker, got: {body:?}"
+        );
+        assert!(
+            body.ends_with('\n'),
+            "body must not end mid-line, got: {body:?}"
+        );
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("stage\t") {
+                assert_eq!(
+                    rest.split('\t').count(),
+                    8,
+                    "emitted stage line is incomplete: {line:?}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "latency-trace")]

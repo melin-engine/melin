@@ -146,11 +146,14 @@ const REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_millis(500
 #[cfg(feature = "latency-trace")]
 pub struct StageRecorder {
     rec: hdrhistogram::sync::Recorder<u64>,
-    /// The registry entry this recorder feeds, kept so [`Self::flush`]
-    /// can mint a replacement `Recorder` without a registry lookup.
-    /// `Arc` because the registry already stores entries behind one and
-    /// recorders outlive nothing in particular — a stage thread may
-    /// hold its recorder for the process lifetime.
+    /// The registry entry this recorder feeds, so [`Self::flush`] can
+    /// mint a replacement `Recorder` without a by-name registry lookup
+    /// (which would take the registry-wide lock, not just this stage's).
+    ///
+    /// `Arc` rather than a borrow because a stage thread typically holds
+    /// its recorder for the process lifetime; the registry stores the
+    /// same entries behind `Arc` already, so this adds a refcount, not
+    /// an allocation.
     entry: std::sync::Arc<StageEntry>,
 }
 
@@ -202,17 +205,27 @@ impl StageRecorder {
             Ok(sync) => self.rec = sync.recorder(),
             Err(std::sync::TryLockError::Poisoned(p)) => self.rec = p.into_inner().recorder(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                // The only contender for this mutex is `snapshot_all`,
-                // which holds it across `refresh_timeout` — and it has
-                // already bumped the phase counter by the time it
-                // blocks. So `idle()` observes the shift and sheds into
-                // the same channel the reader is waiting on, landing in
-                // *this* snapshot rather than the next one. Dropping
-                // the guard immediately rejoins the current phase.
+                // Never wait: the contender that matters is
+                // `snapshot_all`, which holds this mutex across the
+                // whole refresh. Blocking would stall us for the refresh
+                // budget and shed too late to be merged — the bug this
+                // method exists to fix.
                 //
-                // Waiting for the mutex instead would stall this thread
-                // for the full refresh timeout and shed too late to be
-                // merged — the bug this method exists to fix.
+                // `idle()` is the non-blocking substitute. Whether it
+                // recovers anything depends on who we lost the race to:
+                //
+                // - `snapshot_all` past its phase bump — `deactivate`
+                //   sees the shift and sheds into the very channel the
+                //   refresh is waiting on, so the samples land in *this*
+                //   snapshot rather than the next.
+                // - `register`, a sibling recorder's `flush`, or
+                //   `snapshot_all` before its phase bump — no shift is
+                //   pending, so this sheds nothing and the samples roll
+                //   over to the next flush one interval from now. Still
+                //   correct, just one cycle later.
+                //
+                // Dropping the guard immediately rejoins the current
+                // phase either way.
                 drop(self.rec.idle());
             }
         }
@@ -326,8 +339,9 @@ impl StatsRegistry {
     /// by the time we get here — the wait is only a backstop for a
     /// thread that went quiet inside the flush interval.
     ///
-    /// That wait is bounded by a single [`REFRESH_BUDGET`] shared
-    /// across the whole snapshot, not per stage. A dormant recorder
+    /// That wait is bounded by a single `REFRESH_BUDGET` (500 ms)
+    /// shared across the whole snapshot, not per stage — so that is
+    /// also this call's worst-case duration. A dormant recorder
     /// never acknowledges, so a per-stage timeout would multiply by the
     /// stage count — with a dozen-odd stages and every thread idle,
     /// which is exactly the state at end of run, a `/stats-dump` would
@@ -394,6 +408,15 @@ impl StatsRegistry {
 
         for snap in self.snapshot_all() {
             let us = |ns: u64| ns as f64 / 1000.0;
+            if snap.samples == 0 {
+                // Printing the percentile block would show seven
+                // `0.00 µs` rows that read as measurements rather than
+                // as an absence of them.
+                let buf = format!("  {}\n\x20   samples: 0 (never recorded)\n", snap.name);
+                // Best-effort diagnostic output on shutdown.
+                let _ = std::io::stderr().lock().write_all(buf.as_bytes());
+                continue;
+            }
             let buf = format!(
                 "  {name}\n\
                  \x20   samples: {samples}\n\
