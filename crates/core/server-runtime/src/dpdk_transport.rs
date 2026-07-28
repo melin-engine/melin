@@ -239,6 +239,16 @@ pub fn run_dpdk_poll<A: Application>(
     );
     #[cfg(feature = "latency-trace")]
     let mut poll_iter_start = mono_trace_ns();
+    // Paces the recorder flush. The poll thread never idles — it
+    // busy-spins — but it stops *recording* as soon as traffic stops,
+    // which is enough to strand its samples in the thread-local buffer.
+    // Nanoseconds rather than `Instant` so the gate reuses the
+    // `mono_trace_ns` read the poll-iteration histogram already takes.
+    #[cfg(feature = "latency-trace")]
+    let stats_flush_interval_ns =
+        melin_transport_core::trace::IDLE_FLUSH_INTERVAL.as_nanos() as u64;
+    #[cfg(feature = "latency-trace")]
+    let mut last_stats_flush_ns = poll_iter_start;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -638,6 +648,16 @@ pub fn run_dpdk_poll<A: Application>(
                 poll_iter_rec.record_elapsed(poll_iter_start, now);
             }
             poll_iter_start = now;
+
+            // Hand buffered samples to the stats registry so a
+            // /stats-dump taken after traffic stops still sees them.
+            if now.saturating_sub(last_stats_flush_ns) >= stats_flush_interval_ns {
+                last_stats_flush_ns = now;
+                poll_iter_rec.flush();
+                publish_rec.flush();
+                #[cfg(feature = "tick-to-trade")]
+                ingest_rec.flush();
+            }
         }
     }
 }

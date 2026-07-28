@@ -667,7 +667,11 @@ fn detect_request(stream: &mut TcpStream) -> RequestKind {
 }
 
 /// Write the latency-trace stage histograms into `buf` as one
-/// tab-separated record per non-empty stage. Returns bytes written.
+/// tab-separated record per registered stage. Returns bytes written.
+///
+/// Stages that recorded nothing are emitted with `samples` = 0 rather
+/// than omitted, so a stage that was quiet is distinguishable from one
+/// that was never compiled in.
 ///
 /// Format (one line per stage, '\n'-terminated):
 ///
@@ -687,8 +691,11 @@ fn write_stats_dump(buf: &mut [u8]) -> usize {
     {
         let snaps = crate::trace::global_registry().snapshot_all();
         if snaps.is_empty() {
-            // Feature on but no samples yet — explicit empty marker so
-            // the bench doesn't confuse it with a feature-off server.
+            // Feature on but no stage has registered yet — explicit
+            // marker so the bench doesn't confuse it with a feature-off
+            // server. Reached only before the pipeline threads start;
+            // once they have, a quiet stage shows up as a zero-sample
+            // row instead.
             let _ = writeln!(c, "# no samples");
         } else {
             for s in snaps {
@@ -1588,15 +1595,13 @@ mod tests {
         // dump contains a tab-separated record for it.
         // The global registry is shared across tests; we use a unique
         // stage name to avoid collisions with concurrent test runs.
-        // Recorder dropped before the snapshot fetch — see the
-        // SyncHistogram caveat in `crates/core/journal/src/trace.rs` tests.
-        {
-            let mut rec =
-                melin_transport_core::trace::register_stage("test::stats_dump_emit_marker");
-            rec.record_ns(1_500);
-            rec.record_ns(2_500);
-            rec.record_ns(3_500);
-        }
+        // Flushed before the snapshot fetch — see the SyncHistogram
+        // caveat in `crates/core/transport-core/src/trace.rs` tests.
+        let mut rec = crate::trace::register_stage("test::stats_dump_emit_marker");
+        rec.record_ns(1_500);
+        rec.record_ns(2_500);
+        rec.record_ns(3_500);
+        rec.flush();
 
         let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
         let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
@@ -1614,15 +1619,34 @@ mod tests {
 
     #[cfg(feature = "latency-trace")]
     #[test]
+    fn stats_dump_body_emits_zero_sample_stages() {
+        // A stage that registered but recorded nothing must still
+        // appear, so the bench can tell "quiet" from "not compiled in".
+        let _rec = crate::trace::register_stage("test::stats_dump_zero_sample");
+
+        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
+        let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
+
+        assert!(
+            response.contains("stage\ttest::stats_dump_zero_sample\t0\t0\t0\t0\t0\t0\t0"),
+            "expected zero-sample stage record, got: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[cfg(feature = "latency-trace")]
+    #[test]
     fn stats_dump_body_line_format() {
         // Pin the wire contract that phase 3's bench parser will rely
         // on: every non-comment body line is exactly 9 tab-separated
         // fields — `stage`, name, then 7 numeric percentile fields.
         // Recorder dropped before the snapshot fetch — see the
-        // SyncHistogram caveat in `crates/core/journal/src/trace.rs` tests.
+        // SyncHistogram caveat in `crates/core/transport-core/src/trace.rs`
+        // tests.
         {
-            let mut rec =
-                melin_transport_core::trace::register_stage("test::stats_dump_line_format_marker");
+            let mut rec = crate::trace::register_stage("test::stats_dump_line_format_marker");
             rec.record_ns(1_000);
             rec.record_ns(2_000);
             rec.record_ns(3_000);
@@ -1656,26 +1680,6 @@ mod tests {
             f.parse::<u64>()
                 .unwrap_or_else(|_| panic!("field {i} not a u64: {f:?}"));
         }
-
-        shutdown.store(true, Ordering::Relaxed);
-        handle.join().unwrap();
-    }
-
-    #[cfg(feature = "latency-trace")]
-    #[test]
-    fn stats_dump_body_skips_empty_stages() {
-        // A stage with no samples must not appear in the dump.
-        let _empty =
-            melin_transport_core::trace::register_stage("test::stats_dump_empty_stage_marker");
-        // No record_ns calls.
-
-        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
-        let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
-
-        assert!(
-            !response.contains("test::stats_dump_empty_stage_marker"),
-            "empty stage leaked into dump: {response}"
-        );
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();

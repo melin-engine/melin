@@ -32,6 +32,21 @@
 //! same stage simply each hold their own recorder. The API takes
 //! `&mut self` on `record_ns` because `Recorder::record` does — the
 //! local buffer is mutated without synchronization.
+//!
+//! ## Why quiet threads must flush
+//!
+//! A `Recorder` hands its buffered samples to the `SyncHistogram` only
+//! on its *next* `record` call after the reader starts a phase shift.
+//! A thread that stops recording — the response stage once the bench
+//! disconnects, the reader parked in `submit_and_wait` — never reaches
+//! that call, so `refresh` waits for an acknowledgement that never
+//! arrives, times out, and the whole run's samples stay stranded in the
+//! thread-local buffer. `/stats-dump` is normally fetched right after
+//! the workload ends, which is exactly when that happens.
+//!
+//! [`StageRecorder::flush`] forces the handover. Every stage thread
+//! calls it from its idle path on a coarse timer, so a scrape taken
+//! after traffic stops still sees the run's samples.
 
 /// Monotonic timestamp carried through pipeline slots.
 ///
@@ -99,6 +114,25 @@ pub struct StageSnapshot {
     pub max_ns: u64,
 }
 
+/// How often a stage thread should call [`StageRecorder::flush`] from
+/// its idle path.
+///
+/// Short enough that a `/stats-dump` fetched right after the workload
+/// ends sees the run's samples, long enough that the flush cost (a
+/// mutex plus a histogram allocation per recorder) is irrelevant even
+/// on a thread that is idle continuously.
+#[cfg(feature = "latency-trace")]
+pub const IDLE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Total time [`StatsRegistry::snapshot_all`] will spend waiting for
+/// recorders to acknowledge a phase shift, across all stages.
+///
+/// Comfortably above [`IDLE_FLUSH_INTERVAL`] so a thread that went
+/// quiet just before the scrape gets a chance to flush, and low enough
+/// that a `/stats-dump` stays responsive when every thread is idle.
+#[cfg(feature = "latency-trace")]
+const REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A handle for recording samples into a registered stage histogram.
 ///
 /// Owns a per-thread `Recorder` (no Arc, no Mutex on the record path).
@@ -112,6 +146,12 @@ pub struct StageSnapshot {
 #[cfg(feature = "latency-trace")]
 pub struct StageRecorder {
     rec: hdrhistogram::sync::Recorder<u64>,
+    /// The registry entry this recorder feeds, kept so [`Self::flush`]
+    /// can mint a replacement `Recorder` without a registry lookup.
+    /// `Arc` because the registry already stores entries behind one and
+    /// recorders outlive nothing in particular — a stage thread may
+    /// hold its recorder for the process lifetime.
+    entry: std::sync::Arc<StageEntry>,
 }
 
 #[cfg(feature = "latency-trace")]
@@ -119,6 +159,7 @@ impl Clone for StageRecorder {
     fn clone(&self) -> Self {
         Self {
             rec: self.rec.clone(),
+            entry: std::sync::Arc::clone(&self.entry),
         }
     }
 }
@@ -141,6 +182,41 @@ impl StageRecorder {
     pub fn record_elapsed(&mut self, start: MonoTraceInstant, end: MonoTraceInstant) {
         self.record_ns(mono_trace_elapsed_ns(start, end));
     }
+
+    /// Hand this recorder's buffered samples to the `SyncHistogram` so
+    /// the next snapshot sees them.
+    ///
+    /// **Idle path only** — never call this per event. It takes the
+    /// stage mutex and allocates a fresh thread-local histogram. Stage
+    /// threads call it from their no-work branch on a ~100 ms timer;
+    /// see the module docs for why a quiet thread otherwise loses its
+    /// samples entirely.
+    ///
+    /// Replacing the inner `Recorder` is the flush: the old one's
+    /// `Drop` ships its local histogram down the `SyncHistogram`'s
+    /// channel unconditionally, which is the only unconditional
+    /// handover hdrhistogram's API offers. (`Recorder::idle` sheds only
+    /// when a phase shift is already pending.)
+    pub fn flush(&mut self) {
+        match self.entry.sync.try_lock() {
+            Ok(sync) => self.rec = sync.recorder(),
+            Err(std::sync::TryLockError::Poisoned(p)) => self.rec = p.into_inner().recorder(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // The only contender for this mutex is `snapshot_all`,
+                // which holds it across `refresh_timeout` — and it has
+                // already bumped the phase counter by the time it
+                // blocks. So `idle()` observes the shift and sheds into
+                // the same channel the reader is waiting on, landing in
+                // *this* snapshot rather than the next one. Dropping
+                // the guard immediately rejoins the current phase.
+                //
+                // Waiting for the mutex instead would stall this thread
+                // for the full refresh timeout and shed too late to be
+                // merged — the bug this method exists to fix.
+                drop(self.rec.idle());
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "latency-trace"))]
@@ -154,6 +230,9 @@ impl StageRecorder {
 
     #[inline]
     pub fn record_elapsed(&mut self, _start: MonoTraceInstant, _end: MonoTraceInstant) {}
+
+    #[inline]
+    pub fn flush(&mut self) {}
 }
 
 /// One stage's storage in the registry: a stable name + the
@@ -200,12 +279,16 @@ impl StatsRegistry {
         };
         for existing in entries.iter() {
             if existing.name == name {
-                let sync = match existing.sync.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
+                let rec = {
+                    let sync = match existing.sync.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    sync.recorder()
                 };
                 return StageRecorder {
-                    rec: sync.recorder(),
+                    rec,
+                    entry: std::sync::Arc::clone(existing),
                 };
             }
         }
@@ -216,35 +299,52 @@ impl StatsRegistry {
             .expect("valid histogram bounds");
         let sync: hdrhistogram::sync::SyncHistogram<u64> = hist.into();
         let recorder = sync.recorder();
-        entries.push(std::sync::Arc::new(StageEntry {
+        let entry = std::sync::Arc::new(StageEntry {
             name,
             sync: std::sync::Mutex::new(sync),
-        }));
-        StageRecorder { rec: recorder }
+        });
+        entries.push(std::sync::Arc::clone(&entry));
+        StageRecorder {
+            rec: recorder,
+            entry,
+        }
     }
 
-    /// Snapshot every registered stage. Stages with zero samples are
-    /// omitted from the result.
+    /// Snapshot every registered stage, including stages that hold no
+    /// samples — those come back with `samples == 0` and zeroed
+    /// percentiles.
     ///
-    /// Refresh waits up to 500 ms for each recorder to acknowledge the
-    /// phase shift via its next `record` call. The bench's `/stats-dump`
-    /// fetch typically happens immediately after the workload completes
-    /// — at which point the stage threads have just gone idle and may
-    /// not record again for hundreds of milliseconds (busy-spin, no
-    /// inbound traffic). A short 10 ms timeout missed those tail
-    /// records; 500 ms is generous enough to catch stragglers from
-    /// heartbeats, scheduler ticks, or one-off control messages while
-    /// still bounding the dump's worst-case wall time.
+    /// Zero-sample stages are reported rather than dropped so a stage
+    /// that registered but produced nothing is distinguishable from one
+    /// that was never compiled in. Silently omitting them made a
+    /// missing stage look like a build-configuration problem.
     ///
-    /// Recorders that stay fully dormant past the timeout have their
-    /// last samples skipped (rolled over to the next snapshot when the
-    /// recorder records again). Worst case the bench gets slightly
-    /// stale data; never wrong, never hung.
+    /// Refresh waits for each recorder to acknowledge the phase shift
+    /// via its next `record` call. Stage threads flush explicitly from
+    /// their idle paths (see [`StageRecorder::flush`]), so a recorder
+    /// that has gone quiet has normally already handed its samples over
+    /// by the time we get here — the wait is only a backstop for a
+    /// thread that went quiet inside the flush interval.
+    ///
+    /// That wait is bounded by a single [`REFRESH_BUDGET`] shared
+    /// across the whole snapshot, not per stage. A dormant recorder
+    /// never acknowledges, so a per-stage timeout would multiply by the
+    /// stage count — with a dozen-odd stages and every thread idle,
+    /// which is exactly the state at end of run, a `/stats-dump` would
+    /// block for seconds. Stages reached after the budget is spent
+    /// still merge everything already in the channel (refresh drains it
+    /// before waiting), so the flush is what keeps this lossless and
+    /// the budget only bounds how long we hope for a straggler.
+    ///
+    /// A recorder still dormant past the budget has its pending samples
+    /// rolled over into the next snapshot. Worst case the data is
+    /// slightly stale; never wrong, never hung.
     pub fn snapshot_all(&self) -> Vec<StageSnapshot> {
         let entries = match self.entries.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let deadline = std::time::Instant::now() + REFRESH_BUDGET;
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries.iter() {
             let mut sync = match entry.sync.lock() {
@@ -252,11 +352,23 @@ impl StatsRegistry {
                 Err(poisoned) => poisoned.into_inner(),
             };
             // Pull pending samples from all recorders into the main
-            // histogram. Bounded wait so an idle recorder can't hang
-            // a /stats-dump request — see the doc on `snapshot_all`
-            // for why 500 ms (vs e.g. 10 ms).
-            sync.refresh_timeout(std::time::Duration::from_millis(500));
+            // histogram. `saturating_duration_since` yields ZERO once
+            // the budget is spent, which still performs the drain — see
+            // the doc on `snapshot_all`.
+            sync.refresh_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
             if sync.is_empty() {
+                // Percentile queries on an empty histogram are defined
+                // but meaningless; report explicit zeros instead.
+                out.push(StageSnapshot {
+                    name: entry.name,
+                    samples: 0,
+                    min_ns: 0,
+                    p50_ns: 0,
+                    p90_ns: 0,
+                    p99_ns: 0,
+                    p99_9_ns: 0,
+                    max_ns: 0,
+                });
                 continue;
             }
             out.push(StageSnapshot {
@@ -353,11 +465,10 @@ mod tests {
     // until it times out, at which point its pending samples are
     // still in its local buffer — invisible to the snapshot.
     //
-    // Production stage threads record continuously, so refresh
-    // completes well below the timeout. Tests work around this by
-    // dropping recorders before snapshot: the Recorder Drop impl
-    // ships pending samples to the SyncHistogram via an unbounded
-    // channel, which the next refresh picks up.
+    // `StageRecorder::flush` is the fix for that; tests that keep a
+    // recorder alive across a snapshot must call it first. Dropping
+    // the recorder works too (the Drop impl ships pending samples via
+    // the same channel), which is what the older tests below rely on.
 
     #[test]
     fn registry_register_returns_recorder_that_records() {
@@ -395,7 +506,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_omits_empty_stages() {
+    fn snapshot_reports_empty_stages_with_zero_samples() {
+        // A registered-but-silent stage must stay visible: dropping it
+        // makes a stage that recorded nothing indistinguishable from a
+        // stage that was never compiled in.
         let reg = StatsRegistry::new();
         let _empty = reg.register("test::empty");
         {
@@ -404,8 +518,200 @@ mod tests {
         }
 
         let snaps = reg.snapshot_all();
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].name, "test::used");
+        assert_eq!(snaps.len(), 2);
+
+        let empty = snaps
+            .iter()
+            .find(|s| s.name == "test::empty")
+            .expect("empty stage must still be reported");
+        assert_eq!(empty.samples, 0);
+        assert_eq!(empty.min_ns, 0);
+        assert_eq!(empty.p99_ns, 0);
+        assert_eq!(empty.max_ns, 0);
+
+        let used = snaps
+            .iter()
+            .find(|s| s.name == "test::used")
+            .expect("used stage missing");
+        assert_eq!(used.samples, 1);
+    }
+
+    #[test]
+    fn flush_recovers_samples_from_a_dormant_recorder() {
+        // The regression test for the stranded-sample bug: a thread
+        // records, goes quiet without dropping its recorder, and a
+        // snapshot is taken. Without the flush the stage is absent
+        // from the dump entirely.
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let reg = Arc::new(StatsRegistry::new());
+        // Channels rather than a barrier: the worker must be *parked*,
+        // not spinning, when the snapshot runs — spinning would let it
+        // ack the phase shift and mask the bug.
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let worker_reg = Arc::clone(&reg);
+        let worker = thread::spawn(move || {
+            let mut rec = worker_reg.register("test::dormant");
+            for i in 0..1_000u64 {
+                rec.record_ns(1_000 + i);
+            }
+            rec.flush();
+            done_tx.send(()).expect("main thread alive");
+            // Park holding the recorder — no further records, so no
+            // phase-shift acknowledgement will ever come.
+            go_rx.recv().expect("main thread alive");
+            drop(rec);
+        });
+
+        done_rx.recv().expect("worker recorded");
+        let snaps = reg.snapshot_all();
+
+        go_tx.send(()).expect("worker alive");
+        worker.join().expect("worker did not panic");
+
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::dormant")
+            .expect("dormant stage missing from snapshot");
+        assert_eq!(stage.samples, 1_000);
+        assert!(stage.min_ns >= 1_000);
+    }
+
+    #[test]
+    fn flush_is_idempotent_and_loses_nothing() {
+        let reg = StatsRegistry::new();
+        let mut rec = reg.register("test::double_flush");
+        rec.record_ns(10_000);
+        rec.record_ns(20_000);
+        rec.flush();
+        // Second flush sheds an empty local histogram — merging it must
+        // neither duplicate nor drop the first flush's samples.
+        rec.flush();
+
+        let snaps = reg.snapshot_all();
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::double_flush")
+            .expect("stage missing");
+        assert_eq!(stage.samples, 2);
+
+        // Recording again after a flush keeps working.
+        rec.record_ns(30_000);
+        rec.flush();
+        let snaps = reg.snapshot_all();
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::double_flush")
+            .expect("stage missing");
+        assert_eq!(stage.samples, 3);
+    }
+
+    #[test]
+    fn snapshot_refresh_budget_is_shared_across_stages() {
+        // Every recorder here is dormant, so none will ever acknowledge
+        // the phase shift and each stage burns whatever timeout it is
+        // given. A per-stage budget would make the dump take
+        // stages × REFRESH_BUDGET — seconds, at the real stage count,
+        // in exactly the all-idle state a post-run scrape hits.
+        use std::time::Instant;
+
+        const STAGES: usize = 6;
+        let reg = StatsRegistry::new();
+        // Held for the whole test: a dropped recorder sheds and
+        // acknowledges, which is what we are deliberately preventing.
+        let mut recorders = Vec::with_capacity(STAGES);
+        for name in [
+            "test::budget_0",
+            "test::budget_1",
+            "test::budget_2",
+            "test::budget_3",
+            "test::budget_4",
+            "test::budget_5",
+        ] {
+            let mut rec = reg.register(name);
+            rec.record_ns(7_000);
+            rec.flush();
+            recorders.push(rec);
+        }
+
+        let start = Instant::now();
+        let snaps = reg.snapshot_all();
+        let elapsed = start.elapsed();
+
+        // One budget plus slack, not STAGES budgets.
+        assert!(
+            elapsed < REFRESH_BUDGET * 2,
+            "snapshot took {elapsed:?} for {STAGES} dormant stages; \
+             budget is {REFRESH_BUDGET:?} shared across all of them"
+        );
+
+        // Bounding the wait must not cost samples — the flush already
+        // delivered them, and refresh drains the channel before waiting.
+        for name in ["test::budget_0", "test::budget_5"] {
+            let stage = snaps
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from snapshot"));
+            assert_eq!(stage.samples, 1, "{name} lost its sample to the budget");
+        }
+    }
+
+    #[test]
+    fn flush_does_not_block_on_a_contended_stage_mutex() {
+        // `snapshot_all` holds the stage mutex across a 500 ms refresh.
+        // A flush landing in that window must take the `idle()` path —
+        // return promptly *and* still get its samples merged into the
+        // snapshot that is in flight, not the one after it.
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Instant;
+
+        let reg = Arc::new(StatsRegistry::new());
+        let (recorded_tx, recorded_rx) = mpsc::channel::<()>();
+        let (elapsed_tx, elapsed_rx) = mpsc::channel::<std::time::Duration>();
+
+        let worker_reg = Arc::clone(&reg);
+        let worker = thread::spawn(move || {
+            let mut rec = worker_reg.register("test::contended");
+            rec.record_ns(4_000);
+            recorded_tx.send(()).expect("main thread alive");
+            // Let the snapshot get inside `refresh_timeout` and take
+            // the mutex before we flush against it.
+            thread::sleep(std::time::Duration::from_millis(50));
+            let start = Instant::now();
+            rec.flush();
+            elapsed_tx.send(start.elapsed()).expect("main thread alive");
+            // Hold the recorder so the samples can only have arrived
+            // via the flush, never via Drop.
+            thread::park();
+            drop(rec);
+        });
+
+        recorded_rx.recv().expect("worker recorded");
+        let snaps = reg.snapshot_all();
+
+        let flush_took = elapsed_rx.recv().expect("worker flushed");
+        assert!(
+            flush_took < std::time::Duration::from_millis(400),
+            "flush blocked on the refresh instead of taking the idle path: {flush_took:?}"
+        );
+
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::contended")
+            .expect("contended stage missing from snapshot");
+        assert_eq!(
+            stage.samples, 1,
+            "flush shed too late to be merged into the in-flight refresh"
+        );
+
+        worker.thread().unpark();
+        worker.join().expect("worker did not panic");
     }
 
     #[test]

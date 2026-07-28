@@ -361,6 +361,11 @@ fn reader_loop<A: Application, R: AsRawFd>(
     #[cfg(feature = "tick-to-trade")]
     let mut ingest_rec =
         melin_transport_core::trace::register_stage("reader: ingest (recv_ts → publish complete)");
+    // Paces the recorder flush at the tail of each loop iteration. This
+    // thread parks in `submit_and_wait` when there is no traffic, so
+    // without an explicit flush its samples never reach the registry.
+    #[cfg(feature = "latency-trace")]
+    let mut last_stats_flush = Instant::now();
 
     // Coarse gate for timeout scanning — avoids scanning on every
     // submit_and_wait return during high throughput.
@@ -681,6 +686,21 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     let _ = control_tx.send(ControlEvent::Disconnected { connection_id });
                 }
             }
+        }
+
+        // Hand buffered latency samples to the stats registry before
+        // parking in `submit_and_wait` at the top of the next
+        // iteration — once traffic stops this thread can sleep in the
+        // kernel indefinitely, which is precisely when the bench
+        // scrapes /stats-dump. Reuses the per-batch clock read.
+        #[cfg(feature = "latency-trace")]
+        if batch_now.duration_since(last_stats_flush)
+            >= melin_transport_core::trace::IDLE_FLUSH_INTERVAL
+        {
+            last_stats_flush = batch_now;
+            publish_rec.flush();
+            #[cfg(feature = "tick-to-trade")]
+            ingest_rec.flush();
         }
     }
 

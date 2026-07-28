@@ -748,6 +748,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         #[cfg(feature = "latency-trace")]
         let mut batch_rec =
             crate::trace::register_stage("journal: batch processing (write + sync)");
+        // Paces the idle-path recorder flush. See `trace::StageRecorder::flush`.
+        #[cfg(feature = "latency-trace")]
+        let mut stats_flush_timer = melin_app::amortized_timer::AmortizedTimer::new();
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -934,6 +937,22 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     self.utilization.busy.store(busy_count, Ordering::Relaxed);
                     self.utilization.idle.store(idle_count, Ordering::Relaxed);
                     self.apply_stream_marks(true)?;
+                }
+                // Hand buffered latency samples to the stats registry
+                // while quiesced — a recorder that stops recording keeps
+                // its samples thread-local and they never reach a
+                // snapshot. `AmortizedTimer` keeps the clock read off
+                // the spin path.
+                #[cfg(feature = "latency-trace")]
+                if stats_flush_timer
+                    .tick(
+                        crate::trace::IDLE_FLUSH_INTERVAL,
+                        self.busy_spin || idle_spins < 1000,
+                    )
+                    .is_some()
+                {
+                    wakeup_rec.flush();
+                    batch_rec.flush();
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
@@ -2491,6 +2510,9 @@ impl<A: Application> MatchingStage<A> {
             crate::trace::register_stage("matching: disruptor wakeup (publish → matching consume)");
         #[cfg(feature = "latency-trace")]
         let mut execute_rec = crate::trace::register_stage("matching: execute (process_event)");
+        // Paces the idle-path recorder flush. See `trace::StageRecorder::flush`.
+        #[cfg(feature = "latency-trace")]
+        let mut stats_flush_timer = melin_app::amortized_timer::AmortizedTimer::new();
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2521,6 +2543,19 @@ impl<A: Application> MatchingStage<A> {
                 if idle_count.is_multiple_of(1024) {
                     self.utilization.busy.store(busy_count, Ordering::Relaxed);
                     self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                }
+                // Hand buffered latency samples to the stats registry
+                // while idle — see the journal stage for why.
+                #[cfg(feature = "latency-trace")]
+                if stats_flush_timer
+                    .tick(
+                        crate::trace::IDLE_FLUSH_INTERVAL,
+                        self.busy_spin || idle_spins < 1000,
+                    )
+                    .is_some()
+                {
+                    wakeup_rec.flush();
+                    execute_rec.flush();
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
                 continue;

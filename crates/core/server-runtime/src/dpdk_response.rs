@@ -212,6 +212,9 @@ pub fn run<A: Application>(
     );
     #[cfg(feature = "tick-to-trade")]
     let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
+    // Paces the idle-path recorder flush — see `response::run`.
+    #[cfg(feature = "latency-trace")]
+    let mut last_stats_flush = Instant::now();
 
     loop {
         // Observe runtime mode swaps from the admin `DURABILITY`
@@ -333,6 +336,23 @@ pub fn run<A: Application>(
                         DEGRADED_LOG_INTERVAL,
                     );
                     cached_durable_pos = status.durable_pos;
+                }
+
+                // Hand buffered latency samples to the stats registry
+                // while idle. Reuses the policy check's clock read —
+                // see `response::run` for why this must happen at all.
+                #[cfg(feature = "latency-trace")]
+                if now_ts.duration_since(last_stats_flush) >= trace::IDLE_FLUSH_INTERVAL {
+                    last_stats_flush = now_ts;
+                    spsc_rec.flush();
+                    dispatch_rec.flush();
+                    server_e2e_rec.flush();
+                    #[cfg(feature = "tick-to-trade")]
+                    {
+                        journal_wait_rec.flush();
+                        replica_wait_rec.flush();
+                        encode_rec.flush();
+                    }
                 }
             }
 

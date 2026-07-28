@@ -41,6 +41,39 @@ type Writer = SectorWriter<TestEvent>;
 type TestInput = InputSlot<TestEvent>;
 type TestOutput = OutputSlot<TestReport, TestQuery>;
 
+/// Wall-clock budget for a test thread waiting on pipeline output.
+///
+/// Generous because these tests run concurrently with the rest of the
+/// suite, each spawning busy-spinning stage threads, so the machine is
+/// heavily oversubscribed.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Back-off for a test thread polling a pipeline output ring. Panics
+/// once [`DRAIN_TIMEOUT`] of wall time has passed since `start`.
+///
+/// Spins briefly, then **yields**. A pure `spin_loop()` wait starves
+/// the very stage thread it is waiting on when the suite oversubscribes
+/// the CPU, and a spin-*count* budget then runs out without the
+/// pipeline ever having been scheduled — which showed up as flaky
+/// "timeout draining outputs" failures under `--features latency-trace`,
+/// where the stages do more work per event.
+///
+/// Takes `&mut u32` rather than owning the counter so the spin/yield
+/// switchover survives across loop iterations.
+#[track_caller]
+fn drain_backoff(spins: &mut u32, start: std::time::Instant, what: &str) {
+    assert!(
+        start.elapsed() < DRAIN_TIMEOUT,
+        "timeout after {DRAIN_TIMEOUT:?} {what}"
+    );
+    if *spins < 1000 {
+        *spins += 1;
+        std::hint::spin_loop();
+    } else {
+        std::thread::yield_now();
+    }
+}
+
 /// A standalone durable-wire-seq handle for matching-stage-only tests
 /// (nothing publishes into it; the stage reads it once per batch).
 fn dummy_durable_cursor() -> DurableWireSeqCursor {
@@ -169,16 +202,13 @@ fn matching_stage_processes_events() {
 
     let handle = std::thread::spawn(move || stage.run(&shutdown2));
 
-    let mut attempts = 0;
+    let mut spins = 0u32;
+    let drain_start = std::time::Instant::now();
     let output = loop {
         if let Some((_, slot)) = output_consumer.try_consume() {
             break slot;
         }
-        attempts += 1;
-        if attempts > 1_000_000 {
-            panic!("timeout waiting for output");
-        }
-        std::hint::spin_loop();
+        drain_backoff(&mut spins, drain_start, "waiting for output");
     };
 
     assert_eq!(output.connection_id, 42);
@@ -294,14 +324,13 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     // Drain six output slots — one per input event under the
     // connection-id-1 invariant above.
     let mut outputs: Vec<TestOutput> = Vec::with_capacity(6);
-    let mut spins = 0u64;
+    let mut spins = 0u32;
+    let drain_start = std::time::Instant::now();
     while outputs.len() < 6 {
         if let Some((_, slot)) = output_consumer.try_consume() {
             outputs.push(slot);
         } else {
-            spins += 1;
-            assert!(spins < 10_000_000, "timeout draining outputs");
-            std::hint::spin_loop();
+            drain_backoff(&mut spins, drain_start, "draining outputs");
         }
     }
 
@@ -464,14 +493,13 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     // seqs. A change here means the allocator/wire rule moved — update
     // only in lockstep with the journal stage's allocation rule.
     let mut outputs: Vec<TestOutput> = Vec::with_capacity(6);
-    let mut spins = 0u64;
+    let mut spins = 0u32;
+    let drain_start = std::time::Instant::now();
     while outputs.len() < 6 {
         if let Some((_, slot)) = output_consumer.try_consume() {
             outputs.push(slot);
         } else {
-            spins += 1;
-            assert!(spins < 10_000_000, "timeout draining outputs");
-            std::hint::spin_loop();
+            drain_backoff(&mut spins, drain_start, "draining outputs");
         }
     }
     let wire_seqs: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
@@ -667,14 +695,13 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     input_producer.publish(make_slot(JournalEvent::Tick { now_ns: 1 }));
 
     let mut outputs: Vec<TestOutput> = Vec::with_capacity(3);
-    let mut spins = 0u64;
+    let mut spins = 0u32;
+    let drain_start = std::time::Instant::now();
     while outputs.len() < 3 {
         if let Some((_, slot)) = output_consumer.try_consume() {
             outputs.push(slot);
         } else {
-            spins += 1;
-            assert!(spins < 10_000_000, "timeout draining outputs");
-            std::hint::spin_loop();
+            drain_backoff(&mut spins, drain_start, "draining outputs");
         }
     }
     let wire_seqs: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
@@ -2703,16 +2730,19 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     }
 
     fn drain_query(output_consumer: &mut ring::Consumer<TestOutput>) -> TestQuery {
-        let mut spins = 0u64;
+        let mut spins = 0u32;
+        let drain_start = std::time::Instant::now();
         loop {
             if let Some((_, out_slot)) = output_consumer.try_consume() {
                 if let OutputPayload::QueryResponse(q) = out_slot.payload {
                     return q;
                 }
             } else {
-                spins += 1;
-                assert!(spins < 100_000_000, "timeout draining query response");
-                std::hint::spin_loop();
+                crate::pipeline_tests::drain_backoff(
+                    &mut spins,
+                    drain_start,
+                    "draining query response",
+                );
             }
         }
     }

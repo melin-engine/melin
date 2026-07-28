@@ -265,6 +265,11 @@ pub fn run<A: Application>(
     let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
     #[cfg(feature = "tick-to-trade")]
     let mut egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
+    // Paces the idle-path recorder flush. Without it, every sample this
+    // thread recorded stays in its thread-local buffer once traffic
+    // stops — which is exactly when the bench scrapes /stats-dump.
+    #[cfg(feature = "latency-trace")]
+    let mut last_stats_flush = Instant::now();
 
     // Track connections with buffered (unflushed) writes across batches.
     let mut dirty_connections: HashSet<u64> = HashSet::new();
@@ -479,6 +484,25 @@ pub fn run<A: Application>(
                     // Cache the position so the next batch's gate sees a
                     // fresh value rather than spinning from a stale cache.
                     cached_durable_pos = status.durable_pos;
+                }
+
+                // Hand buffered latency samples to the stats registry
+                // while we have nothing better to do. Reuses the policy
+                // check's clock read, so the spin path picks up no
+                // extra `clock_gettime`.
+                #[cfg(feature = "latency-trace")]
+                if now_ts.duration_since(last_stats_flush) >= trace::IDLE_FLUSH_INTERVAL {
+                    last_stats_flush = now_ts;
+                    spsc_rec.flush();
+                    dispatch_rec.flush();
+                    server_e2e_rec.flush();
+                    #[cfg(feature = "tick-to-trade")]
+                    {
+                        journal_wait_rec.flush();
+                        replica_wait_rec.flush();
+                        encode_rec.flush();
+                        egress_rec.flush();
+                    }
                 }
             }
 
