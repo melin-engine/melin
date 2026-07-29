@@ -271,7 +271,8 @@ pub fn run<A: Application>(
     #[cfg(feature = "latency-trace")]
     let mut last_stats_flush = Instant::now();
 
-    // Server-side end-to-end samples awaiting a flush.
+    // Server-side end-to-end samples awaiting a flush, tagged with the
+    // connection whose bytes they measure.
     //
     // The stage encodes into `send_buf` and hands the bytes to the
     // kernel later, so closing the sample at encode time would omit
@@ -282,15 +283,30 @@ pub fn run<A: Application>(
     // stage name claims and what the DPDK path already records (it
     // samples after `tx_producers.flush()`).
     //
-    // `Vec` rather than a per-connection map: samples are only ever
-    // pushed and then drained wholesale, order is irrelevant, and a flat
-    // append is the cheapest thing that does that. Length is bounded by
-    // the responses encoded between two flushes.
+    // The connection id is what lets a connection dropped without a
+    // flush have its samples thrown away rather than closed — see
+    // `discard_e2e_samples`. Two rules keep the queue honest, and every
+    // mutation of `dirty_connections` obeys one of them:
+    //
+    // - a clear-by-flush closes the queue (`close_e2e_samples`),
+    // - a removal-by-drop discards that connection's entries
+    //   (`discard_e2e_samples`).
+    //
+    // Together they give the invariant "queue non-empty implies some
+    // connection is dirty", which is what makes the flush sites
+    // sufficient drain points.
+    //
+    // `Vec` rather than a per-connection map: entries are appended and
+    // then walked wholesale, order is irrelevant, and the dropped-
+    // connection lists they are matched against are almost always empty.
+    // A flat append is the cheapest thing that does that. Capacity is a
+    // starting point, not a bound — under saturation the output ring
+    // never empties, so the queue grows until something forces a flush.
     //
     // Only compiled under `latency-trace`; production builds carry
     // neither the buffer nor the pushes.
     #[cfg(feature = "latency-trace")]
-    let mut pending_e2e: Vec<trace::MonoTraceInstant> = Vec::with_capacity(MAX_BATCH);
+    let mut pending_e2e: Vec<(u64, trace::MonoTraceInstant)> = Vec::with_capacity(MAX_BATCH);
 
     // Track connections with buffered (unflushed) writes across batches.
     let mut dirty_connections: HashSet<u64> = HashSet::new();
@@ -390,12 +406,7 @@ pub fn run<A: Application>(
                     &mut cqes,
                 );
                 #[cfg(feature = "latency-trace")]
-                {
-                    let flushed_at = trace::mono_trace_ns();
-                    for recv_ts in pending_e2e.drain(..) {
-                        server_e2e_rec.record_elapsed(recv_ts, flushed_at);
-                    }
-                }
+                close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
                 dirty_connections.clear();
             }
             utilization.busy.store(busy_count, Ordering::Relaxed);
@@ -428,6 +439,11 @@ pub fn run<A: Application>(
                 ControlEvent::Disconnected { connection_id } => {
                     connections.remove(&connection_id);
                     dirty_connections.remove(&connection_id);
+                    // Anything this connection had buffered goes with
+                    // it, so its queued samples measure bytes that will
+                    // never be sent.
+                    #[cfg(feature = "latency-trace")]
+                    discard_e2e_samples(&mut pending_e2e, &[connection_id]);
                 }
             }
         }
@@ -452,12 +468,7 @@ pub fn run<A: Application>(
                 #[cfg(feature = "tick-to-trade")]
                 egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
                 #[cfg(feature = "latency-trace")]
-                {
-                    let flushed_at = trace::mono_trace_ns();
-                    for recv_ts in pending_e2e.drain(..) {
-                        server_e2e_rec.record_elapsed(recv_ts, flushed_at);
-                    }
-                }
+                close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
                 for conn_id in to_remove.drain(..) {
                     connections.remove(&conn_id);
                 }
@@ -467,9 +478,12 @@ pub fn run<A: Application>(
             // Send heartbeats to idle connections. Only checked during
             // idle periods (SPSC empty) to avoid overhead on the hot path.
             //
-            // No end-to-end samples to close here: a queued sample always
-            // accompanies a dirty connection, and the flush above cleared
-            // both, so anything dirty at this point is heartbeat frames.
+            // No end-to-end samples to close here: the sample queue's
+            // invariant is that a queued entry implies a dirty
+            // connection, so the flush above — which closes the queue
+            // whenever anything was dirty — leaves it empty. Anything
+            // dirtied from here on is heartbeat frames, which carry no
+            // samples.
             if let Some(interval) = heartbeat_interval {
                 let now = Instant::now();
                 // Coarse gate: only scan at most once per second.
@@ -667,12 +681,7 @@ pub fn run<A: Application>(
                     #[cfg(feature = "tick-to-trade")]
                     egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
                     #[cfg(feature = "latency-trace")]
-                    {
-                        let flushed_at = trace::mono_trace_ns();
-                        for recv_ts in pending_e2e.drain(..) {
-                            server_e2e_rec.record_elapsed(recv_ts, flushed_at);
-                        }
-                    }
+                    close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
                     // This slot and later ones addressed to a dropped
                     // connection are skipped by the
                     // `connections.get_mut` lookup below, so removing
@@ -884,14 +893,20 @@ pub fn run<A: Application>(
                     // bytes.
                     #[cfg(feature = "latency-trace")]
                     if matches!(outcome, AppendOutcome::Continue) {
-                        pending_e2e.push(slot.recv_ts);
+                        pending_e2e.push((slot.connection_id, slot.recv_ts));
                     }
                     let _ = outcome;
                 }
             }
         }
 
-        // Remove connections that exceeded the send buffer limit.
+        // Remove connections that exceeded the send buffer limit. Like
+        // the disconnect handler, this un-dirties a connection without
+        // flushing it, so it has to discard that connection's queued
+        // samples too — otherwise they outlive the bytes they measure
+        // and land on some later, unrelated flush.
+        #[cfg(feature = "latency-trace")]
+        discard_e2e_samples(&mut pending_e2e, &to_remove);
         for conn_id in to_remove.drain(..) {
             connections.remove(&conn_id);
             dirty_connections.remove(&conn_id);
@@ -923,6 +938,56 @@ pub fn run<A: Application>(
         #[cfg(feature = "latency-trace")]
         dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
     }
+}
+
+/// Close every queued server-side end-to-end sample against the flush
+/// that just completed. Call immediately after `flush_sends`.
+///
+/// Closes the whole queue unconditionally, including entries for a
+/// connection the flush then dropped on a send error. That is
+/// deliberate: the stage measures "reader recv → response flush", which
+/// ends when the bytes are handed to the kernel, not when the peer
+/// acknowledges them. A failed SEND still produces a sample whose
+/// duration is the real one for everything this stage controls.
+/// Contrast [`discard_e2e_samples`], where no flush happens at all.
+///
+/// One clock read serves the whole queue: the samples all end at the
+/// same flush, so reading per entry would only measure the drain loop.
+#[cfg(feature = "latency-trace")]
+fn close_e2e_samples(
+    pending: &mut Vec<(u64, trace::MonoTraceInstant)>,
+    rec: &mut trace::StageRecorder,
+) {
+    let flushed_at = trace::mono_trace_ns();
+    for (_, recv_ts) in pending.drain(..) {
+        rec.record_elapsed(recv_ts, flushed_at);
+    }
+}
+
+/// Drop queued samples belonging to connections going away *without* a
+/// flush — the disconnect handler and the send-buffer-overflow drain.
+///
+/// Their buffered bytes are discarded along with the connection, so
+/// there is no flush to close the samples against and nothing to
+/// measure. Left queued, they would instead be timed against some later,
+/// unrelated connection's flush: a millisecond-scale phantom in a
+/// microsecond histogram, landing squarely in the tail this stage exists
+/// to report.
+///
+/// Not to be used after `flush_sends`. `dropped` there can hold a
+/// connection queued by an earlier append overflow whose buffered bytes
+/// the flush nonetheless shipped — discarding would lose a legitimate
+/// sample.
+///
+/// Linear scan per entry, but `dropped` is empty on every iteration that
+/// loses no connection, which is essentially all of them, and the early
+/// return keeps that case free.
+#[cfg(feature = "latency-trace")]
+fn discard_e2e_samples(pending: &mut Vec<(u64, trace::MonoTraceInstant)>, dropped: &[u64]) {
+    if dropped.is_empty() {
+        return;
+    }
+    pending.retain(|(conn_id, _)| !dropped.contains(conn_id));
 }
 
 /// Whether this slot must wait on the durability gate before its
@@ -1551,6 +1616,42 @@ mod tests {
     };
     use crate::durability_policy::{Clause, Level, Policy};
     use crate::replication::ReplicationMetrics;
+
+    /// Queued end-to-end samples survive a flush that dropped nothing,
+    /// and are closed (drained) by it.
+    #[cfg(feature = "latency-trace")]
+    #[test]
+    fn e2e_samples_survive_until_a_flush_closes_them() {
+        let mut pending = vec![(1u64, 10u64), (2, 20), (1, 30)];
+        super::discard_e2e_samples(&mut pending, &[]);
+        assert_eq!(pending.len(), 3, "an empty drop list must lose nothing");
+
+        let mut rec = melin_transport_core::trace::register_stage("test::response_e2e_close");
+        super::close_e2e_samples(&mut pending, &mut rec);
+        assert!(pending.is_empty(), "a flush closes the whole queue");
+    }
+
+    /// The defect this pairing exists to prevent: a dropped connection's
+    /// buffered bytes are discarded with it, so its samples must not
+    /// survive to be timed against some later connection's flush.
+    #[cfg(feature = "latency-trace")]
+    #[test]
+    fn e2e_samples_for_a_dropped_connection_are_discarded() {
+        let mut pending = vec![(1u64, 10u64), (2, 20), (1, 30), (3, 40)];
+        super::discard_e2e_samples(&mut pending, &[1, 3]);
+        assert_eq!(
+            pending,
+            vec![(2, 20)],
+            "only the surviving connection's samples remain"
+        );
+
+        // Dropping the last live connection empties the queue, which is
+        // what restores "queue non-empty implies something is dirty" —
+        // the invariant the flush sites rely on to be sufficient drain
+        // points.
+        super::discard_e2e_samples(&mut pending, &[2]);
+        assert!(pending.is_empty());
+    }
 
     /// Output slot carrying only the fields the gate decision reads.
     /// `()` for the report/query types keeps the fixture independent of
