@@ -278,14 +278,18 @@ The response stage runs on a dedicated OS thread and is the final stage in the p
 
 Before sending any response, the response stage verifies that the corresponding event is durable:
 
-1. For each batch consumed from the SPSC, find the maximum `input_seq` across all slots.
-2. Determine the durable position:
+1. Each response carries the sequence number the event was assigned in the journal, which is the same number replicas report progress against.
+2. The durable position is derived from the configured mode:
    - **Quorum mode** (default, 2 replicas connected): `replication_cursor` — both replicas have acked, NVMe fsync is off the critical path.
    - **Degraded/standalone mode** (0-1 replicas): `min(journal_cursor, replication_cursor)` — local fsync is required.
-3. If the durable position is less than `max_seq + 1`, spin-wait until it advances.
-4. Once confirmed, encode and send all responses in the batch.
+3. If the durable position has not reached that response's own sequence number, spin-wait until it does.
+4. Once confirmed, the response is encoded and sent.
 
-The journal cursor value is cached across batches to avoid redundant atomic loads when the journal is ahead of the response stage.
+The check is made **per response**, not once per batch. A response is released as soon as its own event is durable, so a request does not wait on the durability of unrelated requests that happened to be processed alongside it. Since the durable position is a high-water mark, a client that receives a response knows that event and every event before it is durable under the configured mode.
+
+Responses whose delivery does not depend on durability are exempt from the wait entirely. The halt rejection sent when the matching engine has stopped is the case that matters in practice: it reports no engine state, so it is delivered immediately rather than blocking on a mode that a degraded cluster may not be able to satisfy.
+
+The durable position is cached across batches to avoid redundant atomic loads when durability is running ahead of the response stage.
 
 ### Per-connection send buffers
 
@@ -299,9 +303,11 @@ Connections are registered and unregistered via a `std::sync::mpsc` control chan
 
 The response stage uses an adaptive flush strategy:
 
-- Under high load, it processes many SPSC batches before the queue empties, accumulating writes in `BlockingFrameWriter` buffers. Flushes happen only when the SPSC is empty, amortizing syscall overhead across thousands of entries.
+- Under high load, it processes many SPSC batches before the queue empties, accumulating buffered writes and amortizing syscall overhead across thousands of entries.
 - Under low load, the SPSC empties quickly, and the flush happens promptly.
-- A `dirty_connections: HashSet<u64>` tracks which connections have buffered writes pending flush.
+- Buffered writes are also flushed immediately before the stage blocks on a durability wait. Without this, a response that is already durable would sit in the buffer for the length of an unrelated event's fsync and replica round-trip. The flush costs nothing in latency terms because it only happens when the stage is about to wait anyway.
+
+**Operational note.** Both triggers — the lull and the pre-wait flush — fall silent while the output ring stays non-empty *and* durability keeps running ahead: no wait, no lull, no flush. A client that saturates the pipeline in that regime can accumulate 64 KiB of buffered responses, at which point the connection is dropped to bound memory. A size-based flush trigger on the consumed path would close this; it is not implemented yet.
 
 ### Heartbeats
 
@@ -376,9 +382,9 @@ Without this invariant, a crash between matching and journal sync could cause:
 ### How it is enforced
 
 1. The journal stage reads events from the input disruptor and writes them to disk. Its consumer progress cursor advances **only after** `flush_batch_sync()` completes (durable write confirmed by the kernel/NVMe controller).
-2. The matching stage publishes each `OutputSlot` with the `input_seq` it originated from.
-3. The response stage, before sending a batch, computes `max_seq = max(batch[..count].input_seq)` and spin-waits until `journal_cursor >= max_seq + 1`.
-4. Only then are the responses encoded and written to client sockets.
+2. The matching stage stamps each response with the journal sequence number of the event that produced it. Query responses are stamped with the last event applied before the query, since that is the state they report.
+3. The response stage spin-waits until the durable position reaches that number — for each response individually, not once per batch.
+4. Only then is that response encoded and written to its client socket.
 
 Because the journal and matching consumers run in parallel (not chained), the matching stage often finishes before the journal. The response stage absorbs this difference by waiting on the journal cursor, achieving maximum pipeline parallelism while preserving the durability guarantee.
 

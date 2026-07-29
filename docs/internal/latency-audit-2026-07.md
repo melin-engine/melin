@@ -35,7 +35,7 @@ uniformly low and is the column most worth reading.
 | 1 | `ReplicationMetrics` unpadded | **High** | Low | **Low** | Low–Med |
 | 2 | Hoist `connected_persisted_min` | Low–Med | None | High\* | ~~Trivial~~ **done** |
 | 3 | SipHash → FxHash (3 sites) | Med | Low | **Low** | **Trivial** |
-| 4 | No flush while ring has work | **High** | **Med–High** | Low–Med | Med |
+| 4 | No flush while ring has work | **High** | **Med–High** | Low–Med | **partly done** |
 | 5 | Journal 512 KiB copy | Med | Med | Med | **High** |
 | 6 | `CachePadded` 64 → 128 | Med | **Med** | Low–Med | Trivial to try |
 | 7 | `Arc<AtomicU64>` cursors unpadded | Low–Med | Low | Med | Low |
@@ -54,7 +54,9 @@ Flushing more often means more `submit_and_wait` calls and fewer bytes per
 send — a direct trade of throughput for tail latency. Expect the LAN
 suite's throughput figure to dip while `server e2e` improves. That is the
 change working as intended, but decide which number is being optimised
-before picking the threshold.
+before picking the threshold. The gate-driven half that shipped has the
+same exposure and has not been measured; see item 4's section for what it
+does and does not cover.
 
 **6 could genuinely net negative, which is why it stays an experiment.**
 Editing `padding.rs` doubles padding at *every* `CachePadded` site — the
@@ -194,10 +196,10 @@ currently reallocates during warmup.
 
 ## 4. Response data never flushes while the output ring has work
 
-**Where:** `crates/core/server-runtime/src/response.rs:401`
+**Where:** `crates/core/server-runtime/src/response.rs:447`
 
-`flush_sends` is reachable from exactly three places: the idle path
-(`count == 0`), the heartbeat scan, and shutdown. There is **no flush on
+`flush_sends` was reachable from exactly three places: the idle path
+(`count == 0`), the heartbeat scan, and shutdown. There was **no flush on
 the path where slots were consumed**.
 
 Under sustained load — or, more sharply, immediately after a durability
@@ -207,7 +209,7 @@ ring the whole time — the stage runs iteration after iteration with
 flushing. Responses sit in userspace until traffic happens to pause.
 
 The degenerate case is not just latency. `append_frame`
-(`response.rs:810`) drops the connection outright once `send_buf` would
+(`response.rs:1040`) drops the connection outright once `send_buf` would
 exceed `MAX_SEND_BUF` (64 KiB), so a client that keeps the pipeline busy
 enough gets disconnected rather than served.
 
@@ -217,12 +219,40 @@ or a slot-count trigger, whichever profiles better. The point is to bound
 the interval between "matched" and "on the wire" by something other than
 "the next lull".
 
+**Partly fixed** — a fourth `flush_sends` site now fires immediately
+before the stage blocks on a durability wait, so a response that is
+already durable no longer sits in `send_buf` for the length of an
+unrelated event's fsync and replica round-trip. That trigger was chosen
+over a byte threshold because it needs no tuning constant and cannot cost
+latency: it only fires when the stage was about to spin anyway. The same
+change made the gate per-slot rather than per-batch, which is what makes
+the trigger fire at durability boundaries instead of once per batch.
+
+**Still open, and it is the half with teeth.** The new trigger is
+gate-driven, so it does nothing in the regime where the gate never
+closes — `local` mode, or any deployment whose durability frontier stays
+ahead of the response stage. There, a saturated output ring still means
+no wait, no lull, and no flush, and the 64 KiB disconnect above is
+reached exactly as before. Closing that needs the size- or count-based
+trigger this section originally proposed. Note that a byte threshold is
+the only one of the two that bounds the disconnect directly.
+
+**Unmeasured.** The throughput-vs-latency trade flagged in "Ratings that
+need a why" has not been run on the LAN suite, and should be before this
+is treated as settled. Pick the run deliberately: this audit records a max
+output-ring depth of 1 in the latency run, so the stage reaches its idle
+path and flushes constantly there. Extra `submit_and_wait` calls will show
+up in a saturating throughput run or not at all.
+
 **Adjacent, same area.** `flush_sends` submits with
-`submit_and_wait(pending)` and `retry_send` (`response.rs:906`) loops
+`submit_and_wait(pending)` and `retry_send` (`response.rs:1136`) loops
 synchronously on `submit_and_wait(1)`. A single client with a full TCP
 receive window therefore head-of-line-blocks the response stage for every
 other connection. Worth separating from the flush-trigger change, but it
-belongs on the same list.
+belongs on the same list — and its priority went up with the partial fix
+above, which moved a `flush_sends` call onto the gate path. That exposure
+used to be confined to lulls and shutdown; it now sits in a path that runs
+under load.
 
 ---
 
