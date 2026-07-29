@@ -745,9 +745,18 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         #[cfg(feature = "latency-trace")]
         let mut wakeup_rec =
             crate::trace::register_stage("journal: disruptor wakeup (publish → journal consume)");
+        // Two stages, split where the sync boundary actually is: the
+        // encode stage covers consume → writer buffer (no I/O), the
+        // sync-point stage covers `sync_point` — write + fsync +
+        // replication/cursor publish, the interval the response stage's
+        // durability gate waits on. A single "write + sync" stage closed
+        // before `should_sync` ran and never saw the fsync.
         #[cfg(feature = "latency-trace")]
-        let mut batch_rec =
-            crate::trace::register_stage("journal: batch processing (write + sync)");
+        let mut encode_rec =
+            crate::trace::register_stage("journal: encode (consume → writer buffer)");
+        #[cfg(feature = "latency-trace")]
+        let mut sync_rec =
+            crate::trace::register_stage("journal: sync point (flush + cursor publish)");
         // Paces the idle-path recorder flush. See `trace::StageRecorder::flush`.
         #[cfg(feature = "latency-trace")]
         let mut stats_flush_timer = melin_app::amortized_timer::AmortizedTimer::new();
@@ -878,7 +887,11 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     self.apply_stream_marks(false)?;
                     if matches!(self.pending_mark, Some(StreamMark::Rotate(_))) {
                         if pending > 0 {
+                            #[cfg(feature = "latency-trace")]
+                            let sync_start = mono_trace_ns();
                             self.sync_point(read_start + stop as u64)?;
+                            #[cfg(feature = "latency-trace")]
+                            sync_rec.record_elapsed(sync_start, mono_trace_ns());
                             pending = 0;
                             first_write_ts = None;
                         }
@@ -897,8 +910,12 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     start = stop;
                 }
 
+                // Rotation-boundary batches include the mid-batch sync
+                // above in this sample as well as in `sync_rec` — rare
+                // enough (one per segment rotation) not to distort the
+                // encode percentiles.
                 #[cfg(feature = "latency-trace")]
-                batch_rec.record_elapsed(batch_start, mono_trace_ns());
+                encode_rec.record_elapsed(batch_start, mono_trace_ns());
             }
 
             // Sync when: we have data AND (batch full OR delay expired OR no delay).
@@ -910,7 +927,11 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 if should_sync {
                     // Everything read so far is encoded — committing to
                     // `next_read` is exact here.
+                    #[cfg(feature = "latency-trace")]
+                    let sync_start = mono_trace_ns();
                     self.sync_point(self.consumer.next_read())?;
+                    #[cfg(feature = "latency-trace")]
+                    sync_rec.record_elapsed(sync_start, mono_trace_ns());
                     self.maybe_publish_chain_check();
                     let _ = self.maybe_rotate();
                     // Replica mode: act on a mark that landed exactly at
@@ -952,7 +973,8 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     .is_some()
                 {
                     wakeup_rec.flush();
-                    batch_rec.flush();
+                    encode_rec.flush();
+                    sync_rec.flush();
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
@@ -1960,6 +1982,27 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
         let mut busy_count: u64 = 0;
         let mut idle_count: u64 = 0;
 
+        // io_uring counterpart of the sync path's sync-point stage: the
+        // overlapped write measured from submit to the reap that
+        // publishes the cursor. Includes any time the CQE sat unreaped
+        // while this thread encoded — that delay is real gate latency,
+        // since durability is only visible once the cursor advances.
+        // Valid only while `inflight` is `Some`: the steady-state submit
+        // is the only site that sets `inflight`, and it stamps first.
+        // The steady-state reap sites below record it; the rotation and
+        // shutdown drains (`flush_pending_uring`,
+        // `reap_inflight_on_shutdown`) reap without recording — one
+        // lost sample per rotation/teardown, not worth threading the
+        // recorder through their signatures.
+        #[cfg(feature = "latency-trace")]
+        let mut write_rec =
+            crate::trace::register_stage("journal: uring write (submit → cursor publish)");
+        #[cfg(feature = "latency-trace")]
+        let mut inflight_submit_ts = mono_trace_ns();
+        // Paces the idle-path recorder flush. See `trace::StageRecorder::flush`.
+        #[cfg(feature = "latency-trace")]
+        let mut stats_flush_timer = melin_app::amortized_timer::AmortizedTimer::new();
+
         loop {
             // --- Check shutdown ---
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2025,6 +2068,8 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 // Advance cursor: these events are now durable.
                 self.consumer.set_progress(seq);
                 self.publish_fsync_state();
+                #[cfg(feature = "latency-trace")]
+                write_rec.record_elapsed(inflight_submit_ts, mono_trace_ns());
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
                 rotated_top = self.maybe_rotate_with_prepared();
@@ -2182,6 +2227,8 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 }
                 self.consumer.set_progress(seq);
                 self.publish_fsync_state();
+                #[cfg(feature = "latency-trace")]
+                write_rec.record_elapsed(inflight_submit_ts, mono_trace_ns());
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
                 rotated_eager = self.maybe_rotate_with_prepared();
@@ -2217,6 +2264,8 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                         self.wait_for_cqe(&mut ring, batch_data.len)?;
                         self.consumer.set_progress(seq);
                         self.publish_fsync_state();
+                        #[cfg(feature = "latency-trace")]
+                        write_rec.record_elapsed(inflight_submit_ts, mono_trace_ns());
                         self.writer.confirm_async_write(batch_data);
                         if self.maybe_rotate_with_prepared() {
                             Self::reregister_journal_fd(&ring, self.writer.fd())?;
@@ -2249,6 +2298,10 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                             .build()
                             .user_data(1);
 
+                            #[cfg(feature = "latency-trace")]
+                            {
+                                inflight_submit_ts = mono_trace_ns();
+                            }
                             unsafe {
                                 ring.submission().push(&sqe).expect("SQ full");
                             }
@@ -2294,6 +2347,21 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                     // `pending == 0` here (no-pending branch); quiesced
                     // once the last in-flight write has been reaped.
                     self.apply_stream_marks_uring(&ring, inflight.is_none())?;
+                }
+                // Hand buffered latency samples to the stats registry
+                // while quiesced — a recorder that stops recording keeps
+                // its samples thread-local and they never reach a
+                // snapshot. `AmortizedTimer` keeps the clock read off
+                // the spin path.
+                #[cfg(feature = "latency-trace")]
+                if stats_flush_timer
+                    .tick(
+                        crate::trace::IDLE_FLUSH_INTERVAL,
+                        self.busy_spin || idle_spins < 1000,
+                    )
+                    .is_some()
+                {
+                    write_rec.flush();
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }

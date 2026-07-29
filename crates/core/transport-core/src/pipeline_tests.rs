@@ -162,6 +162,111 @@ fn journal_stage_allocates_primary_sequences() {
     }
 }
 
+/// The journal decomposition depends on the trace stages actually
+/// covering the durable write: `run_sync`'s sync-point stage must wrap
+/// `sync_point`, and `run_uring`'s write stage must wrap submit → reap.
+/// Guards against the regression the encode/sync split fixed: a single
+/// "write + sync" stage that closed before `should_sync` ran and
+/// reported encode-only numbers while the fsync stayed invisible.
+#[cfg(all(feature = "latency-trace", not(feature = "no-persist")))]
+#[test]
+fn journal_stage_records_encode_and_sync_point_samples() {
+    // Enough events per wave to overflow the partial-tail sector: a
+    // batch that fits inside it is written synchronously by
+    // `take_batch_for_async_write` and would leave the uring write
+    // stage without a sample.
+    const WAVE: u64 = 300;
+
+    // Poll the journal until `at_least` app entries are durable. A
+    // fixed sleep is a scheduling race under a loaded test runner: the
+    // stage thread can be starved past the shutdown store and consume
+    // nothing. A concurrent read can hit a partial trailing entry —
+    // treated as end-of-file and retried.
+    fn wait_for_entries(path: &std::path::Path, at_least: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut count = 0;
+            if let Ok(mut reader) = JournalReader::<TestEvent>::open(path) {
+                while let Ok(Some(entry)) = reader.next_entry() {
+                    if matches!(entry.event, JournalEvent::App(_)) {
+                        count += 1;
+                    }
+                }
+            }
+            if count >= at_least {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "journal never reached {at_least} entries (got {count})"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    macro_rules! run_for {
+        ($writer_ty:ty) => {{
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("trace_stages.journal");
+            let writer = <$writer_ty>::create(&path).unwrap();
+
+            let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(512)
+                .add_consumer()
+                .build();
+            let consumer = consumers.pop().unwrap();
+            let stage = JournalStage::<TestEvent, $writer_ty>::new(
+                writer,
+                consumer,
+                Duration::ZERO,
+                MAX_JOURNAL_BATCH,
+                false,
+            );
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown2 = Arc::clone(&shutdown);
+            let handle = std::thread::spawn(move || stage.run(&shutdown2));
+
+            // Two waves: the second wave's async submit requires the
+            // first wave's write to have been reaped on the steady-state
+            // path (single write slot), so by the time wave two is on
+            // disk at least one submit → reap sample has been recorded.
+            // Shutting down after a single wave could instead drain the
+            // in-flight write through the shutdown reap, which is
+            // deliberately not instrumented.
+            for wave in 0..2u64 {
+                for i in 0..WAVE {
+                    producer.publish(add_slot(wave * WAVE + i, 1_000_000_000 + i));
+                }
+                wait_for_entries(&path, ((wave + 1) * WAVE) as usize);
+            }
+
+            shutdown.store(true, Ordering::Relaxed);
+            handle.join().unwrap().unwrap();
+        }};
+    }
+
+    run_for!(BufferedWriter<TestEvent>);
+    run_for!(SectorWriter<TestEvent>);
+
+    // The stages' recorders drop when `run` returns, which ships their
+    // buffered samples to the registry unconditionally — the snapshot
+    // below is deterministic, no flush-interval timing involved. The
+    // registry is process-global and cumulative, so assert presence,
+    // not exact counts (sibling journal tests may add samples).
+    let snapshot = crate::trace::global_registry().snapshot_all();
+    for name in [
+        "journal: encode (consume → writer buffer)",
+        "journal: sync point (flush + cursor publish)",
+        "journal: uring write (submit → cursor publish)",
+    ] {
+        let stage_snap = snapshot
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("stage not registered: {name}"));
+        assert!(stage_snap.samples > 0, "no samples recorded for: {name}");
+    }
+}
+
 #[test]
 fn matching_stage_processes_events() {
     let app = TestApp::new();
