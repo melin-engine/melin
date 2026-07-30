@@ -3,45 +3,11 @@
 Review of the `feat/control-plane-raft` branch (13 commits) after rebase
 onto `main` at 0.12.0. Status at review time: clippy clean, full test
 suite green (including the E2E failover test), no correctness-critical
-bugs found. The items below are the open findings, ranked; strike or
-delete each one as it is resolved.
-
-## 1. Auto-promotion's "primary still starting up" protection is weaker than documented (medium)
-
-`PRIMARY_DOWN_GRACE` (3 s, `raft_promotion.rs`) measures how long *this
-process* has seen the primary link down, with the clock starting when
-the promotion thread boots. The rustdoc and `docs/replication.md` claim
-the grace distinguishes "a primary that is simply still starting up"
-from a real failure — but it only does so if the primary comes up
-within ~3 s of the replicas:
-
-- **Cluster cold start / rolling restart with auto-promote armed.**
-  Replicas boot, form quorum (1–2 s election), and 3 s later one
-  auto-promotes even though it has *never observed a primary at all*
-  (`primary_link_up` starts false; no refusal covers "never saw a
-  primary this boot"). A primary whose journal recovery + prefault
-  takes longer than ~5 s comes up already superseded and is fenced at
-  birth.
-- **Restart of a crashed primary.** By restart time `down_for` is long
-  past the grace, so the primary's recovery duration is irrelevant —
-  failover has already happened. Arguably intended (that is what
-  auto-failover is for), but the docs imply more protection than
-  exists.
-
-No data loss in either case (epochs stay distinct, fencing holds), but
-a spurious deposition at cluster bring-up is an operational footgun.
-Options, in order of preference:
-
-1. Document the bring-up ordering rule (start the primary and let
-   replicas connect before relying on auto-promote, or arm it only
-   after the cluster has formed).
-2. Add a refusal: "no primary observed this boot **and** the local
-   journal is empty" — kills the genesis-race case specifically.
-3. Make the grace configurable with a more conservative default.
-
-A plain "must have observed the primary once since boot" rule would be
-wrong: it deadlocks the legitimate case of a replica that restarts
-during a primary outage and wins the election.
+bugs found. The items below are the open findings, ranked; delete each
+one as it is resolved. (Original finding 1 — the overstated
+"still-starting primary" grace-period claim — is resolved: the blank
+genesis refusal, corrected rustdoc, and the primary-first bring-up rule
+in `docs/replication.md`.)
 
 ## 2. Error paths leak the raft driver thread and its port (low-medium)
 

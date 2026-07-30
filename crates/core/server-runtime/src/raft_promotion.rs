@@ -29,12 +29,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// `primary_link_up` reflects only *this* node's replication socket — not
 /// whether the primary is actually dead — and the receiver clears it on
-/// every reconnect attempt. So the bare flag cannot distinguish three
-/// very different situations that all read as "link down": a real primary
-/// failure, a transient network blip, and a primary that simply hasn't
-/// finished starting up. Acting on the instantaneous flag lets a replica
-/// that happens to hold control-plane leadership depose a perfectly
-/// healthy primary the moment its own link hiccups.
+/// every reconnect attempt. So the bare flag cannot tell a real primary
+/// failure from a transient network blip. Acting on the instantaneous
+/// flag lets a replica that happens to hold control-plane leadership
+/// depose a perfectly healthy primary the moment its own link hiccups.
 ///
 /// The distinguisher is *duration*: the receiver reconnects a healthy
 /// primary in milliseconds, and even a brief unreachability retries on a
@@ -43,6 +41,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// seconds clears one full reconnect cycle with margin. This bounds how
 /// long a real failover waits — a few seconds of extra downtime bought in
 /// exchange for never failing over on a blip (correctness first).
+///
+/// What the grace deliberately does NOT cover: a primary whose *startup*
+/// (journal recovery, prefault) outlasts it — the grace clock measures
+/// this replica's own view of the link, not the primary's progress. A
+/// blank replica is stopped by the genesis refusal in
+/// [`auto_promotion_decision`]; a data-bearing replica deposing a
+/// still-recovering primary is accepted as a real failover (the
+/// ex-primary is fenced on contact), and the operator rule is to bring
+/// the cluster up primary-first — see `docs/replication.md`.
 const PRIMARY_DOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// The durability mode the auto-promotion refusal judges: the mode
@@ -76,10 +83,16 @@ struct AutoPromotionInputs {
     primary_link_up: bool,
     /// How long that link has been *continuously* down (`ZERO` while it
     /// is up). Auto-promotion waits for this to reach
-    /// [`PRIMARY_DOWN_GRACE`] so a transient blip — or a primary still
-    /// coming up at boot — cannot trip a failover; the link state is
-    /// one-sided (this node's socket only).
+    /// [`PRIMARY_DOWN_GRACE`] so a transient blip cannot trip a
+    /// failover; the link state is one-sided (this node's socket only).
     primary_link_down_for: Duration,
+    /// A primary has been observed at least once since this process
+    /// booted (streaming started, i.e. the acking-mode gauge left
+    /// `ACKING_MODE_UNKNOWN`). Process-lifetime, not per-session.
+    primary_observed: bool,
+    /// This node's advertised journal tip is still at sequence 0 — it
+    /// holds no journal data at all.
+    journal_empty: bool,
     /// The term this node was elected at.
     term: u64,
     /// The fencing epoch currently in force.
@@ -102,9 +115,17 @@ struct AutoPromotionInputs {
 ///   depose a healthy primary.
 /// - `primary_link_down_for` — the link flag is one-sided (this node's
 ///   socket only), so `link down` on its own cannot tell a transient
-///   blip, or a primary still starting up, from a real failure. Require
-///   the link to have been down continuously past [`PRIMARY_DOWN_GRACE`];
-///   a healthy primary reconnects well inside that window.
+///   blip from a real failure. Require the link to have been down
+///   continuously past [`PRIMARY_DOWN_GRACE`]; a healthy primary
+///   reconnects well inside that window.
+/// - `primary_observed` / `journal_empty` — a node that has never seen
+///   a primary this boot *and* holds no journal data is a blank genesis
+///   node: an election among blank nodes proves nothing about acked
+///   data, and the likeliest reason such a node leads is a cluster
+///   bring-up race — promoting would depose a primary that is merely
+///   slow to start (journal recovery outlasting the link grace). A
+///   restarted data-bearing replica (journal non-empty) is unaffected
+///   and may still win a real failover.
 /// - `local` durability — acks in `local` mode never waited for this
 ///   replica, so no election can prove it holds every acked order.
 ///   Failover stays a manual, eyes-on decision.
@@ -128,7 +149,14 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
     if inputs.primary_link_down_for < PRIMARY_DOWN_GRACE {
         return Err(
             "the primary link dropped only moments ago — waiting out the grace period to tell \
-             a transient blip (or a still-starting primary) from a real failure before failover",
+             a transient blip from a real failure before failover",
+        );
+    }
+    if !inputs.primary_observed && inputs.journal_empty {
+        return Err(
+            "no primary has been observed since boot and the local journal is empty — a blank \
+             genesis node must not depose a primary that may still be starting; bring the \
+             primary up first, or promote manually",
         );
     }
     match inputs.durability_mode {
@@ -171,15 +199,20 @@ fn consider_auto_promotion(
         return;
     }
     let term = status.term.load(Ordering::Relaxed);
+    // Loaded once: both the effective mode and the observed-a-primary
+    // fact must come from the same snapshot of the gauge.
+    let observed_mode = control.primary_acking_mode.load(Ordering::Acquire);
     let inputs = AutoPromotionInputs {
         tip_ready: control.tip_ready.load(Ordering::Acquire),
         fenced: fence_state.is_fenced(),
         durability_mode: effective_acking_mode(
-            control.primary_acking_mode.load(Ordering::Acquire),
+            observed_mode,
             durability_mode.load(Ordering::Relaxed),
         ),
         primary_link_up: control.primary_link_up.load(Ordering::Acquire),
         primary_link_down_for,
+        primary_observed: observed_mode != crate::durability_policy::ACKING_MODE_UNKNOWN,
+        journal_empty: control.journal_tip.load().get() == 0,
         term,
         fence_epoch: fence_state.epoch(),
     };
@@ -269,6 +302,10 @@ mod tests {
             primary_link_up: false,
             // Well past the grace: a sustained outage, not a blip.
             primary_link_down_for: PRIMARY_DOWN_GRACE * 10,
+            // A normal failover: the primary streamed to this node
+            // before dying, and the journal carries its data.
+            primary_observed: true,
+            journal_empty: false,
             term: 5,
             fence_epoch: 3,
         }
@@ -320,8 +357,8 @@ mod tests {
 
     #[test]
     fn refuses_on_a_transient_primary_link_blip() {
-        // The link is down, but not for long enough — a blip, a brief
-        // partition, or a primary still coming up must not fail over.
+        // The link is down, but not for long enough — a blip or a brief
+        // partition must not fail over.
         let inputs = AutoPromotionInputs {
             primary_link_up: false,
             primary_link_down_for: PRIMARY_DOWN_GRACE - Duration::from_millis(1),
@@ -345,6 +382,43 @@ mod tests {
             auto_promotion_decision(&inputs).is_ok(),
             "a sustained outage past the grace must promote"
         );
+    }
+
+    #[test]
+    fn refuses_a_blank_genesis_node_but_not_a_restarted_replica() {
+        // Never observed a primary this boot AND no journal data: a
+        // blank node leading an election is a bring-up race, not a
+        // failover — it must not depose a slow-starting primary.
+        let inputs = AutoPromotionInputs {
+            primary_observed: false,
+            journal_empty: true,
+            ..ok_inputs()
+        };
+        assert!(
+            auto_promotion_decision(&inputs)
+                .unwrap_err()
+                .contains("journal is empty")
+        );
+
+        // A data-bearing replica that restarted mid-outage never saw
+        // the primary this boot either — it must still be promotable,
+        // or a full-cluster outage could never auto-fail-over.
+        let inputs = AutoPromotionInputs {
+            primary_observed: false,
+            journal_empty: false,
+            ..ok_inputs()
+        };
+        assert!(auto_promotion_decision(&inputs).is_ok());
+
+        // An observed primary that never streamed any data (empty
+        // journal, nothing ever acked): nothing can be lost by
+        // promoting, and the outage is real.
+        let inputs = AutoPromotionInputs {
+            primary_observed: true,
+            journal_empty: true,
+            ..ok_inputs()
+        };
+        assert!(auto_promotion_decision(&inputs).is_ok());
     }
 
     #[test]

@@ -232,10 +232,15 @@ Auto-promotion is deliberately conservative. The elected replica
 - its link to the primary dropped only moments ago — a replica only acts
   once the link has been *continuously* down for a few seconds. The link
   state is one-sided (it reflects only the winner's own socket), so a
-  transient network blip, or a primary that is simply still starting up,
-  reads the same as a real failure; requiring a sustained outage keeps a
-  brief hiccup from deposing a healthy primary, at the cost of a few
-  seconds of extra failover latency;
+  transient network blip reads the same as a real failure; requiring a
+  sustained outage keeps a brief hiccup from deposing a healthy primary,
+  at the cost of a few seconds of extra failover latency. The grace
+  period cannot vouch for a primary whose *startup* outlasts it — see
+  the bring-up rule under "Deployment rules";
+- it has never observed a primary since it booted **and** its own
+  journal is empty — a blank node winning an election is a cluster
+  bring-up race, not a failover, and must not depose a primary that is
+  merely slow to start;
 - the primary was acking under `local` durability — acks never waited
   for any replica, so no election can prove the winner holds every
   acked order; failover stays a manual, eyes-on decision under `local`;
@@ -254,6 +259,18 @@ for a data-plane connection to cross.
 
 ### Deployment rules
 
+- **Bring the cluster up primary-first when auto-promotion is armed.**
+  The grace period tells a link blip from an outage; it cannot tell a
+  dead primary from one whose startup (journal recovery, memory
+  prefault) simply outlasts it. A blank replica refuses to promote (see
+  the refusal list above), but a replica that already carries journal
+  data will — one election timeout plus the grace after its link went
+  down — depose a primary that is still recovering, fencing it when it
+  finally comes up. On a full-cluster (re)start, start the primary and
+  wait until it serves before starting the replicas. A crashed primary
+  that restarts slower than the grace while its replicas stayed up *is*
+  deposed — that is automatic failover doing its job, not a
+  misconfiguration.
 - **Three voters minimum for auto-promotion.** A two-node cluster
   cannot elect a leader after losing either node, so automation would
   never fire when needed; the server refuses to start with
