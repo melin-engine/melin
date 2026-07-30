@@ -108,11 +108,79 @@ pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftConf
     }))
 }
 
-/// Spawn the raft driver if configured. Returns `None` when raft is off.
+/// Owns the raft driver — and, when armed, the auto-promotion thread —
+/// and guarantees teardown on **every** exit path: dropping the guard
+/// sets the process `shutdown` flag and joins the threads. Without it, an
+/// early `?` return between the driver spawn and the regular shutdown
+/// sequence would leak the driver: a zombie voter that keeps its
+/// `--raft-bind` port bound and keeps granting votes after the server
+/// function returned (`run_with_listener` is a library entry point, so
+/// the process does not necessarily exit). Under panic=abort there is no
+/// unwinding, so `Drop` runs exactly on the scope-exit paths this
+/// protects.
+pub(crate) struct RaftDriverGuard {
+    /// `None` when raft is not configured — the guard is then inert.
+    handles: Option<RaftHandles>,
+    /// Auto-promotion poll thread (replica paths under
+    /// `--raft-auto-promote`), adopted via [`Self::arm_promotion`]. Exits
+    /// within one 100 ms poll of the shutdown flag, or the moment a
+    /// promotion is filed.
+    promotion: Option<std::thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl RaftDriverGuard {
+    /// Guard for a node without a control plane (raft off). Dropping it
+    /// does nothing.
+    pub(crate) fn disabled(shutdown: &Arc<AtomicBool>) -> Self {
+        Self {
+            handles: None,
+            promotion: None,
+            shutdown: Arc::clone(shutdown),
+        }
+    }
+
+    /// Election state for the health gauges; `None` when raft is off.
+    pub(crate) fn status(&self) -> Option<Arc<melin_transport_core::health::RaftStatus>> {
+        self.handles.as_ref().map(|h| Arc::clone(&h.status))
+    }
+
+    /// Adopt the auto-promotion thread so it is joined on every exit
+    /// path alongside the driver.
+    pub(crate) fn arm_promotion(&mut self, handle: std::thread::JoinHandle<()>) {
+        self.promotion = Some(handle);
+    }
+}
+
+impl Drop for RaftDriverGuard {
+    fn drop(&mut self) {
+        if self.handles.is_none() && self.promotion.is_none() {
+            return;
+        }
+        // Idempotent — normally already set by the shutdown sequence; on
+        // error-return paths this is what bounds the joins below to the
+        // threads' 100 ms polls.
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handles.take() {
+            // Best-effort: under panic=abort a join error can't occur; if
+            // the thread is already gone the storage was left crash-safe.
+            let _ = h.join.join();
+        }
+        if let Some(h) = self.promotion.take() {
+            // Exits within one poll of the (now set) shutdown flag, or
+            // already exited the moment a promotion was filed.
+            let _ = h.join();
+        }
+    }
+}
+
+/// Spawn the raft driver if configured; the returned guard is inert when
+/// raft is off (its [`RaftDriverGuard::status`] returns `None`).
 ///
 /// Called on every mode path (primary, replica, DPDK variants) right after
 /// the fence state exists — the driver shares the process `shutdown` flag
-/// and survives a replica → primary promotion untouched.
+/// and survives a replica → primary promotion untouched: the guard is
+/// dropped (stopping the driver) only after `run_as_primary` returns.
 pub(crate) fn spawn_raft_driver(
     config: &ServerConfig,
     signing_key: &ed25519_dalek::SigningKey,
@@ -125,9 +193,9 @@ pub(crate) fn spawn_raft_driver(
     // Primaries pass `|| true`; replicas pass a promotion-filed check.
     serving_claim: Arc<dyn Fn() -> bool + Send + Sync>,
     shutdown: &Arc<AtomicBool>,
-) -> Result<Option<RaftHandles>, Box<dyn std::error::Error>> {
+) -> Result<RaftDriverGuard, Box<dyn std::error::Error>> {
     let Some(raft_config) = build_raft_config(config)? else {
-        return Ok(None);
+        return Ok(RaftDriverGuard::disabled(shutdown));
     };
     info!(
         node_id = raft_config.node_id,
@@ -160,26 +228,42 @@ pub(crate) fn spawn_raft_driver(
         supersession,
         Arc::clone(shutdown),
     )?;
-    Ok(Some(handles))
+    Ok(RaftDriverGuard {
+        handles: Some(handles),
+        promotion: None,
+        shutdown: Arc::clone(shutdown),
+    })
 }
 
-/// Stop the raft driver and join its thread. Sets the process `shutdown`
-/// flag first (idempotent — it is normally already set) so the join is
-/// bounded by the driver's 100 ms poll even on error-return paths that
-/// never reached the regular shutdown sequence.
-pub(crate) fn stop_raft_driver(handles: Option<RaftHandles>, shutdown: &Arc<AtomicBool>) {
-    if let Some(h) = handles {
-        shutdown.store(true, Ordering::Relaxed);
-        // Best-effort: under panic=abort a join error can't occur; if the
-        // thread is already gone the storage was left crash-safe anyway.
-        let _ = h.join.join();
+/// Owns a replica's minimal health endpoint: join handle + its private
+/// stop flag (distinct from the process `shutdown` flag so promotion can
+/// tear it down early — `run_as_primary` rebinds the same
+/// `--health-bind`). [`Self::stop`] is explicit for exactly that
+/// pre-rebind moment; `Drop` covers every other exit path (clean
+/// shutdown, early `?` errors) so the listener thread and its port can
+/// never outlive the server function.
+pub(crate) struct ReplicaHealthGuard {
+    inner: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>,
+}
+
+impl ReplicaHealthGuard {
+    /// Stop the endpoint and join its thread so the listen socket is
+    /// released. Idempotent.
+    pub(crate) fn stop(&mut self) {
+        if let Some((handle, stop)) = self.inner.take() {
+            stop.store(true, Ordering::Release);
+            // Best-effort: a join error just means the thread already
+            // unwound; the port is freed either way.
+            let _ = handle.join();
+        }
     }
 }
 
-/// A replica's minimal health endpoint: join handle + its private stop
-/// flag (distinct from the process `shutdown` flag so promotion can tear
-/// it down early — `run_as_primary` rebinds the same `--health-bind`).
-pub(crate) type ReplicaHealth = (std::thread::JoinHandle<()>, Arc<AtomicBool>);
+impl Drop for ReplicaHealthGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 /// Spawn a minimal health endpoint for a replica so its control-plane
 /// raft election gauges and liveness are observable — a replica
@@ -188,18 +272,18 @@ pub(crate) type ReplicaHealth = (std::thread::JoinHandle<()>, Arc<AtomicBool>);
 ///
 /// Only spawned when control-plane raft is enabled: without raft a
 /// replica stays headless as before, so this doesn't perturb non-raft
-/// deployments. `Ok(None)` when raft is off or no `--health-bind` is
-/// configured.
+/// deployments. The returned guard is inert when raft is off or no
+/// `--health-bind` is configured.
 pub(crate) fn spawn_replica_health(
     config: &ServerConfig,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
     raft_status: Option<&Arc<melin_transport_core::health::RaftStatus>>,
-) -> Result<Option<ReplicaHealth>, Box<dyn std::error::Error>> {
+) -> Result<ReplicaHealthGuard, Box<dyn std::error::Error>> {
     if raft_status.is_none() {
-        return Ok(None);
+        return Ok(ReplicaHealthGuard { inner: None });
     }
     let Some(addr) = config.health_bind else {
-        return Ok(None);
+        return Ok(ReplicaHealthGuard { inner: None });
     };
     let stop = Arc::new(AtomicBool::new(false));
     let handle = melin_transport_core::health::spawn(
@@ -212,19 +296,9 @@ pub(crate) fn spawn_replica_health(
         Arc::clone(&stop),
     )?;
     info!(addr = %addr, "replica health endpoint started (election + liveness)");
-    Ok(Some((handle, stop)))
-}
-
-/// Stop the replica health endpoint and join its thread so the listen
-/// socket is released — called on the promotion path before
-/// `run_as_primary` rebinds `--health-bind`, and on clean shutdown.
-pub(crate) fn stop_replica_health(health: Option<ReplicaHealth>) {
-    if let Some((handle, stop)) = health {
-        stop.store(true, Ordering::Release);
-        // Best-effort: a join error just means the thread already
-        // unwound; the port is freed either way.
-        let _ = handle.join();
-    }
+    Ok(ReplicaHealthGuard {
+        inner: Some((handle, stop)),
+    })
 }
 
 #[cfg(test)]

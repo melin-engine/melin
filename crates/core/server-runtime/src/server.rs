@@ -871,7 +871,7 @@ where
         // refuses to grant votes. The receiver owns the sequence half
         // until a promotion hands it to the new primary's journal stage.
         let journal_tip = control.journal_tip.clone();
-        let raft_handles = crate::raft::spawn_raft_driver(
+        let mut raft = crate::raft::spawn_raft_driver(
             &config,
             &signing_key,
             &authorized_keys,
@@ -887,21 +887,24 @@ where
             &shutdown,
         )?;
         // Act on election wins when the operator opted in. Genesis
-        // primaries have nothing to promote — replica paths only.
-        let promotion_handle = match (&raft_handles, config.raft_auto_promote) {
-            (Some(handles), true) => Some(crate::raft_promotion::spawn_auto_promotion(
-                Arc::clone(&handles.status),
+        // primaries have nothing to promote — replica paths only. The
+        // guard joins the thread on every exit path.
+        if config.raft_auto_promote
+            && let Some(status) = raft.status()
+        {
+            raft.arm_promotion(crate::raft_promotion::spawn_auto_promotion(
+                status,
                 control.clone(),
                 Arc::clone(&fence_state),
                 Arc::clone(&durability_mode_atomic),
                 Arc::clone(&shutdown),
-            )),
-            _ => None,
-        };
-        let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
+            ));
+        }
+        let raft_status = raft.status();
         // A raft-enabled replica exposes election gauges on --health-bind;
-        // torn down before promotion so run_as_primary can rebind the port.
-        let replica_health =
+        // stopped explicitly before promotion so run_as_primary can rebind
+        // the port, and by its guard on every other exit path.
+        let mut replica_health =
             crate::raft::spawn_replica_health(&config, &fence_state, raft_status.as_ref())?;
 
         // No local rotation triggers on the replica side: segment
@@ -925,22 +928,15 @@ where
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
-            None => {
-                crate::raft::stop_replica_health(replica_health);
-                crate::raft::stop_raft_driver(raft_handles, &shutdown);
-                if let Some(h) = promotion_handle {
-                    // Exits within one poll of the (already set) shutdown flag.
-                    let _ = h.join();
-                }
-                return Ok(()); // clean shutdown
-            }
+            // Clean shutdown — the raft and health guards tear down on drop.
+            None => return Ok(()),
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode. Bump the epoch so a
                 // paused/partitioned ex-primary is fenced when it reconnects.
                 info!("replica promoted — transitioning to primary");
                 // Release --health-bind before run_as_primary rebinds it
                 // with the full primary health state.
-                crate::raft::stop_replica_health(replica_health);
+                replica_health.stop();
                 <A as Application>::prefault(&mut exchange);
 
                 // A ROTATE received while this node was a replica latched
@@ -952,7 +948,11 @@ where
                     flag.store(false, Ordering::Release);
                 }
 
-                let result = run_as_primary::<A, L, W>(
+                // The raft guard drops — stopping the driver and joining
+                // the (already exited) promotion thread — after this
+                // returns, so the driver serves elections and the fencing
+                // channel for the whole primary tenure.
+                return run_as_primary::<A, L, W>(
                     exchange,
                     writer,
                     listener,
@@ -971,13 +971,6 @@ where
                     raft_status,
                     journal_tip,
                 );
-                crate::raft::stop_raft_driver(raft_handles, &shutdown);
-                if let Some(h) = promotion_handle {
-                    // Already exited: it returns the moment a promotion is
-                    // filed, which is the only way this branch is reached.
-                    let _ = h.join();
-                }
-                return result;
             }
         }
     }
@@ -1031,8 +1024,8 @@ where
     let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
         melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
     );
-    let raft_handles = match crate::raft::build_raft_config(&config)? {
-        None => None,
+    let raft = match crate::raft::build_raft_config(&config)? {
+        None => crate::raft::RaftDriverGuard::disabled(&shutdown),
         Some(_) => {
             let signing_key = load_replication_key(&config)?;
             crate::raft::spawn_raft_driver(
@@ -1048,9 +1041,10 @@ where
             )?
         }
     };
-    let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
+    let raft_status = raft.status();
 
-    let result = run_as_primary::<A, L, W>(
+    // The raft guard drops — stopping the driver — after this returns.
+    run_as_primary::<A, L, W>(
         exchange,
         writer,
         listener,
@@ -1068,9 +1062,7 @@ where
         None, // not promoted — no EpochBump injection
         raft_status,
         journal_tip,
-    );
-    crate::raft::stop_raft_driver(raft_handles, &shutdown);
-    result
+    )
 }
 
 /// Load the Ed25519 replication signing key from `--replication-key` —
@@ -2196,7 +2188,7 @@ where
         // queue. Same promotion-surviving placement and tip ownership as
         // the kernel replica path.
         let journal_tip = control.journal_tip.clone();
-        let raft_handles = crate::raft::spawn_raft_driver(
+        let mut raft = crate::raft::spawn_raft_driver(
             &config,
             &signing_key,
             &authorized_keys,
@@ -2212,19 +2204,21 @@ where
             &shutdown,
         )?;
         // Act on election wins when the operator opted in. Genesis
-        // primaries have nothing to promote — replica paths only.
-        let promotion_handle = match (&raft_handles, config.raft_auto_promote) {
-            (Some(handles), true) => Some(crate::raft_promotion::spawn_auto_promotion(
-                Arc::clone(&handles.status),
+        // primaries have nothing to promote — replica paths only. The
+        // guard joins the thread on every exit path.
+        if config.raft_auto_promote
+            && let Some(status) = raft.status()
+        {
+            raft.arm_promotion(crate::raft_promotion::spawn_auto_promotion(
+                status,
                 control.clone(),
                 Arc::clone(&fence_state),
                 Arc::clone(&durability_mode_atomic),
                 Arc::clone(&shutdown),
-            )),
-            _ => None,
-        };
-        let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
-        let replica_health =
+            ));
+        }
+        let raft_status = raft.status();
+        let mut replica_health =
             crate::raft::spawn_replica_health(&config, &fence_state, raft_status.as_ref())?;
 
         // No local rotation triggers on the replica side — rotation is
@@ -2265,20 +2259,13 @@ where
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
-            None => {
-                crate::raft::stop_replica_health(replica_health);
-                crate::raft::stop_raft_driver(raft_handles, &shutdown);
-                if let Some(h) = promotion_handle {
-                    // Exits within one poll of the (already set) shutdown flag.
-                    let _ = h.join();
-                }
-                return Ok(()); // clean shutdown
-            }
+            // Clean shutdown — the raft and health guards tear down on drop.
+            None => return Ok(()),
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode (DPDK).
                 info!("replica promoted (DPDK) — transitioning to primary");
                 // Release --health-bind before run_as_primary rebinds it.
-                crate::raft::stop_replica_health(replica_health);
+                replica_health.stop();
                 <A as Application>::prefault(&mut exchange);
 
                 // Clear a ROTATE latched while this node was a replica —
@@ -2291,7 +2278,10 @@ where
                 // kernel TCP primary after promotion.
                 warn!("DPDK primary promotion not yet implemented — falling back to kernel TCP");
                 let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
-                let result = run_as_primary::<A, _, W>(
+                // The raft guard drops — stopping the driver and joining
+                // the (already exited) promotion thread — after this
+                // returns; see the kernel-TCP promotion path.
+                return run_as_primary::<A, _, W>(
                     exchange,
                     writer,
                     listener,
@@ -2310,13 +2300,6 @@ where
                     raft_status,
                     journal_tip,
                 );
-                crate::raft::stop_raft_driver(raft_handles, &shutdown);
-                if let Some(h) = promotion_handle {
-                    // Already exited: it returns the moment a promotion is
-                    // filed, which is the only way this branch is reached.
-                    let _ = h.join();
-                }
-                return result;
             }
         }
     }
@@ -2367,8 +2350,8 @@ where
     let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
         melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
     );
-    let raft_handles = match crate::raft::build_raft_config(&config)? {
-        None => None,
+    let raft = match crate::raft::build_raft_config(&config)? {
+        None => crate::raft::RaftDriverGuard::disabled(&shutdown),
         Some(_) => {
             let signing_key = load_replication_key(&config)?;
             crate::raft::spawn_raft_driver(
@@ -2384,7 +2367,7 @@ where
             )?
         }
     };
-    let raft_status = raft_handles.as_ref().map(|h| Arc::clone(&h.status));
+    let raft_status = raft.status();
 
     // Clone exchange state for the shadow snapshot stage before moving
     // exchange into the pipeline (same as the kernel TCP path).
@@ -2851,7 +2834,8 @@ where
     // to join here — replication sender (if enabled) is joined below.
     let dpdk_extras: Vec<(String, std::thread::Result<()>)> = Vec::new();
 
-    let result = shutdown_pipeline_stages(
+    // The raft guard drops — stopping the driver — after this returns.
+    shutdown_pipeline_stages(
         PipelineHandles {
             journal: journal_handle,
             matching: matching_handle,
@@ -2864,9 +2848,7 @@ where
         dpdk_extras,
         &pipeline_healthy,
         &shutdown,
-    );
-    crate::raft::stop_raft_driver(raft_handles, &shutdown);
-    result
+    )
 }
 
 // The `apply_max_orders` / `empty_app` / `empty_app_for_seed` helpers

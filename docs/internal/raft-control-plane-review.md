@@ -4,25 +4,11 @@ Review of the `feat/control-plane-raft` branch (13 commits) after rebase
 onto `main` at 0.12.0. Status at review time: clippy clean, full test
 suite green (including the E2E failover test), no correctness-critical
 bugs found. The items below are the open findings, ranked; delete each
-one as it is resolved. (Original finding 1 — the overstated
-"still-starting primary" grace-period claim — is resolved: the blank
-genesis refusal, corrected rustdoc, and the primary-first bring-up rule
-in `docs/replication.md`.)
-
-## 2. Error paths leak the raft driver thread and its port (low-medium)
-
-In `server.rs`, `stop_raft_driver` / `stop_replica_health` run on the
-success and clean-shutdown paths, but not when a `?` fires between
-driver spawn and those calls — e.g. `spawn_replica_health(...)?`
-failing on a taken health port, or `run_receiver(...)?` returning
-`Err`. The driver thread, its `--raft-bind` port, and the promotion
-thread outlive the function. Irrelevant when `main` exits, but
-`run_with_listener` is a library entry point (the integration tests
-call it in-process and re-bind ports); a leaked driver keeps its port
-and keeps voting. The `stop_raft_driver` doc comment advertises
-coverage of error-return paths, but nothing routes those paths through
-it. A scope guard — or an inner function whose result passes through a
-single cleanup point — closes this.
+one as it is resolved. (Resolved so far: finding 1, the overstated
+"still-starting primary" grace-period claim — blank-genesis refusal,
+corrected rustdoc, primary-first bring-up rule; finding 2, the
+error-path driver/health leak — `RaftDriverGuard` and
+`ReplicaHealthGuard` now tear down on every exit path via Drop.)
 
 ## 3. Replica health endpoint hardcodes `pipeline_healthy = true` (low)
 
