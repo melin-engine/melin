@@ -433,6 +433,7 @@ where
         journal_tip,
         primary_link_up,
         primary_acking_mode,
+        pipeline_healthy,
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
     // fresh replicas get `(None, None, 0, zeros)`. See
@@ -689,6 +690,7 @@ where
                 group_commit_delay,
                 busy_spin,
                 Arc::clone(&fence_state),
+                Arc::clone(pipeline_healthy),
             )?);
         }
 
@@ -1057,7 +1059,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let promote = crate::promotion::PromotionRequest::new();
+            let control = crate::replication::ReplicaControlPlane::new();
             let cores = crate::server::PipelineCores {
                 // 0 = unpinned sentinel for every stage.
                 journal: 0,
@@ -1073,14 +1075,14 @@ mod tests {
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let promote = promote.clone();
+                let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
                         &shutdown,
-                        &promote,
+                        &control,
                         3_600_000,
                         replica_snapshot,
                         cores,
@@ -1108,7 +1110,7 @@ mod tests {
                 other => panic!("expected Handshake, got {other:?}"),
             }
             let mut buf = Vec::new();
-            encode_stream_start(0, lineage_start, lineage_anchor, 0, &mut buf);
+            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
             s1.write_all(&buf).expect("StreamStart 1");
             buf.clear();
             melin_transport_core::replication_wire::encode_input_batch(
@@ -1146,6 +1148,15 @@ mod tests {
                 ),
                 other => panic!("expected Handshake, got {other:?}"),
             }
+            // The journal stage's divergence failure latched the health
+            // mirror before the teardown that led to this reconnect, and
+            // the replacement pipeline is not built until after the resync
+            // verdict — so at this deterministic point the replica must be
+            // reporting unhealthy.
+            assert!(
+                !control.pipeline_healthy.load(Ordering::Acquire),
+                "the divergence must have latched the health mirror false"
+            );
             buf.clear();
             encode_hash_mismatch(&mut buf);
             s2.write_all(&buf).expect("HashMismatch");
@@ -1160,6 +1171,7 @@ mod tests {
                 &primary_journal,
                 &mut publish,
                 &transfer_shutdown,
+                1,
             )
             .expect("snapshot transfer");
             assert_eq!(
@@ -1168,6 +1180,13 @@ mod tests {
             );
             let mut s2_acks = s2.try_clone().expect("clone");
             wait_for_ack(&mut s2_acks, 5);
+
+            // Streaming resumed on the rebuilt pipeline — the rebuild
+            // must have reset the health mirror.
+            assert!(
+                control.pipeline_healthy.load(Ordering::Acquire),
+                "the resync rebuild must reset the health mirror true"
+            );
 
             // --- Clean shutdown; the receiver must return Ok(None) —
             // the divergence never escaped as a process-fatal error.
@@ -1230,7 +1249,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let promote = crate::promotion::PromotionRequest::new();
+            let control = crate::replication::ReplicaControlPlane::new();
             let cores = crate::server::PipelineCores {
                 journal: 0,
                 matching: 0,
@@ -1245,14 +1264,14 @@ mod tests {
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let promote = promote.clone();
+                let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
                         &shutdown,
-                        &promote,
+                        &control,
                         3_600_000,
                         replica_snapshot,
                         cores,
@@ -1271,7 +1290,7 @@ mod tests {
             // session and wait for its ack.
             let stream_one = |s: &mut TcpStream, buf: &mut Vec<u8>| {
                 buf.clear();
-                encode_stream_start(0, lineage_start, lineage_anchor, 0, buf);
+                encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, buf);
                 s.write_all(buf).expect("StreamStart");
                 buf.clear();
                 melin_transport_core::replication_wire::encode_input_batch(
@@ -1417,7 +1436,7 @@ mod tests {
             let replica_journal = dir.path().join("replica.journal");
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let promote = crate::promotion::PromotionRequest::new();
+            let control = crate::replication::ReplicaControlPlane::new();
             let cores = crate::server::PipelineCores {
                 journal: 0,
                 matching: 0,
@@ -1432,14 +1451,14 @@ mod tests {
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let promote = promote.clone();
+                let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
                         &shutdown,
-                        &promote,
+                        &control,
                         3_600_000,
                         replica_snapshot,
                         cores,
@@ -1463,7 +1482,7 @@ mod tests {
                 other => panic!("expected Handshake, got {other:?}"),
             }
             let mut buf = Vec::new();
-            encode_stream_start(0, lineage_start, lineage_anchor, 0, &mut buf);
+            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
             s1.write_all(&buf).expect("StreamStart 1");
             buf.clear();
             melin_transport_core::replication_wire::encode_input_batch(
@@ -1507,6 +1526,7 @@ mod tests {
                     &primary_journal,
                     &mut publish,
                     &transfer_shutdown,
+                    1,
                 )
                 .expect("snapshot transfer");
             }

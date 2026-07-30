@@ -100,8 +100,11 @@ impl HealthState {
     /// A replica accepts no client connections and its detailed
     /// replication progress is reported by the primary's per-replica
     /// gauges, so its own `/metrics` exists mainly to expose
-    /// control-plane raft election state (`raft`) and node liveness.
-    /// The pipeline/journal/replication gauges are intentionally
+    /// control-plane raft election state (`raft`), node liveness, and
+    /// pipeline health: `pipeline_healthy` is the caller's live signal
+    /// (the runtime feeds the replica pipeline's journal-failure latch)
+    /// and drives `/health` OK/ERR plus the `melin_pipeline_healthy`
+    /// gauge. The queue/journal/replication gauges are intentionally
     /// unpopulated (0); `replicas_connected: Some(0)` makes the node
     /// report `halted` (it is following, not trading), and the fence
     /// state still surfaces a superseded ex-primary. This reuses the one
@@ -1103,6 +1106,37 @@ mod tests {
         let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
         assert!(body.contains("melin_raft_is_leader 0\n"), "{body}");
         assert!(body.contains("melin_raft_driver_running 0\n"), "{body}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn replica_health_endpoint_reports_unhealthy_pipeline() {
+        // The caller's live pipeline-health signal (the replica journal
+        // stage's failure mirror) must surface as ERR + gauge 0 — not be
+        // masked by a hardcoded healthy default.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let raft = Arc::new(RaftStatus::new(4));
+        let fence = Arc::new(crate::fence::FenceState::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pipeline_healthy = Arc::new(AtomicBool::new(false));
+
+        let handle = spawn(
+            addr,
+            HealthState::for_replica(fence, Some(raft), Arc::clone(&pipeline_healthy)),
+            Arc::clone(&shutdown),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(body.contains("melin_pipeline_healthy 0\n"), "{body}");
+        let health = http_request(addr, "GET /health HTTP/1.1\r\n\r\n");
+        assert!(health.contains("ERR"), "{health}");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();

@@ -8,18 +8,13 @@ one as it is resolved. (Resolved so far: finding 1, the overstated
 "still-starting primary" grace-period claim — blank-genesis refusal,
 corrected rustdoc, primary-first bring-up rule; finding 2, the
 error-path driver/health leak — `RaftDriverGuard` and
-`ReplicaHealthGuard` now tear down on every exit path via Drop.)
-
-## 3. Replica health endpoint hardcodes `pipeline_healthy = true` (low)
-
-`spawn_replica_health` (`raft.rs`) passes a fresh
-`AtomicBool::new(true)` into `HealthState::for_replica`, and nothing
-ever writes it. A replica whose journal stage has failed
-(`journal_failed` latched, receive loop resyncing in a loop) still
-exports a healthy pipeline gauge. Either plumb the real flag (it lives
-inside `run_receiver`, so a shared handle would need to be created
-alongside `ReplicaControlPlane`) or suppress the gauge on the replica
-endpoint so it cannot mislead.
+`ReplicaHealthGuard` now tear down on every exit path via Drop;
+finding 3, the hardcoded replica `pipeline_healthy` — now a live
+mirror of the replica journal stage's failure latch. Fixing 3 also
+surfaced and fixed a branch regression: the `hash-chain`-gated
+divergence-resync tests had been left uncompiled against the new
+receiver/protocol signatures — remember to run the `hash-chain`
+feature in verification, not just the default set.)
 
 ## 4. Test gaps (low)
 

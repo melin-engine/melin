@@ -604,6 +604,8 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         // Recovery seeded it long before any streaming session.
         tip_ready: _,
         primary_link_up: _,
+        // Latched by the journal thread's failure wrapper, not here.
+        pipeline_healthy: _,
     } = control;
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);

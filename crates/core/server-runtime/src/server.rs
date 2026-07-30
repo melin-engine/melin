@@ -904,8 +904,12 @@ where
         // A raft-enabled replica exposes election gauges on --health-bind;
         // stopped explicitly before promotion so run_as_primary can rebind
         // the port, and by its guard on every other exit path.
-        let mut replica_health =
-            crate::raft::spawn_replica_health(&config, &fence_state, raft_status.as_ref())?;
+        let mut replica_health = crate::raft::spawn_replica_health(
+            &config,
+            &fence_state,
+            raft_status.as_ref(),
+            Arc::clone(&control.pipeline_healthy),
+        )?;
 
         // No local rotation triggers on the replica side: segment
         // rotation is primary-driven (the replica adopts the boundaries
@@ -2218,8 +2222,12 @@ where
             ));
         }
         let raft_status = raft.status();
-        let mut replica_health =
-            crate::raft::spawn_replica_health(&config, &fence_state, raft_status.as_ref())?;
+        let mut replica_health = crate::raft::spawn_replica_health(
+            &config,
+            &fence_state,
+            raft_status.as_ref(),
+            Arc::clone(&control.pipeline_healthy),
+        )?;
 
         // No local rotation triggers on the replica side — rotation is
         // primary-driven (see the kernel-TCP receiver path).

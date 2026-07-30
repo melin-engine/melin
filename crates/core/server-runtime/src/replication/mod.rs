@@ -173,11 +173,20 @@ pub struct ReplicaControlPlane {
     /// mode while unknown, which is exactly the pre-propagation
     /// behavior.
     pub primary_acking_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Whether the replica's pipeline is healthy — fed to the replica's
+    /// minimal health endpoint (`/health` OK/ERR and the
+    /// `melin_pipeline_healthy` gauge). Process-lifetime (the per-session
+    /// pipeline is torn down and rebuilt across resyncs, so its own
+    /// `journal_failed` latch cannot be handed to the endpoint):
+    /// `true` from boot, latched `false` by the journal stage's failure
+    /// wrapper, reset `true` when a fresh pipeline is built.
+    pub pipeline_healthy: std::sync::Arc<AtomicBool>,
 }
 
 impl ReplicaControlPlane {
     /// Fresh handles for a replica boot: nothing requested, tip not
-    /// trustworthy yet, tip sequence 0, primary link down.
+    /// trustworthy yet, tip sequence 0, primary link down, pipeline
+    /// healthy (nothing has failed yet).
     pub fn new() -> Self {
         Self {
             promote: crate::promotion::PromotionRequest::new(),
@@ -189,6 +198,7 @@ impl ReplicaControlPlane {
             primary_acking_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 crate::durability_policy::ACKING_MODE_UNKNOWN,
             )),
+            pipeline_healthy: std::sync::Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -401,6 +411,12 @@ pub(super) fn build_replica_pipeline_with_threads<A, W>(
     group_commit_delay: std::time::Duration,
     busy_spin: bool,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // Process-lifetime health mirror for the replica health endpoint —
+    // see `ReplicaControlPlane::pipeline_healthy`. Reset `true` here (a
+    // fresh pipeline is healthy) and latched `false` by the journal
+    // thread's failure wrapper, alongside the per-pipeline
+    // `journal_failed` latch.
+    pipeline_healthy: Arc<AtomicBool>,
 ) -> Result<ReplicaPipelineHandles<A, W>, Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -440,6 +456,9 @@ where
     journal_stage.set_stream_marks(Arc::clone(&stream_marks));
     let journal_failed = Arc::new(AtomicBool::new(false));
     let journal_failed_latch = Arc::clone(&journal_failed);
+    // A fresh pipeline is healthy — this also clears the latch after a
+    // successful in-process resync rebuild.
+    pipeline_healthy.store(true, Ordering::Release);
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
@@ -453,6 +472,9 @@ where
                 // the streaming loop polls this latch and tears the
                 // session down instead.
                 journal_failed_latch.store(true, Ordering::Release);
+                // Mirror into the process-lifetime gauge the replica
+                // health endpoint serves.
+                pipeline_healthy.store(false, Ordering::Release);
                 tracing::error!(error = %e, "replica journal stage failed — session teardown");
             }
             result

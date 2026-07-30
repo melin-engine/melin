@@ -1093,6 +1093,7 @@ where
         journal_tip,
         primary_link_up,
         primary_acking_mode,
+        pipeline_healthy,
     } = control;
     journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
     tip_ready.store(true, Ordering::Release);
@@ -1498,6 +1499,7 @@ where
                 group_commit_delay,
                 busy_spin,
                 Arc::clone(&fence_state),
+                Arc::clone(pipeline_healthy),
             )?);
 
             // Pipeline children are spawned and self-pinned. Now safe to

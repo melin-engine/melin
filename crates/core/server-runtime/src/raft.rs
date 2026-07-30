@@ -278,6 +278,10 @@ pub(crate) fn spawn_replica_health(
     config: &ServerConfig,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
     raft_status: Option<&Arc<melin_transport_core::health::RaftStatus>>,
+    // The replica's live pipeline-health mirror
+    // (`ReplicaControlPlane::pipeline_healthy`) — drives the endpoint's
+    // OK/ERR status and the `melin_pipeline_healthy` gauge.
+    pipeline_healthy: Arc<AtomicBool>,
 ) -> Result<ReplicaHealthGuard, Box<dyn std::error::Error>> {
     if raft_status.is_none() {
         return Ok(ReplicaHealthGuard { inner: None });
@@ -291,7 +295,7 @@ pub(crate) fn spawn_replica_health(
         melin_transport_core::health::HealthState::for_replica(
             Arc::clone(fence_state),
             raft_status.map(Arc::clone),
-            Arc::new(AtomicBool::new(true)),
+            pipeline_healthy,
         ),
         Arc::clone(&stop),
     )?;
