@@ -368,6 +368,33 @@ mod tests {
     }
 
     #[test]
+    fn auto_promote_requires_three_voters() {
+        let mut c = base_config();
+        c.raft_bind = Some("127.0.0.1:7001".parse().unwrap());
+        c.raft_node_id = Some(1);
+        c.replication_key = Some("key".into());
+        c.raft_auto_promote = true;
+        c.raft_peer = vec![
+            format!("1@10.0.0.1:7001#{}", b64_key(1)),
+            format!("2@10.0.0.2:7001#{}", b64_key(2)),
+        ];
+        // A two-node cluster cannot elect after losing either node, so
+        // automation would never fire when needed — refused at startup.
+        let err = build_raft_config(&c).unwrap_err();
+        assert!(err.contains("at least 3"), "{err}");
+
+        // Three voters clears the gate with the same flags.
+        c.raft_peer.push(format!("3@10.0.0.3:7001#{}", b64_key(3)));
+        assert!(build_raft_config(&c).unwrap().is_some());
+
+        // The flag alone (no --raft-bind) is a partial flag set, refused
+        // like the others rather than silently ignored.
+        let mut c = base_config();
+        c.raft_auto_promote = true;
+        assert!(build_raft_config(&c).unwrap_err().contains("--raft-bind"));
+    }
+
+    #[test]
     fn valid_config_parses_and_defaults_dir() {
         let mut c = base_config();
         c.journal = "/data/melin.journal".into();

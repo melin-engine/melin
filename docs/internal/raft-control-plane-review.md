@@ -10,27 +10,13 @@ corrected rustdoc, primary-first bring-up rule; finding 2, the
 error-path driver/health leak — `RaftDriverGuard` and
 `ReplicaHealthGuard` now tear down on every exit path via Drop;
 finding 3, the hardcoded replica `pipeline_healthy` — now a live
-mirror of the replica journal stage's failure latch. Fixing 3 also
+mirror of the replica journal stage's failure latch; finding 4, the
+test gaps — the 3-voter auto-promote refusal and the tip-readiness
+vote gate are now covered. Fixing 3 also
 surfaced and fixed a branch regression: the `hash-chain`-gated
 divergence-resync tests had been left uncompiled against the new
 receiver/protocol signatures — remember to run the `hash-chain`
 feature in verification, not just the default set.)
-
-## 4. Test gaps (low)
-
-- **The 3-voter auto-promote refusal is untested.**
-  `build_raft_config`'s rejection of `--raft-auto-promote` with fewer
-  than three voters has no unit test; every other config refusal has
-  one.
-- **The tip-readiness vote gate is untested.**
-  `RpcServerConfig::admit_vote`'s "drop all votes while
-  `tip.is_ready()` is false" branch has no coverage at any level —
-  `rpc_loopback.rs` always constructs ready tips. One loopback test
-  with `ready: false` asserting the connection closes would pin it.
-
-The behind-candidate drop itself is covered end-to-end
-(`election.rs::behind_node_never_wins_an_election`), and supersession
-has a real-socket test.
 
 ## 5. Nits
 

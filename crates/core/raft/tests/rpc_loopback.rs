@@ -236,6 +236,73 @@ async fn oversized_frame_is_refused() {
     h.shutdown.store(true, Ordering::Relaxed);
 }
 
+/// Tip-readiness gate over a real socket: until journal recovery seeds
+/// the local tip (`TipSource::ready`), the server must drop every vote
+/// request — a vote judged against a default epoch/sequence could admit
+/// a candidate behind data this node actually holds. Dropping closes the
+/// connection, exactly like the recency filter. Appends are never gated
+/// (a legitimately elected leader must still lead), and flipping `ready`
+/// restores voting without a reconnect ceremony.
+#[tokio::test]
+async fn votes_are_dropped_until_the_tip_is_ready() {
+    let client_key = SigningKey::from_bytes(&[0x11; 32]);
+    let table = format!(
+        "replication {} node-2\n",
+        base64::engine::general_purpose::STANDARD.encode(client_key.verifying_key().to_bytes())
+    );
+    let authorized_keys = Arc::new(AuthorizedKeys::parse(&table).unwrap());
+    let peer_ids = Arc::new(HashMap::from([(
+        client_key.verifying_key().to_bytes(),
+        2u64,
+    )]));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let cfg = Arc::new(RpcServerConfig {
+        authorized_keys,
+        peer_ids,
+        tip: Arc::new(TipSource {
+            fence: Arc::new(FenceState::new(0)),
+            seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0)),
+            ready: Arc::clone(&ready),
+        }),
+        supersession: None,
+        vote_filter: std::sync::Mutex::new(Default::default()),
+    });
+    tokio::spawn(serve(listener, MockApi, cfg, Arc::clone(&shutdown)));
+
+    let mut factory = RaftClientFactory::new(Arc::new(client_key.clone()), tip_at(0, 0));
+    let node = BasicNode { addr };
+
+    let mut client = factory.new_client(1, &node).await;
+    client
+        .vote(vote_req_from(2), opt())
+        .await
+        .expect_err("vote requests must be dropped while the local tip is unready");
+
+    // Appends must never be gated — the dropped vote closed that
+    // connection, so dial a fresh one.
+    let mut client = factory.new_client(1, &node).await;
+    let append = AppendEntriesRequest {
+        vote: Vote::new(5, 2),
+        prev_log_id: None,
+        entries: vec![],
+        leader_commit: None,
+    };
+    let resp = client.append_entries(append, opt()).await.unwrap();
+    assert_eq!(resp, AppendEntriesResponse::Success);
+
+    // Recovery finishes: the same server now delivers votes.
+    ready.store(true, Ordering::Release);
+    let resp = client.vote(vote_req_from(2), opt()).await.unwrap();
+    assert!(resp.vote_granted, "a ready tip must restore vote delivery");
+
+    shutdown.store(true, Ordering::Relaxed);
+}
+
 /// Fence-on-supersession over a real socket: a serving node that reads a
 /// peer envelope advertising a strictly higher fencing epoch self-fences
 /// and co-sets the shutdown flag — the raft mesh as a fencing channel.
