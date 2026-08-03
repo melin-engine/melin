@@ -146,8 +146,13 @@ impl RaftDriverGuard {
     }
 
     /// Adopt the auto-promotion thread so it is joined on every exit
-    /// path alongside the driver.
+    /// path alongside the driver. At most once — overwriting would drop
+    /// the previous handle without joining it.
     pub(crate) fn arm_promotion(&mut self, handle: std::thread::JoinHandle<()>) {
+        debug_assert!(
+            self.promotion.is_none(),
+            "arm_promotion called twice — the first thread would leak"
+        );
         self.promotion = Some(handle);
     }
 }
@@ -174,15 +179,21 @@ impl Drop for RaftDriverGuard {
     }
 }
 
-/// Spawn the raft driver if configured; the returned guard is inert when
-/// raft is off (its [`RaftDriverGuard::status`] returns `None`).
+/// Spawn the raft driver from an already-validated [`RaftConfig`] — the
+/// caller matches [`build_raft_config`]'s `None` (raft off) to a
+/// [`RaftDriverGuard::disabled`] guard, so the peer list is parsed
+/// exactly once per boot.
 ///
 /// Called on every mode path (primary, replica, DPDK variants) right after
 /// the fence state exists — the driver shares the process `shutdown` flag
 /// and survives a replica → primary promotion untouched: the guard is
 /// dropped (stopping the driver) only after `run_as_primary` returns.
+#[allow(clippy::too_many_arguments)] // driver assembly point, same as melin_raft::driver::spawn
 pub(crate) fn spawn_raft_driver(
-    config: &ServerConfig,
+    raft_config: RaftConfig,
+    // `--raft-auto-promote`: arms the raft mesh as a fencing channel
+    // (see `SupersessionPolicy` below).
+    auto_promote: bool,
     signing_key: &ed25519_dalek::SigningKey,
     authorized_keys: &Arc<AuthorizedKeys>,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
@@ -194,9 +205,6 @@ pub(crate) fn spawn_raft_driver(
     serving_claim: Arc<dyn Fn() -> bool + Send + Sync>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<RaftDriverGuard, Box<dyn std::error::Error>> {
-    let Some(raft_config) = build_raft_config(config)? else {
-        return Ok(RaftDriverGuard::disabled(shutdown));
-    };
     info!(
         node_id = raft_config.node_id,
         bind = %raft_config.bind,
@@ -212,14 +220,11 @@ pub(crate) fn spawn_raft_driver(
     // The raft mesh doubles as a fencing channel only under
     // auto-promotion: without automation, a serving node's fencing
     // stays a data-plane-contact concern exactly as documented.
-    let supersession =
-        config
-            .raft_auto_promote
-            .then(|| melin_raft::rpc_server::SupersessionPolicy {
-                fence: Arc::clone(fence_state),
-                shutdown: Arc::clone(shutdown),
-                serving: serving_claim,
-            });
+    let supersession = auto_promote.then(|| melin_raft::rpc_server::SupersessionPolicy {
+        fence: Arc::clone(fence_state),
+        shutdown: Arc::clone(shutdown),
+        serving: serving_claim,
+    });
     let handles = melin_raft::driver::spawn(
         raft_config,
         Arc::new(signing_key.clone()),

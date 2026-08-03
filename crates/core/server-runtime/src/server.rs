@@ -871,21 +871,25 @@ where
         // refuses to grant votes. The receiver owns the sequence half
         // until a promotion hands it to the new primary's journal stage.
         let journal_tip = control.journal_tip.clone();
-        let mut raft = crate::raft::spawn_raft_driver(
-            &config,
-            &signing_key,
-            &authorized_keys,
-            &fence_state,
-            journal_tip.clone(),
-            Arc::clone(&control.tip_ready),
-            // A replica claims to be serving once a promotion is in
-            // flight (see SupersessionPolicy).
-            {
-                let promote = control.promote.clone();
-                Arc::new(move || promote.is_requested())
-            },
-            &shutdown,
-        )?;
+        let mut raft = match crate::raft::build_raft_config(&config)? {
+            None => crate::raft::RaftDriverGuard::disabled(&shutdown),
+            Some(cfg) => crate::raft::spawn_raft_driver(
+                cfg,
+                config.raft_auto_promote,
+                &signing_key,
+                &authorized_keys,
+                &fence_state,
+                journal_tip.clone(),
+                Arc::clone(&control.tip_ready),
+                // A replica claims to be serving once a promotion is in
+                // flight (see SupersessionPolicy).
+                {
+                    let promote = control.promote.clone();
+                    Arc::new(move || promote.is_requested())
+                },
+                &shutdown,
+            )?,
+        };
         // Act on election wins when the operator opted in. Genesis
         // primaries have nothing to promote — replica paths only. The
         // guard joins the thread on every exit path.
@@ -1030,10 +1034,11 @@ where
     );
     let raft = match crate::raft::build_raft_config(&config)? {
         None => crate::raft::RaftDriverGuard::disabled(&shutdown),
-        Some(_) => {
+        Some(cfg) => {
             let signing_key = load_replication_key(&config)?;
             crate::raft::spawn_raft_driver(
-                &config,
+                cfg,
+                config.raft_auto_promote,
                 &signing_key,
                 &authorized_keys,
                 &fence_state,
@@ -2192,21 +2197,25 @@ where
         // queue. Same promotion-surviving placement and tip ownership as
         // the kernel replica path.
         let journal_tip = control.journal_tip.clone();
-        let mut raft = crate::raft::spawn_raft_driver(
-            &config,
-            &signing_key,
-            &authorized_keys,
-            &fence_state,
-            journal_tip.clone(),
-            Arc::clone(&control.tip_ready),
-            // A replica claims to be serving once a promotion is in
-            // flight (see SupersessionPolicy).
-            {
-                let promote = control.promote.clone();
-                Arc::new(move || promote.is_requested())
-            },
-            &shutdown,
-        )?;
+        let mut raft = match crate::raft::build_raft_config(&config)? {
+            None => crate::raft::RaftDriverGuard::disabled(&shutdown),
+            Some(cfg) => crate::raft::spawn_raft_driver(
+                cfg,
+                config.raft_auto_promote,
+                &signing_key,
+                &authorized_keys,
+                &fence_state,
+                journal_tip.clone(),
+                Arc::clone(&control.tip_ready),
+                // A replica claims to be serving once a promotion is in
+                // flight (see SupersessionPolicy).
+                {
+                    let promote = control.promote.clone();
+                    Arc::new(move || promote.is_requested())
+                },
+                &shutdown,
+            )?,
+        };
         // Act on election wins when the operator opted in. Genesis
         // primaries have nothing to promote — replica paths only. The
         // guard joins the thread on every exit path.
@@ -2360,10 +2369,11 @@ where
     );
     let raft = match crate::raft::build_raft_config(&config)? {
         None => crate::raft::RaftDriverGuard::disabled(&shutdown),
-        Some(_) => {
+        Some(cfg) => {
             let signing_key = load_replication_key(&config)?;
             crate::raft::spawn_raft_driver(
-                &config,
+                cfg,
+                config.raft_auto_promote,
                 &signing_key,
                 &authorized_keys,
                 &fence_state,

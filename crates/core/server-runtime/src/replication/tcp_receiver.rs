@@ -613,8 +613,6 @@ where
                     continue;
                 }
                 // Adopt the primary's epoch immediately; streamed `EpochBump`s
-                // keep it current thereafter.
-                // Adopt the primary's epoch immediately; streamed `EpochBump`s
                 // keep it current thereafter. Likewise the acking mode
                 // (heartbeats keep it current mid-session).
                 fence_state.observe_epoch(epoch);

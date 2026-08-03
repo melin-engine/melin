@@ -291,6 +291,14 @@ for a data-plane connection to cross.
 - **Same peer list everywhere.** Identical `--raft-peer` lists
   (including each node's own entry) keep the first-boot membership
   consistent across the cluster.
+- **Arm `--raft-auto-promote` uniformly — every node or none.** The
+  flag arms two things on the node that carries it: acting on election
+  wins, and the raft-mesh fencing channel described above. A cluster
+  with the flag on only some nodes still fails over (any flagged
+  replica can win and promote) but fences asymmetrically: an unflagged
+  ex-primary ignores the mesh and keeps serving until a data-plane
+  connection carries the new epoch to it, lengthening the
+  two-primaries exposure window that mesh fencing exists to close.
 
 ## Journal mirroring and divergence detection
 

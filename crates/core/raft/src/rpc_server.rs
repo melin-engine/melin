@@ -65,7 +65,7 @@ const ACCEPT_POLL: Duration = Duration::from_millis(100);
 /// response, or a snapshot-chunk ack) and a healthy peer drains them
 /// instantly, so this only fires when a peer's receive window is wedged
 /// (crashed mid-read, black-holed link). Without it a stalled writer pins
-/// its task — and the [`MAX_INBOUND`] slot it holds — indefinitely; 30
+/// its task — and the [`MAX_INBOUND`] slot it holds — indefinitely; 32
 /// such peers would exhaust the accept cap. Reclaim the task instead; the
 /// peer reconnects on next use.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
