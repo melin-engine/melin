@@ -141,7 +141,7 @@ pursuing.
 Independent of any redesign, the chain could be computed off the journal
 stage entirely, and this is likely the cheaper first move. The chain value
 is never read on the ack path — `publish_fsync_state` is a non-blocking
-SeqLock store and `evaluate_durability` reads journal and replica cursors
+seqlock store and `evaluate_durability` reads journal and replica cursors
 only — so its consumers (shadow snapshots, segment rotation, replica
 handshakes, periodic `ChainCheck`) all run orders of magnitude less often
 than entries are produced. A hasher thread fed entry bytes over an SPSC
