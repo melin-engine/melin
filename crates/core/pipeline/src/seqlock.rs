@@ -42,20 +42,68 @@
 //! costs nothing over the volatile version.
 //!
 //! One requirement follows: `T` must not contain padding bytes, because
-//! atomically reading a word that covers uninitialized padding is itself
-//! UB. All current payloads (`u64`, `[u8; 32]`, `FsyncState`) are
-//! padding-free.
+//! reading a word that covers uninitialized padding is itself UB — even
+//! single-threaded, before any race enters the picture. Like the
+//! single-writer invariant above, this is enforced by the type system
+//! rather than documented: [`split`] bounds the payload by [`NoPadding`],
+//! so a padded type is a compile error:
+//!
+//! ```compile_fail
+//! #[derive(Clone, Copy)]
+//! struct Padded {
+//!     a: u8,
+//!     b: u64, // 7 padding bytes between `a` and `b`
+//! }
+//! // the trait bound `Padded: NoPadding` is not satisfied
+//! let _ = melin_pipeline::seqlock::split(Padded { a: 1, b: 2 });
+//! ```
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+/// Marker for payload types whose every byte is initialized — no padding.
+///
+/// The seqlock copies its payload through word-sized atomics; a word that
+/// covers padding bytes would read uninitialized memory, which is UB
+/// regardless of the seqlock protocol (see the module docs). The trait is
+/// `unsafe` because the compiler cannot check the property; implementors
+/// assert it.
+///
+/// # Safety
+/// Every byte of a value of the implementing type must always be
+/// initialized: no padding bytes, no `MaybeUninit` (or similar
+/// possibly-uninitialized) fields. Where the layout allows, back the
+/// `unsafe impl` with a const assertion that `size_of` equals the sum of
+/// the field sizes — under `repr(C)`, that equality rules out padding.
+pub unsafe trait NoPadding: Copy {}
+
+// Safety: primitive integers are their size in initialized bytes — no
+// padding.
+unsafe impl NoPadding for u8 {}
+unsafe impl NoPadding for u16 {}
+unsafe impl NoPadding for u32 {}
+unsafe impl NoPadding for u64 {}
+unsafe impl NoPadding for u128 {}
+unsafe impl NoPadding for usize {}
+unsafe impl NoPadding for i8 {}
+unsafe impl NoPadding for i16 {}
+unsafe impl NoPadding for i32 {}
+unsafe impl NoPadding for i64 {}
+unsafe impl NoPadding for i128 {}
+unsafe impl NoPadding for isize {}
+
+// Safety: an array of padding-free elements is padding-free — its size is
+// exactly `N * size_of::<T>()`.
+unsafe impl<T: NoPadding, const N: usize> NoPadding for [T; N] {}
+
 /// Create a linked writer/reader pair over `value`.
 ///
 /// The writer is unique for the lifetime of the pair; readers are `Clone`
-/// and may be shared across any number of threads.
-pub fn split<T: Copy>(value: T) -> (SeqLockWriter<T>, SeqLockReader<T>) {
+/// and may be shared across any number of threads. The [`NoPadding`]
+/// bound is load-bearing — see the module docs.
+pub fn split<T: NoPadding>(value: T) -> (SeqLockWriter<T>, SeqLockReader<T>) {
     let cell = Arc::new(SeqLockCell::new(value));
     (
         SeqLockWriter {
@@ -70,11 +118,11 @@ pub fn split<T: Copy>(value: T) -> (SeqLockWriter<T>, SeqLockReader<T>) {
 /// Deliberately not `Clone`, and [`store`](Self::store) takes `&mut self`,
 /// so the single-writer invariant the protocol depends on cannot be broken
 /// without `unsafe`.
-pub struct SeqLockWriter<T: Copy> {
+pub struct SeqLockWriter<T: NoPadding> {
     cell: Arc<SeqLockCell<T>>,
 }
 
-impl<T: Copy> SeqLockWriter<T> {
+impl<T: NoPadding> SeqLockWriter<T> {
     /// Publish a new value. The sequence counter goes odd before the write
     /// and back to even after, so a reader that observes the mid-write
     /// state retries.
@@ -108,11 +156,11 @@ impl<T: Copy> SeqLockWriter<T> {
 }
 
 /// A reader of a seqlock value. Cheap to clone and share across threads.
-pub struct SeqLockReader<T: Copy> {
+pub struct SeqLockReader<T: NoPadding> {
     cell: Arc<SeqLockCell<T>>,
 }
 
-impl<T: Copy> Clone for SeqLockReader<T> {
+impl<T: NoPadding> Clone for SeqLockReader<T> {
     fn clone(&self) -> Self {
         Self {
             cell: Arc::clone(&self.cell),
@@ -120,7 +168,7 @@ impl<T: Copy> Clone for SeqLockReader<T> {
     }
 }
 
-impl<T: Copy> SeqLockReader<T> {
+impl<T: NoPadding> SeqLockReader<T> {
     /// Read the current value. Retries automatically on torn reads (writer
     /// was mid-update). Lock-free and wait-free in practice — retries only
     /// happen if a read overlaps a write, which is vanishingly rare when
@@ -176,7 +224,7 @@ impl<T: Copy> SeqLockReader<T> {
 /// Cache-line padded so the sequence counter and value do not false-share
 /// with whatever the allocator places next to them.
 #[repr(align(64))]
-struct SeqLockCell<T: Copy> {
+struct SeqLockCell<T: NoPadding> {
     /// Even = idle (safe to read), odd = write in progress. `u64` rather
     /// than `u32` so wrap-around is unreachable in practice: at one write
     /// per nanosecond it takes ~584 years, and a wrap that landed exactly
@@ -193,7 +241,7 @@ struct SeqLockCell<T: Copy> {
 #[repr(C, align(8))]
 struct Aligned<T>(UnsafeCell<T>);
 
-impl<T: Copy> SeqLockCell<T> {
+impl<T: NoPadding> SeqLockCell<T> {
     fn new(value: T) -> Self {
         Self {
             sequence: AtomicU64::new(0),
@@ -209,7 +257,9 @@ impl<T: Copy> SeqLockCell<T> {
 ///
 /// # Safety
 /// - `src` must be valid for reads of `size_of::<T>()` bytes with no
-///   concurrent writes (it is the writer's stack value).
+///   concurrent writes (it is the writer's stack value), and every one of
+///   those bytes must be initialized — guaranteed by the [`NoPadding`]
+///   bound at the public boundary.
 /// - `dst` must be valid for writes of `size_of::<T>()` bytes, 8-byte
 ///   aligned, and concurrently accessed only through atomics.
 unsafe fn atomic_store_copy<T>(src: *const T, dst: *mut T) {
@@ -266,8 +316,8 @@ unsafe fn atomic_load_copy<T>(src: *const T, dst: *mut T) {
 // Safety: T is Copy (no interior pointers), the writer handle is unique,
 // and the seqlock protocol ensures readers never return a partially
 // written value.
-unsafe impl<T: Copy + Send> Send for SeqLockCell<T> {}
-unsafe impl<T: Copy + Send> Sync for SeqLockCell<T> {}
+unsafe impl<T: NoPadding + Send> Send for SeqLockCell<T> {}
+unsafe impl<T: NoPadding + Send> Sync for SeqLockCell<T> {}
 
 #[cfg(test)]
 mod tests {

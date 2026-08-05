@@ -34,7 +34,7 @@ use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
 
 use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
-use melin_pipeline::seqlock::{SeqLockReader, SeqLockWriter};
+use melin_pipeline::seqlock::{NoPadding, SeqLockReader, SeqLockWriter};
 
 use crate::cursors::{DurableWireSeqCursor, PipelineCursors, RingPos, WireSeq};
 
@@ -64,6 +64,17 @@ pub struct FsyncState {
     /// it has caught up to the exact fsync boundary.
     pub input_ring_seq: RingPos,
 }
+
+// Safety: `repr(C)` over padding-free fields (`WireSeq` and `RingPos` are
+// `repr(transparent)` over `u64`, plus a byte array), with the assertion
+// below proving the size equals the sum of the field sizes — under
+// `repr(C)`, that equality rules out padding.
+unsafe impl NoPadding for FsyncState {}
+// Compile-time proof for the impl above; fails the build if a future field
+// introduces padding.
+const _: () = assert!(
+    size_of::<FsyncState>() == size_of::<WireSeq>() + size_of::<[u8; 32]>() + size_of::<RingPos>()
+);
 
 /// Per-stage busy/idle iteration counters for pipeline utilization monitoring.
 ///
