@@ -26,10 +26,30 @@
 //!
 //! The counter's atomicity was never the missing piece; the even/odd
 //! invariant is, and no read-modify-write restores it.
+//!
+//! # The payload copy is atomic — not plain, not volatile
+//!
+//! A reader's payload load intentionally races with the writer's store;
+//! the sequence check discards torn values. But in the Rust memory model
+//! a racing non-atomic access is a data race — undefined behavior even
+//! when the value is thrown away — and volatile does not help: volatile
+//! only pins the number of real accesses the compiler emits, it does not
+//! make them atomic (Miri flags both the plain and the volatile variant
+//! as UB). The payload is therefore copied through word-sized `Relaxed`
+//! atomics — the same construction crossbeam's seqlock uses — with the
+//! fences below providing the ordering. On x86 and AArch64 a `Relaxed`
+//! atomic load/store compiles to a plain mov / `ldr`+`str`, so this
+//! costs nothing over the volatile version.
+//!
+//! One requirement follows: `T` must not contain padding bytes, because
+//! atomically reading a word that covers uninitialized padding is itself
+//! UB. All current payloads (`u64`, `[u8; 32]`, `FsyncState`) are
+//! padding-free.
 
 use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Create a linked writer/reader pair over `value`.
 ///
@@ -72,16 +92,13 @@ impl<T: Copy> SeqLockWriter<T> {
         // Fence: the sequence increment is visible before the value write.
         std::sync::atomic::fence(Ordering::Release);
 
-        // Volatile: this write intentionally races with reader loads (the
-        // seq check makes them discard torn values), which a plain store
-        // would make a formal data race the compiler may assume away.
-        // Volatile keeps the access a single untorn-as-emitted, non-elidable
-        // store — the seqlock idiom used in practice (e.g. Linux, crossbeam).
-        //
         // Safety: the writer handle is unique and `store` takes `&mut
-        // self`, so no other write overlaps this one, and `value.get()`
-        // is a valid, aligned pointer for the cell's lifetime.
-        unsafe { std::ptr::write_volatile(cell.value.get(), value) };
+        // self`, so no other write overlaps this one; `src` is a live
+        // stack value; `dst` is valid for the cell's lifetime and
+        // 8-aligned (`Aligned`). Racing reader loads are atomic, so the
+        // per-word atomic stores race with nothing non-atomic (see the
+        // module docs for why the copy must be atomic).
+        unsafe { atomic_store_copy(&raw const value, cell.value.0.get()) };
 
         // Fence: the value write is visible before the sequence goes back
         // to even.
@@ -119,26 +136,31 @@ impl<T: Copy> SeqLockReader<T> {
                 continue;
             }
 
-            // Volatile: this load may race with the writer's store; the
-            // seq2 check below discards any torn result, but a plain load
-            // racing with a store is formally UB the compiler may fold or
-            // re-materialize. Volatile forces one real load per iteration.
+            // This load may race with the writer's store; the seq2 check
+            // below discards any torn result. The copy is atomic per
+            // word, so the race is defined behavior, and the bytes land
+            // in a `MaybeUninit` that is only assumed initialized after
+            // the sequence check proves they came from one complete
+            // `store` (see the module docs).
             //
-            // Safety: `value.get()` is a valid, aligned pointer for the
-            // cell's lifetime, and `T: Copy` means duplicating the bytes
-            // is sound even if they are torn (we then retry, not return).
-            let value = unsafe { std::ptr::read_volatile(cell.value.get()) };
+            // Safety: `src` is valid for the cell's lifetime and
+            // 8-aligned (`Aligned`); `dst` is a live stack buffer.
+            let mut value = MaybeUninit::<T>::uninit();
+            unsafe { atomic_load_copy(cell.value.0.get(), value.as_mut_ptr()) };
 
-            // On weakly-ordered architectures (ARM/AArch64), the plain
-            // load of `value` above can be reordered past a subsequent
+            // On weakly-ordered architectures (ARM/AArch64), the Relaxed
+            // payload loads above can be reordered past a subsequent
             // atomic load at a different address. This Acquire fence
-            // ensures the value read completes before we re-read the
+            // ensures the payload copy completes before we re-read the
             // sequence counter — without it, we could observe seq1==seq2
             // while `value` contains a torn read.
             std::sync::atomic::fence(Ordering::Acquire);
             let seq2 = cell.sequence.load(Ordering::Relaxed);
             if seq1 == seq2 {
-                return value;
+                // Safety: the sequence did not change across the copy,
+                // so every word came from the same completed `store` of
+                // a valid `T` — the bytes are initialized and coherent.
+                return unsafe { value.assume_init() };
             }
             // Sequence changed — writer updated during our read. Retry.
             std::hint::spin_loop();
@@ -161,15 +183,83 @@ struct SeqLockCell<T: Copy> {
     /// between a reader's two counter loads would be needed to fool the
     /// torn-read check.
     sequence: AtomicU64,
-    value: UnsafeCell<T>,
+    value: Aligned<T>,
 }
+
+/// Payload storage forced to 8-byte alignment so the copy helpers can
+/// access it in `AtomicU64` chunks regardless of `T`'s own alignment
+/// (`[u8; 32]` is only 1-aligned). `repr(C)` pins the cell at offset 0
+/// so the guarantee transfers to the payload itself.
+#[repr(C, align(8))]
+struct Aligned<T>(UnsafeCell<T>);
 
 impl<T: Copy> SeqLockCell<T> {
     fn new(value: T) -> Self {
         Self {
             sequence: AtomicU64::new(0),
-            value: UnsafeCell::new(value),
+            value: Aligned(UnsafeCell::new(value)),
         }
+    }
+}
+
+/// Copy `size_of::<T>()` bytes from `src` into `dst` with per-word
+/// `Relaxed` atomic stores: `AtomicU64` chunks, then an `AtomicU8` tail
+/// for payload sizes that are not a multiple of 8. Ordering relative to
+/// the sequence counter comes from the fences in `store`.
+///
+/// # Safety
+/// - `src` must be valid for reads of `size_of::<T>()` bytes with no
+///   concurrent writes (it is the writer's stack value).
+/// - `dst` must be valid for writes of `size_of::<T>()` bytes, 8-byte
+///   aligned, and concurrently accessed only through atomics.
+unsafe fn atomic_store_copy<T>(src: *const T, dst: *mut T) {
+    let size = size_of::<T>();
+    let src = src.cast::<u8>();
+    let dst = dst.cast::<u8>();
+    let mut offset = 0;
+    // The `AtomicU64` casts are aligned: `dst` is 8-aligned and `offset`
+    // is a multiple of 8. `src` has only `T`'s alignment — which can be
+    // 1 — hence `read_unaligned`.
+    while offset + 8 <= size {
+        let chunk = unsafe { src.add(offset).cast::<u64>().read_unaligned() };
+        let slot = unsafe { &*dst.add(offset).cast::<AtomicU64>() };
+        slot.store(chunk, Ordering::Relaxed);
+        offset += 8;
+    }
+    while offset < size {
+        let byte = unsafe { *src.add(offset) };
+        let slot = unsafe { &*dst.add(offset).cast::<AtomicU8>() };
+        slot.store(byte, Ordering::Relaxed);
+        offset += 1;
+    }
+}
+
+/// Mirror of [`atomic_store_copy`]: per-word `Relaxed` atomic loads from
+/// the shared payload into a private buffer. The result may be torn if a
+/// write overlapped the copy — the caller must validate the sequence
+/// counter before treating `dst` as initialized.
+///
+/// # Safety
+/// - `src` must be valid for reads of `size_of::<T>()` bytes, 8-byte
+///   aligned, and concurrently written only through atomics.
+/// - `dst` must be valid for writes of `size_of::<T>()` bytes with no
+///   concurrent access (it is the reader's stack buffer).
+unsafe fn atomic_load_copy<T>(src: *const T, dst: *mut T) {
+    let size = size_of::<T>();
+    let src = src.cast::<u8>();
+    let dst = dst.cast::<u8>();
+    let mut offset = 0;
+    while offset + 8 <= size {
+        let slot = unsafe { &*src.add(offset).cast::<AtomicU64>() };
+        let chunk = slot.load(Ordering::Relaxed);
+        unsafe { dst.add(offset).cast::<u64>().write_unaligned(chunk) };
+        offset += 8;
+    }
+    while offset < size {
+        let slot = unsafe { &*src.add(offset).cast::<AtomicU8>() };
+        let byte = slot.load(Ordering::Relaxed);
+        unsafe { *dst.add(offset) = byte };
+        offset += 1;
     }
 }
 
