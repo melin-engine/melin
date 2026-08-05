@@ -72,10 +72,16 @@ impl<T: Copy> SeqLockWriter<T> {
         // Fence: the sequence increment is visible before the value write.
         std::sync::atomic::fence(Ordering::Release);
 
+        // Volatile: this write intentionally races with reader loads (the
+        // seq check makes them discard torn values), which a plain store
+        // would make a formal data race the compiler may assume away.
+        // Volatile keeps the access a single untorn-as-emitted, non-elidable
+        // store — the seqlock idiom used in practice (e.g. Linux, crossbeam).
+        //
         // Safety: the writer handle is unique and `store` takes `&mut
-        // self`, so no other write and no reader-visible aliasing can
-        // overlap this one.
-        unsafe { *cell.value.get() = value };
+        // self`, so no other write overlaps this one, and `value.get()`
+        // is a valid, aligned pointer for the cell's lifetime.
+        unsafe { std::ptr::write_volatile(cell.value.get(), value) };
 
         // Fence: the value write is visible before the sequence goes back
         // to even.
@@ -113,10 +119,15 @@ impl<T: Copy> SeqLockReader<T> {
                 continue;
             }
 
-            // Safety: sequence is even, so no write is in progress. The
-            // Acquire on seq1 ensures we see the completed write, and the
-            // seq2 check below discards the value if that stopped holding.
-            let value = unsafe { *cell.value.get() };
+            // Volatile: this load may race with the writer's store; the
+            // seq2 check below discards any torn result, but a plain load
+            // racing with a store is formally UB the compiler may fold or
+            // re-materialize. Volatile forces one real load per iteration.
+            //
+            // Safety: `value.get()` is a valid, aligned pointer for the
+            // cell's lifetime, and `T: Copy` means duplicating the bytes
+            // is sound even if they are torn (we then retry, not return).
+            let value = unsafe { std::ptr::read_volatile(cell.value.get()) };
 
             // On weakly-ordered architectures (ARM/AArch64), the plain
             // load of `value` above can be reordered past a subsequent
