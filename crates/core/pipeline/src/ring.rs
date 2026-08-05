@@ -615,15 +615,23 @@ impl<T: Copy + Default> Consumer<T> {
         // written by the producer (dependency.load() returned a value
         // >= next_read+count) and the producer cannot overwrite them
         // until `processed` advances — which `peek_batch` does not do.
-        // `UnsafeCell<T>::get()` on a `Box<[UnsafeCell<T>]>` yields a
-        // contiguous run of `*mut T`, so a `std::slice::from_raw_parts`
-        // over [start_idx, start_idx+first_len) is sound. The two
-        // slices never overlap (the second always starts at index 0).
+        // `UnsafeCell<T>` is `repr(transparent)`, so a contiguous run of
+        // `UnsafeCell<T>` slots reads as a contiguous run of `T`. The
+        // slice pointers are derived from the whole `slots` allocation
+        // (`as_ptr().add(idx)`), NOT from a single element's `.get()`:
+        // an element-derived pointer only has provenance for that one
+        // element, and a multi-element `from_raw_parts` through it is
+        // UB (caught by Miri under Stacked Borrows). The two slices
+        // never overlap (the second always starts at index 0).
+        let base: *const UnsafeCell<T> = self.shared.buffer.slots.as_ptr();
         let first = unsafe {
-            std::slice::from_raw_parts(self.shared.buffer.slots[start_idx].get(), first_len)
+            std::slice::from_raw_parts(
+                UnsafeCell::raw_get(base.add(start_idx)) as *const T,
+                first_len,
+            )
         };
         let second = if second_len > 0 {
-            unsafe { std::slice::from_raw_parts(self.shared.buffer.slots[0].get(), second_len) }
+            unsafe { std::slice::from_raw_parts(UnsafeCell::raw_get(base) as *const T, second_len) }
         } else {
             &[]
         };
