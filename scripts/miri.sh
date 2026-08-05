@@ -61,12 +61,15 @@ echo "==> miri: melin-pipeline"
 cargo +nightly miri test -p melin-pipeline -- "${FILTER[@]}"
 
 # Test modules that hit real file/socket syscalls even under
-# no-persist. Keep in sync with any new I/O-touching test modules.
+# no-persist (pipeline_tests: every pipeline needs a real journal file
+# at construction; no-persist only skips the writes). Keep in sync with
+# any new I/O-touching test modules.
 SKIPS=(
     --skip health::
     --skip snapshot::
     --skip shadow::
     --skip journaled_app::
+    --skip pipeline_tests::
     --skip replication::handoff_test
     --skip replication::validate
     --skip replication::archive
