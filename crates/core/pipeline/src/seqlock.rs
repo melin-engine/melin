@@ -347,14 +347,17 @@ mod tests {
         assert_eq!((r1.load(), r2.load()), (7, 7));
     }
 
+    /// Miri interprets ~1000x slower than native; a few hundred racy
+    /// iterations still give its data-race detector plenty of overlapping
+    /// accesses to check, where the native count would run for minutes.
+    const STRESS_ITERATIONS: u32 = if cfg!(miri) { 300 } else { 100_000 };
+
     #[test]
     fn concurrent_writer_reader_no_torn_reads() {
         let (mut writer_lock, lock) = split([0u8; 32]);
 
-        let iterations = 100_000;
-
         let writer = std::thread::spawn(move || {
-            for i in 0..iterations {
+            for i in 0..STRESS_ITERATIONS {
                 // Write a uniform-byte array so torn reads are detectable:
                 // if the reader sees mixed bytes, the seqlock failed.
                 let byte = (i % 256) as u8;
@@ -363,8 +366,11 @@ mod tests {
         });
 
         // Reader: verify every read is a uniform array (no torn reads).
+        // Check the finish flag before the read so at least one load
+        // always happens, even if the writer finishes before we start.
         let mut reads = 0u64;
-        while !writer.is_finished() {
+        loop {
+            let writer_finished = writer.is_finished();
             let value = lock.load();
             // All 32 bytes must be the same — a torn read would mix
             // bytes from two different writes.
@@ -374,6 +380,9 @@ mod tests {
                 value
             );
             reads += 1;
+            if writer_finished {
+                break;
+            }
         }
         writer.join().unwrap();
 
@@ -391,8 +400,12 @@ mod tests {
                 let lock = lock.clone();
                 let done = Arc::clone(&done);
                 std::thread::spawn(move || {
+                    // Check the done flag before the read so at least one
+                    // load always happens, even if the writer finishes
+                    // before this thread is first scheduled.
                     let mut reads = 0u64;
-                    while !done.load(Ordering::Relaxed) {
+                    loop {
+                        let writer_done = done.load(Ordering::Relaxed);
                         let value = lock.load();
                         assert!(
                             value.iter().all(|&b| b == value[0]),
@@ -400,13 +413,16 @@ mod tests {
                             value
                         );
                         reads += 1;
+                        if writer_done {
+                            break;
+                        }
                     }
                     reads
                 })
             })
             .collect();
 
-        for i in 0..100_000u32 {
+        for i in 0..STRESS_ITERATIONS {
             writer_lock.store([(i % 256) as u8; 32]);
         }
         done.store(true, Ordering::Relaxed);
