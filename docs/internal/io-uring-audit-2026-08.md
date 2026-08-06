@@ -113,6 +113,31 @@ ownership, cross-flush CQE accounting, and cancel-on-disconnect handling
 efficiency only in the rare blocked-client case that the paced retry
 already bounds.
 
+**Adversarial-review follow-ups (2026-08-07)**, applied on top of the
+initial fix:
+
+- `submit_and_wait` retries `EINTR` instead of returning early. The
+  interrupt lands after the submit phase consumed the SQEs, so the
+  inline completions are already posted; returning without reaping left
+  stale CQEs that the *next* flush would apply against updated buffer
+  contents — a delivered prefix re-sent and `drain(..sent)` applied
+  twice. Non-`EINTR` submit errors now fall through and apply whatever
+  completed rather than leaving those CQEs stale.
+- The blocked-drop clock measures time since last *forward progress*,
+  not time since first refusal: a partial send restarts it. A
+  slow-but-steadily-draining client is `MAX_SEND_BUF`'s problem;
+  only a peer accepting zero bytes for the full timeout is dropped.
+- Accepted, not fixed here: the busy path (SPSC never empty, gate open)
+  flushes only inside the gate-wait branch, so both delivery and the
+  blocked-peer bookkeeping can be starved during a sustained busy
+  stretch. That is the pre-existing flush-cadence shape tracked as
+  finding 4 of `latency-audit-2026-07.md` — resolve it there, not with
+  an ad-hoc trigger in this fix. Also accepted: under `latency-trace`,
+  e2e samples close on the first flush *attempt* even when the SEND
+  returned `EAGAIN`, slightly understating egress for blocked peers
+  (trace-only, and blocked peers are the pathology being measured
+  around, not the signal).
+
 ## 2. The ServerBusy frame is written with a blocking syscall on the reader thread
 
 When the input disruptor is full, the reader sheds load by writing a

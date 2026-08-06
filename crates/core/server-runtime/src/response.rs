@@ -61,12 +61,14 @@ const MAX_SEND_BUF: usize = 64 * 1024;
 /// cadence (millisecond scale), and healthy connections are never paced.
 const BLOCKED_RETRY_INTERVAL: Duration = Duration::from_micros(100);
 
-/// How long a connection may hold undelivered bytes behind a full socket
-/// buffer before it is dropped. Complements `MAX_SEND_BUF`, which only
-/// catches clients that lag while new responses keep *arriving* — a
-/// client that stops reading during a quiet period accumulates almost
-/// nothing (heartbeats only) and would otherwise pin its buffered bytes
-/// and its slot indefinitely.
+/// How long a connection's socket may accept *zero* bytes while it has
+/// undelivered data before it is dropped. Partial progress restarts the
+/// clock — a slow-but-draining client is `MAX_SEND_BUF`'s problem, not
+/// this one's. Complements `MAX_SEND_BUF`, which only catches clients
+/// that lag while new responses keep *arriving* — a client that stops
+/// reading during a quiet period accumulates almost nothing (heartbeats
+/// only) and would otherwise pin its buffered bytes and its slot
+/// indefinitely.
 const BLOCKED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use crate::ControlEvent;
@@ -144,9 +146,10 @@ struct ConnectionEntry {
     send_buf: Vec<u8>,
     /// Last time data was sent to this connection. Used for heartbeat scheduling.
     last_send: Instant,
-    /// When this connection's socket first refused bytes (`EAGAIN`, or a
-    /// partial send that filled the socket buffer). `None` while the
-    /// socket is accepting everything. Drives retry pacing and the
+    /// When this connection's socket last made zero forward progress:
+    /// set on `EAGAIN`, reset to the flush timestamp on a partial send
+    /// (bytes moved), cleared when the buffer fully drains. `None` while
+    /// the socket is accepting everything. Drives retry pacing and the
     /// [`BLOCKED_SEND_TIMEOUT`] drop.
     blocked_since: Option<Instant>,
     /// Last SEND attempt. Read only while blocked, to pace retries at
@@ -1186,9 +1189,31 @@ fn flush_sends(
         // (success, partial, or EAGAIN — the flag sets the kernel's
         // no-wait path, so nothing is deferred to a poll retry). The
         // wait is bounded by op execution, never by a peer.
-        if let Err(e) = ring.submit_and_wait(pending) {
-            error!(error = %e, "io_uring submit_and_wait failed in response stage");
-            return;
+        //
+        // EINTR must retry, not return: a signal (profilers use them
+        // routinely) can interrupt the CQE wait *after* the submit phase
+        // consumed the SQEs — the inline completions are already posted
+        // by then. Returning without reaping would leave stale CQEs that
+        // the next flush drains against *updated* buffer contents:
+        // a delivered prefix gets re-sent and `drain(..sent)` double-
+        // drains. The retry submits an empty SQ and finds the CQ already
+        // holding `pending` entries, so it cannot stall.
+        loop {
+            match ring.submit_and_wait(pending) {
+                Ok(_) => break,
+                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => {
+                    // Submit-phase failure (ENOMEM class — EBUSY cannot
+                    // happen: the CQ is RING_SIZE deep and fully reaped
+                    // every flush, so at most `pending` ≤ RING_SIZE
+                    // entries are ever outstanding). A genuine server
+                    // malfunction; fall through and apply whatever did
+                    // complete — strictly safer than leaving those CQEs
+                    // stale for the next flush's accounting.
+                    error!(error = %e, "io_uring submit_and_wait failed in response stage");
+                    break;
+                }
+            }
         }
 
         // Drain completions into pre-allocated buffer. Must collect to
@@ -1225,11 +1250,13 @@ fn flush_sends(
             } else {
                 // Partial send — the socket buffer filled mid-copy. An
                 // immediate retry would only report EAGAIN, so keep the
-                // remainder for the paced retry, same as a full block.
+                // remainder for the paced retry. Bytes moved, though:
+                // restart the blocked clock from this progress, so only
+                // a peer accepting *zero* bytes for the full timeout is
+                // dropped — a slow-but-draining client keeps its
+                // connection (until `MAX_SEND_BUF` says otherwise).
                 entry.send_buf.drain(..sent);
-                if entry.blocked_since.is_none() {
-                    entry.blocked_since = Some(now);
-                }
+                entry.blocked_since = Some(now);
             }
         }
     }
@@ -2792,8 +2819,21 @@ mod tests {
             assert_eq!(rc, 0, "setsockopt(SO_SNDBUF) failed");
             let payload = vec![0x55u8; 512 * 1024];
 
+            // Enter the flush as an already-blocked peer with a stale
+            // (but unexpired) block timestamp and an expired pacing
+            // window, so the partial delivery below must *restart* the
+            // blocked clock — the behaviour that keeps a slow-but-
+            // draining client alive past BLOCKED_SEND_TIMEOUT.
+            let Some(stale_block) = Instant::now().checked_sub(BLOCKED_SEND_TIMEOUT / 2) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            let mut entry = entry_for(tx, &payload);
+            entry.blocked_since = Some(stale_block);
+            entry.last_send_attempt = stale_block;
+
             let mut connections = HashMap::new();
-            connections.insert(1u64, entry_for(tx, &payload));
+            connections.insert(1u64, entry);
             let mut dirty: HashSet<u64> = [1].into_iter().collect();
             let mut to_remove = Vec::new();
             let mut cqes = Vec::new();
@@ -2809,7 +2849,11 @@ mod tests {
             let entry = &connections[&1];
             assert!(entry.send_buf.len() < payload.len(), "some bytes were sent");
             assert!(!entry.send_buf.is_empty(), "remainder kept for retry");
-            assert!(entry.blocked_since.is_some(), "partial send marks blocked");
+            let refreshed = entry.blocked_since.expect("partial send marks blocked");
+            assert!(
+                refreshed > stale_block,
+                "forward progress restarts the blocked clock"
+            );
             assert!(dirty.contains(&1));
             assert!(to_remove.is_empty());
         }
@@ -2824,7 +2868,13 @@ mod tests {
             fill_socket(tx.as_raw_fd());
 
             let mut entry = entry_for(tx, &[1u8; 64]);
-            entry.blocked_since = Some(Instant::now() - BLOCKED_SEND_TIMEOUT);
+            // `checked_sub`: a plain `-` panics when the monotonic clock
+            // is younger than the timeout (fresh-boot CI microVMs).
+            let Some(expired) = Instant::now().checked_sub(BLOCKED_SEND_TIMEOUT) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            entry.blocked_since = Some(expired);
             let mut connections = HashMap::new();
             connections.insert(7u64, entry);
             let mut dirty: HashSet<u64> = [7].into_iter().collect();
@@ -2854,7 +2904,11 @@ mod tests {
 
             let mut entry = entry_for(tx, &[1u8; 64]);
             entry.blocked_since = Some(Instant::now());
-            entry.last_send_attempt = Instant::now();
+            // A future attempt timestamp makes the pacing skip
+            // deterministic: `duration_since` saturates to zero, so no
+            // CI-load preemption between here and the flush's own clock
+            // read can open the 100 µs window and flake the assertion.
+            entry.last_send_attempt = Instant::now() + Duration::from_secs(1);
             let attempted_at = entry.last_send_attempt;
             let mut connections = HashMap::new();
             connections.insert(3u64, entry);
@@ -2879,8 +2933,11 @@ mod tests {
 
             // Outside the pacing window the retry happens: backdate the
             // last attempt and verify the attempt timestamp advances.
-            connections.get_mut(&3).unwrap().last_send_attempt =
-                attempted_at - BLOCKED_RETRY_INTERVAL * 2;
+            let Some(backdated) = Instant::now().checked_sub(BLOCKED_RETRY_INTERVAL * 2) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            connections.get_mut(&3).unwrap().last_send_attempt = backdated;
             flush_sends(
                 &mut ring,
                 &mut connections,
@@ -2889,7 +2946,7 @@ mod tests {
                 &mut cqes,
             );
             assert!(
-                connections[&3].last_send_attempt > attempted_at,
+                connections[&3].last_send_attempt > backdated,
                 "retry submitted once the pacing window elapsed"
             );
         }
