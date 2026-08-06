@@ -1016,7 +1016,6 @@ where
 mod tests {
     use std::io::Write;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
 
     use super::auth::{authenticate_replica, authenticate_with_primary};
     use super::*;
@@ -1027,7 +1026,6 @@ mod tests {
     // test deps free of exchange crates.
     use counter_server::CounterEvent;
     type InputSlot = melin_transport_core::pipeline::InputSlot<CounterEvent>;
-    use melin_transport_core::PipelineCursors;
     use melin_transport_core::replication::protocol::{
         MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE, MSG_SNAPSHOT_BEGIN,
         MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, decode_auth_result, decode_challenge,
@@ -1529,10 +1527,7 @@ mod tests {
         // Create a mock connection.
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
 
-        let replication_cursor = Arc::new(AtomicU64::new(0));
-
         // Spawn a thread simulating the replica side.
-        let _replica_cursor = Arc::clone(&replication_cursor);
         let replica_handle = std::thread::spawn(move || {
             let mut reader = replica_stream.try_clone().unwrap();
             let mut writer = replica_stream;
@@ -1610,55 +1605,6 @@ mod tests {
         // Join replica thread.
         let end_seq = replica_handle.join().unwrap();
         assert_eq!(end_seq, 42);
-    }
-
-    #[test]
-    fn disconnect_degrades_cursor_to_max() {
-        // When a replica disconnects, run_sender resets the replication
-        // cursor to u64::MAX so the response stage stops gating on acks.
-        // Test the cursor lifecycle: starts at 0, set during handshake,
-        // then reset to MAX on disconnect.
-        let cursor = Arc::new(AtomicU64::new(0));
-
-        // Simulate handshake: cursor set to last_sequence + 1.
-        let handshake_seq = 42u64;
-        cursor.store(handshake_seq + 1, Ordering::Release);
-        assert_eq!(cursor.load(Ordering::Acquire), 43);
-
-        // Simulate ack advancing cursor.
-        cursor.fetch_max(100 + 1, Ordering::Release);
-        assert_eq!(cursor.load(Ordering::Acquire), 101);
-
-        // Simulate disconnect: run_sender parks the cursor at the
-        // disengaged sentinel.
-        cursor.store(PipelineCursors::NO_REPLICA, Ordering::Release);
-        assert_eq!(cursor.load(Ordering::Acquire), PipelineCursors::NO_REPLICA);
-
-        // Simulate reconnect: cursor set back to handshake value.
-        cursor.store(1, Ordering::Release);
-        assert_eq!(cursor.load(Ordering::Acquire), 1);
-    }
-
-    #[test]
-    fn ack_advances_cursor_monotonically() {
-        // Acks must only advance the cursor, never regress it.
-        // A stale ack (lower sequence) should be ignored.
-        let cursor = Arc::new(AtomicU64::new(0));
-
-        // Simulate processing ack seq=100 → cursor should become 101.
-        let new_val = 100 + 1;
-        cursor.fetch_max(new_val, Ordering::Release);
-        assert_eq!(cursor.load(Ordering::Acquire), 101);
-
-        // Stale ack seq=50 → cursor should stay at 101.
-        let stale_val = 50 + 1;
-        cursor.fetch_max(stale_val, Ordering::Release);
-        assert_eq!(cursor.load(Ordering::Acquire), 101);
-
-        // Newer ack seq=200 → cursor should advance to 201.
-        let newer_val = 200 + 1;
-        cursor.fetch_max(newer_val, Ordering::Release);
-        assert_eq!(cursor.load(Ordering::Acquire), 201);
     }
 
     #[test]
@@ -2671,41 +2617,5 @@ mod tests {
             .is_none(),
             "post-resume idle → no further ack",
         );
-    }
-
-    // --- Cursor reset test ---
-
-    #[test]
-    fn disconnect_resets_cursor_to_max() {
-        // Verify the cursor reset behavior documented in the replication
-        // cursor table: "All replicas disconnect → NO_REPLICA sentinel".
-        let cursor = Arc::new(AtomicU64::new(42));
-        let replicas_connected = Arc::new(AtomicU32::new(1));
-
-        // Simulate disconnect: decrement connected count.
-        replicas_connected.fetch_sub(1, Ordering::Release);
-
-        // The sender loop checks and resets.
-        if replicas_connected.load(Ordering::Relaxed) == 0 {
-            cursor.store(PipelineCursors::NO_REPLICA, Ordering::Release);
-        }
-
-        assert_eq!(cursor.load(Ordering::Relaxed), PipelineCursors::NO_REPLICA);
-    }
-
-    #[test]
-    fn cursor_not_reset_when_replica_still_connected() {
-        let cursor = Arc::new(AtomicU64::new(42));
-        let replicas_connected = Arc::new(AtomicU32::new(2));
-
-        // One replica disconnects, one remains.
-        replicas_connected.fetch_sub(1, Ordering::Release);
-
-        if replicas_connected.load(Ordering::Relaxed) == 0 {
-            cursor.store(PipelineCursors::NO_REPLICA, Ordering::Release);
-        }
-
-        // Cursor should NOT be reset — one replica still connected.
-        assert_eq!(cursor.load(Ordering::Relaxed), 42);
     }
 }

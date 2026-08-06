@@ -111,6 +111,89 @@ impl SlotAcked {
     }
 }
 
+/// Shared per-slot replica progress cursors, in [`SlotAcked`] space.
+///
+/// The single source of truth for replica-progress monitoring: the
+/// replication sender (`ReplicaCursors`, the sole production writer)
+/// stores each slot's acked position here, and readers derive the
+/// quorum (`min`) and fastest (`max`) views **at read time**.
+///
+/// Derive-on-read replaces a previously *published* min/max aggregate
+/// pair. Maintaining derived state from multiple writer threads (the two
+/// per-slot sender threads plus the accept loop's disconnect path) was a
+/// multi-atomic read-modify-write — snapshot both slots, store min, store
+/// max — and two concurrent recomputes could interleave last-writer-wins,
+/// leaving a stale aggregate published until the next ack. `fetch_min`/
+/// `fetch_max` could not fix that because the aggregates must be able to
+/// *decrease* (a reconnect lowers the min, a disconnect lowers the max).
+/// With no derived state there is nothing to race on: each slot has
+/// exactly one writer at a time, and every read observes the latest
+/// committed slot stores. Both consumers (health endpoint, Prometheus
+/// gauges) are cold read paths, so the two loads per read are free.
+pub struct ReplicaSlotCursors {
+    /// `[AtomicU64; 2]` rather than per-slot `Arc`s: both slots live on
+    /// one cache line of a single shared allocation, and both derived
+    /// views need both values anyway.
+    slots: [AtomicU64; Self::SLOTS],
+}
+
+impl ReplicaSlotCursors {
+    /// Number of replica slots. Fixed by the `1 primary + 2 replicas`
+    /// topology cap (see `ReplicationMetrics` for the same rationale).
+    pub const SLOTS: usize = 2;
+
+    /// Fresh cursors with every slot parked at [`SlotAcked::DISENGAGED`].
+    pub fn new() -> Self {
+        Self {
+            slots: [
+                AtomicU64::new(SlotAcked::DISENGAGED.raw()),
+                AtomicU64::new(SlotAcked::DISENGAGED.raw()),
+            ],
+        }
+    }
+
+    /// Store a slot's position. `Release` so a reader that observes the
+    /// writer's subsequent `active_flag` flip also observes this position
+    /// (see the ordering contract in the `replication::cursors` module).
+    /// `pub(crate)`: every production store goes through `ReplicaCursors`,
+    /// which owns the ack-sanity invariant; only in-crate tests store
+    /// directly.
+    pub(crate) fn store(&self, slot: usize, value: SlotAcked) {
+        self.slots[slot].store(value.raw(), Ordering::Release);
+    }
+
+    /// Highest wire seq durably confirmed by *every* engaged replica (the
+    /// slowest engaged replica's ack), or `None` while no replica is
+    /// engaged. `min` over the slots needs no disengaged handling:
+    /// `min(x, DISENGAGED) == x`, and all-disengaged yields the sentinel,
+    /// which decodes to `None`.
+    #[inline]
+    pub fn quorum_acked(&self) -> Option<WireSeq> {
+        // `Acquire` pairs with the writer's `Release` stores.
+        let a = self.slots[0].load(Ordering::Acquire);
+        let b = self.slots[1].load(Ordering::Acquire);
+        SlotAcked::from_raw(a.min(b)).acked()
+    }
+
+    /// Highest wire seq confirmed by the *fastest* engaged replica, or
+    /// `None` while no replica is engaged. Decoding each slot before
+    /// taking the max skips disengaged slots (`None < Some(_)`) —
+    /// otherwise one parked slot's sentinel would masquerade as the
+    /// fastest replica whenever fewer than two replicas are connected.
+    #[inline]
+    pub fn fastest_acked(&self) -> Option<WireSeq> {
+        let a = SlotAcked::from_raw(self.slots[0].load(Ordering::Acquire)).acked();
+        let b = SlotAcked::from_raw(self.slots[1].load(Ordering::Acquire)).acked();
+        a.max(b)
+    }
+}
+
+impl Default for ReplicaSlotCursors {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared handle to the durable-wire-seq cursor: the highest wire seq durably
 /// persisted on this node's journal. This is the durability gate's `persisted`
 /// cursor, the replica reconnect-handshake value, and the health endpoint's
@@ -165,34 +248,26 @@ pub struct PipelineCursors {
     journal_ring: Arc<Sequence>,
     /// Matching consumer's ring progress (slots read), for queue-depth monitoring.
     matching_ring: Arc<Sequence>,
-    /// Replica quorum cursor: `min` over the engaged replicas' cursors,
-    /// maintained by the replication sender (`ReplicaCursors`) in
-    /// [`SlotAcked`] space — `load_replica_quorum_acked` decodes back to the
-    /// acked wire seq. Holds [`Self::NO_REPLICA`] until a replica engages,
-    /// and for the lifetime of a replica node (no downstream replica to ack
-    /// it). Monitoring-only: the durability gate evaluates replica progress
-    /// from `ReplicationMetrics`, not from this cursor.
-    replica_quorum_cursor: Arc<AtomicU64>,
+    /// Per-slot replica progress cursors, maintained by the replication
+    /// sender (`ReplicaCursors`) in [`SlotAcked`] space. The quorum
+    /// (slowest engaged replica) and fastest-replica views are derived at
+    /// read time — see [`ReplicaSlotCursors`]. Every slot stays parked at
+    /// [`SlotAcked::DISENGAGED`] until a replica engages, and for the
+    /// lifetime of a replica node (no downstream replica to ack it).
+    /// Monitoring-only: the durability gate evaluates replica progress
+    /// from `ReplicationMetrics`, not from these cursors.
+    replica_slots: Arc<ReplicaSlotCursors>,
 }
 
 impl PipelineCursors {
-    /// Sentinel held by `replica_quorum_cursor` while no replica is engaged
-    /// (standalone mode, pre-connect, or a replica node). Defined as
-    /// [`SlotAcked::DISENGAGED`]'s raw value — the replication sender parks
-    /// disengaged slots at the same value, and `min`/`max` over
-    /// all-disengaged slots yield it back;
-    /// [`load_replica_quorum_acked`](Self::load_replica_quorum_acked) maps it
-    /// to `None` so the health endpoint reports zero replication lag.
-    pub const NO_REPLICA: u64 = SlotAcked::DISENGAGED.raw();
-
     /// Bundle the journal-progress cursors.
     ///
-    /// The two wire-seq atomics are constructed here — `durable_wire_seq`
+    /// The wire-seq cursors are constructed here — `durable_wire_seq`
     /// from `starting_durable` (the recovered/genesis high-water mark) and
-    /// `replica_quorum_cursor` parked at [`Self::NO_REPLICA`] — so no call
-    /// site can cross-wire them; writers are handed handles afterwards
+    /// `replica_slots` with every slot disengaged — so no call site can
+    /// cross-wire them; writers are handed handles afterwards
     /// ([`durable_wire_seq`](Self::durable_wire_seq) for the journal stage,
-    /// [`replica_quorum_cursor_arc`](Self::replica_quorum_cursor_arc) for the
+    /// [`replica_slot_cursors`](Self::replica_slot_cursors) for the
     /// replication sender). The two ring cursors share a type, so a swap
     /// there is still expressible — but it only skews queue-depth gauges,
     /// not durability.
@@ -205,7 +280,7 @@ impl PipelineCursors {
             durable_wire_seq: DurableWireSeqCursor::detached(starting_durable),
             journal_ring,
             matching_ring,
-            replica_quorum_cursor: Arc::new(AtomicU64::new(Self::NO_REPLICA)),
+            replica_slots: Arc::new(ReplicaSlotCursors::new()),
         }
     }
 
@@ -226,12 +301,19 @@ impl PipelineCursors {
 
     /// Highest wire seq durably confirmed by *every* engaged replica (i.e.
     /// the slowest engaged replica's ack), or `None` while no replica is
-    /// engaged. Decoded from slot-acked space via [`SlotAcked::acked`]. The
-    /// fastest replica's cursor is a separate atomic owned by the server
-    /// wiring, not part of this bundle.
+    /// engaged. Derived from the per-slot cursors at read time — see
+    /// [`ReplicaSlotCursors::quorum_acked`].
     #[inline]
     pub fn load_replica_quorum_acked(&self) -> Option<WireSeq> {
-        SlotAcked::from_raw(self.replica_quorum_cursor.load(Ordering::Relaxed)).acked()
+        self.replica_slots.quorum_acked()
+    }
+
+    /// Highest wire seq confirmed by the *fastest* engaged replica, or
+    /// `None` while no replica is engaged. Derived from the per-slot
+    /// cursors at read time — see [`ReplicaSlotCursors::fastest_acked`].
+    #[inline]
+    pub fn load_fastest_replica_acked(&self) -> Option<WireSeq> {
+        self.replica_slots.fastest_acked()
     }
 
     // ── Writer / wiring handles ────────────────────────────────────────
@@ -262,12 +344,12 @@ impl PipelineCursors {
         Arc::clone(&self.matching_ring)
     }
 
-    /// Raw handle to the replica quorum cursor, for the replication sender
-    /// that maintains it (`ReplicaCursors`' shared `min` cursor) and for
-    /// monitoring taps. Slot-acked space — see the field docs.
+    /// Shared handle to the per-slot replica cursors, for the replication
+    /// sender that maintains them (`ReplicaCursors`, the sole production
+    /// writer). Slot-acked space — see the field docs.
     #[inline]
-    pub fn replica_quorum_cursor_arc(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.replica_quorum_cursor)
+    pub fn replica_slot_cursors(&self) -> Arc<ReplicaSlotCursors> {
+        Arc::clone(&self.replica_slots)
     }
 }
 
@@ -312,15 +394,33 @@ mod tests {
     }
 
     #[test]
-    fn replica_quorum_sentinel_maps_to_none() {
+    fn replica_views_are_none_until_a_slot_engages() {
         let c = cursors();
         assert_eq!(c.load_replica_quorum_acked(), None);
+        assert_eq!(c.load_fastest_replica_acked(), None);
         // Store the way the replication sender does: encoded slot-acked.
-        c.replica_quorum_cursor_arc().store(
-            SlotAcked::from_acked(WireSeq::new(100)).raw(),
-            Ordering::Relaxed,
-        );
+        c.replica_slot_cursors()
+            .store(0, SlotAcked::from_acked(WireSeq::new(100)));
         assert_eq!(c.load_replica_quorum_acked(), Some(WireSeq::new(100)));
+        assert_eq!(c.load_fastest_replica_acked(), Some(WireSeq::new(100)));
+    }
+
+    #[test]
+    fn quorum_is_the_slowest_and_fastest_the_quickest_engaged_slot() {
+        let slots = ReplicaSlotCursors::new();
+        slots.store(0, SlotAcked::from_acked(WireSeq::new(500)));
+        slots.store(1, SlotAcked::from_acked(WireSeq::new(200)));
+        assert_eq!(slots.quorum_acked(), Some(WireSeq::new(200)));
+        assert_eq!(slots.fastest_acked(), Some(WireSeq::new(500)));
+        // One slot disengages: the survivor owns both views — the parked
+        // slot's sentinel must not masquerade as the fastest replica.
+        slots.store(1, SlotAcked::DISENGAGED);
+        assert_eq!(slots.quorum_acked(), Some(WireSeq::new(500)));
+        assert_eq!(slots.fastest_acked(), Some(WireSeq::new(500)));
+        // Both disengaged: no replica, both views are None.
+        slots.store(0, SlotAcked::DISENGAGED);
+        assert_eq!(slots.quorum_acked(), None);
+        assert_eq!(slots.fastest_acked(), None);
     }
 
     #[test]
@@ -335,7 +435,6 @@ mod tests {
             Some(WireSeq::new(41))
         );
         assert_eq!(SlotAcked::DISENGAGED.acked(), None);
-        assert_eq!(SlotAcked::DISENGAGED.raw(), PipelineCursors::NO_REPLICA);
     }
 
     #[test]

@@ -24,8 +24,8 @@
 //!   where `replica_quorum_ack` is the *slowest engaged* replica's durably
 //!   confirmed sequence — the number of durable events not yet confirmed by
 //!   every engaged replica (0 in standalone, or until a replica engages; the
-//!   fastest replica's position is the separate `fastest_replica_cursor`
-//!   gauge)
+//!   fastest replica's position is reported by the `fastest_replica_cursor`
+//!   gauge, derived from the same per-slot cursors)
 
 use std::io::{Cursor, Read as _, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -37,7 +37,7 @@ use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring::QueueCursor;
 use tracing::{debug, error, info};
 
-use crate::cursors::{PipelineCursors, RingPos, SlotAcked, WireSeq};
+use crate::cursors::{PipelineCursors, RingPos, WireSeq};
 use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};
 
 /// Shared monitoring state passed to the health loop.
@@ -74,11 +74,6 @@ pub struct HealthState {
     pub replication_ring_producer_cursors: Option<[Arc<dyn QueueCursor>; 2]>,
     /// Per-slot replication-ring consumer progress counters. See above.
     pub replication_ring_consumer_cursors: Option<[Arc<Sequence>; 2]>,
-    /// The "fastest replica" cursor — `max` over the engaged slots'
-    /// [`SlotAcked`] cursors, maintained by the replication sender; the
-    /// snapshot decodes it to the acked wire seq. Holds the disengaged
-    /// sentinel when no replica has engaged. `None` in standalone mode.
-    pub fastest_replica_cursor: Option<Arc<AtomicU64>>,
     /// Per-stage busy/idle utilization counters.
     pub journal_utilization: Arc<StageUtilization>,
     pub matching_utilization: Arc<StageUtilization>,
@@ -152,8 +147,9 @@ struct HealthSnapshot {
     /// Per-slot replication-ring depth: producer_cursor - consumer.processed.
     /// 0 in standalone mode or when ring cursors aren't available.
     per_replica_ring_depth: [u64; 2],
-    /// Fastest-replica cursor (max of slot_acked values). 0 when no replica
-    /// has engaged — the sentinel `u64::MAX` is mapped to 0 for plotting.
+    /// Fastest-replica cursor: the fastest engaged replica's acked wire
+    /// seq, derived from the per-slot cursors at read time. 0 when no
+    /// replica has engaged, so the plotted series stays on-scale.
     fastest_replica_cursor: u64,
     /// Total replica eviction count.
     evictions_total: u64,
@@ -349,15 +345,13 @@ impl HealthSnapshot {
             _ => [0, 0],
         };
 
-        // Fastest-replica cursor, decoded from slot-acked space to the acked
-        // wire seq (same space as `journal_seq` and the per-slot acked
-        // gauges). The disengaged sentinel maps to 0 so the plotted series
+        // Fastest-replica gauge, derived from the per-slot cursors at read
+        // time (same wire-seq space as `journal_seq` and the per-slot acked
+        // gauges). "No replica engaged" maps to 0 so the plotted series
         // stays on-scale.
         let fastest_replica_cursor = state
-            .fastest_replica_cursor
-            .as_ref()
-            .map(|c| SlotAcked::from_raw(c.load(Ordering::Relaxed)))
-            .and_then(SlotAcked::acked)
+            .cursors
+            .load_fastest_replica_acked()
             .map_or(0, WireSeq::get);
 
         Self {
@@ -844,6 +838,7 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cursors::SlotAcked;
     use crate::replication::ReplicationMetrics;
     use std::io::Read;
 
@@ -856,9 +851,8 @@ mod tests {
     }
 
     /// Build test cursors with explicit seeds for each space. `repl_acked`
-    /// is the slowest engaged replica's *acked wire seq* (stored as
-    /// `acked + 1`, mirroring `ReplicaCursors`' slot-acked space), or
-    /// `u64::MAX` (`NO_REPLICA`) for "no replica engaged".
+    /// is the engaged replica's *acked wire seq*, stored into slot 0 the
+    /// way `ReplicaCursors` does, or `u64::MAX` for "no replica engaged".
     fn test_cursors(
         durable: u64,
         journal_ring: u64,
@@ -870,10 +864,11 @@ mod tests {
             Arc::new(Sequence::new(AtomicU64::new(journal_ring))),
             Arc::new(Sequence::new(AtomicU64::new(matching_ring))),
         );
-        if repl_acked != PipelineCursors::NO_REPLICA {
+        // `u64::MAX` means "no replica engaged" — leave every slot parked.
+        if repl_acked != u64::MAX {
             cursors
-                .replica_quorum_cursor_arc()
-                .store(repl_acked + 1, Ordering::Relaxed);
+                .replica_slot_cursors()
+                .store(0, SlotAcked::from_acked(WireSeq::new(repl_acked)));
         }
         cursors
     }
@@ -939,7 +934,6 @@ mod tests {
             replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
-            fastest_replica_cursor: None,
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -1065,7 +1059,6 @@ mod tests {
                 replica_active: None,
                 replication_ring_producer_cursors: None,
                 replication_ring_consumer_cursors: None,
-                fastest_replica_cursor: None,
                 journal_utilization: Arc::new(StageUtilization::new()),
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
@@ -1100,7 +1093,6 @@ mod tests {
                 replica_active: None,
                 replication_ring_producer_cursors: None,
                 replication_ring_consumer_cursors: None,
-                fastest_replica_cursor: None,
                 journal_utilization: Arc::new(StageUtilization::new()),
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
@@ -1261,7 +1253,6 @@ mod tests {
             replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
-            fastest_replica_cursor: None,
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -1363,7 +1354,6 @@ mod tests {
             replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
-            fastest_replica_cursor: None,
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -1426,7 +1416,6 @@ mod tests {
             replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
-            fastest_replica_cursor: None,
             journal_utilization: journal_util,
             matching_utilization: matching_util,
             response_utilization: response_util,
@@ -1485,15 +1474,12 @@ mod tests {
         let prod_1: Arc<dyn QueueCursor> = Arc::new(MockCursor(AtomicU64::new(5000)));
         let cons_0 = Arc::new(Sequence::new(AtomicU64::new(4950)));
         let cons_1 = Arc::new(Sequence::new(AtomicU64::new(5000)));
-        // Stored the way the sender does — slot-acked encoded; the gauge
-        // must decode back to the acked wire seq (4990).
-        let fastest = Arc::new(AtomicU64::new(
-            SlotAcked::from_acked(WireSeq::new(4990)).raw(),
-        ));
 
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            // The engaged slot at acked 4990 drives the fastest-replica
+            // gauge, which must decode back to the acked wire seq.
             cursors: test_cursors(5000, 5000, 5000, 4990),
             input_cursor: Box::new(MockCursor(AtomicU64::new(5000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1503,7 +1489,6 @@ mod tests {
             replica_active: None,
             replication_ring_producer_cursors: Some([prod_0, prod_1]),
             replication_ring_consumer_cursors: Some([cons_0, cons_1]),
-            fastest_replica_cursor: Some(fastest),
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -1532,9 +1517,10 @@ mod tests {
     }
 
     #[test]
-    fn fastest_replica_cursor_sentinel_mapped_to_zero() {
-        // u64::MAX is the "no replica engaged" sentinel — it must render as 0
-        // so it doesn't dominate the plotted y-axis or skew aggregates.
+    fn fastest_replica_cursor_renders_zero_with_no_replica() {
+        // With every slot disengaged the derived view is None — it must
+        // render as 0 so it doesn't dominate the plotted y-axis or skew
+        // aggregates.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1554,7 +1540,6 @@ mod tests {
             replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
-            fastest_replica_cursor: Some(Arc::new(AtomicU64::new(u64::MAX))),
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -1810,7 +1795,6 @@ mod tests {
             ]),
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
-            fastest_replica_cursor: None,
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -1893,7 +1877,6 @@ mod tests {
             ]),
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
-            fastest_replica_cursor: None,
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -1941,25 +1924,21 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let s = Arc::clone(&shutdown);
 
-        // Production wiring shape: the bundle owns the quorum cursor, the
-        // fastest cursor is the loose max twin, and ReplicaCursors is the
-        // single writer for both (plus the metrics gauge pair).
+        // Production wiring shape: the bundle owns the per-slot cursors
+        // (the quorum and fastest gauges are derived from them at read
+        // time), and ReplicaCursors is the single writer for the slots
+        // plus the metrics gauge pair.
         let cursors = PipelineCursors::new(
             WireSeq::new(1_000),
             Arc::new(Sequence::new(AtomicU64::new(0))),
             Arc::new(Sequence::new(AtomicU64::new(0))),
         );
-        let fastest = Arc::new(AtomicU64::new(PipelineCursors::NO_REPLICA));
         let metrics = Arc::new(ReplicationMetrics::default());
         let active = [
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ];
-        let writer = ReplicaCursors::new(
-            cursors.replica_quorum_cursor_arc(),
-            Arc::clone(&fastest),
-            Arc::clone(&metrics),
-        );
+        let writer = ReplicaCursors::new(cursors.replica_slot_cursors(), Arc::clone(&metrics));
 
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
@@ -1973,7 +1952,6 @@ mod tests {
             replica_active: Some([Arc::clone(&active[0]), Arc::clone(&active[1])]),
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
-            fastest_replica_cursor: Some(Arc::clone(&fastest)),
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -2137,7 +2115,6 @@ mod tests {
             replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
-            fastest_replica_cursor: None,
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: response_util,

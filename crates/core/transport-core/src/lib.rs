@@ -54,5 +54,7 @@ mod test_support;
 #[cfg(test)]
 mod pipeline_tests;
 
-pub use cursors::{DurableWireSeqCursor, PipelineCursors, RingPos, SlotAcked, WireSeq};
+pub use cursors::{
+    DurableWireSeqCursor, PipelineCursors, ReplicaSlotCursors, RingPos, SlotAcked, WireSeq,
+};
 pub use journaled_app::{JournaledApp, JournaledAppError};

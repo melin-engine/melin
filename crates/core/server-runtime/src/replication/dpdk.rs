@@ -9,7 +9,7 @@
 use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tracing::{debug, error, info, warn};
 
@@ -195,8 +195,9 @@ impl DpdkReplicaSlot {
     ///   step each arm must remember) is what prevents the
     ///   leak-on-disconnect class of bug.
     /// - Disengages the shared cursors **before** releasing the journal-stage
-    ///   gate — ordering contract B2 (a frozen shared-min would otherwise stop
-    ///   the primary acking client requests even with a healthy peer).
+    ///   gate — ordering contract B2 (frozen replica-progress cursors would
+    ///   otherwise stop the primary acking client requests even with a
+    ///   healthy peer).
     /// - Decrements the trading-halt gate **only if the replica was past auth**
     ///   (`Handshaking`/`Streaming`) — an `Authenticating` connection never
     ///   lifted it (the gate is lifted on auth success, not on connect), so it
@@ -257,7 +258,7 @@ impl DpdkReplicaSlot {
 pub struct DpdkReplicationDriver<A: Application> {
     slots: [DpdkReplicaSlot; 2],
     /// Single owner of the per-replica progress cursors (per-slot
-    /// acked positions, shared min/max, and the gate's gauge pair).
+    /// acked positions and the gate's gauge pair).
     cursors: ReplicaCursors,
     journal_path: std::path::PathBuf,
     replica_ready: Arc<AtomicBool>,
@@ -287,8 +288,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repl_consumers: [ReplicationConsumer; 2],
-        replication_cursor: Arc<AtomicU64>,
-        fastest_replica_cursor: Arc<AtomicU64>,
+        replica_slots: Arc<melin_transport_core::ReplicaSlotCursors>,
         journal_path: std::path::PathBuf,
         replica_ready: Arc<AtomicBool>,
         replicas_connected: Arc<AtomicU32>,
@@ -333,11 +333,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     auth: None,
                 },
             ],
-            cursors: ReplicaCursors::new(
-                replication_cursor,
-                fastest_replica_cursor,
-                metrics.clone(),
-            ),
+            cursors: ReplicaCursors::new(replica_slots, metrics.clone()),
             journal_path,
             replica_ready,
             replicas_connected,
@@ -929,10 +925,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     //    per-socket TX queue: if we commit a batch from
                     //    the ring but `queue_send` rejects it (TX full),
                     //    the data is gone from the ring without ever
-                    //    reaching the replica — replica never acks,
-                    //    replication_cursor stalls, and the response
-                    //    gate freezes the whole exchange. We saw this
-                    //    exact symptom on dpdk-dual-repl.
+                    //    reaching the replica — the replica never acks,
+                    //    its acked-progress cursor stalls, and the
+                    //    response gate freezes the whole exchange. We saw
+                    //    this exact symptom on dpdk-dual-repl.
                     let max_tx = transport.max_tx_queue_size(handle);
                     let used = transport.tx_queue_bytes(handle);
                     let mut available = max_tx.saturating_sub(used);
