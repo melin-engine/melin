@@ -3120,22 +3120,12 @@ pub struct ReplicaPipeline<A: Application, W: JournalWrite<A::Event>> {
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
     /// Journal-progress cursors, space-typed. On a replica the orchestrator
     /// reads `durable_wire_seq` for reconnect handshakes (last journal sequence
-    /// durably persisted); the replica quorum cursor stays at the `NO_REPLICA` sentinel
+    /// durably persisted); the replica slot cursors stay disengaged
     /// (no downstream replica). Updated by `JournalStage` after each fsync.
     pub cursors: PipelineCursors,
     pub chain_hash_lock: Option<SeqLockReader<FsyncState>>,
 }
 
-/// Build the pipeline with optional replication support.
-///
-/// When `enable_replication` is true, builds a replication ring (pre-allocated,
-/// lock-free) and wires the producer into the `JournalStage`. After each
-/// `flush_batch_sync()`, the journal stage copies the encoded bytes into a
-/// pre-allocated ring slot (no heap allocation). The returned consumer(s)
-/// are for replica sender threads.
-///
-/// Returns one `ReplicationConsumer` for the sender thread, and a
-/// `replication_cursor` `Arc<AtomicU64>` for the response stage.
 /// Handles for monitoring replication ring drain progress.
 ///
 /// The server gates on ring drain after seeding: it waits for all ring
@@ -3246,8 +3236,16 @@ fn setup_chain_hash_publisher<E: AppEvent, W: JournalWrite<E>>(
     }
 }
 
-/// When replication is disabled, the replica quorum cursor stays at its
-/// `PipelineCursors::NO_REPLICA` sentinel (standalone mode).
+/// Build the pipeline with optional replication support.
+///
+/// When `enable_replication` is true, builds a replication ring (pre-allocated,
+/// lock-free) and wires the producer into the `JournalStage`. After each
+/// `flush_batch_sync()`, the journal stage copies the encoded bytes into a
+/// pre-allocated ring slot (no heap allocation). The returned consumer(s)
+/// are for replica sender threads.
+///
+/// When replication is disabled, the replica slot cursors stay disengaged
+/// (standalone mode) and the derived quorum view reads "no replica".
 #[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication<A, W>(
     app: A,
@@ -3306,10 +3304,10 @@ where
     // `starting_wire_seq - 1` so the response stage sees the post-recovery /
     // post-genesis durable position immediately rather than waiting for the
     // first user event's fsync to publish it; the journal stage
-    // Release-stores into it after every fsync batch. The replica quorum
-    // cursor starts at the `NO_REPLICA` sentinel so the server works
-    // immediately even before a replica connects (the replication sender
-    // takes over the cursor when one does).
+    // Release-stores into it after every fsync batch. The replica slot
+    // cursors start disengaged so the server works immediately even before
+    // a replica connects (the replication sender takes over the slots when
+    // one does).
     let cursors = PipelineCursors::new(
         WireSeq::new(starting_wire_seq.saturating_sub(1)),
         journal_cursor,
@@ -3497,8 +3495,8 @@ where
     // fsync nudges the cursor — a fresh writer here returns
     // `starting_wire_seq == 1` (no genesis yet) or `>= 2` (post-genesis),
     // so `saturating_sub(1)` yields the correct "highest wire seq durable"
-    // reading at boot. The replica quorum cursor stays at its `NO_REPLICA`
-    // sentinel for the lifetime of the pipeline (no downstream replica).
+    // reading at boot. The replica slot cursors stay disengaged for the
+    // lifetime of the pipeline (no downstream replica).
     let cursors = PipelineCursors::new(
         WireSeq::new(starting_wire_seq.saturating_sub(1)),
         journal_cursor,

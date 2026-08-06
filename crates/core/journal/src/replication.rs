@@ -296,8 +296,8 @@ impl ReplicationConsumer {
     /// pre-eviction ring contents once live streaming resumes,
     /// acknowledging them with sequences that lag the primary's
     /// journal by however many events were in the ring at eviction.
-    /// That in turn stalls the primary's `replication_cursor` at the
-    /// evicted-position slot value and gates the response stage.
+    /// That in turn stalls the slot's acked-progress cursor at the
+    /// pre-eviction position and gates the response stage.
     pub fn skip_to_producer(&mut self) {
         self.inner.skip_to_dependency();
         self.pending_meta = None;

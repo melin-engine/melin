@@ -1126,18 +1126,11 @@ where
     // Ring-position cursors for the seed-drain gate below (Acquire loads,
     // stronger than the bundle's monitoring reads). The durability gate and
     // the replication sender pull their typed handles straight from
-    // `cursors`; the health endpoint takes `cursors` itself.
+    // `cursors`; the health endpoint takes `cursors` itself — the quorum
+    // and fastest-replica gauges are derived from the bundle's per-slot
+    // cursors at read time.
     let journal_cursor = cursors.journal_ring_arc();
     let matching_cursor = cursors.matching_ring_arc();
-    // Fastest-replica cursor: `max(slot0_acked, slot1_acked)` in slot-acked
-    // space, maintained by the replication sender alongside the quorum-min
-    // cursor in `cursors`. Monitoring only — the health endpoint's
-    // fastest-replica gauge reads it; the durability gate evaluates replica
-    // progress from `ReplicationMetrics` instead. Parked at the same
-    // no-replica sentinel as the bundle's quorum cursor.
-    let fastest_replica_cursor = Arc::new(AtomicU64::new(
-        melin_transport_core::PipelineCursors::NO_REPLICA,
-    ));
 
     // Consumer 0 is always the response stage. Consumer 1 (if present)
     // is the event publisher — only created when --event-bind is set.
@@ -1302,8 +1295,7 @@ where
             .replication_bind
             .ok_or("replication_bind must be set when replication is enabled")?;
         let s_repl = Arc::clone(&shutdown);
-        let repl_cursor = cursors.replica_quorum_cursor_arc();
-        let fastest_repl_cursor = Arc::clone(&fastest_replica_cursor);
+        let repl_slots = cursors.replica_slot_cursors();
         let ready_flag = Arc::clone(&replica_ready);
         let connected_counter = replicas_connected
             .clone()
@@ -1355,8 +1347,7 @@ where
                         bind_addr: repl_bind,
                         repl_consumer_1,
                         repl_consumer_2,
-                        replication_cursor: repl_cursor,
-                        fastest_replica_cursor: fastest_repl_cursor,
+                        replica_slots: repl_slots,
                         journal_path,
                         authorized_keys: repl_auth_keys,
                         evict_flags,
@@ -1442,7 +1433,6 @@ where
         &replication_metrics,
         &replica_active,
         &replication_ring_progress,
-        &fastest_replica_cursor,
         &journal_utilization,
         &matching_utilization,
         &response_utilization,
@@ -2180,11 +2170,6 @@ where
     // one-shot seed loop — same property as the io_uring transport.
     let tick_cadence = config.tick_interval();
 
-    // Fastest-replica cursor (see TCP path for explanation).
-    let fastest_replica_cursor = Arc::new(AtomicU64::new(
-        melin_transport_core::PipelineCursors::NO_REPLICA,
-    ));
-
     // Control channel: DPDK poll thread → response stage (connect/disconnect).
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
@@ -2328,8 +2313,7 @@ where
             .ok_or("replication_bind must be set when replication is enabled")?;
         let repl_port = repl_bind.port();
 
-        let repl_cursor = cursors.replica_quorum_cursor_arc();
-        let fastest_repl_cursor = Arc::clone(&fastest_replica_cursor);
+        let repl_slots = cursors.replica_slot_cursors();
         let ready_flag = Arc::clone(&replica_ready);
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
@@ -2383,8 +2367,7 @@ where
 
         let driver = crate::replication::DpdkReplicationDriver::new(
             [repl_consumer_1, repl_consumer_2],
-            repl_cursor,
-            fastest_repl_cursor,
+            repl_slots,
             journal_path,
             ready_flag,
             connected_counter,
@@ -2514,7 +2497,6 @@ where
         &replication_metrics,
         &replica_active,
         &replication_ring_progress,
-        &fastest_replica_cursor,
         &journal_utilization,
         &matching_utilization,
         &response_utilization,
@@ -2848,7 +2830,6 @@ fn spawn_health_endpoint(
     replication_metrics: &Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: &Option<[Arc<AtomicBool>; 2]>,
     replication_ring_progress: &Option<melin_transport_core::pipeline::ReplicationRingProgress>,
-    fastest_replica_cursor: &Arc<AtomicU64>,
     journal_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
     matching_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
     response_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
@@ -2873,9 +2854,6 @@ fn spawn_health_endpoint(
             )
         })
         .unwrap_or((None, None));
-    let fastest_repl_cursor_health = replication_metrics
-        .as_ref()
-        .map(|_| Arc::clone(fastest_replica_cursor));
     Ok(Some(melin_transport_core::health::spawn(
         health_addr,
         melin_transport_core::health::HealthState {
@@ -2890,7 +2868,6 @@ fn spawn_health_endpoint(
             replica_active: replica_active.clone(),
             replication_ring_producer_cursors: repl_ring_producers,
             replication_ring_consumer_cursors: repl_ring_consumers,
-            fastest_replica_cursor: fastest_repl_cursor_health,
             journal_utilization: Arc::clone(journal_utilization),
             matching_utilization: Arc::clone(matching_utilization),
             response_utilization: Arc::clone(response_utilization),

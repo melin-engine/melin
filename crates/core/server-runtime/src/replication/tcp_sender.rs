@@ -7,7 +7,7 @@
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tracing::{debug, error, info, warn};
 
@@ -35,8 +35,7 @@ pub struct Sender {
     pub bind_addr: SocketAddr,
     pub repl_consumer_1: ReplicationConsumer,
     pub repl_consumer_2: ReplicationConsumer,
-    pub replication_cursor: Arc<AtomicU64>,
-    pub fastest_replica_cursor: Arc<AtomicU64>,
+    pub replica_slots: Arc<melin_transport_core::ReplicaSlotCursors>,
     pub journal_path: std::path::PathBuf,
     pub authorized_keys: Arc<melin_app::auth::AuthorizedKeys>,
     pub evict_flags: [Arc<AtomicBool>; 2],
@@ -67,8 +66,7 @@ pub fn run_sender<A: Application>(
         bind_addr,
         repl_consumer_1,
         repl_consumer_2,
-        replication_cursor,
-        fastest_replica_cursor,
+        replica_slots,
         journal_path,
         authorized_keys,
         evict_flags,
@@ -116,14 +114,10 @@ pub fn run_sender<A: Application>(
     ];
 
     // Single owner of the per-replica progress cursors (per-slot acked
-    // positions, shared min/max, and the gate's gauge pair). Shared by
-    // both handler threads — see `ReplicaCursors` for the ordering
-    // contract relative to the active flags.
-    let cursors = Arc::new(ReplicaCursors::new(
-        Arc::clone(&replication_cursor),
-        Arc::clone(&fastest_replica_cursor),
-        Arc::clone(&metrics),
-    ));
+    // positions and the gate's gauge pair). Shared by both handler
+    // threads — see `ReplicaCursors` for the ordering contract relative
+    // to the active flags.
+    let cursors = Arc::new(ReplicaCursors::new(replica_slots, Arc::clone(&metrics)));
 
     // Per-slot "this connection authenticated" latch. The trading-halt gate
     // (`replicas_connected`) is lifted by the handler thread only after auth
@@ -178,9 +172,9 @@ pub fn run_sender<A: Application>(
         // Disengage a finished slot's shared state. Both the clean-exit and
         // panic arms below call this, so they cannot drift: a panicked handler
         // must tear down exactly like a clean exit, or it leaks the trading-halt
-        // gate and — far worse — leaves the slot's cursor engaged, freezing the
-        // shared min so the primary stops acking client requests even with a
-        // healthy surviving replica. Borrows only atomics (interior
+        // gate and — far worse — leaves the slot's progress cursors engaged,
+        // so the primary stops acking client requests even with a healthy
+        // surviving replica. Borrows only atomics (interior
         // mutability), so it coexists with the `&mut` iteration over `slots`.
         let disengage_slot = |slot_idx: usize| {
             // Lower the gate only if this connection authenticated (and so
@@ -213,9 +207,10 @@ pub fn run_sender<A: Application>(
                         // left them in place, the NEXT handler on this
                         // slot would drain them to its replica and
                         // acknowledge with pre-eviction sequences. Those
-                        // acks would stall `replication_cursor` at the
-                        // old position and gate the primary's response
-                        // stage at the slow-replica rate.
+                        // acks would stall the slot's acked-progress
+                        // cursor at the old position and gate the
+                        // primary's response stage at the slow-replica
+                        // rate.
                         //
                         // Fast-forward to the producer cursor so the
                         // live-streaming loop starts with a clean ring.

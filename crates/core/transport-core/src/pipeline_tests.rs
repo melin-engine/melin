@@ -17,10 +17,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use melin_journal::replication::REPLICATION_RING_CAPACITY;
-use melin_journal::{BufferedWriter, JournalEvent, JournalReader, SectorWriter};
+// Only the journal-reading tests touch these, and those are gated off
+// under no-persist (every read needs a really-persisted journal file).
+#[cfg(not(feature = "no-persist"))]
+use melin_journal::{BufferedWriter, JournalReader};
+use melin_journal::{JournalEvent, SectorWriter};
 use melin_pipeline::ring;
 
-use crate::cursors::{DurableWireSeqCursor, PipelineCursors, WireSeq};
+#[cfg(not(feature = "no-persist"))]
+use crate::cursors::SlotAcked;
+use crate::cursors::{DurableWireSeqCursor, WireSeq};
 use crate::journaled_app::JournaledApp;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::build_replica_pipeline;
@@ -1000,7 +1006,7 @@ fn journal_stage_sends_replication_batches() {
     let matching_stage = out.matching_stage;
     let mut input_producer = out.input_producer;
     let journal_cursor = out.cursors.journal_ring_arc();
-    let replication_cursor = out.cursors.replica_quorum_cursor_arc();
+    let replica_slots = out.cursors.replica_slot_cursors();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let s1 = Arc::clone(&shutdown);
@@ -1062,10 +1068,16 @@ fn journal_stage_sends_replication_batches() {
     );
     assert!(matches!(first.event, JournalEvent::App(TestEvent::Add(77))));
 
-    replication_cursor.store(repl_meta.end_sequence + 1, Ordering::Release);
+    replica_slots.store(
+        0,
+        SlotAcked::from_acked(WireSeq::new(repl_meta.end_sequence)),
+    );
     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
-    let repl_pos = replication_cursor.load(Ordering::Acquire);
-    let effective = journal_pos.min(repl_pos);
+    let repl_acked = replica_slots
+        .quorum_acked()
+        .expect("slot 0 engaged above")
+        .get();
+    let effective = journal_pos.min(repl_acked + 1);
     assert!(
         effective > output.input_seq,
         "both cursors should have advanced"
@@ -1077,7 +1089,7 @@ fn journal_stage_sends_replication_batches() {
 }
 
 #[test]
-fn replication_cursor_always_starts_at_max() {
+fn replica_quorum_always_starts_disengaged() {
     let dir = tempfile::tempdir().unwrap();
 
     // Standalone mode.
@@ -1100,15 +1112,10 @@ fn replication_cursor_always_starts_at_max() {
             Arc::new(crate::fence::FenceState::new(0)),
         );
         assert!(out.replication_consumers.is_none());
-        assert_eq!(
-            out.cursors
-                .replica_quorum_cursor_arc()
-                .load(Ordering::Relaxed),
-            PipelineCursors::NO_REPLICA
-        );
+        assert_eq!(out.cursors.load_replica_quorum_acked(), None);
     }
 
-    // Replication enabled — cursor still starts at u64::MAX.
+    // Replication enabled — the quorum still starts disengaged.
     {
         let path = dir.path().join("repl_enabled.journal");
         let writer = Writer::create(&path).unwrap();
@@ -1129,11 +1136,9 @@ fn replication_cursor_always_starts_at_max() {
         );
         assert!(out.replication_consumers.is_some());
         assert_eq!(
-            out.cursors
-                .replica_quorum_cursor_arc()
-                .load(Ordering::Relaxed),
-            PipelineCursors::NO_REPLICA,
-            "replication cursor should start at the sentinel even when enabled"
+            out.cursors.load_replica_quorum_acked(),
+            None,
+            "replica quorum should start disengaged even when replication is enabled"
         );
     }
 }

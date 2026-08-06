@@ -280,8 +280,8 @@ Before sending any response, the response stage verifies that the corresponding 
 
 1. Each response carries the sequence number the event was assigned in the journal, which is the same number replicas report progress against.
 2. The durable position is derived from the configured mode:
-   - **Quorum mode** (default, 2 replicas connected): `replication_cursor` — both replicas have acked, NVMe fsync is off the critical path.
-   - **Degraded/standalone mode** (0-1 replicas): `min(journal_cursor, replication_cursor)` — local fsync is required.
+   - **Quorum mode** (default, 2 replicas connected): every connected replica has acknowledged the event — NVMe fsync is off the critical path.
+   - **Degraded/standalone mode** (0-1 replicas): the event is fsynced to the local journal, and acknowledged by the surviving replica if one is connected.
 3. If the durable position has not reached that response's own sequence number, spin-wait until it does.
 4. Once confirmed, the response is encoded and sent.
 
