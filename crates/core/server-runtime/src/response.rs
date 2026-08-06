@@ -53,6 +53,22 @@ const RING_SIZE: u32 = 4096;
 /// 64 KiB holds ~500 response frames — well beyond any reasonable lag.
 const MAX_SEND_BUF: usize = 64 * 1024;
 
+/// Minimum interval between SEND retries to a connection whose socket
+/// buffer is full (`MSG_DONTWAIT` completed with `EAGAIN`). The stage
+/// busy-spins, so without pacing a blocked connection would cost one
+/// futile `io_uring_enter` per loop iteration. 100 µs adds no meaningful
+/// delivery delay: a full socket buffer drains at the client's read
+/// cadence (millisecond scale), and healthy connections are never paced.
+const BLOCKED_RETRY_INTERVAL: Duration = Duration::from_micros(100);
+
+/// How long a connection may hold undelivered bytes behind a full socket
+/// buffer before it is dropped. Complements `MAX_SEND_BUF`, which only
+/// catches clients that lag while new responses keep *arriving* — a
+/// client that stops reading during a quiet period accumulates almost
+/// nothing (heartbeats only) and would otherwise pin its buffered bytes
+/// and its slot indefinitely.
+const BLOCKED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub use crate::ControlEvent;
 
 /// Encoder type alias: response encoder bound to the application's
@@ -121,10 +137,21 @@ struct ConnectionEntry {
     /// The full wire frame (length prefix + payload) is appended here.
     /// Vec's internal data pointer is heap-stable, so io_uring SEND SQEs
     /// referencing `as_ptr()` remain valid even if the HashMap relocates
-    /// this struct — as long as we don't reallocate the Vec during in-flight sends.
+    /// this struct. No SEND outlives its `flush_sends` call (every SQE
+    /// carries `MSG_DONTWAIT`, and the flush reaps all completions before
+    /// returning), so the Vec is never mutated while the kernel holds its
+    /// pointer.
     send_buf: Vec<u8>,
     /// Last time data was sent to this connection. Used for heartbeat scheduling.
     last_send: Instant,
+    /// When this connection's socket first refused bytes (`EAGAIN`, or a
+    /// partial send that filled the socket buffer). `None` while the
+    /// socket is accepting everything. Drives retry pacing and the
+    /// [`BLOCKED_SEND_TIMEOUT`] drop.
+    blocked_since: Option<Instant>,
+    /// Last SEND attempt. Read only while blocked, to pace retries at
+    /// [`BLOCKED_RETRY_INTERVAL`].
+    last_send_attempt: Instant,
 }
 
 /// Run the io_uring response stage loop. Blocks the calling thread until shutdown.
@@ -401,13 +428,12 @@ pub fn run<A: Application>(
                 flush_sends(
                     &mut ring,
                     &mut connections,
-                    &dirty_connections,
+                    &mut dirty_connections,
                     &mut to_remove,
                     &mut cqes,
                 );
                 #[cfg(feature = "latency-trace")]
                 close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
-                dirty_connections.clear();
             }
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);
@@ -433,6 +459,8 @@ pub fn run<A: Application>(
                             _owner: owner,
                             send_buf: Vec::with_capacity(4096),
                             last_send: Instant::now(),
+                            blocked_since: None,
+                            last_send_attempt: Instant::now(),
                         },
                     );
                 }
@@ -461,7 +489,7 @@ pub fn run<A: Application>(
                 flush_sends(
                     &mut ring,
                     &mut connections,
-                    &dirty_connections,
+                    &mut dirty_connections,
                     &mut to_remove,
                     &mut cqes,
                 );
@@ -472,7 +500,6 @@ pub fn run<A: Application>(
                 for conn_id in to_remove.drain(..) {
                     connections.remove(&conn_id);
                 }
-                dirty_connections.clear();
             }
 
             // Send heartbeats to idle connections. Only checked during
@@ -501,14 +528,13 @@ pub fn run<A: Application>(
                         flush_sends(
                             &mut ring,
                             &mut connections,
-                            &dirty_connections,
+                            &mut dirty_connections,
                             &mut to_remove,
                             &mut cqes,
                         );
                         for conn_id in to_remove.drain(..) {
                             connections.remove(&conn_id);
                         }
-                        dirty_connections.clear();
                     }
                 }
             }
@@ -674,7 +700,7 @@ pub fn run<A: Application>(
                     flush_sends(
                         &mut ring,
                         &mut connections,
-                        &dirty_connections,
+                        &mut dirty_connections,
                         &mut to_remove,
                         &mut cqes,
                     );
@@ -689,7 +715,6 @@ pub fn run<A: Application>(
                     for conn_id in to_remove.drain(..) {
                         connections.remove(&conn_id);
                     }
-                    dirty_connections.clear();
                 }
 
                 loop {
@@ -1020,8 +1045,6 @@ pub(crate) fn slot_needs_gate<R: Copy, Q: Copy>(
     !slot.durability_bypass && cached_durable_pos < slot.wire_seq
 }
 
-/// Submit io_uring SEND SQEs for all dirty connections and wait for completions.
-///
 /// Outcome of a single per-frame append. `Continue` means the
 /// caller may proceed to the next frame for this slot;
 /// `ConnectionDropped` means the connection's send buffer overflowed
@@ -1080,129 +1103,146 @@ fn append_frame(
     AppendOutcome::Continue
 }
 
-/// Each dirty connection's accumulated send buffer is sent in a single SEND
-/// operation. Partial sends are retried until all bytes are delivered.
-/// Failed connections are collected in `to_remove` for the caller to clean up.
+/// Each dirty connection's accumulated send buffer is sent in a single
+/// SEND operation, and the flush never blocks on a slow peer.
+///
+/// Every SEND carries `MSG_DONTWAIT`, so a full socket buffer completes
+/// immediately with `EAGAIN` instead of parking the operation until the
+/// peer reads. That matters because io_uring never surfaces `EAGAIN` for
+/// a plain SEND — it arms an internal poll and withholds the CQE, which
+/// is what let one zero-window client wedge this stage (and with it every
+/// client's acks) behind the `submit_and_wait` below.
+///
+/// Undelivered bytes (EAGAIN or a partial send) stay in the connection's
+/// `send_buf` and the connection stays in `dirty`; retries are paced by
+/// [`BLOCKED_RETRY_INTERVAL`] and bounded by [`BLOCKED_SEND_TIMEOUT`].
+/// `MAX_SEND_BUF` remains the growth cap while new responses accumulate.
+///
+/// On return, `dirty` holds exactly the connections that still have
+/// undelivered bytes and were not queued in `to_remove` — callers must
+/// not clear it. Failed connections are collected in `to_remove` for the
+/// caller to purge from `connections`.
 fn flush_sends(
     ring: &mut IoUring,
     connections: &mut HashMap<u64, ConnectionEntry>,
-    dirty: &HashSet<u64>,
+    dirty: &mut HashSet<u64>,
     to_remove: &mut Vec<u64>,
     cqes: &mut Vec<(u64, i32)>,
 ) {
-    // Submit SEND SQEs for all dirty connections.
+    // One clock read per flush, shared by the retry-pacing and
+    // blocked-timeout decisions. Cheap next to the submit syscall below,
+    // and flushes are already batched (one per drained SPSC batch or
+    // idle-loop pass, not one per response).
+    let now = Instant::now();
+
+    // Submit SEND SQEs for all dirty connections not in retry backoff.
     let mut pending: usize = 0;
-    for &conn_id in dirty {
-        if let Some(entry) = connections.get(&conn_id) {
-            if entry.send_buf.is_empty() {
-                continue;
-            }
-            let sqe = opcode::Send::new(
-                types::Fd(entry.fd),
-                entry.send_buf.as_ptr(),
-                entry.send_buf.len() as u32,
-            )
-            .build()
-            .user_data(conn_id);
-
-            unsafe {
-                ring.submission()
-                    .push(&sqe)
-                    .expect("io_uring SQ full — increase RING_SIZE");
-            }
-            pending += 1;
-        }
-    }
-
-    if pending == 0 {
-        return;
-    }
-
-    // Submit and wait for all completions.
-    if let Err(e) = ring.submit_and_wait(pending) {
-        error!(error = %e, "io_uring submit_and_wait failed in response stage");
-        return;
-    }
-
-    // Drain completions into pre-allocated buffer. Must collect to
-    // release CQ borrow before mutating connections.
-    cqes.clear();
-    cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
-
-    for &(conn_id, result) in cqes.iter() {
-        if result < 0 {
-            debug!(
-                connection_id = conn_id,
-                error = result,
-                "send error, dropping connection"
-            );
-            to_remove.push(conn_id);
+    for &conn_id in dirty.iter() {
+        let Some(entry) = connections.get_mut(&conn_id) else {
+            continue;
+        };
+        if entry.send_buf.is_empty() {
             continue;
         }
-
-        let sent = result as usize;
-        if let Some(entry) = connections.get_mut(&conn_id) {
-            if sent >= entry.send_buf.len() {
-                entry.send_buf.clear();
-            } else {
-                // Partial send — drain sent bytes, retry remainder.
-                // Rare for small response frames over TCP/UDS but must
-                // be handled for correctness (e.g., send buffer pressure).
-                entry.send_buf.drain(..sent);
-                retry_send(ring, entry, conn_id, to_remove);
+        if let Some(blocked_at) = entry.blocked_since {
+            // A peer that has refused bytes for the full timeout is not
+            // coming back for them — reclaim the slot. Client-caused,
+            // hence debug (see the log-level convention).
+            if now.duration_since(blocked_at) >= BLOCKED_SEND_TIMEOUT {
+                debug!(
+                    connection_id = conn_id,
+                    pending_bytes = entry.send_buf.len(),
+                    blocked_ms = now.duration_since(blocked_at).as_millis() as u64,
+                    "socket blocked past timeout, dropping connection"
+                );
+                to_remove.push(conn_id);
+                continue;
+            }
+            if now.duration_since(entry.last_send_attempt) < BLOCKED_RETRY_INTERVAL {
+                continue;
             }
         }
-    }
-}
+        entry.last_send_attempt = now;
 
-/// Retry sending remaining bytes after a partial send. Loops until the
-/// entire buffer is delivered or an error occurs.
-fn retry_send(
-    ring: &mut IoUring,
-    entry: &mut ConnectionEntry,
-    conn_id: u64,
-    to_remove: &mut Vec<u64>,
-) {
-    while !entry.send_buf.is_empty() {
         let sqe = opcode::Send::new(
             types::Fd(entry.fd),
             entry.send_buf.as_ptr(),
             entry.send_buf.len() as u32,
         )
+        .flags(libc::MSG_DONTWAIT)
         .build()
         .user_data(conn_id);
 
         unsafe {
             ring.submission()
                 .push(&sqe)
-                .expect("io_uring SQ full during send retry");
+                .expect("io_uring SQ full — increase RING_SIZE");
         }
+        pending += 1;
+    }
 
-        if let Err(e) = ring.submit_and_wait(1) {
-            debug!(connection_id = conn_id, error = %e, "send retry failed");
-            to_remove.push(conn_id);
+    if pending > 0 {
+        // With MSG_DONTWAIT every SEND completes during submission
+        // (success, partial, or EAGAIN — the flag sets the kernel's
+        // no-wait path, so nothing is deferred to a poll retry). The
+        // wait is bounded by op execution, never by a peer.
+        if let Err(e) = ring.submit_and_wait(pending) {
+            error!(error = %e, "io_uring submit_and_wait failed in response stage");
             return;
         }
 
-        if let Some(cqe) = ring.completion().next() {
-            let result = cqe.result();
-            if result <= 0 {
+        // Drain completions into pre-allocated buffer. Must collect to
+        // release CQ borrow before mutating connections.
+        cqes.clear();
+        cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
+
+        for &(conn_id, result) in cqes.iter() {
+            let Some(entry) = connections.get_mut(&conn_id) else {
+                continue;
+            };
+            if result == -libc::EAGAIN {
+                // Socket buffer full. Keep the bytes; the connection
+                // stays dirty and retries at the paced cadence.
+                if entry.blocked_since.is_none() {
+                    entry.blocked_since = Some(now);
+                }
+                continue;
+            }
+            if result < 0 {
                 debug!(
                     connection_id = conn_id,
                     error = result,
-                    "send retry error, dropping connection"
+                    "send error, dropping connection"
                 );
                 to_remove.push(conn_id);
-                return;
+                continue;
             }
+
             let sent = result as usize;
             if sent >= entry.send_buf.len() {
                 entry.send_buf.clear();
+                entry.blocked_since = None;
             } else {
+                // Partial send — the socket buffer filled mid-copy. An
+                // immediate retry would only report EAGAIN, so keep the
+                // remainder for the paced retry, same as a full block.
                 entry.send_buf.drain(..sent);
+                if entry.blocked_since.is_none() {
+                    entry.blocked_since = Some(now);
+                }
             }
         }
     }
+
+    // Keep exactly the connections that still hold undelivered bytes and
+    // survived this flush. Runs even when nothing was submitted so a
+    // blocked-timeout drop above still leaves the dirty set consistent.
+    dirty.retain(|conn_id| {
+        !to_remove.contains(conn_id)
+            && connections
+                .get(conn_id)
+                .is_some_and(|e| !e.send_buf.is_empty())
+    });
 }
 
 /// Read the live gate cursors and lend them to `f` as a [`CursorView`].
@@ -2627,5 +2667,231 @@ mod tests {
             Duration::from_millis(500),
         );
         assert!(!final_state);
+    }
+
+    /// Regression tests for the slow-client head-of-line block fixed in
+    /// the 2026-08 io_uring audit (docs/internal/io-uring-audit-2026-08.md,
+    /// finding 1): `flush_sends` used to `submit_and_wait` on SENDs
+    /// without `MSG_DONTWAIT`, and io_uring holds such a SEND's CQE back
+    /// until the peer reads — so one zero-window client stalled every
+    /// client's acks. These use real sockets and a real ring: the defect
+    /// was kernel-level behaviour a mock would not reproduce.
+    mod flush_sends {
+        use super::super::{
+            BLOCKED_RETRY_INTERVAL, BLOCKED_SEND_TIMEOUT, ConnectionEntry, flush_sends,
+        };
+        use io_uring::IoUring;
+        use std::collections::{HashMap, HashSet};
+        use std::io::Read as _;
+        use std::os::unix::io::{AsRawFd, RawFd};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        fn entry_for(stream: UnixStream, payload: &[u8]) -> ConnectionEntry {
+            ConnectionEntry {
+                fd: stream.as_raw_fd(),
+                _owner: Box::new(stream),
+                send_buf: payload.to_vec(),
+                last_send: Instant::now(),
+                blocked_since: None,
+                last_send_attempt: Instant::now(),
+            }
+        }
+
+        /// Fill `fd`'s socket send buffer with non-blocking writes until
+        /// the kernel refuses more — the state a zero-window / non-reading
+        /// client leaves a connection in.
+        fn fill_socket(fd: RawFd) {
+            let junk = [0u8; 4096];
+            loop {
+                let n =
+                    unsafe { libc::send(fd, junk.as_ptr().cast(), junk.len(), libc::MSG_DONTWAIT) };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    assert_eq!(
+                        err.raw_os_error(),
+                        Some(libc::EAGAIN),
+                        "unexpected errno while filling socket"
+                    );
+                    break;
+                }
+            }
+        }
+
+        /// The defect this module exists to prevent: a peer that stops
+        /// reading must cost the flush nothing, and healthy peers on the
+        /// same flush must still be delivered. Against the pre-fix code
+        /// this test never returns.
+        #[test]
+        fn slow_peer_does_not_block_flush_and_healthy_peer_is_delivered() {
+            let mut ring = IoUring::new(64).unwrap();
+            let (slow_tx, _slow_rx) = UnixStream::pair().unwrap();
+            let (fast_tx, mut fast_rx) = UnixStream::pair().unwrap();
+            fill_socket(slow_tx.as_raw_fd());
+
+            let mut connections = HashMap::new();
+            connections.insert(1u64, entry_for(slow_tx, &[0xAA; 1024]));
+            connections.insert(2u64, entry_for(fast_tx, b"hello"));
+            let mut dirty: HashSet<u64> = [1, 2].into_iter().collect();
+            let mut to_remove = Vec::new();
+            let mut cqes = Vec::new();
+
+            let start = Instant::now();
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+            // Generous bound to stay unflaky under CI load — the fixed
+            // path completes in microseconds, the broken one only when
+            // the slow peer reads (here: never).
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "flush blocked on a slow peer"
+            );
+
+            assert!(to_remove.is_empty(), "nobody dropped on first refusal");
+            let slow = &connections[&1];
+            assert!(
+                !slow.send_buf.is_empty(),
+                "slow peer keeps its undelivered bytes"
+            );
+            assert!(slow.blocked_since.is_some(), "slow peer marked blocked");
+            assert!(dirty.contains(&1), "slow peer stays dirty for retry");
+
+            assert!(connections[&2].send_buf.is_empty(), "healthy peer drained");
+            assert!(!dirty.contains(&2), "healthy peer leaves the dirty set");
+            fast_rx
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut buf = [0u8; 5];
+            fast_rx.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"hello", "healthy peer's bytes reached the socket");
+        }
+
+        /// A payload larger than the socket buffer must be partially
+        /// delivered, the remainder kept, and the connection treated as
+        /// blocked (an immediate retry would only report EAGAIN).
+        #[test]
+        fn partial_send_keeps_remainder_and_marks_blocked() {
+            let mut ring = IoUring::new(64).unwrap();
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            // Shrink the send buffer so the payload cannot fit in one go.
+            let sz: libc::c_int = 8192;
+            let rc = unsafe {
+                libc::setsockopt(
+                    tx.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&raw const sz).cast(),
+                    size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "setsockopt(SO_SNDBUF) failed");
+            let payload = vec![0x55u8; 512 * 1024];
+
+            let mut connections = HashMap::new();
+            connections.insert(1u64, entry_for(tx, &payload));
+            let mut dirty: HashSet<u64> = [1].into_iter().collect();
+            let mut to_remove = Vec::new();
+            let mut cqes = Vec::new();
+
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+
+            let entry = &connections[&1];
+            assert!(entry.send_buf.len() < payload.len(), "some bytes were sent");
+            assert!(!entry.send_buf.is_empty(), "remainder kept for retry");
+            assert!(entry.blocked_since.is_some(), "partial send marks blocked");
+            assert!(dirty.contains(&1));
+            assert!(to_remove.is_empty());
+        }
+
+        /// A connection blocked past `BLOCKED_SEND_TIMEOUT` is dropped —
+        /// the guard for clients that stop reading during quiet periods,
+        /// where `MAX_SEND_BUF` never trips because nothing accumulates.
+        #[test]
+        fn blocked_past_timeout_is_dropped() {
+            let mut ring = IoUring::new(64).unwrap();
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            fill_socket(tx.as_raw_fd());
+
+            let mut entry = entry_for(tx, &[1u8; 64]);
+            entry.blocked_since = Some(Instant::now() - BLOCKED_SEND_TIMEOUT);
+            let mut connections = HashMap::new();
+            connections.insert(7u64, entry);
+            let mut dirty: HashSet<u64> = [7].into_iter().collect();
+            let mut to_remove = Vec::new();
+            let mut cqes = Vec::new();
+
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+
+            assert_eq!(to_remove, vec![7], "timed-out peer queued for removal");
+            assert!(!dirty.contains(&7), "dropped peer leaves the dirty set");
+        }
+
+        /// A blocked connection retried a moment ago is skipped — the
+        /// pacing that keeps a busy-spinning stage from probing a full
+        /// socket once per loop iteration.
+        #[test]
+        fn blocked_retry_is_paced() {
+            let mut ring = IoUring::new(64).unwrap();
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            fill_socket(tx.as_raw_fd());
+
+            let mut entry = entry_for(tx, &[1u8; 64]);
+            entry.blocked_since = Some(Instant::now());
+            entry.last_send_attempt = Instant::now();
+            let attempted_at = entry.last_send_attempt;
+            let mut connections = HashMap::new();
+            connections.insert(3u64, entry);
+            let mut dirty: HashSet<u64> = [3].into_iter().collect();
+            let mut to_remove = Vec::new();
+            let mut cqes = Vec::new();
+
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+
+            assert_eq!(
+                connections[&3].last_send_attempt, attempted_at,
+                "no SEND submitted inside the pacing window"
+            );
+            assert!(dirty.contains(&3), "paced peer stays dirty");
+            assert!(to_remove.is_empty());
+
+            // Outside the pacing window the retry happens: backdate the
+            // last attempt and verify the attempt timestamp advances.
+            connections.get_mut(&3).unwrap().last_send_attempt =
+                attempted_at - BLOCKED_RETRY_INTERVAL * 2;
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+            assert!(
+                connections[&3].last_send_attempt > attempted_at,
+                "retry submitted once the pacing window elapsed"
+            );
+        }
     }
 }
