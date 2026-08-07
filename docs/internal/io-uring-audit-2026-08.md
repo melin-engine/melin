@@ -138,6 +138,53 @@ initial fix:
   (trace-only, and blocked peers are the pathology being measured
   around, not the signal).
 
+**Second review round (2026-08-07)**, on the follow-up commits:
+
+- A non-`EINTR` `submit_and_wait` error means the SQEs were *not*
+  consumed; "drain and continue" would leave them queued for the next
+  flush's submit, against buffers mutated in between — the double-drain
+  class resurrected on the error path. The stage now fails loudly
+  instead (panic → the accept loop's pipeline-death detection): the
+  errno class is kernel resource exhaustion, and on the ack path of a
+  financial sequencer, dying beats sending corrupt bytes.
+- A CQE result of 0 (unreachable for `SOCK_STREAM` sends of nonzero
+  length) is treated as zero progress, not as a partial send, so it
+  cannot restart the blocked clock.
+
+## Review finding F1: response-initiated drops leaked the connection
+
+Found while auditing the drop path (pre-existing, not io_uring-specific,
+widened by the new `BLOCKED_SEND_TIMEOUT` drop): removing a connection
+from the response stage's map only dropped *its* dup of the socket. The
+reader holds another dup, no `shutdown(2)` was issued, and no
+reader-ward disconnect signal exists — so the socket stayed fully open.
+A dropped client that kept sending kept its ingress slot indefinitely
+(the reader's idle timeout never fires while traffic flows) with zero
+acks ever delivered. Worse, `active_connections` was never decremented
+anywhere on the kernel-TCP path: every disconnect permanently consumed a
+`max_connections` permit — reconnect churn alone could walk a server to
+"connection rejected" with near-zero live clients.
+
+Fixed: a response-initiated drop now calls `shutdown(2)` `SHUT_RDWR`
+(reaches every dup — the reader's multishot RECV completes with 0, it
+tears down its half and emits `Disconnected`, which finds the entry
+already gone), and the permit is decremented exactly when an entry
+actually leaves the response stage's connection map, whichever side
+initiated the death.
+
+## Review finding F3: two threads wrote the same client socket
+
+The reader's direct ServerBusy send and the response stage's SENDs
+targeted the same socket. After the finding-1 fix, a *partially-flushed*
+response frame with the remainder held for paced retry is a designed
+steady state — a ServerBusy landing between the two halves permanently
+desyncs the client's length-prefix framing, and the trigger conditions
+(pipeline full, slow consumer) are correlated. Fixed by making the
+response stage the sole egress writer per socket: the reader emits
+`ControlEvent::PipelineBusy` and the busy frame goes out as an ordinary
+send-buffer append. Invariant worth preserving in future transports:
+**one thread writes a given client socket, ever.**
+
 ## 2. The ServerBusy frame is written with a blocking syscall on the reader thread
 
 When the input disruptor is full, the reader sheds load by writing a
@@ -149,12 +196,20 @@ thread — ingress for **all** connections stops.
 This fires exactly when it is most likely to hurt: the pipeline-full path
 is the overload path, and the client most likely to have triggered it is
 the one most likely to have a congested socket. The comment already
-declares the write best-effort; it just isn't.
+declares the write best-effort; it just isn't. (Review correction: the
+accept loop sets `SO_SNDTIMEO` on the socket, so each blocked write was
+bounded at ~5 s, not indefinite — repeated 5 s ingress stalls per
+overload event rather than a permanent wedge. Still a defect.)
 
-**Fix direction:** `send(2)` with `MSG_DONTWAIT`, drop the frame on
-`EAGAIN`. The client's request was already shed; if the busy notice can't
-be delivered either, the client times out — which was the documented
-fallback anyway.
+**Fix, as landed (two steps):** first `send(2)` with `MSG_DONTWAIT`,
+dropping the frame on `EAGAIN` — the request was already shed and client
+timeout was the documented fallback. The adversarial review then flagged
+that *any* reader-side send races the response stage's writes on the
+same socket (finding F3 below), so the final form goes further: the
+reader emits `ControlEvent::PipelineBusy` and the response stage — the
+sole egress writer per socket — appends the pre-encoded frame to the
+connection's send buffer. The reader no longer touches client sockets at
+all.
 
 ## 3. Receive-buffer recycling costs one SQE + one CQE per received chunk
 
