@@ -2349,53 +2349,76 @@ fn journal_stage_rotates_on_size_threshold() {
 /// segment instead of stalling on the synchronous allocate.
 /// Regression test for the unwired `enable_preparer` — without the
 /// startup call, every rotation is a sync fallback forever.
+/// Instantiated for both writer specializations: `run_uring` arms the
+/// preparer on the sector path, the buffered `run` arms it on the
+/// page-cache path. Macro instead of a generic fn for the same reason
+/// as `pipeline_journal_contents_match_across_writer_modes` below.
 #[cfg(not(feature = "no-persist"))]
-#[test]
-fn size_rotation_uses_prepared_fast_path_after_warmup() {
-    // The loop below rotates open-endedly until the fast path engages;
-    // at the default 256 MiB prealloc chunk each rotation would
-    // materialize a full archive plus a staged sidecar (real memory on
-    // tmpfs), and disk pressure would make failure self-reinforcing
-    // via the preparer's 30 s error backoff. Shrink the chunk.
-    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("fast_rotate.journal");
-    let writer = Writer::create(&path).unwrap();
+macro_rules! size_rotation_fast_path_test {
+    ($name:ident, $writer_ty:ty) => {
+        #[test]
+        fn $name() {
+            // The loop below rotates open-endedly until the fast path
+            // engages; at the default 256 MiB prealloc chunk each
+            // rotation would materialize a full archive plus a staged
+            // sidecar (real memory on tmpfs), and disk pressure would
+            // make failure self-reinforcing via the preparer's 30 s
+            // error backoff. Shrink the chunk.
+            let _prealloc_guard =
+                melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fast_rotate.journal");
+            let writer = <$writer_ty>::create(&path).unwrap();
 
-    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
-        .add_consumer()
-        .build();
-    let consumer = consumers.pop().unwrap();
+            let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
+                .add_consumer()
+                .build();
+            let consumer = consumers.pop().unwrap();
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
-    // Tiny threshold — every non-empty fsync rotates.
-    stage.set_rotation(/* max_journal_bytes */ 1, None);
-    let util = stage.utilization();
+            let mut stage =
+                JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+            // Tiny threshold — every non-empty fsync rotates.
+            stage.set_rotation(/* max_journal_bytes */ 1, None);
+            let util = stage.utilization();
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let s = Arc::clone(&shutdown);
-    let handle = std::thread::spawn(move || stage.run(&s));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let s = Arc::clone(&shutdown);
+            let handle = std::thread::spawn(move || stage.run(&s));
 
-    // Each publish lands in its own fsync (threshold 1) and rotates.
-    // Early rotations may race the preparer's initial staging and fall
-    // back; once the worker catches up, a rotation must hit the fast
-    // path. Keep publishing until one does (bounded by the deadline).
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut n = 0u64;
-    while util.rotations_fast_path.load(Ordering::Relaxed) == 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no fast-path rotation within deadline (sync fallbacks: {})",
-            util.rotations_sync_fallback.load(Ordering::Relaxed)
-        );
-        n += 1;
-        producer.publish(add_slot(n, 1_000_000_000 + n));
-        std::thread::sleep(Duration::from_millis(20));
-    }
+            // Each publish lands in its own fsync (threshold 1) and
+            // rotates. Early rotations may race the preparer's initial
+            // staging and fall back; once the worker catches up, a
+            // rotation must hit the fast path. Keep publishing until
+            // one does (bounded by the deadline).
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut n = 0u64;
+            while util.rotations_fast_path.load(Ordering::Relaxed) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no fast-path rotation within deadline (sync fallbacks: {})",
+                    util.rotations_sync_fallback.load(Ordering::Relaxed)
+                );
+                n += 1;
+                producer.publish(add_slot(n, 1_000_000_000 + n));
+                std::thread::sleep(Duration::from_millis(20));
+            }
 
-    shutdown.store(true, Ordering::Relaxed);
-    handle.join().unwrap().unwrap();
+            shutdown.store(true, Ordering::Relaxed);
+            handle.join().unwrap().unwrap();
+        }
+    };
 }
+
+#[cfg(not(feature = "no-persist"))]
+size_rotation_fast_path_test!(
+    size_rotation_uses_prepared_fast_path_after_warmup,
+    SectorWriter<TestEvent>
+);
+#[cfg(not(feature = "no-persist"))]
+size_rotation_fast_path_test!(
+    size_rotation_uses_prepared_fast_path_after_warmup_buffered,
+    BufferedWriter<TestEvent>
+);
 
 /// `enable_preparer` arms exactly when rotation recurs on a
 /// predictable cadence: size-driven rotation or replica adoption

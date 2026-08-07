@@ -107,6 +107,19 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Close the active segment and open a fresh one; returns the
     /// archived path.
     fn rotate_segment(&mut self) -> Result<PathBuf, JournalError>;
+    /// Same contract as [`rotate_segment`](Self::rotate_segment), but
+    /// adopts a segment pre-staged by
+    /// [`crate::preparer::SegmentPreparer`] instead of paying the
+    /// synchronous allocate ceremony on the calling thread.
+    fn rotate_segment_with_prepared(
+        &mut self,
+        prepared: crate::preparer::PreparedSegment,
+    ) -> Result<PathBuf, JournalError>;
+    /// Inputs the segment preparer needs to stage this writer's next
+    /// segment (staging-file open mode + sector size). Spawning the
+    /// preparer with the writer's own params is what keeps the prepared
+    /// fd adoptable — both adopters reject a mode mismatch.
+    fn staging_params(&self) -> crate::preparer::StagingParams;
     /// Decoded file-header fields of the active segment (used by
     /// replication to bootstrap a fresh replica's chain anchor and
     /// starting sequence).
@@ -232,6 +245,22 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     }
 
     #[inline]
+    fn rotate_segment_with_prepared(
+        &mut self,
+        prepared: crate::preparer::PreparedSegment,
+    ) -> Result<PathBuf, JournalError> {
+        SectorWriter::rotate_segment_with_prepared(self, prepared)
+    }
+
+    #[inline]
+    fn staging_params(&self) -> crate::preparer::StagingParams {
+        crate::preparer::StagingParams {
+            sector_size: SectorWriter::sector_size(self),
+            open_mode: crate::preparer::SegmentOpenMode::Direct,
+        }
+    }
+
+    #[inline]
     fn read_header_info(&self) -> Result<crate::codec::FileHeaderInfo, JournalError> {
         SectorWriter::read_header_info(self)
     }
@@ -322,6 +351,25 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     #[inline]
     fn rotate_segment(&mut self) -> Result<PathBuf, JournalError> {
         BufferedWriter::rotate_segment(self)
+    }
+
+    #[inline]
+    fn rotate_segment_with_prepared(
+        &mut self,
+        prepared: crate::preparer::PreparedSegment,
+    ) -> Result<PathBuf, JournalError> {
+        BufferedWriter::rotate_segment_with_prepared(self, prepared)
+    }
+
+    #[inline]
+    fn staging_params(&self) -> crate::preparer::StagingParams {
+        // No alignment requirement on the page-cache path; the stamped
+        // sector size is only the fixed header reservation and is
+        // ignored at adoption.
+        crate::preparer::StagingParams {
+            sector_size: crate::codec::MAX_SECTOR_SIZE,
+            open_mode: crate::preparer::SegmentOpenMode::PageCache,
+        }
     }
 
     #[inline]

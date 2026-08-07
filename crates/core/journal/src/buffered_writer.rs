@@ -8,12 +8,19 @@
 //!
 //! ## Durability contract
 //!
-//! Every call to [`BufferedWriter::flush_batch_sync`] issues a
-//! single positioned `pwrite` followed by `fdatasync`. The call returns
-//! only once the kernel reports the data is on stable media — honest
-//! durability on any drive, PLP or not. On a drive with a volatile write
-//! cache (NVMe `VWC=1`) this pays one device flush per batch; on a drive
-//! that reports `VWC=0` (full PLP) the flush is a near-no-op.
+//! Every call to [`BufferedWriter::flush_batch_sync`] writes the batch
+//! and returns only once the kernel reports the data is on stable media
+//! — honest durability on any drive, PLP or not. On a drive with a
+//! volatile write cache (NVMe `VWC=1`) this pays one device flush per
+//! batch; on a drive that reports `VWC=0` (full PLP) the flush is a
+//! near-no-op.
+//!
+//! The write itself is a single `pwritev2(RWF_DSYNC)` — per-write
+//! `O_DSYNC` semantics, so write + sync cost one syscall instead of the
+//! classic `pwrite` + `fdatasync` pair. Kernels or filesystems that
+//! reject the flag are detected on the first flush and the writer
+//! permanently falls back to the two-syscall sequence; the durability
+//! guarantee is identical on both paths.
 //!
 //! ## Why a separate writer
 //!
@@ -38,6 +45,8 @@ use crate::chain::SegmentChain;
 use crate::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
+use crate::preparer::{PreparedSegment, SegmentOpenMode};
+use crate::sector_writer::zero_range_extents;
 
 /// Maximum encoded entry size. Mirrors `writer::MAX_ENTRY_SIZE` — actual
 /// entries are ~81-101 bytes; the array is sized generously so the
@@ -101,6 +110,11 @@ pub struct BufferedWriter<E: AppEvent> {
     // without a second encode pass.
     last_user_entry_offset: usize,
     last_user_entry_len: usize,
+    // Whether `pwritev2(RWF_DSYNC)` works on this kernel/filesystem.
+    // Probed by the first flush; a rejection downgrades the writer to
+    // `pwrite` + `fdatasync` permanently. A `bool` rather than a retry
+    // counter — support cannot appear mid-run on the same fd.
+    dsync_supported: bool,
 }
 
 impl<E: AppEvent> BufferedWriter<E> {
@@ -130,6 +144,15 @@ impl<E: AppEvent> BufferedWriter<E> {
         // growth latency for a while. ext4/xfs/btrfs all back this with
         // unwritten extents (no zero-fill cost) on the supported targets.
         let allocated_end = fallocate_chunk(&file, 0)?;
+
+        // Convert the unwritten extents to written zeros up front. On
+        // the buffered path the unwritten→written conversion otherwise
+        // happens at writeback time — i.e. inside `fdatasync`, where the
+        // jbd2 metadata commit it triggers lands directly on the
+        // durability gate (see `zero_range_extents`). Start past the
+        // header region: the header write below converts that extent
+        // once, before the segment sees traffic.
+        zero_range_extents(&file, HEADER_OFFSET, allocated_end);
 
         // Write the file header at offset 0. The codec reserves the
         // first `MAX_SECTOR_SIZE` (= 4096) bytes for the header
@@ -166,6 +189,91 @@ impl<E: AppEvent> BufferedWriter<E> {
             last_encoded_seq: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
+            dsync_supported: true,
+        })
+    }
+
+    /// Adopt a [`PreparedSegment`] produced by
+    /// [`crate::preparer::SegmentPreparer`].
+    ///
+    /// Mirrors [`Self::create_continuing`] but reuses the
+    /// already-allocated / zero-ranged / prefaulted staging file
+    /// instead of doing that work synchronously. On success the new
+    /// live segment is at `live_path` with its header (anchor included)
+    /// durably written.
+    ///
+    /// Failure-mode contract matches `SectorWriter::adopt_prepared`:
+    /// the staging file may or may not have been renamed before the
+    /// error. The caller's rename-back rollback overwrites a
+    /// partially-installed live file atomically, and a leftover staging
+    /// file is reclaimed by the next preparer cycle.
+    pub(crate) fn adopt_prepared(
+        prepared: PreparedSegment,
+        live_path: &Path,
+        starting_sequence: u64,
+        anchor_hash: [u8; 32],
+    ) -> Result<Self, JournalError> {
+        let PreparedSegment {
+            file,
+            path: staging_path,
+            allocated_end,
+            // The buffered writer has no alignment requirement — the
+            // stamped sector size is meaningful only to `SectorWriter`.
+            sector_size: _,
+            open_mode,
+        } = prepared;
+
+        // An O_DIRECT staging fd would make every buffered pwrite an
+        // alignment-checked direct write — the first flush would fail
+        // with EINVAL. Refuse up front, before any disk mutation, so
+        // the rotation fails cleanly and the caller's rollback runs.
+        // Unreachable in practice: the preparer is spawned with this
+        // writer's own `staging_params`.
+        if open_mode != SegmentOpenMode::PageCache {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prepared segment was opened O_DIRECT; \
+                 buffered adoption requires a page-cache staging fd",
+            )));
+        }
+
+        // Rename staging onto the live path. `archive_live` has already
+        // moved the previous live segment aside, so the destination is
+        // free. Done before any further writes so that, if it fails,
+        // the staging file is still findable for cleanup.
+        std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
+
+        // Write the file header through the adopted fd, then commit it
+        // explicitly so a crash before the next user write doesn't
+        // leave a header-less live segment.
+        let mut header_buf = [0u8; MAX_SECTOR_SIZE];
+        codec::encode_file_header(
+            &mut header_buf,
+            MAX_SECTOR_SIZE,
+            starting_sequence,
+            anchor_hash,
+        );
+        write_all_at(&file, &header_buf, 0)?;
+        file.sync_all()?;
+
+        Ok(Self {
+            _marker: PhantomData,
+            file,
+            buffer: [0u8; MAX_ENTRY_SIZE],
+            batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
+            batch_len: 0,
+            next_sequence: starting_sequence,
+            starting_sequence,
+            path: live_path.to_path_buf(),
+            write_pos: HEADER_OFFSET,
+            allocated_end,
+            #[cfg(feature = "hash-chain")]
+            hash_chain: SegmentChain::new(anchor_hash),
+            #[cfg(debug_assertions)]
+            last_encoded_seq: 0,
+            last_user_entry_offset: 0,
+            last_user_entry_len: 0,
+            dsync_supported: true,
         })
     }
 
@@ -213,6 +321,11 @@ impl<E: AppEvent> BufferedWriter<E> {
             file.set_len(valid_end)?;
         }
         let allocated_end = fallocate_chunk(&file, valid_end)?;
+        // Same jbd2-dodge as `create_continuing`, starting at the data
+        // frontier: everything below `valid_end` is recovered entries
+        // that a zero-range would destroy. The `sync_all` below also
+        // makes the conversion metadata durable.
+        zero_range_extents(&file, valid_end, allocated_end);
         file.sync_all()?;
 
         Ok(Self {
@@ -237,6 +350,7 @@ impl<E: AppEvent> BufferedWriter<E> {
             last_encoded_seq: last_seq,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
+            dsync_supported: true,
         })
     }
 
@@ -321,8 +435,10 @@ impl<E: AppEvent> BufferedWriter<E> {
 
     /// Write the accumulated batch and force it to stable media.
     ///
-    /// Issues exactly one `pwrite` covering the whole batch, followed by
-    /// `fdatasync`. Returns only when the kernel reports data is durable.
+    /// One `pwritev2(RWF_DSYNC)` covering the whole batch — write +
+    /// sync in a single syscall — falling back to `pwrite` +
+    /// `fdatasync` where the flag is unsupported. Returns only when the
+    /// kernel reports data is durable.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
         if self.batch_len == 0 {
             return Ok(());
@@ -330,17 +446,74 @@ impl<E: AppEvent> BufferedWriter<E> {
         self.ensure_allocated()?;
 
         let len = self.batch_len;
-        write_all_at(&self.file, &self.batch_buf[..len], self.write_pos)?;
-
-        // Honest durability: the call doesn't return until the kernel
-        // reports the data is on stable media. On a drive with a
-        // volatile write cache this issues a device-side flush; on a
-        // PLP drive (VWC=0) the flush is a near-no-op.
-        self.file.sync_data()?;
+        self.write_batch_durable(len)?;
 
         self.write_pos += len as u64;
         self.batch_len = 0;
         self.last_user_entry_len = 0;
+        Ok(())
+    }
+
+    /// Write `batch_buf[..len]` at `write_pos` and return only once it
+    /// is on stable media.
+    ///
+    /// Fast path: `pwritev2(RWF_DSYNC)` — per-write `O_DSYNC`
+    /// semantics; each successfully written chunk is individually
+    /// synced (short writes included), so completing the loop means the
+    /// whole range is durable. A kernel/filesystem that rejects the
+    /// flag downgrades the writer permanently and the remainder goes
+    /// through the classic `pwrite` + `fdatasync` sequence.
+    fn write_batch_durable(&mut self, len: usize) -> Result<(), JournalError> {
+        let mut written = 0usize;
+        while self.dsync_supported && written < len {
+            let bufs = [std::io::IoSlice::new(&self.batch_buf[written..len])];
+            match rustix::io::pwritev2(
+                self.file.as_fd(),
+                &bufs,
+                self.write_pos + written as u64,
+                rustix::io::ReadWriteFlags::DSYNC,
+            ) {
+                Ok(0) => {
+                    return Err(JournalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "buffered journal pwritev2 returned 0",
+                    )));
+                }
+                Ok(n) => written += n,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) if dsync_unsupported(e) => {
+                    // One-time capability probe outcome, not an error:
+                    // finish this flush (and every later one) via the
+                    // two-syscall path below.
+                    tracing::info!(
+                        errno = e.raw_os_error(),
+                        "pwritev2(RWF_DSYNC) unavailable; buffered journal \
+                         falls back to pwrite + fdatasync"
+                    );
+                    self.dsync_supported = false;
+                }
+                Err(e) => {
+                    return Err(JournalError::Io(std::io::Error::from_raw_os_error(
+                        e.raw_os_error(),
+                    )));
+                }
+            }
+        }
+        if written < len {
+            // Fallback (or remainder after a capability downgrade):
+            // plain positioned writes, then one fdatasync. Chunks
+            // already written with RWF_DSYNC above are durable; the
+            // fdatasync covers what the pwrite dirtied. On a drive
+            // with a volatile write cache the sync issues a
+            // device-side flush; on a PLP drive (VWC=0) it is a
+            // near-no-op.
+            write_all_at(
+                &self.file,
+                &self.batch_buf[written..len],
+                self.write_pos + written as u64,
+            )?;
+            self.file.sync_data()?;
+        }
         Ok(())
     }
 
@@ -442,6 +615,33 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// segment. No sequence number is consumed — the next event written
     /// gets exactly `next_sequence`.
     pub fn rotate_segment(&mut self) -> Result<PathBuf, JournalError> {
+        self.rotate_segment_inner(None)
+    }
+
+    /// Rotate, adopting a pre-staged segment produced by
+    /// [`crate::preparer::SegmentPreparer`].
+    ///
+    /// Same contract as [`Self::rotate_segment`] but skips the
+    /// synchronous `posix_fallocate + zero-range + sync_all` ceremony
+    /// for the new segment — that work already happened off the hot
+    /// thread. The remaining on-rotation cost is the outgoing flush,
+    /// two renames, a header write, and a parent-directory fsync.
+    ///
+    /// On error the prepared file is consumed; callers should re-arm
+    /// the preparer after any attempt so the next rotation can also be
+    /// fast.
+    pub fn rotate_segment_with_prepared(
+        &mut self,
+        prepared: PreparedSegment,
+    ) -> Result<PathBuf, JournalError> {
+        self.rotate_segment_inner(Some(prepared))
+    }
+
+    /// Shared rotation body. `prepared.is_some()` takes the fast path.
+    fn rotate_segment_inner(
+        &mut self,
+        prepared: Option<PreparedSegment>,
+    ) -> Result<PathBuf, JournalError> {
         self.flush_batch_sync()?;
 
         let path = self.path.clone();
@@ -454,7 +654,12 @@ impl<E: AppEvent> BufferedWriter<E> {
 
         let archived = crate::segment::archive_live(&path)?;
 
-        match Self::create_continuing(&path, next_seq, anchor) {
+        let new_writer_result = match prepared {
+            Some(p) => Self::adopt_prepared(p, &path, next_seq, anchor),
+            None => Self::create_continuing(&path, next_seq, anchor),
+        };
+
+        match new_writer_result {
             Ok(new_writer) => {
                 *self = new_writer;
                 // Persist both the rename (archive_live) and the new
@@ -493,15 +698,44 @@ impl<E: AppEvent> BufferedWriter<E> {
 
     /// Extend the file's pre-allocated region whenever the next write
     /// would land past it. Allocates one chunk at a time via
-    /// `posix_fallocate` — extent allocation only, no zero-fill cost.
+    /// `posix_fallocate`, then converts the fresh extents to written
+    /// zeros so writeback never queues jbd2 metadata for `fdatasync`
+    /// to commit.
     fn ensure_allocated(&mut self) -> Result<(), JournalError> {
         let need = self.write_pos + self.batch_len as u64;
         if need <= self.allocated_end {
             return Ok(());
         }
-        self.allocated_end = fallocate_chunk(&self.file, self.allocated_end)?;
+        // Allocate forward from wherever is farther: the previous
+        // allocation mark, or the data frontier. An oversize batch can
+        // push `write_pos` past `allocated_end` (the kernel auto-extends
+        // the file on write); chunking from the stale mark alone would
+        // ratchet uselessly behind the frontier forever.
+        let from = self.allocated_end.max(self.write_pos);
+        self.allocated_end = fallocate_chunk(&self.file, from)?;
+        // The zero-range starts at the data frontier — never at the
+        // stale `allocated_end` — so bytes the writer has already placed
+        // can't be wiped: everything at or past `write_pos` is not yet
+        // valid data by definition. Same invariant as
+        // `SectorWriter::zero_unwritten_through`.
+        zero_range_extents(&self.file, self.write_pos, self.allocated_end);
         Ok(())
     }
+}
+
+/// Errnos that mean "this kernel or filesystem cannot do
+/// `pwritev2(RWF_DSYNC)`" — a permanent property of the running
+/// system, so the writer stops probing and falls back to
+/// `pwrite` + `fdatasync`. `NOSYS`: pre-4.6 kernel without `pwritev2`;
+/// `OPNOTSUPP`: kernel (pre-4.7) or filesystem that rejects the
+/// `RWF_DSYNC` flag; `INVAL`: what some older kernels return for
+/// unknown `RWF_*` bits. Anything else is a real I/O error and must
+/// surface — a genuine `INVAL` write fault also fails the fallback
+/// write immediately after, so it cannot be swallowed here.
+fn dsync_unsupported(errno: rustix::io::Errno) -> bool {
+    errno == rustix::io::Errno::NOSYS
+        || errno == rustix::io::Errno::OPNOTSUPP
+        || errno == rustix::io::Errno::INVAL
 }
 
 /// Pre-allocate one chunk of disk blocks starting at `from`. Returns
@@ -735,6 +969,192 @@ mod tests {
         // holds the pre-rotation entries.
         assert_eq!(read_all_payloads(&path), vec![3]);
         assert_eq!(read_all_payloads(&archived), vec![1, 2]);
+    }
+
+    /// Fast-path rotation: a `PageCache`-staged segment adopts cleanly,
+    /// sequences stay contiguous across the boundary, and the chain
+    /// anchor links the new header to the archive's tail. Mirrors the
+    /// `SectorWriter` round-trip test.
+    #[test]
+    fn rotate_with_prepared_round_trip() {
+        use crate::preparer::SegmentPreparer;
+        use crate::write::JournalWrite;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&sample(1)).unwrap();
+        writer.append(&sample(2)).unwrap();
+        let next_seq_before_rotate = writer.next_sequence();
+        #[cfg(feature = "hash-chain")]
+        let pre_rotate_chain = writer.chain_hash().unwrap();
+
+        // Spawn the preparer exactly as the pipeline would — with this
+        // writer's own staging params — and wait for a staged segment.
+        let preparer = SegmentPreparer::spawn(path.clone(), JournalWrite::staging_params(&writer));
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let prepared = prepared.expect("preparer should publish a segment within 5 s");
+
+        let archived = writer
+            .rotate_segment_with_prepared(prepared)
+            .expect("rotate_with_prepared should succeed");
+        assert!(archived.exists(), "archive should be on disk");
+        assert!(path.exists(), "new live segment should be at original path");
+        assert!(
+            !crate::preparer::staging_path(&path).exists(),
+            "staging file should have been renamed onto the live path"
+        );
+
+        // Rotation consumes no sequence number.
+        assert_eq!(writer.next_sequence(), next_seq_before_rotate);
+
+        writer.append(&sample(3)).unwrap();
+        drop(writer);
+        preparer.shutdown();
+
+        assert_eq!(read_all_payloads(&path), vec![3]);
+        assert_eq!(read_all_payloads(&archived), vec![1, 2]);
+
+        // Cross-segment chain link: the adopted header's anchor equals
+        // the outgoing segment's tail chain hash.
+        #[cfg(feature = "hash-chain")]
+        {
+            let info = crate::segment::read_header_info(&path).unwrap();
+            assert_eq!(
+                info.anchor_hash, pre_rotate_chain,
+                "adopted segment's anchor must equal the pre-rotation tail"
+            );
+            assert_eq!(info.starting_sequence, next_seq_before_rotate);
+        }
+    }
+
+    /// A `Direct`-staged segment must be refused by buffered adoption —
+    /// before any disk mutation, so the rotation's rollback leaves a
+    /// working live segment behind.
+    #[test]
+    fn rotate_with_direct_prepared_segment_is_refused() {
+        use crate::preparer::{SegmentOpenMode, SegmentPreparer, StagingParams};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&sample(1)).unwrap();
+
+        let preparer = SegmentPreparer::spawn(
+            path.clone(),
+            StagingParams {
+                sector_size: MAX_SECTOR_SIZE,
+                open_mode: SegmentOpenMode::Direct,
+            },
+        );
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let prepared = prepared.expect("preparer should publish a segment within 5 s");
+
+        let err = writer.rotate_segment_with_prepared(prepared);
+        preparer.shutdown();
+        assert!(err.is_err(), "O_DIRECT staging fd must be refused");
+
+        // The rollback restored the live segment: the writer's file is
+        // gone from under it (its fd points at the archived inode), but
+        // a reopen sees the pre-rotation entries intact.
+        drop(writer);
+        assert_eq!(read_all_payloads(&path), vec![1]);
+    }
+
+    /// Regression guard for the `ensure_allocated` zero-range: the
+    /// conversion must start at the data frontier (`write_pos`), never
+    /// at the stale `allocated_end`. A single oversized batch advances
+    /// `write_pos` far past `allocated_end` (the kernel auto-extends
+    /// the file on write); a zero-range that started at the stale mark
+    /// would wipe every byte in `[old_end, write_pos)`. Mirrors the
+    /// `SectorWriter` regression test of the same shape.
+    #[test]
+    fn ensure_allocated_preserves_data_written_past_preallocation() {
+        use crate::prealloc::PreallocOverrideGuard;
+
+        // Shrink the prealloc chunk so one batch overflows it many
+        // times over. The guard scopes the override to this test and
+        // serialises with other tests using the same mechanism.
+        let _guard = PreallocOverrideGuard::new(8 * 1024);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regression.journal");
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+
+        // ~70 KiB of entries in one batch — roughly 9× the 8 KiB chunk.
+        // The flush's single pwrite pushes `write_pos` far past
+        // `allocated_end`.
+        const N: u64 = 2000;
+        for i in 0..N {
+            writer.batch_append_with_ts(&sample(i), 0, 0, 0).unwrap();
+        }
+        writer.flush_batch_sync().unwrap();
+
+        // One more append+flush triggers `ensure_allocated` with
+        // `write_pos` past the stale `allocated_end` — exactly the
+        // condition where a stale-mark zero-range would eat the
+        // previous batch.
+        writer.append(&sample(9_999)).unwrap();
+        drop(writer);
+
+        let payloads = read_all_payloads(&path);
+        let mut expected: Vec<u64> = (0..N).collect();
+        expected.push(9_999);
+        assert_eq!(
+            payloads, expected,
+            "zero-range wiped journal data written past the preallocation mark"
+        );
+    }
+
+    /// The capability probe downgrades on exactly the "no such
+    /// flag/syscall" errnos; real I/O errors must surface, not
+    /// silently flip the writer onto the fallback path.
+    #[test]
+    fn dsync_errno_classification() {
+        use rustix::io::Errno;
+        assert!(dsync_unsupported(Errno::NOSYS));
+        assert!(dsync_unsupported(Errno::OPNOTSUPP));
+        assert!(dsync_unsupported(Errno::INVAL));
+        assert!(!dsync_unsupported(Errno::IO));
+        assert!(!dsync_unsupported(Errno::NOSPC));
+        assert!(!dsync_unsupported(Errno::BADF));
+        assert!(!dsync_unsupported(Errno::INTR));
+    }
+
+    /// The fallback path must produce a byte-identical, durable
+    /// journal: force `dsync_supported = false` and round-trip.
+    #[test]
+    fn fallback_write_path_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fallback.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        // Simulate a kernel/filesystem without RWF_DSYNC.
+        writer.dsync_supported = false;
+        for i in 1..=5u64 {
+            writer.append(&sample(i)).unwrap();
+        }
+        drop(writer);
+
+        assert_eq!(read_all_payloads(&path), vec![1, 2, 3, 4, 5]);
     }
 
     #[test]

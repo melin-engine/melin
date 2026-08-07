@@ -41,11 +41,10 @@ The default is `buffered` both because incorrect use of `sector` silently corrup
 
 For each fsync batch:
 
-1. `pwrite` the batch bytes to the journal file (writes hit the kernel page cache).
-2. `fdatasync` the file (kernel flushes dirty pages to the drive, drive flushes its own write cache to media, kernel returns).
-3. Acknowledge the batch to the response stage.
+1. `pwritev2(RWF_DSYNC)` the batch bytes to the journal file — one syscall that both writes through the kernel page cache and synchronizes the written range to the drive, with the same semantics as a `pwrite` followed by `fdatasync`. (On kernels or filesystems that reject the flag, the writer detects it on the first flush and permanently falls back to the explicit `pwrite` + `fdatasync` pair; durability is identical either way.)
+2. Acknowledge the batch to the response stage.
 
-The `fdatasync` syscall is the durability boundary. When it returns, every byte in the batch is in non-volatile storage regardless of whether the drive has PLP — the kernel always issues a flush command (`REQ_OP_FLUSH`) to the device as part of `fdatasync`, and the device must acknowledge it before the syscall returns. On a drive with a volatile write cache, the flush command physically flushes the cache to media. On a PLP drive with the volatile write cache disabled (`VWC=0`), the flush is a near-no-op because the device acknowledges writes only after they're protected by the capacitor.
+The synchronized write is the durability boundary. When it returns, every byte in the batch is in non-volatile storage regardless of whether the drive has PLP — the kernel issues a flush command (`REQ_OP_FLUSH`) to the device as part of the sync, and the device must acknowledge it before the syscall returns. On a drive with a volatile write cache, the flush command physically flushes the cache to media. On a PLP drive with the volatile write cache disabled (`VWC=0`), the flush is a near-no-op because the device acknowledges writes only after they're protected by the capacitor.
 
 ### Sector mode
 
@@ -125,9 +124,9 @@ Sector mode under sustained load can show ~1 Hz spikes on some NVMe firmware (dr
 
 ### Segment rotation cost
 
-`sector` mode pre-stages the next segment off the hot path using a background preparer thread whenever rotation recurs — size-driven rotation, or a replica following the primary's announced boundaries. Those rotations cost ~microseconds in the journal stage's critical path. Manual-only configurations (`--max-journal-mib 0`, rotating exclusively via `ROTATE`) skip pre-staging and pay a synchronous allocate of tens of milliseconds per rotation; raise `--max-journal-mib` if fast manual rotation matters. `melin_journal_rotations_total{path=...}` on `/metrics` shows which path rotations are taking.
+Both modes pre-stage the next segment off the hot path using a background preparer thread whenever rotation recurs — size-driven rotation, or a replica following the primary's announced boundaries. Those rotations cost ~microseconds in the journal stage's critical path: the pre-allocated staging file is renamed into place and only the header is written synchronously.
 
-`buffered` mode rotates synchronously: `posix_fallocate` + `sync_all` on the new live file. At 256 MiB per segment and ~1 GiB/s sustained throughput, this is a ~20-40 ms stall every ~256 ms. For most workloads this is fine; if your tail latency budget is tight at the segment-rotation cadence, consider raising `--max-journal-mib` to extend the rotation period, or pre-allocate a larger segment.
+Manual-only configurations (`--max-journal-mib 0`, rotating exclusively via `ROTATE`) skip pre-staging and pay a synchronous allocate per rotation — tens of milliseconds depending on drive and filesystem; raise `--max-journal-mib` if fast manual rotation matters. The same synchronous fallback applies when a rotation fires before the preparer has finished staging (e.g. rotations more frequent than the staging cost). `melin_journal_rotations_total{path=...}` on `/metrics` shows which path rotations are taking; sustained growth of `path="sync_fallback"` means rotation stalls are landing on the journal thread.
 
 ---
 

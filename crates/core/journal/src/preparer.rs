@@ -40,8 +40,37 @@ use crate::codec::ENTRY_OFFSET;
 use crate::error::JournalError;
 use crate::sector_writer::{preallocate, prefault_pages, zero_range_extents};
 
+/// How the preparer opens the staging file. Must match the adopting
+/// writer's own open flags, because the prepared fd is reused as the
+/// live fd after the rename — a mismatch either breaks buffered writes
+/// (O_DIRECT alignment errors) or silently voids sector mode's
+/// write-through durability assumption (page-cache buffering behind an
+/// fd the writer believes is O_DIRECT). Both adopters hard-reject the
+/// wrong mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentOpenMode {
+    /// `O_DIRECT` (unless the `no-o-direct` feature strips it) — for
+    /// `SectorWriter` adoption.
+    Direct,
+    /// Plain page-cache fd — for `BufferedWriter` adoption.
+    PageCache,
+}
+
+/// Writer-specific inputs to segment staging, obtained via
+/// `JournalWrite::staging_params`. A struct rather than loose
+/// arguments so adding a knob cannot silently miss a spawn site.
+#[derive(Clone, Copy, Debug)]
+pub struct StagingParams {
+    /// Device sector size stamped into the [`PreparedSegment`] —
+    /// consumed by `SectorWriter` adoption, ignored by the buffered
+    /// writer.
+    pub sector_size: usize,
+    /// Open flags for the staging file.
+    pub open_mode: SegmentOpenMode,
+}
+
 /// A fully-prepared journal segment file ready to be adopted by a
-/// `SectorWriter` on the next rotation.
+/// writer on the next rotation.
 ///
 /// At this point the file already has:
 ///   - extents allocated for `[sector_size, allocated_end)` via
@@ -51,19 +80,24 @@ use crate::sector_writer::{preallocate, prefault_pages, zero_range_extents};
 ///   - the corresponding pages prefaulted into the page cache,
 ///   - `sync_all` issued so the allocation is durable across crashes.
 ///
-/// The file header is *not* yet written — `SectorWriter::adopt_prepared`
+/// The file header is *not* yet written — the writer's `adopt_prepared`
 /// writes it at adopt time so it reflects the rotation boundary's
 /// sequence + chain anchor.
 pub struct PreparedSegment {
-    /// O_DIRECT file handle. Reused by the writer after rename.
+    /// File handle opened per [`Self::open_mode`]. Reused by the writer
+    /// after rename.
     pub file: File,
     /// Path of the staging file (`<live>.next-staging`). The adopter
     /// renames it onto the live path.
     pub path: PathBuf,
-    /// End of pre-allocated region (matches `SectorWriter::allocated_end`).
+    /// End of pre-allocated region (matches the writer's `allocated_end`).
     pub allocated_end: u64,
-    /// Sector size detected at open time — must match the live file.
+    /// Sector size the segment was staged for — must match the live
+    /// file for `SectorWriter` adoption.
     pub sector_size: usize,
+    /// How [`Self::file`] was opened. Adopters reject a mismatch with
+    /// their own I/O mode.
+    pub open_mode: SegmentOpenMode,
 }
 
 /// Manages a background thread that pre-stages the next segment.
@@ -83,9 +117,9 @@ struct State {
     /// Path of the live journal segment. The staging path is derived as
     /// `<live_path>.next-staging`.
     live_path: PathBuf,
-    /// Device sector size, propagated from the live writer so the
-    /// staging file uses the same alignment.
-    sector_size: usize,
+    /// Sector size + open mode, propagated from the live writer so the
+    /// staging file matches its alignment and I/O mode.
+    params: StagingParams,
     /// Mutex<Option<…>> because the slot is mutated from two threads
     /// (worker writes, adopter takes) and has at most one entry. No
     /// contention on the hot path — the lock is only acquired at
@@ -111,12 +145,12 @@ impl SegmentPreparer {
     /// a crashed prior run — these files have no header and are not
     /// recognised by `segment::list_archives`, but leaving them on disk
     /// would cause `create_new` to fail at the next prepare.
-    pub fn spawn(live_path: PathBuf, sector_size: usize) -> Self {
+    pub fn spawn(live_path: PathBuf, params: StagingParams) -> Self {
         cleanup_staging_orphan(&live_path);
 
         let state = Arc::new(State {
             live_path,
-            sector_size,
+            params,
             slot: Mutex::new(None),
             // Pre-arm at startup so the worker prepares the first spare
             // segment in parallel with engine warm-up. The first rotation
@@ -243,7 +277,7 @@ fn worker_loop(state: Arc<State>) {
             continue;
         }
 
-        match prepare_one(&state.live_path, state.sector_size) {
+        match prepare_one(&state.live_path, state.params) {
             Ok(prepared) => {
                 if let Ok(mut g) = state.slot.lock() {
                     *g = Some(prepared);
@@ -273,11 +307,11 @@ fn backoff_sleep(state: &State) {
 
 /// Create the staging file and run the expensive preallocation steps.
 ///
-/// Mirrors the prep done in `SectorWriter::create_bare_inner` except
-/// it does *not* write a file header — the header is application data
-/// that depends on the rotation-boundary state and is written by
-/// `SectorWriter::adopt_prepared` after the rename.
-fn prepare_one(live_path: &Path, sector_size: usize) -> Result<PreparedSegment, JournalError> {
+/// Mirrors the prep done in the writers' create paths except it does
+/// *not* write a file header — the header is application data that
+/// depends on the rotation-boundary state and is written by the
+/// writer's `adopt_prepared` after the rename.
+fn prepare_one(live_path: &Path, params: StagingParams) -> Result<PreparedSegment, JournalError> {
     let staging = staging_path(live_path);
 
     // Remove any stale staging file. A leftover here is normally
@@ -294,13 +328,18 @@ fn prepare_one(live_path: &Path, sector_size: usize) -> Result<PreparedSegment, 
 
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create_new(true);
-    #[cfg(not(feature = "no-o-direct"))]
-    opts.custom_flags(libc::O_DIRECT);
+    match params.open_mode {
+        SegmentOpenMode::Direct => {
+            #[cfg(not(feature = "no-o-direct"))]
+            opts.custom_flags(libc::O_DIRECT);
+        }
+        SegmentOpenMode::PageCache => {}
+    }
     let file = opts.open(&staging)?;
 
     // Reserve `ENTRY_OFFSET` for the file header (written later by
-    // `adopt_prepared`) — matches `create_bare_inner` so adoption is a
-    // simple header pwrite, not a re-allocate.
+    // `adopt_prepared`) — matches the writers' create paths so adoption
+    // is a simple header pwrite, not a re-allocate.
     let allocated_end = preallocate(&file, ENTRY_OFFSET)?;
     zero_range_extents(&file, ENTRY_OFFSET, allocated_end);
     prefault_pages(&file, ENTRY_OFFSET, allocated_end);
@@ -310,7 +349,8 @@ fn prepare_one(live_path: &Path, sector_size: usize) -> Result<PreparedSegment, 
         file,
         path: staging,
         allocated_end,
-        sector_size,
+        sector_size: params.sector_size,
+        open_mode: params.open_mode,
     })
 }
 
@@ -368,6 +408,13 @@ pub(crate) fn staging_path(live: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn direct_params() -> StagingParams {
+        StagingParams {
+            sector_size: 4096,
+            open_mode: SegmentOpenMode::Direct,
+        }
+    }
+
     /// Spawning, arming, and shutdown round-trips without leaking the
     /// worker thread or the staging file.
     #[test]
@@ -377,7 +424,7 @@ mod tests {
         // Live file doesn't need to exist — the preparer only touches
         // the staging sibling.
 
-        let preparer = SegmentPreparer::spawn(live.clone(), 4096);
+        let preparer = SegmentPreparer::spawn(live.clone(), direct_params());
 
         // Wait up to 5 s for the worker to publish a prepared segment.
         // 256 MiB fallocate on tmpfs is sub-millisecond, but the bounded
@@ -393,6 +440,7 @@ mod tests {
         let prepared = prepared.expect("preparer should publish a segment within 5 s");
 
         assert_eq!(prepared.sector_size, 4096);
+        assert_eq!(prepared.open_mode, SegmentOpenMode::Direct);
         assert_eq!(prepared.path, staging_path(&live));
         assert!(prepared.allocated_end > 4096);
 
@@ -410,6 +458,8 @@ mod tests {
     }
 
     /// `spawn` removes a leftover staging file from a prior crash.
+    /// Runs in `PageCache` mode so the buffered-adoption open path gets
+    /// coverage in the preparer's own suite.
     #[test]
     fn spawn_cleans_orphan_staging_file() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -419,7 +469,13 @@ mod tests {
         std::fs::write(&staging, b"orphan from prior crash").expect("write orphan");
         assert!(staging.exists());
 
-        let preparer = SegmentPreparer::spawn(live, 4096);
+        let preparer = SegmentPreparer::spawn(
+            live,
+            StagingParams {
+                sector_size: 4096,
+                open_mode: SegmentOpenMode::PageCache,
+            },
+        );
 
         // The orphan should be gone immediately; the worker will then
         // create a fresh staging file.
@@ -448,7 +504,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
 
-        let preparer = SegmentPreparer::spawn(live, 4096);
+        let preparer = SegmentPreparer::spawn(live, direct_params());
 
         // First prepared segment.
         let mut first = None;

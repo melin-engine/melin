@@ -366,7 +366,22 @@ impl<E: AppEvent> SectorWriter<E> {
             path: staging_path,
             allocated_end,
             sector_size,
+            open_mode,
         } = prepared;
+
+        // A page-cache fd here would buffer writes the sector path
+        // believes are O_DIRECT write-through — a silent durability
+        // hole, not an I/O error. Refuse before touching the disk; the
+        // caller's rollback restores the live segment and the rotation
+        // fails loudly. Unreachable in practice: the preparer is
+        // spawned with this writer's own `staging_params`.
+        if open_mode != crate::preparer::SegmentOpenMode::Direct {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prepared segment was opened for page-cache I/O; \
+                 sector adoption requires an O_DIRECT staging fd",
+            )));
+        }
 
         // Rename staging onto the live path. `archive_live` has already
         // moved the previous live segment aside, so the destination is
@@ -1753,7 +1768,13 @@ mod tests {
         let next_seq_before_rotate = writer.next_sequence();
 
         // Spawn a preparer and wait for it to publish a prepared segment.
-        let preparer = SegmentPreparer::spawn(path.clone(), writer.sector_size);
+        let preparer = SegmentPreparer::spawn(
+            path.clone(),
+            crate::preparer::StagingParams {
+                sector_size: writer.sector_size,
+                open_mode: crate::preparer::SegmentOpenMode::Direct,
+            },
+        );
         let mut prepared = None;
         for _ in 0..500 {
             if let Some(p) = preparer.take() {

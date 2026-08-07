@@ -190,7 +190,7 @@ Expires all GTD orders with `expiry_ns <= timestamp_ns`.
 
 The journal stage offers two write paths, selected at startup via `--journal-writer`:
 
-- **`buffered`** *(default, production)* — `pwrite` plus `fdatasync` per batch. Honest durability on any drive: `fdatasync` flushes the page cache to the drive and waits for the drive to acknowledge a flush of its own write cache. Latency: ~10–30 µs per batch on PLP NVMe, ~50–200 µs on consumer NVMe.
+- **`buffered`** *(default, production)* — one synchronized write (`pwritev2(RWF_DSYNC)`, falling back to `pwrite` plus `fdatasync` where unsupported) per batch. Honest durability on any drive: the sync flushes the page cache to the drive and waits for the drive to acknowledge a flush of its own write cache. Latency: ~10–30 µs per batch on PLP NVMe, ~50–200 µs on consumer NVMe.
 - **`sector`** *(experimental)* — `pwrite` with `O_DIRECT`, no `fdatasync`. Bypasses the page cache and skips the device-level flush command. Durability depends entirely on the drive having capacitor-backed Power Loss Protection (PLP) with the volatile write cache disabled (`VWC=0`). Latency: ~5–15 µs per batch. **Silently loses acknowledged writes on power loss without PLP**, and shows unresolved ~1 Hz tail-latency spikes on some NVMe firmware. Not recommended for production.
 
 See [Journal Writer Modes](journal-writer-modes.md) for the full operator decision guide, PLP verification commands, and migration procedure.
