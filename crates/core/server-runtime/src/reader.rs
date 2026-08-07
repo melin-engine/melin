@@ -848,19 +848,31 @@ fn process_frames<A: Application, R>(
                 connection_id = conn.connection_id,
                 "pipeline full, sending ServerBusy"
             );
-            // Best-effort: if the write fails, the client will timeout.
+            // Best-effort: if the send fails, the client will timeout.
+            //
+            // MSG_DONTWAIT because client fds are in blocking mode and
+            // this runs on the reader thread: a plain write(2) into a
+            // full socket buffer would park the thread — stalling
+            // ingress for *every* connection — precisely on the overload
+            // path, where the client that filled the pipeline is also
+            // the one most likely to have a congested socket. If the
+            // frame doesn't fit, drop it: the request was already shed.
+            // MSG_NOSIGNAL so a peer that raced a close gets EPIPE here
+            // instead of raising SIGPIPE (std ignores it, but don't
+            // depend on that).
             let n = unsafe {
-                libc::write(
+                libc::send(
                     conn.fd,
                     server_busy_frame.as_ptr().cast(),
                     server_busy_frame.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
                 )
             };
             if n != server_busy_frame.len() as isize {
                 debug!(
                     connection_id = conn.connection_id,
                     written = n,
-                    "ServerBusy write incomplete"
+                    "ServerBusy send incomplete"
                 );
             }
             false
@@ -1296,6 +1308,66 @@ mod tests {
             conn.parse_buf,
             frame(0x06).to_vec(),
             "the 6th frame remains in parse_buf for the next recv-cycle"
+        );
+    }
+
+    /// Regression for the 2026-08 io_uring audit, finding 2
+    /// (docs/internal/io-uring-audit-2026-08.md): ServerBusy goes out
+    /// with `MSG_DONTWAIT`. Client fds are in blocking mode, so the old
+    /// plain `write(2)` parked the reader thread whenever the offender's
+    /// socket buffer was also full — stalling ingress for *every*
+    /// connection exactly on the overload path. Against that code this
+    /// test never returns.
+    #[test]
+    fn server_busy_send_does_not_block_when_the_socket_is_full() {
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            peer: _peer,
+        } = make_fixture(2);
+
+        // Fill the server→peer direction until the kernel refuses more —
+        // the state a non-reading client leaves the connection in.
+        let junk = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::send(
+                    conn.fd,
+                    junk.as_ptr().cast(),
+                    junk.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN),
+                    "unexpected errno while filling socket"
+                );
+                break;
+            }
+        }
+
+        // Capacity 2 + 3 frames ⇒ the third triggers Full ⇒ ServerBusy.
+        conn.parse_buf.extend_from_slice(&frame(0x01));
+        conn.parse_buf.extend_from_slice(&frame(0x02));
+        conn.parse_buf.extend_from_slice(&frame(0x03));
+
+        let start = std::time::Instant::now();
+        let disconnect = run_process_frames(&mut conn, &mut producer);
+        // Generous bound to stay unflaky under CI load — the fixed path
+        // returns in microseconds, the broken one only when the peer
+        // reads (here: never).
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "ServerBusy send blocked on a full socket"
+        );
+        assert!(!disconnect, "Full does not drop the connection");
+        assert_eq!(
+            drain(&mut consumer).len(),
+            2,
+            "the frames that fit are still published"
         );
     }
 
