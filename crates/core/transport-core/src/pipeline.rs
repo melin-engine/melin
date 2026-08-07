@@ -1712,6 +1712,53 @@ impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::Buffered
     }
 }
 
+/// Registered-slot lookup for a journal batch buffer about to be
+/// submitted: pointer identity against the two regions registered at
+/// ring setup. A miss means the writer's defensive replacement-alloc
+/// path produced an unregistered buffer — it must go out as a plain
+/// `Write`, since `WriteFixed` against a wrong slot would fail (or
+/// worse, write the wrong region's bytes).
+///
+/// `u16` because that is the SQE's `buf_index` width.
+pub(crate) fn journal_fixed_slot(
+    registered: Option<&[*const u8; 2]>,
+    buf_ptr: *const u8,
+) -> Option<u16> {
+    registered.and_then(|regs| {
+        regs.iter()
+            .position(|&p| std::ptr::eq(p, buf_ptr))
+            .map(|i| i as u16)
+    })
+}
+
+/// Build the journal write SQE: `WriteFixed` against a registered slot
+/// when the batch buffer is one of the two registered at setup — the
+/// pages were pinned once at registration, so the submit skips the
+/// `get_user_pages` walk a plain `Write` pays under O_DIRECT — and
+/// `Write` otherwise (unregistered replacement buffer, or registration
+/// failed at setup). `user_data(1)` on both: the reap path does not
+/// distinguish the variants, a CQE is a CQE.
+fn journal_write_sqe(
+    registered: Option<&[*const u8; 2]>,
+    batch: &melin_journal::AsyncWriteBatch,
+    rw_flags: i32,
+) -> io_uring::squeue::Entry {
+    use io_uring::{opcode, types};
+    let ptr = batch.buf.as_ptr();
+    match journal_fixed_slot(registered, ptr) {
+        Some(slot) => opcode::WriteFixed::new(types::Fixed(0), ptr, batch.len as u32, slot)
+            .offset(batch.offset)
+            .rw_flags(rw_flags)
+            .build()
+            .user_data(1),
+        None => opcode::Write::new(types::Fixed(0), ptr, batch.len as u32)
+            .offset(batch.offset)
+            .rw_flags(rw_flags)
+            .build()
+            .user_data(1),
+    }
+}
+
 /// Sector-specialized implementation: io_uring overlapped journal loop
 /// and the preparer fast-path rotation. Only meaningful for
 /// `SectorWriter` because the io_uring submit/complete path operates on
@@ -1862,11 +1909,10 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
     fn flush_pending_uring(
         &mut self,
         ring: &mut io_uring::IoUring,
+        registered_bufs: Option<&[*const u8; 2]>,
         inflight: &mut Option<(melin_journal::AsyncWriteBatch, u64)>,
         progress: u64,
     ) -> Result<(), JournalError> {
-        use io_uring::{opcode, types};
-
         if let Some((batch_data, seq)) = inflight.take() {
             self.wait_for_cqe(ring, batch_data.len)?;
             self.consumer.set_progress(seq);
@@ -1882,11 +1928,11 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
         // `take_batch_for_async_write`. Both are durable already.
         if let Some(async_batch) = self.writer.take_batch_for_async_write()? {
             let len = async_batch.len;
-            let sqe = opcode::Write::new(types::Fixed(0), async_batch.buf.as_ptr(), len as u32)
-                .offset(async_batch.offset)
-                .rw_flags(self.writer.io_uring_rw_flags())
-                .build()
-                .user_data(1);
+            let sqe = journal_write_sqe(
+                registered_bufs,
+                &async_batch,
+                self.writer.io_uring_rw_flags(),
+            );
             // SAFETY: `async_batch.buf` stays alive until the CQE is
             // reaped by `wait_for_cqe` immediately below; the ring
             // is single-threaded.
@@ -1938,7 +1984,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
-        use io_uring::{IoUring, opcode, types};
+        use io_uring::IoUring;
         use std::time::Instant;
 
         // Arm the background segment preparer so recurring rotations
@@ -1987,6 +2033,44 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
             })?;
         }
 
+        // Register the two batch buffers so steady-state journal writes
+        // go out as `WriteFixed`: their pages are pinned once here
+        // instead of `get_user_pages` walking the buffer on every
+        // O_DIRECT submit — a fixed per-batch cost (and an occasional
+        // page-migration stall) sitting directly on the durability-
+        // critical path. Registration counts against RLIMIT_MEMLOCK on
+        // top of the writer's own mlock, so failure degrades to plain
+        // `Write` with a warn (operator should raise the limit) rather
+        // than refusing to start.
+        let registered_bufs: Option<[*const u8; 2]> = match self.writer.batch_buffer_regions() {
+            Some(regions) => {
+                let iovecs = regions.map(|(ptr, len)| libc::iovec {
+                    iov_base: ptr as *mut libc::c_void,
+                    iov_len: len,
+                });
+                // SAFETY: the regions are owned by `self.writer`, are
+                // mlocked, never move or shrink (fixed-capacity boxes
+                // exchanged by ownership with in-flight batches), and
+                // outlive `ring` — the writer is returned to the caller
+                // only after the shutdown path has reaped every
+                // in-flight write and this function's locals are gone.
+                match unsafe { ring.submitter().register_buffers(&iovecs) } {
+                    Ok(()) => Some([regions[0].0, regions[1].0]),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "io_uring register_buffers failed — journal writes fall back \
+                             to plain Write; raise RLIMIT_MEMLOCK to enable WriteFixed"
+                        );
+                        None
+                    }
+                }
+            }
+            // A batch already in flight at setup cannot happen (nothing
+            // has been submitted yet); degrading beats asserting on it.
+            None => None,
+        };
+
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let delay = self.group_commit_delay;
         let mut idle_spins: u32 = 0;
@@ -2015,15 +2099,8 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                     if let Some(async_batch) = self.writer.take_batch_for_async_write()? {
                         let seq = self.consumer.next_read();
                         let len = async_batch.len;
-                        let sqe = opcode::Write::new(
-                            types::Fixed(0),
-                            async_batch.buf.as_ptr(),
-                            len as u32,
-                        )
-                        .offset(async_batch.offset)
-                        .rw_flags(rw_flags)
-                        .build()
-                        .user_data(1);
+                        let sqe =
+                            journal_write_sqe(registered_bufs.as_ref(), &async_batch, rw_flags);
                         unsafe {
                             ring.submission().push(&sqe).expect("SQ full");
                         }
@@ -2163,6 +2240,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                     if matches!(self.pending_mark, Some(StreamMark::Rotate(_))) {
                         self.flush_pending_uring(
                             &mut ring,
+                            registered_bufs.as_ref(),
                             &mut inflight,
                             read_start + stop as u64,
                         )?;
@@ -2281,15 +2359,8 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                     match self.writer.take_batch_for_async_write() {
                         Ok(Some(async_batch)) => {
                             let seq = self.consumer.next_read();
-                            let sqe = opcode::Write::new(
-                                types::Fixed(0),
-                                async_batch.buf.as_ptr(),
-                                async_batch.len as u32,
-                            )
-                            .offset(async_batch.offset)
-                            .rw_flags(rw_flags)
-                            .build()
-                            .user_data(1);
+                            let sqe =
+                                journal_write_sqe(registered_bufs.as_ref(), &async_batch, rw_flags);
 
                             unsafe {
                                 ring.submission().push(&sqe).expect("SQ full");

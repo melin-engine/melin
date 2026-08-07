@@ -636,6 +636,30 @@ impl<E: AppEvent> SectorWriter<E> {
         self.last_user_entry_len = 0;
     }
 
+    /// The two batch buffers' memory regions, for io_uring buffer
+    /// registration (`WriteFixed`).
+    ///
+    /// Both are fixed-capacity aligned allocations, mlocked at
+    /// construction, and exchanged with in-flight batches by *ownership*
+    /// (`take_batch_for_async_write` / `confirm_async_write`) — the
+    /// addresses never change for the writer's lifetime, which is
+    /// exactly the stability registration requires.
+    ///
+    /// `None` while the spare is checked out (a write is in flight):
+    /// register at setup, before the first async submit. Note the
+    /// take/confirm cycle can transiently introduce a *replacement*
+    /// buffer (see `take_batch_for_async_write`'s defensive alloc), so
+    /// submitters must match a batch's pointer against these regions and
+    /// fall back to an unregistered write on a miss.
+    pub fn batch_buffer_regions(&self) -> Option<[(*const u8, usize); 2]> {
+        self.spare_buf.as_ref().map(|spare| {
+            [
+                (self.batch_buf.as_ptr(), BATCH_BUF_CAPACITY),
+                (spare.as_ptr(), BATCH_BUF_CAPACITY),
+            ]
+        })
+    }
+
     /// Take the current batch buffer for async writing via io_uring.
     ///
     /// Returns `None` if the batch buffer is empty (nothing to write).
