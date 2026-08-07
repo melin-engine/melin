@@ -2,9 +2,11 @@
 //!
 //! Uses `IORING_OP_RECV` with `IORING_RECV_MULTISHOT` — a single SQE per
 //! connection produces multiple CQEs as data arrives, eliminating the
-//! resubmission overhead of standard RECV. Combined with provided buffer
-//! groups (`IOSQE_BUFFER_SELECT`), the kernel selects a buffer from a
-//! shared pool for each recv, replacing per-connection buffer allocations.
+//! resubmission overhead of standard RECV. Combined with a ring-mapped
+//! provided-buffer ring (`IOSQE_BUFFER_SELECT` + `buf_ring`), the kernel
+//! selects a buffer from a shared pool for each recv, and consumed
+//! buffers are recycled with a shared-memory store — no per-recv
+//! ProvideBuffers SQE/CQE round trip. Requires kernel ≥ 5.19.
 //!
 //! Uses a single reader thread — io_uring is efficient enough for hundreds
 //! of connections. New connections are registered via eventfd wakeup.
@@ -26,6 +28,7 @@ use io_uring::{IoUring, opcode, types};
 use tracing::{debug, error};
 
 use crate::ControlEvent;
+use crate::buf_ring::BufRing;
 use melin_app::Application;
 use melin_app::auth::Permission;
 use melin_app::decoder::RequestDecoder;
@@ -43,11 +46,13 @@ use melin_transport_core::pipeline::InputSlot;
 /// recv (frames are typically <100 bytes).
 const BUF_SIZE: usize = 4096;
 
-/// Number of provided buffers in the shared pool. Must be large enough
-/// to handle concurrent in-flight recvs across all connections. When the
-/// pool is exhausted, multishot terminates and is resubmitted after buffers
-/// are re-provided. 2048 supports up to ~1024 connections per reader
-/// thread with headroom for burst re-provision lag.
+/// Number of provided buffers in the shared pool. Must be a power of two
+/// (buf_ring ABI) and large enough for concurrent in-flight recvs across
+/// all connections. On exhaustion the kernel completes the multishot
+/// with `ENOBUFS` (no data consumed) and the loop re-arms it after the
+/// drain's recycles refill the ring. 2048 supports up to ~1024
+/// connections per reader thread; recycling is now a shared-memory store
+/// (no SQE), so raising this no longer interacts with `RING_SIZE`.
 const NUM_BUFFERS: u16 = 2048;
 
 /// Buffer group ID for the provided recv buffer pool.
@@ -56,15 +61,16 @@ const BUF_GROUP_ID: u16 = 0;
 use crate::client_frames::MAX_FRAME_SIZE;
 
 /// io_uring submission queue depth. Power of 2, sized for up to ~1024
-/// connections per reader thread (multishot RECVs + eventfd read +
-/// buffer re-provisions).
+/// connections per reader thread (multishot RECVs + eventfd read; buffer
+/// recycling goes through the buf_ring, not the SQ).
 const RING_SIZE: u32 = 4096;
 
 /// User data sentinel for the eventfd read SQE.
 const EVENTFD_TOKEN: u64 = u64::MAX;
 
-/// User data sentinel for ProvideBuffers CQEs. These are best-effort
-/// re-provisions — we log errors but don't act on success.
+/// User data sentinel for legacy ProvideBuffers CQEs (fallback recycle
+/// path only — see `BufferRecycleMode`). Best-effort re-provisions: we
+/// log errors but don't act on success.
 const PROVIDE_BUFS_TOKEN: u64 = u64::MAX - 1;
 
 /// User data sentinel for the tick timeout SQE. The reader arms a single
@@ -311,6 +317,27 @@ fn reader_loop<A: Application, R: AsRawFd>(
     tick_cadence: Option<Duration>,
     shutdown: &AtomicBool,
 ) {
+    // Kernel-referenced memory is declared BEFORE the io_uring so it
+    // drops AFTER the ring on every exit path, including panic unwind
+    // (locals drop in reverse declaration order). The kernel holds live
+    // references into all three for as long as the ring fd is open:
+    // armed multishot RECVs select entries from the buf_ring and write
+    // into the pool, and the armed eventfd READ writes its buffer.
+
+    // Eventfd read buffer — boxed for pointer stability across SQE lifetimes.
+    let mut eventfd_buf: Box<[u8; 8]> = Box::new([0u8; 8]);
+
+    // Shared buffer pool for provided buffers. Contiguous allocation of
+    // NUM_BUFFERS × BUF_SIZE bytes. The kernel selects a buffer from this
+    // pool for each recv completion, identified by buffer ID in the CQE.
+    let mut buffer_pool = vec![0u8; NUM_BUFFERS as usize * BUF_SIZE].into_boxed_slice();
+
+    // Ring-mapped provided-buffer ring: recycling a consumed buffer is a
+    // shared-memory store, not a ProvideBuffers SQE — see `buf_ring`.
+    // Allocated unconditionally (32 KiB) so its declaration precedes the
+    // io_uring's even when the legacy fallback below ends up in use.
+    let mut buf_ring = BufRing::new(NUM_BUFFERS, buffer_pool.as_mut_ptr(), BUF_SIZE);
+
     // SINGLE_ISSUER: this thread creates the ring and is the only one
     // that ever submits — lets the kernel skip SQ locking, and turns any
     // future cross-thread submission bug into an immediate EEXIST
@@ -323,27 +350,36 @@ fn reader_loop<A: Application, R: AsRawFd>(
         .build(RING_SIZE)
         .expect("failed to create io_uring instance");
 
+    // Prefer the buf_ring; fall back to legacy ProvideBuffers SQEs if
+    // the kernel rejects the registration. Not theoretical: PBUF_RING
+    // needs kernel ≥ 5.19, and some virtualized hosts filter newer
+    // io_uring register opcodes (EINVAL) while reporting a modern
+    // uname. The fallback costs one SQE + one CQE per received chunk —
+    // degraded but fully functional, hence warn (see log conventions).
+    let use_buf_ring = match buf_ring.register(&ring, BUF_GROUP_ID) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "buf_ring registration rejected — falling back to legacy \
+                 ProvideBuffers recycling (kernel < 5.19, or a hypervisor \
+                 filtering io_uring register opcodes)"
+            );
+            register_buffer_pool(&mut ring, buffer_pool.as_mut_ptr());
+            false
+        }
+    };
+
     let mut slab = ConnectionSlab::<R>::new();
     // Reverse map for cleanup when a connection's fd needs removal.
     // HashMap for O(1) lookup by fd. Sized for typical connection counts.
     let mut fd_to_slab: HashMap<RawFd, usize> = HashMap::with_capacity(256);
-
-    // Eventfd read buffer — boxed for pointer stability across SQE lifetimes.
-    let mut eventfd_buf: Box<[u8; 8]> = Box::new([0u8; 8]);
-
-    // Shared buffer pool for provided buffers. Contiguous allocation of
-    // NUM_BUFFERS × BUF_SIZE bytes. The kernel selects a buffer from this
-    // pool for each recv completion, identified by buffer ID in the CQE.
-    let mut buffer_pool = vec![0u8; NUM_BUFFERS as usize * BUF_SIZE].into_boxed_slice();
 
     // Pre-allocated CQE collection buffer. We must collect CQEs before
     // processing because the CQ borrow must end before pushing new SQEs.
     // Stores (user_data, result, flags) — flags needed for buffer ID and
     // multishot continuation.
     let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(RING_SIZE as usize);
-
-    // Register the provided buffer pool with io_uring.
-    register_buffer_pool(&mut ring, buffer_pool.as_mut_ptr());
 
     // Submit the initial eventfd read so we wake on first connection.
     push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
@@ -501,7 +537,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 continue;
             }
 
-            // ── ProvideBuffers completion ──
+            // ── Legacy ProvideBuffers completion (fallback mode only) ──
             if token == PROVIDE_BUFS_TOKEN {
                 if result < 0 {
                     error!(error = result, "ProvideBuffers failed");
@@ -545,6 +581,23 @@ fn reader_loop<A: Application, R: AsRawFd>(
 
             let slab_idx = token as usize;
             let has_more = (flags & IORING_CQE_F_MORE) != 0;
+
+            if result == -libc::ENOBUFS {
+                // Pool exhausted at buffer-selection time: the multishot
+                // terminated WITHOUT reading — no data was lost, it sits
+                // in the socket buffer. This is not a client error and
+                // must not disconnect (a bare `result <= 0 ⇒ remove`
+                // here dropped innocent clients under burst). Re-arm:
+                // recycles from data CQEs earlier in this drain have
+                // already refilled the buf_ring (publication is
+                // immediate), and the re-arm SQE submits after the whole
+                // drain, so the retry finds buffers.
+                if let Some(entry) = slab.get_mut(slab_idx) {
+                    entry.multishot_active = false;
+                }
+                push_recv_multi(&mut ring, &mut slab, slab_idx);
+                continue;
+            }
 
             if result <= 0 {
                 // Disconnect (0) or error (negative errno).
@@ -639,10 +692,16 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 Action::None
             };
 
-            // Re-provide the consumed buffer back to the pool. Must happen
-            // after we've copied the data out. Pushed to SQ and submitted
-            // on the next submit_and_wait.
-            re_provide_buffer(&mut ring, buffer_pool.as_mut_ptr(), buf_id);
+            // Recycle the consumed buffer. Must happen after the copy-out
+            // above — from this line on the kernel may write fresh recv
+            // data into the slot. buf_ring mode: a shared-memory store,
+            // published immediately. Legacy mode: a ProvideBuffers SQE,
+            // submitted with the next submit_and_wait.
+            if use_buf_ring {
+                buf_ring.push(buf_id as u16);
+            } else {
+                re_provide_buffer(&mut ring, buffer_pool.as_mut_ptr(), buf_id);
+            }
 
             match action {
                 Action::Remove { connection_id, fd } => {
@@ -721,8 +780,10 @@ enum Action {
 // SQE helpers
 // ---------------------------------------------------------------------------
 
-/// Register the provided buffer pool with io_uring via ProvideBuffers.
-/// Submits synchronously and panics on failure — called once at startup.
+/// Register the provided buffer pool via a legacy ProvideBuffers op —
+/// the fallback when buf_ring registration is rejected. Submits
+/// synchronously and panics on failure — called once at startup, and
+/// only after the preferred path already failed.
 fn register_buffer_pool(ring: &mut IoUring, pool_ptr: *mut u8) {
     let sqe = opcode::ProvideBuffers::new(pool_ptr, BUF_SIZE as i32, NUM_BUFFERS, BUF_GROUP_ID, 0)
         .build()
@@ -745,8 +806,10 @@ fn register_buffer_pool(ring: &mut IoUring, pool_ptr: *mut u8) {
     assert!(cqe.result() >= 0, "ProvideBuffers failed: {}", cqe.result());
 }
 
-/// Re-provide a single consumed buffer back to the pool. Pushed to SQ
-/// without immediate submission — batched with the next submit_and_wait.
+/// Re-provide a single consumed buffer back to the pool (legacy fallback
+/// mode). Pushed to SQ without immediate submission — batched with the
+/// next submit_and_wait. Safe against SQ overflow only because at most
+/// `NUM_BUFFERS` (< `RING_SIZE`) recycles can accumulate per drain.
 fn re_provide_buffer(ring: &mut IoUring, pool_ptr: *mut u8, buf_id: usize) {
     let buf_ptr = unsafe { pool_ptr.add(buf_id * BUF_SIZE) };
     let sqe = opcode::ProvideBuffers::new(buf_ptr, BUF_SIZE as i32, 1, BUF_GROUP_ID, buf_id as u16)
@@ -1525,5 +1588,125 @@ mod tests {
         assert!(conn.parse_buf.is_empty());
         assert_eq!(busy_events(&control_rx), 0);
         assert!(read_server_busy(&mut peer).is_none());
+    }
+
+    /// End-to-end soak through the real reader loop: 4 connections
+    /// concurrently write 10 000 frames each, one `write(2)` per frame,
+    /// so the receive path churns through the shared buffer pool and
+    /// its recycle machinery under genuine concurrency (buf_ring where
+    /// the kernel supports it, legacy ProvideBuffers otherwise — this
+    /// test is the coverage for whichever mode the host engages).
+    ///
+    /// The failure signatures of a recycle bug are exactly what is
+    /// asserted: a torn or misordered frame (a buffer reused while the
+    /// kernel still owned it), a lost frame, or a spurious disconnect
+    /// (`ENOBUFS` mishandled as a client error).
+    #[test]
+    fn reader_loop_soak_delivers_every_frame_in_order() {
+        use std::io::Write as _;
+
+        const CONNS: u64 = 4;
+        const FRAMES: u32 = 10_000;
+
+        // Capacity ≥ total frames: even if this thread is descheduled
+        // and stops draining, the ring cannot fill, so the reader never
+        // sheds load (which would legitimately drop frames and turn a
+        // CI hiccup into a false failure).
+        let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(65536)
+            .add_consumer()
+            .build();
+        let mut consumer = consumers.pop().expect("consumer");
+        let (control_tx, control_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let mut handle = spawn_reader::<TestApp, UnixStream>(
+            producer,
+            Arc::new(TagDecoder),
+            control_tx,
+            0,    // "do not pin" sentinel
+            None, // no idle timeout — a CI stall must not disconnect
+            None, // no tick generator
+            Arc::clone(&shutdown),
+        );
+
+        let mut writers = Vec::new();
+        for id in 0..CONNS {
+            let (client, server_side) = UnixStream::pair().expect("socketpair");
+            handle.register(ReaderRegistration {
+                connection_id: ConnectionId(id),
+                reader: server_side,
+                addr: "127.0.0.1:1".parse().expect("addr"),
+                permission: Permission::Trader,
+                key_hash: id,
+            });
+            writers.push(std::thread::spawn(move || {
+                let mut client = client;
+                for i in 0..FRAMES {
+                    let byte = (i % 200 + 1) as u8;
+                    client.write_all(&frame(byte)).expect("client write");
+                    // Brief pauses fragment the stream so the reader
+                    // sees many small recvs (heavy buffer churn) rather
+                    // than a few large coalesced ones.
+                    if i % 512 == 0 {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                }
+                client // keep the socket alive until after the drain
+            }));
+        }
+
+        // Drain until every frame arrived or the deadline passes. The
+        // deadline is generous — the run takes well under a second on
+        // an idle machine — because a genuine recycle deadlock must
+        // fail loudly, not hang CI.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut per_conn_count = [0u32; CONNS as usize];
+        let mut total: u64 = 0;
+        while total < CONNS * FRAMES as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "soak stalled: {total} of {} frames after 60s ({per_conn_count:?})",
+                CONNS * FRAMES as u64
+            );
+            while let Some((_seq, slot)) = consumer.try_consume() {
+                let conn = slot.connection_id as usize;
+                assert!(conn < CONNS as usize, "unknown connection id");
+                let expected = (per_conn_count[conn] % 200 + 1) as u8;
+                assert_eq!(
+                    slot.event,
+                    JournalEvent::App(TestEvent::Cmd(expected)),
+                    "conn {conn} frame {} out of order or corrupted",
+                    per_conn_count[conn]
+                );
+                per_conn_count[conn] += 1;
+                total += 1;
+            }
+            std::hint::spin_loop();
+        }
+
+        // Any control event at this point is a defect: sockets are
+        // still alive (held by the writer join handles) and the ring
+        // never filled. Every arm diverges, so inspecting the first
+        // queued event suffices.
+        if let Ok(event) = control_rx.try_recv() {
+            match event {
+                ControlEvent::Disconnected { connection_id } => {
+                    panic!("spurious disconnect of connection {connection_id}")
+                }
+                ControlEvent::PipelineBusy { connection_id } => {
+                    panic!("spurious pipeline-full for connection {connection_id}")
+                }
+                ControlEvent::Connected { .. } => {
+                    unreachable!("reader never sends Connected")
+                }
+            }
+        }
+
+        let _clients: Vec<UnixStream> = writers
+            .into_iter()
+            .map(|w| w.join().expect("writer thread"))
+            .collect();
+        handle.shutdown();
+        handle.join();
     }
 }

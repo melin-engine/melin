@@ -13,6 +13,7 @@
 //! separate `melin-server` crate.
 
 pub mod admin;
+mod buf_ring;
 mod client_frames;
 pub mod durability_policy;
 pub mod process;

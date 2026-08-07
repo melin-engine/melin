@@ -224,6 +224,41 @@ The ring-mapped provided-buffer ring (`IORING_REGISTER_PBUF_RING`, kernel
 an atomic tail bump — no SQE, no CQE, no syscall. Same pool, same
 multishot RECV, same CQE `buffer_id` plumbing.
 
+**Fixed, as landed** (`crates/core/server-runtime/src/buf_ring.rs`):
+
+- The `BufRing` type documents and encodes the kernel contract (release
+  store of the tail pairing with the kernel's acquire read) and the
+  overrun discipline (a bid is only ever pushed after the kernel handed
+  exactly that bid back in a CQE, so kernel-claimable + kernel-held +
+  userspace-held always sums to the pool size). Publication is per push,
+  not batched: a release store is an ordinary store on x86, and the
+  tighter window reduces `ENOBUFS` terminations.
+- **Runtime fallback, not a hard floor**: registration is attempted at
+  startup and failure degrades to the legacy `ProvideBuffers` path with
+  a warn. This is not theoretical — a dev host reporting a 6.8 uname
+  rejects `PBUF_RING` with `EINVAL` while accepting older register
+  opcodes (a hypervisor/seccomp layer filtering newer `io_uring_register`
+  opcodes). Deployments behind such filtering silently run the legacy
+  path; the warn is the operator's signal.
+- **Latent defect found and fixed during the migration**: on pool
+  exhaustion the kernel completes the multishot RECV with `-ENOBUFS`
+  (no data consumed), and the reader's CQE handler treated any
+  non-positive result as a client error — a burst that exhausted the
+  pool *disconnected* innocent clients. The handler now re-arms on
+  `ENOBUFS`; the fix applies to both recycle modes.
+- Kernel-referenced memory (buffer pool, buf_ring, eventfd buffer) is
+  now declared before the `IoUring` so it outlives the ring fd on every
+  exit path including panic unwind — previously the pool could be freed
+  while armed multishot RECVs still referenced it during unwind.
+- Tests: entry-layout and u16-tail-wrap unit tests; kernel-level
+  integration tests (delivery through selected buffers, a recycle soak
+  crossing the tail wrap under the kernel with sequence-stamped payload
+  verification, exhaustion → `ENOBUFS` → re-arm recovery), runtime-
+  skipped with a stderr notice on hosts that reject `PBUF_RING`; and an
+  end-to-end reader-loop soak (4 connections × 10 000 single-write
+  frames) asserting exactly-once, in-order delivery with no spurious
+  disconnects in whichever recycle mode the host engages.
+
 ## 4. Journal writes re-pin their buffer pages on every submit
 
 The journal ring registers the file (`types::Fixed(0)`) and pins io-wq
