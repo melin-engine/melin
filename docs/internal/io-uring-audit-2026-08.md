@@ -259,6 +259,38 @@ multishot RECV, same CQE `buffer_id` plumbing.
   frames) asserting exactly-once, in-order delivery with no spurious
   disconnects in whichever recycle mode the host engages.
 
+**Third review round (2026-08-07)**, on the buf_ring commit. The core
+protocol (tail publication, wrap arithmetic, overrun accounting,
+registration ordering) survived adversarial refutation. Findings fixed:
+
+- **Slab-index reuse injection (pre-existing, the round's real
+  defect)**: tearing down a connection (malformed frame, idle timeout)
+  never cancelled its armed multishot RECV, and the slab's LIFO free
+  list handed the index straight to the next registration. The armed op
+  holds a kernel file reference past the fd close, so the repudiated
+  peer's socket stayed live and its bytes were parsed under the *new*
+  connection's identity, key hash, and permissions. Teardown now severs
+  the peer (`shutdown(2)`), marks the entry dying, cancels the armed op
+  (`AsyncCancel`), and frees the index only at the terminal CQE — dying
+  entries' CQEs recycle their buffers and are otherwise discarded.
+  Regression-tested end to end (repudiated peer keeps writing while a
+  new client registers; nothing crosses streams).
+- Buffers are now extracted and recycled on *every* CQE arm, including
+  EOF/error CQEs (6.8 recycles those internally; the 5.19 floor could
+  not be shown to) and defensive paths — a leaked buffer is permanent.
+- Multishot bookkeeping (`F_MORE`) is recorded before any branch can
+  `continue`, so no defensive skip can wedge a connection; the
+  `ENOBUFS` re-arm guards on `F_MORE` against future kernels retrying
+  the multishot themselves.
+- Shutdown now quiesces (CANCEL_ANY + bounded CQ drain) before the
+  kernel-referenced allocations leave scope — closing the ring fd alone
+  triggers *asynchronous* teardown that could outlive the frees. Panic
+  unwind accepts the residual window (process failing; ring fd still
+  closes before the frees).
+- The recycle bid check is a hard assert (per-CQE path, off the
+  per-frame budget): an out-of-pool bid handed to the kernel would aim
+  a future DMA at arbitrary heap.
+
 ## 4. Journal writes re-pin their buffer pages on every submit
 
 The journal ring registers the file (`types::Fixed(0)`) and pins io-wq

@@ -129,7 +129,10 @@ impl BufRing {
     /// and terminate with `ENOBUFS`.
     #[inline]
     pub(crate) fn push(&mut self, bid: u16) {
-        debug_assert!(bid < self.entries, "bid {bid} out of range");
+        // Hard assert: an out-of-range bid becomes an out-of-pool addr
+        // in the entry — a future recv would DMA into arbitrary heap.
+        // This path runs per CQE, off the per-frame budget.
+        assert!(bid < self.entries, "bid {bid} out of range");
         let idx = (self.tail & (self.entries - 1)) as usize;
         // SAFETY: `idx < entries`, so the slot is inside the allocation,
         // and the kernel does not own it: the kernel only reads slots in
@@ -173,8 +176,11 @@ impl Drop for BufRing {
     fn drop(&mut self) {
         // SAFETY: allocated in `new` with this exact layout. The
         // `IoUring` this was registered with is already gone (the
-        // declaration-order rule), so the kernel holds no references
-        // into this memory.
+        // declaration-order rule). Ring-fd close makes the kernel's
+        // teardown *eventually* release its reference; the reader's
+        // shutdown path additionally cancels all armed ops and drains
+        // the CQ to quiescence before this runs, closing the async
+        // exit-work window on every non-panic path.
         unsafe { std::alloc::dealloc(self.ring as *mut u8, Self::layout(self.entries)) }
     }
 }
@@ -268,6 +274,16 @@ mod tests {
     fn non_power_of_two_entry_count_is_rejected() {
         let mut pool = vec![0u8; 6 * 32];
         let _ = BufRing::new(6, pool.as_mut_ptr(), 32);
+    }
+
+    /// An out-of-pool bid must never be written into a ring entry — it
+    /// would point a future recv's DMA at arbitrary heap. Hard assert,
+    /// pinned here so it can't be quietly downgraded to debug-only.
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn out_of_range_bid_is_rejected() {
+        let mut f = fixture(8, 32);
+        f.ring.push(8); // == entries: one past the pool
     }
 
     // ── Kernel integration: real io_uring, real sockets ──

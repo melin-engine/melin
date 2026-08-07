@@ -69,9 +69,14 @@ const RING_SIZE: u32 = 4096;
 const EVENTFD_TOKEN: u64 = u64::MAX;
 
 /// User data sentinel for legacy ProvideBuffers CQEs (fallback recycle
-/// path only — see `BufferRecycleMode`). Best-effort re-provisions: we
-/// log errors but don't act on success.
+/// path only). Best-effort re-provisions: we log errors but don't act
+/// on success.
 const PROVIDE_BUFS_TOKEN: u64 = u64::MAX - 1;
+
+/// User data sentinel for AsyncCancel SQEs (connection teardown and the
+/// shutdown quiesce). The completion carries no actionable information:
+/// `ENOENT`/`EALREADY` just mean the target op already finished.
+const CANCEL_TOKEN: u64 = u64::MAX - 3;
 
 /// User data sentinel for the tick timeout SQE. The reader arms a single
 /// `IORING_OP_TIMEOUT` per cadence so `submit_and_wait` returns at the tick
@@ -251,6 +256,16 @@ struct ConnectionEntry<R> {
     /// Last time any data was received on this connection. Used for
     /// idle timeout detection.
     last_activity: Instant,
+    /// Teardown has begun (malformed frame or idle timeout) while the
+    /// multishot RECV was still armed. The slab index must stay
+    /// allocated until the armed op's terminal CQE arrives — freeing it
+    /// early lets the LIFO free list hand the index to a new
+    /// registration while the kernel can still post CQEs carrying it,
+    /// and the old peer's bytes would be parsed under the new
+    /// connection's identity and permissions (audit review F1). CQEs
+    /// for a dying entry recycle their buffers and are otherwise
+    /// discarded.
+    dying: bool,
 }
 
 /// Index-stable allocator for connection state. Slab indices are used as
@@ -378,8 +393,9 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // Pre-allocated CQE collection buffer. We must collect CQEs before
     // processing because the CQ borrow must end before pushing new SQEs.
     // Stores (user_data, result, flags) — flags needed for buffer ID and
-    // multishot continuation.
-    let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(RING_SIZE as usize);
+    // multishot continuation. Sized to the CQ depth (2× the SQ) so even
+    // a maximal drain never reallocates mid-loop.
+    let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(RING_SIZE as usize * 2);
 
     // Submit the initial eventfd read so we wake on first connection.
     push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
@@ -406,7 +422,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
     let mut last_timeout_scan = Instant::now();
     // Pre-allocated buffer for stale connection indices to avoid
     // heap allocation inside the hot loop.
-    let mut stale: Vec<(usize, u64, RawFd)> = Vec::new();
+    let mut stale: Vec<usize> = Vec::new();
 
     // Tick generator state. `next_tick_deadline` is the monotonic instant the
     // next `JournalEvent::Tick` should fire. `last_tick_ns` enforces strict
@@ -545,6 +561,14 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 continue;
             }
 
+            // ── AsyncCancel completion ──
+            if token == CANCEL_TOKEN {
+                // Nothing to do: the cancelled op's own terminal CQE
+                // drives the state machine; ENOENT/EALREADY just mean
+                // it already finished on its own.
+                continue;
+            }
+
             // ── Eventfd wakeup ──
             if token == EVENTFD_TOKEN {
                 if result >= 0 {
@@ -561,6 +585,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                             parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
                             multishot_active: false,
                             last_activity: Instant::now(),
+                            dying: false,
                         };
                         let idx = slab.insert(entry);
                         fd_to_slab.insert(fd, idx);
@@ -582,6 +607,47 @@ fn reader_loop<A: Application, R: AsRawFd>(
             let slab_idx = token as usize;
             let has_more = (flags & IORING_CQE_F_MORE) != 0;
 
+            // A cleared F_MORE means THIS armed op posts no further
+            // CQEs — record it before any branch, so no early `continue`
+            // below can wedge the connection with a stale `true`.
+            if !has_more && let Some(entry) = slab.get_mut(slab_idx) {
+                entry.multishot_active = false;
+            }
+
+            // Extract the buffer (if any) before acting on `result`: a
+            // buffer can ride ANY recv CQE, and one that is not recycled
+            // is leaked from the pool forever. On 6.8 the kernel
+            // recycles internally before posting error/EOF CQEs, but the
+            // supported floor is 5.19, where that guarantee could not be
+            // established — the defensive recycle is one branch.
+            let buf_id = if (flags & IORING_CQE_F_BUFFER) != 0 {
+                Some((flags >> IORING_CQE_BUFFER_SHIFT) as usize)
+            } else {
+                None
+            };
+
+            // Dying connection: teardown began while its multishot was
+            // still armed (see `begin_teardown`). Consume its CQEs
+            // without parsing — the bytes belong to a repudiated peer —
+            // but keep recycling their buffers; free the slab index only
+            // at the terminal CQE, so it cannot be handed to a new
+            // registration while the kernel can still post CQEs carrying
+            // it. Checked before the disconnect branch so the cancel's
+            // -ECANCELED completion lands here, not there (which would
+            // emit a second Disconnected event).
+            if slab.get_mut(slab_idx).is_some_and(|e| e.dying) {
+                if let Some(bid) = buf_id {
+                    recycle_buffer(&mut ring, &mut buf_ring, use_buf_ring, &buffer_pool, bid);
+                }
+                if !has_more && let Some(dead) = slab.remove(slab_idx) {
+                    debug!(
+                        connection_id = dead.connection_id,
+                        "teardown complete, slab index released"
+                    );
+                }
+                continue;
+            }
+
             if result == -libc::ENOBUFS {
                 // Pool exhausted at buffer-selection time: the multishot
                 // terminated WITHOUT reading — no data was lost, it sits
@@ -592,15 +658,29 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 // already refilled the buf_ring (publication is
                 // immediate), and the re-arm SQE submits after the whole
                 // drain, so the retry finds buffers.
-                if let Some(entry) = slab.get_mut(slab_idx) {
-                    entry.multishot_active = false;
+                if let Some(bid) = buf_id {
+                    // No buffer accompanies a selection failure by
+                    // definition; recycle defensively if one appears.
+                    recycle_buffer(&mut ring, &mut buf_ring, use_buf_ring, &buffer_pool, bid);
+                }
+                if has_more {
+                    // Future-kernel guard: should the kernel ever keep
+                    // the multishot alive across ENOBUFS, arming a second
+                    // one would interleave two delivery streams into the
+                    // same parse buffer.
+                    continue;
                 }
                 push_recv_multi(&mut ring, &mut slab, slab_idx);
                 continue;
             }
 
             if result <= 0 {
-                // Disconnect (0) or error (negative errno).
+                // Disconnect (0) or error (negative errno) — terminal
+                // for the armed op, so the index is immediately safe to
+                // free. Recycle any buffer riding the CQE first.
+                if let Some(bid) = buf_id {
+                    recycle_buffer(&mut ring, &mut buf_ring, use_buf_ring, &buffer_pool, bid);
+                }
                 if let Some(removed) = slab.remove(slab_idx) {
                     if result == 0 {
                         debug!(
@@ -636,22 +716,20 @@ fn reader_loop<A: Application, R: AsRawFd>(
             #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
             let recv_ts = melin_transport_core::trace::mono_trace_ns();
 
-            // Extract the buffer ID from the CQE flags. The kernel sets
-            // IORING_CQE_F_BUFFER and encodes the buffer ID in bits 16-31.
-            let buf_id = if (flags & IORING_CQE_F_BUFFER) != 0 {
-                (flags >> IORING_CQE_BUFFER_SHIFT) as usize
-            } else {
-                // Should not happen with provided buffers — defensive skip.
+            // Data CQEs always carry a buffer with buffer-select recvs.
+            // Defensive: nothing to copy or recycle without one, but the
+            // multishot bookkeeping already ran above, so a terminal
+            // no-buffer CQE re-arms instead of wedging the connection.
+            let Some(buf_id) = buf_id else {
                 debug!(slab_idx, "recv CQE without buffer flag");
+                if !has_more {
+                    push_recv_multi(&mut ring, &mut slab, slab_idx);
+                }
                 continue;
             };
 
             // Feed received bytes into the frame parser from the shared pool.
             let action = if let Some(entry) = slab.get_mut(slab_idx) {
-                if !has_more {
-                    entry.multishot_active = false;
-                }
-
                 // Any successful recv resets the idle timeout.
                 entry.last_activity = batch_now;
 
@@ -676,10 +754,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     &mut ingest_rec,
                 );
                 if drop_conn {
-                    Action::Remove {
-                        connection_id: entry.connection_id,
-                        fd: entry.fd,
-                    }
+                    Action::Remove
                 } else if !has_more {
                     // Multishot terminated (buffer pool exhaustion or kernel
                     // decision) but connection is healthy — resubmit.
@@ -694,20 +769,15 @@ fn reader_loop<A: Application, R: AsRawFd>(
 
             // Recycle the consumed buffer. Must happen after the copy-out
             // above — from this line on the kernel may write fresh recv
-            // data into the slot. buf_ring mode: a shared-memory store,
-            // published immediately. Legacy mode: a ProvideBuffers SQE,
-            // submitted with the next submit_and_wait.
-            if use_buf_ring {
-                buf_ring.push(buf_id as u16);
-            } else {
-                re_provide_buffer(&mut ring, buffer_pool.as_mut_ptr(), buf_id);
-            }
+            // data into the slot.
+            recycle_buffer(&mut ring, &mut buf_ring, use_buf_ring, &buffer_pool, buf_id);
 
             match action {
-                Action::Remove { connection_id, fd } => {
-                    slab.remove(slab_idx);
-                    fd_to_slab.remove(&fd);
-                    let _ = control_tx.send(ControlEvent::Disconnected { connection_id });
+                Action::Remove => {
+                    // Deferred teardown, NOT an immediate slab free — the
+                    // multishot may still be armed and its index must not
+                    // be reused until the terminal CQE (audit review F1).
+                    begin_teardown(&mut ring, &mut slab, &mut fd_to_slab, control_tx, slab_idx);
                 }
                 Action::Resubmit => {
                     push_recv_multi(&mut ring, &mut slab, slab_idx);
@@ -726,7 +796,11 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 last_timeout_scan = now;
                 stale.clear();
                 for (idx, slot) in slab.entries.iter().enumerate() {
+                    // Dying entries are already mid-teardown: their
+                    // `last_activity` stays stale by design, and a second
+                    // teardown would emit a duplicate Disconnected.
                     if let Some(entry) = slot
+                        && !entry.dying
                         && now.duration_since(entry.last_activity) > timeout
                     {
                         debug!(
@@ -734,13 +808,11 @@ fn reader_loop<A: Application, R: AsRawFd>(
                             addr = %entry.addr,
                             "connection timed out"
                         );
-                        stale.push((idx, entry.connection_id, entry.fd));
+                        stale.push(idx);
                     }
                 }
-                for &(idx, connection_id, fd) in &stale {
-                    slab.remove(idx);
-                    fd_to_slab.remove(&fd);
-                    let _ = control_tx.send(ControlEvent::Disconnected { connection_id });
+                for &idx in &stale {
+                    begin_teardown(&mut ring, &mut slab, &mut fd_to_slab, control_tx, idx);
                 }
             }
         }
@@ -761,6 +833,42 @@ fn reader_loop<A: Application, R: AsRawFd>(
         }
     }
 
+    // Quiesce armed operations before the kernel-referenced allocations
+    // (buffer pool, buf_ring, eventfd buffer) leave scope. Closing the
+    // ring fd alone triggers ASYNCHRONOUS cancellation (the kernel's
+    // ring-exit work) which can still be touching those allocations
+    // after this function returns and frees them. Cancel everything
+    // (CANCEL_ANY matches all armed ops), then drain until the CQ stays
+    // quiet — bounded by a deadline so a wedged kernel cannot hang
+    // shutdown. Panic unwind skips this and accepts the (tiny,
+    // process-is-dying) exit-work window; declaration order still
+    // guarantees the ring fd closes before the frees.
+    {
+        let cancel_all = opcode::AsyncCancel2::new(types::CancelBuilder::any())
+            .build()
+            .user_data(CANCEL_TOKEN);
+        unsafe {
+            // Ignore a full SQ: the drain below still reaps whatever
+            // completes on its own within the deadline.
+            let _ = ring.submission().push(&cancel_all);
+        }
+        // Best-effort by design — on failure the bounded drain below
+        // still runs and the deadline caps the exposure.
+        let _ = ring.submit();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut quiet_polls = 0u32;
+        while quiet_polls < 10 && Instant::now() < deadline {
+            if ring.completion().next().is_some() {
+                quiet_polls = 0;
+                // Drain the rest of this batch without sleeping.
+                while ring.completion().next().is_some() {}
+            } else {
+                quiet_polls += 1;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
     unsafe {
         libc::close(wakeup_fd);
     }
@@ -770,8 +878,9 @@ fn reader_loop<A: Application, R: AsRawFd>(
 enum Action {
     /// Multishot terminated but connection healthy — resubmit RecvMulti.
     Resubmit,
-    /// Connection should be removed (malformed frame).
-    Remove { connection_id: u64, fd: RawFd },
+    /// Connection should be torn down (malformed frame). Handled via
+    /// `begin_teardown`, which reads what it needs from the slab entry.
+    Remove,
     /// Multishot still active — nothing to do.
     None,
 }
@@ -820,6 +929,85 @@ fn re_provide_buffer(ring: &mut IoUring, pool_ptr: *mut u8, buf_id: usize) {
         ring.submission()
             .push(&sqe)
             .expect("io_uring SQ full — increase RING_SIZE");
+    }
+}
+
+/// Return a consumed buffer to the shared pool, in whichever recycle
+/// mode registration selected.
+///
+/// Hard assert, not debug: the bid comes from a kernel CQE, this path
+/// runs per CQE (off the per-frame budget), and an out-of-range bid
+/// handed back to the kernel would point a future recv's DMA at
+/// arbitrary heap — the one failure mode worth an unconditional branch.
+fn recycle_buffer(
+    ring: &mut IoUring,
+    buf_ring: &mut BufRing,
+    use_buf_ring: bool,
+    buffer_pool: &[u8],
+    buf_id: usize,
+) {
+    assert!(
+        buf_id < NUM_BUFFERS as usize,
+        "kernel returned out-of-pool buffer id {buf_id}"
+    );
+    if use_buf_ring {
+        buf_ring.push(buf_id as u16);
+    } else {
+        re_provide_buffer(ring, buffer_pool.as_ptr() as *mut u8, buf_id);
+    }
+}
+
+/// Begin tearing down a connection the reader decided to drop while its
+/// multishot RECV may still be armed (malformed frame, idle timeout).
+///
+/// The slab index must NOT be freed yet: the kernel can still post CQEs
+/// carrying it, and the slab's LIFO free list would hand the index to
+/// the next registration — the old peer's bytes would then be parsed
+/// under the new connection's identity, key hash, and permissions
+/// (order-flow injection; audit review F1). Instead: sever the peer,
+/// mark the entry dying, cancel the armed op, and let the terminal CQE
+/// free the index (the `dying` branch of the CQE loop). When no op is
+/// armed there is nothing that can post — free immediately.
+fn begin_teardown<R>(
+    ring: &mut IoUring,
+    slab: &mut ConnectionSlab<R>,
+    fd_to_slab: &mut HashMap<RawFd, usize>,
+    control_tx: &mpsc::Sender<ControlEvent>,
+    idx: usize,
+) {
+    let Some(entry) = slab.get_mut(idx) else {
+        return;
+    };
+    if entry.dying {
+        return;
+    }
+    let connection_id = entry.connection_id;
+    let fd = entry.fd;
+    // Sever the peer now. The fd itself must stay open until the armed
+    // op completes (the kernel holds a file reference for it anyway);
+    // shutdown(2) stops both directions immediately. Best-effort:
+    // ENOTCONN just means the peer already went away.
+    unsafe {
+        libc::shutdown(fd, libc::SHUT_RDWR);
+    }
+    fd_to_slab.remove(&fd);
+    // Dropped error: a dead control channel means the response stage is
+    // gone and the server is shutting down.
+    let _ = control_tx.send(ControlEvent::Disconnected { connection_id });
+
+    if entry.multishot_active {
+        entry.dying = true;
+        let sqe = opcode::AsyncCancel::new(idx as u64)
+            .build()
+            .user_data(CANCEL_TOKEN);
+        unsafe {
+            ring.submission()
+                .push(&sqe)
+                .expect("io_uring SQ full — increase RING_SIZE");
+        }
+    } else {
+        // No armed op ⇒ no future CQEs can carry this index.
+        slab.remove(idx);
     }
 }
 
@@ -1083,6 +1271,7 @@ mod tests {
             parse_buf: Vec::with_capacity(64),
             multishot_active: false,
             last_activity: Instant::now(),
+            dying: false,
         };
 
         let (producer, mut consumers) =
@@ -1706,6 +1895,143 @@ mod tests {
             .into_iter()
             .map(|w| w.join().expect("writer thread"))
             .collect();
+        handle.shutdown();
+        handle.join();
+    }
+
+    /// Regression for audit review F1
+    /// (docs/internal/io-uring-audit-2026-08.md): a connection torn down
+    /// while its multishot RECV is still armed must not have its slab
+    /// index reused while the kernel can still post CQEs carrying it.
+    /// Pre-fix, the LIFO free list handed client A's index straight to
+    /// client B; A's socket stayed open (the armed op holds a file
+    /// reference past the fd close), and A's continued bytes were parsed
+    /// under B's connection id, key hash, and permissions — order-flow
+    /// injection under someone else's identity. Post-fix, A's entry dies
+    /// in place until the cancelled op's terminal CQE, so B gets a fresh
+    /// index and A's post-teardown bytes are discarded.
+    #[test]
+    fn torn_down_connection_cannot_inject_frames_into_a_reused_slot() {
+        use std::io::Write as _;
+
+        let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(65536)
+            .add_consumer()
+            .build();
+        let mut consumer = consumers.pop().expect("consumer");
+        let (control_tx, control_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut handle = spawn_reader::<TestApp, UnixStream>(
+            producer,
+            Arc::new(TagDecoder),
+            control_tx,
+            0,
+            None,
+            None,
+            Arc::clone(&shutdown),
+        );
+
+        const A_ID: u64 = 100;
+        const B_ID: u64 = 200;
+
+        // Client A: valid frames (0x01..=0x08), an oversize prefix (the
+        // teardown trigger), then a sustained stream of would-be
+        // injection frames from A's byte range.
+        let (a_client, a_server) = UnixStream::pair().expect("socketpair");
+        handle.register(ReaderRegistration {
+            connection_id: ConnectionId(A_ID),
+            reader: a_server,
+            addr: "127.0.0.1:1".parse().expect("addr"),
+            permission: Permission::Trader,
+            key_hash: A_ID,
+        });
+        let a_writer = std::thread::spawn(move || {
+            let mut a = a_client;
+            for byte in 0x01..=0x08u8 {
+                let _ = a.write_all(&frame(byte));
+            }
+            let _ = a.write_all(&oversize_prefix());
+            // Keep writing after the reader repudiates us. Write errors
+            // (EPIPE once teardown's shutdown(2) lands) are the fix
+            // doing its job — ignore them and keep trying.
+            let stop = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < stop {
+                let _ = a.write_all(&frame(0x05));
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            a
+        });
+
+        // Wait for A's teardown announcement, then register B — the
+        // instant a buggy free list would hand B the still-armed index.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match control_rx.try_recv() {
+                Ok(ControlEvent::Disconnected { connection_id }) if connection_id == A_ID => break,
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(Instant::now() < deadline, "no Disconnected for A");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+
+        const B_FRAMES: u32 = 2_000;
+        let (b_client, b_server) = UnixStream::pair().expect("socketpair");
+        handle.register(ReaderRegistration {
+            connection_id: ConnectionId(B_ID),
+            reader: b_server,
+            addr: "127.0.0.1:2".parse().expect("addr"),
+            permission: Permission::Trader,
+            key_hash: B_ID,
+        });
+        let b_writer = std::thread::spawn(move || {
+            let mut b = b_client;
+            for i in 0..B_FRAMES {
+                let byte = 0x21 + (i % 0x10) as u8; // 0x21..=0x30, disjoint from A
+                b.write_all(&frame(byte)).expect("B write");
+                if i % 128 == 0 {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+            b
+        });
+
+        // Drain until all of B's frames arrive. Every B-attributed slot
+        // must carry B's key hash and a B-range byte; anything else is
+        // the injection this test exists to prevent.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut b_seen = 0u32;
+        while b_seen < B_FRAMES {
+            assert!(
+                Instant::now() < deadline,
+                "stalled: {b_seen}/{B_FRAMES} B frames"
+            );
+            while let Some((_seq, slot)) = consumer.try_consume() {
+                match slot.event {
+                    JournalEvent::App(TestEvent::Cmd(byte)) => {
+                        if slot.connection_id == B_ID {
+                            assert_eq!(slot.key_hash, B_ID, "B slot with foreign key hash");
+                            assert!(
+                                (0x21..=0x30).contains(&byte),
+                                "byte {byte:#x} injected into B's stream"
+                            );
+                            b_seen += 1;
+                        } else {
+                            assert_eq!(slot.connection_id, A_ID, "unknown connection id");
+                            assert!(
+                                (0x01..=0x08).contains(&byte),
+                                "unexpected byte {byte:#x} on A"
+                            );
+                        }
+                    }
+                    ref other => panic!("unexpected event {other:?}"),
+                }
+            }
+            std::hint::spin_loop();
+        }
+
+        let _a = a_writer.join().expect("A writer");
+        let _b = b_writer.join().expect("B writer");
         handle.shutdown();
         handle.join();
     }
