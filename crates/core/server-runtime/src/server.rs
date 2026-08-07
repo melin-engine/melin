@@ -1484,6 +1484,7 @@ where
     let busy_spin = !config.yield_idle;
     let response_utilization_thread = Arc::clone(&response_utilization);
     let response_fence = Arc::clone(&fence_state);
+    let active_connections_response = Arc::clone(&active_connections);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -1501,6 +1502,7 @@ where
                     utilization: response_utilization_thread,
                     encoder,
                     fence_state: response_fence,
+                    active_connections: active_connections_response,
                 },
                 &s3,
             );
@@ -2018,10 +2020,12 @@ where
             );
         }
 
-        // Set a write timeout on the response socket so a slow/stalled
-        // client cannot block the response thread (SEC-01). If a write
-        // takes longer than this, it returns EAGAIN and the response
-        // stage drops the connection.
+        // Belt-and-braces write timeout (SEC-01). The real slow-client
+        // protection is in the response stage — MSG_DONTWAIT sends,
+        // paced retries, and the blocked-send timeout — since io_uring
+        // SEND does not honor SO_SNDTIMEO. This bounds any residual
+        // blocking write(2) on this fd (none exist today; the response
+        // stage is the sole egress writer).
         if let Err(e) = set_write_timeout(&std_write, Some(std::time::Duration::from_secs(5))) {
             debug!(connection_id = connection_id.0, error = %e, "failed to set write timeout");
         }

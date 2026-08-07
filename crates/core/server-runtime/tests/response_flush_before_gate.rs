@@ -82,6 +82,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         utilization: Arc::new(StageUtilization::default()),
         encoder: Arc::new(ResponseEncoder),
         fence_state: Arc::new(FenceState::new(0)),
+        active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
 }
 

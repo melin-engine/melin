@@ -29,9 +29,9 @@ pub mod dpdk_response;
 #[cfg(feature = "dpdk")]
 pub mod dpdk_transport;
 
-/// Control-plane event the accept loop and response stage exchange.
-/// Transport-agnostic — the payload is a socket fd + writer, not an
-/// app event — so both build modes refer to the same type.
+/// Control-plane event the accept loop, reader, and response stage
+/// exchange. Transport-agnostic — the payload is a socket fd + writer,
+/// not an app event — so both build modes refer to the same type.
 pub enum ControlEvent {
     Connected {
         connection_id: u64,
@@ -39,6 +39,16 @@ pub enum ControlEvent {
         writer: melin_wire_protocol::blocking::BlockingFrameWriter<Box<dyn std::io::Write + Send>>,
     },
     Disconnected {
+        connection_id: u64,
+    },
+    /// Reader → response: the input pipeline was full when this
+    /// connection's frame arrived; deliver a `ServerBusy` notice through
+    /// the normal egress path. Routed through the response stage so
+    /// exactly one thread ever writes a client socket — a reader-side
+    /// send could land between the two halves of a partially-flushed
+    /// response frame and permanently desync the client's length-prefix
+    /// framing (2026-08 io_uring audit, review finding F3).
+    PipelineBusy {
         connection_id: u64,
     },
 }

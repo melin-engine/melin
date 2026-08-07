@@ -38,8 +38,6 @@ pub type RequestDecoderArc<A> = Arc<dyn RequestDecoder<Event = <A as Application
 use melin_app::unix_epoch_nanos;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
-use melin_wire_protocol::control::TransportResponse;
-use melin_wire_protocol::control_codec;
 
 /// Size of each provided buffer. 4 KiB accommodates multiple frames per
 /// recv (frames are typically <100 bytes).
@@ -313,17 +311,17 @@ fn reader_loop<A: Application, R: AsRawFd>(
     tick_cadence: Option<Duration>,
     shutdown: &AtomicBool,
 ) {
-    let mut ring = IoUring::new(RING_SIZE).expect("failed to create io_uring instance");
-
-    // Pre-encode the ServerBusy response frame (length prefix + tag = 5 bytes).
-    let server_busy_frame = {
-        let mut buf = [0u8; 8];
-        let n = control_codec::encode_transport_response(&TransportResponse::ServerBusy, &mut buf)
-            .expect("ServerBusy encodes");
-        let mut frame = [0u8; 5];
-        frame.copy_from_slice(&buf[..n]);
-        frame
-    };
+    // SINGLE_ISSUER: this thread creates the ring and is the only one
+    // that ever submits — lets the kernel skip SQ locking, and turns any
+    // future cross-thread submission bug into an immediate EEXIST
+    // instead of a silent race. Same rationale as the journal and
+    // replication rings. (COOP_TASKRUN/DEFER_TASKRUN deliberately not
+    // set — see the journal ring's measured rationale in
+    // melin-transport-core::pipeline.)
+    let mut ring: IoUring = IoUring::builder()
+        .setup_single_issuer()
+        .build(RING_SIZE)
+        .expect("failed to create io_uring instance");
 
     let mut slab = ConnectionSlab::<R>::new();
     // Reverse map for cleanup when a connection's fd needs removal.
@@ -616,7 +614,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     entry,
                     &mut producer,
                     decoder,
-                    &server_busy_frame,
+                    control_tx,
                     batch_wall_ns,
                     recv_ts,
                     #[cfg(feature = "latency-trace")]
@@ -817,7 +815,7 @@ fn process_frames<A: Application, R>(
     conn: &mut ConnectionEntry<R>,
     producer: &mut ring::Producer<InputSlot<A::Event>>,
     decoder: &dyn RequestDecoder<Event = A::Event>,
-    server_busy_frame: &[u8; 5],
+    control_tx: &mpsc::Sender<ControlEvent>,
     batch_wall_ns: u64,
     recv_ts: melin_transport_core::trace::MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
@@ -846,35 +844,23 @@ fn process_frames<A: Application, R>(
         FrameAction::PipelineFull => {
             debug!(
                 connection_id = conn.connection_id,
-                "pipeline full, sending ServerBusy"
+                "pipeline full, routing ServerBusy via response stage"
             );
-            // Best-effort: if the send fails, the client will timeout.
+            // The response stage owns ALL egress on a client socket. A
+            // reader-side send here — however non-blocking — races the
+            // response stage's own writes and can land between the two
+            // halves of a partially-flushed response frame, permanently
+            // desyncing the client's length-prefix framing (audit review
+            // F3). It also kept a client-socket syscall on the ingress
+            // thread. Routing through the control channel makes the
+            // notice an ordinary send_buf append over there.
             //
-            // MSG_DONTWAIT because client fds are in blocking mode and
-            // this runs on the reader thread: a plain write(2) into a
-            // full socket buffer would park the thread — stalling
-            // ingress for *every* connection — precisely on the overload
-            // path, where the client that filled the pipeline is also
-            // the one most likely to have a congested socket. If the
-            // frame doesn't fit, drop it: the request was already shed.
-            // MSG_NOSIGNAL so a peer that raced a close gets EPIPE here
-            // instead of raising SIGPIPE (std ignores it, but don't
-            // depend on that).
-            let n = unsafe {
-                libc::send(
-                    conn.fd,
-                    server_busy_frame.as_ptr().cast(),
-                    server_busy_frame.len(),
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                )
-            };
-            if n != server_busy_frame.len() as isize {
-                debug!(
-                    connection_id = conn.connection_id,
-                    written = n,
-                    "ServerBusy send incomplete"
-                );
-            }
+            // Error deliberately dropped: a dead control channel means
+            // the response stage is gone and the server is shutting
+            // down — same reasoning as the Disconnected sends below.
+            let _ = control_tx.send(ControlEvent::PipelineBusy {
+                connection_id: conn.connection_id,
+            });
             false
         }
     }
@@ -988,12 +974,6 @@ mod tests {
         }
     }
 
-    /// 5-byte ServerBusy placeholder. The real reader passes an encoded
-    /// `ResponseKind::ServerBusy`, but `process_frames` writes the bytes
-    /// verbatim — distinct sentinel bytes make peer-side assertions
-    /// unambiguous.
-    const TEST_SERVER_BUSY: [u8; 5] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
-
     /// One-byte payload framed as `[u32 LE length=1][byte]`.
     fn frame(byte: u8) -> [u8; 5] {
         let mut f = [0u8; 5];
@@ -1059,10 +1039,15 @@ mod tests {
     /// Invoke `process_frames::<TestApp, UnixStream>`, threading the
     /// feature-gated histogram args when the relevant features are on so
     /// the call compiles in every `cargo test` configuration.
+    ///
+    /// Returns the disconnect flag plus the control-channel receiver —
+    /// pipeline-full now surfaces as a `PipelineBusy` event for the
+    /// response stage rather than reader-side socket bytes, so busy
+    /// assertions read the channel, not the peer.
     fn run_process_frames(
         conn: &mut ConnectionEntry<UnixStream>,
         producer: &mut ring::Producer<InputSlot<TestEvent>>,
-    ) -> bool {
+    ) -> (bool, mpsc::Receiver<ControlEvent>) {
         #[cfg(feature = "latency-trace")]
         let mut publish_rec = melin_transport_core::trace::register_stage("test: publish");
         #[cfg(feature = "tick-to-trade")]
@@ -1071,18 +1056,32 @@ mod tests {
         #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
         let recv_ts = melin_transport_core::trace::mono_trace_ns();
 
-        process_frames::<TestApp, UnixStream>(
+        let (control_tx, control_rx) = mpsc::channel();
+        let disconnect = process_frames::<TestApp, UnixStream>(
             conn,
             producer,
             &TagDecoder,
-            &TEST_SERVER_BUSY,
+            &control_tx,
             0xDEAD_BEEF,
             recv_ts,
             #[cfg(feature = "latency-trace")]
             &mut publish_rec,
             #[cfg(feature = "tick-to-trade")]
             &mut ingest_rec,
-        )
+        );
+        (disconnect, control_rx)
+    }
+
+    /// Count `PipelineBusy` events for the fixture connection (id 7)
+    /// queued on the control channel.
+    fn busy_events(rx: &mpsc::Receiver<ControlEvent>) -> usize {
+        let mut n = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, ControlEvent::PipelineBusy { connection_id } if connection_id == 7) {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Drain `consumer` into a Vec of `(seq, slot)` until it yields `None`.
@@ -1123,7 +1122,7 @@ mod tests {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
 
-        let disconnect = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect, "no oversize frame ⇒ no disconnect");
 
         let events = drain(&mut consumer);
@@ -1140,10 +1139,16 @@ mod tests {
         }
         // Parse buffer fully consumed.
         assert!(conn.parse_buf.is_empty());
-        // No ServerBusy on the wire — no Full happened.
+        // No Full happened: no busy event, and the reader never writes
+        // the client socket (egress belongs to the response stage).
+        assert_eq!(
+            busy_events(&control_rx),
+            0,
+            "no PipelineBusy on the happy path"
+        );
         assert!(
             read_server_busy(&mut peer).is_none(),
-            "ServerBusy must not be sent on the happy path"
+            "reader must never write the client socket"
         );
     }
 
@@ -1175,11 +1180,12 @@ mod tests {
         #[cfg(feature = "tick-to-trade")]
         let mut ingest_rec = melin_transport_core::trace::register_stage("test: ingest recv_ts");
 
+        let (control_tx, _control_rx) = mpsc::channel();
         let disconnect = process_frames::<TestApp, UnixStream>(
             &mut conn,
             &mut producer,
             &TagDecoder,
-            &TEST_SERVER_BUSY,
+            &control_tx,
             0xDEAD_BEEF,
             RECV_TS,
             &mut publish_rec,
@@ -1223,7 +1229,7 @@ mod tests {
             conn.parse_buf.extend_from_slice(&frame((i + 1) as u8));
         }
 
-        let disconnect = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect, "no oversize / no Full ⇒ no disconnect");
 
         let events = drain(&mut consumer);
@@ -1249,7 +1255,7 @@ mod tests {
         } = make_fixture(8);
         conn.parse_buf.extend_from_slice(&frame(0xFF)); // tag → Query
 
-        let disconnect = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);
 
         let events = drain(&mut consumer);
@@ -1271,7 +1277,8 @@ mod tests {
         //   * The frame that triggered Full is silently dropped — its bytes
         //     are compacted out of `parse_buf` along with every earlier
         //     frame, mirroring pre-batch behaviour.
-        //   * ServerBusy is written exactly once to the peer.
+        //   * Exactly one PipelineBusy event is routed to the response
+        //     stage, and nothing is written to the socket from here.
         let Fixture {
             mut conn,
             mut producer,
@@ -1282,7 +1289,7 @@ mod tests {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
 
-        let disconnect = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect, "Full does not drop the connection");
 
         let events = drain(&mut consumer);
@@ -1296,9 +1303,18 @@ mod tests {
             assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(byte)));
         }
 
-        // ServerBusy is delivered to the peer.
-        let busy = read_server_busy(&mut peer).expect("ServerBusy frame written");
-        assert_eq!(busy, TEST_SERVER_BUSY);
+        // The busy notice goes to the response stage — never directly
+        // onto the socket, where it could tear a partially-flushed
+        // response frame (audit review F3).
+        assert_eq!(
+            busy_events(&control_rx),
+            1,
+            "exactly one PipelineBusy routed"
+        );
+        assert!(
+            read_server_busy(&mut peer).is_none(),
+            "reader must never write the client socket"
+        );
 
         // The frame that triggered Full (0x05) had its bytes consumed by
         // the loop's `cursor +=` before `try_push_with` ran; the 6th frame
@@ -1311,20 +1327,24 @@ mod tests {
         );
     }
 
-    /// Regression for the 2026-08 io_uring audit, finding 2
-    /// (docs/internal/io-uring-audit-2026-08.md): ServerBusy goes out
-    /// with `MSG_DONTWAIT`. Client fds are in blocking mode, so the old
-    /// plain `write(2)` parked the reader thread whenever the offender's
-    /// socket buffer was also full — stalling ingress for *every*
-    /// connection exactly on the overload path. Against that code this
-    /// test never returns.
+    /// Regression for the 2026-08 io_uring audit, finding 2 and review
+    /// finding F3 (docs/internal/io-uring-audit-2026-08.md): the
+    /// pipeline-full path must not touch the client socket at all. The
+    /// original defect was a blocking `write(2)` of ServerBusy that
+    /// parked the reader thread whenever the offender's socket buffer
+    /// was also full — stalling ingress for *every* connection exactly
+    /// on the overload path (against that code this test never
+    /// returns). The busy notice now routes to the response stage,
+    /// which also closes the frame-tearing race of any reader-side
+    /// send. The socket-buffer fill stays: it proves the path is
+    /// insensitive to socket state.
     #[test]
-    fn server_busy_send_does_not_block_when_the_socket_is_full() {
+    fn pipeline_full_never_touches_the_client_socket() {
         let Fixture {
             mut conn,
             mut producer,
             mut consumer,
-            peer: _peer,
+            mut peer,
         } = make_fixture(2);
 
         // Fill the server→peer direction until the kernel refuses more —
@@ -1355,13 +1375,13 @@ mod tests {
         conn.parse_buf.extend_from_slice(&frame(0x03));
 
         let start = std::time::Instant::now();
-        let disconnect = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
         // Generous bound to stay unflaky under CI load — the fixed path
         // returns in microseconds, the broken one only when the peer
         // reads (here: never).
         assert!(
             start.elapsed() < Duration::from_secs(1),
-            "ServerBusy send blocked on a full socket"
+            "pipeline-full path blocked on a full socket"
         );
         assert!(!disconnect, "Full does not drop the connection");
         assert_eq!(
@@ -1369,6 +1389,24 @@ mod tests {
             2,
             "the frames that fit are still published"
         );
+        assert_eq!(
+            busy_events(&control_rx),
+            1,
+            "busy notice routed to response stage"
+        );
+        // Nothing beyond the pre-fill junk arrives: drain it, then the
+        // read must time out rather than yield a reader-written frame.
+        let mut sink = [0u8; 4096];
+        loop {
+            match peer.read(&mut sink) {
+                Ok(0) => panic!("unexpected EOF"),
+                Ok(_) => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                    break;
+                }
+                Err(e) => panic!("unexpected peer read error: {e}"),
+            }
+        }
     }
 
     #[test]
@@ -1378,7 +1416,7 @@ mod tests {
         //     pipeline observes them even though we're about to tear the
         //     connection down,
         //   * return `true` so the caller drops the connection,
-        //   * NOT write ServerBusy (that is reserved for pipeline-full).
+        //   * NOT emit PipelineBusy (that is reserved for pipeline-full).
         let Fixture {
             mut conn,
             mut producer,
@@ -1389,7 +1427,7 @@ mod tests {
         conn.parse_buf.extend_from_slice(&frame(0x02));
         conn.parse_buf.extend_from_slice(&oversize_prefix());
 
-        let disconnect = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(disconnect, "oversize frame must request disconnect");
 
         let events = drain(&mut consumer);
@@ -1401,9 +1439,14 @@ mod tests {
         assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x01)));
         assert_eq!(events[1].1.event, JournalEvent::App(TestEvent::Cmd(0x02)));
 
+        assert_eq!(
+            busy_events(&control_rx),
+            0,
+            "PipelineBusy is emitted on Full, not on oversize"
+        );
         assert!(
             read_server_busy(&mut peer).is_none(),
-            "ServerBusy is sent on Full, not on oversize"
+            "reader must never write the client socket"
         );
     }
 
@@ -1422,7 +1465,7 @@ mod tests {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
 
-        let disconnect = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);
 
         let events = drain(&mut consumer);
@@ -1452,7 +1495,7 @@ mod tests {
         // partial.
         conn.parse_buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
 
-        let disconnect = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);
 
         let events = drain(&mut consumer);
@@ -1468,7 +1511,7 @@ mod tests {
     #[test]
     fn process_frames_empty_buffer_is_noop() {
         // No bytes in parse_buf ⇒ loop never enters; commit is the
-        // documented zero-slot no-op; no ServerBusy; no disconnect.
+        // documented zero-slot no-op; no busy event; no disconnect.
         let Fixture {
             mut conn,
             mut producer,
@@ -1476,10 +1519,11 @@ mod tests {
             mut peer,
         } = make_fixture(4);
 
-        let disconnect = run_process_frames(&mut conn, &mut producer);
+        let (disconnect, control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);
         assert_eq!(drain(&mut consumer).len(), 0);
         assert!(conn.parse_buf.is_empty());
+        assert_eq!(busy_events(&control_rx), 0);
         assert!(read_server_busy(&mut peer).is_none());
     }
 }

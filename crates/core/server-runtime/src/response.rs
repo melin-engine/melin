@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -128,6 +128,13 @@ pub struct Response<A: Application> {
     /// co-sets `shutdown`, so the latch is only consulted on the shutdown
     /// path (zero steady-state cost). See `crate::fence`.
     pub fence_state: Arc<melin_transport_core::fence::FenceState>,
+    /// Live-connection count shared with the accept loop's
+    /// `max_connections` gate. Incremented there after auth; decremented
+    /// here — the response stage owns the connection map, so "an entry
+    /// left the map" is the one place a connection verifiably dies
+    /// exactly once, whichever side (reader disconnect or a drop
+    /// decision here) initiated it.
+    pub active_connections: Arc<AtomicU64>,
 }
 
 /// Per-connection state for batched io_uring sends.
@@ -182,6 +189,7 @@ pub fn run<A: Application>(
         utilization,
         encoder,
         fence_state,
+        active_connections,
     } = config;
     // Resolve the starting mode from the shared atomic and derive the
     // local Policy. The atomic is the single source of truth across the
@@ -200,8 +208,13 @@ pub fn run<A: Application>(
                 DurabilityMode::Hybrid
             });
     let mut policy = active_mode.to_policy();
-    let mut ring =
-        IoUring::new(RING_SIZE).expect("failed to create io_uring instance for response stage");
+    // SINGLE_ISSUER: created and submitted from this thread only — the
+    // kernel skips SQ locking and rejects cross-thread submission with
+    // EEXIST instead of racing. Matches the journal/replication rings.
+    let mut ring: IoUring = IoUring::builder()
+        .setup_single_issuer()
+        .build(RING_SIZE)
+        .expect("failed to create io_uring instance for response stage");
 
     // Connection table: maps connection IDs to their state.
     // HashMap for O(1) lookup. Pre-sized for a reasonable number of concurrent clients.
@@ -359,6 +372,19 @@ pub fn run<A: Application>(
         buf[..written].to_vec()
     };
 
+    // Pre-encode the ServerBusy frame the same way. Sent on behalf of
+    // the reader (`ControlEvent::PipelineBusy`) — this stage owns all
+    // egress on a client socket, so the busy notice appends to
+    // `send_buf` like any other frame instead of racing our sends from
+    // the reader thread.
+    let server_busy_wire_frame = {
+        let mut buf = [0u8; 8];
+        let written =
+            control_codec::encode_transport_response(&TransportResponse::ServerBusy, &mut buf)
+                .expect("ServerBusy encodes");
+        buf[..written].to_vec()
+    };
+
     // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.
     let mut last_heartbeat_scan = Instant::now();
 
@@ -468,13 +494,34 @@ pub fn run<A: Application>(
                     );
                 }
                 ControlEvent::Disconnected { connection_id } => {
-                    connections.remove(&connection_id);
+                    // Reader-initiated teardown: the reader already
+                    // closed its half. Decrement only if the entry was
+                    // actually present — a response-initiated drop
+                    // already removed it (and paid the decrement), and
+                    // this event is its echo.
+                    if connections.remove(&connection_id).is_some() {
+                        active_connections.fetch_sub(1, Ordering::Relaxed);
+                    }
                     dirty_connections.remove(&connection_id);
                     // Anything this connection had buffered goes with
                     // it, so its queued samples measure bytes that will
                     // never be sent.
                     #[cfg(feature = "latency-trace")]
                     discard_e2e_samples(&mut pending_e2e, &[connection_id]);
+                }
+                ControlEvent::PipelineBusy { connection_id } => {
+                    if let Some(entry) = connections.get_mut(&connection_id) {
+                        // Overflow discipline: a busy notice to a peer
+                        // already at its buffer cap is not worth more
+                        // memory — skip it; the cap (or the blocked
+                        // timeout) is about to drop the connection
+                        // anyway. Missing entry likewise: best-effort.
+                        if entry.send_buf.len() + server_busy_wire_frame.len() <= MAX_SEND_BUF {
+                            entry.send_buf.extend_from_slice(&server_busy_wire_frame);
+                            entry.last_send = Instant::now();
+                            dirty_connections.insert(connection_id);
+                        }
+                    }
                 }
             }
         }
@@ -501,7 +548,9 @@ pub fn run<A: Application>(
                 #[cfg(feature = "latency-trace")]
                 close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
                 for conn_id in to_remove.drain(..) {
-                    connections.remove(&conn_id);
+                    if let Some(entry) = connections.remove(&conn_id) {
+                        teardown_dropped(entry, &active_connections);
+                    }
                 }
             }
 
@@ -536,7 +585,9 @@ pub fn run<A: Application>(
                             &mut cqes,
                         );
                         for conn_id in to_remove.drain(..) {
-                            connections.remove(&conn_id);
+                            if let Some(entry) = connections.remove(&conn_id) {
+                                teardown_dropped(entry, &active_connections);
+                            }
                         }
                     }
                 }
@@ -716,7 +767,9 @@ pub fn run<A: Application>(
                     // `connections.get_mut` lookup below, so removing
                     // here is safe.
                     for conn_id in to_remove.drain(..) {
-                        connections.remove(&conn_id);
+                        if let Some(entry) = connections.remove(&conn_id) {
+                            teardown_dropped(entry, &active_connections);
+                        }
                     }
                 }
 
@@ -936,7 +989,9 @@ pub fn run<A: Application>(
         #[cfg(feature = "latency-trace")]
         discard_e2e_samples(&mut pending_e2e, &to_remove);
         for conn_id in to_remove.drain(..) {
-            connections.remove(&conn_id);
+            if let Some(entry) = connections.remove(&conn_id) {
+                teardown_dropped(entry, &active_connections);
+            }
             dirty_connections.remove(&conn_id);
         }
 
@@ -1046,6 +1101,27 @@ pub(crate) fn slot_needs_gate<R: Copy, Q: Copy>(
     cached_durable_pos: u64,
 ) -> bool {
     !slot.durability_bypass && cached_durable_pos < slot.wire_seq
+}
+
+/// Tear down a connection the *response stage* decided to drop (send
+/// error, `MAX_SEND_BUF` overflow, blocked-send timeout).
+///
+/// Removing the map entry alone only drops this stage's dup of the
+/// socket — the reader still holds its own dup, so the socket would
+/// stay fully open: the dropped client's requests keep flowing through
+/// the reader (whose idle timeout never fires while the client keeps
+/// sending) with no response ever delivered, and the accept loop's
+/// `max_connections` permit stays pinned forever. `shutdown(2)` reaches
+/// every dup: the reader's multishot RECV completes with 0, it tears
+/// down its slab entry and emits `Disconnected` — which finds this
+/// entry already gone, so the permit is released exactly once.
+fn teardown_dropped(entry: ConnectionEntry, active_connections: &AtomicU64) {
+    // Best-effort: ENOTCONN just means the peer tore the socket down
+    // first — dropping `entry` below still reclaims our dup.
+    unsafe {
+        libc::shutdown(entry.fd, libc::SHUT_RDWR);
+    }
+    active_connections.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Outcome of a single per-frame append. `Continue` means the
@@ -1206,12 +1282,17 @@ fn flush_sends(
                     // Submit-phase failure (ENOMEM class — EBUSY cannot
                     // happen: the CQ is RING_SIZE deep and fully reaped
                     // every flush, so at most `pending` ≤ RING_SIZE
-                    // entries are ever outstanding). A genuine server
-                    // malfunction; fall through and apply whatever did
-                    // complete — strictly safer than leaving those CQEs
-                    // stale for the next flush's accounting.
+                    // entries are ever outstanding). An error here means
+                    // the SQEs were NOT consumed: continuing would leave
+                    // them queued for the next flush's submit, by which
+                    // time their addr fields can point at drained or
+                    // reallocated send_bufs — garbage on client sockets,
+                    // on the ack path. The kernel is out of resources
+                    // and the stage cannot proceed without corruption
+                    // risk: fail loudly and let the accept loop's
+                    // pipeline-death detection take the server down.
                     error!(error = %e, "io_uring submit_and_wait failed in response stage");
-                    break;
+                    panic!("response stage io_uring submit failed: {e}");
                 }
             }
         }
@@ -1244,7 +1325,15 @@ fn flush_sends(
             }
 
             let sent = result as usize;
-            if sent >= entry.send_buf.len() {
+            if sent == 0 {
+                // Unreachable for SOCK_STREAM sends of len > 0 (the
+                // kernel reports -EAGAIN instead), but keep the
+                // zero-progress invariant literal: 0 bytes must not
+                // restart the blocked clock via the partial branch.
+                if entry.blocked_since.is_none() {
+                    entry.blocked_since = Some(now);
+                }
+            } else if sent >= entry.send_buf.len() {
                 entry.send_buf.clear();
                 entry.blocked_since = None;
             } else {
@@ -2949,6 +3038,36 @@ mod tests {
                 connections[&3].last_send_attempt > backdated,
                 "retry submitted once the pacing window elapsed"
             );
+        }
+
+        /// Review finding F1 (io-uring-audit-2026-08.md): a
+        /// response-initiated drop must tear down the *whole* socket and
+        /// release the `max_connections` permit. The reader holds its
+        /// own dup of the socket, so merely dropping this stage's entry
+        /// (closing our dup) leaves the socket open — the EOF below must
+        /// arrive *despite* a live second dup, which only shutdown(2)
+        /// achieves.
+        #[test]
+        fn teardown_shuts_the_socket_despite_other_dups_and_releases_the_permit() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            let (tx, mut peer) = UnixStream::pair().unwrap();
+            // Simulates the reader's half: still open across the drop.
+            let reader_dup = tx.try_clone().unwrap();
+            let entry = entry_for(tx, &[]);
+            let active = AtomicU64::new(1);
+
+            super::super::teardown_dropped(entry, &active);
+
+            assert_eq!(active.load(Ordering::Relaxed), 0, "permit released");
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut buf = [0u8; 1];
+            assert_eq!(
+                peer.read(&mut buf).expect("EOF, not a timeout"),
+                0,
+                "peer observes EOF even though another dup is still open"
+            );
+            drop(reader_dup);
         }
     }
 }
