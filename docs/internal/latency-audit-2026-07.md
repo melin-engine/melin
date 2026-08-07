@@ -228,21 +228,29 @@ latency: it only fires when the stage was about to spin anyway. The same
 change made the gate per-slot rather than per-batch, which is what makes
 the trigger fire at durability boundaries instead of once per batch.
 
-**Still open, and it is the half with teeth.** The new trigger is
-gate-driven, so it does nothing in the regime where the gate never
-closes — `local` mode, or any deployment whose durability frontier stays
-ahead of the response stage. There, a saturated output ring still means
-no wait, no lull, and no flush, and the 64 KiB disconnect above is
-reached exactly as before. Closing that needs the size- or count-based
-trigger this section originally proposed. Note that a byte threshold is
-the only one of the two that bounds the disconnect directly.
+**Closed (2026-08-07, `fix/io-uring-audit` branch).** The remaining half
+was the gate-never-closes regime — `local` mode, or any deployment whose
+durability frontier stays ahead of the response stage — where a
+saturated output ring meant no wait, no lull, no flush, and the 64 KiB
+disconnect was reached exactly as described. A per-connection byte
+threshold (`FLUSH_BYTES_THRESHOLD`, ~one MSS) now triggers a flush at
+the end of any consumed batch in which a connection crossed it, chosen
+over a slot count because only the byte form bounds the distance to the
+disconnect cap directly. The flag is set at append time (no per-batch
+scan of the dirty set). Regression-tested deterministically: 8192 slots
+released through an open gate in back-to-back busy batches must all be
+delivered — pre-fix the connection dropped at ~slot 5000 with nothing on
+the wire. The head-of-line hazard flagged below no longer applies: the
+flush path is `MSG_DONTWAIT` end to end and cannot block on a peer.
 
-**Unmeasured.** The throughput-vs-latency trade flagged in "Ratings that
-need a why" has not been run on the LAN suite, and should be before this
-is treated as settled. Pick the run deliberately: this audit records a max
-output-ring depth of 1 in the latency run, so the stage reaches its idle
-path and flushes constantly there. Extra `submit_and_wait` calls will show
-up in a saturating throughput run or not at all.
+**Still unmeasured.** The throughput-vs-latency trade flagged in
+"Ratings that need a why" has not been run on the LAN suite, and should
+be before the threshold value is treated as settled. Pick the run
+deliberately: this audit records a max output-ring depth of 1 in the
+latency run, so the stage reaches its idle path and flushes constantly
+there — the new trigger literally cannot fire in that regime. Extra
+`submit_and_wait` calls will show up in a saturating throughput run or
+not at all; that run prices the 1400-byte constant.
 
 **Adjacent, same area.** `flush_sends` submits with
 `submit_and_wait(pending)` and `retry_send` (`response.rs:1136`) loops

@@ -61,6 +61,19 @@ const MAX_SEND_BUF: usize = 64 * 1024;
 /// cadence (millisecond scale), and healthy connections are never paced.
 const BLOCKED_RETRY_INTERVAL: Duration = Duration::from_micros(100);
 
+/// Byte-threshold flush trigger for the consumed (busy) path — the
+/// still-open half of finding 4 in
+/// `docs/internal/latency-audit-2026-07.md`. Under sustained load with
+/// an open durability gate, neither the idle-path flush (SPSC never
+/// empties) nor the gate-path flush (no wait) runs, so without this
+/// trigger responses sit in `send_buf` until `MAX_SEND_BUF` *drops* the
+/// connection instead of serving it. Roughly one TCP MSS (1460 for
+/// standard Ethernet, minus margin): once a connection has a full
+/// segment buffered, flushing early costs nothing in wire efficiency,
+/// and the bound keeps `send_buf` ~45 flushes away from the disconnect
+/// cap instead of zero.
+const FLUSH_BYTES_THRESHOLD: usize = 1400;
+
 /// How long a connection's socket may accept *zero* bytes while it has
 /// undelivered data before it is dropped. Partial progress restarts the
 /// clock — a slow-but-draining client is `MAX_SEND_BUF`'s problem, not
@@ -704,6 +717,13 @@ pub fn run<A: Application>(
         // wait more often.
         let batch_now = Instant::now();
 
+        // Set when any connection's send_buf crosses
+        // FLUSH_BYTES_THRESHOLD during this batch; checked once per
+        // batch below. A flag written at append time rather than a
+        // post-batch scan of the dirty set: the scan would cost a hash
+        // lookup per dirty connection per batch on the hot path.
+        let mut flush_due = false;
+
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
@@ -978,6 +998,8 @@ pub fn run<A: Application>(
                     }
                     let _ = outcome;
                 }
+
+                flush_due |= entry.send_buf.len() >= FLUSH_BYTES_THRESHOLD;
             }
         }
 
@@ -993,6 +1015,38 @@ pub fn run<A: Application>(
                 teardown_dropped(entry, &active_connections);
             }
             dirty_connections.remove(&conn_id);
+        }
+
+        // Byte-threshold flush on the consumed path — the still-open
+        // half of July-audit finding 4. Under sustained load with an
+        // open gate this is the ONLY flush that runs: the idle path
+        // needs an empty SPSC, the gate path needs a durability wait,
+        // and heartbeats need idleness. Without it, delivery on a busy
+        // stretch degenerates to `MAX_SEND_BUF` evicting the very
+        // clients being served. Threshold-gated so light traffic keeps
+        // full batching; once a connection holds ~an MSS the extra
+        // submit no longer costs wire efficiency. MSG_DONTWAIT flushes
+        // cannot block, so this adds no head-of-line exposure (the
+        // hazard that deferred this trigger in July).
+        if flush_due {
+            #[cfg(feature = "tick-to-trade")]
+            let egress_start = trace::mono_trace_ns();
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty_connections,
+                &mut to_remove,
+                &mut cqes,
+            );
+            #[cfg(feature = "tick-to-trade")]
+            egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
+            #[cfg(feature = "latency-trace")]
+            close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
+            for conn_id in to_remove.drain(..) {
+                if let Some(entry) = connections.remove(&conn_id) {
+                    teardown_dropped(entry, &active_connections);
+                }
+            }
         }
 
         // Log degradation transitions / re-emit the reminder. Same

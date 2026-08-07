@@ -127,12 +127,13 @@ initial fix:
   not time since first refusal: a partial send restarts it. A
   slow-but-steadily-draining client is `MAX_SEND_BUF`'s problem;
   only a peer accepting zero bytes for the full timeout is dropped.
-- Accepted, not fixed here: the busy path (SPSC never empty, gate open)
-  flushes only inside the gate-wait branch, so both delivery and the
-  blocked-peer bookkeeping can be starved during a sustained busy
-  stretch. That is the pre-existing flush-cadence shape tracked as
-  finding 4 of `latency-audit-2026-07.md` — resolve it there, not with
-  an ad-hoc trigger in this fix. Also accepted: under `latency-trace`,
+- ~~Accepted, not fixed here~~ **since closed (2026-08-07)**: the busy
+  path (SPSC never empty, gate open) originally flushed only inside the
+  gate-wait branch, starving both delivery and the blocked-peer
+  bookkeeping during a sustained busy stretch. Resolved as finding 4 of
+  `latency-audit-2026-07.md`: a byte-threshold flush on the consumed
+  path (see that doc for the design and the outstanding bench run).
+  Still accepted: under `latency-trace`,
   e2e samples close on the first flush *attempt* even when the SEND
   returned `EAGAIN`, slightly understating egress for blocked peers
   (trace-only, and blocked peers are the pathology being measured
