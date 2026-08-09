@@ -45,6 +45,28 @@ const HEARTBEAT_INTERVAL_MS: u64 = 200;
 const ELECTION_TIMEOUT_MIN_MS: u64 = 1000;
 const ELECTION_TIMEOUT_MAX_MS: u64 = 2000;
 
+/// Per-node random jitter added to `HEARTBEAT_INTERVAL_MS`, breaking a
+/// split-vote livelock openraft 0.9 is prone to: it randomizes a node's
+/// election timeout **once** (at `Raft::new`, not per election round the
+/// way standard raft prescribes) and fires elections only on its
+/// internal tick, whose period is `heartbeat_interval * 3/2` anchored at
+/// startup. Nodes booted in the same instant — an orchestrated deploy,
+/// or a test — therefore share a tick grid: two candidates whose fixed
+/// timeouts land in the same grid bucket campaign on the same edge,
+/// split the vote, re-arm on the same edge, and repeat indefinitely
+/// (~25% likely per candidate pair with the 300 ms grid the defaults
+/// produce). Jittering the heartbeat interval de-rates the grids —
+/// different periods drift apart, so an aligned edge cannot stay
+/// aligned. The range trades residual risk (equal draws, 1/150) against
+/// worst-case election-trigger delay (+225 ms on the tick period),
+/// both comfortably inside the failover grace.
+///
+/// Workaround, not root fix: the 0.10 line re-randomizes the timeout per
+/// election round (`do_elect` → `resample_election_timeout`) and adds
+/// pre-vote, which removes the livelock at the source; the 0.9 line does
+/// not (checked through 0.9.25). Drop this on migration to 0.10.
+const HEARTBEAT_JITTER_MS: u64 = 150;
+
 /// Shutdown-flag poll cadence in the driver loop.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
@@ -206,9 +228,23 @@ async fn driver_main(
     supersession: Option<crate::rpc_server::SupersessionPolicy>,
     shutdown: Arc<AtomicBool>,
 ) {
+    // See `HEARTBEAT_JITTER_MS`. Best-effort: a failed RNG read falls
+    // back to the un-jittered interval — status-quo timing rather than
+    // a startup failure, since the jitter is probabilistic hardening,
+    // not a correctness gate.
+    let heartbeat_jitter = {
+        let mut bytes = [0u8; 8];
+        match getrandom::fill(&mut bytes) {
+            Ok(()) => u64::from_le_bytes(bytes) % HEARTBEAT_JITTER_MS,
+            Err(e) => {
+                warn!(error = %e, "heartbeat jitter rng failed — running un-jittered");
+                0
+            }
+        }
+    };
     let raft_config = Config {
         cluster_name: "melin-control-plane".to_owned(),
-        heartbeat_interval: HEARTBEAT_INTERVAL_MS,
+        heartbeat_interval: HEARTBEAT_INTERVAL_MS + heartbeat_jitter,
         election_timeout_min: ELECTION_TIMEOUT_MIN_MS,
         election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
         ..Config::default()
