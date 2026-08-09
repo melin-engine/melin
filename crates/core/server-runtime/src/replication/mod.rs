@@ -282,6 +282,21 @@ pub(super) fn sleep_checking_flags(
     }
 }
 
+/// Wait out one retry delay: sleep for the current `backoff` (checking
+/// the shutdown and promotion flags — see [`sleep_checking_flags`]),
+/// then double it, capped at [`MAX_BACKOFF`], for the next attempt.
+/// Sleep-then-double, so the first retry waits the base delay rather
+/// than twice it. Every retry arm in both receivers goes through this —
+/// don't hand-roll the idiom, the copies drift.
+pub(super) fn sleep_then_double_backoff(
+    backoff: &mut std::time::Duration,
+    shutdown: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
+) {
+    sleep_checking_flags(*backoff, shutdown, promote);
+    *backoff = (*backoff * 2).min(MAX_BACKOFF);
+}
+
 /// Outcome of shutting down a replica pipeline. All stage threads are
 /// joined in every variant — by the time the caller sees this, no
 /// pipeline thread can still touch the journal or snapshot files.
@@ -813,8 +828,7 @@ where
                 backoff_secs = backoff.as_secs(),
                 "reconnecting to primary"
             );
-            sleep_checking_flags(*backoff, shutdown, promote);
-            *backoff = (*backoff * 2).min(MAX_BACKOFF);
+            sleep_then_double_backoff(backoff, shutdown, promote);
             AfterSession::Reconnect
         }
     }

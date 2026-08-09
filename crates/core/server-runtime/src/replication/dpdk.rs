@@ -27,9 +27,9 @@ use super::receiver_transport::{
     try_extract_frame,
 };
 use super::{
-    AfterSession, MAX_BACKOFF, ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles,
+    AfterSession, ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles,
     ReplicationMetrics, ResyncDecision, SentHighWater, build_replica_pipeline_with_threads,
-    handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_checking_flags,
+    handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_then_double_backoff,
     take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
@@ -1227,7 +1227,7 @@ where
                 "failed to connect to primary (DPDK) — retrying"
             );
             transport.close(handle);
-            sleep_checking_flags(backoff, shutdown, promote);
+            sleep_then_double_backoff(&mut backoff, shutdown, promote);
             if shutdown.load(Ordering::Relaxed) {
                 if let Some(p) = pipeline.take() {
                     let _ = teardown_replica_pipeline::<A, W>(p);
@@ -1242,7 +1242,6 @@ where
                     &mut journal_writer,
                 );
             }
-            backoff = (backoff * 2).min(MAX_BACKOFF);
             continue;
         }
         info!("connected to primary (DPDK)");
@@ -1279,7 +1278,7 @@ where
                     "authentication failed (DPDK) — retrying"
                 );
             }
-            sleep_checking_flags(backoff, shutdown, promote);
+            sleep_then_double_backoff(&mut backoff, shutdown, promote);
             if shutdown.load(Ordering::Relaxed) {
                 if let Some(p) = pipeline.take() {
                     let _ = teardown_replica_pipeline::<A, W>(p);
@@ -1294,7 +1293,6 @@ where
                     &mut journal_writer,
                 );
             }
-            backoff = (backoff * 2).min(MAX_BACKOFF);
             continue;
         }
         info!("authenticated with primary (DPDK)");
@@ -1367,8 +1365,13 @@ where
                                     "primary is behind our fencing epoch — refusing to follow \
                                      stale primary (DPDK)"
                                 );
-                                backoff = (backoff * 2).min(MAX_BACKOFF);
-                                sleep_checking_flags(backoff, shutdown, promote);
+                                // Close before sleeping — a handle left open
+                                // here leaks its smoltcp socket on every
+                                // refusal round (the reconnect allocates a
+                                // fresh one) and holds the stale primary's
+                                // connection through the backoff.
+                                transport.close(handle);
+                                sleep_then_double_backoff(&mut backoff, shutdown, promote);
                                 break 'handshake None; // caught by the None check below
                             }
                             fence_state.observe_epoch(epoch);
@@ -1410,8 +1413,7 @@ where
                                 }
                                 Ok(ResyncDecision::Retry) => {
                                     transport.close(handle);
-                                    sleep_checking_flags(backoff, shutdown, promote);
-                                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                                    sleep_then_double_backoff(&mut backoff, shutdown, promote);
                                     break 'handshake None; // caught by the None check below
                                 }
                                 Err(e) => fatal_err_dpdk!(e),
@@ -1431,8 +1433,7 @@ where
             if !transport.is_active(handle) {
                 warn!("disconnected from primary during handshake (DPDK)");
                 transport.close(handle);
-                sleep_checking_flags(backoff, shutdown, promote);
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                sleep_then_double_backoff(&mut backoff, shutdown, promote);
                 break None; // trigger reconnect via the None check below
             }
             std::thread::yield_now();

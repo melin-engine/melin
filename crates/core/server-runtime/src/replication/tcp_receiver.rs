@@ -23,10 +23,9 @@ use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
 use super::{
-    AfterSession, MAX_BACKOFF, ReplicaPipelineHandles, ResyncDecision,
-    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
-    recover_replica_state, sleep_checking_flags, take_pipeline_for_promotion,
-    teardown_replica_pipeline,
+    AfterSession, ReplicaPipelineHandles, ResyncDecision, build_replica_pipeline_with_threads,
+    handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_then_double_backoff,
+    take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
@@ -510,7 +509,7 @@ where
                     backoff_secs = backoff.as_secs(),
                     "failed to connect to primary — retrying"
                 );
-                sleep_checking_flags(backoff, shutdown, promote);
+                sleep_then_double_backoff(&mut backoff, shutdown, promote);
                 if shutdown.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
@@ -522,7 +521,6 @@ where
                         &mut journal_writer,
                     );
                 }
-                backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
         };
@@ -577,8 +575,7 @@ where
             // Back off before redialing — without the sleep this loop
             // hammers a primary that keeps refusing us. The loop top
             // re-checks the shutdown/promote flags after the sleep.
-            sleep_checking_flags(backoff, shutdown, promote);
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            sleep_then_double_backoff(&mut backoff, shutdown, promote);
             continue;
         }
         info!("authenticated with primary");
@@ -635,8 +632,7 @@ where
                     // failure arm above.
                     drop(reader);
                     drop(tcp_writer);
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    sleep_checking_flags(backoff, shutdown, promote);
+                    sleep_then_double_backoff(&mut backoff, shutdown, promote);
                     continue;
                 }
                 // Adopt the primary's epoch immediately; streamed `EpochBump`s
@@ -675,8 +671,7 @@ where
                         resume_sequence,
                     } => ((segment_start_sequence, anchor_hash), resume_sequence),
                     ResyncDecision::Retry => {
-                        sleep_checking_flags(backoff, shutdown, promote);
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        sleep_then_double_backoff(&mut backoff, shutdown, promote);
                         continue;
                     }
                 }
