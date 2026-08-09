@@ -555,6 +555,10 @@ where
         // a single handle works. Use `reader` (carries the read timeout above).
         if let Err(e) = authenticate_with_primary(&mut reader, signing_key) {
             warn!(error = %e, "authentication failed — retrying");
+            // Back off before redialing — without the sleep this loop
+            // hammers a primary that keeps refusing us. The loop top
+            // re-checks the shutdown/promote flags after the sleep.
+            sleep_checking_flags(backoff, shutdown, promote);
             backoff = (backoff * 2).min(MAX_BACKOFF);
             continue;
         }
