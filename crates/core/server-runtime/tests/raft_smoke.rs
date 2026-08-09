@@ -13,9 +13,27 @@ use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 use serial_test::serial;
 
+/// Allocate a listen address on a probed-free port below the kernel's
+/// ephemeral range — see the twin helper in `raft_failover.rs` for the
+/// full rationale (reserve-and-drop ports can be stolen by concurrent
+/// test processes before the server re-binds them). This file owns
+/// 25000..30000; `raft_failover.rs` owns 20000..25000.
 fn free_addr() -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // 100 blocks of 50 ports; this test uses ~4, so a block never runs
+    // out. u32 arithmetic to match `process::id`, narrowed only at the
+    // final in-range port.
+    const BASE: u32 = 25_000;
+    const BLOCK: u32 = 50;
+    const NBLOCKS: u32 = 100;
+    let block_base = BASE + (std::process::id() % NBLOCKS) * BLOCK;
+    for _ in 0..BLOCK {
+        let port = (block_base + NEXT.fetch_add(1, Ordering::Relaxed) % BLOCK) as u16;
+        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            return l.local_addr().unwrap();
+        }
+    }
+    panic!("no free port in block {block_base}..{}", block_base + BLOCK);
 }
 
 fn http_metrics(addr: SocketAddr) -> Option<String> {
