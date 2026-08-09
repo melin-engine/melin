@@ -11,6 +11,14 @@
 
 set -e
 
+# Stderr from the cargo steps is captured here and replayed only on
+# failure: successful commits stay quiet, but a failing step keeps its
+# diagnostics — clippy's warnings and nextest's report (including which
+# test failed and its output) all go to stderr, and discarding them
+# leaves nothing to debug a transient failure with.
+STDERR_LOG="$(mktemp)"
+trap 'rm -f "$STDERR_LOG"' EXIT
+
 # 1. Cargo.lock must be staged if it has changes.
 if ! git diff --quiet -- Cargo.lock 2>/dev/null; then
     echo "error: Cargo.lock has unstaged changes. Stage it with 'git add Cargo.lock'."
@@ -24,7 +32,8 @@ if ! cargo fmt --all --check 2>/dev/null; then
 fi
 
 # 3. Clippy on all targets (lib + tests + benches) with warnings as errors.
-if ! cargo clippy --all-targets -- -D warnings 2>/dev/null; then
+if ! cargo clippy --all-targets -- -D warnings 2>"$STDERR_LOG"; then
+    cat "$STDERR_LOG" >&2
     echo "error: clippy reported warnings. Fix them and try again."
     exit 1
 fi
@@ -33,14 +42,16 @@ fi
 # per-test process isolation) and fall back to cargo test if it isn't
 # installed. Install with `cargo install cargo-nextest --locked`.
 if command -v cargo-nextest >/dev/null 2>&1; then
-    if ! cargo nextest run 2>/dev/null; then
+    if ! cargo nextest run 2>"$STDERR_LOG"; then
+        cat "$STDERR_LOG" >&2
         echo "error: tests failed. Fix them and try again."
         exit 1
     fi
 else
     echo "note: cargo-nextest not found; falling back to cargo test."
     echo "      install with 'cargo install cargo-nextest --locked' for ~3× faster runs."
-    if ! cargo test 2>/dev/null; then
+    if ! cargo test 2>"$STDERR_LOG"; then
+        cat "$STDERR_LOG" >&2
         echo "error: tests failed. Fix them and try again."
         exit 1
     fi
