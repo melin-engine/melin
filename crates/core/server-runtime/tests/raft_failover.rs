@@ -16,40 +16,16 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use counter_server::{CounterFactory, RequestDecoder, ResponseEncoder};
 use melin_server_runtime::server::{self, ServerConfig};
+use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::TAG_CHALLENGE;
 use melin_wire_protocol::tcp::BlockingTcpListener;
 use serial_test::serial;
 
-/// Allocate a listen address on a probed-free port *below* the kernel's
-/// ephemeral range (`net.ipv4.ip_local_port_range`, ≥32768 by default).
-/// The classic reserve-and-drop trick (`bind(port 0)`, read, drop) hands
-/// back a port the kernel may immediately reissue — to another test
-/// process's listener or as some outgoing connection's source port. This
-/// test re-binds its ports seconds after reservation (the replication
-/// listener comes up after journal recovery), and a stolen replication
-/// port left the cluster unable to ever form. Below the ephemeral floor,
-/// only explicit binds can collide; each test file that plays this game
-/// owns a disjoint range (this one: 20000..25000, `raft_smoke.rs`:
-/// 25000..30000), split into per-process blocks so concurrently spawned
-/// test processes (near-adjacent pids) probe disjoint blocks, and the
-/// probe itself filters anything else alive on the port.
-fn free_addr() -> SocketAddr {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    // 100 blocks of 50 ports; this test uses ~10, so a block never runs
-    // out. u32 arithmetic to match `process::id`, narrowed only at the
-    // final in-range port.
-    const BASE: u32 = 20_000;
-    const BLOCK: u32 = 50;
-    const NBLOCKS: u32 = 100;
-    let block_base = BASE + (std::process::id() % NBLOCKS) * BLOCK;
-    for _ in 0..BLOCK {
-        let port = (block_base + NEXT.fetch_add(1, Ordering::Relaxed) % BLOCK) as u16;
-        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
-            return l.local_addr().unwrap();
-        }
-    }
-    panic!("no free port in block {block_base}..{}", block_base + BLOCK);
-}
+/// Port range this file owns for `free_addr` (20000..25000);
+/// `raft_smoke.rs` owns 25000..30000, `melin-raft`'s election tests
+/// 15000..20000. A stolen replication port once left this cluster
+/// unable to ever form — see `test_ports::free_addr` for the scheme.
+const PORT_BASE: u16 = 20_000;
 
 fn http_metrics(addr: SocketAddr) -> Option<String> {
     use std::io::Write;
@@ -117,14 +93,14 @@ fn cluster_summary(nodes: &[NodeSetup]) -> String {
 #[serial]
 fn killed_primary_triggers_exactly_one_auto_promotion() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let replication_addr = free_addr();
+    let replication_addr = free_addr(PORT_BASE);
 
     let nodes: Vec<NodeSetup> = (0..3)
         .map(|i| NodeSetup {
             key: ed25519_dalek::SigningKey::from_bytes(&[0x51 + i as u8; 32]),
-            client_addr: free_addr(),
-            raft_addr: free_addr(),
-            health_addr: free_addr(),
+            client_addr: free_addr(PORT_BASE),
+            raft_addr: free_addr(PORT_BASE),
+            health_addr: free_addr(PORT_BASE),
         })
         .collect();
 
@@ -319,8 +295,8 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
         // TIME_WAIT. No replication bind — this exercises the raft-mesh
         // fencing channel in isolation, not a data-plane handshake.
         let mut config = make_config(0);
-        config.bind = free_addr();
-        config.health_bind = Some(free_addr());
+        config.bind = free_addr(PORT_BASE);
+        config.health_bind = Some(free_addr(PORT_BASE));
         let listener =
             BlockingTcpListener::bind(config.bind).expect("bind revived primary client port");
         let sd = Arc::clone(&revived_shutdown);

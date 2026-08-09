@@ -45,6 +45,11 @@ pub mod replication_wire;
 /// journal fsync. Generic over `A: Application`.
 pub mod shadow;
 pub mod snapshot;
+/// Test-only allocation of localhost listen addresses safe against the
+/// reserve-and-drop port race. For integration tests of any crate in the
+/// workspace; activate via `[dev-dependencies]` only.
+#[cfg(feature = "test-utils")]
+pub mod test_ports;
 pub mod tick;
 pub mod trace;
 
