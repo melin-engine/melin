@@ -336,12 +336,13 @@ pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
     shadow_handle: Option<std::thread::JoinHandle<()>>,
 ) -> TeardownOutcome<A, W> {
     // Defense-in-depth: set the flag before joining. The sentinel was
-    // already published by `tcp_receiver` before this call, so no further
-    // events can arrive in the input ring — setting the flag here cannot
-    // race with new publishes. The flag is the fallback exit signal for
-    // paths that don't observe the sentinel: `run_sync` in `no-persist`
-    // builds, the drain consumer, the shadow stage, and any case where
-    // the receiver thread panicked before publishing the sentinel.
+    // already published by `teardown_replica_pipeline` before this call,
+    // so no further events can arrive in the input ring — setting the
+    // flag here cannot race with new publishes. The flag is the fallback
+    // exit signal for paths that don't observe the sentinel: `run_sync`
+    // in `no-persist` builds, the drain consumer, the shadow stage, and
+    // any case where the receiver thread panicked before publishing the
+    // sentinel.
     //
     // The flag is also what makes these joins safe when the journal
     // stage is already dead: the matching stage's gate on the (frozen)
@@ -580,12 +581,34 @@ where
     })
 }
 
-/// Tear down the pipeline: signal shutdown, join all threads, return the
-/// recovered (App, SectorWriter) so the orchestrator can use them for the
-/// next pipeline build (e.g., post-snapshot) or pass them up on promotion.
+/// Tear down the pipeline: publish the shutdown sentinel, join all
+/// threads, return the recovered (App, SectorWriter) so the orchestrator
+/// can use them for the next pipeline build (e.g., post-snapshot) or
+/// pass them up on promotion.
 pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send + 'static>(
-    handles: ReplicaPipelineHandles<A, W>,
+    mut handles: ReplicaPipelineHandles<A, W>,
 ) -> TeardownOutcome<A, W> {
+    // The sentinel is published here, not by callers, so no teardown
+    // path can forget it — the journal and matching stages exit by
+    // consuming it through the normal event path, draining anything
+    // received-but-not-yet-journaled (see `shutdown_pipeline` for why
+    // the flag alone is only the emergency fallback). Bounded retry
+    // rather than the blocking `publish`: if the journal stage dies
+    // with the ring full, its gate cursor freezes and a blocking
+    // publish would spin forever — re-check the failure latch between
+    // attempts and fall through to the flag-only teardown once it
+    // trips (the sentinel has no reader then anyway: the matching
+    // stage is gated behind the frozen journal cursor).
+    while !handles.journal_failed.load(Ordering::Acquire) {
+        match handles
+            .input_producer
+            .try_publish(InputSlot::<A::Event>::shutdown_sentinel())
+        {
+            Ok(_) => break,
+            // Ring full — consumers need to make progress first.
+            Err(_) => std::thread::yield_now(),
+        }
+    }
     shutdown_pipeline::<A, W>(
         &handles.pipeline_shutdown,
         handles.journal_handle,
@@ -691,13 +714,13 @@ pub(in crate::replication) enum AfterSession<A, W> {
 /// Dispatch a finished streaming session — shared by the kernel-TCP and
 /// DPDK receivers.
 ///
-/// Folds the three behaviours that were previously copied between the
-/// two receiver loops (and had drifted — the copies reset the
-/// post-resync writer differently, a latent corruption bug): the
-/// terminal-exit shutdown-sentinel publish, the
+/// Folds the behaviours that were previously copied between the two
+/// receiver loops (and had drifted — the copies reset the post-resync
+/// writer differently, a latent corruption bug): the
 /// `Shutdown`/`Promote`/`Fatal` teardown (including the once-per-process
-/// in-process divergence-resync policy), and the `Disconnected`
-/// reconnect backoff.
+/// in-process divergence-resync policy) and the `Disconnected` reconnect
+/// backoff. The shutdown-sentinel publish lives in
+/// [`teardown_replica_pipeline`].
 ///
 /// `close` runs any transport-specific teardown that must precede a
 /// reconnect — the DPDK receiver closes its smoltcp socket so the
@@ -731,19 +754,6 @@ where
         exit,
         received_data,
     } = result;
-
-    // Publish the shutdown sentinel for terminal exits — unless the
-    // journal stage already failed: its gate cursor is frozen, so a full
-    // ring would wedge this publish forever, and the sentinel has no
-    // reader anyway (the matching stage is gated behind the journal
-    // cursor; teardown's shutdown flag covers every consumer).
-    if !matches!(exit, SessionExit::Disconnected)
-        && let Some(p) = pipeline.as_mut()
-        && !p.journal_failed.load(Ordering::Acquire)
-    {
-        p.input_producer
-            .publish(InputSlot::<A::Event>::shutdown_sentinel());
-    }
 
     match exit {
         SessionExit::Shutdown => {
@@ -839,14 +849,10 @@ where
 /// during reconnect backoff — and return the warm Exchange + writer for
 /// the promoted primary. Shared by both receivers.
 ///
-/// Publishes the shutdown sentinel before teardown so the idle stages
-/// drain the input ring cleanly (any received-but-not-yet-journaled
-/// events) instead of exiting via the flag's emergency-abort branch —
-/// see [`shutdown_pipeline`]. A clean teardown hands back the warm
-/// state; if there is no pipeline (promotion before the first connect,
-/// or after a resync that left the state in the receiver's locals) those
-/// locals carry it. A missing pair is a hard error — a promote with
-/// nothing to promote.
+/// A clean teardown hands back the warm state; if there is no pipeline
+/// (promotion before the first connect, or after a resync that left the
+/// state in the receiver's locals) those locals carry it. A missing
+/// pair is a hard error — a promote with nothing to promote.
 pub(in crate::replication) fn take_pipeline_for_promotion<A, W>(
     pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
     exchange: &mut Option<A>,
@@ -856,13 +862,11 @@ where
     A: Application + Send + 'static,
     W: JournalWrite<A::Event> + Send + 'static,
 {
-    if let Some(mut p) = pipeline.take() {
-        p.input_producer
-            .publish(InputSlot::<A::Event>::shutdown_sentinel());
-        if let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p) {
-            *exchange = Some(e);
-            *journal_writer = Some(w);
-        }
+    if let Some(p) = pipeline.take()
+        && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
+    {
+        *exchange = Some(e);
+        *journal_writer = Some(w);
     }
     match (exchange.take(), journal_writer.take()) {
         (Some(e), Some(w)) => Ok(Some((e, w))),
@@ -1012,9 +1016,7 @@ where
         tracing::info!("primary requires snapshot transfer — receiving snapshot");
     }
 
-    if let Some(mut p) = pipeline.take() {
-        p.input_producer
-            .publish(InputSlot::<A::Event>::shutdown_sentinel());
+    if let Some(p) = pipeline.take() {
         let _ = teardown_replica_pipeline::<A, W>(p);
     }
 
@@ -2572,6 +2574,99 @@ mod tests {
             shutdown_pipeline::<u64, u32>(&flag, journal, matching, drain, None),
             TeardownOutcome::Panicked
         ));
+    }
+
+    /// `ReplicaPipelineHandles` over a real input ring (one gate
+    /// consumer) with immediately-returning stage threads — just enough
+    /// structure for `teardown_replica_pipeline` to run for real. The
+    /// returned consumer observes what teardown published.
+    fn teardown_fixture(
+        capacity: usize,
+    ) -> (
+        ReplicaPipelineHandles<counter_server::Counter, u32>,
+        melin_pipeline::ring::Consumer<InputSlot>,
+    ) {
+        use melin_app::app_factory::AppFactory;
+        let (input_producer, mut consumers) =
+            melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(capacity)
+                .add_consumer()
+                .build();
+        let consumer = consumers.pop().expect("one consumer");
+        let handles = ReplicaPipelineHandles {
+            input_producer,
+            journal_cursor: Arc::new(make_journal_cursor(0)),
+            last_seq: melin_transport_core::DurableWireSeqCursor::detached(
+                melin_transport_core::WireSeq::new(0),
+            ),
+            chain_hash_lock: None,
+            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            journal_failed: Arc::new(AtomicBool::new(false)),
+            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
+            journal_handle: std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> {
+                Ok(11)
+            }),
+            matching_handle: std::thread::spawn(|| counter_server::CounterFactory.empty()),
+            drain_handle: std::thread::spawn(|| {}),
+            shadow_handle: None,
+        };
+        (handles, consumer)
+    }
+
+    /// The invariant behind moving the sentinel publish into
+    /// `teardown_replica_pipeline`: a healthy teardown always puts the
+    /// shutdown sentinel on the ring, so the stages exit by consuming it
+    /// through the normal event path (draining anything ahead of it),
+    /// not via the flag's emergency-abort branch.
+    #[test]
+    fn teardown_publishes_shutdown_sentinel() {
+        let (handles, mut consumer) = teardown_fixture(8);
+        assert!(matches!(
+            teardown_replica_pipeline::<counter_server::Counter, u32>(handles),
+            TeardownOutcome::Clean(..)
+        ));
+        let (_, slot) = consumer.try_consume().expect("sentinel on the ring");
+        assert!(
+            slot.event.is_shutdown(),
+            "published slot must be the sentinel"
+        );
+        assert!(consumer.try_consume().is_none(), "exactly one sentinel");
+    }
+
+    /// With the journal-failure latch set and the ring full — the state
+    /// a dead journal stage leaves behind (its frozen gate cursor means
+    /// the ring never drains) — teardown must skip the sentinel and
+    /// return, instead of spinning forever on ring backpressure.
+    #[test]
+    fn teardown_skips_sentinel_when_journal_failed_and_ring_full() {
+        let (mut handles, mut consumer) = teardown_fixture(4);
+        for seq in 0..4 {
+            assert!(
+                handles
+                    .input_producer
+                    .try_publish(InputSlot {
+                        sequence: seq,
+                        ..InputSlot::default()
+                    })
+                    .is_ok(),
+                "ring must have space while filling"
+            );
+        }
+        assert!(
+            handles
+                .input_producer
+                .try_publish(InputSlot::default())
+                .is_err(),
+            "ring must be full"
+        );
+        handles.journal_failed.store(true, Ordering::Release);
+        // Would spin forever on the frozen gate without the latch check.
+        assert!(matches!(
+            teardown_replica_pipeline::<counter_server::Counter, u32>(handles),
+            TeardownOutcome::Clean(..)
+        ));
+        while let Some((_, slot)) = consumer.try_consume() {
+            assert!(!slot.event.is_shutdown(), "no sentinel may be published");
+        }
     }
 
     #[test]

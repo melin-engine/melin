@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use melin_app::Application;
 use melin_journal::JournalWrite;
-use melin_transport_core::pipeline::{InputSlot, JournalStage, JournalStageRun};
+use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
 use super::auth::authenticate_with_primary;
 use super::receiver_transport::{
@@ -485,10 +485,12 @@ where
             }
         }
 
+        // Sole authority for shutdown/promote while disconnected: every
+        // backoff arm just sleeps (the sleep observes both flags) and
+        // continues back here, so teardown/promotion handling exists
+        // exactly once.
         if shutdown.load(Ordering::Relaxed) {
-            if let Some(mut p) = pipeline.take() {
-                p.input_producer
-                    .publish(InputSlot::<A::Event>::shutdown_sentinel());
+            if let Some(p) = pipeline.take() {
                 let _ = teardown_replica_pipeline::<A, W>(p);
             }
             return Ok(None);
@@ -510,17 +512,6 @@ where
                     "failed to connect to primary — retrying"
                 );
                 sleep_then_double_backoff(&mut backoff, shutdown, promote);
-                if shutdown.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                if promote.is_requested() {
-                    info!("promotion triggered during reconnect backoff");
-                    return take_pipeline_for_promotion(
-                        &mut pipeline,
-                        &mut exchange,
-                        &mut journal_writer,
-                    );
-                }
                 continue;
             }
         };
@@ -573,8 +564,7 @@ where
             drop(reader);
             drop(tcp_writer);
             // Back off before redialing — without the sleep this loop
-            // hammers a primary that keeps refusing us. The loop top
-            // re-checks the shutdown/promote flags after the sleep.
+            // hammers a primary that keeps refusing us.
             sleep_then_double_backoff(&mut backoff, shutdown, promote);
             continue;
         }
@@ -899,28 +889,22 @@ mod tests {
         assert_eq!(seqs, vec![1, 2, 3]);
     }
 
-    // -----------------------------------------------------------------
-    // In-process divergence resync — end to end against a scripted
-    // primary. Needs hash-chain (divergence is a chain verdict) and
-    // real persistence (the resync re-derives state from disk).
-    // -----------------------------------------------------------------
-    #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
-    mod divergence_resync {
-        use super::super::super::auth::authenticate_replica;
+    /// Scripted-primary scaffolding shared by the end-to-end receiver
+    /// tests below: a no-op application over a trivial event, the
+    /// primary-side frame helpers, and common fixtures. Gated like its
+    /// consumers so a `no-persist` build carries no dead test code.
+    #[cfg(not(feature = "no-persist"))]
+    mod scripted {
         use super::*;
         use melin_app::app_factory::AppFactory;
         use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
-        use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
-        use melin_transport_core::cursors::WireSeq;
-        use melin_transport_core::replication::catchup::{lineage_origin, snapshot_transfer_with};
-        use melin_transport_core::replication::protocol::{
-            encode_hash_mismatch, encode_rotate, encode_stream_start,
-        };
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
+
+        // Re-export so the sibling test modules can name the generic
+        // slot type without reaching into transport-core themselves.
+        pub(super) use melin_transport_core::pipeline::InputSlot;
 
         #[derive(Debug, Clone, Copy, PartialEq)]
-        struct EvtAdd(u64);
+        pub(super) struct EvtAdd(pub(super) u64);
 
         impl AppEvent for EvtAdd {
             fn encoded_size(&self) -> usize {
@@ -942,9 +926,9 @@ mod tests {
         }
 
         #[derive(Debug, Clone, Copy)]
-        struct Rpt;
+        pub(super) struct Rpt;
 
-        struct App;
+        pub(super) struct App;
 
         impl Application for App {
             type Event = EvtAdd;
@@ -970,7 +954,7 @@ mod tests {
             }
         }
 
-        struct Factory;
+        pub(super) struct Factory;
 
         impl AppFactory for Factory {
             type App = App;
@@ -980,8 +964,39 @@ mod tests {
             fn prefault(&self, _app: &mut App) {}
         }
 
+        /// Deterministic replica signing-key bytes; [`replica_auth`]
+        /// builds the matching authorized-keys table.
+        pub(super) const REPLICA_KEY: [u8; 32] = [0xFC; 32];
+
+        /// The authorized-keys table listing [`REPLICA_KEY`]'s public
+        /// half.
+        pub(super) fn replica_auth() -> melin_app::auth::AuthorizedKeys {
+            let key = ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY);
+            let pub_b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                key.verifying_key().to_bytes(),
+            );
+            melin_app::auth::AuthorizedKeys::parse(&format!("replication {pub_b64} test-replica\n"))
+                .expect("parse keys")
+        }
+
+        /// All-zero (unpinned sentinel) core assignment for every stage.
+        pub(super) fn unpinned_cores() -> crate::server::PipelineCores {
+            crate::server::PipelineCores {
+                journal: 0,
+                matching: 0,
+                response: 0,
+                reader: 0,
+                repl_sender: 0,
+                event_publisher: 0,
+                shadow: 0,
+                repl_handler_0: 0,
+                repl_handler_1: 0,
+            }
+        }
+
         /// Read one length-prefixed `ReplicaMessage` frame.
-        fn read_replica_msg(stream: &mut TcpStream) -> ReplicaMessage {
+        pub(super) fn read_replica_msg(stream: &mut TcpStream) -> ReplicaMessage {
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).expect("frame length");
             let len = u32::from_le_bytes(len_buf) as usize;
@@ -991,7 +1006,7 @@ mod tests {
         }
 
         /// Skip frames until an `Ack` at or past `seq` arrives.
-        fn wait_for_ack(stream: &mut TcpStream, seq: u64) {
+        pub(super) fn wait_for_ack(stream: &mut TcpStream, seq: u64) {
             loop {
                 if let ReplicaMessage::Ack(a) = read_replica_msg(stream)
                     && a.acked_sequence >= seq
@@ -1003,7 +1018,7 @@ mod tests {
 
         /// Accept with a deadline so a replica that fails to (re)connect
         /// fails the test instead of hanging it.
-        fn accept_within(listener: &std::net::TcpListener, secs: u64) -> TcpStream {
+        pub(super) fn accept_within(listener: &std::net::TcpListener, secs: u64) -> TcpStream {
             let deadline = Instant::now() + Duration::from_secs(secs);
             loop {
                 match listener.accept() {
@@ -1020,6 +1035,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // In-process divergence resync — end to end against a scripted
+    // primary. Needs hash-chain (divergence is a chain verdict) and
+    // real persistence (the resync re-derives state from disk).
+    // -----------------------------------------------------------------
+    #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+    mod divergence_resync {
+        use super::super::super::auth::authenticate_replica;
+        use super::scripted::*;
+        use super::*;
+        use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+        use melin_transport_core::cursors::WireSeq;
+        use melin_transport_core::replication::catchup::{lineage_origin, snapshot_transfer_with};
+        use melin_transport_core::replication::protocol::{
+            encode_hash_mismatch, encode_rotate, encode_stream_start,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
 
         /// A scripted primary brings a fresh replica up, streams one
         /// event, then announces a rotation with a deliberately wrong
@@ -1061,15 +1096,7 @@ mod tests {
                 lineage_origin(&primary_journal).expect("lineage");
 
             // --- Auth: one replica key, authorized.
-            let repl_key = ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]);
-            let pub_b64 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                repl_key.verifying_key().to_bytes(),
-            );
-            let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&format!(
-                "replication {pub_b64} test-replica\n"
-            ))
-            .expect("parse keys");
+            let authorized_keys = replica_auth();
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             listener.set_nonblocking(true).expect("nonblocking");
@@ -1080,18 +1107,7 @@ mod tests {
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
             let control = crate::replication::ReplicaControlPlane::new();
-            let cores = crate::server::PipelineCores {
-                // 0 = unpinned sentinel for every stage.
-                journal: 0,
-                matching: 0,
-                response: 0,
-                reader: 0,
-                repl_sender: 0,
-                event_publisher: 0,
-                shadow: 0,
-                repl_handler_0: 0,
-                repl_handler_1: 0,
-            };
+            let cores = unpinned_cores();
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
@@ -1100,7 +1116,7 @@ mod tests {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
                         &journal,
-                        &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
+                        &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                         &shutdown,
                         &control,
                         3_600_000,
@@ -1252,15 +1268,7 @@ mod tests {
             let (lineage_start, lineage_anchor) =
                 lineage_origin(&primary_journal).expect("lineage");
 
-            let repl_key = ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]);
-            let pub_b64 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                repl_key.verifying_key().to_bytes(),
-            );
-            let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&format!(
-                "replication {pub_b64} test-replica\n"
-            ))
-            .expect("parse keys");
+            let authorized_keys = replica_auth();
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             listener.set_nonblocking(true).expect("nonblocking");
@@ -1270,17 +1278,7 @@ mod tests {
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
             let control = crate::replication::ReplicaControlPlane::new();
-            let cores = crate::server::PipelineCores {
-                journal: 0,
-                matching: 0,
-                response: 0,
-                reader: 0,
-                repl_sender: 0,
-                event_publisher: 0,
-                shadow: 0,
-                repl_handler_0: 0,
-                repl_handler_1: 0,
-            };
+            let cores = unpinned_cores();
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
@@ -1289,7 +1287,7 @@ mod tests {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
                         &journal,
-                        &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
+                        &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                         &shutdown,
                         &control,
                         3_600_000,
@@ -1439,15 +1437,7 @@ mod tests {
             let (lineage_start, lineage_anchor) =
                 lineage_origin(&primary_journal).expect("lineage");
 
-            let repl_key = ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]);
-            let pub_b64 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                repl_key.verifying_key().to_bytes(),
-            );
-            let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&format!(
-                "replication {pub_b64} test-replica\n"
-            ))
-            .expect("parse keys");
+            let authorized_keys = replica_auth();
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             listener.set_nonblocking(true).expect("nonblocking");
@@ -1457,17 +1447,7 @@ mod tests {
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
             let control = crate::replication::ReplicaControlPlane::new();
-            let cores = crate::server::PipelineCores {
-                journal: 0,
-                matching: 0,
-                response: 0,
-                reader: 0,
-                repl_sender: 0,
-                event_publisher: 0,
-                shadow: 0,
-                repl_handler_0: 0,
-                repl_handler_1: 0,
-            };
+            let cores = unpinned_cores();
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
@@ -1476,7 +1456,7 @@ mod tests {
                     run_receiver::<App, BufferedWriter<EvtAdd>>(
                         addr,
                         &journal,
-                        &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
+                        &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
                         &shutdown,
                         &control,
                         3_600_000,
@@ -1650,6 +1630,168 @@ mod tests {
             );
 
             assert!(result.is_err(), "partial state is not a valid promotion");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Shutdown during reconnect backoff — end to end against a scripted
+    // primary. Needs real persistence (the pipeline journals the one
+    // streamed event); no chain verdicts involved, so no hash-chain.
+    // -----------------------------------------------------------------
+    #[cfg(not(feature = "no-persist"))]
+    mod backoff_shutdown {
+        use super::super::super::auth::authenticate_replica;
+        use super::scripted::*;
+        use super::*;
+        use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+        use melin_transport_core::replication::catchup::lineage_origin;
+        use melin_transport_core::replication::protocol::encode_stream_start;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        /// Names of every live thread in this process, via
+        /// `/proc/self/task` (Linux-only, like the runtime itself).
+        fn live_thread_names() -> Vec<String> {
+            std::fs::read_dir("/proc/self/task")
+                .expect("read /proc/self/task")
+                .filter_map(|entry| {
+                    // A thread may exit between readdir and the comm
+                    // read — skipping it is the correct outcome.
+                    let entry = entry.ok()?;
+                    let name = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+                    Some(name.trim().to_string())
+                })
+                .collect()
+        }
+
+        /// Shutdown while the receiver waits out a reconnect backoff must
+        /// tear the live pipeline down — join every stage thread — rather
+        /// than abandon it. Pins the fix for the connect-failure arm that
+        /// returned without teardown (stages left detached mid-run, the
+        /// journal writer never closed).
+        #[test]
+        fn shutdown_during_reconnect_backoff_joins_pipeline_threads() {
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            // Minimal primary journal — only its lineage identity is
+            // needed for the StreamStart the fresh replica accepts.
+            let primary_journal = dir.path().join("primary.journal");
+            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            w.append(&JournalEvent::App(EvtAdd(1))).expect("append");
+            drop(w);
+            let (lineage_start, lineage_anchor) =
+                lineage_origin(&primary_journal).expect("lineage");
+
+            let authorized_keys = replica_auth();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let control = crate::replication::ReplicaControlPlane::new();
+            let replica = {
+                let journal = dir.path().join("replica.journal");
+                let snapshot = dir.path().join("replica.snapshot");
+                let shutdown = Arc::clone(&shutdown);
+                let control = control.clone();
+                std::thread::spawn(move || -> Result<bool, String> {
+                    run_receiver::<App, BufferedWriter<EvtAdd>>(
+                        addr,
+                        &journal,
+                        &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                        &shutdown,
+                        &control,
+                        3_600_000,
+                        snapshot,
+                        unpinned_cores(),
+                        Duration::ZERO,
+                        64,
+                        false,
+                        Arc::new(Factory),
+                        Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                    )
+                    // ReceiverResult's error is !Send — stringify for join().
+                    .map(|state| state.is_none())
+                    .map_err(|e| e.to_string())
+                })
+            };
+
+            // Session 1: bring the pipeline up for real — stream one
+            // event and wait for its ack (acked ⇒ journaled ⇒ the stage
+            // threads exist).
+            let mut s1 = accept_within(&listener, 30);
+            let mut s1r = s1.try_clone().expect("clone");
+            authenticate_replica(&mut s1r, &authorized_keys).expect("auth");
+            match read_replica_msg(&mut s1) {
+                ReplicaMessage::Handshake(h) => {
+                    assert_eq!(h.last_sequence, 0, "fresh replica handshake")
+                }
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            let mut buf = Vec::new();
+            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
+            s1.write_all(&buf).expect("StreamStart");
+            buf.clear();
+            melin_transport_core::replication_wire::encode_input_batch(
+                &[InputSlot::<EvtAdd> {
+                    connection_id: 0,
+                    key_hash: 0,
+                    request_seq: 0,
+                    sequence: 1,
+                    timestamp_ns: 1,
+                    event: JournalEvent::App(EvtAdd(1)),
+                    publish_ts: Default::default(),
+                    recv_ts: Default::default(),
+                }],
+                &mut buf,
+            );
+            s1.write_all(&buf).expect("InputBatch");
+            wait_for_ack(&mut s1, 1);
+
+            // Kill the primary completely — both socket halves and the
+            // listener — so every reconnect attempt is refused and the
+            // receiver settles into the connect-failure backoff.
+            drop(s1);
+            drop(s1r);
+            drop(listener);
+            // Past the 1s post-disconnect backoff, inside the 2s
+            // connect-failure backoff sleep. (Any other point in the
+            // reconnect loop must satisfy the assertions too — this
+            // timing just targets the arm that historically leaked.)
+            std::thread::sleep(Duration::from_millis(1500));
+
+            shutdown.store(true, Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !replica.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "receiver did not exit after shutdown"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let result = replica.join().expect("replica thread panicked");
+            assert_eq!(result, Ok(true), "receiver must exit cleanly via shutdown");
+
+            // The stage threads are named at spawn, and a leaked stage
+            // spins forever — absence within the deadline proves the
+            // teardown joined them. Deadline-poll rather than one-shot:
+            // under plain `cargo test`, concurrent tests' stages may be
+            // momentarily alive, but those exit on their own.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let names = live_thread_names();
+                if !names
+                    .iter()
+                    .any(|n| n == "journal" || n == "matching" || n == "drain")
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pipeline threads still alive after shutdown: {names:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 }

@@ -1149,6 +1149,10 @@ where
             }
         }
 
+        // Sole authority for shutdown/promote while disconnected: every
+        // backoff arm just sleeps (the sleep observes both flags) and
+        // continues back here, so teardown/promotion handling exists
+        // exactly once.
         if shutdown.load(Ordering::Relaxed) {
             if let Some(p) = pipeline.take() {
                 let _ = teardown_replica_pipeline::<A, W>(p);
@@ -1208,8 +1212,11 @@ where
         let connect_start = std::time::Instant::now();
         const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let connected = loop {
+            // Route shutdown through the `!connected` arm and the loop
+            // top — returning from here would leak the pipeline threads
+            // and the smoltcp socket.
             if shutdown.load(Ordering::Relaxed) {
-                return Ok(None);
+                break false;
             }
             transport.poll();
             if transport.is_connected(handle) {
@@ -1222,26 +1229,18 @@ where
         };
 
         if !connected {
-            warn!(
-                backoff_secs = backoff.as_secs(),
-                "failed to connect to primary (DPDK) — retrying"
-            );
-            transport.close(handle);
-            sleep_then_double_backoff(&mut backoff, shutdown, promote);
+            // A shutdown racing the connect window is a clean exit, not
+            // degraded operation — don't warn.
             if shutdown.load(Ordering::Relaxed) {
-                if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline::<A, W>(p);
-                }
-                return Ok(None);
-            }
-            if promote.is_requested() {
-                info!("promotion triggered during reconnect backoff");
-                return take_pipeline_for_promotion(
-                    &mut pipeline,
-                    &mut exchange,
-                    &mut journal_writer,
+                debug!("connect aborted — shutting down (DPDK)");
+            } else {
+                warn!(
+                    backoff_secs = backoff.as_secs(),
+                    "failed to connect to primary (DPDK) — retrying"
                 );
             }
+            transport.close(handle);
+            sleep_then_double_backoff(&mut backoff, shutdown, promote);
             continue;
         }
         info!("connected to primary (DPDK)");
@@ -1279,20 +1278,6 @@ where
                 );
             }
             sleep_then_double_backoff(&mut backoff, shutdown, promote);
-            if shutdown.load(Ordering::Relaxed) {
-                if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline::<A, W>(p);
-                }
-                return Ok(None);
-            }
-            if promote.is_requested() {
-                info!("promotion triggered during reconnect backoff");
-                return take_pipeline_for_promotion(
-                    &mut pipeline,
-                    &mut exchange,
-                    &mut journal_writer,
-                );
-            }
             continue;
         }
         info!("authenticated with primary (DPDK)");
@@ -1331,10 +1316,10 @@ where
         // StreamStart inline, via `handle_resync_verdict`).
         let stream_lineage: Option<(u64, [u8; 32])> = 'handshake: loop {
             if shutdown.load(Ordering::Relaxed) {
-                if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline::<A, W>(p);
-                }
-                return Ok(None);
+                // Route through the loop top (via the `None` check
+                // below) rather than duplicating its teardown here.
+                transport.close(handle);
+                break 'handshake None;
             }
             transport.poll();
             transport.recv_into_vec(handle, &mut recv_buf);
