@@ -1099,7 +1099,8 @@ where
     tip_ready.store(true, Ordering::Release);
 
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
-    // Reset to 1s on successful streaming (first InputBatch received).
+    // Reset to 1s when a session heard the primary speak (data or
+    // heartbeat) — see `handle_session_exit`.
     let mut backoff = std::time::Duration::from_secs(1);
 
     // Mid-stream divergence resyncs this process has attempted — see

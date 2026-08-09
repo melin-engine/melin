@@ -684,7 +684,9 @@ where
 
 /// Reconnect backoff cap shared by both receivers — exponential from
 /// 1 s, clamped here so a long outage settles to one attempt every 30 s
-/// without hammering a flapping primary.
+/// without hammering a flapping primary. Reset to 1 s only when a
+/// session heard the primary speak (data or heartbeat) — see
+/// [`handle_session_exit`].
 pub(super) const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What the receiver's reconnect loop does after a streaming session
@@ -752,7 +754,7 @@ where
 {
     let StreamingResult {
         exit,
-        received_data,
+        heard_from_primary,
     } = result;
 
     match exit {
@@ -828,13 +830,20 @@ where
             // Transport-specific teardown before reconnecting (smoltcp
             // socket reclaim on DPDK; no-op on kernel TCP).
             close();
-            // A session that received data is proof the primary is
-            // reachable — treat the drop as transient and reset backoff.
-            if received_data {
+            // A session in which the primary spoke — data or heartbeat
+            // (heartbeats flow even on a quiet system) — proves it
+            // alive and serving: treat the drop as transient and reset
+            // the backoff. A session with no word from the primary
+            // keeps escalating: that covers instant-drop flaps and
+            // synthetic results from sessions that never started
+            // streaming (a persistent local transport failure must not
+            // redial at 1 Hz forever).
+            if heard_from_primary {
                 *backoff = std::time::Duration::from_secs(1);
             }
             tracing::warn!(
                 last_sequence,
+                heard_from_primary,
                 backoff_secs = backoff.as_secs(),
                 "reconnecting to primary"
             );
@@ -2630,6 +2639,64 @@ mod tests {
             "published slot must be the sentinel"
         );
         assert!(consumer.try_consume().is_none(), "exactly one sentinel");
+    }
+
+    /// Drive `handle_session_exit` through one `Disconnected` exit with
+    /// the given liveness flag and a backoff pre-escalated to
+    /// `MAX_BACKOFF`, returning the post-exit backoff. Shutdown is
+    /// latched so the backoff sleep returns immediately (the receiver's
+    /// loop top would handle it on the next turn); the journal, factory
+    /// and fence arguments are inert on the `Disconnected` path.
+    fn backoff_after_disconnect(heard_from_primary: bool) -> std::time::Duration {
+        let dir = tempfile::tempdir().expect("tempdir");
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let mut pipeline: Option<ReplicaPipelineHandles<counter_server::Counter, Writer>> = None;
+        let mut divergence_resyncs = 0u32;
+        let mut backoff = MAX_BACKOFF;
+        let shutdown = AtomicBool::new(true);
+        let promote = crate::promotion::PromotionRequest::new();
+        let after = handle_session_exit::<counter_server::Counter, Writer>(
+            StreamingResult {
+                exit: SessionExit::Disconnected,
+                heard_from_primary,
+            },
+            &mut pipeline,
+            &mut divergence_resyncs,
+            &mut backoff,
+            0,
+            &dir.path().join("r.journal"),
+            &dir.path().join("r.snapshot"),
+            &counter_server::CounterFactory,
+            &melin_transport_core::fence::FenceState::new(0),
+            &shutdown,
+            &promote,
+            || {},
+        );
+        assert!(matches!(after, AfterSession::Reconnect));
+        backoff
+    }
+
+    /// A session in which the primary spoke — even heartbeat-only on a
+    /// quiet system — must reset the disconnect backoff. A stale
+    /// escalated backoff delays primary-link recovery, and with it the
+    /// auto-promotion veto, by up to MAX_BACKOFF.
+    #[test]
+    fn disconnect_resets_backoff_when_primary_spoke() {
+        // Reset to 1s, then doubled for the next attempt by the shared
+        // helper — NOT stuck at MAX_BACKOFF.
+        assert_eq!(
+            backoff_after_disconnect(true),
+            std::time::Duration::from_secs(2)
+        );
+    }
+
+    /// A session with no word from the primary — an instant-drop flap,
+    /// or the synthetic result of a session that never started
+    /// streaming (local transport init failure) — must keep its
+    /// escalated backoff rather than redialing at 1 Hz forever.
+    #[test]
+    fn disconnect_keeps_escalated_backoff_when_primary_silent() {
+        assert_eq!(backoff_after_disconnect(false), MAX_BACKOFF);
     }
 
     /// With the journal-failure latch set and the ring full — the state

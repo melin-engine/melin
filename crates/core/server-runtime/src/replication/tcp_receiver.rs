@@ -720,9 +720,14 @@ where
                             Ok(t) => t,
                             Err(e) => {
                                 tracing::error!(error = %e, "UringTransport init failed");
+                                // Synthetic result: streaming never started,
+                                // so `heard_from_primary` stays false and the
+                                // reconnect keeps its escalated backoff — this
+                                // failure is local (io_uring setup), and a
+                                // persistent one must not redial at 1 Hz.
                                 return super::receiver_transport::StreamingResult {
                                     exit: SessionExit::Disconnected,
-                                    received_data: false,
+                                    heard_from_primary: false,
                                 };
                             }
                         };

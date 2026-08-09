@@ -233,8 +233,10 @@ pub(super) struct StreamingFrameOutcome {
     /// Updated `accum_end_sequence` — only names slots that were
     /// committed to the input ring.
     pub accum_end_sequence: u64,
-    /// Whether at least one non-empty `InputBatch` arrived.
-    pub received_data: bool,
+    /// Whether the primary spoke this cycle — a non-empty `InputBatch`
+    /// or a `Heartbeat`. Session-level liveness evidence; see
+    /// [`StreamingResult::heard_from_primary`].
+    pub heard_from_primary: bool,
     /// Fatal frame error — caller should break with `SessionExit::Fatal`.
     pub frame_err: Option<Box<dyn std::error::Error + Send + Sync>>,
     /// The primary's acking mode as advertised by the last `Heartbeat`
@@ -280,7 +282,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     let mut consumed = 0;
     let mut last_target = 0u64;
     let mut any_published = false;
-    let mut received_data = false;
+    let mut heard_from_primary = false;
     let mut frame_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     let mut observed_acking_mode: Option<u8> = None;
     let mut batch = input_producer.batch();
@@ -303,7 +305,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                 match try_decode_input_batch_into(payload, slot_buf) {
                     Ok(()) => {
                         if !slot_buf.is_empty() {
-                            received_data = true;
+                            heard_from_primary = true;
                             for slot in slot_buf.drain(..) {
                                 let primary_seq = slot.sequence;
                                 if primary_seq <= pending_accum {
@@ -360,6 +362,10 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                         }) => {
                             debug!(sequence, durability_mode, "heartbeat from primary");
                             observed_acking_mode = Some(durability_mode);
+                            // A heartbeat is the primary speaking — on a
+                            // quiet system it is the only liveness
+                            // evidence a session produces.
+                            heard_from_primary = true;
                         }
                         Ok(PrimaryMessage::Rotate {
                             boundary_seq,
@@ -430,7 +436,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
         last_target,
         any_published,
         accum_end_sequence: pending_accum,
-        received_data,
+        heard_from_primary,
         frame_err,
         observed_acking_mode,
     }
@@ -542,7 +548,13 @@ pub(super) enum SessionExit {
 /// What the streaming loop returns to the caller.
 pub(super) struct StreamingResult {
     pub exit: SessionExit,
-    pub received_data: bool,
+    /// Whether the primary spoke during the session — a non-empty
+    /// `InputBatch` or a `Heartbeat` (which flow even on a quiet
+    /// system). This is what the disconnect handler keys the backoff
+    /// reset on: it is in-session liveness evidence, so a synthetic
+    /// result from a session that never started streaming (flag false)
+    /// keeps its escalated backoff.
+    pub heard_from_primary: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -627,7 +639,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     // cannot regress the tip below data already accepted.
     journal_tip.advance(melin_transport_core::WireSeq::new(initial_sequence));
 
-    let mut received_data = false;
+    let mut heard_from_primary = false;
     let mut idle_spins: u32 = 0;
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
@@ -803,7 +815,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             // primary acks under (runtime `DURABILITY` retunes).
             primary_acking_mode.store(mode, Ordering::Release);
         }
-        received_data |= outcome.received_data;
+        heard_from_primary |= outcome.heard_from_primary;
         compact_recv_buf(&mut recv_buf, outcome.consumed);
 
         if let Some(e) = outcome.frame_err {
@@ -836,7 +848,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
 
     StreamingResult {
         exit,
-        received_data,
+        heard_from_primary,
     }
 }
 
@@ -1069,7 +1081,7 @@ mod tests {
         );
 
         assert!(matches!(result.exit, SessionExit::Shutdown));
-        assert!(!result.received_data);
+        assert!(!result.heard_from_primary);
     }
 
     #[test]
@@ -1163,7 +1175,7 @@ mod tests {
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
-        assert!(result.received_data);
+        assert!(result.heard_from_primary);
 
         let slots = drain(&mut consumer);
         assert_eq!(slots.len(), 2);
@@ -1206,7 +1218,7 @@ mod tests {
             &AtomicBool::new(false),
         );
 
-        assert!(result.received_data);
+        assert!(result.heard_from_primary);
         let slots = drain(&mut consumer);
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].request_seq, 0x42);
@@ -1406,7 +1418,7 @@ mod tests {
         assert!(outcome.frame_err.is_none(), "no fatal exit");
         assert_eq!(outcome.consumed, buf.len(), "every byte processed");
         assert!(outcome.any_published);
-        assert!(outcome.received_data);
+        assert!(outcome.heard_from_primary);
         assert_eq!(outcome.accum_end_sequence, 9);
         assert_eq!(
             outcome.observed_acking_mode,
@@ -1653,7 +1665,9 @@ mod tests {
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.consumed, buf.len());
         assert!(!outcome.any_published);
-        assert!(!outcome.received_data);
+        // Heartbeats don't advance the stream, but they ARE the primary
+        // speaking — the liveness evidence the backoff reset keys on.
+        assert!(outcome.heard_from_primary);
         assert_eq!(outcome.accum_end_sequence, 100);
         assert!(drain(&mut consumer).is_empty());
     }
@@ -1675,7 +1689,7 @@ mod tests {
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.consumed, 0);
         assert!(!outcome.any_published);
-        assert!(!outcome.received_data);
+        assert!(!outcome.heard_from_primary);
         assert_eq!(outcome.accum_end_sequence, 77);
         assert!(drain(&mut consumer).is_empty());
     }
