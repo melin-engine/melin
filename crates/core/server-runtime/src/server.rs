@@ -794,6 +794,20 @@ where
     // stage's source of truth after the replica → primary transition.
     let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
 
+    // Bind the replication listener up front, before any pipeline thread
+    // exists and regardless of role: a bad or stolen --replication-bind
+    // fails the boot cleanly (nothing spawned yet to leak), and a
+    // replica holds its configured port from boot, so a later promotion
+    // can neither lose the port to another process nor die on a
+    // mid-failover bind. Pending connections just sit in the backlog
+    // until a promotion starts the sender's accept loop — replicas dial
+    // the configured primary, not each other, so nothing queues there
+    // in normal operation.
+    let repl_listener = config
+        .replication_bind
+        .map(bind_replication_listener)
+        .transpose()?;
+
     // Replica mode: connect to primary, receive journal stream, replay.
     // Must run before init_engine — the replica's journal is created from
     // the primary's segment lineage during the replication handshake.
@@ -964,6 +978,7 @@ where
                     exchange,
                     writer,
                     listener,
+                    repl_listener,
                     &config,
                     &*factory,
                     decoder,
@@ -1057,6 +1072,7 @@ where
         exchange,
         writer,
         listener,
+        repl_listener,
         &config,
         &*factory,
         decoder,
@@ -1072,6 +1088,23 @@ where
         raft_status,
         journal_tip,
     )
+}
+
+/// Bind the kernel-TCP replication listener, non-blocking (the sender's
+/// accept loop polls the shutdown flag between accepts). The kernel path
+/// binds at boot (`run_impl`) so a failure cannot leak pipeline threads
+/// and a promotion cannot fail on it; the DPDK promotion fallback binds
+/// at promotion, where its kernel listeners come up.
+fn bind_replication_listener(
+    addr: std::net::SocketAddr,
+) -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| format!("failed to bind replication listener on {addr}: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("failed to set non-blocking on replication listener: {e}"))?;
+    info!(%addr, "replication listener bound");
+    Ok(listener)
 }
 
 /// Load the Ed25519 replication signing key from `--replication-key` —
@@ -1205,6 +1238,11 @@ fn run_as_primary<A, L, W>(
     exchange: A,
     writer: W,
     mut listener: L,
+    // Pre-bound (non-blocking) replication listener, `Some` iff
+    // `--replication-bind` is set. Bound in `run_impl` before any
+    // pipeline thread exists so a bind failure cannot leak threads, and
+    // held from boot on replicas so a promotion cannot fail on it.
+    repl_listener: Option<std::net::TcpListener>,
     config: &ServerConfig,
     factory: &dyn AppFactory<App = A>,
     decoder: RequestDecoderArc<A>,
@@ -1474,9 +1512,6 @@ where
 
     let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers
     {
-        let repl_bind = config
-            .replication_bind
-            .ok_or("replication_bind must be set when replication is enabled")?;
         let s_repl = Arc::clone(&shutdown);
         let repl_slots = cursors.replica_slot_cursors();
         let ready_flag = Arc::clone(&replica_ready);
@@ -1522,16 +1557,10 @@ where
         let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
         let sender_durability = Arc::clone(&durability_mode_atomic);
-        // Bind here, not on the sender thread: a failed bind must fail
-        // startup with a clear error. Bound-but-dead replication would
-        // otherwise leave a primary that looks healthy yet can never
-        // satisfy hybrid/durably-replicated acks.
-        let repl_listener = std::net::TcpListener::bind(repl_bind)
-            .map_err(|e| format!("failed to bind replication listener on {repl_bind}: {e}"))?;
-        // Non-blocking accept so the sender loop can check shutdown.
-        repl_listener
-            .set_nonblocking(true)
-            .map_err(|e| format!("failed to set non-blocking on replication listener: {e}"))?;
+        // Bound in `run_impl` before any pipeline thread was spawned —
+        // see the `repl_listener` parameter doc.
+        let repl_listener = repl_listener
+            .ok_or("replication listener must be pre-bound when replication is enabled")?;
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -1561,7 +1590,6 @@ where
             })
             .map_err(|e| format!("spawn replication sender thread: {e}"))?;
 
-        info!(addr = %repl_bind, "replication listener started");
         Some(repl_sender_handle)
     } else {
         if !config.standalone && config.replica_of.is_none() {
@@ -2305,6 +2333,14 @@ where
                 // kernel TCP primary after promotion.
                 warn!("DPDK primary promotion not yet implemented — falling back to kernel TCP");
                 let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
+                // Unlike the kernel path (bound at boot in `run_impl`),
+                // the fallback's kernel listeners only come up here at
+                // promotion — the DPDK stack carried replication until
+                // now. See `bind_replication_listener`.
+                let repl_listener = config
+                    .replication_bind
+                    .map(bind_replication_listener)
+                    .transpose()?;
                 // The raft guard drops — stopping the driver and joining
                 // the (already exited) promotion thread — after this
                 // returns; see the kernel-TCP promotion path.
@@ -2312,6 +2348,7 @@ where
                     exchange,
                     writer,
                     listener,
+                    repl_listener,
                     &config,
                     &*factory,
                     decoder,
