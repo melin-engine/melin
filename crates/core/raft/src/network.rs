@@ -32,12 +32,12 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::auth::authenticate_outbound;
+use crate::recency::TipSource;
 use crate::types::Node;
 use crate::types::NodeId;
 use crate::types::TypeConfig;
 use crate::wire::RpcBody;
 use crate::wire::RpcFrame;
-use crate::wire::SharedTip;
 use crate::wire::read_frame;
 use crate::wire::write_frame;
 
@@ -47,11 +47,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct RaftClientFactory {
     signing_key: Arc<SigningKey>,
-    tip: Arc<SharedTip>,
+    tip: Arc<TipSource>,
 }
 
 impl RaftClientFactory {
-    pub fn new(signing_key: Arc<SigningKey>, tip: Arc<SharedTip>) -> Self {
+    pub fn new(signing_key: Arc<SigningKey>, tip: Arc<TipSource>) -> Self {
         Self { signing_key, tip }
     }
 }
@@ -74,7 +74,7 @@ pub struct RaftClient {
     target: NodeId,
     addr: String,
     signing_key: Arc<SigningKey>,
-    tip: Arc<SharedTip>,
+    tip: Arc<TipSource>,
     /// Live authenticated connection, established on first use and dropped
     /// on any I/O error.
     stream: Option<TcpStream>,
@@ -123,7 +123,8 @@ impl RaftClient {
                 .stream
                 .as_mut()
                 .ok_or_else(|| io::Error::other("no connection after connect"))?;
-            let (tip_epoch, tip_seq) = self.tip.load();
+            let local = self.tip.local_tip();
+            let (tip_epoch, tip_seq) = (local.epoch, local.last_sequence);
             write_frame(
                 stream,
                 &RpcFrame {

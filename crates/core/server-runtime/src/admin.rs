@@ -39,6 +39,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::durability_policy::DurabilityMode;
+use crate::promotion::PromotionRequest;
 
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info};
@@ -57,7 +58,7 @@ use melin_wire_protocol::control_codec;
 /// a TCP RST.
 pub fn spawn(
     bind_addr: SocketAddr,
-    promote: Option<Arc<AtomicBool>>,
+    promote: Option<PromotionRequest>,
     rotate_requested: Option<Arc<AtomicBool>>,
     durability_mode: Option<Arc<AtomicU8>>,
     shutdown: Arc<AtomicBool>,
@@ -69,7 +70,7 @@ pub fn spawn(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run(
                     bind_addr,
-                    promote.as_deref(),
+                    promote.as_ref(),
                     rotate_requested.as_deref(),
                     durability_mode.as_deref(),
                     &shutdown,
@@ -96,7 +97,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 
 fn run(
     bind_addr: SocketAddr,
-    promote: Option<&AtomicBool>,
+    promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
     durability_mode: Option<&AtomicU8>,
     shutdown: &AtomicBool,
@@ -256,7 +257,7 @@ fn send_best_effort(stream: &mut TcpStream, payload: &[u8]) {
 /// line and dispatches it.
 fn handle_connection(
     mut stream: TcpStream,
-    promote: Option<&AtomicBool>,
+    promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
     durability_mode: Option<&AtomicU8>,
     authorized_keys: &AuthorizedKeys,
@@ -287,10 +288,19 @@ fn handle_connection(
     let trimmed = line.trim();
     match trimmed {
         "PROMOTE" => match promote {
-            Some(flag) => {
-                flag.store(true, Ordering::Release);
+            Some(request) => {
+                // First request wins; a duplicate (or a race with an
+                // auto-promotion) leaves the in-flight transition
+                // untouched — still OK from the operator's viewpoint.
+                if request.request(PromotionRequest::MANUAL) {
+                    info!("promotion triggered by operator");
+                } else {
+                    // debug!, not info!: an operator-caused no-op, not
+                    // a lifecycle event (the in-flight promotion was
+                    // already info-logged by whoever filed it).
+                    debug!("PROMOTE received but a promotion is already in flight");
+                }
                 send_best_effort(&mut stream, b"OK\n");
-                info!("promotion triggered by operator");
             }
             None => {
                 send_best_effort(&mut stream, b"ERR PROMOTE not available on this node\n");
@@ -491,12 +501,12 @@ mod tests {
         drop(listener);
 
         let (key, auth_keys) = operator_keys();
-        let promote = Arc::new(AtomicBool::new(false));
+        let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let _h = spawn(
             addr,
-            Some(Arc::clone(&promote)),
+            Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
@@ -505,7 +515,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
 
         assert_eq!(send_command(addr, &key, b"PROMOTE\n"), "OK");
-        assert!(promote.load(Ordering::Acquire));
+        assert_eq!(promote.pending(), Some(PromotionRequest::MANUAL));
         assert!(!rotate.load(Ordering::Acquire));
 
         shutdown.store(true, Ordering::Release);
@@ -517,12 +527,12 @@ mod tests {
         drop(listener);
 
         let (key, auth_keys) = operator_keys();
-        let promote = Arc::new(AtomicBool::new(false));
+        let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let _h = spawn(
             addr,
-            Some(Arc::clone(&promote)),
+            Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
@@ -532,7 +542,7 @@ mod tests {
 
         assert_eq!(send_command(addr, &key, b"ROTATE\n"), "OK");
         assert!(rotate.load(Ordering::Acquire));
-        assert!(!promote.load(Ordering::Acquire));
+        assert!(!promote.is_requested());
 
         shutdown.store(true, Ordering::Release);
     }
@@ -571,11 +581,11 @@ mod tests {
         drop(listener);
 
         let (key, auth_keys) = operator_keys();
-        let promote = Arc::new(AtomicBool::new(false));
+        let promote = PromotionRequest::new();
         let shutdown = Arc::new(AtomicBool::new(false));
         let _h = spawn(
             addr,
-            Some(Arc::clone(&promote)),
+            Some(promote.clone()),
             None,
             None,
             Arc::clone(&shutdown),
@@ -585,7 +595,7 @@ mod tests {
 
         let resp = send_command(addr, &key, b"ROTATE\n");
         assert!(resp.starts_with("ERR"), "expected ERR, got {resp}");
-        assert!(!promote.load(Ordering::Acquire));
+        assert!(!promote.is_requested());
 
         shutdown.store(true, Ordering::Release);
     }
@@ -599,12 +609,12 @@ mod tests {
         drop(listener);
 
         let (key, auth_keys) = operator_keys();
-        let promote = Arc::new(AtomicBool::new(false));
+        let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let _h = spawn(
             addr,
-            Some(Arc::clone(&promote)),
+            Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
@@ -625,7 +635,7 @@ mod tests {
 
         // Final PROMOTE on the same listener still works.
         assert_eq!(send_command(addr, &key, b"PROMOTE\n"), "OK");
-        assert!(promote.load(Ordering::Acquire));
+        assert_eq!(promote.pending(), Some(PromotionRequest::MANUAL));
 
         shutdown.store(true, Ordering::Release);
     }
@@ -636,12 +646,12 @@ mod tests {
         drop(listener);
 
         let (key, auth_keys) = operator_keys();
-        let promote = Arc::new(AtomicBool::new(false));
+        let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let _h = spawn(
             addr,
-            Some(Arc::clone(&promote)),
+            Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
@@ -651,7 +661,7 @@ mod tests {
 
         let resp = send_command(addr, &key, b"INVALID\n");
         assert!(resp.starts_with("ERR"), "expected ERR, got {resp}");
-        assert!(!promote.load(Ordering::Acquire));
+        assert!(!promote.is_requested());
         assert!(!rotate.load(Ordering::Acquire));
 
         shutdown.store(true, Ordering::Release);
@@ -663,12 +673,12 @@ mod tests {
         drop(listener);
 
         let (trader_key, auth_keys) = trader_keys();
-        let promote = Arc::new(AtomicBool::new(false));
+        let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let _h = spawn(
             addr,
-            Some(Arc::clone(&promote)),
+            Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
@@ -679,7 +689,7 @@ mod tests {
         let mut stream = TcpStream::connect(addr).unwrap();
         let result = client_authenticate(&mut stream, &trader_key);
         assert_eq!(result, TAG_AUTH_FAILED);
-        assert!(!promote.load(Ordering::Acquire));
+        assert!(!promote.is_requested());
         assert!(!rotate.load(Ordering::Acquire));
 
         shutdown.store(true, Ordering::Release);
@@ -762,11 +772,11 @@ mod tests {
         drop(listener);
 
         let (key, auth_keys) = operator_keys();
-        let promote = Arc::new(AtomicBool::new(false));
+        let promote = PromotionRequest::new();
         let shutdown = Arc::new(AtomicBool::new(false));
         let _h = spawn(
             addr,
-            Some(Arc::clone(&promote)),
+            Some(promote.clone()),
             None,
             None,
             Arc::clone(&shutdown),

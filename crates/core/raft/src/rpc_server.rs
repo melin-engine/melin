@@ -31,11 +31,13 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::auth::authenticate_inbound;
+use crate::recency::JournalTip;
+use crate::recency::TipSource;
+use crate::recency::VoteFilter;
 use crate::types::NodeId;
 use crate::types::TypeConfig;
 use crate::wire::RpcBody;
 use crate::wire::RpcFrame;
-use crate::wire::SharedTip;
 use crate::wire::claimed_sender;
 use crate::wire::read_frame;
 use crate::wire::write_frame;
@@ -58,6 +60,15 @@ const MAX_INBOUND: usize = 32;
 /// Shutdown-poll cadence for the accept loop — same convention as the
 /// admin/health listener loops in the server runtime.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
+
+/// Bound on writing a single reply frame. Replies are tiny (a vote/append
+/// response, or a snapshot-chunk ack) and a healthy peer drains them
+/// instantly, so this only fires when a peer's receive window is wedged
+/// (crashed mid-read, black-holed link). Without it a stalled writer pins
+/// its task — and the [`MAX_INBOUND`] slot it holds — indefinitely; 32
+/// such peers would exhaust the accept cap. Reclaim the task instead; the
+/// peer reconnects on next use.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The slice of the raft core the RPC server needs. Implemented by
 /// [`openraft::Raft`]; mocked in tests. Errors are stringly-typed because
@@ -108,8 +119,74 @@ pub struct RpcServerConfig {
     /// A key that authenticates but isn't a configured peer is refused: the
     /// replication trust domain is broader than the raft voter set.
     pub peer_ids: Arc<HashMap<[u8; 32], NodeId>>,
-    /// Local journal tip stamped on every response envelope.
-    pub tip: Arc<SharedTip>,
+    /// Local journal tip: stamped on every response envelope, and the
+    /// voter side of the recency filter below.
+    pub tip: Arc<TipSource>,
+    /// Fence-on-supersession (see [`SupersessionPolicy`]); `None` when
+    /// auto-promotion is off — without automation, fencing stays a
+    /// data-plane-contact concern exactly as documented today.
+    pub supersession: Option<SupersessionPolicy>,
+    /// Journal-tip vote filter (see `crate::recency`). One per node —
+    /// its drop counter is *this voter's* view of election progress, so
+    /// it is shared across peer connections. A `std::sync::Mutex` (not
+    /// tokio): the critical section is a couple of integer compares at
+    /// control-plane RPC rates, and no `.await` ever happens inside it.
+    pub vote_filter: std::sync::Mutex<VoteFilter>,
+}
+
+/// The raft peer mesh as an additional fencing channel. Every inbound
+/// envelope carries the sender's journal-tip *fencing epoch*; a node
+/// that currently claims to be serving (a primary, or a replica whose
+/// promotion is already in flight) and observes a strictly higher epoch
+/// has been superseded — it self-fences and shuts down, exactly like
+/// the data-plane handshake path (`FenceState::fence_if_superseded`).
+/// This closes the split-brain window faster than waiting for a
+/// data-plane connection to cross: raft heartbeats flow continuously.
+pub struct SupersessionPolicy {
+    pub fence: Arc<melin_transport_core::fence::FenceState>,
+    /// Process shutdown flag, co-set on supersession (self-demotion).
+    pub shutdown: Arc<AtomicBool>,
+    /// Whether this node currently claims to be serving. A closure
+    /// because the claim is role-dependent and owned by the server
+    /// runtime: primaries always claim; replicas claim once a
+    /// promotion has been filed.
+    pub serving: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl RpcServerConfig {
+    /// Feed an inbound envelope's advertised fencing epoch to the
+    /// supersession policy, if one is armed and this node is serving.
+    fn observe_peer_epoch(&self, peer_epoch: u64) {
+        let Some(policy) = &self.supersession else {
+            return;
+        };
+        if !(policy.serving)() {
+            return;
+        }
+        if policy
+            .fence
+            .fence_if_superseded(peer_epoch, &policy.shutdown)
+            == Some(true)
+        {
+            warn!(
+                peer_epoch,
+                "raft peer advertises a higher fencing epoch — this node is superseded; fencing"
+            );
+        }
+    }
+
+    /// Recency-filter verdict for an inbound vote request whose envelope
+    /// advertised `candidate_tip`. Also the tip-readiness gate: before
+    /// recovery seeds the local tip, no vote may be delivered at all.
+    fn admit_vote(&self, candidate_tip: JournalTip) -> bool {
+        if !self.tip.is_ready() {
+            debug!("dropping vote request — local journal tip not recovered yet");
+            return false;
+        }
+        // Poisoning unreachable under panic=abort (no unwinding).
+        let mut filter = self.vote_filter.lock().expect("vote filter mutex poisoned");
+        filter.should_deliver(candidate_tip, self.tip.local_tip())
+    }
 }
 
 /// Accept loop. Runs until `shutdown` flips; each authenticated connection
@@ -212,16 +289,61 @@ async fn handle_connection<A: RaftApi>(
             return;
         }
 
+        // Fence-on-supersession: every peer envelope advertises the
+        // sender's fencing epoch (see `SupersessionPolicy`).
+        cfg.observe_peer_epoch(frame.tip_epoch);
+
+        // Journal-tip recency filter (see `crate::recency`): a vote
+        // request from a candidate behind our own tip is dropped before
+        // it can reach `Raft::vote` — indistinguishable from packet loss,
+        // so raft safety is untouched. Appends re-arm the filter: they
+        // prove a live leader exists.
+        match &frame.body {
+            RpcBody::VoteReq(_) => {
+                let candidate_tip = JournalTip {
+                    epoch: frame.tip_epoch,
+                    last_sequence: frame.tip_seq,
+                };
+                if !cfg.admit_vote(candidate_tip) {
+                    debug!(
+                        peer_id,
+                        candidate_epoch = frame.tip_epoch,
+                        candidate_seq = frame.tip_seq,
+                        "vote request filtered — candidate journal tip behind ours"
+                    );
+                    // Close rather than answer: to the candidate this is a
+                    // network error, exactly like a lost packet.
+                    return;
+                }
+            }
+            RpcBody::AppendReq(_) => {
+                // Poisoning unreachable under panic=abort.
+                cfg.vote_filter
+                    .lock()
+                    .expect("vote filter mutex poisoned")
+                    .leader_observed();
+            }
+            _ => {}
+        }
+
         let response = handle_body(&api, frame.body).await;
-        let (tip_epoch, tip_seq) = cfg.tip.load();
+        let local = cfg.tip.local_tip();
+        let (tip_epoch, tip_seq) = (local.epoch, local.last_sequence);
         let reply = RpcFrame {
             tip_epoch,
             tip_seq,
             body: response,
         };
-        if let Err(e) = write_frame(&mut stream, &reply).await {
-            debug!(peer_id, error = %e, "raft rpc reply failed");
-            return;
+        match tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut stream, &reply)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                debug!(peer_id, error = %e, "raft rpc reply failed");
+                return;
+            }
+            Err(_elapsed) => {
+                debug!(peer_id, "raft rpc reply write stalled — closing");
+                return;
+            }
         }
     }
 }

@@ -36,7 +36,9 @@ use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::{NoPadding, SeqLockReader, SeqLockWriter};
 
-use crate::cursors::{DurableWireSeqCursor, PipelineCursors, RingPos, WireSeq};
+use crate::cursors::{
+    AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, RingPos, WireSeq,
+};
 
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
 
@@ -456,6 +458,12 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// replica orchestrator's reconnect handshake all read the same cursor.
     /// Updated once per fsync batch alongside `chain_hash`.
     last_seq: Option<DurableWireSeqCursor>,
+    /// Optional handle to the control-plane advertised journal tip
+    /// (raft vote filtering). Wired only on a primary's pipeline — on a
+    /// replica the replication receiver owns the tip at its in-memory
+    /// accepted position instead (see [`AdvertisedJournalTip`]). Advanced
+    /// once per fsync batch alongside `last_seq`, with the same value.
+    advertised_tip: Option<AdvertisedJournalTip>,
     /// When true, never yield to the OS scheduler — spin indefinitely with
     /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
     busy_spin: bool,
@@ -645,6 +653,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             repl: Box::default(),
             chain_hash: None,
             last_seq: None,
+            advertised_tip: None,
             busy_spin,
             utilization: Arc::new(StageUtilization::new()),
             max_journal_bytes: 0,
@@ -725,6 +734,13 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// orchestrator) need to read the writer's progress without owning it.
     pub fn set_last_seq_publisher(&mut self, last_seq: DurableWireSeqCursor) {
         self.last_seq = Some(last_seq);
+    }
+
+    /// Set the control-plane advertised-tip handle. Called by the server
+    /// wiring on a *primary's* pipeline only — see the field docs for the
+    /// replica-side ownership rule.
+    pub fn set_advertised_tip_publisher(&mut self, tip: AdvertisedJournalTip) {
+        self.advertised_tip = Some(tip);
     }
 
     /// Synchronous journal loop: `pwrite` blocks until the write completes.
@@ -1169,6 +1185,14 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         }
         if let Some(ref cursor) = self.last_seq {
             cursor.store(WireSeq::new(journal_seq));
+        }
+        if let Some(ref tip) = self.advertised_tip {
+            // `advance`, not a plain store: across a promotion the receiver
+            // left the tip at its in-memory accepted position, which the
+            // new primary's journal only reaches after the drained ring is
+            // flushed — a plain store would regress the advertised tip in
+            // that window.
+            tip.advance(WireSeq::new(journal_seq));
         }
     }
 

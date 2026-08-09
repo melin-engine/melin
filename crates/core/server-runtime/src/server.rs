@@ -384,6 +384,48 @@ pub struct ServerConfig {
     /// leave it on.
     #[arg(long, default_value_t = false)]
     pub no_mlock: bool,
+
+    /// Bind address for the control-plane raft RPC listener. Setting this
+    /// enables the control plane on this node: leader election runs and is
+    /// observable via the `melin_raft_*` gauges. Requires `--raft-node-id`
+    /// and a `--raft-peer` entry for this node; requires
+    /// `--replication-key` (peer links authenticate with the replication
+    /// key, same trust domain as the data plane). Raft always runs on
+    /// kernel TCP, including on DPDK nodes.
+    #[arg(long)]
+    pub raft_bind: Option<SocketAddr>,
+
+    /// This node's control-plane raft id (non-zero, unique per cluster).
+    #[arg(long)]
+    pub raft_node_id: Option<u64>,
+
+    /// A control-plane cluster member as `id@host:port#base64-pubkey`
+    /// (repeatable). Give **every node the same list, including an entry
+    /// for the node itself** — the self entry supplies the dialable
+    /// address peers use to reach it, and identical lists keep the
+    /// first-boot membership consistent. The pubkey pins the peer's
+    /// identity: a connection authenticated with a different key cannot
+    /// speak for that id.
+    #[arg(long)]
+    pub raft_peer: Vec<String>,
+
+    /// Directory for durable raft state (vote, log, membership).
+    /// Defaults to the journal path with a `.raft` extension. Must live
+    /// on the same durability class as the journal — losing it can
+    /// double-grant a vote (see docs/replication.md).
+    #[arg(long)]
+    pub raft_dir: Option<PathBuf>,
+
+    /// Act on control-plane election wins: a replica elected leader
+    /// promotes itself (journaling the election term as its fencing
+    /// epoch), and a serving node self-fences when the raft mesh shows
+    /// it superseded. Off by default — automatic failover is an explicit
+    /// operator policy decision. Requires `--raft-bind` and at least
+    /// three configured voters (a two-node cluster cannot elect after
+    /// losing either node, so automation would be dead weight with real
+    /// misconfiguration risk; see docs/replication.md).
+    #[arg(long, default_value_t = false)]
+    pub raft_auto_promote: bool,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -450,6 +492,11 @@ impl Default for ServerConfig {
             snapshot_path: None,
             tick_interval_ms: 250,
             no_mlock: false,
+            raft_bind: None,
+            raft_node_id: None,
+            raft_peer: Vec::new(),
+            raft_dir: None,
+            raft_auto_promote: false,
         }
     }
 }
@@ -786,17 +833,20 @@ where
             "loaded authorized keys (replica mode)"
         );
 
-        // Shared admin flags: constructed before mode-detection so they
-        // survive a replica → primary transition. The promote flag is
-        // consumed by the replica's receive loop and becomes a stale
-        // pointer post-promotion (harmless); the rotate flag is re-wired
-        // into the new primary's journal stage by `run_as_primary`.
-        let promote_flag = Arc::new(AtomicBool::new(false));
+        // The replica's control-plane bundle: promotion request (admin
+        // PROMOTE / raft auto-promotion), tip readiness + advertised
+        // journal tip (vote recency), primary link state, and the
+        // primary's advertised acking mode. Constructed before
+        // mode-detection so it survives a replica → primary transition.
+        // The rotate flag is re-wired into the new primary's journal
+        // stage by `run_as_primary`.
+        let control = crate::replication::ReplicaControlPlane::new();
+        let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
                 addr,
-                Some(Arc::clone(&promote_flag)),
+                Some(promotion_request.clone()),
                 rotate_flag.clone(),
                 Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
@@ -811,6 +861,60 @@ where
         // `EpochBump`. Carried into `run_as_primary` post-promotion.
         let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
 
+        // Control-plane raft (observational election). Spawned before the
+        // receive loop so the driver — like the fence state and admin
+        // flags — survives a replica → primary promotion untouched: it
+        // shares the process shutdown flag and runs on its own thread.
+        // The advertised tip isn't trustworthy until journal recovery
+        // seeds the fence epoch and sequence, so `control.tip_ready`
+        // starts false and the receiver flips it — until then the driver
+        // refuses to grant votes. The receiver owns the sequence half
+        // until a promotion hands it to the new primary's journal stage.
+        let journal_tip = control.journal_tip.clone();
+        let mut raft = match crate::raft::build_raft_config(&config)? {
+            None => crate::raft::RaftDriverGuard::disabled(&shutdown),
+            Some(cfg) => crate::raft::spawn_raft_driver(
+                cfg,
+                config.raft_auto_promote,
+                &signing_key,
+                &authorized_keys,
+                &fence_state,
+                journal_tip.clone(),
+                Arc::clone(&control.tip_ready),
+                // A replica claims to be serving once a promotion is in
+                // flight (see SupersessionPolicy).
+                {
+                    let promote = control.promote.clone();
+                    Arc::new(move || promote.is_requested())
+                },
+                &shutdown,
+            )?,
+        };
+        // Act on election wins when the operator opted in. Genesis
+        // primaries have nothing to promote — replica paths only. The
+        // guard joins the thread on every exit path.
+        if config.raft_auto_promote
+            && let Some(status) = raft.status()
+        {
+            raft.arm_promotion(crate::raft_promotion::spawn_auto_promotion(
+                status,
+                control.clone(),
+                Arc::clone(&fence_state),
+                Arc::clone(&durability_mode_atomic),
+                Arc::clone(&shutdown),
+            ));
+        }
+        let raft_status = raft.status();
+        // A raft-enabled replica exposes election gauges on --health-bind;
+        // stopped explicitly before promotion so run_as_primary can rebind
+        // the port, and by its guard on every other exit path.
+        let mut replica_health = crate::raft::spawn_replica_health(
+            &config,
+            &fence_state,
+            raft_status.as_ref(),
+            Arc::clone(&control.pipeline_healthy),
+        )?;
+
         // No local rotation triggers on the replica side: segment
         // rotation is primary-driven (the replica adopts the boundaries
         // announced over the replication stream), so replica journals
@@ -822,7 +926,7 @@ where
             &config.journal,
             &signing_key,
             &shutdown,
-            &promote_flag,
+            &control,
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
@@ -832,11 +936,15 @@ where
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
-            None => return Ok(()), // clean shutdown
+            // Clean shutdown — the raft and health guards tear down on drop.
+            None => return Ok(()),
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode. Bump the epoch so a
                 // paused/partitioned ex-primary is fenced when it reconnects.
                 info!("replica promoted — transitioning to primary");
+                // Release --health-bind before run_as_primary rebinds it
+                // with the full primary health state.
+                replica_health.stop();
                 <A as Application>::prefault(&mut exchange);
 
                 // A ROTATE received while this node was a replica latched
@@ -848,6 +956,10 @@ where
                     flag.store(false, Ordering::Release);
                 }
 
+                // The raft guard drops — stopping the driver and joining
+                // the (already exited) promotion thread — after this
+                // returns, so the driver serves elections and the fencing
+                // channel for the whole primary tenure.
                 return run_as_primary::<A, L, W>(
                     exchange,
                     writer,
@@ -857,13 +969,15 @@ where
                     decoder,
                     encoder,
                     event_publisher,
-                    shutdown,
+                    Arc::clone(&shutdown),
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
                     rotate_flag,
                     durability_mode_atomic,
                     fence_state,
-                    true, // promoted — inject an EpochBump before serving
+                    promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
+                    raft_status,
+                    journal_tip,
                 );
             }
         }
@@ -908,6 +1022,37 @@ where
         recovered_epoch,
     ));
 
+    // Control-plane raft (observational election). The primary needs the
+    // replication signing key only when raft is on — peer links
+    // authenticate with it (build_raft_config enforces the flag).
+    // A primary's fence epoch is already recovered here, so its tip is
+    // trustworthy from the moment the driver starts. Seed the advertised
+    // sequence from the recovered journal for the same reason — the
+    // pipeline's journal stage takes the handle over once it runs.
+    let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
+        melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
+    );
+    let raft = match crate::raft::build_raft_config(&config)? {
+        None => crate::raft::RaftDriverGuard::disabled(&shutdown),
+        Some(cfg) => {
+            let signing_key = load_replication_key(&config)?;
+            crate::raft::spawn_raft_driver(
+                cfg,
+                config.raft_auto_promote,
+                &signing_key,
+                &authorized_keys,
+                &fence_state,
+                journal_tip.clone(),
+                Arc::new(AtomicBool::new(true)),
+                // A primary always claims to be serving.
+                Arc::new(|| true),
+                &shutdown,
+            )?
+        }
+    };
+    let raft_status = raft.status();
+
+    // The raft guard drops — stopping the driver — after this returns.
     run_as_primary::<A, L, W>(
         exchange,
         writer,
@@ -917,14 +1062,43 @@ where
         decoder,
         encoder,
         event_publisher,
-        shutdown,
+        Arc::clone(&shutdown),
         authorized_keys,
         needs_seeding,
         rotate_flag,
         durability_mode_atomic,
         fence_state,
-        false, // not promoted — no EpochBump injection
+        None, // not promoted — no EpochBump injection
+        raft_status,
+        journal_tip,
     )
+}
+
+/// Load the Ed25519 replication signing key from `--replication-key` —
+/// shared by the replica connect path and raft-enabled primaries.
+fn load_replication_key(
+    config: &ServerConfig,
+) -> Result<ed25519_dalek::SigningKey, Box<dyn std::error::Error>> {
+    let path = config.replication_key.as_ref().ok_or_else(|| {
+        std::io::Error::other("--replication-key is required (replica mode or --raft-bind)")
+    })?;
+    let seed = std::fs::read(path).map_err(|e| {
+        std::io::Error::other(format!(
+            "failed to read replication key {}: {e}",
+            path.display()
+        ))
+    })?;
+    if seed.len() != 32 {
+        return Err(format!(
+            "replication key must be 32 bytes, got {} ({})",
+            seed.len(),
+            path.display()
+        )
+        .into());
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&seed);
+    Ok(ed25519_dalek::SigningKey::from_bytes(&bytes))
 }
 
 /// Run the server as a primary: build the disruptor pipeline, spawn
@@ -1042,7 +1216,12 @@ fn run_as_primary<A, L, W>(
     rotate_flag: Option<Arc<AtomicBool>>,
     durability_mode_atomic: Arc<AtomicU8>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    promoted: bool,
+    promotion: Option<u64>,
+    raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
+    // Control-plane advertised tip. This primary's journal stage becomes
+    // its writer (the raft driver keeps reading the same handle across a
+    // promotion) — see `AdvertisedJournalTip`.
+    journal_tip: melin_transport_core::AdvertisedJournalTip,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -1171,6 +1350,10 @@ where
     let mut journal_stage = journal_stage;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    // On a primary the journal stage owns the control-plane advertised
+    // tip (durable cursor after each fsync batch). On the promotion path
+    // this takes over the handle the receiver was advancing.
+    journal_stage.set_advertised_tip_publisher(journal_tip.clone());
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,
@@ -1338,6 +1521,7 @@ where
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
+        let sender_durability = Arc::clone(&durability_mode_atomic);
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -1358,6 +1542,7 @@ where
                         heartbeat_secs,
                         busy_spin,
                         fence_state: sender_fence,
+                        durability_mode: sender_durability,
                     },
                     &s_repl,
                     &ready_flag,
@@ -1437,6 +1622,7 @@ where
         &matching_utilization,
         &response_utilization,
         &shutdown,
+        &raft_status,
     )?;
 
     if enable_replication && needs_seeding {
@@ -1564,13 +1750,44 @@ where
     // flows through journal + replication to every replica. We wait for the
     // matching stage to apply it (epoch advanced) before serving so the first
     // handshake already advertises the new epoch.
-    if promoted {
+    //
+    // The new epoch honours the promotion request's floor: a manual
+    // `PROMOTE` carries `MANUAL` (= 1) and resolves to the classic
+    // `epoch + 1`; a raft auto-promotion carries its election term
+    // (strictly above the old epoch by the driver's request rule), so
+    // tenure epochs align with raft terms and two overlapping
+    // promotions from different elections always allocate distinct
+    // epochs — the newer one fences the older.
+    if let Some(requested_epoch) = promotion {
         use melin_app::unix_epoch_nanos;
         use melin_journal::JournalEvent;
         use melin_transport_core::trace::mono_trace_ns;
 
-        let new_epoch = fence_state.epoch().saturating_add(1);
-        info!(new_epoch, "promotion: injecting epoch bump");
+        let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
+        // Re-validate the term↔epoch alignment at the moment the epoch is
+        // minted, not just at the driver's request-time check: a streamed
+        // `EpochBump` from a concurrent promotion elsewhere can raise the
+        // fence during the drain, in which case `max` allocates `epoch+1`
+        // instead of the election term. Fencing still converges (the
+        // epochs stay distinct and the higher one wins), but the skew
+        // makes later "epochs outran raft terms" refusals — so say what
+        // actually happened while the evidence exists. Manual promotions
+        // (requested == MANUAL) are exempt: they never claimed alignment.
+        if requested_epoch > crate::promotion::PromotionRequest::MANUAL
+            && new_epoch != requested_epoch
+        {
+            warn!(
+                new_epoch,
+                requested_epoch,
+                "promotion epoch does not match its election term — a concurrent \
+                 promotion advanced the fencing epoch mid-drain; auto-promotion \
+                 refusals may report term/epoch misalignment until a newer election"
+            );
+        }
+        info!(
+            new_epoch,
+            requested_epoch, "promotion: injecting epoch bump"
+        );
         input_producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
@@ -1952,14 +2169,15 @@ where
             ed25519_dalek::SigningKey::from_bytes(&bytes)
         };
 
-        // Shared admin flags, same shape as the kernel TCP replica path
-        // — see `run` for the rationale on lifetime.
-        let promote_flag = Arc::new(AtomicBool::new(false));
+        // The replica's control-plane bundle, same shape as the kernel
+        // TCP replica path — see `run` for the rationale on lifetime.
+        let control = crate::replication::ReplicaControlPlane::new();
+        let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
             crate::admin::spawn(
                 addr,
-                Some(Arc::clone(&promote_flag)),
+                Some(promotion_request.clone()),
                 rotate_flag.clone(),
                 Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
@@ -1973,6 +2191,52 @@ where
         // replication stream, and a promotion bumps it by injecting an
         // `EpochBump`. Carried into `run_as_primary` post-promotion.
         let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
+
+        // Control-plane raft runs on kernel TCP even on DPDK nodes — the
+        // control plane is off the hot path and must not consume a DPDK
+        // queue. Same promotion-surviving placement and tip ownership as
+        // the kernel replica path.
+        let journal_tip = control.journal_tip.clone();
+        let mut raft = match crate::raft::build_raft_config(&config)? {
+            None => crate::raft::RaftDriverGuard::disabled(&shutdown),
+            Some(cfg) => crate::raft::spawn_raft_driver(
+                cfg,
+                config.raft_auto_promote,
+                &signing_key,
+                &authorized_keys,
+                &fence_state,
+                journal_tip.clone(),
+                Arc::clone(&control.tip_ready),
+                // A replica claims to be serving once a promotion is in
+                // flight (see SupersessionPolicy).
+                {
+                    let promote = control.promote.clone();
+                    Arc::new(move || promote.is_requested())
+                },
+                &shutdown,
+            )?,
+        };
+        // Act on election wins when the operator opted in. Genesis
+        // primaries have nothing to promote — replica paths only. The
+        // guard joins the thread on every exit path.
+        if config.raft_auto_promote
+            && let Some(status) = raft.status()
+        {
+            raft.arm_promotion(crate::raft_promotion::spawn_auto_promotion(
+                status,
+                control.clone(),
+                Arc::clone(&fence_state),
+                Arc::clone(&durability_mode_atomic),
+                Arc::clone(&shutdown),
+            ));
+        }
+        let raft_status = raft.status();
+        let mut replica_health = crate::raft::spawn_replica_health(
+            &config,
+            &fence_state,
+            raft_status.as_ref(),
+            Arc::clone(&control.pipeline_healthy),
+        )?;
 
         // No local rotation triggers on the replica side — rotation is
         // primary-driven (see the kernel-TCP receiver path).
@@ -2002,7 +2266,7 @@ where
             &signing_key,
             &config.journal,
             &shutdown,
-            &promote_flag,
+            &control,
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
@@ -2012,10 +2276,13 @@ where
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
-            None => return Ok(()), // clean shutdown
+            // Clean shutdown — the raft and health guards tear down on drop.
+            None => return Ok(()),
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode (DPDK).
                 info!("replica promoted (DPDK) — transitioning to primary");
+                // Release --health-bind before run_as_primary rebinds it.
+                replica_health.stop();
                 <A as Application>::prefault(&mut exchange);
 
                 // Clear a ROTATE latched while this node was a replica —
@@ -2028,6 +2295,9 @@ where
                 // kernel TCP primary after promotion.
                 warn!("DPDK primary promotion not yet implemented — falling back to kernel TCP");
                 let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
+                // The raft guard drops — stopping the driver and joining
+                // the (already exited) promotion thread — after this
+                // returns; see the kernel-TCP promotion path.
                 return run_as_primary::<A, _, W>(
                     exchange,
                     writer,
@@ -2037,13 +2307,15 @@ where
                     decoder,
                     encoder,
                     event_publisher,
-                    shutdown,
+                    Arc::clone(&shutdown),
                     authorized_keys,
                     false,
                     rotate_flag,
                     durability_mode_atomic,
                     fence_state,
-                    true, // promoted — inject an EpochBump before serving
+                    promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
+                    raft_status,
+                    journal_tip,
                 );
             }
         }
@@ -2086,6 +2358,34 @@ where
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
         recovered_epoch,
     ));
+
+    // Control-plane raft (kernel TCP even on DPDK — off the hot path, no
+    // DPDK queue consumed). Signing key loaded only when raft is on.
+    // A DPDK primary's fence epoch is recovered here too; seed the
+    // advertised sequence from the recovered journal (see the kernel
+    // primary path). The pipeline's journal stage owns the handle below.
+    let journal_tip = melin_transport_core::AdvertisedJournalTip::new(
+        melin_transport_core::WireSeq::new(writer.next_sequence().saturating_sub(1)),
+    );
+    let raft = match crate::raft::build_raft_config(&config)? {
+        None => crate::raft::RaftDriverGuard::disabled(&shutdown),
+        Some(cfg) => {
+            let signing_key = load_replication_key(&config)?;
+            crate::raft::spawn_raft_driver(
+                cfg,
+                config.raft_auto_promote,
+                &signing_key,
+                &authorized_keys,
+                &fence_state,
+                journal_tip.clone(),
+                Arc::new(AtomicBool::new(true)),
+                // A primary always claims to be serving.
+                Arc::new(|| true),
+                &shutdown,
+            )?
+        }
+    };
+    let raft_status = raft.status();
 
     // Clone exchange state for the shadow snapshot stage before moving
     // exchange into the pipeline (same as the kernel TCP path).
@@ -2208,6 +2508,10 @@ where
     });
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    // On a primary the journal stage owns the control-plane advertised
+    // tip (durable cursor after each fsync batch). On the promotion path
+    // this takes over the handle the receiver was advancing.
+    journal_stage.set_advertised_tip_publisher(journal_tip.clone());
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,
@@ -2377,6 +2681,7 @@ where
             batch_size,
             heartbeat_secs,
             Arc::clone(&fence_state),
+            Arc::clone(&durability_mode_atomic),
             Arc::clone(&authorized_keys),
         );
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
@@ -2501,6 +2806,7 @@ where
         &matching_utilization,
         &response_utilization,
         &shutdown,
+        &raft_status,
     )?;
 
     info!(
@@ -2546,6 +2852,7 @@ where
     // to join here — replication sender (if enabled) is joined below.
     let dpdk_extras: Vec<(String, std::thread::Result<()>)> = Vec::new();
 
+    // The raft guard drops — stopping the driver — after this returns.
     shutdown_pipeline_stages(
         PipelineHandles {
             journal: journal_handle,
@@ -2834,6 +3141,7 @@ fn spawn_health_endpoint(
     matching_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
     response_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
     shutdown: &Arc<AtomicBool>,
+    raft_status: &Option<Arc<melin_transport_core::health::RaftStatus>>,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
     let Some(health_addr) = config.health_bind else {
         return Ok(None);
@@ -2871,6 +3179,7 @@ fn spawn_health_endpoint(
             journal_utilization: Arc::clone(journal_utilization),
             matching_utilization: Arc::clone(matching_utilization),
             response_utilization: Arc::clone(response_utilization),
+            raft: raft_status.clone(),
         },
         Arc::clone(shutdown),
     )?))

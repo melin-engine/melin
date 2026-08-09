@@ -237,6 +237,10 @@ pub(super) struct StreamingFrameOutcome {
     pub received_data: bool,
     /// Fatal frame error — caller should break with `SessionExit::Fatal`.
     pub frame_err: Option<Box<dyn std::error::Error + Send + Sync>>,
+    /// The primary's acking mode as advertised by the last `Heartbeat`
+    /// in this cycle, if any — the caller folds it into the
+    /// control-plane gauge (`ReplicaControlPlane::primary_acking_mode`).
+    pub observed_acking_mode: Option<u8>,
 }
 
 /// Process every complete frame in `recv_buf`, publishing decoded slots
@@ -278,6 +282,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     let mut any_published = false;
     let mut received_data = false;
     let mut frame_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    let mut observed_acking_mode: Option<u8> = None;
     let mut batch = input_producer.batch();
     let mut pending_accum = accum_end_sequence;
 
@@ -349,8 +354,12 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                         }
                     }
                     Err(_) => match decode_primary_message(payload) {
-                        Ok(PrimaryMessage::Heartbeat { sequence }) => {
-                            debug!(sequence, "heartbeat from primary");
+                        Ok(PrimaryMessage::Heartbeat {
+                            sequence,
+                            durability_mode,
+                        }) => {
+                            debug!(sequence, durability_mode, "heartbeat from primary");
+                            observed_acking_mode = Some(durability_mode);
                         }
                         Ok(PrimaryMessage::Rotate {
                             boundary_seq,
@@ -423,6 +432,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
         accum_end_sequence: pending_accum,
         received_data,
         frame_err,
+        observed_acking_mode,
     }
 }
 
@@ -560,7 +570,11 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
     journal_cursor: &melin_pipeline::padding::Sequence,
     shutdown: &AtomicBool,
-    promote: &AtomicBool,
+    // The replica's control-plane bundle: the promotion request this
+    // loop polls, the advertised journal tip it advances, and the
+    // primary-acking-mode gauge heartbeats refresh — see
+    // [`super::ReplicaControlPlane`].
+    control: &super::ReplicaControlPlane,
     pipeline_depth: usize,
     busy_spin: bool,
     initial_sequence: u64,
@@ -580,6 +594,19 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     // forever instead of tearing down for the reconnect/resync path.
     journal_failed: &AtomicBool,
 ) -> StreamingResult {
+    let super::ReplicaControlPlane {
+        promote,
+        // Advanced to the in-memory accepted position as frames are
+        // published, so raft vote filtering sees everything a promotion
+        // would carry into the journal — not just the fsynced position.
+        journal_tip,
+        primary_acking_mode,
+        // Recovery seeded it long before any streaming session.
+        tip_ready: _,
+        primary_link_up: _,
+        // Latched by the journal thread's failure wrapper, not here.
+        pipeline_healthy: _,
+    } = control;
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);
 
@@ -593,6 +620,12 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     let mut last_sent_acked_seq: u64 = initial_sequence;
     let mut last_sent_in_memory_seq: u64 = initial_sequence;
     let mut last_committed_primary_seq: u64 = initial_sequence;
+
+    // The session resume point covers this node's holdings (post-recovery
+    // journal, or the just-installed snapshot); `advance` (not a store) so
+    // a reconnect whose handshake read the journal before the ring settled
+    // cannot regress the tip below data already accepted.
+    journal_tip.advance(melin_transport_core::WireSeq::new(initial_sequence));
 
     let mut received_data = false;
     let mut idle_spins: u32 = 0;
@@ -625,7 +658,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 "replica journal stage failed — tearing down for reconnect/resync".into(),
             );
         }
-        if promote.load(Ordering::Acquire) {
+        if promote.is_requested() {
             info!("promotion triggered — stopping replication, transitioning to primary");
             // Drain remaining data from the transport.
             loop {
@@ -638,6 +671,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                     journal_failed,
                 );
                 accum_end_sequence = outcome.accum_end_sequence;
+                journal_tip.advance(melin_transport_core::WireSeq::new(accum_end_sequence));
                 compact_recv_buf(&mut recv_buf, outcome.consumed);
                 if outcome.any_published && !pending_acks.is_full() {
                     pending_acks.push(outcome.last_target, accum_end_sequence);
@@ -763,6 +797,12 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         );
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
+        journal_tip.advance(melin_transport_core::WireSeq::new(accum_end_sequence));
+        if let Some(mode) = outcome.observed_acking_mode {
+            // Heartbeats refresh the replica's view of the mode the
+            // primary acks under (runtime `DURABILITY` retunes).
+            primary_acking_mode.store(mode, Ordering::Release);
+        }
         received_data |= outcome.received_data;
         compact_recv_buf(&mut recv_buf, outcome.consumed);
 
@@ -986,6 +1026,21 @@ mod tests {
         std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()))
     }
 
+    /// Throwaway control-plane bundle — these tests don't exercise
+    /// raft; `streaming_loop` just needs somewhere to write.
+    fn control() -> crate::replication::ReplicaControlPlane {
+        crate::replication::ReplicaControlPlane::new()
+    }
+
+    /// A bundle whose promotion request is already filed (manually) —
+    /// for the promote drain tests.
+    fn promoted_control() -> crate::replication::ReplicaControlPlane {
+        let c = control();
+        c.promote
+            .request(crate::promotion::PromotionRequest::MANUAL);
+        c
+    }
+
     // ---------------------------------------------------------------
     // streaming_loop tests
     // ---------------------------------------------------------------
@@ -995,7 +1050,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(0);
         let shutdown = AtomicBool::new(true);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
 
         let result = streaming_loop::<MockTransport, TestEvent>(
@@ -1003,7 +1058,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             0,
@@ -1022,7 +1077,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(true);
+        let control = promoted_control();
         let mut transport = MockTransport::new();
 
         // Queue one InputBatch that the promote drain should flush.
@@ -1035,7 +1090,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             0,
@@ -1056,7 +1111,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(0);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
         transport.disconnect_after_data();
 
@@ -1065,7 +1120,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             0,
@@ -1084,7 +1139,7 @@ mod tests {
         // Journal cursor at u64::MAX so pending acks are immediately durable.
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1097,7 +1152,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             9,
@@ -1128,7 +1183,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
         transport.disconnect_after_data();
 
@@ -1141,7 +1196,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             0,
@@ -1162,7 +1217,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
         transport.simulate_in_flight = true;
 
@@ -1183,7 +1238,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             1, // pipeline_depth=1 → PendingAckQueue cap=1
             false,
             0,
@@ -1209,7 +1264,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(0);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1222,7 +1277,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             0,
@@ -1240,7 +1295,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1269,7 +1324,7 @@ mod tests {
                 &mut producer,
                 &cursor,
                 shutdown_ref,
-                &promote,
+                &control,
                 4,
                 false,
                 41,
@@ -1294,7 +1349,7 @@ mod tests {
         let (mut producer, _consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1309,7 +1364,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             0,
@@ -1336,7 +1391,7 @@ mod tests {
 
         let mut buf = Vec::new();
         append_input_batch_frame(&mut buf, &[slot(6, 0xA0), slot(7, 0xA1), slot(8, 0xA2)]);
-        encode_heartbeat(99, &mut buf);
+        encode_heartbeat(99, 1, &mut buf);
         append_input_batch_frame(&mut buf, &[slot(9, 0xA3)]);
 
         let outcome = process_streaming_frames::<TestEvent>(
@@ -1353,6 +1408,11 @@ mod tests {
         assert!(outcome.any_published);
         assert!(outcome.received_data);
         assert_eq!(outcome.accum_end_sequence, 9);
+        assert_eq!(
+            outcome.observed_acking_mode,
+            Some(1),
+            "the heartbeat's acking mode must surface for the control-plane gauge"
+        );
 
         let slots = drain(&mut consumer);
         assert_eq!(slots.len(), 4);
@@ -1578,8 +1638,8 @@ mod tests {
         let mut slot_buf = Vec::new();
 
         let mut buf = Vec::new();
-        encode_heartbeat(42, &mut buf);
-        encode_heartbeat(43, &mut buf);
+        encode_heartbeat(42, 1, &mut buf);
+        encode_heartbeat(43, 1, &mut buf);
 
         let outcome = process_streaming_frames::<TestEvent>(
             &buf,
@@ -1792,7 +1852,7 @@ mod tests {
         // durable — ack content is what's under test, not flush timing.
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
 
         let mut data1 = Vec::new();
@@ -1809,7 +1869,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             0,
@@ -1859,7 +1919,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1873,7 +1933,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             100, // initial_sequence — the post-snapshot resume point
@@ -1912,7 +1972,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
-        let promote = AtomicBool::new(false);
+        let control = control();
         let mut transport = MockTransport::new();
 
         let mut data = Vec::new();
@@ -1926,7 +1986,7 @@ mod tests {
             &mut producer,
             &cursor,
             &shutdown,
-            &promote,
+            &control,
             4,
             false,
             100,
@@ -1960,7 +2020,7 @@ mod tests {
 
         let mut buf = Vec::new();
         append_input_batch_frame(&mut buf, &[slot(20, 0xE0), slot(21, 0xE1)]);
-        encode_heartbeat(999, &mut buf);
+        encode_heartbeat(999, 1, &mut buf);
         append_input_batch_frame(&mut buf, &[slot(22, 0xE2)]);
 
         let outcome = process_drain_frames::<TestEvent>(
@@ -2131,7 +2191,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let tmp = dir.path().join("body.tmp");
             // A StreamStart where a chunk/end belongs.
-            let stray = payload(|b| encode_stream_start(0, 1, [0u8; 32], 0, b));
+            let stray = payload(|b| encode_stream_start(0, 1, [0u8; 32], 0, 1, b));
             let mut src = source(vec![stray]);
 
             let err = receive_chunked_body(&mut src, &tmp, 4, "snapshot").unwrap_err();

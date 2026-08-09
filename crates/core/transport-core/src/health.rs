@@ -78,6 +78,131 @@ pub struct HealthState {
     pub journal_utilization: Arc<StageUtilization>,
     pub matching_utilization: Arc<StageUtilization>,
     pub response_utilization: Arc<StageUtilization>,
+    /// Control-plane raft election state, updated by the raft driver
+    /// thread. `None` when the node runs without control-plane raft
+    /// (no `--raft-bind`).
+    pub raft: Option<Arc<RaftStatus>>,
+}
+
+/// A [`QueueCursor`] that always reads 0 — used for the pipeline-cursor
+/// slots of a replica's minimal [`HealthState`], which has no client
+/// input ring.
+struct ZeroCursor;
+impl QueueCursor for ZeroCursor {
+    fn load(&self) -> u64 {
+        0
+    }
+}
+
+impl HealthState {
+    /// Minimal health state for a **replica** node.
+    ///
+    /// A replica accepts no client connections and its detailed
+    /// replication progress is reported by the primary's per-replica
+    /// gauges, so its own `/metrics` exists mainly to expose
+    /// control-plane raft election state (`raft`), node liveness, and
+    /// pipeline health: `pipeline_healthy` is the caller's live signal
+    /// (the runtime feeds the replica pipeline's journal-failure latch)
+    /// and drives `/health` OK/ERR plus the `melin_pipeline_healthy`
+    /// gauge. The queue/journal/replication gauges are intentionally
+    /// unpopulated (0); `replicas_connected: Some(0)` makes the node
+    /// report `halted` (it is following, not trading), and the fence
+    /// state still surfaces a superseded ex-primary. This reuses the one
+    /// `/metrics` implementation and exposition format rather than
+    /// standing up a second endpoint.
+    pub fn for_replica(
+        fence_state: Arc<crate::fence::FenceState>,
+        raft: Option<Arc<RaftStatus>>,
+        pipeline_healthy: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            cursors: PipelineCursors::new(
+                WireSeq::new(0),
+                Arc::new(Sequence::new(AtomicU64::new(0))),
+                Arc::new(Sequence::new(AtomicU64::new(0))),
+            ),
+            input_cursor: Box::new(ZeroCursor),
+            pipeline_healthy,
+            // `Some(0)` (not `None`) so the trading flag reports
+            // `halted` — a replica is not accepting client orders.
+            replicas_connected: Some(Arc::new(AtomicU32::new(0))),
+            fence_state: Some(fence_state),
+            replication_metrics: None,
+            replica_active: None,
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+            raft,
+        }
+    }
+}
+
+/// Control-plane raft election state exposed through `/metrics`.
+///
+/// Plain atomics (not a `Mutex`) so the raft driver publishes after
+/// every metrics change and the health thread reads without any
+/// coordination — each gauge is independently meaningful, so a torn
+/// multi-field read is harmless. Defined here (not in `melin-raft`)
+/// because this crate is observability plumbing and must not depend on
+/// the consensus crate.
+#[derive(Debug)]
+pub struct RaftStatus {
+    /// This node's raft id (static once configured).
+    pub node_id: u64,
+    /// Current raft term. Under `--raft-auto-promote` the term doubles as
+    /// the fencing-epoch allocator: a promotion journals `epoch = term`,
+    /// so an election win and the fencing epoch it mints stay aligned.
+    pub term: AtomicU64,
+    /// The leader this node currently believes in; 0 while unknown
+    /// (mid-election).
+    pub leader_id: AtomicU64,
+    /// Role encoding: 0 = follower, 1 = learner, 2 = candidate,
+    /// 3 = leader (openraft `ServerState` mapping). `u8` — four states,
+    /// and the health thread only formats it.
+    pub role: std::sync::atomic::AtomicU8,
+    /// Whether the raft driver thread is still running. Flipped to
+    /// `false` when the driver exits (clean shutdown, or an
+    /// unrecoverable storage failure that stops raft while trading
+    /// continues). Exposed as `melin_raft_driver_running` so a dead
+    /// control plane is visible instead of its gauges freezing at the
+    /// last-published (possibly leader) state.
+    pub running: AtomicBool,
+}
+
+impl RaftStatus {
+    /// Role gauge values (kept in sync with the raft driver's mapping
+    /// from `openraft::ServerState`).
+    pub const ROLE_FOLLOWER: u8 = 0;
+    pub const ROLE_LEARNER: u8 = 1;
+    pub const ROLE_CANDIDATE: u8 = 2;
+    pub const ROLE_LEADER: u8 = 3;
+
+    /// Fresh status for node `node_id`: follower, term 0, no leader,
+    /// running.
+    pub fn new(node_id: u64) -> Self {
+        Self {
+            node_id,
+            term: AtomicU64::new(0),
+            leader_id: AtomicU64::new(0),
+            role: std::sync::atomic::AtomicU8::new(Self::ROLE_FOLLOWER),
+            running: AtomicBool::new(true),
+        }
+    }
+
+    /// Mark the driver stopped: clears leadership (role → follower,
+    /// leader → none) so `melin_raft_is_leader` cannot stay stuck at 1
+    /// on a node whose control plane has died, and drops
+    /// `melin_raft_driver_running` to 0. The term is left as-is — its
+    /// last value is still meaningful for correlating the outage.
+    pub fn mark_stopped(&self) {
+        self.role.store(Self::ROLE_FOLLOWER, Ordering::Relaxed);
+        self.leader_id.store(0, Ordering::Relaxed);
+        self.running.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Spawn the health endpoint thread. Returns the join handle.
@@ -189,6 +314,18 @@ struct HealthSnapshot {
     /// Rotation attempts that failed and left the current segment in
     /// place (the journal keeps growing) — any growth is alert-worthy.
     journal_rotations_failed: u64,
+    /// Control-plane raft election state; `None` when raft isn't
+    /// configured on this node.
+    raft: Option<RaftSnapshot>,
+}
+
+/// Point-in-time copy of [`RaftStatus`] for the formatters.
+struct RaftSnapshot {
+    node_id: u64,
+    term: u64,
+    leader_id: u64,
+    role: u8,
+    running: bool,
 }
 
 impl HealthSnapshot {
@@ -411,6 +548,13 @@ impl HealthSnapshot {
                 .journal_utilization
                 .rotations_failed
                 .load(Ordering::Relaxed),
+            raft: state.raft.as_ref().map(|r| RaftSnapshot {
+                node_id: r.node_id,
+                term: r.term.load(Ordering::Relaxed),
+                leader_id: r.leader_id.load(Ordering::Relaxed),
+                role: r.role.load(Ordering::Relaxed),
+                running: r.running.load(Ordering::Relaxed),
+            }),
         }
     }
 
@@ -579,6 +723,43 @@ impl HealthSnapshot {
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );
+        // Raft gauges only exist on raft-enabled nodes — omitting the
+        // series entirely (rather than exporting zeros) keeps dashboards
+        // from suggesting a one-node "cluster" on standalone deployments.
+        if let Some(raft) = &self.raft {
+            // Best-effort like the main block above: a write error only
+            // means the fixed metrics buffer filled, which truncates the
+            // exposition rather than being actionable here.
+            let _ = write!(
+                c,
+                "# HELP melin_raft_node_id This node's control-plane raft id.\n\
+                 # TYPE melin_raft_node_id gauge\n\
+                 melin_raft_node_id {}\n\
+                 # HELP melin_raft_term Current raft election term; under auto-promotion a promotion journals this as its fencing epoch.\n\
+                 # TYPE melin_raft_term gauge\n\
+                 melin_raft_term {}\n\
+                 # HELP melin_raft_leader_id Node id of the current raft leader (0 while unknown).\n\
+                 # TYPE melin_raft_leader_id gauge\n\
+                 melin_raft_leader_id {}\n\
+                 # HELP melin_raft_role This node's raft role (0 follower, 1 learner, 2 candidate, 3 leader).\n\
+                 # TYPE melin_raft_role gauge\n\
+                 melin_raft_role {}\n\
+                 # HELP melin_raft_is_leader Whether this node currently leads the control plane (1) or not (0).\n\
+                 # TYPE melin_raft_is_leader gauge\n\
+                 melin_raft_is_leader {}\n\
+                 # HELP melin_raft_driver_running Whether the raft driver thread is alive (1) or has stopped, e.g. on an unrecoverable state-file error while trading continues (0).\n\
+                 # TYPE melin_raft_driver_running gauge\n\
+                 melin_raft_driver_running {}\n",
+                raft.node_id,
+                raft.term,
+                raft.leader_id,
+                raft.role,
+                // A stopped driver never leads, regardless of the last
+                // role it published.
+                u8::from(raft.running && raft.role == RaftStatus::ROLE_LEADER),
+                u8::from(raft.running),
+            );
+        }
         c.position() as usize
     }
 }
@@ -842,6 +1023,135 @@ mod tests {
     use crate::replication::ReplicationMetrics;
     use std::io::Read;
 
+    #[test]
+    fn raft_status_mark_stopped_clears_leadership() {
+        let status = RaftStatus::new(7);
+        status
+            .role
+            .store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        status.leader_id.store(7, Ordering::Relaxed);
+        status.term.store(4, Ordering::Relaxed);
+
+        status.mark_stopped();
+
+        assert_eq!(
+            status.role.load(Ordering::Relaxed),
+            RaftStatus::ROLE_FOLLOWER
+        );
+        assert_eq!(status.leader_id.load(Ordering::Relaxed), 0);
+        assert!(!status.running.load(Ordering::Relaxed));
+        // Term is deliberately retained for outage correlation.
+        assert_eq!(status.term.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn replica_health_endpoint_serves_raft_gauges_and_reports_halted() {
+        // A replica's minimal endpoint must expose the election gauges
+        // (the point of having it) and report `halted` (it serves no
+        // client orders).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let raft = Arc::new(RaftStatus::new(2));
+        raft.role.store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        raft.leader_id.store(2, Ordering::Relaxed);
+        raft.term.store(7, Ordering::Relaxed);
+        let fence = Arc::new(crate::fence::FenceState::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = spawn(
+            addr,
+            HealthState::for_replica(fence, Some(raft), Arc::new(AtomicBool::new(true))),
+            Arc::clone(&shutdown),
+        )
+        .unwrap();
+        // Give the listener a moment to come up.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(body.contains("melin_raft_node_id 2\n"), "{body}");
+        assert!(body.contains("melin_raft_term 7\n"), "{body}");
+        assert!(body.contains("melin_raft_is_leader 1\n"), "{body}");
+        assert!(body.contains("melin_raft_driver_running 1\n"), "{body}");
+        // A replica is following, not accepting client orders.
+        assert!(body.contains("melin_trading_active 0\n"), "{body}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn stopped_driver_clears_is_leader_gauge() {
+        // A dead control plane must not keep advertising leadership.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let raft = Arc::new(RaftStatus::new(3));
+        raft.role.store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        raft.leader_id.store(3, Ordering::Relaxed);
+        raft.mark_stopped();
+        let fence = Arc::new(crate::fence::FenceState::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = spawn(
+            addr,
+            HealthState::for_replica(fence, Some(raft), Arc::new(AtomicBool::new(true))),
+            Arc::clone(&shutdown),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(body.contains("melin_raft_is_leader 0\n"), "{body}");
+        assert!(body.contains("melin_raft_driver_running 0\n"), "{body}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn replica_health_endpoint_reports_unhealthy_pipeline() {
+        // The caller's live pipeline-health signal (the replica journal
+        // stage's failure mirror) must surface as ERR + gauge 0 — not be
+        // masked by a hardcoded healthy default.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let raft = Arc::new(RaftStatus::new(4));
+        let fence = Arc::new(crate::fence::FenceState::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pipeline_healthy = Arc::new(AtomicBool::new(false));
+
+        let handle = spawn(
+            addr,
+            HealthState::for_replica(fence, Some(raft), Arc::clone(&pipeline_healthy)),
+            Arc::clone(&shutdown),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(body.contains("melin_pipeline_healthy 0\n"), "{body}");
+        let health = http_request(addr, "GET /health HTTP/1.1\r\n\r\n");
+        assert!(health.contains("ERR"), "{health}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn raft_gauges_absent_without_raft() {
+        // Standalone/non-raft nodes must not export the series at all.
+        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(!body.contains("melin_raft_"), "{body}");
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
     /// Test-only QueueCursor backed by an AtomicU64.
     struct MockCursor(AtomicU64);
     impl QueueCursor for MockCursor {
@@ -937,6 +1247,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1062,6 +1373,7 @@ mod tests {
                 journal_utilization: Arc::new(StageUtilization::new()),
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
+                raft: None,
             },
             Arc::clone(&shutdown),
         );
@@ -1096,6 +1408,7 @@ mod tests {
                 journal_utilization: Arc::new(StageUtilization::new()),
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
+                raft: None,
             },
             Arc::new(AtomicBool::new(false)),
         );
@@ -1256,6 +1569,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1357,6 +1671,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1419,6 +1734,7 @@ mod tests {
             journal_utilization: journal_util,
             matching_utilization: matching_util,
             response_utilization: response_util,
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1492,6 +1808,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1543,6 +1860,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1798,6 +2116,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1880,6 +2199,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1955,6 +2275,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2118,6 +2439,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: response_util,
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {

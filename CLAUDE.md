@@ -4,7 +4,7 @@
 
 ## Project
 
-**Melin** — a deterministic, replicated sequencer for latency-critical applications, built on the **LMAX architecture** (single-threaded business logic, event sourcing, mechanical sympathy). Rust (edition 2024). Provides the event-sourced processing pipeline, durable journaling, synchronous replication, transport (kernel TCP and DPDK), and the application-agnostic server runtime. Applications (e.g. the Melin Exchange Core, maintained separately) plug in via the `melin-app` traits; `crates/examples/counter` is the reference application.
+**Melin** — a deterministic, replicated sequencer for latency-critical applications, built on the **LMAX architecture** (single-threaded business logic, event sourcing, mechanical sympathy). Rust (edition 2024). Provides the event-sourced processing pipeline, durable journaling, synchronous replication, transport (kernel TCP and DPDK), the application-agnostic server runtime, and a raft control plane (`crates/core/raft`, on openraft) for leader election and automatic failover — the one place tokio/serde are allowed, confined to its dedicated thread, never on the hot path. Applications (e.g. the Melin Exchange Core, maintained separately) plug in via the `melin-app` traits; `crates/examples/counter` is the reference application.
 
 **Commercial product** — Every feature decision should be evaluated through the lens of "does this make the product more appealing to an operator of latency-critical, durability-critical systems?"
 
