@@ -794,6 +794,13 @@ where
     // stage's source of truth after the replica → primary transition.
     let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
 
+    // Validate before the bind below so an invalid config has no side
+    // effects. `run_as_primary` re-checks (it is also reached from the
+    // DPDK promotion fallback, which does not pass through here).
+    if config.replication_bind.is_some() && config.standalone {
+        return Err("--replication-bind and --standalone are mutually exclusive".into());
+    }
+
     // Bind the replication listener up front, before any pipeline thread
     // exists and regardless of role: a bad or stolen --replication-bind
     // fails the boot cleanly (nothing spawned yet to leak), and a

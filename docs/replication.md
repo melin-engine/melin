@@ -287,7 +287,9 @@ for a data-plane connection to cross.
   fixed at first boot (later flag changes are ignored in favor of the
   stored membership, with a warning). Surviving replicas do **not**
   automatically re-point `--replica-of` at a newly promoted primary —
-  reconnecting them is still operator work after a failover.
+  reconnecting them is still operator work after a failover. Give
+  every candidate `--replication-bind` (see the flags section) so the
+  winner's listener is already up when you re-point them.
 - **Same peer list everywhere.** Identical `--raft-peer` lists
   (including each node's own entry) keep the first-boot membership
   consistent across the cluster.
@@ -400,16 +402,21 @@ requiring the full journal history.
 
 | Flag | Required | Default | Purpose |
 |---|---|---|---|
-| `--replication-bind <addr>` | No | — | Address to listen for replica connections. |
+| `--replication-bind <addr>` | No | — | Address to listen for replica connections. Bound at startup on any node that sets it — including a replica, which holds the port from boot and starts serving on it at promotion. |
 | `--standalone` | No | `false` | Explicitly disable replication. Requires `--durability-mode local`. |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary. |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `DURABILITY <mode>`. |
 | `--durability-mode <mode>` | Primary | `hybrid` | Active durability mode at startup. `local`, `hybrid`, or `durably-replicated`. Can be swapped at runtime via admin `DURABILITY`. |
 
-`--replication-bind` and `--standalone` are mutually exclusive.
-`--replica-of` is mutually exclusive with both. If none are specified,
-the server runs in standalone mode.
+`--standalone` is mutually exclusive with both `--replication-bind`
+and `--replica-of`. `--replica-of` **combines** with
+`--replication-bind`: the replica binds the port at startup and holds
+it unused until a promotion starts serving on it. Give every failover
+candidate the same `--replication-bind` it would need as a primary, so
+a promoted winner is immediately ready to accept re-pointed replicas —
+no other process can have taken the port in the meantime. If none of
+these flags are specified, the server runs in standalone mode.
 
 ## Wire protocol
 
