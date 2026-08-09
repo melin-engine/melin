@@ -554,7 +554,30 @@ where
         // `reader`/`tcp_writer` are clones of one socket; auth is sequential so
         // a single handle works. Use `reader` (carries the read timeout above).
         if let Err(e) = authenticate_with_primary(&mut reader, signing_key) {
-            warn!(error = %e, "authentication failed — retrying");
+            // A read timeout means no challenge arrived: the target
+            // holds the port but is not serving — typically a
+            // not-yet-promoted replica (the listener is bound from boot)
+            // or a primary mid-start. Only other errors suggest a real
+            // credential problem. SO_RCVTIMEO surfaces as WouldBlock on
+            // Linux; match TimedOut too for portability.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                warn!(error = %e, "no auth challenge from primary (not serving yet?) — retrying");
+            } else {
+                warn!(error = %e, "authentication failed — retrying");
+            }
+            // Drop the socket before sleeping — held through the
+            // backoff it would sit in the target's accept backlog, and
+            // a just-promoted primary would waste a replica slot (and
+            // its 10s auth timeout) on the zombie.
+            drop(reader);
+            drop(tcp_writer);
+            // Back off before redialing — without the sleep this loop
+            // hammers a primary that keeps refusing us. The loop top
+            // re-checks the shutdown/promote flags after the sleep.
+            sleep_checking_flags(backoff, shutdown, promote);
             backoff = (backoff * 2).min(MAX_BACKOFF);
             continue;
         }
@@ -608,6 +631,10 @@ where
                         our_epoch,
                         "primary is behind our fencing epoch — refusing to follow stale primary"
                     );
+                    // Drop the socket before sleeping — see the auth
+                    // failure arm above.
+                    drop(reader);
+                    drop(tcp_writer);
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                     sleep_checking_flags(backoff, shutdown, promote);
                     continue;

@@ -32,6 +32,32 @@ struct Node {
 /// to 1–2 s; several rounds of collisions would still fit well inside this.
 const ELECTION_DEADLINE: Duration = Duration::from_secs(20);
 
+/// Allocate a listen address on a probed-free port below the kernel's
+/// ephemeral range (≥32768 by default). Reserving via `bind(port 0)` and
+/// dropping hands back a port the kernel may reissue — to a concurrent
+/// test process's listener or as an outgoing connection's source port —
+/// before `spawn` re-binds it (observed as an `AddrInUse` spawn failure
+/// under full-suite load). This file owns 15000..20000; the
+/// `melin-server-runtime` raft tests own 20000..30000. Per-process
+/// blocks keep the parallel election tests (near-adjacent pids) probing
+/// disjoint spans, and the probe filters anything else on the port.
+fn free_addr() -> std::net::SocketAddr {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // 100 blocks of 50 ports; the widest test uses 5. u32 arithmetic to
+    // match `process::id`, narrowed only at the final in-range port.
+    const BASE: u32 = 15_000;
+    const BLOCK: u32 = 50;
+    const NBLOCKS: u32 = 100;
+    let block_base = BASE + (std::process::id() % NBLOCKS) * BLOCK;
+    for _ in 0..BLOCK {
+        let port = (block_base + NEXT.fetch_add(1, Ordering::Relaxed) % BLOCK) as u16;
+        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            return l.local_addr().unwrap();
+        }
+    }
+    panic!("no free port in block {block_base}..{}", block_base + BLOCK);
+}
+
 fn start_cluster(n: u64) -> Cluster {
     // All nodes at the same (zero) journal tip: recency never filters.
     start_cluster_with_tips(&vec![0u64; n as usize])
@@ -45,13 +71,8 @@ fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
         .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
         .collect();
 
-    // Reserve n distinct localhost ports by binding and dropping.
-    let addrs: Vec<String> = (0..n)
-        .map(|_| {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().to_string()
-        })
-        .collect();
+    // Reserve n distinct localhost ports — see `free_addr`.
+    let addrs: Vec<String> = (0..n).map(|_| free_addr().to_string()).collect();
 
     let table: String = keys
         .iter()

@@ -20,9 +20,35 @@ use melin_wire_protocol::control_codec::TAG_CHALLENGE;
 use melin_wire_protocol::tcp::BlockingTcpListener;
 use serial_test::serial;
 
+/// Allocate a listen address on a probed-free port *below* the kernel's
+/// ephemeral range (`net.ipv4.ip_local_port_range`, ≥32768 by default).
+/// The classic reserve-and-drop trick (`bind(port 0)`, read, drop) hands
+/// back a port the kernel may immediately reissue — to another test
+/// process's listener or as some outgoing connection's source port. This
+/// test re-binds its ports seconds after reservation (the replication
+/// listener comes up after journal recovery), and a stolen replication
+/// port left the cluster unable to ever form. Below the ephemeral floor,
+/// only explicit binds can collide; each test file that plays this game
+/// owns a disjoint range (this one: 20000..25000, `raft_smoke.rs`:
+/// 25000..30000), split into per-process blocks so concurrently spawned
+/// test processes (near-adjacent pids) probe disjoint blocks, and the
+/// probe itself filters anything else alive on the port.
 fn free_addr() -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // 100 blocks of 50 ports; this test uses ~10, so a block never runs
+    // out. u32 arithmetic to match `process::id`, narrowed only at the
+    // final in-range port.
+    const BASE: u32 = 20_000;
+    const BLOCK: u32 = 50;
+    const NBLOCKS: u32 = 100;
+    let block_base = BASE + (std::process::id() % NBLOCKS) * BLOCK;
+    for _ in 0..BLOCK {
+        let port = (block_base + NEXT.fetch_add(1, Ordering::Relaxed) % BLOCK) as u16;
+        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            return l.local_addr().unwrap();
+        }
+    }
+    panic!("no free port in block {block_base}..{}", block_base + BLOCK);
 }
 
 fn http_metrics(addr: SocketAddr) -> Option<String> {
@@ -59,6 +85,32 @@ struct NodeSetup {
     client_addr: SocketAddr,
     raft_addr: SocketAddr,
     health_addr: SocketAddr,
+}
+
+/// Per-node control-plane state for deadline diagnostics: the raft and
+/// replication gauges of every node, so a timed-out wait reports *which*
+/// formation condition was stuck (replication attach vs. election) and
+/// what each node believed at the time — the servers install no tracing
+/// subscriber under test, so the panic message is the only record.
+fn cluster_summary(nodes: &[NodeSetup]) -> String {
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let gauges = match http_metrics(n.health_addr) {
+                None => "health endpoint unreachable".to_owned(),
+                Some(body) => body
+                    .lines()
+                    .filter(|l| {
+                        l.starts_with("melin_raft_") || l.starts_with("melin_replicas_connected")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            format!("node {}: {gauges}", i + 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -167,7 +219,6 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     // if the primary itself leads there is nothing to act on).
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        assert!(Instant::now() < deadline, "cluster never formed");
         if primary_handle.is_finished() {
             panic!("primary exited early: {:?}", primary_handle.join().unwrap());
         }
@@ -179,6 +230,11 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
         if connected && any_leader {
             break;
         }
+        assert!(
+            Instant::now() < deadline,
+            "cluster never formed: replicas_connected_2={connected} any_leader={any_leader}\n{}",
+            cluster_summary(&nodes)
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
 
@@ -196,7 +252,8 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     let winner = loop {
         assert!(
             Instant::now() < deadline,
-            "no replica promoted within the deadline"
+            "no replica promoted within the deadline\n{}",
+            cluster_summary(&nodes)
         );
         let serving: Vec<usize> = (1..3)
             .filter(|&i| serves_clients(nodes[i].client_addr, Duration::from_millis(500)))
@@ -221,7 +278,8 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
         }
         assert!(
             Instant::now() < deadline,
-            "winner's health endpoint never reported leadership"
+            "winner's health endpoint never reported leadership\n{}",
+            cluster_summary(&nodes)
         );
         std::thread::sleep(Duration::from_millis(200));
     }
