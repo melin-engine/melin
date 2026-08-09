@@ -1522,13 +1522,23 @@ where
         let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
         let sender_durability = Arc::clone(&durability_mode_atomic);
+        // Bind here, not on the sender thread: a failed bind must fail
+        // startup with a clear error. Bound-but-dead replication would
+        // otherwise leave a primary that looks healthy yet can never
+        // satisfy hybrid/durably-replicated acks.
+        let repl_listener = std::net::TcpListener::bind(repl_bind)
+            .map_err(|e| format!("failed to bind replication listener on {repl_bind}: {e}"))?;
+        // Non-blocking accept so the sender loop can check shutdown.
+        repl_listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("failed to set non-blocking on replication listener: {e}"))?;
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
                 melin_app::affinity::pin_thread("repl-sender", cores.repl_sender);
                 crate::replication::run_sender::<A>(
                     crate::replication::Sender {
-                        bind_addr: repl_bind,
+                        listener: repl_listener,
                         repl_consumer_1,
                         repl_consumer_2,
                         replica_slots: repl_slots,

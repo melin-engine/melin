@@ -5,7 +5,7 @@
 //! is defined in `super::protocol`.
 
 use std::io::{self, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -32,7 +32,13 @@ use melin_transport_core::replication::validate::{
 
 /// Owned state for the replication sender thread.
 pub struct Sender {
-    pub bind_addr: SocketAddr,
+    /// Pre-bound, non-blocking replication listener. Bound by the caller
+    /// at startup — not here — so a bad or stolen `--replication-bind`
+    /// port fails the boot with a clear error. Binding on this thread
+    /// meant a failure only killed the sender silently, leaving a
+    /// primary that looked healthy but could never satisfy
+    /// hybrid/durably-replicated acks.
+    pub listener: TcpListener,
     pub repl_consumer_1: ReplicationConsumer,
     pub repl_consumer_2: ReplicationConsumer,
     pub replica_slots: Arc<melin_transport_core::ReplicaSlotCursors>,
@@ -68,7 +74,7 @@ pub fn run_sender<A: Application>(
     replicas_connected: &AtomicU32,
 ) {
     let Sender {
-        bind_addr,
+        listener,
         repl_consumer_1,
         repl_consumer_2,
         replica_slots,
@@ -84,20 +90,11 @@ pub fn run_sender<A: Application>(
         fence_state,
         durability_mode,
     } = config;
-    let listener = match TcpListener::bind(bind_addr) {
-        Ok(l) => l,
-        Err(e) => {
-            error!(addr = %bind_addr, error = %e, "failed to bind replication listener");
-            return;
-        }
-    };
-    // Non-blocking accept so we can check shutdown.
-    if let Err(e) = listener.set_nonblocking(true) {
-        error!(error = %e, "failed to set non-blocking on replication listener");
-        return;
+    match listener.local_addr() {
+        Ok(addr) => info!(%addr, "replication sender listening"),
+        // Best-effort log detail — the pre-bound listener works either way.
+        Err(_) => info!("replication sender listening"),
     }
-
-    info!(addr = %bind_addr, "replication sender listening");
 
     // Two replica slots, each with its own ring consumer and thread handle.
     // The accept loop fills empty slots. When a replica disconnects, its
