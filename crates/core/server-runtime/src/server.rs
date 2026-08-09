@@ -864,16 +864,19 @@ where
         let control = crate::replication::ReplicaControlPlane::new();
         let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
-        let _admin_handle = config.admin_bind.map(|addr| {
-            crate::admin::spawn(
-                addr,
-                Some(promotion_request.clone()),
-                rotate_flag.clone(),
-                Some(Arc::clone(&durability_mode_atomic)),
-                Arc::clone(&shutdown),
-                Arc::clone(&authorized_keys),
-            )
-        });
+        let _admin_handle = config
+            .admin_bind
+            .map(|addr| {
+                crate::admin::spawn(
+                    addr,
+                    Some(promotion_request.clone()),
+                    rotate_flag.clone(),
+                    Some(Arc::clone(&durability_mode_atomic)),
+                    Arc::clone(&shutdown),
+                    Arc::clone(&authorized_keys),
+                )
+            })
+            .transpose()?;
 
         // Shared fencing state, created before mode detection so it
         // survives a replica → primary transition. Seeded at epoch 0; the
@@ -1017,16 +1020,19 @@ where
     // promotion is meaningful only on a replica. ROTATE is wired
     // whenever the admin endpoint is configured.
     let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
-    let _admin_handle = config.admin_bind.map(|addr| {
-        crate::admin::spawn(
-            addr,
-            None,
-            rotate_flag.clone(),
-            Some(Arc::clone(&durability_mode_atomic)),
-            Arc::clone(&shutdown),
-            Arc::clone(&authorized_keys),
-        )
-    });
+    let _admin_handle = config
+        .admin_bind
+        .map(|addr| {
+            crate::admin::spawn(
+                addr,
+                None,
+                rotate_flag.clone(),
+                Some(Arc::clone(&durability_mode_atomic)),
+                Arc::clone(&shutdown),
+                Arc::clone(&authorized_keys),
+            )
+        })
+        .transpose()?;
 
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — seed events will flow through the pipeline later.
@@ -2219,16 +2225,19 @@ where
         let control = crate::replication::ReplicaControlPlane::new();
         let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
-        let _admin_handle = config.admin_bind.map(|addr| {
-            crate::admin::spawn(
-                addr,
-                Some(promotion_request.clone()),
-                rotate_flag.clone(),
-                Some(Arc::clone(&durability_mode_atomic)),
-                Arc::clone(&shutdown),
-                Arc::clone(&authorized_keys),
-            )
-        });
+        let _admin_handle = config
+            .admin_bind
+            .map(|addr| {
+                crate::admin::spawn(
+                    addr,
+                    Some(promotion_request.clone()),
+                    rotate_flag.clone(),
+                    Some(Arc::clone(&durability_mode_atomic)),
+                    Arc::clone(&shutdown),
+                    Arc::clone(&authorized_keys),
+                )
+            })
+            .transpose()?;
 
         // Shared fencing state, created before mode detection so it
         // survives a replica → primary transition. Seeded at epoch 0; the
@@ -2550,16 +2559,19 @@ where
     // same flag the journal stage observes.
     let mut journal_stage = journal_stage;
     let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
-    let _admin_handle = config.admin_bind.map(|addr| {
-        crate::admin::spawn(
-            addr,
-            None,
-            rotate_flag.clone(),
-            Some(Arc::clone(&durability_mode_atomic)),
-            Arc::clone(&shutdown),
-            Arc::clone(&authorized_keys),
-        )
-    });
+    let _admin_handle = config
+        .admin_bind
+        .map(|addr| {
+            crate::admin::spawn(
+                addr,
+                None,
+                rotate_flag.clone(),
+                Some(Arc::clone(&durability_mode_atomic)),
+                Arc::clone(&shutdown),
+                Arc::clone(&authorized_keys),
+            )
+        })
+        .transpose()?;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     // On a primary the journal stage owns the control-plane advertised

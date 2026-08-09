@@ -50,6 +50,13 @@ use melin_wire_protocol::control_codec;
 
 /// Spawn the admin listener on a dedicated thread.
 ///
+/// The listener is bound (and set non-blocking) here, before the thread
+/// starts, so a taken or misconfigured admin port fails startup loudly —
+/// bound inside the thread it died with an `error!` nobody joins on,
+/// leaving `PROMOTE`/`ROTATE`/`DURABILITY` silently dead on a
+/// healthy-looking node. Returns the bound address alongside the
+/// handle (they differ from `bind_addr` when it carries port 0).
+///
 /// Any of `promote` / `rotate_requested` / `durability_mode` may be
 /// `None` to disable the corresponding command on this node. The
 /// listener still accepts connections and authenticates them — a
@@ -63,13 +70,22 @@ pub fn spawn(
     durability_mode: Option<Arc<AtomicU8>>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
-) -> JoinHandle<()> {
-    std::thread::Builder::new()
+) -> Result<(JoinHandle<()>, SocketAddr), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(bind_addr)
+        .map_err(|e| format!("failed to bind admin listener on {bind_addr}: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("failed to set non-blocking on admin listener: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("failed to read admin listener address: {e}"))?;
+    let handle = std::thread::Builder::new()
         .name("admin-listener".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run(
-                    bind_addr,
+                    listener,
+                    addr,
                     promote.as_ref(),
                     rotate_requested.as_deref(),
                     durability_mode.as_deref(),
@@ -79,10 +95,11 @@ pub fn spawn(
             }));
             if let Err(panic) = result {
                 let msg = panic_message(&panic);
-                error!(addr = %bind_addr, panic = %msg, "admin listener thread panicked");
+                error!(addr = %addr, panic = %msg, "admin listener thread panicked");
             }
         })
-        .expect("failed to spawn admin listener thread")
+        .map_err(|e| format!("failed to spawn admin listener thread: {e}"))?;
+    Ok((handle, addr))
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -95,27 +112,19 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// Accept loop over the listener pre-bound by [`spawn`]. `addr` is the
+/// actual bound address, for logs.
 fn run(
-    bind_addr: SocketAddr,
+    listener: TcpListener,
+    addr: SocketAddr,
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
     durability_mode: Option<&AtomicU8>,
     shutdown: &AtomicBool,
     authorized_keys: &AuthorizedKeys,
 ) {
-    let listener = match TcpListener::bind(bind_addr) {
-        Ok(l) => l,
-        Err(e) => {
-            error!(addr = %bind_addr, error = %e, "admin listener bind failed");
-            return;
-        }
-    };
-    listener
-        .set_nonblocking(true)
-        .expect("set admin listener nonblocking");
-
     info!(
-        addr = %bind_addr,
+        addr = %addr,
         promote_enabled = promote.is_some(),
         rotate_enabled = rotate_requested.is_some(),
         durability_enabled = durability_mode.is_some(),
@@ -476,12 +485,6 @@ mod tests {
         result_buf[0]
     }
 
-    fn ephemeral_listener() -> (TcpListener, SocketAddr) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        (listener, addr)
-    }
-
     /// Helper: connect, authenticate, send a command, return the
     /// server's first response line.
     fn send_command(addr: SocketAddr, key: &SigningKey, command: &[u8]) -> String {
@@ -495,24 +498,39 @@ mod tests {
         line.trim().to_string()
     }
 
+    /// A taken admin port must fail `spawn` loudly. The old
+    /// bind-inside-the-thread pattern died with an `error!` nobody
+    /// joins on, leaving PROMOTE/ROTATE/DURABILITY silently dead on a
+    /// healthy-looking node.
+    #[test]
+    fn spawn_errs_when_port_taken() {
+        let (_key, auth_keys) = operator_keys();
+        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = holder.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let err = spawn(addr, None, None, None, shutdown, auth_keys)
+            .expect_err("bind on a taken port must fail");
+        assert!(
+            err.to_string().contains("failed to bind admin listener"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn promote_command_sets_flag_when_wired() {
-        let (listener, addr) = ephemeral_listener();
-        drop(listener);
-
         let (key, auth_keys) = operator_keys();
         let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _h = spawn(
-            addr,
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
             auth_keys,
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        )
+        .expect("spawn admin listener");
 
         assert_eq!(send_command(addr, &key, b"PROMOTE\n"), "OK");
         assert_eq!(promote.pending(), Some(PromotionRequest::MANUAL));
@@ -523,22 +541,19 @@ mod tests {
 
     #[test]
     fn rotate_command_sets_flag_when_wired() {
-        let (listener, addr) = ephemeral_listener();
-        drop(listener);
-
         let (key, auth_keys) = operator_keys();
         let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _h = spawn(
-            addr,
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
             auth_keys,
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        )
+        .expect("spawn admin listener");
 
         assert_eq!(send_command(addr, &key, b"ROTATE\n"), "OK");
         assert!(rotate.load(Ordering::Acquire));
@@ -551,21 +566,18 @@ mod tests {
     /// ERR rather than silently no-opping.
     #[test]
     fn promote_rejected_when_not_wired() {
-        let (listener, addr) = ephemeral_listener();
-        drop(listener);
-
         let (key, auth_keys) = operator_keys();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _h = spawn(
-            addr,
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
             None,
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
             auth_keys,
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        )
+        .expect("spawn admin listener");
 
         let resp = send_command(addr, &key, b"PROMOTE\n");
         assert!(resp.starts_with("ERR"), "expected ERR, got {resp}");
@@ -577,21 +589,18 @@ mod tests {
     /// On a node without runtime rotation enabled, ROTATE returns ERR.
     #[test]
     fn rotate_rejected_when_not_wired() {
-        let (listener, addr) = ephemeral_listener();
-        drop(listener);
-
         let (key, auth_keys) = operator_keys();
         let promote = PromotionRequest::new();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _h = spawn(
-            addr,
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
             Some(promote.clone()),
             None,
             None,
             Arc::clone(&shutdown),
             auth_keys,
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        )
+        .expect("spawn admin listener");
 
         let resp = send_command(addr, &key, b"ROTATE\n");
         assert!(resp.starts_with("ERR"), "expected ERR, got {resp}");
@@ -605,22 +614,19 @@ mod tests {
     /// run.
     #[test]
     fn listener_handles_multiple_commands() {
-        let (listener, addr) = ephemeral_listener();
-        drop(listener);
-
         let (key, auth_keys) = operator_keys();
         let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _h = spawn(
-            addr,
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
             auth_keys,
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        )
+        .expect("spawn admin listener");
 
         // Three rotations, each consuming the flag (simulates the
         // journal stage's CAS).
@@ -642,22 +648,19 @@ mod tests {
 
     #[test]
     fn unknown_command_rejected() {
-        let (listener, addr) = ephemeral_listener();
-        drop(listener);
-
         let (key, auth_keys) = operator_keys();
         let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _h = spawn(
-            addr,
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
             auth_keys,
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        )
+        .expect("spawn admin listener");
 
         let resp = send_command(addr, &key, b"INVALID\n");
         assert!(resp.starts_with("ERR"), "expected ERR, got {resp}");
@@ -669,22 +672,19 @@ mod tests {
 
     #[test]
     fn non_operator_key_rejected() {
-        let (listener, addr) = ephemeral_listener();
-        drop(listener);
-
         let (trader_key, auth_keys) = trader_keys();
         let promote = PromotionRequest::new();
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _h = spawn(
-            addr,
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
             auth_keys,
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        )
+        .expect("spawn admin listener");
 
         let mut stream = TcpStream::connect(addr).unwrap();
         let result = client_authenticate(&mut stream, &trader_key);
@@ -700,21 +700,18 @@ mod tests {
     /// it with `initial`, send the supplied command, and return
     /// `(response, mode_after)`.
     fn run_durability(initial: DurabilityMode, cmd: &[u8]) -> (String, Option<DurabilityMode>) {
-        let (listener, addr) = ephemeral_listener();
-        drop(listener);
-
         let (key, auth_keys) = operator_keys();
         let mode = Arc::new(AtomicU8::new(initial.as_u8()));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _h = spawn(
-            addr,
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
             None,
             None,
             Some(Arc::clone(&mode)),
             Arc::clone(&shutdown),
             auth_keys,
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        )
+        .expect("spawn admin listener");
 
         let resp = send_command(addr, &key, cmd);
         let after = DurabilityMode::from_u8(mode.load(Ordering::Relaxed));
@@ -768,21 +765,18 @@ mod tests {
     fn durability_command_rejected_when_not_wired() {
         // On a pure-replica node (no response stage), DURABILITY must
         // not silently no-op — operators get a structured ERR.
-        let (listener, addr) = ephemeral_listener();
-        drop(listener);
-
         let (key, auth_keys) = operator_keys();
         let promote = PromotionRequest::new();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _h = spawn(
-            addr,
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
             Some(promote.clone()),
             None,
             None,
             Arc::clone(&shutdown),
             auth_keys,
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        )
+        .expect("spawn admin listener");
 
         let resp = send_command(addr, &key, b"DURABILITY local\n");
         assert!(
