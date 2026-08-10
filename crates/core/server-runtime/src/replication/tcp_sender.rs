@@ -31,14 +31,30 @@ use melin_transport_core::replication::validate::{
 // --- Replication Sender (Primary side) ---
 
 /// Owned state for the replication sender thread.
+/// A TCP listener guaranteed non-blocking: the only constructor sets
+/// the flag, so the guarantee is carried by the type. [`run_sender`]'s
+/// accept loop polls the shutdown flag between accepts — handed a
+/// blocking listener it would park inside `accept()` and only observe
+/// shutdown when the next replica happened to dial in. This newtype
+/// makes that state unrepresentable instead of documenting it away.
+pub struct ReplicationListener(TcpListener);
+
+impl ReplicationListener {
+    /// Wrap a bound listener, setting it non-blocking.
+    pub fn new(listener: TcpListener) -> std::io::Result<Self> {
+        listener.set_nonblocking(true)?;
+        Ok(Self(listener))
+    }
+}
+
 pub struct Sender {
-    /// Pre-bound, non-blocking replication listener. Bound by the caller
-    /// at startup — not here — so a bad or stolen `--replication-bind`
-    /// port fails the boot with a clear error. Binding on this thread
-    /// meant a failure only killed the sender silently, leaving a
-    /// primary that looked healthy but could never satisfy
-    /// hybrid/durably-replicated acks.
-    pub listener: TcpListener,
+    /// Pre-bound replication listener, non-blocking by construction.
+    /// Bound by the caller at startup — not here — so a bad or stolen
+    /// `--replication-bind` port fails the boot with a clear error.
+    /// Binding on this thread meant a failure only killed the sender
+    /// silently, leaving a primary that looked healthy but could never
+    /// satisfy hybrid/durably-replicated acks.
+    pub listener: ReplicationListener,
     pub repl_consumer_1: ReplicationConsumer,
     pub repl_consumer_2: ReplicationConsumer,
     pub replica_slots: Arc<melin_transport_core::ReplicaSlotCursors>,
@@ -90,6 +106,9 @@ pub fn run_sender<A: Application>(
         fence_state,
         durability_mode,
     } = config;
+    // Unwrap the invariant-carrying newtype — from here `listener` is a
+    // plain TcpListener, known non-blocking.
+    let ReplicationListener(listener) = listener;
     match listener.local_addr() {
         Ok(addr) => info!(%addr, "replication sender listening"),
         // Best-effort log detail — the pre-bound listener works either way.

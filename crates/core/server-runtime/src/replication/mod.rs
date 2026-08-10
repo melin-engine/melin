@@ -136,7 +136,7 @@ pub use melin_transport_core::replication::{ReplicaCursors, ReplicationMetrics, 
 #[cfg(feature = "dpdk")]
 pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
 pub use tcp_receiver::{ReceiverResult, run_receiver};
-pub use tcp_sender::{Sender, run_sender};
+pub use tcp_sender::{ReplicationListener, Sender, run_sender};
 
 /// The handles a replica's receive loop shares with the rest of the
 /// node — the admin endpoint and the control-plane raft driver.

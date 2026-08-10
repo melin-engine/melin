@@ -1110,11 +1110,12 @@ where
 /// at promotion, where its kernel listeners come up.
 fn bind_replication_listener(
     addr: std::net::SocketAddr,
-) -> Result<std::net::TcpListener, Box<dyn std::error::Error>> {
+) -> Result<crate::replication::ReplicationListener, Box<dyn std::error::Error>> {
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|e| format!("failed to bind replication listener on {addr}: {e}"))?;
-    listener
-        .set_nonblocking(true)
+    // The newtype sets non-blocking — the invariant the sender's accept
+    // loop needs is enforced by construction, not by this call site.
+    let listener = crate::replication::ReplicationListener::new(listener)
         .map_err(|e| format!("failed to set non-blocking on replication listener: {e}"))?;
     info!(%addr, "replication listener bound");
     Ok(listener)
@@ -1251,11 +1252,11 @@ fn run_as_primary<A, L, W>(
     exchange: A,
     writer: W,
     mut listener: L,
-    // Pre-bound (non-blocking) replication listener, `Some` iff
-    // `--replication-bind` is set. Bound in `run_impl` before any
-    // pipeline thread exists so a bind failure cannot leak threads, and
-    // held from boot on replicas so a promotion cannot fail on it.
-    repl_listener: Option<std::net::TcpListener>,
+    // Pre-bound replication listener (non-blocking by construction),
+    // `Some` iff `--replication-bind` is set. Bound in `run_impl` before
+    // any pipeline thread exists so a bind failure cannot leak threads,
+    // and held from boot on replicas so a promotion cannot fail on it.
+    repl_listener: Option<crate::replication::ReplicationListener>,
     config: &ServerConfig,
     factory: &dyn AppFactory<App = A>,
     decoder: RequestDecoderArc<A>,
