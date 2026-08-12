@@ -737,11 +737,12 @@ impl<E: AppEvent> SectorWriter<E> {
     /// the pipeline's post-rotation re-registration.
     ///
     /// `None` while the spare is checked out (a write is in flight):
-    /// register at setup, before the first async submit. Note the
-    /// take/confirm cycle can transiently introduce a *replacement*
-    /// buffer (see `take_batch_for_async_write`'s defensive alloc), so
-    /// submitters must match a batch's pointer against these regions and
-    /// fall back to an unregistered write on a miss.
+    /// register at setup, before the first async submit. A double
+    /// checkout is a hard error rather than a silent replacement-buffer
+    /// alloc, so the pool always holds exactly these two allocations;
+    /// submitters still match a batch's pointer against these regions
+    /// and fall back to an unregistered write on a miss (registration
+    /// itself can fail at setup under a tight RLIMIT_MEMLOCK).
     pub fn batch_buffer_regions(&self) -> Option<[(*const u8, usize); 2]> {
         self.spare_buf.as_ref().map(|spare| {
             [
@@ -778,7 +779,24 @@ impl<E: AppEvent> SectorWriter<E> {
         let batch_len = self.batch_len;
 
         // Swap in the spare as output buffer; full_buf holds the encoded data.
-        let spare = self.spare_buf.take().unwrap_or_else(alloc_aligned);
+        //
+        // A missing spare means a second checkout while a batch is
+        // still in flight — a caller bug (the pipeline holds at most
+        // one batch in flight). Minting a replacement buffer here would
+        // silently break the address contract on `batch_buffer_regions`:
+        // the replacement is neither registered nor mlocked, and
+        // `confirm_async_write` would rotate it into the pool while a
+        // registered buffer gets dropped with its pages still pinned by
+        // io_uring — the stale-DMA hazard. Fail loudly instead.
+        debug_assert!(
+            self.spare_buf.is_some(),
+            "take_batch_for_async_write with a batch already checked out"
+        );
+        let Some(spare) = self.spare_buf.take() else {
+            return Err(JournalError::Io(std::io::Error::other(
+                "journal batch double-checkout: a batch is already in flight",
+            )));
+        };
         let full_buf = std::mem::replace(&mut self.batch_buf, spare);
 
         let sector_size = self.sector_size;
@@ -830,6 +848,14 @@ impl<E: AppEvent> SectorWriter<E> {
     /// Return the completed async write buffer to the spare pool.
     /// Called after the io_uring CQE confirms the write completed.
     pub fn confirm_async_write(&mut self, batch: AsyncWriteBatch) {
+        // The only `AsyncWriteBatch` in existence is the one this
+        // writer checked out, so the slot must be empty here — a
+        // non-empty slot would mean silently dropping a registered,
+        // mlocked buffer while io_uring still pins its pages.
+        debug_assert!(
+            self.spare_buf.is_none(),
+            "confirm_async_write without a checked-out batch"
+        );
         self.spare_buf = Some(batch.buf);
     }
 
@@ -1611,6 +1637,59 @@ mod tests {
             assert_eq!(entry.sequence, FIRST_SEQ + i as u64);
             assert_eq!(entry.event, events[i]);
         }
+    }
+
+    /// A double checkout previously minted an unregistered replacement
+    /// buffer — silently breaking the address contract on
+    /// `batch_buffer_regions`. It must fail fast (debug_assert here;
+    /// `JournalError` on the same condition in release builds).
+    #[test]
+    #[should_panic(expected = "take_batch_for_async_write with a batch already checked out")]
+    fn double_checkout_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        // Enough bytes to fill at least one full sector, so the first
+        // take returns a real in-flight batch instead of routing
+        // everything through the synchronous tail-sector pwrite.
+        for i in 0..1000u64 {
+            writer
+                .batch_append_with_ts(&JournalEvent::App(TestEvent(i)), 0, 0, 0)
+                .unwrap();
+        }
+        let _in_flight = writer
+            .take_batch_for_async_write()
+            .unwrap()
+            .expect("a full sector must produce an async batch");
+        // Accumulating while a batch is in flight is the intended
+        // overlap pattern...
+        for i in 0..1000u64 {
+            writer
+                .batch_append_with_ts(&JournalEvent::App(TestEvent(1000 + i)), 0, 0, 0)
+                .unwrap();
+        }
+        // ...but a second checkout before confirming the first is the
+        // caller bug — must trip the guard. The result is unreachable:
+        // the debug_assert fires first in test builds.
+        let _ = writer.take_batch_for_async_write();
+    }
+
+    /// Confirming when no batch is checked out would drop a registered,
+    /// mlocked buffer while io_uring still pins its pages.
+    #[test]
+    #[should_panic(expected = "confirm_async_write without a checked-out batch")]
+    fn confirm_without_checkout_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        let stray = AsyncWriteBatch {
+            buf: alloc_aligned(),
+            len: 0,
+            offset: ENTRY_OFFSET,
+        };
+        writer.confirm_async_write(stray);
     }
 
     #[test]
