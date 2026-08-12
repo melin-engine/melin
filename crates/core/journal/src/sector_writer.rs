@@ -185,6 +185,10 @@ pub struct SectorWriter<E: AppEvent> {
     /// See `tail_sector`'s docstring for the on-disk-equality invariant
     /// that ties `tail_sector_len` to the writer's `write_pos`.
     tail_sector_len: usize,
+    /// Retries a failed post-rotation directory fsync until it succeeds
+    /// (see [`crate::segment::DirFsyncRetry`]). Polled from the flush
+    /// paths — a single branch in steady state.
+    dir_fsync_retry: crate::segment::DirFsyncRetry,
 }
 
 impl<E: AppEvent> SectorWriter<E> {
@@ -346,6 +350,7 @@ impl<E: AppEvent> SectorWriter<E> {
             sector_size,
             tail_sector,
             tail_sector_len: 0,
+            dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
 
@@ -590,6 +595,7 @@ impl<E: AppEvent> SectorWriter<E> {
             sector_size,
             tail_sector,
             tail_sector_len: tail_len,
+            dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
 
@@ -693,6 +699,9 @@ impl<E: AppEvent> SectorWriter<E> {
     /// The hot path uses the async variant; this one is for shutdown drains
     /// and one-shot callers.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
+        // Paced retry of a failed post-rotation dir fsync — a single
+        // branch in steady state.
+        self.dir_fsync_retry.poll();
         if self.batch_len == 0 {
             return Ok(());
         }
@@ -758,6 +767,9 @@ impl<E: AppEvent> SectorWriter<E> {
     /// complete sector; the tail sector position is not advanced until the
     /// sector fills.
     pub fn take_batch_for_async_write(&mut self) -> Result<Option<AsyncWriteBatch>, JournalError> {
+        // Paced retry of a failed post-rotation dir fsync — a single
+        // branch in steady state.
+        self.dir_fsync_retry.poll();
         if self.batch_len == 0 {
             return Ok(None);
         }
@@ -969,15 +981,13 @@ impl<E: AppEvent> SectorWriter<E> {
         match installed {
             Ok(()) => {
                 // Durably commit both the rename (archive_live) and the
-                // new live file's dirent in a single dir fsync. Without
-                // this, power loss between rotation and the next
-                // dir-metadata flush could leave recovery seeing the
-                // pre-rotation layout (acceptable) — or worse, the
-                // archive present without the new live (handled as
-                // Phase B but loses post-rotation crash recovery).
-                if let Err(e) = crate::segment::fsync_parent_dir(&path) {
-                    return Err(JournalError::Io(e));
-                }
+                // new live file's dirent in a single dir fsync. The
+                // rotation is already committed at this point, so a
+                // fsync failure must not surface as a rotation failure
+                // — see `DirFsyncRetry` for why (callers gate fd
+                // re-registration and replication publishing on the
+                // result); a failure is retried from the flush paths.
+                self.dir_fsync_retry.after_rotation(&path);
                 Ok(archived)
             }
             Err(e) => {

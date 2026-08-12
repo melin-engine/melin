@@ -101,6 +101,10 @@ pub struct BufferedWriter<E: AppEvent> {
     // without a second encode pass.
     last_user_entry_offset: usize,
     last_user_entry_len: usize,
+    // Retries a failed post-rotation directory fsync until it succeeds
+    // (see `crate::segment::DirFsyncRetry`). Polled from the flush
+    // path — a single branch in steady state.
+    dir_fsync_retry: crate::segment::DirFsyncRetry,
 }
 
 impl<E: AppEvent> BufferedWriter<E> {
@@ -166,6 +170,7 @@ impl<E: AppEvent> BufferedWriter<E> {
             last_encoded_seq: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
+            dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
 
@@ -237,6 +242,7 @@ impl<E: AppEvent> BufferedWriter<E> {
             last_encoded_seq: last_seq,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
+            dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
 
@@ -324,6 +330,9 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// Issues exactly one `pwrite` covering the whole batch, followed by
     /// `fdatasync`. Returns only when the kernel reports data is durable.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
+        // Paced retry of a failed post-rotation dir fsync — a single
+        // branch in steady state.
+        self.dir_fsync_retry.poll();
         if self.batch_len == 0 {
             return Ok(());
         }
@@ -460,7 +469,11 @@ impl<E: AppEvent> BufferedWriter<E> {
                 // Persist both the rename (archive_live) and the new
                 // live file's dirent in a single dir fsync so recovery
                 // sees a consistent post-rotation layout after a crash.
-                crate::segment::fsync_parent_dir(&path)?;
+                // The rotation is already committed at this point, so a
+                // fsync failure must not surface as a rotation failure
+                // — see `DirFsyncRetry` for why; a failure is retried
+                // from the flush path.
+                self.dir_fsync_retry.after_rotation(&path);
                 Ok(archived)
             }
             Err(e) => {
