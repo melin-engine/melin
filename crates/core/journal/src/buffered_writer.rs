@@ -489,6 +489,10 @@ impl<E: AppEvent> BufferedWriter<E> {
 
         let path = self.path.clone();
         let next_seq = self.next_sequence;
+        // Data end of the outgoing segment, captured post-flush while
+        // `self` still describes it — the archive is compacted to this
+        // after the rotation commits.
+        let sealed_end = self.valid_end();
 
         // The new segment's header anchor is the outgoing segment's tail
         // chain hash, giving recovery a verifiable cross-segment link.
@@ -514,6 +518,10 @@ impl<E: AppEvent> BufferedWriter<E> {
                 // — see `DirFsyncRetry` for why; a failure is retried
                 // from the flush path.
                 self.dir_fsync_retry.after_rotation(&path);
+                // Drop the sealed segment's allocation padding (see
+                // `compact_archive` for why). Best-effort — the
+                // rotation is committed either way.
+                crate::segment::compact_archive(&archived, sealed_end);
                 Ok(archived)
             }
             Err(e) => {
@@ -867,11 +875,19 @@ mod tests {
         writer.append(&sample(2)).unwrap();
         let seq_before_rotate = writer.next_sequence();
 
+        let sealed_end = writer.valid_end();
         let archived = writer.rotate_segment().unwrap();
         assert!(archived.exists(), "archived segment {archived:?} missing");
         // Rotation consumes no sequence number — chain metadata lives in
         // the new segment's header, not in the entry stream.
         assert_eq!(writer.next_sequence(), seq_before_rotate);
+        // The archive is compacted to its data end — no allocation
+        // padding survives sealing (bitwise-mirror property).
+        assert_eq!(
+            std::fs::metadata(&archived).unwrap().len(),
+            sealed_end,
+            "archive must be truncated to its valid data"
+        );
 
         writer.append(&sample(3)).unwrap();
         drop(writer);
@@ -910,8 +926,16 @@ mod tests {
         let prepared = prepared.expect("preparer should stage a segment within 5 s");
         let zeroed_end = prepared.allocated_end;
 
+        let sealed_end = writer.valid_end();
         let archived = writer.rotate_segment_with_prepared(prepared).unwrap();
         assert!(archived.exists(), "archived segment {archived:?} missing");
+        // Sealing compacts the archive to its data end regardless of
+        // rotation path (bitwise-mirror property across nodes).
+        assert_eq!(
+            std::fs::metadata(&archived).unwrap().len(),
+            sealed_end,
+            "archive must be truncated to its valid data"
+        );
         // Rotation consumes no sequence number.
         assert_eq!(writer.next_sequence(), seq_before_rotate);
         // The adopted segment's pre-zeroed region is the allocation —

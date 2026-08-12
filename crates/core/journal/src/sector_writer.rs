@@ -1002,6 +1002,12 @@ impl<E: AppEvent> SectorWriter<E> {
         );
 
         let path = self.path.clone();
+        // Data end of the outgoing segment, captured post-flush while
+        // `self` still describes it — the archive is compacted to this
+        // after the rotation commits. Truncating mid-sector is fine:
+        // the archive is never written again, and readers/tooling use
+        // buffered I/O with no alignment requirement.
+        let sealed_end = self.valid_end();
         // The new segment's header anchor is the outgoing segment's tail
         // chain hash, giving recovery a verifiable cross-segment link.
         // Zeros when hash-chain is disabled (nothing verifies them).
@@ -1027,6 +1033,10 @@ impl<E: AppEvent> SectorWriter<E> {
                 // re-registration and replication publishing on the
                 // result); a failure is retried from the flush paths.
                 self.dir_fsync_retry.after_rotation(&path);
+                // Drop the sealed segment's allocation padding (see
+                // `compact_archive` for why). Best-effort — the
+                // rotation is committed either way.
+                crate::segment::compact_archive(&archived, sealed_end);
                 Ok(archived)
             }
             Err(e) => {
@@ -2029,10 +2039,18 @@ mod tests {
         let prepared = prepared.expect("preparer should publish a segment within 5 s");
 
         // Take the fast path.
+        let sealed_end = writer.valid_end();
         let archived = writer
             .rotate_segment_with_prepared(prepared)
             .expect("rotate_with_prepared should succeed");
         assert!(archived.exists(), "archive should be on disk");
+        // Sealing compacts the archive to its data end regardless of
+        // writer mode (bitwise-mirror property across nodes).
+        assert_eq!(
+            std::fs::metadata(&archived).unwrap().len(),
+            sealed_end,
+            "archive must be truncated to its valid data"
+        );
         assert!(path.exists(), "new live segment should be at original path");
         assert!(
             !path.with_extension("journal.next-staging").exists(),
