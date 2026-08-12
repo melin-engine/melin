@@ -503,6 +503,12 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// boundary. Rotation outcome counters live in
     /// [`StageUtilization`] so `/healthz` can surface them.
     preparer: Option<SegmentPreparer>,
+    /// Core the preparer worker pins itself to; `0` = unpinned
+    /// (default). Set via [`set_preparer_core`](Self::set_preparer_core)
+    /// before the stage runs — keeps staging I/O off the IRQ core and
+    /// pipeline cores deterministically, same convention as the shadow
+    /// and event-publisher threads.
+    preparer_core: usize,
     /// Primary-announced stream marks to apply (replica mode only;
     /// `None` on primaries/standalone). Pushed by the replication
     /// receiver, popped here. See [`StreamMark`].
@@ -665,6 +671,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             rotate_requested: None,
             rotation_backoff_until: None,
             preparer: None,
+            preparer_core: 0,
             stream_marks: None,
             pending_mark: None,
         }
@@ -1307,6 +1314,14 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         }
     }
 
+    /// Set the core the preparer worker pins itself to (`0` =
+    /// unpinned). Call before the stage runs — `enable_preparer` reads
+    /// it at spawn time; changing it afterwards has no effect on an
+    /// already-running worker.
+    pub fn set_preparer_core(&mut self, core: usize) {
+        self.preparer_core = core;
+    }
+
     /// Test-only probe: whether `enable_preparer` armed the preparer.
     #[cfg(test)]
     pub(crate) fn preparer_enabled(&self) -> bool {
@@ -1803,6 +1818,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::BufferedWriter<E>> {
             SegmentPreparer::spawn_zero_fill(
                 stage.writer.path().to_path_buf(),
                 stage.max_journal_bytes,
+                stage.preparer_core,
             )
         });
     }
@@ -1895,6 +1911,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
             SegmentPreparer::spawn(
                 stage.writer.path().to_path_buf(),
                 stage.writer.sector_size(),
+                stage.preparer_core,
             )
         });
     }

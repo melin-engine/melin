@@ -997,6 +997,7 @@ mod tests {
                 shadow: 0,
                 repl_handler_0: 0,
                 repl_handler_1: 0,
+                journal_prep: 0,
             }
         }
 

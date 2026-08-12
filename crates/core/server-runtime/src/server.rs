@@ -91,13 +91,15 @@ pub struct ServerConfig {
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
-    /// Pipeline core IDs: journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1
-    /// (comma-separated). Core 0 is reserved for OS/IRQ handling.
+    /// Pipeline core IDs: journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep
+    /// (comma-separated; the tenth entry, journal-prep, is optional and
+    /// defaults to unpinned when omitted). Core 0 is reserved for OS/IRQ
+    /// handling.
     /// reader pins the io_uring reader (TCP) or DPDK poll thread.
     /// repl-sender is used when replication is enabled, event-publisher when
     /// `--event-bind` is set, shadow when `--snapshot-interval-ms` > 0.
     /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
-    #[arg(long, default_value = "1,2,3,4,5,6,7,8,9", value_parser = parse_cores)]
+    #[arg(long, default_value = "1,2,3,4,5,6,7,8,9,10", value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
     #[arg(long, default_value_t = 0)]
@@ -451,6 +453,7 @@ impl Default for ServerConfig {
                 shadow: 7,
                 repl_handler_0: 8,
                 repl_handler_1: 9,
+                journal_prep: 10,
             },
             group_commit_us: 0,
             heartbeat_interval_secs: 10,
@@ -564,6 +567,11 @@ pub struct PipelineCores {
     pub repl_handler_0: usize,
     /// Core for replication handler thread 1. 0 = unpinned (OS scheduled).
     pub repl_handler_1: usize,
+    /// Core for the journal segment preparer (background staging of the
+    /// next segment). 0 = unpinned (OS scheduled). Optional tenth entry
+    /// of `--cores` — omitted (9-entry) values leave it unpinned so
+    /// existing explicit configurations keep their exact behavior.
+    pub journal_prep: usize,
 }
 
 impl PipelineCores {
@@ -601,6 +609,10 @@ impl PipelineCores {
             // repl handlers not spawned in compact; 0 = unpinned.
             repl_handler_0: 0,
             repl_handler_1: 0,
+            // Preparer unpinned in compact — the embedded bench doesn't
+            // rotate at production cadence, and raising compact's core
+            // minimum for it isn't worth a core.
+            journal_prep: 0,
         };
         Ok((cores, 7))
     }
@@ -609,9 +621,13 @@ impl PipelineCores {
 /// Parse "j,m,r,rd,rs,ep,sh,h0,h1" into `PipelineCores` for pipeline core affinity.
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 9 {
+    // 9 or 10 entries: the tenth (journal-prep) was added later, so a
+    // 9-entry value — every explicit operator configuration written
+    // before it existed — must keep parsing, with journal-prep left
+    // unpinned.
+    if parts.len() != 9 && parts.len() != 10 {
         return Err(format!(
-            "expected 9 comma-separated core IDs (journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1), got {}",
+            "expected 9 or 10 comma-separated core IDs (journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1[,journal-prep]), got {}",
             parts.len()
         ));
     }
@@ -629,6 +645,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         shadow: parse(parts[6])?,
         repl_handler_0: parse(parts[7])?,
         repl_handler_1: parse(parts[8])?,
+        journal_prep: parts.get(9).map(|p| parse(p)).transpose()?.unwrap_or(0),
     })
 }
 
@@ -1402,6 +1419,7 @@ where
     let mut journal_stage = journal_stage;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    journal_stage.set_preparer_core(config.cores.journal_prep);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
@@ -2579,6 +2597,7 @@ where
         .transpose()?;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    journal_stage.set_preparer_core(config.cores.journal_prep);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
@@ -3537,6 +3556,23 @@ mod tests {
 
     use super::authenticate_connection;
     use super::{BootstrapSource, choose_bootstrap};
+
+    /// The tenth `--cores` entry (journal-prep) is optional: 9-entry
+    /// values — every explicit configuration written before the entry
+    /// existed — parse with the preparer unpinned, 10-entry values pin
+    /// it, and anything else is rejected.
+    #[test]
+    fn parse_cores_accepts_nine_or_ten_entries() {
+        let nine = super::parse_cores("1,2,3,4,5,6,7,8,9").expect("9 entries must parse");
+        assert_eq!(nine.journal_prep, 0, "omitted journal-prep = unpinned");
+        assert_eq!(nine.repl_handler_1, 9);
+
+        let ten = super::parse_cores("1,2,3,4,5,6,7,8,9,10").expect("10 entries must parse");
+        assert_eq!(ten.journal_prep, 10);
+
+        assert!(super::parse_cores("1,2,3").is_err());
+        assert!(super::parse_cores("1,2,3,4,5,6,7,8,9,10,11").is_err());
+    }
 
     /// Full bootstrap decision matrix. The two archive-only cells are
     /// the regression guard: a post-rotation crash leaves archives with

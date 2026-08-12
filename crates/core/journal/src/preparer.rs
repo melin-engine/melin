@@ -162,6 +162,9 @@ struct State {
     /// rotation (tiny observed segment) from shrinking the target below
     /// what size-driven rotation needs.
     zero_fill_floor: u64,
+    /// Core the worker pins itself to; `0` = unpinned. Read once at
+    /// worker startup.
+    pin_core: usize,
     /// Mutex<Option<…>> because the slot is mutated from two threads
     /// (worker writes, adopter takes) and has at most one entry. No
     /// contention on the hot path — the lock is only acquired at
@@ -187,8 +190,19 @@ impl SegmentPreparer {
     /// a crashed prior run — these files have no header and are not
     /// recognised by `segment::list_archives`, but leaving them on disk
     /// would cause `create_new` to fail at the next prepare.
-    pub fn spawn(live_path: PathBuf, sector_size: usize) -> Self {
-        Self::spawn_with_mode(live_path, PrepareMode::Sector { sector_size }, 0, 0)
+    /// `pin_core`: core to pin the worker to, `0` = unpinned (the
+    /// worker floats on the default mask at `SCHED_OTHER`). Pinning
+    /// keeps staging I/O bursts off the IRQ core and the pipeline
+    /// cores deterministically — same convention as the shadow and
+    /// event-publisher threads.
+    pub fn spawn(live_path: PathBuf, sector_size: usize, pin_core: usize) -> Self {
+        Self::spawn_with_mode(
+            live_path,
+            PrepareMode::Sector { sector_size },
+            0,
+            0,
+            pin_core,
+        )
     }
 
     /// Spawn a worker that stages segments by physically writing zeros
@@ -205,7 +219,12 @@ impl SegmentPreparer {
     /// rotation retunes it to the segment sizes actually observed, so a
     /// replica converges on the primary's real segment size after its
     /// first adoption regardless of configuration mismatch.
-    pub fn spawn_zero_fill(live_path: PathBuf, rotate_threshold_bytes: u64) -> Self {
+    /// `pin_core` as on [`spawn`](Self::spawn): `0` = unpinned.
+    pub fn spawn_zero_fill(
+        live_path: PathBuf,
+        rotate_threshold_bytes: u64,
+        pin_core: usize,
+    ) -> Self {
         let floor = if rotate_threshold_bytes > 0 {
             rotate_threshold_bytes + ZERO_FILL_MARGIN_BYTES
         } else {
@@ -216,7 +235,7 @@ impl SegmentPreparer {
         } else {
             crate::prealloc::prealloc_chunk_bytes() + ZERO_FILL_MARGIN_BYTES
         };
-        Self::spawn_with_mode(live_path, PrepareMode::ZeroFill, initial, floor)
+        Self::spawn_with_mode(live_path, PrepareMode::ZeroFill, initial, floor, pin_core)
     }
 
     fn spawn_with_mode(
@@ -224,6 +243,7 @@ impl SegmentPreparer {
         mode: PrepareMode,
         zero_fill_target: u64,
         zero_fill_floor: u64,
+        pin_core: usize,
     ) -> Self {
         cleanup_staging_orphan(&live_path);
 
@@ -232,6 +252,7 @@ impl SegmentPreparer {
             mode,
             zero_fill_target: AtomicU64::new(zero_fill_target),
             zero_fill_floor,
+            pin_core,
             slot: Mutex::new(None),
             // Pre-arm at startup so the worker prepares the first spare
             // segment in parallel with engine warm-up. The first rotation
@@ -341,12 +362,14 @@ fn worker_loop(state: Arc<State>) {
     // both. Left in place, this worker either starves behind the
     // busy-spinning journal thread (a same-priority FIFO peer on the
     // same core never runs, so the fast path never arms) or executes
-    // the ~38 ms allocate ceremony ON the journal core whenever the
-    // journal thread blocks. Reset to the default mask and SCHED_OTHER
-    // before doing any work, like every other child of a pinned thread.
+    // the staging work ON the journal core whenever the journal thread
+    // blocks. Reset to the default mask and SCHED_OTHER first, like
+    // every other child of a pinned thread — then apply the configured
+    // pin (if any) on top, so a pinned worker still runs SCHED_OTHER.
     if let Err(e) = melin_app::affinity::clear_affinity() {
         tracing::warn!(error = e, "failed to clear segment-preparer affinity");
     }
+    melin_app::affinity::pin_thread("journal-prep", state.pin_core);
     loop {
         // Wait for arm or shutdown.
         let mut armed = match state.armed.lock() {
@@ -694,7 +717,7 @@ mod tests {
         // Live file doesn't need to exist — the preparer only touches
         // the staging sibling.
 
-        let preparer = SegmentPreparer::spawn(live.clone(), 4096);
+        let preparer = SegmentPreparer::spawn(live.clone(), 4096, 0);
 
         // Wait up to 5 s for the worker to publish a prepared segment.
         // 256 MiB fallocate on tmpfs is sub-millisecond, but the bounded
@@ -736,7 +759,7 @@ mod tests {
         std::fs::write(&staging, b"orphan from prior crash").expect("write orphan");
         assert!(staging.exists());
 
-        let preparer = SegmentPreparer::spawn(live, 4096);
+        let preparer = SegmentPreparer::spawn(live, 4096, 0);
 
         // The orphan should be gone immediately; the worker will then
         // create a fresh staging file.
@@ -768,7 +791,7 @@ mod tests {
 
         // 3 MiB threshold → staged size = threshold + margin.
         let threshold: u64 = 3 * 1024 * 1024;
-        let preparer = SegmentPreparer::spawn_zero_fill(live.clone(), threshold);
+        let preparer = SegmentPreparer::spawn_zero_fill(live.clone(), threshold, 0);
 
         let mut prepared = None;
         for _ in 0..500 {
@@ -821,7 +844,7 @@ mod tests {
 
         // Replica-style spawn: threshold unknown (0) → chunk fallback.
         let _prealloc_guard = crate::prealloc::PreallocOverrideGuard::new(1024 * 1024);
-        let preparer = SegmentPreparer::spawn_zero_fill(live, 0);
+        let preparer = SegmentPreparer::spawn_zero_fill(live, 0, 0);
 
         let take_one = || {
             for _ in 0..500 {
@@ -864,7 +887,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
 
-        let preparer = SegmentPreparer::spawn(live, 4096);
+        let preparer = SegmentPreparer::spawn(live, 4096, 0);
 
         // First prepared segment.
         let mut first = None;

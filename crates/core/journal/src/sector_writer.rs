@@ -2027,7 +2027,7 @@ mod tests {
         let next_seq_before_rotate = writer.next_sequence();
 
         // Spawn a preparer and wait for it to publish a prepared segment.
-        let preparer = SegmentPreparer::spawn(path.clone(), writer.sector_size);
+        let preparer = SegmentPreparer::spawn(path.clone(), writer.sector_size, 0);
         let mut prepared = None;
         for _ in 0..500 {
             if let Some(p) = preparer.take() {

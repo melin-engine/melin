@@ -914,7 +914,8 @@ mod tests {
 
         // Stage a zero-filled segment the way the pipeline's preparer
         // would (small threshold keeps the test fast).
-        let preparer = crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024);
+        let preparer =
+            crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024, 0);
         let mut prepared = None;
         for _ in 0..500 {
             if let Some(p) = preparer.take() {
@@ -963,7 +964,8 @@ mod tests {
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         writer.append(&sample(7)).unwrap();
 
-        let preparer = crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024);
+        let preparer =
+            crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024, 0);
         let mut prepared = None;
         for _ in 0..500 {
             if let Some(p) = preparer.take() {
@@ -1014,7 +1016,8 @@ mod tests {
         writer.append(&sample(1)).unwrap();
         let chain_before = writer.chain_hash().unwrap();
 
-        let preparer = crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024);
+        let preparer =
+            crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024, 0);
         let mut prepared = None;
         for _ in 0..500 {
             if let Some(p) = preparer.take() {
