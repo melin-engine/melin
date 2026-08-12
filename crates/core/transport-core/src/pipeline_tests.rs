@@ -2402,6 +2402,104 @@ fn size_rotation_uses_prepared_fast_path_after_warmup() {
     handle.join().unwrap().unwrap();
 }
 
+/// Buffered-writer twin of the fast-path warmup test above: the
+/// buffered stage's `run` must arm the zero-fill preparer, and
+/// steady-state size rotations must adopt pre-zeroed segments. This is
+/// the wiring half of the fdatasync journal-force fix (see
+/// `docs/internal/journal-fsync-beat-2026-08.md`): a sync-fallback
+/// segment still works but re-introduces per-append extent-conversion
+/// metadata until the next rotation.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn buffered_size_rotation_uses_prepared_fast_path_after_warmup() {
+    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("buf_fast_rotate.journal");
+    let writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    // Tiny threshold — every non-empty fsync rotates.
+    stage.set_rotation(/* max_journal_bytes */ 1, None);
+    let util = stage.utilization();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    // Early rotations may race the preparer's initial staging and fall
+    // back; once the worker catches up, a rotation must hit the fast
+    // path. Keep publishing until one does (bounded by the deadline).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut n = 0u64;
+    while util.rotations_fast_path.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no fast-path rotation within deadline (sync fallbacks: {})",
+            util.rotations_sync_fallback.load(Ordering::Relaxed)
+        );
+        n += 1;
+        producer.publish(add_slot(n, 1_000_000_000 + n));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+}
+
+/// The buffered `enable_preparer` follows the same arming policy as
+/// the sector variant: size-driven rotation and replica adoption arm
+/// it, manual-only rotation does not. Separate code path from the
+/// sector impl, so it gets its own regression test.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn buffered_preparer_arms_for_size_and_replica_modes_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk_stage = |name: &str| {
+        let writer = BufferedWriter::<TestEvent>::create(&dir.path().join(name)).unwrap();
+        let (_p, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+            .add_consumer()
+            .build();
+        JournalStage::new(
+            writer,
+            consumers.pop().unwrap(),
+            Duration::ZERO,
+            MAX_JOURNAL_BATCH,
+            false,
+        )
+    };
+
+    let mut size_driven = mk_stage("buf_size.journal");
+    size_driven.set_rotation(1024, None);
+    size_driven.enable_preparer();
+    assert!(
+        size_driven.preparer_enabled(),
+        "size-driven rotation must arm the preparer"
+    );
+
+    let mut replica = mk_stage("buf_replica.journal");
+    replica.set_stream_marks(Arc::new(std::sync::Mutex::new(
+        std::collections::VecDeque::new(),
+    )));
+    replica.enable_preparer();
+    assert!(
+        replica.preparer_enabled(),
+        "replica adoption must arm the preparer"
+    );
+
+    let mut manual_only = mk_stage("buf_manual.journal");
+    manual_only.set_rotation(0, Some(Arc::new(AtomicBool::new(false))));
+    manual_only.enable_preparer();
+    assert!(
+        !manual_only.preparer_enabled(),
+        "manual-only rotation must not arm the preparer"
+    );
+}
+
 /// `enable_preparer` arms exactly when rotation recurs on a
 /// predictable cadence: size-driven rotation or replica adoption
 /// (primary-announced rotations arrive at the primary's cadence).

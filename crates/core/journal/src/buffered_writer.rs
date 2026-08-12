@@ -451,6 +451,40 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// segment. No sequence number is consumed — the next event written
     /// gets exactly `next_sequence`.
     pub fn rotate_segment(&mut self) -> Result<PathBuf, JournalError> {
+        self.rotate_segment_inner(None)
+    }
+
+    /// Rotate, adopting a pre-staged segment produced by
+    /// [`crate::preparer::SegmentPreparer::spawn_zero_fill`].
+    ///
+    /// Same contract as [`Self::rotate_segment`], but the new segment
+    /// is the preparer's zero-filled staging file instead of a fresh
+    /// `create_continuing`. Two wins over the sync path:
+    ///
+    /// - rotation cost drops to two renames + a header pwrite + fsyncs
+    ///   (no `create_new` + `posix_fallocate` on the journal thread),
+    /// - the segment's extents are already *written*, so subsequent
+    ///   appends generate no extent-conversion metadata and
+    ///   `flush_batch_sync`'s `fdatasync` never has to force the
+    ///   filesystem journal (the ~2 ms periodic pipeline freeze
+    ///   documented in `docs/internal/journal-fsync-beat-2026-08.md`).
+    ///
+    /// On error the prepared file is consumed (renamed onto the live
+    /// path then rolled back, or left as staging for the next preparer
+    /// cycle to reclaim). Callers should re-arm the preparer after a
+    /// successful return so the next rotation can also be fast.
+    pub fn rotate_segment_with_prepared(
+        &mut self,
+        prepared: crate::preparer::PreparedSegment,
+    ) -> Result<PathBuf, JournalError> {
+        self.rotate_segment_inner(Some(prepared))
+    }
+
+    /// Shared rotation body. `prepared.is_some()` takes the fast path.
+    fn rotate_segment_inner(
+        &mut self,
+        prepared: Option<crate::preparer::PreparedSegment>,
+    ) -> Result<PathBuf, JournalError> {
         self.flush_batch_sync()?;
 
         let path = self.path.clone();
@@ -463,9 +497,15 @@ impl<E: AppEvent> BufferedWriter<E> {
 
         let archived = crate::segment::archive_live(&path)?;
 
-        match Self::create_continuing(&path, next_seq, anchor) {
-            Ok(new_writer) => {
+        let installed = match prepared {
+            Some(p) => self.install_prepared_segment(p, &path, next_seq, anchor),
+            None => Self::create_continuing(&path, next_seq, anchor).map(|new_writer| {
                 *self = new_writer;
+            }),
+        };
+
+        match installed {
+            Ok(()) => {
                 // Persist both the rename (archive_live) and the new
                 // live file's dirent in a single dir fsync so recovery
                 // sees a consistent post-rotation layout after a crash.
@@ -504,9 +544,84 @@ impl<E: AppEvent> BufferedWriter<E> {
         }
     }
 
+    /// Point this writer at a freshly prepared (zero-filled) segment
+    /// file, keeping the writer's own buffers.
+    ///
+    /// Mirrors `SectorWriter::install_new_segment`: all fallible work
+    /// (rename, header pwrite, fsync) happens before any field is
+    /// assigned, so on error the writer continues on the current
+    /// segment unchanged — the caller's rename-back rollback restores
+    /// the archived live file.
+    ///
+    /// Installing in place (rather than `*self = create_continuing(…)`)
+    /// also keeps the existing `batch_buf` allocation instead of
+    /// building a throwaway replacement per rotation.
+    fn install_prepared_segment(
+        &mut self,
+        prepared: crate::preparer::PreparedSegment,
+        live_path: &Path,
+        starting_sequence: u64,
+        anchor_hash: [u8; 32],
+    ) -> Result<(), JournalError> {
+        let crate::preparer::PreparedSegment {
+            file,
+            path: staging_path,
+            allocated_end,
+            // Sector alignment is an O_DIRECT concern; this writer goes
+            // through the page cache.
+            sector_size: _,
+        } = prepared;
+
+        // Rename staging onto the live path. `archive_live` has already
+        // moved the previous live segment aside, so the destination is
+        // free. Done before any further writes so that, if it fails,
+        // the staging file is still findable for cleanup.
+        std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
+
+        // Write the file header. The staging file is zero-filled
+        // including `[0, ENTRY_OFFSET)`, so this pwrite lands in
+        // already-written extents like every append after it.
+        let mut header_buf = [0u8; MAX_SECTOR_SIZE];
+        codec::encode_file_header(
+            &mut header_buf,
+            MAX_SECTOR_SIZE,
+            starting_sequence,
+            anchor_hash,
+        );
+        write_all_at(&file, &header_buf, 0)?;
+        // Commit the header durably before adopting — a crash before
+        // the next user write must still leave a parseable empty
+        // journal, matching `create_continuing`.
+        file.sync_all()?;
+
+        // Commit point — nothing below can fail. Dropping the old
+        // `self.file` closes the outgoing (now archived) segment's fd.
+        self.file = file;
+        self.write_pos = HEADER_OFFSET;
+        self.allocated_end = allocated_end;
+        self.starting_sequence = starting_sequence;
+        self.batch_len = 0;
+        self.last_user_entry_offset = 0;
+        self.last_user_entry_len = 0;
+        #[cfg(feature = "hash-chain")]
+        {
+            self.hash_chain = SegmentChain::new(anchor_hash);
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.last_encoded_seq = 0;
+        }
+        Ok(())
+    }
+
     /// Extend the file's pre-allocated region whenever the next write
     /// would land past it. Allocates one chunk at a time via
     /// `posix_fallocate` — extent allocation only, no zero-fill cost.
+    /// In the prepared-segment flow this only fires when a segment
+    /// outgrows its pre-zeroed region (threshold overshoot past the
+    /// preparer's margin, or a replica following larger-than-expected
+    /// primary segments) — appends past here generate extent-conversion
+    /// metadata again until the next rotation.
     fn ensure_allocated(&mut self) -> Result<(), JournalError> {
         let need = self.write_pos + self.batch_len as u64;
         if need <= self.allocated_end {
@@ -750,6 +865,86 @@ mod tests {
         assert_eq!(read_all_payloads(&archived), vec![1, 2]);
     }
 
+    /// The prepared-adoption fast path must be observationally
+    /// identical to the synchronous rotation: same archive layout, same
+    /// sequence continuation, same readable entries, and the new live
+    /// segment must resume the chain from the outgoing tail.
+    #[test]
+    fn rotate_with_prepared_matches_sync_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&sample(1)).unwrap();
+        writer.append(&sample(2)).unwrap();
+        let seq_before_rotate = writer.next_sequence();
+
+        // Stage a zero-filled segment the way the pipeline's preparer
+        // would (small threshold keeps the test fast).
+        let preparer = crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024);
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let prepared = prepared.expect("preparer should stage a segment within 5 s");
+        let zeroed_end = prepared.allocated_end;
+
+        let archived = writer.rotate_segment_with_prepared(prepared).unwrap();
+        assert!(archived.exists(), "archived segment {archived:?} missing");
+        // Rotation consumes no sequence number.
+        assert_eq!(writer.next_sequence(), seq_before_rotate);
+        // The adopted segment's pre-zeroed region is the allocation —
+        // appends must not immediately re-fallocate.
+        assert_eq!(writer.allocated_end, zeroed_end);
+        // The staging file is gone (renamed onto the live path).
+        assert!(!crate::preparer::staging_path(&path).exists());
+
+        writer.append(&sample(3)).unwrap();
+        drop(writer);
+        preparer.shutdown();
+
+        // Same observable layout as the sync-rotation test above.
+        assert_eq!(read_all_payloads(&path), vec![3]);
+        assert_eq!(read_all_payloads(&archived), vec![1, 2]);
+    }
+
+    /// A crash between prepared adoption and the first append must
+    /// leave a parseable empty journal (header durable, zero entries).
+    #[test]
+    fn prepared_adoption_leaves_parseable_empty_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&sample(7)).unwrap();
+
+        let preparer = crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024);
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let prepared = prepared.expect("prepared segment");
+
+        writer.rotate_segment_with_prepared(prepared).unwrap();
+        // Simulate the crash: drop without appending.
+        drop(writer);
+        preparer.shutdown();
+
+        assert_eq!(
+            read_all_payloads(&path),
+            Vec::<u64>::new(),
+            "empty live segment must parse cleanly"
+        );
+    }
+
     #[test]
     fn flush_with_empty_buffer_is_noop() {
         let dir = tempfile::tempdir().unwrap();
@@ -763,6 +958,36 @@ mod tests {
         writer.flush_batch_sync().unwrap();
         writer.flush_batch_sync().unwrap();
         assert_eq!(writer.write_pos(), pos_before);
+    }
+
+    /// Prepared rotation anchors the new segment on the outgoing tail:
+    /// an empty just-rotated segment's chain value equals the anchor,
+    /// which must be the pre-rotation chain hash.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn chain_hash_continues_across_prepared_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&sample(1)).unwrap();
+        let chain_before = writer.chain_hash().unwrap();
+
+        let preparer = crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024);
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        writer
+            .rotate_segment_with_prepared(prepared.expect("prepared segment"))
+            .unwrap();
+        preparer.shutdown();
+
+        assert_eq!(writer.chain_hash(), Some(chain_before));
     }
 
     #[cfg(feature = "hash-chain")]

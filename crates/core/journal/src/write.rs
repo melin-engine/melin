@@ -107,6 +107,15 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Close the active segment and open a fresh one; returns the
     /// archived path.
     fn rotate_segment(&mut self) -> Result<PathBuf, JournalError>;
+    /// Rotate adopting a pre-staged segment from the
+    /// [`crate::preparer::SegmentPreparer`] (the fast path — no file
+    /// creation/allocation on the calling thread). Each writer requires
+    /// a preparer spawned in its matching mode: `spawn` for
+    /// `SectorWriter`, `spawn_zero_fill` for `BufferedWriter`.
+    fn rotate_segment_with_prepared(
+        &mut self,
+        prepared: crate::preparer::PreparedSegment,
+    ) -> Result<PathBuf, JournalError>;
     /// Decoded file-header fields of the active segment (used by
     /// replication to bootstrap a fresh replica's chain anchor and
     /// starting sequence).
@@ -232,6 +241,14 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     }
 
     #[inline]
+    fn rotate_segment_with_prepared(
+        &mut self,
+        prepared: crate::preparer::PreparedSegment,
+    ) -> Result<PathBuf, JournalError> {
+        SectorWriter::rotate_segment_with_prepared(self, prepared)
+    }
+
+    #[inline]
     fn read_header_info(&self) -> Result<crate::codec::FileHeaderInfo, JournalError> {
         SectorWriter::read_header_info(self)
     }
@@ -322,6 +339,14 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     #[inline]
     fn rotate_segment(&mut self) -> Result<PathBuf, JournalError> {
         BufferedWriter::rotate_segment(self)
+    }
+
+    #[inline]
+    fn rotate_segment_with_prepared(
+        &mut self,
+        prepared: crate::preparer::PreparedSegment,
+    ) -> Result<PathBuf, JournalError> {
+        BufferedWriter::rotate_segment_with_prepared(self, prepared)
     }
 
     #[inline]
