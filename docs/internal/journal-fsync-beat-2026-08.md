@@ -147,6 +147,27 @@ The terminal `sync_all` remains the durability point but is cheap by
 construction. (The `FALLOC_FL_WRITE_ZEROES` fast path is unaffected —
 its allocation is a handful of extents, one small log item.)
 
+That killed the ~9.4 ms class (run max 9.4 → 6.6 ms) but left a ~2.5 ms
+stall at *every* rotation and p99.9 at ~1.5 ms vs the ~197 µs baseline.
+An off-CPU trace of the primary's journal thread (sched_switch with
+kernel stacks, 45 s / ~13 rotations) attributed it conclusively: every
+block ≥ 1 ms — 1082 of them — was the hot-path fdatasync sleeping in
+`folio_wait_writeback`, i.e. queued behind in-flight staging writeback
+on the device; zero were in `xfs_log_force`, and the rotation-path
+syscalls themselves (renames, dir fsync, archive truncate, header
+sync) all completed in under 1 ms. The slow flushes formed a ~250 ms
+burst after each rotation — the staging window — where every batch
+flush took 1-2 ms instead of ~0.33 ms: the double-window pacing kept
+two 2 MiB chunks (≈ 4 MiB ≈ 1.2-1.4 ms of device time) in flight ahead
+of any colliding flush, and ~7% of samples at 1-2 ms is exactly a
+~1.5 ms p99.9.
+
+Final pacing shape: single-window (write one chunk, wait for *its*
+writeback, sleep 3×) with 256 KiB chunks — at most ~90 µs of staging
+IO can ever sit ahead of a hot-path flush, below the flush's own
+~300 µs floor. Duty and staging duration are unchanged; only the
+in-flight window shrank.
+
 ## Implication: the sector writer
 
 Both structural advantages the sector writer holds over the buffered

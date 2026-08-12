@@ -539,19 +539,26 @@ fn prepare_zero_filled(
     // adjacent fsync stalls that only faded once the kernel's own
     // dirty-page throttling kicked in mid-run.
     //
-    // The double-window pattern makes the loop device-clocked:
+    // The single-window pattern makes the loop device-clocked AND caps
+    // how much staging IO a hot-path flush can ever queue behind:
     //
-    // - write chunk N (memcpy into cache), start async writeback on it;
-    // - wait for chunk N-1's writeback to COMPLETE
-    //   (`WAIT_BEFORE|WRITE|WAIT_AFTER`) — at most two chunks are ever
-    //   in flight, and each iteration's wall time now includes real
-    //   device time for one chunk;
-    // - sleep 3× that wall time: a genuine ~25% device duty, so a live
-    //   batch fsync waits behind at most one 2 MiB chunk (~1.5 ms at
-    //   NVMe bandwidth). Self-adapting — no bandwidth constant — and
-    //   staging duration stays ≈ 4× (segment bytes / device bandwidth),
-    //   well inside any rotation period whose segment the device can
-    //   write once.
+    // - write chunk N (memcpy into cache), then wait for ITS writeback
+    //   to complete (`WAIT_BEFORE|WRITE|WAIT_AFTER`) — exactly one
+    //   chunk is ever in flight, and each iteration's wall time is real
+    //   device time for that chunk;
+    // - sleep 3× that wall time: a genuine ~25% device duty.
+    //   Self-adapting — no bandwidth constant — and staging duration
+    //   stays ≈ 4× (segment bytes / device bandwidth), well inside any
+    //   rotation period whose segment the device can write once.
+    //
+    // The chunk must be SMALL: an off-CPU trace of the journal thread
+    // showed its per-batch fdatasyncs queueing behind in-flight staging
+    // chunks for the duration of the fill — with 2 MiB chunks and a
+    // two-chunk window that was 1-2 ms added to every hot-path flush in
+    // the staging window (~7% of the rotation cycle), which alone put
+    // end-to-end p99.9 at ~1.5 ms. One 256 KiB chunk is ~90 µs of
+    // device time, keeping a colliding flush's detour well under the
+    // hot path's own ~300 µs flush floor.
     //
     // Data pacing alone is not enough: `sync_file_range` never logs
     // filesystem metadata, so the extent allocations for the entire
@@ -571,16 +578,19 @@ fn prepare_zero_filled(
     // partial trailing-page writes never pay a read-modify-write
     // device read on the hot path (which O_DIRECT staging would
     // reintroduce). std's `write_all_at` handles short writes and
-    // EINTR retries. Heap Vec (not a stack array) — 2 MiB would
-    // overflow default thread stacks.
-    const ZERO_CHUNK: usize = 2 * 1024 * 1024;
+    // EINTR retries. Heap Vec (not a stack array) to keep the worker's
+    // stack footprint trivial.
+    //
+    // 256 KiB: large enough that sequential NVMe writeback runs at full
+    // per-command efficiency, small enough that the one in-flight chunk
+    // delays a colliding hot-path flush by only ~90 µs (see above).
+    const ZERO_CHUNK: usize = 256 * 1024;
     // Log-force cadence for the paced fill (see the comment above): at
     // ~25% device duty this is one small `sync_data` every ~100 ms,
     // each logging only the allocations made since the previous one.
     const METADATA_SYNC_INTERVAL: u64 = 64 * 1024 * 1024;
     let zeros = vec![0u8; ZERO_CHUNK];
     let mut offset: u64 = 0;
-    let mut prev_chunk: Option<(u64, u64)> = None;
     let mut last_metadata_sync: u64 = 0;
     while offset < bytes {
         if shutdown.load(Ordering::Acquire) {
@@ -592,17 +602,14 @@ fn prepare_zero_filled(
         let chunk_start = std::time::Instant::now();
         let n = (bytes - offset).min(zeros.len() as u64) as usize;
         std::os::unix::fs::FileExt::write_all_at(&file, &zeros[..n], offset)?;
-        start_background_writeback(&file, offset, n as u64);
-        if let Some((prev_off, prev_len)) = prev_chunk {
-            wait_for_writeback(&file, prev_off, prev_len);
-        }
-        prev_chunk = Some((offset, n as u64));
+        wait_for_writeback(&file, offset, n as u64);
         offset += n as u64;
 
-        // Incremental log force: flushes the pending chunk's data plus
-        // the extent-allocation metadata accumulated since the last
-        // force. Runs before the pacing sleep so its wall time counts
-        // toward this iteration's device-duty accounting.
+        // Incremental log force for the extent-allocation metadata
+        // accumulated since the last force (the data is already on
+        // disk chunk-by-chunk). Runs before the pacing sleep so its
+        // wall time counts toward this iteration's device-duty
+        // accounting.
         if offset - last_metadata_sync >= METADATA_SYNC_INTERVAL {
             file.sync_data()?;
             last_metadata_sync = offset;
@@ -626,12 +633,13 @@ fn prepare_zero_filled(
     })
 }
 
-/// Wait for writeback of `[offset, offset + len)` to complete
-/// (`WAIT_BEFORE|WRITE|WAIT_AFTER`). The device-clock half of the
-/// zero-fill's double-window pacing — the wait is the point, it makes
-/// the loop's wall time reflect real device time. Best-effort like
-/// [`start_background_writeback`]: on failure the fill just paces less
-/// accurately and the final `sync_all` remains the durability point.
+/// Start writeback of `[offset, offset + len)` and wait for it to
+/// complete (`WAIT_BEFORE|WRITE|WAIT_AFTER`). The device clock of the
+/// zero-fill's single-window pacing — the wait is the point: it makes
+/// the loop's wall time reflect real device time and guarantees no
+/// staging IO stays in flight into the next iteration. Best-effort: on
+/// failure the fill just paces less accurately and the final
+/// `sync_all` remains the durability point.
 fn wait_for_writeback(file: &File, offset: u64, len: u64) {
     use std::os::fd::AsRawFd;
     // SAFETY: plain syscall on an owned, open fd; no memory is passed.
@@ -699,25 +707,6 @@ fn try_fallocate_write_zeroes(file: &File, bytes: u64) -> bool {
         );
     }
     false
-}
-
-/// Ask the kernel to start (not wait for) writeback of `[offset,
-/// offset + len)`. Best-effort pacing for the zero fill — a failure
-/// only means the final `sync_all` flushes more at once, so the error
-/// is deliberately ignored (the fill's durability comes from
-/// `sync_all`, not from here).
-fn start_background_writeback(file: &File, offset: u64, len: u64) {
-    use std::os::fd::AsRawFd;
-    // SAFETY: plain syscall on an owned, open fd; no memory is passed.
-    // Result deliberately dropped — see the function docs.
-    let _ = unsafe {
-        libc::sync_file_range(
-            file.as_raw_fd(),
-            offset as libc::off64_t,
-            len as libc::off64_t,
-            libc::SYNC_FILE_RANGE_WRITE,
-        )
-    };
 }
 
 /// Remove a stale `<live>.next-staging` file left behind by a prior
