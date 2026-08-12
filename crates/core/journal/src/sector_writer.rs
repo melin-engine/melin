@@ -250,18 +250,7 @@ impl<E: AppEvent> SectorWriter<E> {
         anchor_hash: [u8; 32],
         sector_size: usize,
     ) -> Result<Self, JournalError> {
-        // Reserve `ENTRY_OFFSET` bytes for the file header regardless of
-        // device sector size — the layout invariant that lets BufferedWriter
-        // and SectorWriter open each other's journals.
-        let allocated_end = preallocate(&file, ENTRY_OFFSET)?;
-        zero_range_extents(&file, ENTRY_OFFSET, allocated_end);
-
-        // Pre-fault all pages in the preallocated region so the first write
-        // to each 4 KB page doesn't trigger a page cache miss during an
-        // io_uring write. Without this, each miss is handled by an io-wq
-        // worker on core 0 (IRQ core), which competes with TCP interrupt
-        // handlers and can stall for hundreds of milliseconds under load.
-        prefault_pages(&file, ENTRY_OFFSET, allocated_end);
+        let allocated_end = Self::prepare_segment_region(&file)?;
 
         let writer = Self::build_from_owned_parts(
             file,
@@ -275,14 +264,36 @@ impl<E: AppEvent> SectorWriter<E> {
         Ok(writer)
     }
 
+    /// Preallocate, zero, and prefault a fresh segment file's header
+    /// region. Shared by first-time creation and the rotation sync
+    /// (no prepared segment) path.
+    ///
+    /// Reserves `ENTRY_OFFSET` bytes for the file header regardless of
+    /// device sector size — the layout invariant that lets
+    /// BufferedWriter and SectorWriter open each other's journals.
+    ///
+    /// Pre-faults all pages in the preallocated region so the first
+    /// write to each 4 KB page doesn't trigger a page cache miss during
+    /// an io_uring write. Without this, each miss is handled by an
+    /// io-wq worker on core 0 (IRQ core), which competes with TCP
+    /// interrupt handlers and can stall for hundreds of milliseconds
+    /// under load.
+    fn prepare_segment_region(file: &File) -> Result<u64, JournalError> {
+        let allocated_end = preallocate(file, ENTRY_OFFSET)?;
+        zero_range_extents(file, ENTRY_OFFSET, allocated_end);
+        prefault_pages(file, ENTRY_OFFSET, allocated_end);
+        Ok(allocated_end)
+    }
+
     /// Assemble a `SectorWriter` from an already-open file whose
     /// `[sector_size, allocated_end)` range is already prepared
     /// (allocated, zeroed, prefaulted). Writes the file header sector
     /// and locks the in-memory buffers. Does not call `sync_all` — the
     /// caller issues one so the header is durable before first use.
     ///
-    /// Shared by `create_bare_inner` (full first-time setup) and
-    /// `adopt_prepared` (the rotation fast path).
+    /// First-time setup only (`create_bare_inner`) — rotation reuses
+    /// the existing writer via `install_new_segment` instead, so the
+    /// batch buffers keep their registered addresses.
     fn build_from_owned_parts(
         file: File,
         path: &Path,
@@ -338,13 +349,12 @@ impl<E: AppEvent> SectorWriter<E> {
         })
     }
 
-    /// Adopt a [`PreparedSegment`] produced by [`SegmentPreparer`].
+    /// Rotation fast path: rename a [`PreparedSegment`]'s staging file
+    /// onto the live path and hand its parts to `install_new_segment`.
     ///
-    /// Mirrors `create_continuing` but reuses the already-allocated /
-    /// zero-ranged / prefaulted staging file instead of doing that work
-    /// synchronously. On a successful return the new live segment is at
-    /// `live_path` with its file header (anchor included) durably
-    /// written.
+    /// The staging file is already allocated / zero-ranged / prefaulted
+    /// by [`SegmentPreparer`]; its file header is written by
+    /// `install_new_segment` after adoption.
     ///
     /// Failure mode contract for [`Self::rotate_segment_inner`]: this
     /// method may or may not have renamed the staging file before
@@ -355,12 +365,10 @@ impl<E: AppEvent> SectorWriter<E> {
     /// (rename succeeded) or still on disk (rename failed); in the
     /// latter case the next preparer cycle removes it via the
     /// `create_new`-then-cleanup pattern.
-    pub(crate) fn adopt_prepared(
+    fn adopt_prepared_file(
         prepared: PreparedSegment,
         live_path: &Path,
-        starting_sequence: u64,
-        anchor_hash: [u8; 32],
-    ) -> Result<Self, JournalError> {
+    ) -> Result<(File, u64, usize), JournalError> {
         let PreparedSegment {
             file,
             path: staging_path,
@@ -374,20 +382,85 @@ impl<E: AppEvent> SectorWriter<E> {
         // staging file is still findable for cleanup.
         std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
 
-        let writer = Self::build_from_owned_parts(
-            file,
-            live_path,
-            starting_sequence,
+        Ok((file, allocated_end, sector_size))
+    }
+
+    /// Rotation sync path: open and prepare a brand-new segment file
+    /// (`create_new` + O_DIRECT, header region preallocated / zeroed /
+    /// prefaulted). Its file header is written by `install_new_segment`.
+    fn prepare_continuing_file(path: &Path) -> Result<(File, u64, usize), JournalError> {
+        // O_DIRECT requires writes aligned to the device's physical
+        // sector size. Read permission is required for prefault_pages
+        // (mmap MAP_SHARED) and for partial-tail recovery on open_append.
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(not(feature = "no-o-direct"))]
+        opts.custom_flags(libc::O_DIRECT);
+        let file = opts.open(path)?;
+
+        let sector_size = detect_sector_size(file.as_fd());
+        let allocated_end = Self::prepare_segment_region(&file)?;
+        Ok((file, allocated_end, sector_size))
+    }
+
+    /// Point this writer at a freshly prepared segment file, reusing
+    /// the writer's own buffers.
+    ///
+    /// Rotation deliberately does NOT construct a new `SectorWriter`:
+    /// the batch buffers may be registered with io_uring as fixed
+    /// buffers, so their addresses must survive rotation (the contract
+    /// documented on [`Self::batch_buffer_regions`]). Installing in
+    /// place makes that structural — no buffer field is touched — and
+    /// skips reallocating and mlocking a throwaway pair per rotation.
+    ///
+    /// All fallible work happens on the new file before any field is
+    /// assigned, so on error the writer continues on the current
+    /// segment unchanged.
+    fn install_new_segment(
+        &mut self,
+        file: File,
+        allocated_end: u64,
+        sector_size: usize,
+        anchor_hash: [u8; 32],
+    ) -> Result<(), JournalError> {
+        // The header goes through a scratch sector rather than
+        // `tail_sector`: `tail_sector` still holds the outgoing
+        // segment's partial tail, which must survive intact if the
+        // header write fails (the writer keeps appending to the current
+        // segment on the error path).
+        let mut header = Self::alloc_tail_sector();
+        codec::encode_file_header(
+            &mut header[..MAX_SECTOR_SIZE],
+            MAX_SECTOR_SIZE,
+            self.next_sequence,
             anchor_hash,
-            sector_size,
-            allocated_end,
-        )?;
+        );
+        pwrite_aligned_sector(file.as_fd(), &header[..MAX_SECTOR_SIZE], 0)?;
+        // Commit the header sector explicitly so a crash before the
+        // next user write doesn't leave a header-less live segment.
+        file.sync_all()?;
 
-        // Commit the header sector explicitly so a crash before the next
-        // user write doesn't leave a header-less live segment.
-        writer.file.sync_all()?;
-
-        Ok(writer)
+        // Commit point — nothing below can fail. Dropping `self.file`
+        // closes the outgoing (now archived) segment's fd.
+        self.file = file;
+        self.write_pos = ENTRY_OFFSET;
+        self.allocated_end = allocated_end;
+        self.starting_sequence = self.next_sequence;
+        self.sector_size = sector_size;
+        self.batch_len = 0;
+        self.last_user_entry_offset = 0;
+        self.last_user_entry_len = 0;
+        self.tail_sector.fill(0);
+        self.tail_sector_len = 0;
+        #[cfg(feature = "hash-chain")]
+        {
+            self.hash_chain = SegmentChain::new(anchor_hash);
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.last_encoded_seq = 0;
+        }
+        Ok(())
     }
 
     /// Open an existing journal file for appending after recovery.
@@ -643,7 +716,16 @@ impl<E: AppEvent> SectorWriter<E> {
     /// construction, and exchanged with in-flight batches by *ownership*
     /// (`take_batch_for_async_write` / `confirm_async_write`) — the
     /// addresses never change for the writer's lifetime, which is
-    /// exactly the stability registration requires.
+    /// exactly the stability registration requires. Segment rotation
+    /// upholds this structurally: `install_new_segment` points the same
+    /// writer at the new file without touching the buffers, so the
+    /// registered addresses survive every rotation. Breaking this would
+    /// at best silently demote `WriteFixed` to plain `Write` (stale
+    /// pointers never match again) — and at worst, if the allocator
+    /// reused a freed address, let `WriteFixed` DMA from the old pinned
+    /// pages and journal stale bytes with a clean CQE. Pinned by
+    /// `batch_buffer_regions_stable_across_rotation` and re-verified at
+    /// the pipeline's post-rotation re-registration.
     ///
     /// `None` while the spare is checked out (a write is in flight):
     /// register at setup, before the first async submit. Note the
@@ -845,7 +927,7 @@ impl<E: AppEvent> SectorWriter<E> {
     ///
     /// On error the prepared file is consumed (renamed onto the live
     /// path then rolled back, or left as staging — see
-    /// `adopt_prepared`'s docs). Callers should re-arm the preparer
+    /// `adopt_prepared_file`'s docs). Callers should re-arm the preparer
     /// after a successful return so the next rotation can also be fast.
     pub fn rotate_segment_with_prepared(
         &mut self,
@@ -860,9 +942,15 @@ impl<E: AppEvent> SectorWriter<E> {
         prepared: Option<PreparedSegment>,
     ) -> Result<std::path::PathBuf, JournalError> {
         self.flush_batch_sync()?;
+        // Rotation runs only on a quiesced writer — with an async batch
+        // still checked out, `install_new_segment` would reset state the
+        // in-flight completion refers to.
+        debug_assert!(
+            self.spare_buf.is_some(),
+            "segment rotation with an async batch checked out"
+        );
 
         let path = self.path.clone();
-        let next_seq = self.next_sequence;
         // The new segment's header anchor is the outgoing segment's tail
         // chain hash, giving recovery a verifiable cross-segment link.
         // Zeros when hash-chain is disabled (nothing verifies them).
@@ -870,14 +958,16 @@ impl<E: AppEvent> SectorWriter<E> {
 
         let archived = crate::segment::archive_live(&path).map_err(JournalError::Io)?;
 
-        let new_writer_result = match prepared {
-            Some(p) => Self::adopt_prepared(p, &path, next_seq, anchor),
-            None => Self::create_continuing(&path, next_seq, anchor),
-        };
+        let installed = match prepared {
+            Some(p) => Self::adopt_prepared_file(p, &path),
+            None => Self::prepare_continuing_file(&path),
+        }
+        .and_then(|(file, allocated_end, sector_size)| {
+            self.install_new_segment(file, allocated_end, sector_size, anchor)
+        });
 
-        match new_writer_result {
-            Ok(new_writer) => {
-                *self = new_writer;
+        match installed {
+            Ok(()) => {
                 // Durably commit both the rename (archive_live) and the
                 // new live file's dirent in a single dir fsync. Without
                 // this, power loss between rotation and the next
@@ -900,7 +990,7 @@ impl<E: AppEvent> SectorWriter<E> {
                 // error and let the caller bring the engine down.
                 if let Err(restore_err) = std::fs::rename(&archived, &path) {
                     tracing::warn!(
-                        "rotate_segment: rename-back failed after create_continuing error: \
+                        "rotate_segment: rename-back failed after segment install error: \
                          original={e}, restore={restore_err}"
                     );
                 }
@@ -1405,6 +1495,20 @@ mod tests {
         entries
     }
 
+    /// The writer's batch-buffer addresses, sorted so asserts compare
+    /// the address *set* — which allocation currently holds the batch
+    /// vs spare role is not part of the registration contract.
+    fn sorted_batch_buf_ptrs(writer: &SectorWriter<TestEvent>) -> Vec<*const u8> {
+        let mut ptrs: Vec<*const u8> = writer
+            .batch_buffer_regions()
+            .unwrap()
+            .iter()
+            .map(|&(ptr, _)| ptr)
+            .collect();
+        ptrs.sort();
+        ptrs
+    }
+
     #[test]
     fn create_initializes_header_and_preallocates() {
         let dir = tempfile::tempdir().unwrap();
@@ -1751,13 +1855,46 @@ mod tests {
         );
     }
 
+    /// Pins the address-stability contract documented on
+    /// `batch_buffer_regions`: rotation must preserve the two
+    /// batch-buffer addresses, because the pipeline registers them with
+    /// io_uring once at setup and never re-registers.
+    #[test]
+    fn batch_buffer_regions_stable_across_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        let registered = sorted_batch_buf_ptrs(&writer);
+
+        for round in 0..2u64 {
+            writer.append(&JournalEvent::App(TestEvent(round))).unwrap();
+            writer.rotate_segment().unwrap();
+            assert_eq!(
+                sorted_batch_buf_ptrs(&writer),
+                registered,
+                "rotation {round} must preserve the registered buffer addresses"
+            );
+        }
+
+        // The retained buffers still carry real writes: an entry
+        // appended after both rotations lands on the live segment.
+        writer.append(&JournalEvent::App(TestEvent(99))).unwrap();
+        drop(writer);
+        let live = read_all(&path);
+        assert_eq!(live.len(), 1, "live segment should have 1 user entry");
+        assert_eq!(live[0].event, JournalEvent::App(TestEvent(99)));
+    }
+
     /// End-to-end exercise of the rotation fast path: spawn a preparer,
     /// drain a [`PreparedSegment`] from it, hand the segment to
     /// `rotate_segment_with_prepared`, then verify that
     ///   - the outgoing segment is archived,
     ///   - the new live segment is at the original path,
     ///   - sequence numbers continue without gaps across the boundary,
-    ///   - entries from both segments are recoverable on read.
+    ///   - entries from both segments are recoverable on read,
+    ///   - the registered batch-buffer addresses survive (the fast-path
+    ///     leg of `batch_buffer_regions_stable_across_rotation`).
     ///
     /// This is the test that gives the fast path its own coverage; the
     /// existing rotate_segment tests cover the sync (no-prepared) path
@@ -1771,6 +1908,7 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        let regions_before = sorted_batch_buf_ptrs(&writer);
         // Two entries on the outgoing segment.
         writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
@@ -1802,6 +1940,12 @@ mod tests {
         // Rotation consumes no sequence number — chain metadata lives in
         // the new segment's header, not in the entry stream.
         assert_eq!(writer.next_sequence(), next_seq_before_rotate);
+
+        assert_eq!(
+            sorted_batch_buf_ptrs(&writer),
+            regions_before,
+            "prepared rotation must preserve the registered buffer addresses"
+        );
 
         // Two more entries on the new segment.
         writer.append(&JournalEvent::App(TestEvent(3))).unwrap();
