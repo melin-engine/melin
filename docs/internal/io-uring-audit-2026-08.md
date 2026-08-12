@@ -6,8 +6,10 @@ invariants listed below. Unlike the July latency audit, the top finding
 here is a **correctness/availability defect**, not a performance read:
 one slow client can stall the acknowledgement path for every client.
 
-Findings 1–2 are defects; 3–5 are optimization gaps. Fixes are being made
-on the `fix/io-uring-audit` branch.
+Findings 1–2 are defects; 3–5 are optimization gaps. All five are fixed
+on the `fix/io-uring-audit` branch; the "Fourth review round" section
+below records the final whole-branch review pass, and "Measured
+outcome" the LAN bench numbers.
 
 ---
 
@@ -307,6 +309,29 @@ addresses, so the buffers must never reallocate (grow) after
 registration. If the encode path can grow a batch buffer, they must be
 pre-sized to their maximum before registering.
 
+**Fixed, as landed.** Both batch buffers register once at pipeline
+setup (warn + plain-`Write` fallback if registration fails, e.g. under
+a tight `RLIMIT_MEMLOCK`); `journal_write_sqe` picks `WriteFixed` by
+pointer identity against the registered pair and falls back to `Write`
+on a miss, so fallback is byte-identical (same alignment, offsets, and
+fsync semantics).
+
+The caveat above turned out to be the branch's most serious bug — found
+in the fourth review round, *after* the feature had passed its own
+review. Segment rotation rebuilt the whole `SectorWriter`, dropping the
+registered allocations: every post-rotation write silently missed the
+pointer match (the measured WriteFixed win evaporating after the first
+rotation, unobservably), and worse, registration pins *physical pages*,
+so an allocator reusing the freed virtual address would make the
+pointer match succeed while `WriteFixed` DMA'd the old pinned pages —
+stale bytes journaled with a clean CQE. Rotation now installs the new
+segment file into the *same* writer (`install_new_segment`) without
+touching the buffers, making address stability structural; the
+pipeline re-verifies the addresses at every post-rotation
+`register_files_update` and permanently demotes to plain `Write` on a
+mismatch (assert in debug). Regression tests pin address stability
+across both rotation paths.
+
 ## 5. `SINGLE_ISSUER` is set on two of the four rings
 
 The journal ring and both replication rings set `setup_single_issuer`
@@ -318,6 +343,98 @@ proposed: the journal ring documents a measured rationale against them
 zero syscalls; deferring task-work would add an `io_uring_enter` per reap
 point), and the same logic plausibly applies to the reader. Do not cargo-
 cult those flags in without a bench.
+
+**Fixed** — both rings now set `setup_single_issuer`. `COOP_TASKRUN` /
+`DEFER_TASKRUN` remain deliberately unset, per the rationale above.
+
+---
+
+## Fourth review round (2026-08-12) — whole branch
+
+A final adversarial pass over the complete branch (three parallel
+reviewers: ingress, egress, journal + cross-cutting), followed by a
+review of the fixes themselves. Everything below is fixed on the branch
+unless marked accepted.
+
+- **Critical — rotation invalidated the WriteFixed registration.** See
+  finding 4 above. The lesson for the next reviewer: a per-commit
+  review of the registration commit and a per-commit review of the
+  (pre-existing) rotation code each passed; only the whole-branch pass
+  asked what rotation does *to* the registration.
+- **Dir-fsync failure after a committed rotation desynced the fixed
+  fd** (pre-existing, both writers). The post-rotation parent-dir
+  fsync error was propagated as a rotation failure after `*self` had
+  already moved to the new segment; the io_uring stage treats `Err` as
+  "not rotated" and kept its registered fd aimed at the archived
+  inode — overwriting the archive head with acked events while the
+  live segment stayed empty. A committed rotation is now reported as
+  complete regardless (the fsync only weakens crash-durability of the
+  dirent renames, whose stale layouts recovery already handles);
+  failure logs at `error!` and a paced retry (`DirFsyncRetry`, 1/s
+  from the writers' flush paths) closes the crash-exposure window as
+  soon as the transient clears.
+- **Batch double-checkout minted an unregistered buffer.** The
+  `take_batch_for_async_write` escape hatch allocated a replacement
+  when the spare was checked out — un-registered, un-mlocked, and a
+  path to dropping a registered buffer whose pages io_uring still
+  pins. Now a hard error (debug assert + `JournalError`), with the
+  mirror assert in `confirm_async_write`.
+- **The byte-threshold flush ran after the batch, not within it** —
+  see the amendment under finding 4 of `latency-audit-2026-07.md`.
+- **Heartbeats bypassed `MAX_SEND_BUF`.** The one append path without
+  the cap check: an idle client trickle-reading a few bytes per
+  interval reset the blocked clock on each dribble while unchecked
+  heartbeats grew its buffer without bound — pinning its connection
+  permit; N such clients exhaust `max_connections`. Heartbeats now
+  skip blocked peers and cap-check the append. Residual, accepted: a
+  trickling client still holds its permit *while draining* (bounded
+  memory; the reader's idle timeout covers clients that stop sending).
+
+**Accepted / open, for the next auditor:**
+
+- Pre-existing (untouched by this branch): on `PipelineFull` the
+  reader drops the triggering frame and strands any later frames
+  already buffered in `parse_buf` — they re-parse only on the next
+  recv from that client. Deserves its own ticket.
+- Legacy `ProvideBuffers` fallback mode only (hosts that filter
+  `PBUF_RING`): the SQ-accounting comment undercounts same-drain SQE
+  producers (a pathological drain can hit the SQ-full panic), and a
+  failed re-provision CQE permanently leaks its buffer id.
+- `max_connections` is not validated against the egress ring's
+  `RING_SIZE` (4096); an operator setting it higher converts a fully-
+  dirty flush into a response-thread panic. Clamp at startup.
+- Narrow eventfd use-after-close if the reader exits unilaterally on a
+  hard submit error while the accept loop still holds the wakeup
+  handle.
+
+## Measured outcome (2026-08-12)
+
+LAN suite, tcp-dual-repl, 4 clients, 60 s runs. At matched load
+(~1.21 M orders/s, inside main's 1.06–1.29 M/s band; audit branch
+pinned to window 40):
+
+| Percentile | main (3 runs) | branch (2 runs) |
+| --- | --- | --- |
+| p50 | 172–204 µs | 130 / 129 µs |
+| p99 | 201–315 µs | 189 / 187 µs |
+| p99.9 | 276–374 µs | 212 / 210 µs |
+| p99.99 | 327–417 µs | 303 / 296 µs |
+| p99.999 | 820–974 µs | 855 / 801 µs |
+| max | 2.62–2.66 ms | 3.15 / 1.81 ms |
+
+~30% off the median and the gain holds through p99.99; p99.999 and max
+overlap (shared-environment noise dominates there). Free-running, the
+branch pulls ~20% more closed-loop throughput (~1.45 M/s vs ~1.21 M/s)
+with *lower* percentiles — the matched-load table understates nothing.
+Per-stage: journal batch write+sync p50 5.5 → 3.5 µs, p90 20.1 → 10.0 µs
+(WriteFixed); matching-wakeup improvements are downstream of the faster
+gate release; matching execute unchanged (the branch never touched the
+engine). Single-order latency (1 client, window 1) is unchanged on both
+branches (~66.5 µs p50) — every win here is queueing behavior under
+load, as predicted. Note the 60 s runs almost certainly never crossed a
+segment rotation: without the fourth-round rotation fix these numbers
+would have quietly regressed to plain-`Write` after the first rotation
+in production.
 
 ---
 
