@@ -168,6 +168,14 @@ IO can ever sit ahead of a hot-path flush, below the flush's own
 ~300 µs floor. Duty and staging duration are unchanged; only the
 in-flight window shrank.
 
+Accepted 2026-08-13 (throughput workload, tcp-dual-repl, 2 replicas,
+1.23 M orders/s): p99.9 242 µs, p99.99 273 µs, **max 387 µs** — vs the
+fix/io-uring-audit baseline's p99.9 197 µs / max 1912 µs (beat) and the
+double-window run's p99.9 1520 µs / max 9.8 ms. 21/21 rotations on the
+fast path, zero sync fallbacks, zero windows with p99.99 above 500 µs
+in 74 k windows, no replica ack-latency spikes. The beat and both
+staging-induced stall classes are gone.
+
 ## Implication: the sector writer
 
 Both structural advantages the sector writer holds over the buffered
