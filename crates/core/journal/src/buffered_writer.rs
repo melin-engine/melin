@@ -524,7 +524,7 @@ impl<E: AppEvent> BufferedWriter<E> {
                 // in-process writer is unusable.
                 if let Err(restore_err) = std::fs::rename(&archived, &path) {
                     tracing::warn!(
-                        "rotate_segment: rename-back failed after create_continuing error: \
+                        "rotate_segment: rename-back failed after segment install error: \
                          original={e}, restore={restore_err}"
                     );
                 } else if let Err(fsync_err) = crate::segment::fsync_parent_dir(&path) {
@@ -567,20 +567,31 @@ impl<E: AppEvent> BufferedWriter<E> {
             file,
             path: staging_path,
             allocated_end,
-            // Sector alignment is an O_DIRECT concern; this writer goes
-            // through the page cache.
-            sector_size: _,
+            sector_size,
         } = prepared;
 
-        // Rename staging onto the live path. `archive_live` has already
-        // moved the previous live segment aside, so the destination is
-        // free. Done before any further writes so that, if it fails,
-        // the staging file is still findable for cleanup.
-        std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
+        // Mode guard: a sector-mode staging file carries an O_DIRECT
+        // handle and unwritten extents — adopting it here would fail
+        // with EINVAL on the first unaligned pwrite (after the commit
+        // point) and silently lose the pre-written-extents property.
+        // Zero-fill mode marks itself with `sector_size == 0`. Erroring
+        // out lands the caller on its sync-fallback rollback path.
+        if sector_size != 0 {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prepared segment was staged in sector mode; BufferedWriter requires zero-fill",
+            )));
+        }
 
-        // Write the file header. The staging file is zero-filled
-        // including `[0, ENTRY_OFFSET)`, so this pwrite lands in
-        // already-written extents like every append after it.
+        // Write the file header into the staging file *before* the
+        // rename, so the file appearing at the live path is always
+        // complete. The reverse order would open a window where a
+        // header-write failure plus a failed rename-back leaves an
+        // all-zeros live file that recovery rejects as invalid instead
+        // of handling as the "no live file" Phase-B case. The staging
+        // file is zero-filled including `[0, ENTRY_OFFSET)`, so this
+        // pwrite lands in already-written extents like every append
+        // after it.
         let mut header_buf = [0u8; MAX_SECTOR_SIZE];
         codec::encode_file_header(
             &mut header_buf,
@@ -589,10 +600,16 @@ impl<E: AppEvent> BufferedWriter<E> {
             anchor_hash,
         );
         write_all_at(&file, &header_buf, 0)?;
-        // Commit the header durably before adopting — a crash before
+        // Commit the header durably before the rename — a crash before
         // the next user write must still leave a parseable empty
         // journal, matching `create_continuing`.
         file.sync_all()?;
+
+        // Rename staging onto the live path. `archive_live` has already
+        // moved the previous live segment aside, so the destination is
+        // free. On failure the fully-written staging file stays on disk
+        // for the next preparer cycle to reclaim.
+        std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
 
         // Commit point — nothing below can fail. Dropping the old
         // `self.file` closes the outgoing (now archived) segment's fd.

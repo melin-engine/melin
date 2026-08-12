@@ -381,6 +381,19 @@ impl<E: AppEvent> SectorWriter<E> {
             sector_size,
         } = prepared;
 
+        // Mode guard: a zero-fill staging file (marked by
+        // `sector_size == 0`) carries a plain page-cache handle —
+        // adopting it here would poison this writer's sector math
+        // (`sector_size - tail_len` underflows, alignment masks become
+        // no-ops) and corrupt the journal. Erroring out lands the
+        // caller on its sync-fallback rollback path.
+        if sector_size == 0 {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prepared segment was staged in zero-fill mode; SectorWriter requires sector mode",
+            )));
+        }
+
         // Rename staging onto the live path. `archive_live` has already
         // moved the previous live segment aside, so the destination is
         // free. Done before any further writes so that, if it fails, the

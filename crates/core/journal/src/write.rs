@@ -111,11 +111,22 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// [`crate::preparer::SegmentPreparer`] (the fast path — no file
     /// creation/allocation on the calling thread). Each writer requires
     /// a preparer spawned in its matching mode: `spawn` for
-    /// `SectorWriter`, `spawn_zero_fill` for `BufferedWriter`.
+    /// `SectorWriter`, `spawn_zero_fill` for `BufferedWriter`; both
+    /// adopters reject a mismatched staging file.
+    ///
+    /// The default body discards the prepared segment and rotates
+    /// synchronously — correct (the orphaned staging file is reclaimed
+    /// by the next preparer cycle) but always the slow path, so real
+    /// writers override it. It exists so adding this method is not a
+    /// breaking change and so the fallback contract is spelled out in
+    /// code.
     fn rotate_segment_with_prepared(
         &mut self,
         prepared: crate::preparer::PreparedSegment,
-    ) -> Result<PathBuf, JournalError>;
+    ) -> Result<PathBuf, JournalError> {
+        drop(prepared);
+        self.rotate_segment()
+    }
     /// Decoded file-header fields of the active segment (used by
     /// replication to bootstrap a fresh replica's chain anchor and
     /// starting sequence).

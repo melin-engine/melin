@@ -54,7 +54,7 @@ use std::io;
 #[cfg(not(feature = "no-o-direct"))]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -102,15 +102,18 @@ pub struct PreparedSegment {
 /// serves one writer, and the two writers need incompatible staging
 /// (O_DIRECT + fallocate vs plain fd + physical zeros).
 ///
-/// Copy: two words, read once per prepare cycle.
+/// Copy: two words, read once per prepare cycle. The zero-fill *size*
+/// is deliberately not in here — it adapts to observed segment sizes
+/// at every re-arm (see `State::zero_fill_target`), so freezing it at
+/// spawn would be wrong.
 #[derive(Clone, Copy)]
 enum PrepareMode {
     /// `posix_fallocate` + `FALLOC_FL_ZERO_RANGE` + prefault, O_DIRECT
     /// handle. For `SectorWriter`.
     Sector { sector_size: usize },
-    /// Physically write `bytes` of zeros and sync, plain handle. For
-    /// `BufferedWriter`.
-    ZeroFill { bytes: u64 },
+    /// Physically write zeros (current `State::zero_fill_target` bytes)
+    /// and sync, plain handle. For `BufferedWriter`.
+    ZeroFill,
 }
 
 /// Extra zeroed bytes past the rotation threshold in zero-fill mode.
@@ -141,6 +144,24 @@ struct State {
     live_path: PathBuf,
     /// Staging strategy, fixed at spawn (see [`PrepareMode`]).
     mode: PrepareMode,
+    /// Zero-fill mode only: how many bytes the next staged segment is
+    /// zeroed to. Seeded at spawn (threshold + margin, or one prealloc
+    /// chunk + margin when the threshold is unknown) and updated on
+    /// every [`SegmentPreparer::arm_with_observed_len`] so the target
+    /// tracks the segment sizes the deployment actually produces —
+    /// critical on replicas, which never know the primary's
+    /// `max_journal_bytes` and would otherwise stage a fixed default
+    /// that silently under- or over-shoots it. `AtomicU64`: written by
+    /// the journal thread at rotation time, read by the worker; no
+    /// ordering dependency beyond the value itself (`Relaxed`) — a
+    /// stale read stages one segment at the previous size, which the
+    /// margin absorbs.
+    zero_fill_target: AtomicU64,
+    /// Floor for `zero_fill_target` updates: the configured rotation
+    /// threshold + margin when known, else 0. Keeps an early manual
+    /// rotation (tiny observed segment) from shrinking the target below
+    /// what size-driven rotation needs.
+    zero_fill_floor: u64,
     /// Mutex<Option<…>> because the slot is mutated from two threads
     /// (worker writes, adopter takes) and has at most one entry. No
     /// contention on the hot path — the lock is only acquired at
@@ -167,7 +188,7 @@ impl SegmentPreparer {
     /// recognised by `segment::list_archives`, but leaving them on disk
     /// would cause `create_new` to fail at the next prepare.
     pub fn spawn(live_path: PathBuf, sector_size: usize) -> Self {
-        Self::spawn_with_mode(live_path, PrepareMode::Sector { sector_size })
+        Self::spawn_with_mode(live_path, PrepareMode::Sector { sector_size }, 0, 0)
     }
 
     /// Spawn a worker that stages segments by physically writing zeros
@@ -175,27 +196,42 @@ impl SegmentPreparer {
     /// rather than `FALLOC_FL_ZERO_RANGE`).
     ///
     /// `rotate_threshold_bytes` is the size trigger the pipeline rotates
-    /// at (`max_journal_bytes`); the staged file is zeroed to that plus
-    /// [`ZERO_FILL_MARGIN_BYTES`]. Pass `0` when the threshold is
-    /// unknown locally (replica mode — rotation follows the primary's
-    /// announced boundaries): the worker falls back to one prealloc
-    /// chunk, which matches the primary's segments under the default
-    /// matched configuration.
+    /// at (`max_journal_bytes`); the staged file is initially zeroed to
+    /// that plus [`ZERO_FILL_MARGIN_BYTES`]. Pass `0` when the threshold
+    /// is unknown locally (replica mode — rotation follows the primary's
+    /// announced boundaries): the initial target falls back to one
+    /// prealloc chunk plus margin, and every
+    /// [`arm_with_observed_len`](Self::arm_with_observed_len) after a
+    /// rotation retunes it to the segment sizes actually observed, so a
+    /// replica converges on the primary's real segment size after its
+    /// first adoption regardless of configuration mismatch.
     pub fn spawn_zero_fill(live_path: PathBuf, rotate_threshold_bytes: u64) -> Self {
-        let bytes = if rotate_threshold_bytes > 0 {
+        let floor = if rotate_threshold_bytes > 0 {
             rotate_threshold_bytes + ZERO_FILL_MARGIN_BYTES
         } else {
-            crate::prealloc::prealloc_chunk_bytes()
+            0
         };
-        Self::spawn_with_mode(live_path, PrepareMode::ZeroFill { bytes })
+        let initial = if floor > 0 {
+            floor
+        } else {
+            crate::prealloc::prealloc_chunk_bytes() + ZERO_FILL_MARGIN_BYTES
+        };
+        Self::spawn_with_mode(live_path, PrepareMode::ZeroFill, initial, floor)
     }
 
-    fn spawn_with_mode(live_path: PathBuf, mode: PrepareMode) -> Self {
+    fn spawn_with_mode(
+        live_path: PathBuf,
+        mode: PrepareMode,
+        zero_fill_target: u64,
+        zero_fill_floor: u64,
+    ) -> Self {
         cleanup_staging_orphan(&live_path);
 
         let state = Arc::new(State {
             live_path,
             mode,
+            zero_fill_target: AtomicU64::new(zero_fill_target),
+            zero_fill_floor,
             slot: Mutex::new(None),
             // Pre-arm at startup so the worker prepares the first spare
             // segment in parallel with engine warm-up. The first rotation
@@ -215,6 +251,20 @@ impl SegmentPreparer {
             state,
             handle: Some(handle),
         }
+    }
+
+    /// [`arm`](Self::arm) plus a zero-fill target update from the size
+    /// of the segment that just rotated out. Called by the journal
+    /// stage after every rotation so staged segments track the sizes
+    /// the deployment actually produces (a replica's only source of
+    /// truth for the primary's segment size). No-op sizing-wise in
+    /// sector mode.
+    pub fn arm_with_observed_len(&self, observed_len: u64) {
+        if matches!(self.state.mode, PrepareMode::ZeroFill) && observed_len > 0 {
+            let target = (observed_len + ZERO_FILL_MARGIN_BYTES).max(self.state.zero_fill_floor);
+            self.state.zero_fill_target.store(target, Ordering::Relaxed);
+        }
+        self.arm();
     }
 
     /// Request preparation of the next segment. Idempotent — if the
@@ -322,13 +372,18 @@ fn worker_loop(state: Arc<State>) {
             continue;
         }
 
-        match prepare_one(&state.live_path, state.mode) {
+        match prepare_one(&state) {
             Ok(prepared) => {
                 if let Ok(mut g) = state.slot.lock() {
                     *g = Some(prepared);
                 }
             }
             Err(e) => {
+                // A shutdown mid-prepare surfaces as an aborted zero
+                // fill — exit quietly instead of warning about it.
+                if state.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
                 tracing::warn!(
                     error = %e,
                     "journal segment preparer failed; will retry after backoff"
@@ -356,8 +411,8 @@ fn backoff_sleep(state: &State) {
 /// Neither mode writes a file header — the header is application data
 /// that depends on the rotation-boundary state and is written by the
 /// adopting writer after the rename.
-fn prepare_one(live_path: &Path, mode: PrepareMode) -> Result<PreparedSegment, JournalError> {
-    let staging = staging_path(live_path);
+fn prepare_one(state: &State) -> Result<PreparedSegment, JournalError> {
+    let staging = staging_path(&state.live_path);
 
     // Remove any stale staging file. A leftover here is normally
     // cleaned by `SegmentPreparer::spawn`, but `create_new` would fail
@@ -371,9 +426,13 @@ fn prepare_one(live_path: &Path, mode: PrepareMode) -> Result<PreparedSegment, J
         Err(_) => {}
     }
 
-    match mode {
+    match state.mode {
         PrepareMode::Sector { sector_size } => prepare_sector(&staging, sector_size),
-        PrepareMode::ZeroFill { bytes } => prepare_zero_filled(&staging, bytes),
+        PrepareMode::ZeroFill => prepare_zero_filled(
+            &staging,
+            state.zero_fill_target.load(Ordering::Relaxed),
+            &state.shutdown,
+        ),
     }
 }
 
@@ -410,7 +469,16 @@ fn prepare_sector(staging: &Path, sector_size: usize) -> Result<PreparedSegment,
 /// through the page cache on purpose: the pages the buffered writer is
 /// about to append into are left resident, which doubles as the
 /// prefault the sector mode does explicitly.
-fn prepare_zero_filled(staging: &Path, bytes: u64) -> Result<PreparedSegment, JournalError> {
+///
+/// Checks `shutdown` between chunks: zeroing scales with the rotation
+/// threshold (multi-GiB segments take seconds at device bandwidth), and
+/// `SegmentPreparer::shutdown` joins this thread — an unchecked loop
+/// would hold up process exit for the remainder of the fill.
+fn prepare_zero_filled(
+    staging: &Path,
+    bytes: u64,
+    shutdown: &AtomicBool,
+) -> Result<PreparedSegment, JournalError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -420,26 +488,33 @@ fn prepare_zero_filled(staging: &Path, bytes: u64) -> Result<PreparedSegment, Jo
     // 1 MiB chunk: large enough that the copy loop is bandwidth-bound,
     // small enough to stay cache/allocator friendly. Heap Vec (not a
     // stack array) — 1 MiB would overflow default thread stacks.
+    // std's `write_all_at` handles short writes and EINTR retries.
     let zeros = vec![0u8; 1024 * 1024];
+    // Kick background writeback every 16 MiB rather than letting the
+    // whole segment pile up dirty for one big `sync_all`: an unpaced
+    // fill dumps hundreds of MiB into the page cache and then contends
+    // with the live journal's per-batch `fdatasync` on the same device
+    // (and can trip the kernel's dirty-page throttling). The interval
+    // is a bandwidth/IPC balance, not tuned — anything in the 8–32 MiB
+    // range behaves equivalently.
+    const WRITEBACK_INTERVAL: u64 = 16 * 1024 * 1024;
     let mut offset: u64 = 0;
+    let mut writeback_from: u64 = 0;
     while offset < bytes {
-        let n = (bytes - offset).min(zeros.len() as u64) as usize;
-        let mut written = 0;
-        while written < n {
-            let w = std::os::unix::fs::FileExt::write_at(
-                &file,
-                &zeros[written..n],
-                offset + written as u64,
-            )?;
-            if w == 0 {
-                return Err(JournalError::Io(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "zero-fill write returned 0",
-                )));
-            }
-            written += w;
+        if shutdown.load(Ordering::Acquire) {
+            return Err(JournalError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "zero-fill aborted by shutdown",
+            )));
         }
+        let n = (bytes - offset).min(zeros.len() as u64) as usize;
+        std::os::unix::fs::FileExt::write_all_at(&file, &zeros[..n], offset)?;
         offset += n as u64;
+
+        if offset - writeback_from >= WRITEBACK_INTERVAL {
+            start_background_writeback(&file, writeback_from, offset - writeback_from);
+            writeback_from = offset;
+        }
     }
     file.sync_all()?;
 
@@ -451,6 +526,25 @@ fn prepare_zero_filled(staging: &Path, bytes: u64) -> Result<PreparedSegment, Jo
         // requirement and ignores this field.
         sector_size: 0,
     })
+}
+
+/// Ask the kernel to start (not wait for) writeback of `[offset,
+/// offset + len)`. Best-effort pacing for the zero fill — a failure
+/// only means the final `sync_all` flushes more at once, so the error
+/// is deliberately ignored (the fill's durability comes from
+/// `sync_all`, not from here).
+fn start_background_writeback(file: &File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain syscall on an owned, open fd; no memory is passed.
+    // Result deliberately dropped — see the function docs.
+    let _ = unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            offset as libc::off64_t,
+            len as libc::off64_t,
+            libc::SYNC_FILE_RANGE_WRITE,
+        )
+    };
 }
 
 /// Remove a stale `<live>.next-staging` file left behind by a prior
@@ -628,6 +722,54 @@ mod tests {
         }
 
         drop(prepared);
+        preparer.shutdown();
+    }
+
+    /// `arm_with_observed_len` retunes the zero-fill target: the next
+    /// staged segment tracks the observed segment size (the replica
+    /// path, where the primary's threshold is unknown), while the
+    /// configured floor keeps a small observation from shrinking a
+    /// size-driven primary's target.
+    #[test]
+    fn zero_fill_target_adapts_to_observed_len() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("test.journal");
+
+        // Replica-style spawn: threshold unknown (0) → chunk fallback.
+        let _prealloc_guard = crate::prealloc::PreallocOverrideGuard::new(1024 * 1024);
+        let preparer = SegmentPreparer::spawn_zero_fill(live, 0);
+
+        let take_one = || {
+            for _ in 0..500 {
+                if let Some(p) = preparer.take() {
+                    return p;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("preparer should stage a segment within 5 s");
+        };
+
+        // Initial staging uses the chunk fallback.
+        let first = take_one();
+        assert_eq!(
+            first.allocated_end,
+            1024 * 1024 + ZERO_FILL_MARGIN_BYTES,
+            "initial replica target = prealloc chunk + margin"
+        );
+        std::fs::remove_file(&first.path).expect("consume first staging");
+        drop(first);
+
+        // Observation retunes the target (no floor when threshold is 0).
+        let observed: u64 = 3 * 1024 * 1024;
+        preparer.arm_with_observed_len(observed);
+        let second = take_one();
+        assert_eq!(
+            second.allocated_end,
+            observed + ZERO_FILL_MARGIN_BYTES,
+            "staged size must track the observed segment size"
+        );
+
+        drop(second);
         preparer.shutdown();
     }
 
