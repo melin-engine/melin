@@ -717,11 +717,16 @@ pub fn run<A: Application>(
         // wait more often.
         let batch_now = Instant::now();
 
-        // Set when any connection's send_buf crosses
-        // FLUSH_BYTES_THRESHOLD during this batch; checked once per
-        // batch below. A flag written at append time rather than a
-        // post-batch scan of the dirty set: the scan would cost a hash
-        // lookup per dirty connection per batch on the hot path.
+        // Set when a connection's send_buf crosses
+        // FLUSH_BYTES_THRESHOLD; checked after every slot so the flush
+        // runs *within* the batch. Deferring it to the end of the batch
+        // would reopen the defect the threshold exists to close: one
+        // MAX_BATCH batch of large frames (anything over ~64 bytes
+        // average) can push a healthy connection from empty past
+        // `MAX_SEND_BUF` before a batch-end flush ever ran, tearing it
+        // down with nothing written. A flag written at append time
+        // rather than a per-slot scan of the dirty set: the scan would
+        // cost a hash lookup per dirty connection on the hot path.
         let mut flush_due = false;
 
         for slot in &batch[..count] {
@@ -1001,6 +1006,58 @@ pub fn run<A: Application>(
 
                 flush_due |= entry.send_buf.len() >= FLUSH_BYTES_THRESHOLD;
             }
+
+            // Byte-threshold flush on the consumed path — the still-
+            // open half of July-audit finding 4. Under sustained load
+            // with an open gate this is the ONLY flush that runs: the
+            // idle path needs an empty SPSC, the gate path needs a
+            // durability wait, and heartbeats need idleness. Without
+            // it, delivery on a busy stretch degenerates to
+            // `MAX_SEND_BUF` evicting the very clients being served.
+            // Threshold-gated so light traffic keeps full batching;
+            // once a connection holds ~an MSS the extra submit no
+            // longer costs wire efficiency. MSG_DONTWAIT flushes cannot
+            // block, so this adds no head-of-line exposure (the hazard
+            // that deferred this trigger in July). Runs between slots,
+            // not after the batch, so `MAX_SEND_BUF` can never trip on
+            // a healthy connection within a single batch — a blocked
+            // peer re-arms the flag on its later slots, but its paced
+            // retry inside `flush_sends` keeps that cheap.
+            if flush_due {
+                flush_due = false;
+                // Overflow-dropped connections leave first so the flush
+                // skips them — same order as the batch-end cleanup, and
+                // their queued samples go with them (they measure bytes
+                // that will never be flushed). Later slots addressed to
+                // them are skipped by the `connections.get_mut` miss
+                // above.
+                #[cfg(feature = "latency-trace")]
+                discard_e2e_samples(&mut pending_e2e, &to_remove);
+                for conn_id in to_remove.drain(..) {
+                    if let Some(entry) = connections.remove(&conn_id) {
+                        teardown_dropped(entry, &active_connections);
+                    }
+                    dirty_connections.remove(&conn_id);
+                }
+                #[cfg(feature = "tick-to-trade")]
+                let egress_start = trace::mono_trace_ns();
+                flush_sends(
+                    &mut ring,
+                    &mut connections,
+                    &mut dirty_connections,
+                    &mut to_remove,
+                    &mut cqes,
+                );
+                #[cfg(feature = "tick-to-trade")]
+                egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
+                #[cfg(feature = "latency-trace")]
+                close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
+                for conn_id in to_remove.drain(..) {
+                    if let Some(entry) = connections.remove(&conn_id) {
+                        teardown_dropped(entry, &active_connections);
+                    }
+                }
+            }
         }
 
         // Remove connections that exceeded the send buffer limit. Like
@@ -1015,38 +1072,6 @@ pub fn run<A: Application>(
                 teardown_dropped(entry, &active_connections);
             }
             dirty_connections.remove(&conn_id);
-        }
-
-        // Byte-threshold flush on the consumed path — the still-open
-        // half of July-audit finding 4. Under sustained load with an
-        // open gate this is the ONLY flush that runs: the idle path
-        // needs an empty SPSC, the gate path needs a durability wait,
-        // and heartbeats need idleness. Without it, delivery on a busy
-        // stretch degenerates to `MAX_SEND_BUF` evicting the very
-        // clients being served. Threshold-gated so light traffic keeps
-        // full batching; once a connection holds ~an MSS the extra
-        // submit no longer costs wire efficiency. MSG_DONTWAIT flushes
-        // cannot block, so this adds no head-of-line exposure (the
-        // hazard that deferred this trigger in July).
-        if flush_due {
-            #[cfg(feature = "tick-to-trade")]
-            let egress_start = trace::mono_trace_ns();
-            flush_sends(
-                &mut ring,
-                &mut connections,
-                &mut dirty_connections,
-                &mut to_remove,
-                &mut cqes,
-            );
-            #[cfg(feature = "tick-to-trade")]
-            egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
-            #[cfg(feature = "latency-trace")]
-            close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
-            for conn_id in to_remove.drain(..) {
-                if let Some(entry) = connections.remove(&conn_id) {
-                    teardown_dropped(entry, &active_connections);
-                }
-            }
         }
 
         // Log degradation transitions / re-emit the reminder. Same
