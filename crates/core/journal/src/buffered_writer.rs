@@ -610,8 +610,16 @@ impl<E: AppEvent> BufferedWriter<E> {
         write_all_at(&file, &header_buf, 0)?;
         // Commit the header durably before the rename — a crash before
         // the next user write must still leave a parseable empty
-        // journal, matching `create_continuing`.
-        file.sync_all()?;
+        // journal, matching `create_continuing`. `sync_data`, not
+        // `sync_all`: this runs on the journal thread at every
+        // rotation, and a full fsync forces the filesystem log for the
+        // timestamp metadata — the stall class this whole design
+        // removes. The header pwrite changes no file size (the staging
+        // file is pre-written to full length) and no allocation (the
+        // extents are written), so the data-only flush covers
+        // everything the header needs; the preparer already made the
+        // file's size and allocation durable at staging time.
+        file.sync_data()?;
 
         // Rename staging onto the live path. `archive_live` has already
         // moved the previous live segment aside, so the destination is

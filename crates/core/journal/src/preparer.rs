@@ -527,21 +527,31 @@ fn prepare_zero_filled(
         });
     }
 
-    // Fallback: physically write the zeros, paced. An unpaced fill
-    // saturates the journal device — the ~2 ms fsync beat this mode
-    // exists to fix was measured being replaced by ~10 ms fsync stalls
-    // whenever a batch fsync queued behind the staging burst. Two
-    // controls bound the interference:
+    // Fallback: physically write the zeros, paced against the DEVICE
+    // clock. An unpaced fill saturates the journal device — the ~2 ms
+    // fsync beat this mode exists to fix was measured being replaced by
+    // ~10 ms fsync stalls whenever a batch fsync queued behind the
+    // staging burst. And pacing must not be clocked off the buffered
+    // `write_all_at` calls: those return at memcpy speed (the writes
+    // only dirty the page cache), so sleeping a multiple of *their*
+    // wall time still dirtied gigabytes per second and left the device
+    // flooded by async writeback — measured as ~7.5 ms rotation-
+    // adjacent fsync stalls that only faded once the kernel's own
+    // dirty-page throttling kicked in mid-run.
     //
-    // - 2 MiB chunks with `sync_file_range` after each: a batch fsync
-    //   never waits behind more than one chunk's device occupancy
-    //   (~1.5 ms at NVMe bandwidth), and dirty pages never pile up for
-    //   the final `sync_all`.
-    // - Occupancy pacing: sleep 3× each chunk's wall time before the
-    //   next, capping the fill at ~25% device duty. Self-adapting — no
-    //   bandwidth constant to tune per device — and it keeps staging
-    //   duration ≈ 4× (segment bytes / device bandwidth), well inside
-    //   any rotation period whose segment the device can write once.
+    // The double-window pattern makes the loop device-clocked:
+    //
+    // - write chunk N (memcpy into cache), start async writeback on it;
+    // - wait for chunk N-1's writeback to COMPLETE
+    //   (`WAIT_BEFORE|WRITE|WAIT_AFTER`) — at most two chunks are ever
+    //   in flight, and each iteration's wall time now includes real
+    //   device time for one chunk;
+    // - sleep 3× that wall time: a genuine ~25% device duty, so a live
+    //   batch fsync waits behind at most one 2 MiB chunk (~1.5 ms at
+    //   NVMe bandwidth). Self-adapting — no bandwidth constant — and
+    //   staging duration stays ≈ 4× (segment bytes / device bandwidth),
+    //   well inside any rotation period whose segment the device can
+    //   write once.
     //
     // Writes go through the page cache deliberately: the pages the
     // buffered writer is about to append into stay resident, so its
@@ -553,6 +563,7 @@ fn prepare_zero_filled(
     const ZERO_CHUNK: usize = 2 * 1024 * 1024;
     let zeros = vec![0u8; ZERO_CHUNK];
     let mut offset: u64 = 0;
+    let mut prev_chunk: Option<(u64, u64)> = None;
     while offset < bytes {
         if shutdown.load(Ordering::Acquire) {
             return Err(JournalError::Io(io::Error::new(
@@ -564,6 +575,10 @@ fn prepare_zero_filled(
         let n = (bytes - offset).min(zeros.len() as u64) as usize;
         std::os::unix::fs::FileExt::write_all_at(&file, &zeros[..n], offset)?;
         start_background_writeback(&file, offset, n as u64);
+        if let Some((prev_off, prev_len)) = prev_chunk {
+            wait_for_writeback(&file, prev_off, prev_len);
+        }
+        prev_chunk = Some((offset, n as u64));
         offset += n as u64;
 
         if offset < bytes {
@@ -580,6 +595,28 @@ fn prepare_zero_filled(
         // requirement and ignores this field.
         sector_size: 0,
     })
+}
+
+/// Wait for writeback of `[offset, offset + len)` to complete
+/// (`WAIT_BEFORE|WRITE|WAIT_AFTER`). The device-clock half of the
+/// zero-fill's double-window pacing — the wait is the point, it makes
+/// the loop's wall time reflect real device time. Best-effort like
+/// [`start_background_writeback`]: on failure the fill just paces less
+/// accurately and the final `sync_all` remains the durability point.
+fn wait_for_writeback(file: &File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain syscall on an owned, open fd; no memory is passed.
+    // Result deliberately dropped — see the function docs.
+    let _ = unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            offset as libc::off64_t,
+            len as libc::off64_t,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                | libc::SYNC_FILE_RANGE_WRITE
+                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+        )
+    };
 }
 
 /// `FALLOC_FL_WRITE_ZEROES` — not yet in the `libc` crate; merged
