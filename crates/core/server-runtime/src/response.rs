@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,37 @@ const RING_SIZE: u32 = 4096;
 /// falls behind and the buffer exceeds this, the connection is dropped.
 /// 64 KiB holds ~500 response frames — well beyond any reasonable lag.
 const MAX_SEND_BUF: usize = 64 * 1024;
+
+/// Minimum interval between SEND retries to a connection whose socket
+/// buffer is full (`MSG_DONTWAIT` completed with `EAGAIN`). The stage
+/// busy-spins, so without pacing a blocked connection would cost one
+/// futile `io_uring_enter` per loop iteration. 100 µs adds no meaningful
+/// delivery delay: a full socket buffer drains at the client's read
+/// cadence (millisecond scale), and healthy connections are never paced.
+const BLOCKED_RETRY_INTERVAL: Duration = Duration::from_micros(100);
+
+/// Byte-threshold flush trigger for the consumed (busy) path — the
+/// still-open half of finding 4 in
+/// `docs/internal/latency-audit-2026-07.md`. Under sustained load with
+/// an open durability gate, neither the idle-path flush (SPSC never
+/// empties) nor the gate-path flush (no wait) runs, so without this
+/// trigger responses sit in `send_buf` until `MAX_SEND_BUF` *drops* the
+/// connection instead of serving it. Roughly one TCP MSS (1460 for
+/// standard Ethernet, minus margin): once a connection has a full
+/// segment buffered, flushing early costs nothing in wire efficiency,
+/// and the bound keeps `send_buf` ~45 flushes away from the disconnect
+/// cap instead of zero.
+const FLUSH_BYTES_THRESHOLD: usize = 1400;
+
+/// How long a connection's socket may accept *zero* bytes while it has
+/// undelivered data before it is dropped. Partial progress restarts the
+/// clock — a slow-but-draining client is `MAX_SEND_BUF`'s problem, not
+/// this one's. Complements `MAX_SEND_BUF`, which only catches clients
+/// that lag while new responses keep *arriving* — a client that stops
+/// reading during a quiet period accumulates almost nothing (heartbeats
+/// only) and would otherwise pin its buffered bytes and its slot
+/// indefinitely.
+const BLOCKED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use crate::ControlEvent;
 
@@ -110,6 +141,13 @@ pub struct Response<A: Application> {
     /// co-sets `shutdown`, so the latch is only consulted on the shutdown
     /// path (zero steady-state cost). See `crate::fence`.
     pub fence_state: Arc<melin_transport_core::fence::FenceState>,
+    /// Live-connection count shared with the accept loop's
+    /// `max_connections` gate. Incremented there after auth; decremented
+    /// here — the response stage owns the connection map, so "an entry
+    /// left the map" is the one place a connection verifiably dies
+    /// exactly once, whichever side (reader disconnect or a drop
+    /// decision here) initiated it.
+    pub active_connections: Arc<AtomicU64>,
 }
 
 /// Per-connection state for batched io_uring sends.
@@ -121,10 +159,22 @@ struct ConnectionEntry {
     /// The full wire frame (length prefix + payload) is appended here.
     /// Vec's internal data pointer is heap-stable, so io_uring SEND SQEs
     /// referencing `as_ptr()` remain valid even if the HashMap relocates
-    /// this struct — as long as we don't reallocate the Vec during in-flight sends.
+    /// this struct. No SEND outlives its `flush_sends` call (every SQE
+    /// carries `MSG_DONTWAIT`, and the flush reaps all completions before
+    /// returning), so the Vec is never mutated while the kernel holds its
+    /// pointer.
     send_buf: Vec<u8>,
     /// Last time data was sent to this connection. Used for heartbeat scheduling.
     last_send: Instant,
+    /// When this connection's socket last made zero forward progress:
+    /// set on `EAGAIN`, reset to the flush timestamp on a partial send
+    /// (bytes moved), cleared when the buffer fully drains. `None` while
+    /// the socket is accepting everything. Drives retry pacing and the
+    /// [`BLOCKED_SEND_TIMEOUT`] drop.
+    blocked_since: Option<Instant>,
+    /// Last SEND attempt. Read only while blocked, to pace retries at
+    /// [`BLOCKED_RETRY_INTERVAL`].
+    last_send_attempt: Instant,
 }
 
 /// Run the io_uring response stage loop. Blocks the calling thread until shutdown.
@@ -152,6 +202,7 @@ pub fn run<A: Application>(
         utilization,
         encoder,
         fence_state,
+        active_connections,
     } = config;
     // Resolve the starting mode from the shared atomic and derive the
     // local Policy. The atomic is the single source of truth across the
@@ -170,8 +221,13 @@ pub fn run<A: Application>(
                 DurabilityMode::Hybrid
             });
     let mut policy = active_mode.to_policy();
-    let mut ring =
-        IoUring::new(RING_SIZE).expect("failed to create io_uring instance for response stage");
+    // SINGLE_ISSUER: created and submitted from this thread only — the
+    // kernel skips SQ locking and rejects cross-thread submission with
+    // EEXIST instead of racing. Matches the journal/replication rings.
+    let mut ring: IoUring = IoUring::builder()
+        .setup_single_issuer()
+        .build(RING_SIZE)
+        .expect("failed to create io_uring instance for response stage");
 
     // Connection table: maps connection IDs to their state.
     // HashMap for O(1) lookup. Pre-sized for a reasonable number of concurrent clients.
@@ -329,6 +385,19 @@ pub fn run<A: Application>(
         buf[..written].to_vec()
     };
 
+    // Pre-encode the ServerBusy frame the same way. Sent on behalf of
+    // the reader (`ControlEvent::PipelineBusy`) — this stage owns all
+    // egress on a client socket, so the busy notice appends to
+    // `send_buf` like any other frame instead of racing our sends from
+    // the reader thread.
+    let server_busy_wire_frame = {
+        let mut buf = [0u8; 8];
+        let written =
+            control_codec::encode_transport_response(&TransportResponse::ServerBusy, &mut buf)
+                .expect("ServerBusy encodes");
+        buf[..written].to_vec()
+    };
+
     // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.
     let mut last_heartbeat_scan = Instant::now();
 
@@ -401,13 +470,12 @@ pub fn run<A: Application>(
                 flush_sends(
                     &mut ring,
                     &mut connections,
-                    &dirty_connections,
+                    &mut dirty_connections,
                     &mut to_remove,
                     &mut cqes,
                 );
                 #[cfg(feature = "latency-trace")]
                 close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
-                dirty_connections.clear();
             }
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);
@@ -433,17 +501,40 @@ pub fn run<A: Application>(
                             _owner: owner,
                             send_buf: Vec::with_capacity(4096),
                             last_send: Instant::now(),
+                            blocked_since: None,
+                            last_send_attempt: Instant::now(),
                         },
                     );
                 }
                 ControlEvent::Disconnected { connection_id } => {
-                    connections.remove(&connection_id);
+                    // Reader-initiated teardown: the reader already
+                    // closed its half. Decrement only if the entry was
+                    // actually present — a response-initiated drop
+                    // already removed it (and paid the decrement), and
+                    // this event is its echo.
+                    if connections.remove(&connection_id).is_some() {
+                        active_connections.fetch_sub(1, Ordering::Relaxed);
+                    }
                     dirty_connections.remove(&connection_id);
                     // Anything this connection had buffered goes with
                     // it, so its queued samples measure bytes that will
                     // never be sent.
                     #[cfg(feature = "latency-trace")]
                     discard_e2e_samples(&mut pending_e2e, &[connection_id]);
+                }
+                ControlEvent::PipelineBusy { connection_id } => {
+                    if let Some(entry) = connections.get_mut(&connection_id) {
+                        // Overflow discipline: a busy notice to a peer
+                        // already at its buffer cap is not worth more
+                        // memory — skip it; the cap (or the blocked
+                        // timeout) is about to drop the connection
+                        // anyway. Missing entry likewise: best-effort.
+                        if entry.send_buf.len() + server_busy_wire_frame.len() <= MAX_SEND_BUF {
+                            entry.send_buf.extend_from_slice(&server_busy_wire_frame);
+                            entry.last_send = Instant::now();
+                            dirty_connections.insert(connection_id);
+                        }
+                    }
                 }
             }
         }
@@ -461,7 +552,7 @@ pub fn run<A: Application>(
                 flush_sends(
                     &mut ring,
                     &mut connections,
-                    &dirty_connections,
+                    &mut dirty_connections,
                     &mut to_remove,
                     &mut cqes,
                 );
@@ -470,9 +561,10 @@ pub fn run<A: Application>(
                 #[cfg(feature = "latency-trace")]
                 close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
                 for conn_id in to_remove.drain(..) {
-                    connections.remove(&conn_id);
+                    if let Some(entry) = connections.remove(&conn_id) {
+                        teardown_dropped(entry, &active_connections);
+                    }
                 }
-                dirty_connections.clear();
             }
 
             // Send heartbeats to idle connections. Only checked during
@@ -490,7 +582,7 @@ pub fn run<A: Application>(
                 if now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1) {
                     last_heartbeat_scan = now;
                     for (&conn_id, entry) in connections.iter_mut() {
-                        if now.duration_since(entry.last_send) >= interval {
+                        if heartbeat_due(entry, now, interval, heartbeat_wire_frame.len()) {
                             entry.send_buf.extend_from_slice(&heartbeat_wire_frame);
                             dirty_connections.insert(conn_id);
                             entry.last_send = now;
@@ -501,14 +593,15 @@ pub fn run<A: Application>(
                         flush_sends(
                             &mut ring,
                             &mut connections,
-                            &dirty_connections,
+                            &mut dirty_connections,
                             &mut to_remove,
                             &mut cqes,
                         );
                         for conn_id in to_remove.drain(..) {
-                            connections.remove(&conn_id);
+                            if let Some(entry) = connections.remove(&conn_id) {
+                                teardown_dropped(entry, &active_connections);
+                            }
                         }
-                        dirty_connections.clear();
                     }
                 }
             }
@@ -624,6 +717,18 @@ pub fn run<A: Application>(
         // wait more often.
         let batch_now = Instant::now();
 
+        // Set when a connection's send_buf crosses
+        // FLUSH_BYTES_THRESHOLD; checked after every slot so the flush
+        // runs *within* the batch. Deferring it to the end of the batch
+        // would reopen the defect the threshold exists to close: one
+        // MAX_BATCH batch of large frames (anything over ~64 bytes
+        // average) can push a healthy connection from empty past
+        // `MAX_SEND_BUF` before a batch-end flush ever ran, tearing it
+        // down with nothing written. A flag written at append time
+        // rather than a per-slot scan of the dirty set: the scan would
+        // cost a hash lookup per dirty connection on the hot path.
+        let mut flush_due = false;
+
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
@@ -674,7 +779,7 @@ pub fn run<A: Application>(
                     flush_sends(
                         &mut ring,
                         &mut connections,
-                        &dirty_connections,
+                        &mut dirty_connections,
                         &mut to_remove,
                         &mut cqes,
                     );
@@ -687,9 +792,10 @@ pub fn run<A: Application>(
                     // `connections.get_mut` lookup below, so removing
                     // here is safe.
                     for conn_id in to_remove.drain(..) {
-                        connections.remove(&conn_id);
+                        if let Some(entry) = connections.remove(&conn_id) {
+                            teardown_dropped(entry, &active_connections);
+                        }
                     }
-                    dirty_connections.clear();
                 }
 
                 loop {
@@ -897,6 +1003,60 @@ pub fn run<A: Application>(
                     }
                     let _ = outcome;
                 }
+
+                flush_due |= entry.send_buf.len() >= FLUSH_BYTES_THRESHOLD;
+            }
+
+            // Byte-threshold flush on the consumed path — the still-
+            // open half of July-audit finding 4. Under sustained load
+            // with an open gate this is the ONLY flush that runs: the
+            // idle path needs an empty SPSC, the gate path needs a
+            // durability wait, and heartbeats need idleness. Without
+            // it, delivery on a busy stretch degenerates to
+            // `MAX_SEND_BUF` evicting the very clients being served.
+            // Threshold-gated so light traffic keeps full batching;
+            // once a connection holds ~an MSS the extra submit no
+            // longer costs wire efficiency. MSG_DONTWAIT flushes cannot
+            // block, so this adds no head-of-line exposure (the hazard
+            // that deferred this trigger in July). Runs between slots,
+            // not after the batch, so `MAX_SEND_BUF` can never trip on
+            // a healthy connection within a single batch — a blocked
+            // peer re-arms the flag on its later slots, but its paced
+            // retry inside `flush_sends` keeps that cheap.
+            if flush_due {
+                flush_due = false;
+                // Overflow-dropped connections leave first so the flush
+                // skips them — same order as the batch-end cleanup, and
+                // their queued samples go with them (they measure bytes
+                // that will never be flushed). Later slots addressed to
+                // them are skipped by the `connections.get_mut` miss
+                // above.
+                #[cfg(feature = "latency-trace")]
+                discard_e2e_samples(&mut pending_e2e, &to_remove);
+                for conn_id in to_remove.drain(..) {
+                    if let Some(entry) = connections.remove(&conn_id) {
+                        teardown_dropped(entry, &active_connections);
+                    }
+                    dirty_connections.remove(&conn_id);
+                }
+                #[cfg(feature = "tick-to-trade")]
+                let egress_start = trace::mono_trace_ns();
+                flush_sends(
+                    &mut ring,
+                    &mut connections,
+                    &mut dirty_connections,
+                    &mut to_remove,
+                    &mut cqes,
+                );
+                #[cfg(feature = "tick-to-trade")]
+                egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
+                #[cfg(feature = "latency-trace")]
+                close_e2e_samples(&mut pending_e2e, &mut server_e2e_rec);
+                for conn_id in to_remove.drain(..) {
+                    if let Some(entry) = connections.remove(&conn_id) {
+                        teardown_dropped(entry, &active_connections);
+                    }
+                }
             }
         }
 
@@ -908,7 +1068,9 @@ pub fn run<A: Application>(
         #[cfg(feature = "latency-trace")]
         discard_e2e_samples(&mut pending_e2e, &to_remove);
         for conn_id in to_remove.drain(..) {
-            connections.remove(&conn_id);
+            if let Some(entry) = connections.remove(&conn_id) {
+                teardown_dropped(entry, &active_connections);
+            }
             dirty_connections.remove(&conn_id);
         }
 
@@ -1020,8 +1182,27 @@ pub(crate) fn slot_needs_gate<R: Copy, Q: Copy>(
     !slot.durability_bypass && cached_durable_pos < slot.wire_seq
 }
 
-/// Submit io_uring SEND SQEs for all dirty connections and wait for completions.
+/// Tear down a connection the *response stage* decided to drop (send
+/// error, `MAX_SEND_BUF` overflow, blocked-send timeout).
 ///
+/// Removing the map entry alone only drops this stage's dup of the
+/// socket — the reader still holds its own dup, so the socket would
+/// stay fully open: the dropped client's requests keep flowing through
+/// the reader (whose idle timeout never fires while the client keeps
+/// sending) with no response ever delivered, and the accept loop's
+/// `max_connections` permit stays pinned forever. `shutdown(2)` reaches
+/// every dup: the reader's multishot RECV completes with 0, it tears
+/// down its slab entry and emits `Disconnected` — which finds this
+/// entry already gone, so the permit is released exactly once.
+fn teardown_dropped(entry: ConnectionEntry, active_connections: &AtomicU64) {
+    // Best-effort: ENOTCONN just means the peer tore the socket down
+    // first — dropping `entry` below still reclaims our dup.
+    unsafe {
+        libc::shutdown(entry.fd, libc::SHUT_RDWR);
+    }
+    active_connections.fetch_sub(1, Ordering::Relaxed);
+}
+
 /// Outcome of a single per-frame append. `Continue` means the
 /// caller may proceed to the next frame for this slot;
 /// `ConnectionDropped` means the connection's send buffer overflowed
@@ -1040,6 +1221,32 @@ enum AppendOutcome {
 /// payloads, or `encode_transport_response` for transport-shaped
 /// frames), and this helper handles size accounting + dirty
 /// tracking uniformly.
+/// Whether the idle-path heartbeat scan should append a frame to this
+/// connection: idle for a full interval — and able to receive it.
+///
+/// The two guards close the one append path that used to bypass
+/// `MAX_SEND_BUF`. A blocked peer's socket is full, so a heartbeat
+/// would only sit in `send_buf` — and an idle client that trickle-read
+/// a few bytes per interval kept resetting the blocked clock while
+/// unchecked heartbeat appends grew its buffer without bound, pinning
+/// its connection permit on ever-growing memory. Skipping blocked
+/// peers (they detect liveness by draining, not by new frames) and
+/// cap-checking the append bounds the buffer; a peer that never drains
+/// is then `BLOCKED_SEND_TIMEOUT`'s or `MAX_SEND_BUF`'s problem, as
+/// designed. Residual: a trickling client still holds its permit while
+/// it drains — bounded memory, and the reader's idle timeout covers
+/// clients that stop sending entirely.
+fn heartbeat_due(
+    entry: &ConnectionEntry,
+    now: Instant,
+    interval: Duration,
+    frame_len: usize,
+) -> bool {
+    now.duration_since(entry.last_send) >= interval
+        && entry.blocked_since.is_none()
+        && entry.send_buf.len() + frame_len <= MAX_SEND_BUF
+}
+
 #[allow(clippy::too_many_arguments)]
 fn append_frame(
     result: Result<usize, &'static str>,
@@ -1080,129 +1287,183 @@ fn append_frame(
     AppendOutcome::Continue
 }
 
-/// Each dirty connection's accumulated send buffer is sent in a single SEND
-/// operation. Partial sends are retried until all bytes are delivered.
-/// Failed connections are collected in `to_remove` for the caller to clean up.
+/// Each dirty connection's accumulated send buffer is sent in a single
+/// SEND operation, and the flush never blocks on a slow peer.
+///
+/// Every SEND carries `MSG_DONTWAIT`, so a full socket buffer completes
+/// immediately with `EAGAIN` instead of parking the operation until the
+/// peer reads. That matters because io_uring never surfaces `EAGAIN` for
+/// a plain SEND — it arms an internal poll and withholds the CQE, which
+/// is what let one zero-window client wedge this stage (and with it every
+/// client's acks) behind the `submit_and_wait` below.
+///
+/// Undelivered bytes (EAGAIN or a partial send) stay in the connection's
+/// `send_buf` and the connection stays in `dirty`; retries are paced by
+/// [`BLOCKED_RETRY_INTERVAL`] and bounded by [`BLOCKED_SEND_TIMEOUT`].
+/// `MAX_SEND_BUF` remains the growth cap while new responses accumulate.
+///
+/// On return, `dirty` holds exactly the connections that still have
+/// undelivered bytes and were not queued in `to_remove` — callers must
+/// not clear it. Failed connections are collected in `to_remove` for the
+/// caller to purge from `connections`.
 fn flush_sends(
     ring: &mut IoUring,
     connections: &mut HashMap<u64, ConnectionEntry>,
-    dirty: &HashSet<u64>,
+    dirty: &mut HashSet<u64>,
     to_remove: &mut Vec<u64>,
     cqes: &mut Vec<(u64, i32)>,
 ) {
-    // Submit SEND SQEs for all dirty connections.
+    // One clock read per flush, shared by the retry-pacing and
+    // blocked-timeout decisions. Cheap next to the submit syscall below,
+    // and flushes are already batched (one per drained SPSC batch or
+    // idle-loop pass, not one per response).
+    let now = Instant::now();
+
+    // Submit SEND SQEs for all dirty connections not in retry backoff.
     let mut pending: usize = 0;
-    for &conn_id in dirty {
-        if let Some(entry) = connections.get(&conn_id) {
-            if entry.send_buf.is_empty() {
-                continue;
-            }
-            let sqe = opcode::Send::new(
-                types::Fd(entry.fd),
-                entry.send_buf.as_ptr(),
-                entry.send_buf.len() as u32,
-            )
-            .build()
-            .user_data(conn_id);
-
-            unsafe {
-                ring.submission()
-                    .push(&sqe)
-                    .expect("io_uring SQ full — increase RING_SIZE");
-            }
-            pending += 1;
-        }
-    }
-
-    if pending == 0 {
-        return;
-    }
-
-    // Submit and wait for all completions.
-    if let Err(e) = ring.submit_and_wait(pending) {
-        error!(error = %e, "io_uring submit_and_wait failed in response stage");
-        return;
-    }
-
-    // Drain completions into pre-allocated buffer. Must collect to
-    // release CQ borrow before mutating connections.
-    cqes.clear();
-    cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
-
-    for &(conn_id, result) in cqes.iter() {
-        if result < 0 {
-            debug!(
-                connection_id = conn_id,
-                error = result,
-                "send error, dropping connection"
-            );
-            to_remove.push(conn_id);
+    for &conn_id in dirty.iter() {
+        let Some(entry) = connections.get_mut(&conn_id) else {
+            continue;
+        };
+        if entry.send_buf.is_empty() {
             continue;
         }
-
-        let sent = result as usize;
-        if let Some(entry) = connections.get_mut(&conn_id) {
-            if sent >= entry.send_buf.len() {
-                entry.send_buf.clear();
-            } else {
-                // Partial send — drain sent bytes, retry remainder.
-                // Rare for small response frames over TCP/UDS but must
-                // be handled for correctness (e.g., send buffer pressure).
-                entry.send_buf.drain(..sent);
-                retry_send(ring, entry, conn_id, to_remove);
+        if let Some(blocked_at) = entry.blocked_since {
+            // A peer that has refused bytes for the full timeout is not
+            // coming back for them — reclaim the slot. Client-caused,
+            // hence debug (see the log-level convention).
+            if now.duration_since(blocked_at) >= BLOCKED_SEND_TIMEOUT {
+                debug!(
+                    connection_id = conn_id,
+                    pending_bytes = entry.send_buf.len(),
+                    blocked_ms = now.duration_since(blocked_at).as_millis() as u64,
+                    "socket blocked past timeout, dropping connection"
+                );
+                to_remove.push(conn_id);
+                continue;
+            }
+            if now.duration_since(entry.last_send_attempt) < BLOCKED_RETRY_INTERVAL {
+                continue;
             }
         }
-    }
-}
+        entry.last_send_attempt = now;
 
-/// Retry sending remaining bytes after a partial send. Loops until the
-/// entire buffer is delivered or an error occurs.
-fn retry_send(
-    ring: &mut IoUring,
-    entry: &mut ConnectionEntry,
-    conn_id: u64,
-    to_remove: &mut Vec<u64>,
-) {
-    while !entry.send_buf.is_empty() {
         let sqe = opcode::Send::new(
             types::Fd(entry.fd),
             entry.send_buf.as_ptr(),
             entry.send_buf.len() as u32,
         )
+        .flags(libc::MSG_DONTWAIT)
         .build()
         .user_data(conn_id);
 
         unsafe {
             ring.submission()
                 .push(&sqe)
-                .expect("io_uring SQ full during send retry");
+                .expect("io_uring SQ full — increase RING_SIZE");
+        }
+        pending += 1;
+    }
+
+    if pending > 0 {
+        // With MSG_DONTWAIT every SEND completes during submission
+        // (success, partial, or EAGAIN — the flag sets the kernel's
+        // no-wait path, so nothing is deferred to a poll retry). The
+        // wait is bounded by op execution, never by a peer.
+        //
+        // EINTR must retry, not return: a signal (profilers use them
+        // routinely) can interrupt the CQE wait *after* the submit phase
+        // consumed the SQEs — the inline completions are already posted
+        // by then. Returning without reaping would leave stale CQEs that
+        // the next flush drains against *updated* buffer contents:
+        // a delivered prefix gets re-sent and `drain(..sent)` double-
+        // drains. The retry submits an empty SQ and finds the CQ already
+        // holding `pending` entries, so it cannot stall.
+        loop {
+            match ring.submit_and_wait(pending) {
+                Ok(_) => break,
+                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => {
+                    // Submit-phase failure (ENOMEM class — EBUSY cannot
+                    // happen: the CQ is RING_SIZE deep and fully reaped
+                    // every flush, so at most `pending` ≤ RING_SIZE
+                    // entries are ever outstanding). An error here means
+                    // the SQEs were NOT consumed: continuing would leave
+                    // them queued for the next flush's submit, by which
+                    // time their addr fields can point at drained or
+                    // reallocated send_bufs — garbage on client sockets,
+                    // on the ack path. The kernel is out of resources
+                    // and the stage cannot proceed without corruption
+                    // risk: fail loudly and let the accept loop's
+                    // pipeline-death detection take the server down.
+                    error!(error = %e, "io_uring submit_and_wait failed in response stage");
+                    panic!("response stage io_uring submit failed: {e}");
+                }
+            }
         }
 
-        if let Err(e) = ring.submit_and_wait(1) {
-            debug!(connection_id = conn_id, error = %e, "send retry failed");
-            to_remove.push(conn_id);
-            return;
-        }
+        // Drain completions into pre-allocated buffer. Must collect to
+        // release CQ borrow before mutating connections.
+        cqes.clear();
+        cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
 
-        if let Some(cqe) = ring.completion().next() {
-            let result = cqe.result();
-            if result <= 0 {
+        for &(conn_id, result) in cqes.iter() {
+            let Some(entry) = connections.get_mut(&conn_id) else {
+                continue;
+            };
+            if result == -libc::EAGAIN {
+                // Socket buffer full. Keep the bytes; the connection
+                // stays dirty and retries at the paced cadence.
+                if entry.blocked_since.is_none() {
+                    entry.blocked_since = Some(now);
+                }
+                continue;
+            }
+            if result < 0 {
                 debug!(
                     connection_id = conn_id,
                     error = result,
-                    "send retry error, dropping connection"
+                    "send error, dropping connection"
                 );
                 to_remove.push(conn_id);
-                return;
+                continue;
             }
+
             let sent = result as usize;
-            if sent >= entry.send_buf.len() {
+            if sent == 0 {
+                // Unreachable for SOCK_STREAM sends of len > 0 (the
+                // kernel reports -EAGAIN instead), but keep the
+                // zero-progress invariant literal: 0 bytes must not
+                // restart the blocked clock via the partial branch.
+                if entry.blocked_since.is_none() {
+                    entry.blocked_since = Some(now);
+                }
+            } else if sent >= entry.send_buf.len() {
                 entry.send_buf.clear();
+                entry.blocked_since = None;
             } else {
+                // Partial send — the socket buffer filled mid-copy. An
+                // immediate retry would only report EAGAIN, so keep the
+                // remainder for the paced retry. Bytes moved, though:
+                // restart the blocked clock from this progress, so only
+                // a peer accepting *zero* bytes for the full timeout is
+                // dropped — a slow-but-draining client keeps its
+                // connection (until `MAX_SEND_BUF` says otherwise).
                 entry.send_buf.drain(..sent);
+                entry.blocked_since = Some(now);
             }
         }
     }
+
+    // Keep exactly the connections that still hold undelivered bytes and
+    // survived this flush. Runs even when nothing was submitted so a
+    // blocked-timeout drop above still leaves the dirty set consistent.
+    dirty.retain(|conn_id| {
+        !to_remove.contains(conn_id)
+            && connections
+                .get(conn_id)
+                .is_some_and(|e| !e.send_buf.is_empty())
+    });
 }
 
 /// Read the live gate cursors and lend them to `f` as a [`CursorView`].
@@ -2627,5 +2888,366 @@ mod tests {
             Duration::from_millis(500),
         );
         assert!(!final_state);
+    }
+
+    /// Regression tests for the slow-client head-of-line block fixed in
+    /// the 2026-08 io_uring audit (docs/internal/io-uring-audit-2026-08.md,
+    /// finding 1): `flush_sends` used to `submit_and_wait` on SENDs
+    /// without `MSG_DONTWAIT`, and io_uring holds such a SEND's CQE back
+    /// until the peer reads — so one zero-window client stalled every
+    /// client's acks. These use real sockets and a real ring: the defect
+    /// was kernel-level behaviour a mock would not reproduce.
+    mod heartbeat {
+        use super::super::{MAX_SEND_BUF, heartbeat_due};
+        use super::flush_sends::entry_for;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        const INTERVAL: Duration = Duration::from_secs(1);
+        const FRAME_LEN: usize = 13;
+
+        /// Backdate `last_send` a full interval so only the receive-
+        /// ability guards decide. `checked_sub` because a young
+        /// monotonic clock can't be backdated (same pattern as the
+        /// flush_sends tests).
+        fn idle_entry(payload: &[u8]) -> Option<super::super::ConnectionEntry> {
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            let mut entry = entry_for(tx, payload);
+            entry.last_send = Instant::now().checked_sub(INTERVAL * 2)?;
+            Some(entry)
+        }
+
+        #[test]
+        fn idle_unblocked_connection_gets_a_heartbeat() {
+            let Some(entry) = idle_entry(&[]) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            assert!(heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN));
+        }
+
+        #[test]
+        fn recently_active_connection_is_skipped() {
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            let entry = entry_for(tx, &[]);
+            assert!(
+                !heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN),
+                "a connection inside the interval must not be pinged"
+            );
+        }
+
+        /// A blocked peer's socket is full — the frame would only grow
+        /// `send_buf`. This is one half of the fix for the unbounded
+        /// heartbeat growth on trickle-reading clients.
+        #[test]
+        fn blocked_connection_is_skipped() {
+            let Some(mut entry) = idle_entry(&[]) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            entry.blocked_since = Some(Instant::now());
+            assert!(!heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN));
+        }
+
+        /// The other half: heartbeats respect `MAX_SEND_BUF` like every
+        /// other append — this was the one path that bypassed the cap.
+        #[test]
+        fn append_never_exceeds_the_send_buffer_cap() {
+            let payload = vec![0u8; MAX_SEND_BUF - FRAME_LEN + 1];
+            let Some(entry) = idle_entry(&payload) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            assert!(!heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN));
+
+            let payload = vec![0u8; MAX_SEND_BUF - FRAME_LEN];
+            let Some(entry) = idle_entry(&payload) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            assert!(
+                heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN),
+                "a frame that exactly fits is allowed"
+            );
+        }
+    }
+
+    mod flush_sends {
+        use super::super::{
+            BLOCKED_RETRY_INTERVAL, BLOCKED_SEND_TIMEOUT, ConnectionEntry, flush_sends,
+        };
+        use io_uring::IoUring;
+        use std::collections::{HashMap, HashSet};
+        use std::io::Read as _;
+        use std::os::unix::io::{AsRawFd, RawFd};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        pub(super) fn entry_for(stream: UnixStream, payload: &[u8]) -> ConnectionEntry {
+            ConnectionEntry {
+                fd: stream.as_raw_fd(),
+                _owner: Box::new(stream),
+                send_buf: payload.to_vec(),
+                last_send: Instant::now(),
+                blocked_since: None,
+                last_send_attempt: Instant::now(),
+            }
+        }
+
+        /// Fill `fd`'s socket send buffer with non-blocking writes until
+        /// the kernel refuses more — the state a zero-window / non-reading
+        /// client leaves a connection in.
+        fn fill_socket(fd: RawFd) {
+            let junk = [0u8; 4096];
+            loop {
+                let n =
+                    unsafe { libc::send(fd, junk.as_ptr().cast(), junk.len(), libc::MSG_DONTWAIT) };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    assert_eq!(
+                        err.raw_os_error(),
+                        Some(libc::EAGAIN),
+                        "unexpected errno while filling socket"
+                    );
+                    break;
+                }
+            }
+        }
+
+        /// The defect this module exists to prevent: a peer that stops
+        /// reading must cost the flush nothing, and healthy peers on the
+        /// same flush must still be delivered. Against the pre-fix code
+        /// this test never returns.
+        #[test]
+        fn slow_peer_does_not_block_flush_and_healthy_peer_is_delivered() {
+            let mut ring = IoUring::new(64).unwrap();
+            let (slow_tx, _slow_rx) = UnixStream::pair().unwrap();
+            let (fast_tx, mut fast_rx) = UnixStream::pair().unwrap();
+            fill_socket(slow_tx.as_raw_fd());
+
+            let mut connections = HashMap::new();
+            connections.insert(1u64, entry_for(slow_tx, &[0xAA; 1024]));
+            connections.insert(2u64, entry_for(fast_tx, b"hello"));
+            let mut dirty: HashSet<u64> = [1, 2].into_iter().collect();
+            let mut to_remove = Vec::new();
+            let mut cqes = Vec::new();
+
+            let start = Instant::now();
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+            // Generous bound to stay unflaky under CI load — the fixed
+            // path completes in microseconds, the broken one only when
+            // the slow peer reads (here: never).
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "flush blocked on a slow peer"
+            );
+
+            assert!(to_remove.is_empty(), "nobody dropped on first refusal");
+            let slow = &connections[&1];
+            assert!(
+                !slow.send_buf.is_empty(),
+                "slow peer keeps its undelivered bytes"
+            );
+            assert!(slow.blocked_since.is_some(), "slow peer marked blocked");
+            assert!(dirty.contains(&1), "slow peer stays dirty for retry");
+
+            assert!(connections[&2].send_buf.is_empty(), "healthy peer drained");
+            assert!(!dirty.contains(&2), "healthy peer leaves the dirty set");
+            fast_rx
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut buf = [0u8; 5];
+            fast_rx.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"hello", "healthy peer's bytes reached the socket");
+        }
+
+        /// A payload larger than the socket buffer must be partially
+        /// delivered, the remainder kept, and the connection treated as
+        /// blocked (an immediate retry would only report EAGAIN).
+        #[test]
+        fn partial_send_keeps_remainder_and_marks_blocked() {
+            let mut ring = IoUring::new(64).unwrap();
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            // Shrink the send buffer so the payload cannot fit in one go.
+            let sz: libc::c_int = 8192;
+            let rc = unsafe {
+                libc::setsockopt(
+                    tx.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&raw const sz).cast(),
+                    size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "setsockopt(SO_SNDBUF) failed");
+            let payload = vec![0x55u8; 512 * 1024];
+
+            // Enter the flush as an already-blocked peer with a stale
+            // (but unexpired) block timestamp and an expired pacing
+            // window, so the partial delivery below must *restart* the
+            // blocked clock — the behaviour that keeps a slow-but-
+            // draining client alive past BLOCKED_SEND_TIMEOUT.
+            let Some(stale_block) = Instant::now().checked_sub(BLOCKED_SEND_TIMEOUT / 2) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            let mut entry = entry_for(tx, &payload);
+            entry.blocked_since = Some(stale_block);
+            entry.last_send_attempt = stale_block;
+
+            let mut connections = HashMap::new();
+            connections.insert(1u64, entry);
+            let mut dirty: HashSet<u64> = [1].into_iter().collect();
+            let mut to_remove = Vec::new();
+            let mut cqes = Vec::new();
+
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+
+            let entry = &connections[&1];
+            assert!(entry.send_buf.len() < payload.len(), "some bytes were sent");
+            assert!(!entry.send_buf.is_empty(), "remainder kept for retry");
+            let refreshed = entry.blocked_since.expect("partial send marks blocked");
+            assert!(
+                refreshed > stale_block,
+                "forward progress restarts the blocked clock"
+            );
+            assert!(dirty.contains(&1));
+            assert!(to_remove.is_empty());
+        }
+
+        /// A connection blocked past `BLOCKED_SEND_TIMEOUT` is dropped —
+        /// the guard for clients that stop reading during quiet periods,
+        /// where `MAX_SEND_BUF` never trips because nothing accumulates.
+        #[test]
+        fn blocked_past_timeout_is_dropped() {
+            let mut ring = IoUring::new(64).unwrap();
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            fill_socket(tx.as_raw_fd());
+
+            let mut entry = entry_for(tx, &[1u8; 64]);
+            // `checked_sub`: a plain `-` panics when the monotonic clock
+            // is younger than the timeout (fresh-boot CI microVMs).
+            let Some(expired) = Instant::now().checked_sub(BLOCKED_SEND_TIMEOUT) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            entry.blocked_since = Some(expired);
+            let mut connections = HashMap::new();
+            connections.insert(7u64, entry);
+            let mut dirty: HashSet<u64> = [7].into_iter().collect();
+            let mut to_remove = Vec::new();
+            let mut cqes = Vec::new();
+
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+
+            assert_eq!(to_remove, vec![7], "timed-out peer queued for removal");
+            assert!(!dirty.contains(&7), "dropped peer leaves the dirty set");
+        }
+
+        /// A blocked connection retried a moment ago is skipped — the
+        /// pacing that keeps a busy-spinning stage from probing a full
+        /// socket once per loop iteration.
+        #[test]
+        fn blocked_retry_is_paced() {
+            let mut ring = IoUring::new(64).unwrap();
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            fill_socket(tx.as_raw_fd());
+
+            let mut entry = entry_for(tx, &[1u8; 64]);
+            entry.blocked_since = Some(Instant::now());
+            // A future attempt timestamp makes the pacing skip
+            // deterministic: `duration_since` saturates to zero, so no
+            // CI-load preemption between here and the flush's own clock
+            // read can open the 100 µs window and flake the assertion.
+            entry.last_send_attempt = Instant::now() + Duration::from_secs(1);
+            let attempted_at = entry.last_send_attempt;
+            let mut connections = HashMap::new();
+            connections.insert(3u64, entry);
+            let mut dirty: HashSet<u64> = [3].into_iter().collect();
+            let mut to_remove = Vec::new();
+            let mut cqes = Vec::new();
+
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+
+            assert_eq!(
+                connections[&3].last_send_attempt, attempted_at,
+                "no SEND submitted inside the pacing window"
+            );
+            assert!(dirty.contains(&3), "paced peer stays dirty");
+            assert!(to_remove.is_empty());
+
+            // Outside the pacing window the retry happens: backdate the
+            // last attempt and verify the attempt timestamp advances.
+            let Some(backdated) = Instant::now().checked_sub(BLOCKED_RETRY_INTERVAL * 2) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            connections.get_mut(&3).unwrap().last_send_attempt = backdated;
+            flush_sends(
+                &mut ring,
+                &mut connections,
+                &mut dirty,
+                &mut to_remove,
+                &mut cqes,
+            );
+            assert!(
+                connections[&3].last_send_attempt > backdated,
+                "retry submitted once the pacing window elapsed"
+            );
+        }
+
+        /// Review finding F1 (io-uring-audit-2026-08.md): a
+        /// response-initiated drop must tear down the *whole* socket and
+        /// release the `max_connections` permit. The reader holds its
+        /// own dup of the socket, so merely dropping this stage's entry
+        /// (closing our dup) leaves the socket open — the EOF below must
+        /// arrive *despite* a live second dup, which only shutdown(2)
+        /// achieves.
+        #[test]
+        fn teardown_shuts_the_socket_despite_other_dups_and_releases_the_permit() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            let (tx, mut peer) = UnixStream::pair().unwrap();
+            // Simulates the reader's half: still open across the drop.
+            let reader_dup = tx.try_clone().unwrap();
+            let entry = entry_for(tx, &[]);
+            let active = AtomicU64::new(1);
+
+            super::super::teardown_dropped(entry, &active);
+
+            assert_eq!(active.load(Ordering::Relaxed), 0, "permit released");
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut buf = [0u8; 1];
+            assert_eq!(
+                peer.read(&mut buf).expect("EOF, not a timeout"),
+                0,
+                "peer observes EOF even though another dup is still open"
+            );
+            drop(reader_dup);
+        }
     }
 }

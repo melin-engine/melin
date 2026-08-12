@@ -51,7 +51,7 @@ use crate::sector_writer::{preallocate, prefault_pages, zero_range_extents};
 ///   - the corresponding pages prefaulted into the page cache,
 ///   - `sync_all` issued so the allocation is durable across crashes.
 ///
-/// The file header is *not* yet written — `SectorWriter::adopt_prepared`
+/// The file header is *not* yet written — `SectorWriter::install_new_segment`
 /// writes it at adopt time so it reflects the rotation boundary's
 /// sequence + chain anchor.
 pub struct PreparedSegment {
@@ -276,7 +276,7 @@ fn backoff_sleep(state: &State) {
 /// Mirrors the prep done in `SectorWriter::create_bare_inner` except
 /// it does *not* write a file header — the header is application data
 /// that depends on the rotation-boundary state and is written by
-/// `SectorWriter::adopt_prepared` after the rename.
+/// `SectorWriter::install_new_segment` after the rename.
 fn prepare_one(live_path: &Path, sector_size: usize) -> Result<PreparedSegment, JournalError> {
     let staging = staging_path(live_path);
 
@@ -299,8 +299,8 @@ fn prepare_one(live_path: &Path, sector_size: usize) -> Result<PreparedSegment, 
     let file = opts.open(&staging)?;
 
     // Reserve `ENTRY_OFFSET` for the file header (written later by
-    // `adopt_prepared`) — matches `create_bare_inner` so adoption is a
-    // simple header pwrite, not a re-allocate.
+    // `install_new_segment`) — matches `create_bare_inner` so adoption
+    // is a simple header pwrite, not a re-allocate.
     let allocated_end = preallocate(&file, ENTRY_OFFSET)?;
     zero_range_extents(&file, ENTRY_OFFSET, allocated_end);
     prefault_pages(&file, ENTRY_OFFSET, allocated_end);

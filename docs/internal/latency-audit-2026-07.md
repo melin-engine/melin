@@ -228,31 +228,49 @@ latency: it only fires when the stage was about to spin anyway. The same
 change made the gate per-slot rather than per-batch, which is what makes
 the trigger fire at durability boundaries instead of once per batch.
 
-**Still open, and it is the half with teeth.** The new trigger is
-gate-driven, so it does nothing in the regime where the gate never
-closes — `local` mode, or any deployment whose durability frontier stays
-ahead of the response stage. There, a saturated output ring still means
-no wait, no lull, and no flush, and the 64 KiB disconnect above is
-reached exactly as before. Closing that needs the size- or count-based
-trigger this section originally proposed. Note that a byte threshold is
-the only one of the two that bounds the disconnect directly.
+**Closed (2026-08-07, `fix/io-uring-audit` branch).** The remaining half
+was the gate-never-closes regime — `local` mode, or any deployment whose
+durability frontier stays ahead of the response stage — where a
+saturated output ring meant no wait, no lull, no flush, and the 64 KiB
+disconnect was reached exactly as described. A per-connection byte
+threshold (`FLUSH_BYTES_THRESHOLD`, ~one MSS) now triggers a flush at
+the end of any consumed batch in which a connection crossed it, chosen
+over a slot count because only the byte form bounds the distance to the
+disconnect cap directly. The flag is set at append time (no per-batch
+scan of the dirty set). Regression-tested deterministically: 8192 slots
+released through an open gate in back-to-back busy batches must all be
+delivered — pre-fix the connection dropped at ~slot 5000 with nothing on
+the wire. The head-of-line hazard flagged below no longer applies: the
+flush path is `MSG_DONTWAIT` end to end and cannot block on a peer.
 
-**Unmeasured.** The throughput-vs-latency trade flagged in "Ratings that
-need a why" has not been run on the LAN suite, and should be before this
-is treated as settled. Pick the run deliberately: this audit records a max
-output-ring depth of 1 in the latency run, so the stage reaches its idle
-path and flushes constantly there. Extra `submit_and_wait` calls will show
-up in a saturating throughput run or not at all.
+**Amended (2026-08-12, whole-branch review).** The end-of-batch flush
+placement left a one-batch hole: `MAX_SEND_BUF` drops at *append* time,
+so a single `MAX_BATCH` batch of frames averaging over ~64 bytes could
+push a healthy client from empty past the cap before the batch-end
+flush ran — unreachable with the 13-byte counter frames (which is why
+the regression test above couldn't see it), real for larger
+application frames. The trigger now fires *between slots*; a second
+regression test with a 400-byte encoder (one batch ≈ 160 KiB) pins it.
 
-**Adjacent, same area.** `flush_sends` submits with
-`submit_and_wait(pending)` and `retry_send` (`response.rs:1136`) loops
-synchronously on `submit_and_wait(1)`. A single client with a full TCP
-receive window therefore head-of-line-blocks the response stage for every
-other connection. Worth separating from the flush-trigger change, but it
-belongs on the same list — and its priority went up with the partial fix
-above, which moved a `flush_sends` call onto the gate path. That exposure
-used to be confined to lulls and shutdown; it now sits in a path that runs
-under load.
+**Measured (2026-08-12, LAN suite, tcp-dual-repl).** The saturating run
+happened, at matched load (~1.21 M orders/s, inside main's band):
+p50 172–204 → ~130 µs, p99 201–315 → ~188 µs, p99.9 276–374 → ~211 µs,
+p99.99 327–417 → ~300 µs; p99.999 and max overlap between branches
+(shared-environment noise dominates at 1-in-100k). Free-running, the
+branch also carries ~20% more closed-loop throughput (~1.45 M/s). The
+numbers price the whole `fix/io-uring-audit` branch (this trigger plus
+WriteFixed, buf_ring recycling, single-writer egress), not the constant
+in isolation — but the feared extra-`submit_and_wait` cost is not
+visible at any percentile through p99.99, in the exact regime that
+would show it. The 1400-byte threshold is settled.
+
+**Adjacent, same area — since closed.** `flush_sends` submitted with
+`submit_and_wait(pending)` and `retry_send` looped synchronously on
+`submit_and_wait(1)`, so a single client with a full TCP receive window
+head-of-line-blocked the response stage for every other connection.
+Resolved as finding 1 of `io-uring-audit-2026-08.md` (`MSG_DONTWAIT` on
+every SEND, paced retry, blocked-duration drop); see that doc for the
+design and its review rounds.
 
 ---
 

@@ -12,6 +12,7 @@
 
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::codec::{self, FileHeaderInfo};
 use crate::error::JournalError;
@@ -435,6 +436,110 @@ pub fn fsync_parent_dir(live: &Path) -> std::io::Result<()> {
     f.sync_all()
 }
 
+/// Pacing for [`DirFsyncRetry`]: coarse enough not to hammer a failing
+/// filesystem from the journal loop, fast enough to close the
+/// crash-durability window promptly once the fault clears.
+const DIR_FSYNC_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Handles a post-rotation directory fsync, retrying on failure until
+/// it succeeds. Owned by each journal writer.
+///
+/// A rotation whose dir fsync failed is still a rotation: by the time
+/// the fsync runs, the archive rename and the new live segment are on
+/// disk and the in-memory writer is already appending to the new file.
+/// The failure only weakens crash-durability of the dirent changes —
+/// power loss before they commit can present recovery with the
+/// pre-rotation layout, or the archive without the live file, both of
+/// which recovery already handles (see [`list_archives`]). Propagating
+/// the error instead would desync callers that treat `Err` as
+/// "rotation did not happen" from a writer that *did* rotate: the
+/// io_uring journal stage would keep its registered fd pointed at the
+/// archived inode and overwrite the archive's head with acked events
+/// while the live segment stays empty, and replication would never
+/// publish the rotation boundary.
+///
+/// So [`Self::after_rotation`] never fails — it logs at `error!` (a
+/// journal I/O failure the operator must investigate) and schedules
+/// retries, which the writers drive from their flush paths via
+/// [`Self::poll`]. Retrying shrinks the crash-exposure window from
+/// "until kernel background writeback or the next rotation" to "until
+/// the transient fault clears".
+pub struct DirFsyncRetry {
+    /// Live path whose parent directory still needs a durable fsync.
+    /// `Option<PathBuf>` rather than a bool so retries don't depend on
+    /// callers re-supplying the path; `None` (the steady state) makes
+    /// `poll` a single branch, cheap enough for per-batch call sites.
+    pending: Option<PathBuf>,
+    /// Time of the last attempt, meaningful only while `pending` is
+    /// `Some` — paces retries to one per [`DIR_FSYNC_RETRY_INTERVAL`].
+    last_attempt: Instant,
+}
+
+impl DirFsyncRetry {
+    pub fn new() -> Self {
+        Self {
+            pending: None,
+            last_attempt: Instant::now(),
+        }
+    }
+
+    /// Fsync `live`'s parent directory after a *committed* rotation.
+    /// Never fails — on error, logs and schedules retries via `poll`
+    /// (see the type docs for why the error must not propagate).
+    pub fn after_rotation(&mut self, live: &Path) {
+        match fsync_parent_dir(live) {
+            // A dir fsync covers every pending dirent in that
+            // directory, including ones left over from an earlier
+            // failed rotation of the same journal.
+            Ok(()) => self.pending = None,
+            Err(e) => {
+                tracing::error!(
+                    path = %live.display(),
+                    error = %e,
+                    "post-rotation directory fsync failed — rotation is complete and \
+                     journaling continues on the new segment, but the rename may not \
+                     survive power loss until a paced retry succeeds"
+                );
+                self.pending = Some(live.to_path_buf());
+                self.last_attempt = Instant::now();
+            }
+        }
+    }
+
+    /// Retry a pending fsync, paced to one attempt per
+    /// [`DIR_FSYNC_RETRY_INTERVAL`]. A single branch when nothing is
+    /// pending — safe to call from per-batch paths.
+    pub fn poll(&mut self) {
+        self.poll_at(Instant::now());
+    }
+
+    fn poll_at(&mut self, now: Instant) {
+        let Some(live) = self.pending.as_ref() else {
+            return;
+        };
+        if now.duration_since(self.last_attempt) < DIR_FSYNC_RETRY_INTERVAL {
+            return;
+        }
+        self.last_attempt = now;
+        if fsync_parent_dir(live).is_ok() {
+            tracing::info!(
+                path = %live.display(),
+                "post-rotation directory fsync recovered on retry"
+            );
+            self.pending = None;
+        }
+        // A still-failing retry stays silent: the initial error! stands,
+        // and one line per second of a persistent fault would drown the
+        // log without adding information.
+    }
+}
+
+impl Default for DirFsyncRetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +587,74 @@ mod tests {
                 writer.rotate_segment().unwrap();
             }
         }
+    }
+
+    /// A failed post-rotation directory fsync must be swallowed (with a
+    /// log) and retried until it succeeds, never propagated: by the
+    /// time it runs the rotation is committed, and callers treat an
+    /// `Err` as "rotation did not happen" — the io_uring stage would
+    /// keep writing to the archived inode via its registered fd. A
+    /// full-rotation injection isn't possible (`archive_live` needs
+    /// directory *read* permission, the same permission whose removal
+    /// makes the fsync's open fail), so this pins the retry tracker
+    /// directly.
+    #[test]
+    fn dir_fsync_retry_swallows_failure_and_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root bypasses permission checks, so the EACCES injection
+        // cannot fire. Runtime skip (not #[ignore]) — CI and dev runs
+        // are unprivileged, where the test is fully exercised.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping dir_fsync_retry test: running as root");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("jdir");
+        std::fs::create_dir(&sub).unwrap();
+        let live = sub.join("test.journal");
+
+        let mut retry = DirFsyncRetry::new();
+
+        // Healthy directory: nothing scheduled.
+        retry.after_rotation(&live);
+        assert!(retry.pending.is_none(), "healthy fsync must not schedule");
+
+        // Write+execute only: renames and file creation inside `sub`
+        // still work, but the read-only `File::open(&sub)` inside
+        // `fsync_parent_dir` fails with EACCES.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o333)).unwrap();
+        retry.after_rotation(&live);
+        assert!(
+            retry.pending.is_some(),
+            "failed fsync must schedule a retry"
+        );
+
+        // Fault persists: a paced retry attempts and stays pending.
+        let t0 = Instant::now();
+        retry.poll_at(t0 + 2 * DIR_FSYNC_RETRY_INTERVAL);
+        assert!(
+            retry.pending.is_some(),
+            "retry against a persistent fault stays pending"
+        );
+
+        // Fault clears — but a poll inside the pacing interval must be
+        // skipped (this is what keeps a failing filesystem from being
+        // hammered from per-batch call sites).
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        retry.poll_at(t0 + 2 * DIR_FSYNC_RETRY_INTERVAL + Duration::from_millis(10));
+        assert!(
+            retry.pending.is_some(),
+            "poll inside the pacing interval must be skipped"
+        );
+
+        // The next paced attempt succeeds and clears the schedule.
+        retry.poll_at(t0 + 4 * DIR_FSYNC_RETRY_INTERVAL);
+        assert!(
+            retry.pending.is_none(),
+            "retry must clear once the fsync succeeds"
+        );
     }
 
     /// `chain_value_at` must reproduce exactly what the writer reported

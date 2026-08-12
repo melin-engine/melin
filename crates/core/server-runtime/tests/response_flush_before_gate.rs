@@ -82,6 +82,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         utilization: Arc::new(StageUtilization::default()),
         encoder: Arc::new(ResponseEncoder),
         fence_state: Arc::new(FenceState::new(0)),
+        active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
 }
 
@@ -287,5 +288,100 @@ fn open_gate_delivers_the_whole_batch_in_order() {
             let value = value.expect("response never arrived");
             assert_eq!(value, expected, "responses delivered out of order");
         }
+    });
+}
+
+/// A sustained busy stream must be *delivered*, not disconnected — the
+/// still-open half of finding 4 in `latency-audit-2026-07.md`, closed by
+/// the byte-threshold flush on the consumed path.
+///
+/// Setup makes the busy regime deterministic rather than a race between
+/// feeder and stage: all 8192 slots are published while the first slot's
+/// gate is shut (the stage spins; the ring fills behind it), then the
+/// cursor opens past everything at once. From there the stage sees
+/// `count > 0` for eight consecutive max-size batches — the idle-path
+/// flush is unreachable (ring never empty) and the gate-path flush never
+/// fires (no more waits). ~106 KiB of responses accumulate, far past
+/// `MAX_SEND_BUF` (64 KiB): without the per-batch threshold flush the
+/// stage drops the connection at roughly slot 5000 with nothing ever
+/// written to the socket, and the reads below time out.
+#[test]
+fn sustained_busy_stream_is_delivered_not_disconnected() {
+    const SLOTS: u64 = 8192;
+
+    let (mut producer, mut consumers) =
+        DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(SLOTS as usize)
+            .add_consumer()
+            .build();
+    let consumer = consumers.pop().expect("one consumer was requested");
+
+    let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
+    let server_fd = server_sock.as_raw_fd();
+    let writer = BlockingFrameWriter::new(Box::new(server_sock) as Box<dyn Write + Send>);
+    client_sock
+        .set_read_timeout(Some(READ_TIMEOUT))
+        .expect("set read timeout");
+
+    // Gate shut for everything until the ring is full.
+    let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(0));
+    let shutdown = AtomicBool::new(false);
+    let (control_tx, control_rx) = mpsc::channel();
+    let config = config_for(journal_cursor.clone());
+
+    thread::scope(|scope| {
+        let stage = scope.spawn(|| {
+            response::run::<Counter>(consumer, control_rx, config, &shutdown);
+        });
+
+        control_tx
+            .send(ControlEvent::Connected {
+                connection_id: 1,
+                fd: server_fd,
+                writer,
+            })
+            .expect("stage is running");
+        thread::sleep(SETTLE);
+
+        // Fill the ring behind the shut gate. The stage consumes the
+        // first batch into its local array and spins on slot 1's gate;
+        // the rest queue up. `publish` applies backpressure if the ring
+        // is momentarily full, so this loop cannot outrun capacity.
+        for i in 1..=SLOTS {
+            producer.publish(ack_slot(i, i));
+        }
+
+        // Open every gate at once: from here the stage runs batch after
+        // batch with the ring non-empty — the regime under test.
+        journal_cursor.store(WireSeq::new(SLOTS));
+
+        // The client drains as the stage flushes. Record the outcome
+        // and stop the stage BEFORE panicking: a panic inside the scope
+        // with the stage still spinning turns a clean failure into a
+        // hung test run (same rule as the first test in this file).
+        let mut delivered = 0u64;
+        let mut failure: Option<String> = None;
+        for i in 1..=SLOTS {
+            match read_ack(&mut client_sock) {
+                Ok(value) if value == i => delivered += 1,
+                Ok(value) => {
+                    failure = Some(format!("out of order: got {value}, expected {i}"));
+                    break;
+                }
+                Err(e) => {
+                    failure = Some(format!(
+                        "response {i} of {SLOTS} never arrived ({e}) — busy-path flush missing"
+                    ));
+                    break;
+                }
+            }
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        stage.join().expect("response stage panicked");
+
+        if let Some(failure) = failure {
+            panic!("{failure}");
+        }
+        assert_eq!(delivered, SLOTS, "every response delivered");
     });
 }

@@ -2848,3 +2848,30 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     let _writer = t_journal.join().unwrap();
     let _app = t_matching.join().unwrap();
 }
+
+/// `journal_fixed_slot` decides WriteFixed-vs-Write per submit. The
+/// miss cases matter most: an unregistered replacement buffer submitted
+/// as `WriteFixed` against a stale slot would write the *wrong region's
+/// bytes* to the journal.
+#[test]
+fn journal_fixed_slot_matches_only_registered_pointers() {
+    use crate::pipeline::journal_fixed_slot;
+
+    let a = [0u8; 8];
+    let b = [0u8; 8];
+    let c = [0u8; 8];
+    let regs = [a.as_ptr(), b.as_ptr()];
+
+    assert_eq!(journal_fixed_slot(Some(&regs), a.as_ptr()), Some(0));
+    assert_eq!(journal_fixed_slot(Some(&regs), b.as_ptr()), Some(1));
+    assert_eq!(
+        journal_fixed_slot(Some(&regs), c.as_ptr()),
+        None,
+        "replacement buffer must fall back to a plain Write"
+    );
+    assert_eq!(
+        journal_fixed_slot(None, a.as_ptr()),
+        None,
+        "no registration (setup failure) means never WriteFixed"
+    );
+}
