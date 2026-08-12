@@ -121,6 +121,32 @@ dropping to ~0 in steady state. Expect p99.99 to tighten toward the
 ~300 µs the beat-free windows already show; p99.999+ should lose the
 ~1.8 ms shelf.
 
+### Follow-up: staging-time log-force collisions (2026-08-13)
+
+The first acceptance runs killed the beat (fast rotations 21/21,
+`sync_fallback` 0) but surfaced a new stall class: ~9.4 ms
+rotation-adjacent pipeline stalls at ~7/21 rotations, visible in
+replica ack-latency gauges as well as the primary. Two staging-pacing
+iterations (memcpy-clocked, then device-clocked double-window) changed
+nothing — the stall was never data bandwidth.
+
+Mechanism: `sync_file_range` flushes data pages but never logs
+filesystem metadata, so the paced zero-fill accumulated the *entire
+segment's* extent-allocation log items in the XFS CIL and detonated
+them in the terminal `sync_all` — one segment-sized log force per
+staging cycle. Log forces serialize filesystem-wide; any hot-path
+fdatasync (primary's or a replica's — replicas run their own preparers,
+and a delayed replica ack stalls the durability gate end-to-end)
+landing in that window queues behind it. The fix that removed metadata
+debt from steady state had batched the same debt into one lump.
+
+Fix: the paced fill issues an incremental `sync_data` every 64 MiB on
+the preparer thread, so each log force covers only the allocations made
+since the previous one and a colliding fdatasync waits sub-millisecond.
+The terminal `sync_all` remains the durability point but is cheap by
+construction. (The `FALLOC_FL_WRITE_ZEROES` fast path is unaffected —
+its allocation is a handful of extents, one small log item.)
+
 ## Implication: the sector writer
 
 Both structural advantages the sector writer holds over the buffered

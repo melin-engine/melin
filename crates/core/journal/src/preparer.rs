@@ -553,6 +553,19 @@ fn prepare_zero_filled(
     //   well inside any rotation period whose segment the device can
     //   write once.
     //
+    // Data pacing alone is not enough: `sync_file_range` never logs
+    // filesystem metadata, so the extent allocations for the entire
+    // fill accumulate in the XFS CIL until something forces the log.
+    // Leaving them all to the terminal `sync_all` detonates one
+    // segment-sized log force — and log forces serialize
+    // filesystem-wide, so a hot-path fdatasync (primary's or a
+    // replica's) landing in that window queues behind it (measured as
+    // ~9.4 ms rotation-adjacent pipeline stalls). The periodic
+    // `sync_data` below caps each force at ~64 MiB worth of allocation
+    // metadata, small enough that a colliding fdatasync waits
+    // sub-millisecond — and the force runs here, on the preparer
+    // thread, off the hot path.
+    //
     // Writes go through the page cache deliberately: the pages the
     // buffered writer is about to append into stay resident, so its
     // partial trailing-page writes never pay a read-modify-write
@@ -561,9 +574,14 @@ fn prepare_zero_filled(
     // EINTR retries. Heap Vec (not a stack array) — 2 MiB would
     // overflow default thread stacks.
     const ZERO_CHUNK: usize = 2 * 1024 * 1024;
+    // Log-force cadence for the paced fill (see the comment above): at
+    // ~25% device duty this is one small `sync_data` every ~100 ms,
+    // each logging only the allocations made since the previous one.
+    const METADATA_SYNC_INTERVAL: u64 = 64 * 1024 * 1024;
     let zeros = vec![0u8; ZERO_CHUNK];
     let mut offset: u64 = 0;
     let mut prev_chunk: Option<(u64, u64)> = None;
+    let mut last_metadata_sync: u64 = 0;
     while offset < bytes {
         if shutdown.load(Ordering::Acquire) {
             return Err(JournalError::Io(io::Error::new(
@@ -581,10 +599,21 @@ fn prepare_zero_filled(
         prev_chunk = Some((offset, n as u64));
         offset += n as u64;
 
+        // Incremental log force: flushes the pending chunk's data plus
+        // the extent-allocation metadata accumulated since the last
+        // force. Runs before the pacing sleep so its wall time counts
+        // toward this iteration's device-duty accounting.
+        if offset - last_metadata_sync >= METADATA_SYNC_INTERVAL {
+            file.sync_data()?;
+            last_metadata_sync = offset;
+        }
+
         if offset < bytes {
             std::thread::sleep(chunk_start.elapsed() * 3);
         }
     }
+    // Cheap by construction: at most the final < 64 MiB of allocation
+    // metadata (plus timestamps) remains unforced here.
     file.sync_all()?;
 
     Ok(PreparedSegment {
