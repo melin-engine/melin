@@ -485,21 +485,51 @@ fn prepare_zero_filled(
         .create_new(true)
         .open(staging)?;
 
-    // 1 MiB chunk: large enough that the copy loop is bandwidth-bound,
-    // small enough to stay cache/allocator friendly. Heap Vec (not a
-    // stack array) — 1 MiB would overflow default thread stacks.
-    // std's `write_all_at` handles short writes and EINTR retries.
-    let zeros = vec![0u8; 1024 * 1024];
-    // Kick background writeback every 16 MiB rather than letting the
-    // whole segment pile up dirty for one big `sync_all`: an unpaced
-    // fill dumps hundreds of MiB into the page cache and then contends
-    // with the live journal's per-batch `fdatasync` on the same device
-    // (and can trip the kernel's dirty-page throttling). The interval
-    // is a bandwidth/IPC balance, not tuned — anything in the 8–32 MiB
-    // range behaves equivalently.
-    const WRITEBACK_INTERVAL: u64 = 16 * 1024 * 1024;
+    // Fast path: FALLOC_FL_WRITE_ZEROES (kernel ≥ 6.16 with fs
+    // support) allocates *written* zeroed extents via the device's
+    // Write Zeroes command — no data crosses the bus, so there is no
+    // bandwidth burst to pace and no write amplification at all. The
+    // pages are not left resident, so prefault them like the sector
+    // path does (reading zeroed extents is a cheap sequential read).
+    if try_fallocate_write_zeroes(&file, bytes) {
+        prefault_pages(&file, 0, bytes);
+        file.sync_all()?;
+        return Ok(PreparedSegment {
+            file,
+            path: staging.to_path_buf(),
+            allocated_end: bytes,
+            // Not applicable — the buffered writer has no alignment
+            // requirement and ignores this field.
+            sector_size: 0,
+        });
+    }
+
+    // Fallback: physically write the zeros, paced. An unpaced fill
+    // saturates the journal device — the ~2 ms fsync beat this mode
+    // exists to fix was measured being replaced by ~10 ms fsync stalls
+    // whenever a batch fsync queued behind the staging burst. Two
+    // controls bound the interference:
+    //
+    // - 2 MiB chunks with `sync_file_range` after each: a batch fsync
+    //   never waits behind more than one chunk's device occupancy
+    //   (~1.5 ms at NVMe bandwidth), and dirty pages never pile up for
+    //   the final `sync_all`.
+    // - Occupancy pacing: sleep 3× each chunk's wall time before the
+    //   next, capping the fill at ~25% device duty. Self-adapting — no
+    //   bandwidth constant to tune per device — and it keeps staging
+    //   duration ≈ 4× (segment bytes / device bandwidth), well inside
+    //   any rotation period whose segment the device can write once.
+    //
+    // Writes go through the page cache deliberately: the pages the
+    // buffered writer is about to append into stay resident, so its
+    // partial trailing-page writes never pay a read-modify-write
+    // device read on the hot path (which O_DIRECT staging would
+    // reintroduce). std's `write_all_at` handles short writes and
+    // EINTR retries. Heap Vec (not a stack array) — 2 MiB would
+    // overflow default thread stacks.
+    const ZERO_CHUNK: usize = 2 * 1024 * 1024;
+    let zeros = vec![0u8; ZERO_CHUNK];
     let mut offset: u64 = 0;
-    let mut writeback_from: u64 = 0;
     while offset < bytes {
         if shutdown.load(Ordering::Acquire) {
             return Err(JournalError::Io(io::Error::new(
@@ -507,13 +537,14 @@ fn prepare_zero_filled(
                 "zero-fill aborted by shutdown",
             )));
         }
+        let chunk_start = std::time::Instant::now();
         let n = (bytes - offset).min(zeros.len() as u64) as usize;
         std::os::unix::fs::FileExt::write_all_at(&file, &zeros[..n], offset)?;
+        start_background_writeback(&file, offset, n as u64);
         offset += n as u64;
 
-        if offset - writeback_from >= WRITEBACK_INTERVAL {
-            start_background_writeback(&file, writeback_from, offset - writeback_from);
-            writeback_from = offset;
+        if offset < bytes {
+            std::thread::sleep(chunk_start.elapsed() * 3);
         }
     }
     file.sync_all()?;
@@ -526,6 +557,59 @@ fn prepare_zero_filled(
         // requirement and ignores this field.
         sector_size: 0,
     })
+}
+
+/// `FALLOC_FL_WRITE_ZEROES` — not yet in the `libc` crate; merged
+/// upstream in Linux 6.16 (mode bit after UNSHARE_RANGE = 0x40).
+/// Allocates extents as physically-written zeros using the block
+/// device's Write Zeroes command.
+const FALLOC_FL_WRITE_ZEROES: libc::c_int = 0x80;
+
+/// Whether `FALLOC_FL_WRITE_ZEROES` is worth attempting. Starts
+/// optimistic; the first unsupported-kernel/filesystem error flips it
+/// off for the process lifetime so every later prepare skips straight
+/// to the paced fill. `Relaxed`: a racing extra probe is harmless.
+static WRITE_ZEROES_SUPPORTED: AtomicBool = AtomicBool::new(true);
+
+/// Try to zero `[0, bytes)` via `FALLOC_FL_WRITE_ZEROES`. Returns
+/// `false` (and remembers the verdict) when the kernel or filesystem
+/// doesn't support it; any other error also falls back to the paced
+/// fill, which will surface a persistent fault through its own I/O
+/// errors.
+fn try_fallocate_write_zeroes(file: &File, bytes: u64) -> bool {
+    use std::os::fd::AsRawFd;
+    if !WRITE_ZEROES_SUPPORTED.load(Ordering::Relaxed) {
+        return false;
+    }
+    // SAFETY: plain syscall on an owned, open fd; no memory is passed.
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            FALLOC_FL_WRITE_ZEROES,
+            0,
+            bytes as libc::off64_t,
+        )
+    };
+    if rc == 0 {
+        return true;
+    }
+    let errno = io::Error::last_os_error();
+    if matches!(
+        errno.raw_os_error(),
+        Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) | Some(libc::ENOSYS)
+    ) {
+        WRITE_ZEROES_SUPPORTED.store(false, Ordering::Relaxed);
+        tracing::info!(
+            error = %errno,
+            "FALLOC_FL_WRITE_ZEROES unsupported; zero-fill staging will use paced writes"
+        );
+    } else {
+        tracing::warn!(
+            error = %errno,
+            "FALLOC_FL_WRITE_ZEROES failed; falling back to paced writes for this prepare"
+        );
+    }
+    false
 }
 
 /// Ask the kernel to start (not wait for) writeback of `[offset,

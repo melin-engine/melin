@@ -439,17 +439,22 @@ pub fn archive_live(live: &Path) -> std::io::Result<PathBuf> {
 /// Best-effort by contract: the rotation is already committed when
 /// this runs, so a truncation failure must not fail the rotation. A
 /// padded archive is the pre-truncation status quo — log and move on.
-/// The `sync_all` keeps the new length durable so a crash doesn't
-/// resurrect padding on one node only; its failure is equally
-/// tolerable.
+///
+/// Deliberately no `sync_all`: this runs on the journal thread at
+/// rotation time, and syncing would force the filesystem log — the
+/// exact stall class the pre-zeroed staging exists to remove. The
+/// truncate is an async-logged transaction on the *archive's* inode,
+/// so it never enters the live segment's `fdatasync` path; the length
+/// change reaches disk with normal filesystem writeback. The crash
+/// window this leaves (padding resurrected on one node, breaking
+/// bitwise archive comparison until re-compacted by hand) is accepted
+/// — it requires a crash inside the writeback window, and entry data
+/// is unaffected.
 pub fn compact_archive(archived: &Path, valid_end: u64) {
     let result = std::fs::OpenOptions::new()
         .write(true)
         .open(archived)
-        .and_then(|f| {
-            f.set_len(valid_end)?;
-            f.sync_all()
-        });
+        .and_then(|f| f.set_len(valid_end));
     if let Err(e) = result {
         tracing::warn!(
             error = %e,
