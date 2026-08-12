@@ -582,7 +582,7 @@ pub fn run<A: Application>(
                 if now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1) {
                     last_heartbeat_scan = now;
                     for (&conn_id, entry) in connections.iter_mut() {
-                        if now.duration_since(entry.last_send) >= interval {
+                        if heartbeat_due(entry, now, interval, heartbeat_wire_frame.len()) {
                             entry.send_buf.extend_from_slice(&heartbeat_wire_frame);
                             dirty_connections.insert(conn_id);
                             entry.last_send = now;
@@ -1221,6 +1221,32 @@ enum AppendOutcome {
 /// payloads, or `encode_transport_response` for transport-shaped
 /// frames), and this helper handles size accounting + dirty
 /// tracking uniformly.
+/// Whether the idle-path heartbeat scan should append a frame to this
+/// connection: idle for a full interval — and able to receive it.
+///
+/// The two guards close the one append path that used to bypass
+/// `MAX_SEND_BUF`. A blocked peer's socket is full, so a heartbeat
+/// would only sit in `send_buf` — and an idle client that trickle-read
+/// a few bytes per interval kept resetting the blocked clock while
+/// unchecked heartbeat appends grew its buffer without bound, pinning
+/// its connection permit on ever-growing memory. Skipping blocked
+/// peers (they detect liveness by draining, not by new frames) and
+/// cap-checking the append bounds the buffer; a peer that never drains
+/// is then `BLOCKED_SEND_TIMEOUT`'s or `MAX_SEND_BUF`'s problem, as
+/// designed. Residual: a trickling client still holds its permit while
+/// it drains — bounded memory, and the reader's idle timeout covers
+/// clients that stop sending entirely.
+fn heartbeat_due(
+    entry: &ConnectionEntry,
+    now: Instant,
+    interval: Duration,
+    frame_len: usize,
+) -> bool {
+    now.duration_since(entry.last_send) >= interval
+        && entry.blocked_since.is_none()
+        && entry.send_buf.len() + frame_len <= MAX_SEND_BUF
+}
+
 #[allow(clippy::too_many_arguments)]
 fn append_frame(
     result: Result<usize, &'static str>,
@@ -2871,6 +2897,81 @@ mod tests {
     /// until the peer reads — so one zero-window client stalled every
     /// client's acks. These use real sockets and a real ring: the defect
     /// was kernel-level behaviour a mock would not reproduce.
+    mod heartbeat {
+        use super::super::{MAX_SEND_BUF, heartbeat_due};
+        use super::flush_sends::entry_for;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        const INTERVAL: Duration = Duration::from_secs(1);
+        const FRAME_LEN: usize = 13;
+
+        /// Backdate `last_send` a full interval so only the receive-
+        /// ability guards decide. `checked_sub` because a young
+        /// monotonic clock can't be backdated (same pattern as the
+        /// flush_sends tests).
+        fn idle_entry(payload: &[u8]) -> Option<super::super::ConnectionEntry> {
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            let mut entry = entry_for(tx, payload);
+            entry.last_send = Instant::now().checked_sub(INTERVAL * 2)?;
+            Some(entry)
+        }
+
+        #[test]
+        fn idle_unblocked_connection_gets_a_heartbeat() {
+            let Some(entry) = idle_entry(&[]) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            assert!(heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN));
+        }
+
+        #[test]
+        fn recently_active_connection_is_skipped() {
+            let (tx, _rx) = UnixStream::pair().unwrap();
+            let entry = entry_for(tx, &[]);
+            assert!(
+                !heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN),
+                "a connection inside the interval must not be pinged"
+            );
+        }
+
+        /// A blocked peer's socket is full — the frame would only grow
+        /// `send_buf`. This is one half of the fix for the unbounded
+        /// heartbeat growth on trickle-reading clients.
+        #[test]
+        fn blocked_connection_is_skipped() {
+            let Some(mut entry) = idle_entry(&[]) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            entry.blocked_since = Some(Instant::now());
+            assert!(!heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN));
+        }
+
+        /// The other half: heartbeats respect `MAX_SEND_BUF` like every
+        /// other append — this was the one path that bypassed the cap.
+        #[test]
+        fn append_never_exceeds_the_send_buffer_cap() {
+            let payload = vec![0u8; MAX_SEND_BUF - FRAME_LEN + 1];
+            let Some(entry) = idle_entry(&payload) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            assert!(!heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN));
+
+            let payload = vec![0u8; MAX_SEND_BUF - FRAME_LEN];
+            let Some(entry) = idle_entry(&payload) else {
+                eprintln!("monotonic clock too young to backdate; skipping");
+                return;
+            };
+            assert!(
+                heartbeat_due(&entry, Instant::now(), INTERVAL, FRAME_LEN),
+                "a frame that exactly fits is allowed"
+            );
+        }
+    }
+
     mod flush_sends {
         use super::super::{
             BLOCKED_RETRY_INTERVAL, BLOCKED_SEND_TIMEOUT, ConnectionEntry, flush_sends,
@@ -2882,7 +2983,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
         use std::time::{Duration, Instant};
 
-        fn entry_for(stream: UnixStream, payload: &[u8]) -> ConnectionEntry {
+        pub(super) fn entry_for(stream: UnixStream, payload: &[u8]) -> ConnectionEntry {
             ConnectionEntry {
                 fd: stream.as_raw_fd(),
                 _owner: Box::new(stream),
