@@ -32,6 +32,10 @@ pub mod fence;
 /// Prometheus text exposition body to `GET /metrics`. The state struct
 /// holds only atomics/cursors; the endpoint is fully transport-shaped.
 pub mod health;
+/// Journal flush executor — the seam that moves `fdatasync` off the
+/// journal thread. Holds the watermark cell, the drain protocol, and the
+/// poison path; the journal stage keeps `pwrite` and encoding.
+pub mod journal_flush;
 pub mod journaled_app;
 pub mod pipeline;
 /// Replication wire protocol, journal-file catch-up, ack queueing,

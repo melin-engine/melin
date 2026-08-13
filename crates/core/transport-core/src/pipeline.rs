@@ -201,7 +201,7 @@ pub const MAX_JOURNAL_BATCH: usize = 4096;
 /// on EPYC (~1-5µs per yield). When true, spins indefinitely with PAUSE —
 /// the thread owns the core (requires `isolcpus`).
 #[inline(always)]
-fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
+pub(crate) fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
     if busy_spin || *idle_spins < 1000 {
         *idle_spins = idle_spins.wrapping_add(1);
         std::hint::spin_loop();
