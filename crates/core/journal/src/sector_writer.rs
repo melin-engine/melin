@@ -2011,6 +2011,65 @@ mod tests {
     /// This is the test that gives the fast path its own coverage; the
     /// existing rotate_segment tests cover the sync (no-prepared) path
     /// transitively.
+    /// Mode guard: a zero-fill staging file (plain page-cache handle,
+    /// `sector_size == 0`) must be *rejected*, not adopted — adopting
+    /// one poisons this writer's sector math and corrupts the journal.
+    /// The failed rotation must roll back cleanly: live segment back at
+    /// the canonical path, no archive left behind, writer still usable.
+    #[test]
+    fn rotate_with_zero_fill_prepared_is_rejected() {
+        use crate::preparer::SegmentPreparer;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+
+        // Wrong mode on purpose: the *buffered* writer's preparer.
+        let preparer = SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024, 0);
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let prepared = prepared.expect("preparer should publish a segment within 5 s");
+        assert_eq!(
+            prepared.sector_size, 0,
+            "zero-fill staging marks itself with sector_size 0"
+        );
+
+        let err = writer
+            .rotate_segment_with_prepared(prepared)
+            .expect_err("zero-fill staging must not be adopted by the sector writer");
+        assert!(
+            err.to_string().contains("zero-fill mode"),
+            "unexpected error: {err}"
+        );
+
+        assert!(path.exists(), "rename-back must restore the live segment");
+        assert!(
+            crate::segment::list_archives(&path).unwrap().is_empty(),
+            "a rejected rotation must leave no archive behind"
+        );
+
+        // Still usable on the original segment.
+        writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
+        drop(writer);
+        preparer.shutdown();
+
+        let entries = read_all(&path);
+        assert_eq!(
+            entries.len(),
+            2,
+            "both entries must survive the rejected rotation"
+        );
+    }
+
     #[test]
     fn rotate_with_prepared_round_trip() {
         use crate::preparer::SegmentPreparer;

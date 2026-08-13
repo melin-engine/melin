@@ -962,6 +962,63 @@ mod tests {
         assert_eq!(read_all_payloads(&archived), vec![1, 2]);
     }
 
+    /// Mode guard: a sector-mode staging file (O_DIRECT handle,
+    /// unwritten extents) must be *rejected*, not adopted — adopting
+    /// one fails on the first unaligned pwrite after the commit point
+    /// and silently loses the pre-written-extents property this mode
+    /// exists for. The failed rotation must roll back cleanly: live
+    /// segment back at the canonical path, no archive left behind,
+    /// writer still usable.
+    #[test]
+    fn rotate_with_sector_prepared_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&sample(1)).unwrap();
+
+        // Wrong mode on purpose: the *sector* writer's preparer.
+        let preparer = crate::preparer::SegmentPreparer::spawn(path.clone(), 4096, 0);
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let prepared = prepared.expect("preparer should stage a segment within 5 s");
+        assert_ne!(
+            prepared.sector_size, 0,
+            "sector staging carries a non-zero sector size"
+        );
+
+        let err = writer
+            .rotate_segment_with_prepared(prepared)
+            .expect_err("sector staging must not be adopted by the buffered writer");
+        assert!(
+            err.to_string().contains("sector mode"),
+            "unexpected error: {err}"
+        );
+
+        assert!(path.exists(), "rename-back must restore the live segment");
+        assert!(
+            crate::segment::list_archives(&path).unwrap().is_empty(),
+            "a rejected rotation must leave no archive behind"
+        );
+
+        // Still usable on the original segment.
+        writer.append(&sample(2)).unwrap();
+        drop(writer);
+        preparer.shutdown();
+
+        assert_eq!(
+            read_all_payloads(&path),
+            vec![1, 2],
+            "both entries must survive the rejected rotation"
+        );
+    }
+
     /// A crash between prepared adoption and the first append must
     /// leave a parseable empty journal (header durable, zero entries).
     #[test]
