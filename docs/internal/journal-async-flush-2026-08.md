@@ -1,6 +1,6 @@
 # Async journal flush — watermark flush thread (spec)
 
-Status: **proposed** (2026-08). Follow-up to
+Status: **proposed** (2026-08), revised after a code audit. Follow-up to
 [journal-fsync-beat-2026-08.md](journal-fsync-beat-2026-08.md). Not yet
 implemented.
 
@@ -29,17 +29,33 @@ all be XFS + PLP + a tuned kernel.
 
 ## Design overview
 
-Split the journal stage's sync point into two halves:
+`sync_point` currently welds together three cadences that have no
+reason to be the same:
 
-- **Journal thread (unchanged core)**: encode, replication publish,
-  `pwrite` (`write_all_at`), then *submit a watermark* instead of
-  calling `fdatasync`. Continues immediately with the next batch.
-- **Flush thread (new)**: consumes the latest watermark, runs
-  `fdatasync`, and publishes everything that today follows the flush
-  inline — the durable wire-seq cursor, `FsyncState`, and the input-ring
-  progress cursor.
+1. **the replication publish** — what feeds `in_memory>=2`,
+2. **the disk write** (`pwrite`) — what bounds journal-stage syscall
+   cost and replication frame size,
+3. **the durability flush** (`fdatasync`) — what gates every
+   `persisted` clause.
 
-Only `fdatasync` moves. `pwrite` stays on the journal thread
+Splitting them is the whole design:
+
+- **Replication publish moves to the read batch.** Every batch read
+  off the input ring publishes its `InputBatch` frame to the
+  replication rings immediately, independent of any disk I/O. This is
+  what makes `hybrid`'s masking structural: `in_memory>=2` then
+  depends on neither `pwrite` nor `fdatasync`.
+- **The disk write self-clocks against the flush.** The journal thread
+  encodes continuously and issues `pwrite` when the flush executor is
+  idle, or when `pending >= max_batch`. It never blocks on the flush.
+- **The flush moves to its own executor.** After `pwrite` the journal
+  thread *submits a watermark* instead of calling `fdatasync`, and
+  continues immediately. A flush thread consumes the latest watermark,
+  runs `fdatasync`, and publishes everything that today follows the
+  flush inline — the durable wire-seq cursor, `FsyncState`, the
+  advertised journal tip, and the input-ring progress cursor.
+
+Only `fdatasync` leaves the journal thread. `pwrite` stays inline
 deliberately: post-prezero it is a near-pure page-cache memcpy (no
 extent conversion, no stable-page waits on this hardware), and every
 stall traced in the beat investigation's endgame was in `fdatasync`,
@@ -53,6 +69,56 @@ disk stall no longer stops the receiver's in-memory acks (until the
 ring fills), so the primary's `in_memory>=2` clause keeps advancing
 through a replica-side stall too.
 
+## Cadence decoupling
+
+### Why the disk write must self-clock
+
+Today the fsync duration *is* the group-commit window. `group_commit_us`
+defaults to `0` (`server.rs:458`), so `should_sync` is true on every
+iteration and the only thing fattening batches is that the journal
+thread is blocked in `fdatasync` while the ring fills behind it. The
+next `read_batch` then returns a large batch. Remove the block naïvely
+and the thread free-runs: batches shrink to whatever one encode+pwrite
+pass takes, which at bench rates is roughly an order of magnitude
+smaller. The consequences all land on the "no regression" criterion:
+
+- more `pwrite` syscalls per event, on the exact thread this design
+  exists to unburden;
+- proportionally more `InputBatch` frames into a 256-entry replication
+  ring (`server.rs:479`) whose overflow policy is immediate eviction
+  (`pipeline.rs:1102-1113`) — a higher frame rate runs closer to that
+  edge;
+- more per-frame parse and `recvmsg` work on the replica receiver,
+  which is the measured throughput ceiling in `tcp-dual-repl`.
+
+Self-clocking removes the problem by construction: submit when the
+flush executor is idle, or when `pending >= max_batch` (1024,
+`server.rs:476`). At low load the executor is always idle, so submit is
+immediate and latency is minimal. Under load where fsync is the
+constraint, the executor is busy and the thread accumulates — producing
+**the same batch-size distribution as today**, because today's inline
+flush is itself a self-clock. The existing `group_commit_delay`
+condition stays as an additional operator-controlled floor.
+
+Accumulation is bounded by `max_batch`, so `batch_buf` gains no new
+growth path and no new config knob appears.
+
+### Why the replication publish must not self-clock with it
+
+Self-clocking the disk write alone would re-couple replication to the
+disk: during a stall the journal thread would accumulate without
+publishing, and the replication feed would freeze — exactly the failure
+this spec exists to remove. Publishing per read batch is what keeps the
+two independent, and it is semantically free: the publish already runs
+*before* any I/O in today's `sync_point` (`pipeline.rs:1235-1237`), so
+moving it earlier changes ordering with respect to nothing. Read-batch
+order preserves the no-gaps invariant the rings require.
+
+Two follow-on edits: `maybe_publish_chain_check` counts
+`batches_since_chain_check` and must now count replication publishes
+rather than sync points; and `sync_point`'s doc comment about the
+replication-cursor gate under `no-persist` moves with the publish.
+
 ## The watermark cell
 
 The handoff is a single latest-value cell, not a queue. `fdatasync` is
@@ -63,23 +129,43 @@ receiver transport, and gives group durability for free during a slow
 flush: when the flush thread comes back, one `fdatasync` covers every
 batch written meanwhile.
 
-The cell carries what `publish_fsync_state` + `sync_point` need at
-publication time, captured at submit time on the journal thread:
+The cell carries everything `publish_fsync_state` + `sync_point` need
+at publication time, captured at submit time on the journal thread.
+**All five fields are required** — the flush thread has no access to
+the writer or the consumer and cannot re-derive any of them:
 
 | Field | Source | Consumed for |
 | --- | --- | --- |
-| `journal_seq` | `writer.next_sequence() - 1` after the batch's `pwrite` | durable wire-seq cursor, `FsyncState.journal_seq` |
+| `journal_seq` | `writer.next_sequence() - 1` after the batch's `pwrite` | durable wire-seq cursor, `FsyncState.journal_seq`, `advertised_tip.advance` |
 | `chain_hash` | `writer.chain_hash()` at the same point | `FsyncState.chain_hash` (shadow snapshots, replica handshakes) |
+| `input_ring_seq` | `consumer.next_read()` at the same point | `FsyncState.input_ring_seq` (shadow snapshot alignment) |
 | `ring_progress` | the `progress` value the caller passes to today's `sync_point` | `consumer.set_progress` (via a shared `Sequence` handle) |
 | `generation` | rotation epoch (see below) | stale-publication guard |
+
+`input_ring_seq` and `ring_progress` are **not** the same value and
+must both be carried. They coincide at the steady-state sync point,
+where the caller passes `consumer.next_read()`, but diverge at a
+replica's mid-batch mark barrier, where `ring_progress` is
+`read_start + stop` while `next_read` already spans the whole read
+batch. The shadow snapshot compares `input_ring_seq` for *exact
+equality* against its own cursor (`shadow.rs:153`); substituting
+`ring_progress` there would produce a snapshot whose header claims a
+`journal_seq` behind the app state it contains, and a restore would
+re-apply events already folded into that state.
+
+`advertised_tip.advance` (`pipeline.rs:1201-1208`) moves to the flush
+thread with the rest of `publish_fsync_state`. This is the correct
+semantics — Raft vote filtering should advertise a durable tip — but it
+is a behavioural change worth naming: on a primary the advertised tip
+now trails by one flush.
 
 Publication semantics (the invariant the whole design hangs on):
 
 1. Flush thread reads the cell → local copy `W`.
-2. If `W.journal_seq` ≤ last published, idle (spin/park).
+2. If `W.journal_seq` ≤ last published, idle (see *Scheduling*).
 3. `fdatasync(fd)`.
 4. Publish `W` — cursor stores, `FsyncState` seqlock write,
-   `set_progress(W.ring_progress)`.
+   `advertised_tip.advance`, `set_progress(W.ring_progress)`.
 
 The sample happens **before** the sync call: `fdatasync` only
 guarantees data dirtied before the call, so a watermark read after the
@@ -97,21 +183,46 @@ reader.
 
 ### Ring progress moves with durability — this is load-bearing
 
-`Consumer::set_progress` publishes the `processed` sequence that (a)
-producers gate slot reuse on and (b) **the replica ack path gates
-persisted acks on** (`PendingAckQueue::pop_oldest_blocking(journal_cursor,
-…)` in the receiver). Today it advances after `flush_batch_sync`
-returns — that ordering *is* persist-before-ack on replicas. The flush
-thread must therefore own `set_progress`; publishing it at submit time
-would let a replica ack entries its disk has not persisted.
+`Consumer::set_progress` (`ring.rs:681`) publishes the `processed`
+sequence that (a) producers gate slot reuse on and (b) **the replica
+ack path gates persisted acks on**: `pop_oldest_blocking(journal_cursor,
+…)` in the receiver (`receiver_transport.rs:752`) blocks on
+`journal_ring_arc()` (`replication/mod.rs:572`), the journal consumer's
+`processed` counter, comparing it against each pending ack's
+`journal_target` (`ack_queue.rs:104`). Today it advances after
+`flush_batch_sync` returns — that ordering *is* persist-before-ack on
+replicas. The flush thread must therefore own `set_progress`;
+publishing it at submit time would let a replica ack entries its disk
+has not persisted.
 
 Consequence: the journal thread's private `next_read` runs ahead of the
 published `processed` cursor during a flush stall. That gap is bounded
-by input-ring capacity, which becomes the natural backpressure bound —
-when the ring fills, producers stall, exactly as today, but only after
-absorbing a full ring's worth of orders instead of stalling on the
-first blocked flush. No new buffering, no new memory bound, no new
-config knob.
+by input-ring capacity (`INPUT_RING_CAPACITY`, 2²⁰ slots), which
+becomes the natural backpressure bound — when the ring fills, producers
+stall, exactly as today, but only after absorbing a full ring's worth
+of orders instead of stalling on the first blocked flush. No new
+buffering, no new memory bound, no new config knob.
+
+The matching stage is unaffected: it is a *parallel* consumer of the
+input ring gated on the producer, not on the journal
+(`pipeline.rs:3376-3377`). Only the shadow consumer is chained behind
+journal progress (`pipeline.rs:3379`), and holding it back through a
+flush is precisely what keeps its snapshot alignment honest.
+
+### Single writer to `processed`
+
+`Consumer::commit` (`ring.rs:668`) also stores to `processed`, and
+`run_sync` calls it on both shutdown paths (`pipeline.rs:805`,
+`pipeline.rs:1018`). Once the flush thread owns publication those calls
+must go, or the guarantee breaks at shutdown: `commit` publishes
+`next_read`, which under async flush can sit arbitrarily far ahead of
+the last synced watermark — a straight ack-before-persist on a replica.
+Both paths become "drain the flush executor, let it publish, then
+exit".
+
+The invariant to hold and to test: **exactly one thread ever stores to
+the journal consumer's `processed` counter, and it is the thread that
+just returned from `fdatasync`.**
 
 ## Rotation protocol
 
@@ -141,6 +252,20 @@ The rotation-adjacent wait cost is one in-flight fdatasync (~30–300 µs
 steady-state post-prezero) — same as today's inline flush at the top of
 `rotate_segment_inner`.
 
+### Writer surface
+
+`BufferedWriter::flush_batch_sync` (`buffered_writer.rs:332`) is
+`dir_fsync_retry.poll()` + `ensure_allocated()` + `write_all_at` +
+`sync_data()` + `write_pos`/`batch_len` advance. The split keeps
+everything except `sync_data()` on the journal thread, which means the
+`File` becomes shared (`Arc<File>`, republished at rotation) while
+`write_pos`, `batch_len`, and the chain stay journal-thread-owned.
+
+Expose this as a `JournalWrite` method that performs the write and
+returns the watermark, rather than as a `BufferedWriter`-only API — the
+sector writer keeps a synchronous implementation behind the same
+signature, and the future uring backend drops into the same seam.
+
 ## Failure semantics
 
 An `fdatasync` error on the flush thread is exactly as fatal as it is
@@ -158,100 +283,230 @@ operators see the same `error!` + teardown as an inline failure, one
 batch later. Shutdown joins the flush thread after the journal thread
 exits (drain first if healthy, abandon if poisoned).
 
+During the one-iteration poison window the journal thread keeps
+publishing to the replication rings. That is not a durability
+violation — no `persisted` clause can be satisfied by the primary once
+its cursor freezes — but it does mean a dead primary disk ships a
+little further than it did inline. Under `hybrid` the `persisted>=1`
+clause can still be satisfied by a *replica's* persisted cursor, so
+acks continue until the journal thread tears the pipeline down. That is
+the documented meaning of `hybrid`, not a regression; it is called out
+here because the async flush makes the primary's own persisted cursor
+lag more often, so `hybrid` leans on the replica leg more often than it
+did.
+
 ## `no-persist` mode
 
 `no-persist` replaces the flush with `discard_batch_buf` and publishes
 immediately. That stays inline on the journal thread — the flush
-executor is simply not engaged. (The replication publish already runs
-regardless; see `sync_point`'s comment about the replication-cursor
-gate.)
+executor is simply not engaged. The replication publish already runs
+regardless, and after the cadence decoupling above it runs from the
+read batch rather than from `sync_point`.
+
+## Interaction with the control plane
+
+Raft carries election, membership and fencing epochs only — no journal
+entry ever enters the raft log, so raft's log-matching properties say
+nothing about journal recency. That job belongs to the **journal-tip
+vote recency filter** (`crates/core/raft/src/recency.rs`): every RPC
+envelope carries `(fencing epoch, advertised sequence)`, and a voter
+drops vote requests from candidates behind its own tip. This spec
+touches one input to that filter, so the effect is worth recording
+rather than re-derived later.
+
+The advertised tip is role-dependent, and only the primary's moves:
+
+- **Replica** — the receive loop advances it to the in-memory
+  *accepted* position (`receiver_transport.rs:611-614`), deliberately
+  ahead of the fsynced position because a promotion drains the ring
+  into the journal. The flush thread is not on that path; unchanged.
+- **Primary** — the journal stage publishes its durable cursor
+  (`pipeline.rs:1201-1208`), which now trails by one flush.
+
+A primary therefore advertises slightly *less* than it holds. That is
+the understating direction: it can only lose a vote it might have won,
+never win one it should have lost, so the filter's safety argument is
+untouched. The promotion refusals in `auto_promotion_decision` key off
+link state, durability mode and epochs — none of which this spec
+touches.
+
+**Why the wider shipped-ahead window is not a fork risk.** Entries are
+published to the rings in sequence order, so within an epoch every
+node's journal remains a prefix of the same logical stream. A fork
+requires a promoted node to reuse sequence numbers for different
+content, which requires its tip to sit *below* a surviving node's. This
+spec does not move replica tips at all, and moves the primary's durable
+tip *down* — so a crashed primary recovers to a shorter prefix and is
+strictly *less* likely to hold a unique suffix than it is today. The
+cost is rejoin depth, not divergence.
+
+The one path that does produce a true fork is unchanged and predates
+this work: the recency filter's liveness escape can legitimately let a
+behind node win, with `auto_promotion_decision` as the only remaining
+guard. Tracked separately in [roadmap.md](roadmap.md) ("Close the
+election fork window").
+
+**One implementation check.** The replica tip's justification is that a
+promotion drains the ring into the journal, so accepted events survive.
+Under async flush that drain becomes durable one flush later. Anything
+on the promotion path that treats "drained" as "durable" must observe
+the journal ring cursor — which the flush thread publishes post-fsync,
+so the property still holds — and not the journal thread's private
+`next_read`. Promotion gains one flush of latency; cover it with a test
+that promotion waits for the flush executor to drain.
 
 ## Scheduling and configuration
 
-Default: **dedicated pinned core, pure busy-spin**, SCHED_FIFO like the
-other pipeline threads. This is load-bearing for the hot path, not a
-tuning nicety: the flush handoff sits on the critical path of **every
-ack's persisted leg**, and spinning is what makes both directions of it
-free —
+The flush thread uses the pipeline's existing idle discipline, not a
+bespoke one: `idle_wait(&mut idle_spins, busy_spin)`
+(`pipeline.rs:204`), with the same `busy_spin` flag every other stage
+receives (`busy_spin = !config.yield_idle`, `server.rs:1502`). Spin by
+default; spin 1000 then `yield_now()` under `--yield-idle`.
 
-- **Submit side (journal thread)**: with a spinning consumer, submit is
-  *only* the seqlock store the journal thread already performs today.
-  No futex wake, no syscall, ever. Any parking variant puts a
-  conditional `futex_wake` (~1 µs syscall) back on the journal
-  thread's loop — the exact thread the whole design exists to unburden.
-- **Receive side (flush thread)**: detection latency is one cross-core
-  cache-line transfer, ~100–200 ns, deterministic. A parked thread adds
-  ~2–5 µs of scheduler wake latency *plus jitter* to the persisted
-  cursor — and it adds it precisely at low/bursty load, where a single
-  order's ack latency is most visible.
+This is not merely consistency — it removes a mechanism the design
+would otherwise need. `yield_now()` is not a futex park, so **the
+journal thread's submit is a bare seqlock store with no wake syscall in
+any mode**. There is no conditional `futex_wake` on the journal loop to
+argue about, no parked-state protocol, and no spin-then-park window to
+tune. The receive-side cost is one cross-core cache-line transfer while
+spinning (~100–200 ns, deterministic), degrading to a `sched_yield`
+round under `--yield-idle` — worse, but strictly better than a futex
+park, and it costs the journal thread nothing either way.
 
-Core assignment: extend the `--cores` list with an 11th entry,
-`journal-flush` (precedent: the optional 10th, `journal-prep`), and
-give it a real core in the `Default` layout. Placement rule: same CCD
-as the journal core — the watermark cell bounces between the two
-threads on every batch, and cross-CCD adds ~100 ns+ per transfer.
+### Core assignment
 
-Constrained-footprint fallback (explicit opt-out, not the default):
-`journal-flush = 0` follows the established "0 = unpinned" convention
-and switches the thread to spin-then-park (bounded spin window, futex
-park, journal thread wakes it on submit when parked). This trades the
-handoff guarantees above for a core, for deployments where the core
-budget genuinely doesn't exist. The `compact` layout (embedded bench,
-small boxes) uses this mode. Document the cost honestly in the operator
-docs: parked-mode handoff is ~2–5 µs plus scheduler jitter on the
-persisted-ack path.
+Extend `--cores` with a `journal-flush` entry following the
+`journal-prep` precedent: `parse_cores` (`server.rs:624-630`) accepts
+9 or 10 entries today and gains an 11th, with `0 = unpinned`.
+
+**Ship the default as `0`.** An unpinned flush thread is correct and
+costs nothing structurally; picking a pinned default requires a layout
+decision this spec should not make, for a reason that only became clear
+on audit:
+
+The target part, the EPYC 9275F, is **8 CCDs × 3 cores** (256 MB L3 /
+32 MB per CCD). With SMT off, CCD0 is cores 0–2, and the default layout
+already fills it: core 0 for OS/IRQ, `journal` 1, `matching` 2. The
+watermark cell is the first genuinely CCD-sensitive pair in the
+pipeline — it bounces between the journal and flush threads on every
+batch, and a cross-CCD transfer costs ~100 ns+ — so honouring "same CCD
+as the journal core" on this part means displacing `matching` from
+CCD0. That is *probably* harmless, since journal and matching are
+parallel input-ring consumers that never talk to each other and
+matching's real cache partners are the ring producer and the output
+ring, but "probably" is not a basis for changing the default layout on
+the part we recommend to customers.
+
+Deriving that layout properly — including whether core 0's kernel and
+IRQ work pollutes CCD0's 32 MB L3 badly enough to move the pair
+elsewhere — is its own measurement exercise, tracked as **"Evidence-based
+`--cores` layout"** in [roadmap.md](roadmap.md). This spec ships the
+seam and the instruments; that item spends the bench time. Note also
+that the control-plane pinning roadmap item claims an "eleventh
+`--cores` entry" too — whichever lands second takes the twelfth.
+
+Two consequences of the `0` default:
+
+- **`compact` needs no core.** It reserves core 7 for the bench client
+  specifically to avoid an HT collision (`server.rs:591-617`); an
+  unpinned flush thread leaves its 8-logical-core minimum unchanged.
+- **Existing explicit `--cores` configs are unaffected**, which is the
+  point of the convention — but an operator who has pinned every other
+  stage should know this thread is not pinned. Emit a startup `warn!`
+  when `journal-flush` is unpinned while the rest of the layout is
+  explicit: degraded-but-handled is exactly that level's remit.
+
+When the flush thread *is* pinned, two placement rules hold regardless
+of the layout chosen: same CCD as the journal core, and never an SMT
+sibling of journal, matching, or response — it is a pure spinner and a
+sibling spinner steals issue slots from the thread this design exists
+to protect. (The bench fleet runs SMT off; the `compact` doc comment at
+`server.rs:583-587` records that the `Default` layout has sibling
+collisions on a 16-thread part, so the rule needs stating rather than
+assuming.)
 
 ## Observability
 
-- The thread is **named** (`journal-flush`) and pinned — deliberately.
-  Every diagnosis in the beat investigation came from thread-targeted
-  off-CPU tracing of named threads; this design keeps the durability
-  path traceable that way, which is a primary reason it was chosen over
-  the io_uring alternative (see below).
+- The thread is **named** (`journal-flush`) and pinnable —
+  deliberately. Every diagnosis in the beat investigation came from
+  thread-targeted off-CPU tracing of named threads; this design keeps
+  the durability path traceable that way, which is a primary reason it
+  was chosen over the io_uring alternative (see below).
 - New health gauge: flush lag, `submitted journal_seq − published
   journal_seq` (0 in steady state; a growing value is a stalling disk
   that the pipeline is riding through).
 - `latency-trace` feature: add a watermark-submit → publish histogram
   next to the existing journal wakeup/batch recorders — this is the
-  direct measure of "what would have been an inline stall".
+  direct measure of "what would have been an inline stall". Rename the
+  batch recorder from "write + sync" to "encode + write", which is what
+  it now covers.
+- Both land **with** the flush thread, not as a follow-up. They are the
+  instruments the `--cores` roadmap item needs: the submit→publish
+  histogram is a direct readout of the journal↔flush edge, so the
+  same-CCD question becomes a two-point experiment rather than a
+  layout sweep. It also discriminates the L3-pollution hypothesis,
+  which predicts a fatter tail rather than a worse median.
 - Existing metrics (`melin_journal_rotations_total`, gate blocker
   counters, replica ack gauges) are unchanged.
 
 ## Expected performance effects
 
 - **Steady state**: neutral to slightly positive. Handoff adds
-  ~100–200 ns (spinning default; the opt-out parked mode pays ~2–5 µs
-  plus jitter instead). In exchange, encode/replication of batch N+1
-  overlaps the fsync of batch N, so the persisted cursor's cadence
-  becomes fsync-duration-limited instead of
-  (encode+pwrite+fsync)-limited, and the `in_memory` leg of `hybrid`
-  advances earlier than today.
-- **Under a disk stall**: the pipeline keeps encoding, journaling
-  (page-cache), and replicating up to ring capacity. Under `hybrid`,
-  acks continue via the replica leg (`persisted>=1` can be satisfied by
-  a replica's persisted cursor). Under `local`, acks stall on the
-  frozen persisted cursor — correct, and now visible as flush lag
-  rather than as a frozen pipeline.
+  ~100–200 ns. Batch sizes should be unchanged, since self-clocked
+  submit reproduces the same clocking today's inline flush provides. In
+  exchange, encode/replication of batch N+1 overlaps the fsync of batch
+  N, so the persisted cursor's cadence becomes fsync-duration-limited
+  instead of (encode+pwrite+fsync)-limited.
+- **Replication latency**: slightly improved. The `InputBatch` frame
+  now leaves for the replicas at read-batch time rather than at sync
+  time, so the `in_memory` leg of `hybrid` advances a full disk-write
+  earlier than today.
+- **Under a disk stall**: the pipeline keeps encoding and replicating
+  up to ring capacity. Under `hybrid`, acks continue via the replica
+  leg (`persisted>=1` satisfied by a replica's persisted cursor). Under
+  `local`, acks stall on the frozen persisted cursor — correct, and now
+  visible as flush lag rather than as a frozen pipeline.
 
 ## Acceptance
 
 1. **No regression**: LAN bench suite (`tcp-dual-repl`, throughput
-   workload) — p99.9/p99.99/max at or below current main numbers
-   (p99.9 ~242 µs, max ~387 µs at 1.23 M orders/s), fast rotations
-   still 100 %, zero sync fallbacks, journal verification MATCH on both
-   replicas.
-2. **Masking works**: fault-injected slow fsync on the primary (test
-   hook delaying the flush thread, or device-level delay) while under
-   load — client latency time series shows *no* corresponding freeze
-   under `hybrid`; flush-lag gauge shows the stall being absorbed;
-   under `local` the same injection produces the (expected,
+   workload) — p99.9/p99.99/max at or below current main numbers, fast
+   rotations still 100 %, zero sync fallbacks, journal verification
+   MATCH on both replicas. Interleave the A/B samples and report median
+   + range; a single before-run followed by a single after-run cannot
+   distinguish a regression from thermal drift.
+2. **Batching did not collapse**: mean events per `pwrite` and
+   `InputBatch` frames/sec at or near main's under the throughput
+   workload. This is the specific failure mode self-clocking exists to
+   prevent, and an end-to-end throughput number can mask it until the
+   replication ring starts evicting.
+3. **Masking works**: fault-injected slow fsync on the primary
+   (feature-gated delay in the flush thread, or device-level delay)
+   under load — client latency time series shows *no* corresponding
+   freeze under `hybrid`; flush-lag gauge shows the stall being
+   absorbed; under `local` the same injection produces the (expected,
    documented) ack stall.
-3. **Unit/property coverage**: watermark cell (sample-before-sync
-   publication, coalescing, seqlock atomicity), rotation drain protocol
-   (no publication with a stale generation, drain always terminates),
-   poison propagation (no cursor advance after a failed sync; journal
-   thread surfaces the original error), replica persist-before-ack
-   (acks never precede `set_progress`).
+4. **Deep rejoin after an ungraceful primary crash**: the primary
+   publishes to the replication rings before its own flush — true
+   today, but bounded to one in-flight batch; under async flush the
+   shipped-ahead window grows to input-ring capacity during a stall, so
+   a crashed primary recovers to a *shorter* prefix than it would
+   today. Kill the primary mid-stall and verify the rejoin: the old
+   primary must catch up cleanly (it is a prefix, not a fork — see
+   *Interaction with the control plane*), including the case where the
+   gap outruns the retained segment window and the rejoin falls through
+   to snapshot transfer. What is being tested is catch-up depth and
+   re-seed behaviour, not divergence.
+5. **Unit/property coverage**: watermark cell (sample-before-sync
+   publication, coalescing, seqlock atomicity, all five fields carried),
+   single-writer-to-`processed` (no `commit` call survives on any
+   shutdown path), rotation drain protocol (no publication with a stale
+   generation, drain always terminates), poison propagation (no cursor
+   advance after a failed sync; journal thread surfaces the original
+   error), replica persist-before-ack (acks never precede
+   `set_progress`), shadow alignment (a mid-batch mark barrier never
+   publishes an `input_ring_seq` the shadow can reach ahead of the
+   matching `journal_seq`).
 
 ## Relation to option C (io_uring linked pwrite→fdatasync)
 
@@ -276,28 +531,33 @@ clean seam: keep the executor boundary narrow — *submit watermark →
 completion published to cursors → drain() → poisoned?* — so the flush
 thread and a future uring backend are two implementations behind the
 same contract. Everything mechanism-agnostic that this spec builds
-(sample-before-sync publication semantics, ring-progress ownership,
-rotation drain, poison path, flush-lag observability, the acceptance
-harness) transfers to C unchanged; only the mechanism behind the seam
-would be swapped. No abstraction should be added *speculatively* beyond
-that boundary — if C never happens, the seam must still be the natural
-shape of the thread design.
+(cadence decoupling, sample-before-sync publication semantics,
+ring-progress ownership, rotation drain, poison path, flush-lag
+observability, the acceptance harness) transfers to C unchanged; only
+the mechanism behind the seam would be swapped. No abstraction should
+be added *speculatively* beyond that boundary — if C never happens, the
+seam must still be the natural shape of the thread design.
 
 Revisit C if: a post-prezero trace ever shows `pwrite`-side blocking;
 the product invests in io_uring more deeply anyway (e.g. NVMe
-passthrough); or the dedicated flush core's footprint cost bites on
-customer minimum specs — C reaches the same decoupling with no extra
-core, so core-budget pressure is the strongest realistic trigger.
+passthrough); or the flush thread's core footprint bites on customer
+minimum specs — C reaches the same decoupling with no extra core, so
+core-budget pressure is the strongest realistic trigger.
 
 ## Out of scope
 
 - The sector writer and the io_uring journal path (`run_uring`) — the
   roadmap already leans toward retiring the sector writer; this spec
   touches only the buffered writer's synchronous path.
+- Choosing a pinned default layout for `journal-flush` — see
+  *Core assignment* and the roadmap item it points at.
 - Any change to durability *guarantees*: acks are still gated on the
-  configured policy over persisted/in-memory cursors. This spec changes
-  when cursors advance relative to a stalled disk, never what they
-  mean.
+  configured policy over persisted/in-memory cursors, and every cursor
+  still means exactly what it meant before. What does change is the
+  *unacked shipped-ahead window* — entries published to the replication
+  rings but not yet fsynced locally, bounded by one in-flight batch
+  today and by input-ring capacity after this change. It costs rejoin
+  depth (acceptance item 4), not fork risk.
 - Snapshot/shadow stages: they consume `FsyncState` through the same
   seqlock as today and see the same post-durability values, merely
   published from a different thread.
