@@ -30,7 +30,10 @@ CRATES=(
     melin-transport-core # depends on: app, pipeline, journal
 
     # Level 3
-    melin-server-runtime # depends on: app, pipeline, journal, wire-protocol, transport-core, dpdk
+    melin-raft           # depends on: app, transport-core
+
+    # Level 4
+    melin-server-runtime # depends on: app, pipeline, journal, wire-protocol, transport-core, raft, dpdk
 )
 
 # Guard: make sure every publishable workspace member is in the list above

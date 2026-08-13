@@ -1,6 +1,6 @@
 [package]
 name = "melin-transport-core"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -47,13 +47,13 @@ tracing = { workspace = true }
 # replaces field-by-field extend_from_slice / try_into chains with a
 # single struct write/read. derive feature for `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-app = { path = "../app", version = "0.12.0" }
-melin-pipeline = { path = "../pipeline", version = "0.12.0" }
-melin-journal = { path = "../journal", version = "0.12.0" }
+melin-app = { path = "../app", version = "0.13.0" }
+melin-pipeline = { path = "../pipeline", version = "0.13.0" }
+melin-journal = { path = "../journal", version = "0.13.0" }
 
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
 # Re-pull melin-journal with `test-utils` so the byte-sweep crash test
 # can shrink the journal prealloc chunk to keep per-iteration cost bounded.
-melin-journal = { path = "../journal", version = "0.12.0", features = ["test-utils"] }
+melin-journal = { path = "../journal", version = "0.13.0", features = ["test-utils"] }

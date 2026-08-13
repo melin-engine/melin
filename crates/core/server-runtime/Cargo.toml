@@ -1,6 +1,6 @@
 [package]
 name = "melin-server-runtime"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -34,12 +34,12 @@ no-o-direct = [
 ]
 
 [dependencies]
-melin-app = { path = "../app", version = "0.12.0" }
-melin-pipeline = { path = "../pipeline", version = "0.12.0" }
-melin-journal = { path = "../journal", version = "0.12.0" }
-melin-wire-protocol = { path = "../wire-protocol", version = "0.12.0" }
-melin-transport-core = { path = "../transport-core", version = "0.12.0" }
-melin-raft = { path = "../raft", version = "0.12.0" }
+melin-app = { path = "../app", version = "0.13.0" }
+melin-pipeline = { path = "../pipeline", version = "0.13.0" }
+melin-journal = { path = "../journal", version = "0.13.0" }
+melin-wire-protocol = { path = "../wire-protocol", version = "0.13.0" }
+melin-transport-core = { path = "../transport-core", version = "0.13.0" }
+melin-raft = { path = "../raft", version = "0.13.0" }
 blake3 = "1"
 base64 = { workspace = true }
 clap = { workspace = true }
@@ -52,7 +52,7 @@ rand = { workspace = true }
 rustc-hash = "2"
 tracing = { workspace = true }
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-dpdk = { path = "../dpdk", version = "0.12.0", optional = true }
+melin-dpdk = { path = "../dpdk", version = "0.13.0", optional = true }
 
 [dev-dependencies]
 # The runtime's library API is application-agnostic. Tests that need a
@@ -71,5 +71,5 @@ melin-example-counter = { path = "../../examples/counter" }
 tempfile = "3"
 serial_test = "3"
 proptest = "1"
-melin-journal = { path = "../journal", version = "0.12.0", features = ["test-utils"] }
-melin-transport-core = { path = "../transport-core", version = "0.12.0", features = ["test-utils"] }
+melin-journal = { path = "../journal", version = "0.13.0", features = ["test-utils"] }
+melin-transport-core = { path = "../transport-core", version = "0.13.0", features = ["test-utils"] }
