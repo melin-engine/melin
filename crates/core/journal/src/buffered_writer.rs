@@ -388,6 +388,11 @@ pub struct BufferedWriter<E: AppEvent> {
     // without a second encode pass.
     last_user_entry_offset: usize,
     last_user_entry_len: usize,
+    /// Segment offset the next handed-off batch belongs at. Equals the
+    /// segment's `write_pos` while writes happen here; once batches are
+    /// handed to a writer thread it runs ahead, counting bytes encoded
+    /// rather than bytes written. See [`take_batch`](Self::take_batch).
+    pending_offset: u64,
 }
 
 impl<E: AppEvent> BufferedWriter<E> {
@@ -410,6 +415,7 @@ impl<E: AppEvent> BufferedWriter<E> {
         Ok(Self {
             _marker: PhantomData,
             segment: SegmentFile::create(path, starting_sequence, anchor_hash)?,
+            pending_offset: HEADER_OFFSET,
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
@@ -479,6 +485,7 @@ impl<E: AppEvent> BufferedWriter<E> {
                 allocated_end,
                 dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
             },
+            pending_offset: valid_end,
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
@@ -619,6 +626,10 @@ impl<E: AppEvent> BufferedWriter<E> {
         }
         let len = self.batch_len;
         self.segment.append(&self.batch_buf[..len])?;
+        // Writing locally, so the encoder's notion of "where the next
+        // batch goes" follows the file's rather than running ahead of
+        // it. The two only diverge once batches are handed off.
+        self.pending_offset = self.segment.valid_end();
         self.batch_len = 0;
         self.last_user_entry_len = 0;
         Ok(Some(self.segment.file.as_raw_fd()))
@@ -645,6 +656,47 @@ impl<E: AppEvent> BufferedWriter<E> {
     pub fn discard_batch_buf(&mut self) {
         self.batch_len = 0;
         self.last_user_entry_len = 0;
+    }
+
+    /// Hand the encoded batch off for someone else to write, taking
+    /// `replacement` as the buffer to encode into next.
+    ///
+    /// Returns the bytes and the offset they belong at, or `None` when
+    /// nothing is pending. The caller keeps `replacement` if there is
+    /// nothing to hand over.
+    ///
+    /// This is what lets the write happen on another thread: the encoder
+    /// gives up the bytes rather than writing them. It therefore has to
+    /// track the segment offset itself — the file, and its `write_pos`,
+    /// are somewhere else — which is why `pending_offset` exists and
+    /// advances here rather than at write time. The two must agree; the
+    /// writer asserts it.
+    ///
+    /// Callers that hand off must not also call
+    /// [`flush_batch_sync`](Self::flush_batch_sync): the bytes are gone,
+    /// and the offset has already moved past them.
+    pub fn take_batch(&mut self, replacement: Vec<u8>) -> Option<(Vec<u8>, u64)> {
+        if self.batch_len == 0 {
+            return None;
+        }
+        let len = self.batch_len;
+        let mut bytes = std::mem::replace(&mut self.batch_buf, replacement);
+        bytes.truncate(len);
+        let offset = self.pending_offset;
+        self.pending_offset += len as u64;
+        self.batch_len = 0;
+        self.last_user_entry_len = 0;
+        Some((bytes, offset))
+    }
+
+    /// Byte offset the next handed-off batch belongs at.
+    ///
+    /// Tracks the segment's `write_pos` while the file is local, and
+    /// runs ahead of it once batches are being handed to a writer
+    /// thread — it counts bytes *encoded*, not bytes written.
+    #[inline]
+    pub fn pending_offset(&self) -> u64 {
+        self.pending_offset
     }
 
     pub fn next_sequence(&self) -> u64 {
@@ -792,6 +844,8 @@ impl<E: AppEvent> BufferedWriter<E> {
         self.batch_len = 0;
         self.last_user_entry_offset = 0;
         self.last_user_entry_len = 0;
+        // The new segment starts right after its header, on both sides.
+        self.pending_offset = HEADER_OFFSET;
         #[cfg(feature = "hash-chain")]
         {
             self.hash_chain = SegmentChain::new(anchor);
@@ -1012,6 +1066,62 @@ mod tests {
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
+    }
+
+    #[test]
+    fn take_batch_hands_over_bytes_and_the_offset_they_belong_at() {
+        // The handoff's core invariant: the encoder gives up the bytes
+        // and tracks where they go, because the file is (or will be)
+        // somewhere else. If its offsets ever disagree with the
+        // segment's, batches overlap or leave holes — so pin that they
+        // advance in lockstep with what a writer would produce.
+        let _prealloc = melin_journal_prealloc_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("takeover.journal");
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+
+        assert_eq!(
+            writer.take_batch(Vec::new()),
+            None,
+            "nothing encoded yet — the caller keeps its buffer"
+        );
+        let start = writer.pending_offset();
+
+        encode_all(&mut writer, &[1, 2, 3]);
+        let (first, first_offset) = writer.take_batch(Vec::new()).expect("bytes pending");
+        assert_eq!(
+            first_offset, start,
+            "the first batch starts at the segment head"
+        );
+        assert!(!first.is_empty());
+        assert_eq!(
+            writer.pending_offset(),
+            start + first.len() as u64,
+            "the encoder advances by exactly what it handed over"
+        );
+
+        encode_all(&mut writer, &[4]);
+        let (second, second_offset) = writer.take_batch(Vec::new()).expect("bytes pending");
+        assert_eq!(
+            second_offset,
+            start + first.len() as u64,
+            "batches are contiguous — a gap here is a hole in the journal"
+        );
+        assert_eq!(writer.pending_offset(), second_offset + second.len() as u64);
+
+        // Writing the handed-over bytes through the segment must land
+        // them exactly where the encoder said, leaving a readable
+        // journal.
+        writer.segment.append(&first).unwrap();
+        writer.segment.append(&second).unwrap();
+        writer.segment.sync().unwrap();
+        assert_eq!(writer.segment.valid_end(), writer.pending_offset());
+        assert_eq!(read_all_payloads(&path), vec![1, 2, 3, 4]);
+    }
+
+    /// Shared guard so the handoff tests don't fallocate 256 MiB each.
+    fn melin_journal_prealloc_guard() -> crate::prealloc::PreallocOverrideGuard {
+        crate::prealloc::PreallocOverrideGuard::new(1024 * 1024)
     }
 
     #[test]

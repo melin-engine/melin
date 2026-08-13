@@ -254,6 +254,39 @@ pub trait SegmentIo {
     fn sync(&mut self) -> std::io::Result<()>;
 }
 
+impl SegmentIo for melin_journal::SegmentFile {
+    fn write_at(&mut self, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+        // The encoder tracks the offset because the file lives here, not
+        // with it. Disagreement means the two have drifted — a torn or
+        // overlapping journal — so check it where both values are in
+        // hand rather than discovering it in a reader later.
+        debug_assert_eq!(
+            offset,
+            self.valid_end(),
+            "batch offset disagrees with the segment's write position: \
+             the encoder and the writer have drifted apart"
+        );
+        self.append(bytes).map_err(io_error)
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        melin_journal::SegmentFile::sync(self).map_err(io_error)
+    }
+}
+
+/// Unwrap a `JournalError` back to the OS error underneath.
+///
+/// The executor records failures as an `errno` and the journal stage
+/// turns that into its fatal shutdown, so re-wrapping would erase
+/// `raw_os_error()` and silently disable the whole path — a defect the
+/// flush-executor branch actually shipped.
+fn io_error(e: melin_journal::JournalError) -> std::io::Error {
+    match e {
+        melin_journal::JournalError::Io(io) => io,
+        other => std::io::Error::other(other),
+    }
+}
+
 /// Writer loop: drain the queue, write every batch, sync once, publish.
 ///
 /// The single `sync` per drain is the point of queue depth: `fdatasync`
