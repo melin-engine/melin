@@ -1499,6 +1499,14 @@ fn thread_cpus_allowed(name: &str) -> Option<String> {
 /// runs, so a "does the cursor advance?" test passes with the bug
 /// present — it only bites where `isolcpus` removes the load balancer,
 /// which is exactly where the product is meant to run.
+///
+/// The load-bearing detail: the executor must **not** fix its own
+/// affinity. A self-reset inside the child is unreachable when the
+/// parent is a pinned `SCHED_FIFO` spinner — the child would have to be
+/// scheduled to run it. So this asserts a property only the *parent* can
+/// establish, and it would pass spuriously if the child were allowed to
+/// repair itself. Keep the production child free of affinity calls or
+/// this test stops meaning anything.
 #[cfg(not(feature = "no-persist"))]
 #[test]
 fn flush_executor_does_not_inherit_the_journal_threads_affinity() {
@@ -1546,6 +1554,70 @@ fn flush_executor_does_not_inherit_the_journal_threads_affinity() {
         "flush executor inherited the journal thread's single-core mask — on an \
          isolated core it would never be scheduled and the durable cursor would \
          never advance"
+    );
+}
+
+/// The journal ring cursor must reach the last published slot *while
+/// the stage is running*, without a shutdown to flush it.
+///
+/// This is the seed drain's exact shape: the server publishes seed
+/// events, then spins on `journal_cursor >= last_seed_seq` before it
+/// will accept clients. Every other test here asserts cursors after
+/// shutdown, where `drain_remaining`'s `commit` sets them — so they pass
+/// even if the running publication path never advances the cursor at
+/// all. A stall here is a server that never opens its listener.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn journal_cursor_advances_while_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("running_cursor.journal");
+    let writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let journal_cursor = consumer.progress_counter();
+
+    // `busy_spin = true`, as production runs it.
+    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, true);
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    const EVENTS: u64 = 200;
+    for i in 1..=EVENTS {
+        producer.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 1,
+            request_seq: i,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000 + i,
+            event: JournalEvent::App(TestEvent::Add(i)),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        });
+    }
+
+    // Spin exactly like the seed drain does, but bounded.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut reached = 0;
+    while std::time::Instant::now() < deadline {
+        reached = journal_cursor.get().load(Ordering::Acquire);
+        if reached >= EVENTS {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = handle.join().unwrap();
+
+    assert!(
+        reached >= EVENTS,
+        "journal cursor stalled at {reached}/{EVENTS} with the stage still running — \
+         the seed drain would never complete and the server would never accept clients"
     );
 }
 

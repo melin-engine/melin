@@ -162,9 +162,6 @@ struct State {
     /// rotation (tiny observed segment) from shrinking the target below
     /// what size-driven rotation needs.
     zero_fill_floor: u64,
-    /// Core the worker pins itself to; `0` = unpinned. Read once at
-    /// worker startup.
-    pin_core: usize,
     /// Mutex<Option<…>> because the slot is mutated from two threads
     /// (worker writes, adopter takes) and has at most one entry. No
     /// contention on the hot path — the lock is only acquired at
@@ -252,7 +249,6 @@ impl SegmentPreparer {
             mode,
             zero_fill_target: AtomicU64::new(zero_fill_target),
             zero_fill_floor,
-            pin_core,
             slot: Mutex::new(None),
             // Pre-arm at startup so the worker prepares the first spare
             // segment in parallel with engine warm-up. The first rotation
@@ -267,6 +263,25 @@ impl SegmentPreparer {
             .name("journal-prep".into())
             .spawn(move || worker_loop(worker_state))
             .expect("failed to spawn journal-prep thread");
+
+        // Configure the child from here, not from inside `worker_loop`.
+        // This is spawned by the journal thread, which is pinned and
+        // `SCHED_FIFO` in tuned deployments, and a child inherits both
+        // at `clone()` time — before its first instruction. A reset it
+        // performs itself is therefore unreachable: it would have to be
+        // scheduled to run it, and as a same-priority FIFO peer of a
+        // never-yielding spinner on an isolated core it never is. The
+        // symptom is silent — the worker never arms, so every rotation
+        // quietly takes the synchronous fallback path and
+        // `melin_journal_rotations_total{path="sync_fallback"}` climbs.
+        {
+            use std::os::unix::thread::JoinHandleExt;
+            melin_app::affinity::configure_spawned_thread(
+                "journal-prep",
+                handle.as_pthread_t(),
+                pin_core,
+            );
+        }
 
         Self {
             state,
@@ -357,19 +372,11 @@ impl Drop for SegmentPreparer {
 /// (interrupted by shutdown) so transient ENOSPC / RO-FS conditions
 /// don't busy-loop the thread.
 fn worker_loop(state: Arc<State>) {
-    // Spawned from the journal thread, which is pinned to a single core
-    // and runs SCHED_FIFO in tuned deployments — child threads inherit
-    // both. Left in place, this worker either starves behind the
-    // busy-spinning journal thread (a same-priority FIFO peer on the
-    // same core never runs, so the fast path never arms) or executes
-    // the staging work ON the journal core whenever the journal thread
-    // blocks. Reset to the default mask and SCHED_OTHER first, like
-    // every other child of a pinned thread — then apply the configured
-    // pin (if any) on top, so a pinned worker still runs SCHED_OTHER.
-    if let Err(e) = melin_app::affinity::clear_affinity() {
-        tracing::warn!(error = e, "failed to clear segment-preparer affinity");
-    }
-    melin_app::affinity::pin_thread("journal-prep", state.pin_core);
+    // Affinity and scheduling policy are set by the *spawning* thread in
+    // `spawn_with_mode`, not here. Doing it here cannot work: this
+    // thread inherits the journal thread's pinned mask and SCHED_FIFO
+    // policy at `clone()` time, so it would have to be scheduled in
+    // order to fix the very thing preventing it from being scheduled.
     loop {
         // Wait for arm or shutdown.
         let mut armed = match state.armed.lock() {

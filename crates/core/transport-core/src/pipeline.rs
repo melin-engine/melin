@@ -854,28 +854,15 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             let handle = std::thread::Builder::new()
                 .name("journal-flush".to_string())
                 .spawn(move || {
-                    // Spawned from the journal thread, which is pinned to
-                    // a single core and runs SCHED_FIFO in tuned
-                    // deployments — child threads inherit both. Left in
-                    // place that is fatal here, not merely slow: this
-                    // thread would land on the journal's core as a
-                    // same-priority FIFO peer of a busy-spinner that
-                    // never yields, so it would never be scheduled, the
-                    // durable cursor would never advance, and the
-                    // pipeline would stall at the seed drain. On an
-                    // isolated core there is no load balancer to rescue
-                    // it either — the tuning that makes the box fast is
-                    // what makes this fatal rather than mild.
-                    //
-                    // Reset to the full mask and SCHED_OTHER first, like
-                    // every other child of a pinned thread, then apply
-                    // the configured pin on top. This is also what makes
-                    // `0 = unpinned` mean what it says instead of
-                    // "inherit the journal core".
-                    if let Err(e) = melin_app::affinity::clear_affinity() {
-                        tracing::warn!(error = e, "failed to clear journal-flush affinity");
-                    }
-                    melin_app::affinity::pin_thread("journal-flush", core);
+                    // Deliberately does NOT touch its own affinity: it is
+                    // spawned from the journal thread, which is pinned
+                    // and SCHED_FIFO in tuned deployments, and a child
+                    // inherits both before its first instruction. A
+                    // self-reset here would be unreachable — the thread
+                    // would have to be scheduled to run it, and as a
+                    // same-priority FIFO peer of a never-yielding spinner
+                    // on an isolated core it never is. The parent
+                    // configures it below, after `spawn` returns.
                     let mut publisher = publisher;
                     run_flush_executor(
                         cell,
@@ -896,6 +883,22 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                         "spawning journal-flush thread: {e}"
                     )))
                 })?;
+
+            // Give the child a workable mask and policy *from here*,
+            // before it needs to run. It inherited this thread's — a
+            // single pinned core, SCHED_FIFO — and cannot fix that
+            // itself: it would have to be scheduled first, and on an
+            // isolated core it is a same-priority FIFO peer of this
+            // busy-spinning thread, which never yields. Starved before
+            // its first instruction, it would never publish, the durable
+            // cursor would never advance, and the pipeline would hang at
+            // the seed drain before serving a request.
+            use std::os::unix::thread::JoinHandleExt;
+            melin_app::affinity::configure_spawned_thread(
+                "journal-flush",
+                handle.as_pthread_t(),
+                core,
+            );
 
             Ok(Some(FlushExec {
                 stop,

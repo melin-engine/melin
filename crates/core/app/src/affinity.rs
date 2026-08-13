@@ -146,6 +146,85 @@ fn set_realtime_fifo(priority: i32) {
     }
 }
 
+/// Configure a **just-spawned** thread's affinity and scheduling policy
+/// from the thread that spawned it.
+///
+/// Use this, not [`pin_thread`] inside the child, whenever the spawning
+/// thread may itself be pinned and running `SCHED_FIFO`.
+///
+/// A child inherits both the parent's affinity mask and its scheduling
+/// policy at `clone()` time, before its first instruction. It therefore
+/// cannot fix either itself: doing so requires being scheduled, and a
+/// child of a pinned `SCHED_FIFO` busy-spinner on an isolated core is a
+/// same-priority peer of a thread that never yields, on a core the
+/// balancer has been told to leave alone. It is starved before it can
+/// un-starve itself — `sum_exec_runtime` stays at exactly zero, and
+/// because Rust sets the thread name from *within* the child, such a
+/// thread does not even appear under its own name. Self-reset inside the
+/// child is unreachable by construction; only the parent can break the
+/// cycle.
+///
+/// `core == 0` means "unpinned": the child gets the full CPU mask and
+/// `SCHED_OTHER`, because a roaming real-time busy-spinner would starve
+/// whatever it lands on. A non-zero isolated core keeps `SCHED_FIFO`,
+/// matching [`pin_to_core`].
+///
+/// Best-effort and non-fatal, like the rest of this module: a failure is
+/// logged and the thread runs with whatever it inherited.
+pub fn configure_spawned_thread(name: &str, thread: libc::pthread_t, core: usize) {
+    // Safety: `set` is fully initialised by `CPU_ZERO`/`CPU_SET` before
+    // use, and `thread` is a live pthread the caller just created.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        if core == 0 {
+            for i in 0..libc::CPU_SETSIZE as usize {
+                libc::CPU_SET(i, &mut set);
+            }
+        } else {
+            libc::CPU_SET(core, &mut set);
+        }
+        let ret =
+            libc::pthread_setaffinity_np(thread, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if ret != 0 {
+            tracing::warn!(
+                thread = name,
+                core,
+                error = %std::io::Error::from_raw_os_error(ret),
+                "failed to set spawned thread affinity"
+            );
+        }
+
+        // Real-time only where `pin_to_core` would grant it: a non-zero
+        // isolated core. Everywhere else the child must be demoted out
+        // of any inherited FIFO, or it becomes the starving peer this
+        // function exists to prevent — one level down.
+        let (policy, priority) = if core > 0 && core_is_isolated(core) {
+            (libc::SCHED_FIFO, 1)
+        } else {
+            (libc::SCHED_OTHER, 0)
+        };
+        let param = libc::sched_param {
+            sched_priority: priority,
+        };
+        let ret = libc::pthread_setschedparam(thread, policy, &param);
+        if ret != 0 {
+            // EPERM without CAP_SYS_NICE — same non-fatal treatment as
+            // `set_realtime_fifo`.
+            tracing::warn!(
+                thread = name,
+                core,
+                error = %std::io::Error::from_raw_os_error(ret),
+                "failed to set spawned thread scheduling policy"
+            );
+        } else if core == 0 {
+            tracing::info!(thread = name, "spawned unpinned (full mask, SCHED_OTHER)");
+        } else {
+            tracing::info!(thread = name, core, "spawned pinned to core");
+        }
+    }
+}
+
 /// Pin the calling thread to `core` with logging on success/failure.
 ///
 /// Convenience wrapper around [`pin_to_core`] for pipeline threads
@@ -216,6 +295,63 @@ mod tests {
     fn pin_to_core_0_succeeds() {
         // Core 0 always exists on any machine.
         assert!(pin_to_core(0).is_ok());
+    }
+
+    /// `configure_spawned_thread` must take effect on a child that never
+    /// executes an affinity call of its own.
+    ///
+    /// This is the whole point of the function. The child it exists for
+    /// — spawned by a pinned `SCHED_FIFO` busy-spinner on an isolated
+    /// core — cannot run *any* instruction until something gives it a
+    /// workable mask, so a fix it performs itself is unreachable. The
+    /// child here therefore only parks: if the parent's call did not do
+    /// the work, nothing did.
+    #[test]
+    fn configure_spawned_thread_applies_without_the_child_running() {
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
+            return; // single CPU: every mask is identical
+        }
+
+        // Pin *this* thread first: the child must inherit a single-CPU
+        // mask, or the assertion below is vacuous — it would pass on the
+        // inherited full mask whether or not the parent-side call did
+        // anything.
+        pin_to_core(0).expect("pin the stand-in parent");
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let child = std::thread::spawn(move || {
+            // Deliberately touches nothing: no pin, no clear. Blocks
+            // until the test is done inspecting it.
+            let _ = rx.recv();
+        });
+
+        use std::os::unix::thread::JoinHandleExt;
+        configure_spawned_thread("affinity-test", child.as_pthread_t(), 0);
+
+        // Read the mask back through the pthread the parent configured.
+        // Safety: `set` is written by the call before it is read, and the
+        // pthread is alive (the child is parked on `rx`).
+        let allowed = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            let ret = libc::pthread_getaffinity_np(
+                child.as_pthread_t(),
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &mut set,
+            );
+            assert_eq!(ret, 0, "pthread_getaffinity_np");
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&i| libc::CPU_ISSET(i, &set))
+                .count()
+        };
+
+        drop(tx);
+        child.join().expect("child thread");
+
+        assert!(
+            allowed > 1,
+            "core 0 means unpinned, so the child should hold the full mask; \
+             it holds {allowed} CPU(s) — the parent-side configuration did not apply"
+        );
     }
 
     #[test]
