@@ -137,11 +137,14 @@ pub struct StageUtilization {
     /// so the atomic costs nothing on the hot path.
     pub rotations_fast_path: AtomicU64,
     /// Cumulative rotations that fell back to the synchronous
-    /// `posix_fallocate + zero_range + prefault + sync_all` path
-    /// because no prepared segment was available. Steady state on the
-    /// sector/io_uring path should be zero — growth means the preparer
-    /// isn't keeping up (or isn't armed) and the rotation stall is
-    /// landing on the journal thread. Only used by the journal stage.
+    /// create-and-allocate path because no prepared segment was
+    /// available. Steady state under recurring rotation should be zero
+    /// for both writers — growth means the preparer isn't keeping up
+    /// (or isn't armed) and the rotation stall is landing on the
+    /// journal thread. For the buffered writer a fallback segment also
+    /// loses the pre-zeroed-extents property until the next rotation
+    /// (see `BufferedWriter::rotate_segment_with_prepared`). Only used
+    /// by the journal stage.
     pub rotations_sync_fallback: AtomicU64,
     /// Cumulative rotation *attempts* that failed (ENOSPC, read-only
     /// filesystem, …) and left the current segment in place. The
@@ -489,15 +492,23 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// a fresh error log on each command.
     rotation_backoff_until: Option<Instant>,
     /// Background preparer that pre-stages the next segment off the
-    /// rotation hot path. `Some` once `enable_preparer` arms it at
-    /// sector run startup (size-driven rotation or replica adoption);
-    /// `None` when rotation can't recur (no point spending disk + a
-    /// thread on speculation that may never pay off). Survives every
+    /// rotation hot path. `Some` once the writer-specific
+    /// `enable_preparer` arms it at run startup (size-driven rotation
+    /// or replica adoption; sector and buffered stages each spawn
+    /// their own staging mode); `None` when rotation can't recur (no
+    /// point spending disk + a thread on speculation that may never
+    /// pay off). Survives every
     /// rotation — only the writer's file is swapped, the preparer
     /// keeps preparing the same live-path sidecar across the rotation
     /// boundary. Rotation outcome counters live in
     /// [`StageUtilization`] so `/healthz` can surface them.
     preparer: Option<SegmentPreparer>,
+    /// Core the preparer worker pins itself to; `0` = unpinned
+    /// (default). Set via [`set_preparer_core`](Self::set_preparer_core)
+    /// before the stage runs — keeps staging I/O off the IRQ core and
+    /// pipeline cores deterministically, same convention as the shadow
+    /// and event-publisher threads.
+    preparer_core: usize,
     /// Primary-announced stream marks to apply (replica mode only;
     /// `None` on primaries/standalone). Pushed by the replication
     /// receiver, popped here. See [`StreamMark`].
@@ -660,6 +671,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             rotate_requested: None,
             rotation_backoff_until: None,
             preparer: None,
+            preparer_core: 0,
             stream_marks: None,
             pending_mark: None,
         }
@@ -676,12 +688,12 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     pub fn set_rotation(&mut self, max_journal_bytes: u64, rotate_flag: Option<Arc<AtomicBool>>) {
         self.max_journal_bytes = max_journal_bytes;
         self.rotate_requested = rotate_flag;
-        // The preparer fast path is only meaningful for `SectorWriter`
-        // (its `rotate_segment_with_prepared` adopts a pre-allocated
-        // sidecar segment). It is wired up in the sector-specialized
-        // `enable_preparer` method called from the io_uring run path.
-        // The buffered writer rotates via plain `rotate_segment()` — no
-        // fast path, but rotation is not on its hot path anyway.
+        // The preparer fast path is wired per writer by the
+        // `enable_preparer` specializations, called from each stage's
+        // run path: sector mode pre-allocates an O_DIRECT sidecar,
+        // buffered mode pre-writes physical zeros so appends stop
+        // generating extent-conversion metadata (the fdatasync
+        // journal-force beat — see the preparer module docs).
     }
 
     /// Replica mode: act only on primary-announced stream marks pushed
@@ -1260,17 +1272,63 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             return false;
         };
         let pre_size = self.writer.valid_end();
-        // Generic path: no fast (pre-staged) rotation. The
-        // `SectorWriter` specialization overrides this via
-        // `maybe_rotate_with_prepared` to consume a sidecar segment
-        // pre-allocated by the preparer thread; the buffered writer
-        // has no fast path (and no preparer).
-        let rotate_result = self.writer.rotate_segment();
-        self.finish_local_rotation(rotate_result, manual, false, pre_size)
+        let (rotate_result, used_fast_path) = self.rotate_taking_prepared();
+        self.finish_local_rotation(rotate_result, manual, used_fast_path, pre_size)
     }
 
-    /// Trigger/guard half of the local-rotation twins ([`maybe_rotate`]
-    /// and the sector path's `maybe_rotate_with_prepared`): consume the
+    /// Rotate, adopting a pre-staged sidecar segment when the
+    /// background preparer (spawned by the writer-specific
+    /// `enable_preparer`) has one ready; synchronous `rotate_segment`
+    /// otherwise. Returns the rotation result and whether the fast
+    /// path was used — the single fast-path selection point shared by
+    /// size/manual rotation and replica boundary adoption, so a policy
+    /// change (e.g. rejecting a stale-sized prepared segment) cannot
+    /// skew the two triggers apart.
+    fn rotate_taking_prepared(&mut self) -> (Result<std::path::PathBuf, JournalError>, bool) {
+        let prepared = self.preparer.as_ref().and_then(|p| p.take());
+        let used_fast_path = prepared.is_some();
+        let result = match prepared {
+            Some(p) => self.writer.rotate_segment_with_prepared(p),
+            None => self.writer.rotate_segment(),
+        };
+        (result, used_fast_path)
+    }
+
+    /// Spawn a preparer via `spawn` iff rotation recurs on a
+    /// predictable cadence — size-driven rotation, or replica mode
+    /// (primary-announced boundaries arrive at the primary's cadence;
+    /// a replica's rotation stall sits on the ack path, where under
+    /// `hybrid`/`durably-replicated` gating it delays the primary's
+    /// durability gate, so the fast path matters *more* there than on
+    /// the primary itself). Deliberately NOT armed for manual-only
+    /// rotation (`ROTATE` with `max_journal_bytes == 0`): the cadence
+    /// is unpredictable and the staged segment's disk + thread cost may
+    /// never pay off. Shared by both writers' `enable_preparer` so the
+    /// policy cannot drift between them (it already regressed once when
+    /// the sector call went unwired — see the `JournalStageRun` impl
+    /// docs).
+    fn arm_preparer_if_recurring(&mut self, spawn: impl FnOnce(&Self) -> SegmentPreparer) {
+        let rotation_recurs = self.max_journal_bytes > 0 || self.stream_marks.is_some();
+        if rotation_recurs && self.preparer.is_none() {
+            self.preparer = Some(spawn(self));
+        }
+    }
+
+    /// Set the core the preparer worker pins itself to (`0` =
+    /// unpinned). Call before the stage runs — `enable_preparer` reads
+    /// it at spawn time; changing it afterwards has no effect on an
+    /// already-running worker.
+    pub fn set_preparer_core(&mut self, core: usize) {
+        self.preparer_core = core;
+    }
+
+    /// Test-only probe: whether `enable_preparer` armed the preparer.
+    #[cfg(test)]
+    pub(crate) fn preparer_enabled(&self) -> bool {
+        self.preparer.is_some()
+    }
+
+    /// Trigger/guard half of [`JournalStage::maybe_rotate`]: consume the
     /// manual flag (CAS so duplicate signals collapse into one
     /// rotation), evaluate the size trigger and the failure backoff,
     /// skip empty-live rotations, and pre-publish pending replication
@@ -1370,9 +1428,12 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 );
                 self.rotation_backoff_until = None;
                 // Kick the preparer to start staging the *next*
-                // segment ahead of the next rotation.
+                // segment ahead of the next rotation, tuning the
+                // zero-fill target to the segment size just observed
+                // (a replica's only source of truth for the primary's
+                // segment size).
                 if let Some(p) = self.preparer.as_ref() {
-                    p.arm();
+                    p.arm_with_observed_len(pre_size);
                 }
                 self.publish_fsync_state();
                 Self::publish_rotate_to_rings(&mut self.repl, &self.writer);
@@ -1598,8 +1659,8 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
 
     /// Apply pending stream marks: chain checks inline, and — when
     /// `quiesced` and the writer sits exactly at a verified boundary —
-    /// the rotation itself (plain `rotate_segment`; the sector path's
-    /// preparer-aware twin is `apply_stream_marks_with_prepared`).
+    /// the rotation itself (adopting a pre-staged segment when the
+    /// preparer has one ready, synchronous `rotate_segment` otherwise).
     ///
     /// Returns `Ok(true)` when a rotation happened, `Ok(false)` when
     /// there was nothing (left) to do or the rotation failed and is
@@ -1614,9 +1675,21 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         }
         // Verified: the local tail equals the primary's, so rotating
         // here anchors the new segment identically on both nodes.
-        match self.writer.rotate_segment() {
+        // Adopt a pre-staged segment when one is ready — on a replica
+        // the rotation stall sits on the ack path, so the fast path
+        // matters *more* here than on the primary.
+        let pre_size = self.writer.valid_end();
+        let (rotate_result, used_fast_path) = self.rotate_taking_prepared();
+        // Re-arm regardless of outcome so the next boundary also has a
+        // chance at the fast path, tuning the zero-fill target to the
+        // observed segment size (the replica's only source of truth
+        // for the primary's segment size).
+        if let Some(p) = self.preparer.as_ref() {
+            p.arm_with_observed_len(pre_size);
+        }
+        match rotate_result {
             Ok(_) => {
-                self.finish_adoption(r.boundary_seq, false);
+                self.finish_adoption(r.boundary_seq, used_fast_path);
                 Ok(true)
             }
             Err(e) => {
@@ -1708,7 +1781,46 @@ impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::Buffered
         self,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<melin_journal::BufferedWriter<E>, JournalError> {
-        self.run_sync(shutdown)
+        // Under `no-persist` the sync point discards batches instead of
+        // writing, `valid_end` never advances, and the size trigger can
+        // never fire — arming the preparer would zero-write a full
+        // segment at boot for a staging file nothing ever adopts.
+        // Mirrors the sector impl, whose `no-persist` arm also skips
+        // `enable_preparer`.
+        #[cfg(feature = "no-persist")]
+        {
+            self.run_sync(shutdown)
+        }
+        #[cfg(not(feature = "no-persist"))]
+        {
+            let mut stage = self;
+            stage.enable_preparer();
+            stage.run_sync(shutdown)
+        }
+    }
+}
+
+impl<E: AppEvent> JournalStage<E, melin_journal::BufferedWriter<E>> {
+    /// Spawn the background segment preparer in zero-fill mode. Called
+    /// from the buffered stage's `run` before entering `run_sync`;
+    /// no-op if already spawned. Arming policy is shared with the
+    /// sector variant (see [`JournalStage::arm_preparer_if_recurring`]).
+    ///
+    /// Zero-fill — physical zeros, not `FALLOC_FL_ZERO_RANGE` — is the
+    /// load-bearing detail: appends into pre-written extents generate
+    /// no extent-conversion metadata, so `flush_batch_sync`'s
+    /// `fdatasync` stays on its data-only fast path instead of
+    /// periodically forcing the filesystem journal on the order
+    /// pipeline's critical path (see the preparer module docs and
+    /// `docs/internal/journal-fsync-beat-2026-08.md`).
+    pub fn enable_preparer(&mut self) {
+        self.arm_preparer_if_recurring(|stage| {
+            SegmentPreparer::spawn_zero_fill(
+                stage.writer.path().to_path_buf(),
+                stage.max_journal_bytes,
+                stage.preparer_core,
+            )
+        });
     }
 }
 
@@ -1788,37 +1900,20 @@ impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::SectorWr
 }
 
 impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
-    /// Spawn the background segment preparer. Called from `run_uring`
-    /// startup; no-op if already spawned.
-    ///
-    /// Armed when rotation recurs on a predictable cadence and the
-    /// speculative staging is therefore guaranteed to pay off:
-    ///
-    /// - size-driven rotation (`max_journal_bytes > 0`), or
-    /// - replica mode (`stream_marks` wired): the replica rotates at
-    ///   the primary's cadence, and its adoption stall sits on the ack
-    ///   path — under `hybrid`/`durably-replicated` it delays the
-    ///   primary's durability gate, so the fast path matters *more*
-    ///   here than on the primary itself.
-    ///
-    /// Deliberately NOT armed for manual-only rotation (`ROTATE` admin
-    /// command with `max_journal_bytes == 0`): the cadence is
-    /// unpredictable and the staged segment's disk + thread cost may
-    /// never pay off. Operators that want fast manual rotation can set
-    /// `--max-journal-mib` high enough to never trigger.
+    /// Spawn the background segment preparer in sector mode. Called
+    /// from `run_uring` startup; no-op if already spawned. Arming
+    /// policy is shared with the buffered variant (see
+    /// [`JournalStage::arm_preparer_if_recurring`]); operators that
+    /// want fast manual rotation can set `--max-journal-mib` high
+    /// enough to never trigger.
     pub fn enable_preparer(&mut self) {
-        let rotation_recurs = self.max_journal_bytes > 0 || self.stream_marks.is_some();
-        if rotation_recurs && self.preparer.is_none() {
-            let live_path = self.writer.path().to_path_buf();
-            let sector_size = self.writer.sector_size();
-            self.preparer = Some(SegmentPreparer::spawn(live_path, sector_size));
-        }
-    }
-
-    /// Test-only probe: whether `enable_preparer` armed the preparer.
-    #[cfg(test)]
-    pub(crate) fn preparer_enabled(&self) -> bool {
-        self.preparer.is_some()
+        self.arm_preparer_if_recurring(|stage| {
+            SegmentPreparer::spawn(
+                stage.writer.path().to_path_buf(),
+                stage.writer.sector_size(),
+                stage.preparer_core,
+            )
+        });
     }
 
     /// Update the io_uring fixed-file slot 0 to point at `new_fd`.
@@ -1883,60 +1978,6 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
             }
         }
         Ok(())
-    }
-
-    /// Rotate using the fast (pre-staged) path if a prepared segment is
-    /// available; falls back to the synchronous rotate otherwise. Same
-    /// trigger logic as the generic [`JournalStage::maybe_rotate`]
-    /// (shared via `local_rotation_armed` / `finish_local_rotation`)
-    /// but adopts the preparer's sidecar when it has one ready.
-    #[inline]
-    fn maybe_rotate_with_prepared(&mut self) -> bool {
-        let Some(manual) = self.local_rotation_armed() else {
-            return false;
-        };
-        let pre_size = self.writer.valid_end();
-        // Fast path: adopt a sidecar segment pre-allocated by the
-        // background preparer. Falls back to the synchronous
-        // `rotate_segment` when no prepared segment is available.
-        let prepared = self.preparer.as_ref().and_then(|p| p.take());
-        let used_fast_path = prepared.is_some();
-        let rotate_result = match prepared {
-            Some(p) => self.writer.rotate_segment_with_prepared(p),
-            None => self.writer.rotate_segment(),
-        };
-        self.finish_local_rotation(rotate_result, manual, used_fast_path, pre_size)
-    }
-
-    /// Apply pending stream marks using the preparer fast path for an
-    /// adopted rotation when a pre-staged segment is available. Same
-    /// contract as the generic [`JournalStage::apply_stream_marks`].
-    fn apply_stream_marks_with_prepared(&mut self, quiesced: bool) -> Result<bool, JournalError> {
-        let Some(r) = self.resolve_stream_marks(quiesced)? else {
-            return Ok(false);
-        };
-        if self.rotation_backed_off() {
-            return Ok(false);
-        }
-        let prepared = self.preparer.as_ref().and_then(|p| p.take());
-        let used_fast_path = prepared.is_some();
-        let rotate_result = match prepared {
-            Some(p) => self.writer.rotate_segment_with_prepared(p),
-            None => self.writer.rotate_segment(),
-        };
-        if let Some(p) = self.preparer.as_ref() {
-            p.arm();
-        }
-        match rotate_result {
-            Ok(_) => {
-                self.finish_adoption(r.boundary_seq, used_fast_path);
-                Ok(true)
-            }
-            Err(e) => {
-                self.fail_adoption(r.boundary_seq, &e);
-                Ok(false)
-            }
-        }
     }
 
     /// Quiesce the writer mid-cycle for a rotation barrier on the
@@ -2010,7 +2051,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
         if self.stream_marks.is_none() {
             return Ok(false);
         }
-        let rotated = self.apply_stream_marks_with_prepared(quiesced)?;
+        let rotated = self.apply_stream_marks(quiesced)?;
         if rotated {
             self.refresh_journal_registration(ring, registered_bufs)?;
         }
@@ -2194,7 +2235,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 self.publish_fsync_state();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
-                rotated_top = self.maybe_rotate_with_prepared();
+                rotated_top = self.maybe_rotate();
             }
             if rotated_top {
                 self.refresh_journal_registration(&ring, &mut registered_bufs)?;
@@ -2356,7 +2397,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 self.publish_fsync_state();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
-                rotated_eager = self.maybe_rotate_with_prepared();
+                rotated_eager = self.maybe_rotate();
             }
             if rotated_eager {
                 self.refresh_journal_registration(&ring, &mut registered_bufs)?;
@@ -2394,7 +2435,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                         self.consumer.set_progress(seq);
                         self.publish_fsync_state();
                         self.writer.confirm_async_write(batch_data);
-                        if self.maybe_rotate_with_prepared() {
+                        if self.maybe_rotate() {
                             self.refresh_journal_registration(&ring, &mut registered_bufs)?;
                         }
                     }
@@ -2435,7 +2476,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                             // state, and check for rotation triggers.
                             self.consumer.commit();
                             self.publish_fsync_state();
-                            if self.maybe_rotate_with_prepared() {
+                            if self.maybe_rotate() {
                                 self.refresh_journal_registration(&ring, &mut registered_bufs)?;
                             }
                             // Replica mode: writer is durable + quiesced

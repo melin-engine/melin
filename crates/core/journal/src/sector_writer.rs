@@ -381,6 +381,19 @@ impl<E: AppEvent> SectorWriter<E> {
             sector_size,
         } = prepared;
 
+        // Mode guard: a zero-fill staging file (marked by
+        // `sector_size == 0`) carries a plain page-cache handle —
+        // adopting it here would poison this writer's sector math
+        // (`sector_size - tail_len` underflows, alignment masks become
+        // no-ops) and corrupt the journal. Erroring out lands the
+        // caller on its sync-fallback rollback path.
+        if sector_size == 0 {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prepared segment was staged in zero-fill mode; SectorWriter requires sector mode",
+            )));
+        }
+
         // Rename staging onto the live path. `archive_live` has already
         // moved the previous live segment aside, so the destination is
         // free. Done before any further writes so that, if it fails, the
@@ -989,6 +1002,12 @@ impl<E: AppEvent> SectorWriter<E> {
         );
 
         let path = self.path.clone();
+        // Data end of the outgoing segment, captured post-flush while
+        // `self` still describes it — the archive is compacted to this
+        // after the rotation commits. Truncating mid-sector is fine:
+        // the archive is never written again, and readers/tooling use
+        // buffered I/O with no alignment requirement.
+        let sealed_end = self.valid_end();
         // The new segment's header anchor is the outgoing segment's tail
         // chain hash, giving recovery a verifiable cross-segment link.
         // Zeros when hash-chain is disabled (nothing verifies them).
@@ -1014,6 +1033,10 @@ impl<E: AppEvent> SectorWriter<E> {
                 // re-registration and replication publishing on the
                 // result); a failure is retried from the flush paths.
                 self.dir_fsync_retry.after_rotation(&path);
+                // Drop the sealed segment's allocation padding (see
+                // `compact_archive` for why). Best-effort — the
+                // rotation is committed either way.
+                crate::segment::compact_archive(&archived, sealed_end);
                 Ok(archived)
             }
             Err(e) => {
@@ -1988,6 +2011,65 @@ mod tests {
     /// This is the test that gives the fast path its own coverage; the
     /// existing rotate_segment tests cover the sync (no-prepared) path
     /// transitively.
+    /// Mode guard: a zero-fill staging file (plain page-cache handle,
+    /// `sector_size == 0`) must be *rejected*, not adopted — adopting
+    /// one poisons this writer's sector math and corrupts the journal.
+    /// The failed rotation must roll back cleanly: live segment back at
+    /// the canonical path, no archive left behind, writer still usable.
+    #[test]
+    fn rotate_with_zero_fill_prepared_is_rejected() {
+        use crate::preparer::SegmentPreparer;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+
+        // Wrong mode on purpose: the *buffered* writer's preparer.
+        let preparer = SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024, 0);
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let prepared = prepared.expect("preparer should publish a segment within 5 s");
+        assert_eq!(
+            prepared.sector_size, 0,
+            "zero-fill staging marks itself with sector_size 0"
+        );
+
+        let err = writer
+            .rotate_segment_with_prepared(prepared)
+            .expect_err("zero-fill staging must not be adopted by the sector writer");
+        assert!(
+            err.to_string().contains("zero-fill mode"),
+            "unexpected error: {err}"
+        );
+
+        assert!(path.exists(), "rename-back must restore the live segment");
+        assert!(
+            crate::segment::list_archives(&path).unwrap().is_empty(),
+            "a rejected rotation must leave no archive behind"
+        );
+
+        // Still usable on the original segment.
+        writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
+        drop(writer);
+        preparer.shutdown();
+
+        let entries = read_all(&path);
+        assert_eq!(
+            entries.len(),
+            2,
+            "both entries must survive the rejected rotation"
+        );
+    }
+
     #[test]
     fn rotate_with_prepared_round_trip() {
         use crate::preparer::SegmentPreparer;
@@ -2004,7 +2086,7 @@ mod tests {
         let next_seq_before_rotate = writer.next_sequence();
 
         // Spawn a preparer and wait for it to publish a prepared segment.
-        let preparer = SegmentPreparer::spawn(path.clone(), writer.sector_size);
+        let preparer = SegmentPreparer::spawn(path.clone(), writer.sector_size, 0);
         let mut prepared = None;
         for _ in 0..500 {
             if let Some(p) = preparer.take() {
@@ -2016,10 +2098,18 @@ mod tests {
         let prepared = prepared.expect("preparer should publish a segment within 5 s");
 
         // Take the fast path.
+        let sealed_end = writer.valid_end();
         let archived = writer
             .rotate_segment_with_prepared(prepared)
             .expect("rotate_with_prepared should succeed");
         assert!(archived.exists(), "archive should be on disk");
+        // Sealing compacts the archive to its data end regardless of
+        // writer mode (bitwise-mirror property across nodes).
+        assert_eq!(
+            std::fs::metadata(&archived).unwrap().len(),
+            sealed_end,
+            "archive must be truncated to its valid data"
+        );
         assert!(path.exists(), "new live segment should be at original path");
         assert!(
             !path.with_extension("journal.next-staging").exists(),

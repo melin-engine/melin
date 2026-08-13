@@ -342,7 +342,7 @@ The SPSC uses two cache-line-padded atomic counters (`head` and `tail`) for coor
 
 ## Threading Model
 
-The server spawns 3-6 dedicated OS threads for the pipeline plus one reader thread:
+The server spawns three always-on pipeline threads plus one reader thread, and up to six more depending on configuration:
 
 | Thread | Default Core | Role | Optional? |
 |--------|-------------|------|-----------|
@@ -350,11 +350,13 @@ The server spawns 3-6 dedicated OS threads for the pipeline plus one reader thre
 | Matching | 2 | Order execution (single-writer) | No |
 | Response | 3 | Client socket writes | No |
 | Reader | 4 | io_uring-based connection multiplexing + tick generation | No |
-| Repl Sender | 6 | Stream journal batches to replicas | Yes (`--replication-bind`) |
-| Event Publisher | 7 | Broadcast execution events to subscribers | Yes (`--event-bind`) |
-| Shadow Exchange | 8 | Periodic snapshots without pausing matching | Yes (`--snapshot-interval-ms`) |
+| Repl Sender | 5 | Stream journal batches to replicas | Yes (`--replication-bind`) |
+| Event Publisher | 6 | Broadcast execution events to subscribers | Yes (`--event-bind`) |
+| Shadow Exchange | 7 | Periodic snapshots without pausing matching | Yes (`--snapshot-interval-ms`) |
+| Repl Handler 0/1 | 8, 9 | Per-replica connection handling | Yes (one per connected replica) |
+| Segment Preparer | 10 | Pre-stage the next journal segment off the rotation path | Yes (recurring rotation only) |
 
-Core 0 is reserved for OS/IRQ handling.
+Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core, or be left unpinned with `0`; only the four mandatory threads need a core to themselves.
 
 ### CPU core pinning
 
@@ -392,7 +394,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3,4,5,6,7,8,9` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1 (comma-separated). 0 = unpinned. |
+| `--cores` | `1,2,3,4,5,6,7,8,9,10` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep (comma-separated). 0 = unpinned. The tenth entry is optional — a 9-entry value parses and leaves the segment preparer unpinned. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |

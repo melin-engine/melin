@@ -418,6 +418,53 @@ pub fn archive_live(live: &Path) -> std::io::Result<PathBuf> {
     Ok(target)
 }
 
+/// Truncate a just-sealed archive to its valid data end, dropping the
+/// allocation tail the live file carried for append performance
+/// (fallocate chunks on the sync path, the pre-zeroed region on the
+/// prepared path).
+///
+/// Two reasons, beyond not wasting disk on padding:
+///
+/// - **Bitwise-mirror property.** Sealed archives must be
+///   byte-identical across primary and replicas (operators lean on
+///   this for cross-node audit, and the failover soak pins it). Entry
+///   data is identical by replication; the padding is *not* — each
+///   node pads by its own allocation/staging policy (a manual-rotation
+///   primary fallocates, an adopting replica pre-zeros, and staged
+///   sizes adapt per node). Trimming to the data end removes the
+///   policy-dependent part entirely.
+/// - **Recovery/tooling never read past the data end** — the padding
+///   is semantically void.
+///
+/// Best-effort by contract: the rotation is already committed when
+/// this runs, so a truncation failure must not fail the rotation. A
+/// padded archive is the pre-truncation status quo — log and move on.
+///
+/// Deliberately no `sync_all`: this runs on the journal thread at
+/// rotation time, and syncing would force the filesystem log — the
+/// exact stall class the pre-zeroed staging exists to remove. The
+/// truncate is an async-logged transaction on the *archive's* inode,
+/// so it never enters the live segment's `fdatasync` path; the length
+/// change reaches disk with normal filesystem writeback. The crash
+/// window this leaves (padding resurrected on one node, breaking
+/// bitwise archive comparison until re-compacted by hand) is accepted
+/// — it requires a crash inside the writeback window, and entry data
+/// is unaffected.
+pub fn compact_archive(archived: &Path, valid_end: u64) {
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .open(archived)
+        .and_then(|f| f.set_len(valid_end));
+    if let Err(e) = result {
+        tracing::warn!(
+            error = %e,
+            path = %archived.display(),
+            valid_end,
+            "could not compact archived segment; leaving allocation padding in place"
+        );
+    }
+}
+
 /// Fsync the parent directory of `live` to durably commit dirent
 /// changes (renames, file creations). Without this, a rename + new-file
 /// pair that has reached the page cache may be lost on power loss even
