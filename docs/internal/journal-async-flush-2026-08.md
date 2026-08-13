@@ -281,6 +281,12 @@ flush executor, let it publish, then exit". `drain_remaining` flushes
 inline per batch and can stay synchronous once the executor is drained,
 but it must not be left publishing on its own.
 
+The same applies to `publish_fsync_state`, which has its own
+journal-thread call sites on the rotation-completion paths — see
+*Rotation-time publication*. The general rule is that **all** post-flush
+publication moves to the executor, and anything on the journal thread
+that needs to publish does so by submitting a watermark.
+
 The invariant to hold and to test: **exactly one thread ever stores to
 the journal consumer's `processed` counter, and under a durable build
 it is the thread that just returned from `fdatasync`.** Under
@@ -291,35 +297,114 @@ half does not apply.
 
 ## Rotation protocol
 
-Rotation stays on the journal thread (`maybe_rotate` at what is now the
-submit point). It needs the old segment quiesced — a drain-then-swap:
+Rotation stays on the journal thread. It needs the old segment
+quiesced — a drain-then-swap:
 
 1. Journal thread sets a `quiesce` flag (or submits a drain-marked
    watermark) and waits for the flush thread to publish up to the
-   current watermark.
+   current watermark, **or for poison / shutdown** (see *Termination*).
 2. Flush thread completes its cycle, publishes, and acks the quiesce.
 3. Journal thread runs the rotation as today
-   (`rotate_segment_with_prepared` / `rotate_segment` — these already
-   begin with a full flush of the old segment, which after the drain is
-   a no-op or near-no-op), installs the new live `File`, bumps the
-   watermark `generation`, and resumes.
+   (`rotate_segment_with_prepared` / `rotate_segment`), installs the new
+   live `File`, bumps the watermark `generation`, and resumes.
+4. Journal thread submits a fresh watermark carrying the post-rotation
+   chain hash and the new generation (see *Rotation-time publication*).
 
-The flush thread accesses the live segment's fd as a **`RawFd` carried
-in the cell**, not an `Arc<File>` — the cell is a `Copy` payload bound
-by `NoPadding`, and `Arc<File>` is neither. Lifetime is safe by the
-drain protocol rather than by refcount: the journal thread only swaps
-the `File` at step 3, after the flush thread has published and
-quiesced, so the fd in the cell is always open for the duration of any
-sync that observes it. The `generation` field makes any
-theoretically stale publication inert: the flush thread never publishes
-a watermark whose generation doesn't match the fd it synced. In
-practice the drain in step 1 means no cross-generation flush is ever in
-flight; the generation check is a cheap belt-and-suspenders invariant,
-not a load-bearing protocol step.
+Step 3's rotation opens with `flush_batch_sync`
+(`buffered_writer.rs:488`), which after the drain early-returns on
+`batch_len == 0` (`buffered_writer.rs:336-338`) — a true no-op, not
+merely a cheap one.
 
-The rotation-adjacent wait cost is one in-flight fdatasync (~30–300 µs
-steady-state post-prezero) — same as today's inline flush at the top of
-`rotate_segment_inner`.
+### Every rotation site must drain
+
+The sync path reaches a rotation from **four** places, not one, and all
+four need the drain:
+
+| Site | Trigger |
+| --- | --- |
+| `pipeline.rs:957` | `maybe_rotate` — size threshold or operator `ROTATE` |
+| `pipeline.rs:927` | mid-batch mark barrier, replica boundary adoption |
+| `pipeline.rs:963` | mark landing exactly at a batch end |
+| `pipeline.rs:981` | **idle path**, trailing mark applied while quiet |
+
+The last three go through `apply_stream_marks(quiesced = true)`, whose
+rotation branch is gated on that flag at `pipeline.rs:1574` — a single
+choke point, which is where the drain belongs.
+
+The idle-path site is the dangerous one. Its comment today reasons
+"`pending == 0` here … so the writer is quiesced" (`pipeline.rs:976-982`),
+and under async flush **that inference no longer holds**: `pending == 0`
+means nothing is encoded-but-unwritten, not that the executor has
+finished syncing what was already submitted. A watermark can be in
+flight with `pending == 0`. Rotating there would swap the `File` under a
+live `fdatasync`.
+
+That is also what makes the drain load-bearing rather than defensive.
+The flush thread holds a **`RawFd` carried in the cell** — not an
+`Arc<File>`, since the cell is a `Copy` payload bound by `NoPadding` and
+`Arc<File>` is neither — so its validity rests entirely on the journal
+thread never closing the old `File` while a sync is in flight. The
+`generation` field guards the *publication* of a stale watermark; it
+does nothing about the *syscall*, which would land on a closed or
+recycled descriptor. Drain first, then swap, at every one of the four
+sites.
+
+### Rotation-time publication
+
+`publish_fsync_state` is called on the journal thread from two
+rotation-completion paths — `finish_local_rotation` (`pipeline.rs:1438`)
+and `finish_adoption` (`pipeline.rs:1617`) — so that shadow observers
+pick up the new genesis-anchored chain value. Both are shared with the
+uring path.
+
+These cannot simply stay where they are. Publication moves to the flush
+thread, which means the `SeqLockWriter` moves with it, and that handle
+is unique — the single-writer property is structural today precisely
+because the journal stage owns the only one (`pipeline.rs:3416-3417`).
+Cloning one for the rotation paths would break the seqlock's core
+invariant.
+
+Hence step 4: after a successful rotation the journal thread *submits*
+a watermark carrying the post-rotation chain hash and bumped
+generation, and the flush thread publishes it on its normal cycle.
+Single-writer is preserved by construction, and the `fdatasync` that
+watermark triggers is a no-op on a freshly rotated segment. The uring
+path keeps its inline publication — it owns its own completion model
+and is out of scope here.
+
+### Termination
+
+The drain wait must watch three conditions, not one: the flush thread
+publishing up to the watermark, the poison flag, and shutdown. Without
+the latter two a poisoned executor wedges the journal thread at the
+next rotation boundary instead of surfacing the stored error. This is
+the same shape as `wait_for_journal_cursor(…, abort)`
+(`ack_queue.rs:158`), which exists for exactly this reason on the
+receiver side — reuse the pattern rather than inventing one.
+
+With those, termination is total: a live executor publishes within one
+`fdatasync`; a poisoned one aborts the rotation and propagates; a
+shutdown abandons it. The single unbounded case is a device that never
+returns from `fdatasync` — which wedges the journal thread inline today
+too, so it is not a regression.
+
+### The masking has a hole at rotation boundaries
+
+This is the design's honest limitation. Steady-state dispatch no longer
+waits on `fdatasync`, but **rotation does** — the drain in step 1 blocks
+the journal thread for whatever remains of an in-flight sync. In the
+healthy case that is one flush (~30–300 µs post-prezero), the same cost
+as today's inline flush at the top of `rotate_segment_inner`. In a
+stall it is the remainder of the stall: a rotation falling due mid-stall
+re-freezes dispatch exactly as today, for that one boundary.
+
+At 256 MiB segments (`max_journal_mib` default) and bench-rate traffic
+that is a boundary every few seconds, so coinciding with a rare stall is
+unlikely — but it is not impossible, and it means the masking guarantee
+is "structural except at rotation boundaries" rather than unconditional.
+Worth stating in the operator-facing docs, and worth noting as a point
+in option C's favour: a linked-SQE design has no shared fd handoff and
+therefore no drain.
 
 ### Writer surface
 
@@ -540,7 +625,8 @@ assuming.)
   that submit no longer waits behind an `fdatasync`.
 - **Under a disk stall**: the pipeline keeps encoding, publishing and
   writing up to ring capacity, with the `in_memory` leg advancing on
-  the age bound rather than freezing. Under `hybrid`, acks continue via
+  the submit trigger's size and age bounds rather than freezing (in
+  `max_batch` steps if no age bound is configured). Under `hybrid`, acks continue via
   the replica leg (`persisted>=1` satisfied by a replica's persisted
   cursor). Under `local`, acks stall on the frozen persisted cursor —
   correct, and now visible as flush lag rather than as a frozen
@@ -590,9 +676,11 @@ assuming.)
    single-writer-to-`processed` (none of the three `commit` sites
    survives — `pipeline.rs:805`, `:1018`, `:1759`), rotation drain
    protocol (no publication with a stale generation, drain always
-   terminates, the cell's `RawFd` is never observed across a swap),
-   poison propagation (no cursor advance after a failed sync; journal
-   thread surfaces the original error; a poisoned executor still
+   terminates under a live executor, aborts under poison, and abandons
+   under shutdown; the cell's `RawFd` is never observed across a swap;
+   **all four rotation sites drain, including the idle path**), poison
+   propagation (no cursor advance after a failed sync; journal thread
+   surfaces the original error; a poisoned executor still
    joins), replica persist-before-ack (acks never precede
    `set_progress`), shadow alignment (a mid-batch mark barrier never
    publishes an `input_ring_seq` the shadow can reach ahead of the
