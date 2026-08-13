@@ -40,10 +40,21 @@ use crate::pipeline::{
 use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport};
 use crate::trace::mono_trace_ns;
 
-// Pipeline tests historically exercised the io_uring path under the
-// sector writer; keep them on that writer here so the io_uring
-// specialization stays covered by the infrastructure tests.
-type Writer = SectorWriter<TestEvent>;
+// The buffered writer is the production default
+// (`JournalWriterMode::default()`) and the path `run_sync` — hence the
+// flush executor — runs on, so the shared pipeline tests exercise it.
+//
+// These tests previously ran on the sector writer, which dispatches to
+// `run_uring`. That meant the suite's rotation, stream-mark and recovery
+// coverage applied to the io_uring specialization and *not* to the
+// default production path. Switching the alias moves that coverage onto
+// the path customers actually run; what remains for the sector writer is
+// `pipeline_journal_contents_match_across_writer_modes` at the end of
+// this file, which runs both and asserts they agree. Deeper io_uring
+// coverage would need those tests parameterised over both writers —
+// worth doing only if the sector writer stops being a retirement
+// candidate (see the roadmap).
+type Writer = BufferedWriter<TestEvent>;
 type TestInput = InputSlot<TestEvent>;
 type TestOutput = OutputSlot<TestReport, TestQuery>;
 
@@ -1443,6 +1454,83 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         primary_chain.expect("hash-chain enabled"),
         replica_chain.expect("hash-chain enabled"),
         "replica journal must be chain-identical to the primary's"
+    );
+}
+
+/// The shutdown exit path must publish cursors covering everything it
+/// journals.
+///
+/// `drain_remaining` writes and commits whatever was still in the ring,
+/// and on this path it is the *only* thing that journals — no
+/// steady-state sync point runs. Publishing nothing afterwards leaves
+/// the durable wire-seq cursor behind the journal on disk, which the
+/// health endpoint reports and a reconnecting replica resumes from.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn shutdown_exit_publishes_cursors_for_what_it_journals() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("flush_drain.journal");
+    // BufferedWriter specifically: it is `run_sync`, the path the flush
+    // executor runs on. The sector writer dispatches to `run_uring`,
+    // which is out of scope for the async flush.
+    let writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let journal_cursor = consumer.progress_counter();
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let durable = DurableWireSeqCursor::detached(WireSeq::new(0));
+    stage.set_last_seq_publisher(durable.clone());
+
+    const EVENTS: u64 = 64;
+    for i in 1..=EVENTS {
+        producer.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 1,
+            request_seq: i,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000 + i,
+            event: JournalEvent::App(TestEvent::Add(i)),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        });
+    }
+
+    // Shutdown is already set when the stage starts, so the loop takes
+    // its exit branch on the first iteration with nothing pending and
+    // `drain_remaining` does all the journaling. Deterministic, and it
+    // is the case where the exit path is the *only* thing that can
+    // publish — no steady-state sync point runs at all.
+    let shutdown = Arc::new(AtomicBool::new(true));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+    let _writer = handle.join().unwrap();
+
+    // Whatever reached the journal must be covered by both published
+    // cursors. Reading the file is the ground truth: the cursors are
+    // claims about it.
+    let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+    let mut last_seq = 0;
+    let mut count = 0u64;
+    while let Some(entry) = reader.next_entry().unwrap() {
+        if matches!(entry.event, JournalEvent::App(_)) {
+            last_seq = entry.sequence;
+            count += 1;
+        }
+    }
+    assert!(count > 0, "no events were journaled — test proves nothing");
+    assert_eq!(
+        durable.load(),
+        WireSeq::new(last_seq),
+        "durable cursor must cover every entry on disk after shutdown"
+    );
+    assert_eq!(
+        journal_cursor.get().load(Ordering::Acquire),
+        count,
+        "ring progress must cover every consumed slot after shutdown"
     );
 }
 

@@ -34,7 +34,7 @@ pub mod write;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
-pub use buffered_writer::BufferedWriter;
+pub use buffered_writer::{BufferedWriter, fdatasync_raw};
 pub use codec::FileHeaderInfo;
 pub use error::JournalError;
 pub use event::JournalEvent;
