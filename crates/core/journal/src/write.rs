@@ -73,6 +73,28 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Write the accumulated batch and force it to stable media.
     fn flush_batch_sync(&mut self) -> Result<(), JournalError>;
 
+    /// Write the accumulated batch, leaving durability to a later
+    /// `fdatasync` on the returned descriptor.
+    ///
+    /// This is the seam that lets the durability call run off the
+    /// journal thread (see
+    /// `docs/internal/journal-async-flush-2026-08.md`). `Some(fd)` means
+    /// bytes are in the page cache and a sync on `fd` is owed; `None`
+    /// means nothing is owed — either the batch was empty, or this
+    /// writer made the bytes durable inline.
+    ///
+    /// The default is the second case: it performs a full
+    /// [`flush_batch_sync`](Self::flush_batch_sync) and reports nothing
+    /// outstanding, so a writer that has no meaningful split (the
+    /// `O_DIRECT` sector writer) keeps today's behaviour without an
+    /// override, and a caller written against this method works with
+    /// either. `BufferedWriter` overrides it with the real split.
+    #[inline]
+    fn write_batch(&mut self) -> Result<Option<std::os::fd::RawFd>, JournalError> {
+        self.flush_batch_sync()?;
+        Ok(None)
+    }
+
     /// Drop the pending batch without writing it.
     fn discard_batch_buf(&mut self);
 
@@ -305,6 +327,11 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     #[inline]
     fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
         BufferedWriter::flush_batch_sync(self)
+    }
+
+    #[inline]
+    fn write_batch(&mut self) -> Result<Option<std::os::fd::RawFd>, JournalError> {
+        BufferedWriter::write_batch(self)
     }
 
     #[inline]

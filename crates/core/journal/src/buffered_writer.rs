@@ -27,7 +27,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -330,26 +330,65 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// Issues exactly one `pwrite` covering the whole batch, followed by
     /// `fdatasync`. Returns only when the kernel reports data is durable.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
+        if self.write_batch()?.is_some() {
+            self.sync_batch()?;
+        }
+        Ok(())
+    }
+
+    /// Write half of [`flush_batch_sync`](Self::flush_batch_sync): push
+    /// the accumulated batch into the page cache and leave durability to
+    /// a matching [`sync_batch`](Self::sync_batch) on the returned
+    /// descriptor.
+    ///
+    /// Returns `None` when there was nothing to write, in which case
+    /// there is nothing new to make durable and the caller must not
+    /// sync — matching the old early return, which never issued a
+    /// `sync_data` on an empty batch.
+    ///
+    /// Splitting these is what lets `fdatasync` run off the journal
+    /// thread (see `docs/internal/journal-async-flush-2026-08.md`). The
+    /// write stays inline deliberately: post-prezero it is a near-pure
+    /// page-cache memcpy, and no stall was ever traced to it.
+    ///
+    /// One consequence: between this call and its sync, `write_pos`
+    /// (hence [`valid_end`](Self::valid_end)) describes bytes that are
+    /// *written* but not yet durable. Callers that need the durable
+    /// point read the cursor the flush publishes, not the writer. A
+    /// failed sync is fatal — the pipeline tears down rather than
+    /// retrying the batch — so the old ordering's implicit "a failed
+    /// sync leaves the batch re-writable" property is not relied upon.
+    pub fn write_batch(&mut self) -> Result<Option<RawFd>, JournalError> {
         // Paced retry of a failed post-rotation dir fsync — a single
         // branch in steady state.
         self.dir_fsync_retry.poll();
         if self.batch_len == 0 {
-            return Ok(());
+            return Ok(None);
         }
         self.ensure_allocated()?;
 
         let len = self.batch_len;
         write_all_at(&self.file, &self.batch_buf[..len], self.write_pos)?;
 
-        // Honest durability: the call doesn't return until the kernel
-        // reports the data is on stable media. On a drive with a
-        // volatile write cache this issues a device-side flush; on a
-        // PLP drive (VWC=0) the flush is a near-no-op.
-        self.file.sync_data()?;
-
         self.write_pos += len as u64;
         self.batch_len = 0;
         self.last_user_entry_len = 0;
+        Ok(Some(self.file.as_raw_fd()))
+    }
+
+    /// Durability half of [`flush_batch_sync`](Self::flush_batch_sync).
+    ///
+    /// Honest durability: the call doesn't return until the kernel
+    /// reports the data is on stable media. On a drive with a volatile
+    /// write cache this issues a device-side flush; on a PLP drive
+    /// (VWC=0) the flush is a near-no-op.
+    ///
+    /// Takes `&self` so a flush executor holding only a descriptor can
+    /// perform it without touching writer state — nothing here mutates
+    /// the writer, which is what makes the handoff a raw fd rather than
+    /// a borrow.
+    pub fn sync_batch(&self) -> Result<(), JournalError> {
+        self.file.sync_data()?;
         Ok(())
     }
 
@@ -750,6 +789,121 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Encode `payloads` into `writer` without flushing.
+    fn encode_all(writer: &mut BufferedWriter<TestEvent>, payloads: &[u64]) {
+        for &p in payloads {
+            let seq = writer.allocate_sequence();
+            writer
+                .encode_event(seq, 1_000 + p, &sample(p), 0, 0)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn split_write_then_sync_matches_flush_batch_sync() {
+        // The split is only safe if it is a refactor: same bytes, same
+        // sequences, same chain. Two writers fed identical input, one
+        // through each path.
+        let dir = tempfile::tempdir().unwrap();
+        let inline_path = dir.path().join("inline.journal");
+        let split_path = dir.path().join("split.journal");
+
+        // Pin the prealloc chunk. `prealloc_chunk_bytes` reads a
+        // process-wide override that sibling tests mutate, so without
+        // the guard the two writers can fallocate different amounts and
+        // differ in trailing preallocated space — nothing to do with the
+        // write path under test.
+        let _prealloc_guard = crate::prealloc::PreallocOverrideGuard::new(1024 * 1024);
+
+        // `create` mints a random chain anchor per journal, which lands
+        // in the file header and seeds every chain value — two
+        // independently created files can never be byte-identical. Pin
+        // the anchor so the comparison isolates the write path.
+        const ANCHOR: [u8; 32] = [7u8; 32];
+        let mut inline =
+            BufferedWriter::<TestEvent>::create_continuing(&inline_path, 1, ANCHOR).unwrap();
+        let mut split =
+            BufferedWriter::<TestEvent>::create_continuing(&split_path, 1, ANCHOR).unwrap();
+
+        for batch in [&[1u64, 2, 3][..], &[4, 5][..], &[6][..]] {
+            encode_all(&mut inline, batch);
+            inline.flush_batch_sync().unwrap();
+
+            encode_all(&mut split, batch);
+            let fd = split.write_batch().unwrap().expect("bytes were pending");
+            assert!(fd >= 0, "a pending write must name a descriptor to sync");
+            split.sync_batch().unwrap();
+        }
+
+        assert_eq!(
+            read_all_payloads(&inline_path),
+            read_all_payloads(&split_path)
+        );
+        assert_eq!(inline.next_sequence(), split.next_sequence());
+        assert_eq!(inline.valid_end(), split.valid_end());
+        assert_eq!(inline.chain_hash(), split.chain_hash());
+
+        // Compare the valid region only. Past `valid_end` lies
+        // preallocated space whose contents and extent are the
+        // filesystem's business, not the write path's.
+        let end = inline.valid_end() as usize;
+        assert_eq!(
+            std::fs::read(&inline_path).unwrap()[..end],
+            std::fs::read(&split_path).unwrap()[..end],
+            "the two paths must produce byte-identical journal data"
+        );
+    }
+
+    #[test]
+    fn write_batch_reports_nothing_owed_for_an_empty_batch() {
+        // `None` is what tells the caller not to sync. The old inline
+        // path returned early on an empty batch and never issued a
+        // `sync_data`; the split has to preserve that or every idle
+        // journal loop would sync nothing, repeatedly.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+
+        assert_eq!(writer.write_batch().unwrap(), None, "nothing encoded yet");
+
+        encode_all(&mut writer, &[1, 2]);
+        assert!(writer.write_batch().unwrap().is_some());
+        writer.sync_batch().unwrap();
+
+        assert_eq!(
+            writer.write_batch().unwrap(),
+            None,
+            "batch already written — nothing further is owed"
+        );
+    }
+
+    #[test]
+    fn write_batch_names_the_live_segment_across_a_rotation() {
+        // The flush executor syncs a raw fd it was handed earlier, so a
+        // rotation must be visible as a *different* descriptor. This is
+        // what the drain protocol protects: syncing the stale fd after a
+        // swap would target a closed — or recycled — descriptor.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+
+        encode_all(&mut writer, &[1]);
+        let before = writer.write_batch().unwrap().expect("bytes pending");
+        writer.sync_batch().unwrap();
+
+        writer.rotate_segment().unwrap();
+
+        encode_all(&mut writer, &[2]);
+        let after = writer.write_batch().unwrap().expect("bytes pending");
+        writer.sync_batch().unwrap();
+
+        assert_ne!(
+            before, after,
+            "rotation must hand out a new descriptor, or a stale watermark \
+             would sync the wrong file"
+        );
     }
 
     #[test]
