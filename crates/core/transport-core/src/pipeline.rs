@@ -854,23 +854,28 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             let handle = std::thread::Builder::new()
                 .name("journal-flush".to_string())
                 .spawn(move || {
-                    // `core == 0` is the "do not pin" sentinel — see
-                    // `melin_app::affinity` module docs.
-                    if core == 0 {
-                        tracing::info!(
-                            thread = "journal-flush",
-                            "thread left unpinned (core 0 sentinel)"
-                        );
-                    } else {
-                        match melin_app::affinity::pin_to_core(core) {
-                            Ok(c) => {
-                                tracing::info!(thread = "journal-flush", core = c, "pinned to core")
-                            }
-                            Err(e) => {
-                                tracing::warn!(thread = "journal-flush", core, error = %e, "failed to pin")
-                            }
-                        }
+                    // Spawned from the journal thread, which is pinned to
+                    // a single core and runs SCHED_FIFO in tuned
+                    // deployments — child threads inherit both. Left in
+                    // place that is fatal here, not merely slow: this
+                    // thread would land on the journal's core as a
+                    // same-priority FIFO peer of a busy-spinner that
+                    // never yields, so it would never be scheduled, the
+                    // durable cursor would never advance, and the
+                    // pipeline would stall at the seed drain. On an
+                    // isolated core there is no load balancer to rescue
+                    // it either — the tuning that makes the box fast is
+                    // what makes this fatal rather than mild.
+                    //
+                    // Reset to the full mask and SCHED_OTHER first, like
+                    // every other child of a pinned thread, then apply
+                    // the configured pin on top. This is also what makes
+                    // `0 = unpinned` mean what it says instead of
+                    // "inherit the journal core".
+                    if let Err(e) = melin_app::affinity::clear_affinity() {
+                        tracing::warn!(error = e, "failed to clear journal-flush affinity");
                     }
+                    melin_app::affinity::pin_thread("journal-flush", core);
                     let mut publisher = publisher;
                     run_flush_executor(
                         cell,

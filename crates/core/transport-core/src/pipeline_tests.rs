@@ -1463,6 +1463,92 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
     );
 }
 
+/// Read the `Cpus_allowed_list` of the thread named `name` within this
+/// process, or `None` if no such thread exists right now.
+#[cfg(not(feature = "no-persist"))]
+fn thread_cpus_allowed(name: &str) -> Option<String> {
+    for entry in std::fs::read_dir("/proc/self/task").ok()? {
+        let dir = entry.ok()?.path();
+        let comm = std::fs::read_to_string(dir.join("comm")).unwrap_or_default();
+        if comm.trim() != name {
+            continue;
+        }
+        let status = std::fs::read_to_string(dir.join("status")).unwrap_or_default();
+        for line in status.lines() {
+            if let Some(v) = line.strip_prefix("Cpus_allowed_list:") {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The flush executor must not inherit the journal thread's CPU
+/// affinity.
+///
+/// It is spawned *from* the journal thread, which in tuned deployments
+/// is pinned to one isolated core and busy-spins there under
+/// SCHED_FIFO. Linux copies both the mask and the policy to new
+/// threads, so without an explicit reset this thread lands on that core
+/// as a same-priority FIFO peer of a spinner that never yields: it is
+/// never scheduled, the durable cursor never advances, and the pipeline
+/// stalls before it serves a single request.
+///
+/// Asserted structurally rather than behaviourally on purpose. On an
+/// untuned machine CFS timeshares the core and the executor eventually
+/// runs, so a "does the cursor advance?" test passes with the bug
+/// present — it only bites where `isolcpus` removes the load balancer,
+/// which is exactly where the product is meant to run.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn flush_executor_does_not_inherit_the_journal_threads_affinity() {
+    if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
+        // Nothing to distinguish: every mask is the same single CPU.
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("affinity.journal");
+    let writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+
+    let (_producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, true);
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || {
+        // Stand in for a tuned deployment's journal thread: pinned to a
+        // single core before it spawns anything.
+        melin_app::affinity::pin_to_core(0).expect("pin the stand-in journal thread");
+        stage.run(&s)
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let allowed = loop {
+        if let Some(v) = thread_cpus_allowed("journal-flush") {
+            break v;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "journal-flush thread never appeared"
+        );
+        std::thread::yield_now();
+    };
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = handle.join().unwrap();
+
+    assert_ne!(
+        allowed, "0",
+        "flush executor inherited the journal thread's single-core mask — on an \
+         isolated core it would never be scheduled and the durable cursor would \
+         never advance"
+    );
+}
+
 /// The shutdown exit path must publish cursors covering everything it
 /// journals.
 ///
