@@ -98,6 +98,74 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Drop the pending batch without writing it.
     fn discard_batch_buf(&mut self);
 
+    // ---- segment handoff (writer-thread path) ----
+    //
+    // One capability with one implementor. Only `BufferedWriter` can give
+    // up its file: its writes are plain positioned `pwrite`s, so any
+    // thread holding the descriptor can issue them. `SectorWriter` drives
+    // an io_uring submission queue bound to a registered fd — handing the
+    // file over would mean handing the ring over — so it takes the
+    // defaults below and keeps writing inline, which is what the io_uring
+    // path already does asynchronously by other means.
+    //
+    // The defaults are written so a writer that never detaches can never
+    // observe the rest: `detach_segment` returning `None` is the gate,
+    // and every other method here is only reachable once it has returned
+    // `Some`. See `docs/internal/journal-writer-thread-2026-08.md`.
+
+    /// Give up the live segment's file so a writer thread can own it,
+    /// leaving this writer able to encode but not to write.
+    ///
+    /// `None` means this writer cannot hand off and the caller must keep
+    /// flushing inline.
+    #[inline]
+    fn detach_segment(&mut self) -> Option<crate::SegmentFile> {
+        None
+    }
+
+    /// Take back a file previously handed out by
+    /// [`detach_segment`](Self::detach_segment).
+    ///
+    /// The default drops it, which closes the descriptor — the correct
+    /// disposal for a file this writer never owned. Unreachable in
+    /// practice: a writer whose `detach_segment` returns `None` never
+    /// hands one out for the caller to give back.
+    #[inline]
+    fn attach_segment(&mut self, segment: crate::SegmentFile) {
+        drop(segment);
+    }
+
+    /// Hand the encoded batch off for another thread to write, taking
+    /// `replacement` as the buffer to encode into next.
+    ///
+    /// `Some((bytes, offset))` is the batch and the segment offset it
+    /// belongs at; `None` means nothing was pending and the caller keeps
+    /// `replacement`. The default returns `None` — a writer that cannot
+    /// detach never hands bytes over either.
+    #[inline]
+    fn take_batch(&mut self, replacement: Vec<u8>) -> Option<(Vec<u8>, u64)> {
+        drop(replacement);
+        None
+    }
+
+    /// The pair a rotation turns on: the new segment's first sequence,
+    /// and the anchor linking its chain to the outgoing segment's tail.
+    ///
+    /// Only the encoder knows these, so a rotation performed on another
+    /// thread has to be told them.
+    #[inline]
+    fn rotation_pair(&self) -> (u64, [u8; 32]) {
+        (self.next_sequence(), self.chain_hash().unwrap_or([0u8; 32]))
+    }
+
+    /// Re-anchor the encoder onto a segment another thread has already
+    /// rotated. Call only after that rotation succeeded — it discards the
+    /// batch buffer and restarts the chain.
+    #[inline]
+    fn adopt_rotation(&mut self, starting_sequence: u64, anchor: [u8; 32]) {
+        let _ = (starting_sequence, anchor);
+    }
+
     // ---- state queries ----
 
     /// Sequence number that the next `allocate_sequence` call will return.
@@ -337,6 +405,31 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     #[inline]
     fn discard_batch_buf(&mut self) {
         BufferedWriter::discard_batch_buf(self)
+    }
+
+    #[inline]
+    fn detach_segment(&mut self) -> Option<crate::SegmentFile> {
+        BufferedWriter::detach_segment(self)
+    }
+
+    #[inline]
+    fn attach_segment(&mut self, segment: crate::SegmentFile) {
+        BufferedWriter::attach_segment(self, segment)
+    }
+
+    #[inline]
+    fn take_batch(&mut self, replacement: Vec<u8>) -> Option<(Vec<u8>, u64)> {
+        BufferedWriter::take_batch(self, replacement)
+    }
+
+    #[inline]
+    fn rotation_pair(&self) -> (u64, [u8; 32]) {
+        BufferedWriter::rotation_pair(self)
+    }
+
+    #[inline]
+    fn adopt_rotation(&mut self, starting_sequence: u64, anchor: [u8; 32]) {
+        BufferedWriter::adopt_rotation(self, starting_sequence, anchor)
     }
 
     #[inline]

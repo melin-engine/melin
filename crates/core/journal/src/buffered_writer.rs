@@ -30,6 +30,8 @@ use std::marker::PhantomData;
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use melin_app::AppEvent;
 
@@ -75,7 +77,15 @@ pub struct SegmentFile {
     path: PathBuf,
     /// Byte offset of the next entry. Always the end of valid data;
     /// there is no in-memory partial sector, so this is `valid_end`.
-    write_pos: u64,
+    ///
+    /// Shared with the encoder half rather than owned outright: once this
+    /// struct moves to a writer thread, `BufferedWriter::valid_end` still
+    /// has to answer — the rotation size trigger runs on the journal
+    /// thread and asks about a file it no longer holds. Publishing the
+    /// position is what keeps that answer true in both states instead of
+    /// only while the file happens to be local. One load and one store
+    /// per batch, never per event.
+    write_pos: Arc<AtomicU64>,
     /// Byte offset of the end of pre-allocated space. When `write_pos`
     /// approaches this, another `prealloc_chunk_bytes()` is allocated.
     allocated_end: u64,
@@ -95,9 +105,16 @@ impl SegmentFile {
         // Paced retry of a failed post-rotation dir fsync — a single
         // branch in steady state.
         self.dir_fsync_retry.poll();
-        self.ensure_allocated(bytes.len())?;
-        write_all_at(&self.file, bytes, self.write_pos)?;
-        self.write_pos += bytes.len() as u64;
+        // One load, one store: this thread is the only writer of
+        // `write_pos`, so the local copy is authoritative for the
+        // duration of the append.
+        let pos = self.write_pos.load(Ordering::Relaxed);
+        self.ensure_allocated(pos, bytes.len())?;
+        write_all_at(&self.file, bytes, pos)?;
+        // `Release` so a reader that sees the new position also sees
+        // everything this thread did to get there.
+        self.write_pos
+            .store(pos + bytes.len() as u64, Ordering::Release);
         Ok(())
     }
 
@@ -114,7 +131,14 @@ impl SegmentFile {
     /// Byte offset past the last written entry.
     #[inline]
     pub fn valid_end(&self) -> u64 {
-        self.write_pos
+        self.write_pos.load(Ordering::Acquire)
+    }
+
+    /// Shared handle to [`valid_end`](Self::valid_end), readable after
+    /// this struct moves to another thread.
+    #[inline]
+    pub(crate) fn write_pos_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.write_pos)
     }
 
     /// On-disk path of the active segment.
@@ -131,8 +155,8 @@ impl SegmentFile {
     /// preparer's margin, or a replica following larger-than-expected
     /// primary segments) — appends past here generate extent-conversion
     /// metadata again until the next rotation.
-    fn ensure_allocated(&mut self, extra: usize) -> Result<(), JournalError> {
-        let need = self.write_pos + extra as u64;
+    fn ensure_allocated(&mut self, write_pos: u64, extra: usize) -> Result<(), JournalError> {
+        let need = write_pos + extra as u64;
         if need <= self.allocated_end {
             return Ok(());
         }
@@ -145,7 +169,7 @@ impl SegmentFile {
         // Dropping the previous `File` closes the outgoing (now
         // archived) segment's fd.
         self.file = file;
-        self.write_pos = HEADER_OFFSET;
+        self.write_pos.store(HEADER_OFFSET, Ordering::Release);
         self.allocated_end = allocated_end;
     }
 
@@ -192,7 +216,7 @@ impl SegmentFile {
         Ok(Self {
             file,
             path: path.to_path_buf(),
-            write_pos: HEADER_OFFSET,
+            write_pos: Arc::new(AtomicU64::new(HEADER_OFFSET)),
             allocated_end,
             dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
@@ -296,7 +320,7 @@ impl SegmentFile {
         // Data end of the outgoing segment, captured while `self` still
         // describes it — the archive is compacted to this after the
         // rotation commits.
-        let sealed_end = self.write_pos;
+        let sealed_end = self.valid_end();
 
         let archived = crate::segment::archive_live(&path)?;
 
@@ -360,7 +384,26 @@ pub struct BufferedWriter<E: AppEvent> {
     _marker: PhantomData<fn(E) -> E>,
     /// The live segment's file and extent bookkeeping. Held whole so it
     /// can be handed to a writer thread as a unit — see [`SegmentFile`].
-    segment: SegmentFile,
+    ///
+    /// `None` while a writer thread owns it
+    /// ([`detach_segment`](Self::detach_segment)). Every method that
+    /// touches the file returns an error in that state rather than
+    /// asserting: the encoder keeps running while detached, so "the file
+    /// is elsewhere" is a reachable condition and a caller that gets it
+    /// wrong deserves a diagnosable failure rather than a panic on the
+    /// journal thread.
+    segment: Option<SegmentFile>,
+    /// On-disk path of the live segment, duplicated from the segment.
+    ///
+    /// Constant for the life of the writer: rotation archives the old
+    /// file aside and recreates at this same path. Held here so `path()`
+    /// and `read_header_info()` keep working while the file is detached
+    /// — both are wanted by callers that have nothing to do with writing.
+    path: PathBuf,
+    /// Shared handle to the segment's write position, so
+    /// [`valid_end`](Self::valid_end) answers whether or not the file is
+    /// currently here. See [`SegmentFile::write_pos`].
+    write_pos: Arc<AtomicU64>,
     // Scratch buffer for single-entry encoding. Fixed-size array — entry
     // sizes are bounded, so avoiding a Vec lets the hot path stay
     // allocation-free.
@@ -412,9 +455,12 @@ impl<E: AppEvent> BufferedWriter<E> {
         starting_sequence: u64,
         anchor_hash: [u8; 32],
     ) -> Result<Self, JournalError> {
+        let segment = SegmentFile::create(path, starting_sequence, anchor_hash)?;
         Ok(Self {
             _marker: PhantomData,
-            segment: SegmentFile::create(path, starting_sequence, anchor_hash)?,
+            path: path.to_path_buf(),
+            write_pos: segment.write_pos_handle(),
+            segment: Some(segment),
             pending_offset: HEADER_OFFSET,
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
@@ -476,15 +522,18 @@ impl<E: AppEvent> BufferedWriter<E> {
         let allocated_end = fallocate_chunk(&file, valid_end)?;
         file.sync_all()?;
 
+        let segment = SegmentFile {
+            file,
+            path: path.to_path_buf(),
+            write_pos: Arc::new(AtomicU64::new(valid_end)),
+            allocated_end,
+            dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
+        };
         Ok(Self {
             _marker: PhantomData,
-            segment: SegmentFile {
-                file,
-                path: path.to_path_buf(),
-                write_pos: valid_end,
-                allocated_end,
-                dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
-            },
+            path: path.to_path_buf(),
+            write_pos: segment.write_pos_handle(),
+            segment: Some(segment),
             pending_offset: valid_end,
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
@@ -618,21 +667,22 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// retrying the batch — so the old ordering's implicit "a failed
     /// sync leaves the batch re-writable" property is not relied upon.
     pub fn write_batch(&mut self) -> Result<Option<RawFd>, JournalError> {
-        if self.batch_len == 0 {
+        let len = self.batch_len;
+        let segment = self.segment.as_mut().ok_or_else(detached)?;
+        if len == 0 {
             // Still poll the paced dir-fsync retry: an empty batch is
             // the common idle case, and the retry must make progress.
-            self.segment.dir_fsync_retry.poll();
+            segment.dir_fsync_retry.poll();
             return Ok(None);
         }
-        let len = self.batch_len;
-        self.segment.append(&self.batch_buf[..len])?;
+        segment.append(&self.batch_buf[..len])?;
         // Writing locally, so the encoder's notion of "where the next
         // batch goes" follows the file's rather than running ahead of
         // it. The two only diverge once batches are handed off.
-        self.pending_offset = self.segment.valid_end();
+        self.pending_offset = segment.valid_end();
         self.batch_len = 0;
         self.last_user_entry_len = 0;
-        Ok(Some(self.segment.file.as_raw_fd()))
+        Ok(Some(segment.file.as_raw_fd()))
     }
 
     /// Durability half of [`flush_batch_sync`](Self::flush_batch_sync).
@@ -647,7 +697,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// the writer, which is what makes the handoff a raw fd rather than
     /// a borrow.
     pub fn sync_batch(&self) -> Result<(), JournalError> {
-        self.segment.sync()
+        self.segment.as_ref().ok_or_else(detached)?.sync()
     }
 
     /// Drop the pending batch without writing it. Used by the
@@ -699,6 +749,93 @@ impl<E: AppEvent> BufferedWriter<E> {
         self.pending_offset
     }
 
+    /// Give up the live segment's file so another thread can own it.
+    ///
+    /// This is the handoff at the centre of the writer-thread design:
+    /// afterwards nothing here can touch the inode, which is the
+    /// property the whole arrangement exists to guarantee (see
+    /// `docs/internal/journal-writer-thread-2026-08.md`). The encoder
+    /// keeps sequencing, hashing and buffering; it hands bytes over with
+    /// [`take_batch`](Self::take_batch) and learns durability from the
+    /// cursors the owning thread publishes.
+    ///
+    /// Returns `None` if the file is already detached, so a double
+    /// handoff yields nothing rather than two owners of one inode.
+    pub fn detach_segment(&mut self) -> Option<SegmentFile> {
+        self.segment.take()
+    }
+
+    /// Take the live segment's file back.
+    ///
+    /// The inverse of [`detach_segment`](Self::detach_segment), used at
+    /// shutdown so the writer this stage returns is whole again — able
+    /// to flush, rotate and be inspected exactly as one that never
+    /// handed off.
+    ///
+    /// The caller must return the *same* file: re-attaching a different
+    /// one would leave `pending_offset` describing offsets in a file
+    /// that no longer exists. Checked in debug builds against the shared
+    /// write position, which only the real file advances.
+    pub fn attach_segment(&mut self, segment: SegmentFile) {
+        debug_assert!(
+            self.segment.is_none(),
+            "attaching a segment file while one is already held would leak the live fd"
+        );
+        debug_assert!(
+            Arc::ptr_eq(&self.write_pos, &segment.write_pos),
+            "attaching a foreign segment file: its write position is not the one this \
+             encoder has been tracking"
+        );
+        self.segment = Some(segment);
+    }
+
+    /// Whether the live segment's file is held here rather than by a
+    /// writer thread.
+    #[inline]
+    pub fn is_attached(&self) -> bool {
+        self.segment.is_some()
+    }
+
+    /// The pair a rotation turns on: the new segment's first sequence,
+    /// and the anchor linking its chain to the outgoing segment's tail.
+    ///
+    /// Only the encoder knows these, so a rotation performed elsewhere
+    /// has to be told them. Pure — reading it does not commit to
+    /// rotating, so a caller whose rotation then fails simply discards
+    /// the pair and keeps writing to the current segment.
+    pub fn rotation_pair(&self) -> (u64, [u8; 32]) {
+        // Zeros with `hash-chain` disabled — nothing verifies them.
+        (self.next_sequence, self.chain_hash().unwrap_or([0u8; 32]))
+    }
+
+    /// Re-anchor the encoder onto a segment that has already been
+    /// rotated, using the pair from
+    /// [`rotation_pair`](Self::rotation_pair).
+    ///
+    /// Call only after the file half has *succeeded*: this discards the
+    /// batch buffer and restarts the chain, neither of which is
+    /// recoverable if the new segment does not exist.
+    pub fn adopt_rotation(&mut self, starting_sequence: u64, anchor: [u8; 32]) {
+        // Kept in place rather than rebuilt, so `batch_buf`'s allocation
+        // survives the rotation instead of being replaced per rotation.
+        self.starting_sequence = starting_sequence;
+        self.batch_len = 0;
+        self.last_user_entry_offset = 0;
+        self.last_user_entry_len = 0;
+        // The new segment starts right after its header, on both sides.
+        self.pending_offset = HEADER_OFFSET;
+        #[cfg(feature = "hash-chain")]
+        {
+            self.hash_chain = SegmentChain::new(anchor);
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        let _ = anchor;
+        #[cfg(debug_assertions)]
+        {
+            self.last_encoded_seq = 0;
+        }
+    }
+
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
     }
@@ -719,19 +856,25 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// no in-memory partial sector, so the on-disk end and the logical
     /// end coincide.
     pub fn write_pos(&self) -> u64 {
-        self.segment.valid_end()
+        self.valid_end()
     }
 
     /// Byte offset of the end of valid on-disk data. Identical to
     /// `write_pos` here — kept as a separate method so callers can
     /// substitute the buffered and O_DIRECT writers behind a common
     /// interface without changing semantics.
+    ///
+    /// Answers whether or not the file is currently attached: it reads
+    /// the position the file's owner publishes, so a detached writer
+    /// reports the writer thread's progress rather than a stale local
+    /// copy. Written bytes, not necessarily durable ones — callers that
+    /// need the durable point read the cursors the flush publishes.
     pub fn valid_end(&self) -> u64 {
-        self.segment.valid_end()
+        self.write_pos.load(Ordering::Acquire)
     }
 
     pub fn path(&self) -> &Path {
-        self.segment.path()
+        &self.path
     }
 
     /// Decoded file-header fields of the live segment (read from disk).
@@ -739,7 +882,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// `(starting_sequence, anchor_hash)` so a fresh replica journal is
     /// byte-identical from the segment's first entry onward.
     pub fn read_header_info(&self) -> Result<codec::FileHeaderInfo, JournalError> {
-        crate::segment::read_header_info(self.segment.path())
+        crate::segment::read_header_info(&self.path)
     }
 
     /// First sequence of the active segment (the header's
@@ -827,35 +970,35 @@ impl<E: AppEvent> BufferedWriter<E> {
         // left here would land in the new one.
         self.flush_batch_sync()?;
 
-        // The pair both halves rotate on: the new segment's first
-        // sequence, and the anchor linking its chain to the outgoing
-        // segment's tail (zeros with `hash-chain` disabled — nothing
-        // verifies them). Only the encoder knows these, which is why
-        // they are computed here and handed to the file half.
-        let next_seq = self.next_sequence;
-        let anchor = self.chain_hash().unwrap_or([0u8; 32]);
-
-        let archived = self.segment.rotate(next_seq, anchor, prepared)?;
-
-        // Encoder half: re-anchor to the same pair. Kept in place rather
-        // than rebuilt, so `batch_buf`'s allocation survives the
-        // rotation instead of being replaced per rotation.
-        self.starting_sequence = next_seq;
-        self.batch_len = 0;
-        self.last_user_entry_offset = 0;
-        self.last_user_entry_len = 0;
-        // The new segment starts right after its header, on both sides.
-        self.pending_offset = HEADER_OFFSET;
-        #[cfg(feature = "hash-chain")]
-        {
-            self.hash_chain = SegmentChain::new(anchor);
-        }
-        #[cfg(debug_assertions)]
-        {
-            self.last_encoded_seq = 0;
-        }
+        // The pair both halves rotate on. Only the encoder knows it,
+        // which is why it is computed here and handed to the file half.
+        let (next_seq, anchor) = self.rotation_pair();
+        let archived = self
+            .segment
+            .as_mut()
+            .ok_or_else(detached)?
+            .rotate(next_seq, anchor, prepared)?;
+        // Strictly after the file half succeeded: `adopt_rotation`
+        // discards the batch buffer and restarts the chain, so running
+        // it against a rotation that failed would lose the outgoing
+        // segment's tail with nowhere to put it.
+        self.adopt_rotation(next_seq, anchor);
         Ok(archived)
     }
+}
+
+/// The live segment's file is held by a writer thread, so this operation
+/// cannot run here.
+///
+/// A caller error rather than a disk failure, but it reaches operators
+/// through the same channel as one — the journal stage treats any I/O
+/// error from the writer as fatal, which is the correct response: a
+/// pipeline that has lost track of who owns its journal must stop, not
+/// improvise.
+fn detached() -> JournalError {
+    JournalError::Io(std::io::Error::other(
+        "the live segment's file is detached onto a writer thread",
+    ))
 }
 
 /// Force a descriptor's data to stable media.
@@ -1099,6 +1242,12 @@ mod tests {
             start + first.len() as u64,
             "the encoder advances by exactly what it handed over"
         );
+        assert_eq!(
+            writer.valid_end(),
+            start,
+            "handing bytes over is not writing them: `valid_end` must stay where the file \
+             is, or the rotation trigger and the recovery tail would count bytes no one wrote"
+        );
 
         encode_all(&mut writer, &[4]);
         let (second, second_offset) = writer.take_batch(Vec::new()).expect("bytes pending");
@@ -1109,14 +1258,65 @@ mod tests {
         );
         assert_eq!(writer.pending_offset(), second_offset + second.len() as u64);
 
-        // Writing the handed-over bytes through the segment must land
-        // them exactly where the encoder said, leaving a readable
-        // journal.
-        writer.segment.append(&first).unwrap();
-        writer.segment.append(&second).unwrap();
-        writer.segment.sync().unwrap();
-        assert_eq!(writer.segment.valid_end(), writer.pending_offset());
+        // Writing the handed-over bytes through the detached segment
+        // must land them exactly where the encoder said, leaving a
+        // readable journal — this is the whole handoff, end to end.
+        let mut segment = writer
+            .detach_segment()
+            .expect("the file starts out attached");
+        segment.append(&first).unwrap();
+        segment.append(&second).unwrap();
+        segment.sync().unwrap();
+        assert_eq!(
+            segment.valid_end(),
+            writer.pending_offset(),
+            "the writer's position and the encoder's must agree once the batches land"
+        );
         assert_eq!(read_all_payloads(&path), vec![1, 2, 3, 4]);
+
+        // The shared position means the encoder can answer for a file it
+        // no longer holds — the rotation size trigger depends on it.
+        assert_eq!(writer.valid_end(), segment.valid_end());
+        writer.attach_segment(segment);
+        assert!(writer.is_attached());
+    }
+
+    #[test]
+    fn a_detached_writer_refuses_to_write_instead_of_writing_elsewhere() {
+        // Losing track of who owns the file is exactly the failure this
+        // design exists to prevent, so it must surface as an error the
+        // journal stage treats as fatal — never as a silent no-op that
+        // leaves the cursor claiming bytes nobody wrote.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detached.journal");
+        let _guard = melin_journal_prealloc_guard();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        encode_all(&mut writer, &[1]);
+
+        let segment = writer
+            .detach_segment()
+            .expect("the file starts out attached");
+        assert!(!writer.is_attached());
+        assert!(
+            writer.detach_segment().is_none(),
+            "a second detach must yield nothing"
+        );
+
+        assert!(writer.write_batch().is_err());
+        assert!(writer.sync_batch().is_err());
+        assert!(writer.flush_batch_sync().is_err());
+        assert!(writer.rotate_segment().is_err());
+        // Encoding is unaffected: the point of the split is that the
+        // encoder keeps running while the file is elsewhere.
+        encode_all(&mut writer, &[2]);
+        assert_eq!(writer.next_sequence(), 3);
+        // So are the accessors that never needed the file.
+        assert_eq!(writer.path(), path);
+        assert_eq!(writer.read_header_info().unwrap().starting_sequence, 1);
+
+        writer.attach_segment(segment);
+        writer.flush_batch_sync().unwrap();
+        assert_eq!(read_all_payloads(&path), vec![1, 2]);
     }
 
     /// Shared guard so the handoff tests don't fallocate 256 MiB each.
@@ -1371,7 +1571,10 @@ mod tests {
         assert_eq!(writer.next_sequence(), seq_before_rotate);
         // The adopted segment's pre-zeroed region is the allocation —
         // appends must not immediately re-fallocate.
-        assert_eq!(writer.segment.allocated_end, zeroed_end);
+        assert_eq!(
+            writer.segment.as_ref().expect("attached").allocated_end,
+            zeroed_end
+        );
         // The staging file is gone (renamed onto the live path).
         assert!(!crate::preparer::staging_path(&path).exists());
 
