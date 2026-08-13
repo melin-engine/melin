@@ -445,8 +445,16 @@ fn prepare_one(state: &State) -> Result<PreparedSegment, JournalError> {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         // Surface other errors via the create_new below — the caller
-        // will see the real fault and log it.
-        Err(_) => {}
+        // will see the real fault and log it. Traced here anyway
+        // because the fault the caller reports is an unhelpful
+        // AlreadyExists, not the EACCES/EIO that actually happened.
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                path = %staging.display(),
+                "could not remove stale staging file before prepare"
+            );
+        }
     }
 
     match state.mode {
@@ -484,19 +492,92 @@ fn prepare_sector(staging: &Path, sector_size: usize) -> Result<PreparedSegment,
     })
 }
 
-/// Zero-fill staging: plain (page-cache) handle, `bytes` of physical
-/// zeros written over `[0, bytes)` and synced.
+/// Staging window size for both paced passes.
 ///
-/// The header region `[0, ENTRY_OFFSET)` is zeroed too, so the
-/// adopter's header pwrite also lands in written extents. Writing goes
-/// through the page cache on purpose: the pages the buffered writer is
-/// about to append into are left resident, which doubles as the
-/// prefault the sector mode does explicitly.
+/// The window must be SMALL: an off-CPU trace of the journal thread
+/// showed its per-batch fdatasyncs queueing behind in-flight staging
+/// chunks for the duration of the fill — with 2 MiB chunks and a
+/// two-chunk window that was 1-2 ms added to every hot-path flush in
+/// the staging window (~7% of the rotation cycle), which alone put
+/// end-to-end p99.9 at ~1.5 ms. One 256 KiB chunk is ~90 µs of device
+/// time, keeping a colliding flush's detour well under the hot path's
+/// own ~300 µs flush floor — while staying large enough that
+/// sequential NVMe transfers run at full per-command efficiency.
+const STAGING_WINDOW_BYTES: usize = 256 * 1024;
+
+/// Sleep multiplier applied to each window's measured wall time: 3×
+/// gives a ~25% device duty, so staging duration is ≈ 4× (segment
+/// bytes / device bandwidth). `u32` because that is what
+/// `Duration: Mul` takes.
+const STAGING_DUTY_SLEEP_MULTIPLIER: u32 = 3;
+
+/// Log-force cadence for the paced zero-fill: at ~25% device duty this
+/// is one small `sync_data` every ~100 ms, each logging only the
+/// allocations made since the previous one.
+const METADATA_SYNC_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Drive `step` over `[0, bytes)` in [`STAGING_WINDOW_BYTES`] windows
+/// under the single-window pacing discipline, aborting on `shutdown`.
 ///
-/// Checks `shutdown` between chunks: zeroing scales with the rotation
-/// threshold (multi-GiB segments take seconds at device bandwidth), and
-/// `SegmentPreparer::shutdown` joins this thread — an unchecked loop
-/// would hold up process exit for the remainder of the fill.
+/// This is the one place the discipline lives, because it is the
+/// property staging correctness rests on and it has already been got
+/// wrong twice (see `docs/internal/journal-fsync-beat-2026-08.md`):
+///
+/// - `step` must complete its window's *device* work before returning,
+///   so exactly one window is ever in flight and each iteration's wall
+///   time is real device time. That caps how much staging I/O a
+///   colliding hot-path fdatasync can ever queue behind — the failure
+///   mode that put p99.9 at ~1.5 ms when two 2 MiB chunks were allowed
+///   in flight.
+/// - Sleeping a multiple of that *measured* time keeps the loop
+///   device-clocked and self-adapting, with no bandwidth constant to
+///   mis-tune. Clocking off anything cheaper (memcpy-speed
+///   `write_all_at` returns, say) floods the device via async
+///   writeback instead — measured as ~7.5 ms rotation-adjacent fsync
+///   stalls.
+///
+/// `shutdown` is checked per window because staging scales with the
+/// rotation threshold (multi-GiB segments take seconds at device
+/// bandwidth) and `SegmentPreparer::shutdown` joins this thread — an
+/// unchecked loop would hold up process exit for the remainder of the
+/// pass.
+fn paced_over_segment(
+    bytes: u64,
+    shutdown: &AtomicBool,
+    mut step: impl FnMut(u64, usize) -> Result<(), JournalError>,
+) -> Result<(), JournalError> {
+    let mut offset: u64 = 0;
+    while offset < bytes {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(JournalError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "segment staging aborted by shutdown",
+            )));
+        }
+        let window_start = std::time::Instant::now();
+        let n = (bytes - offset).min(STAGING_WINDOW_BYTES as u64) as usize;
+        step(offset, n)?;
+        offset += n as u64;
+        if offset < bytes {
+            std::thread::sleep(window_start.elapsed() * STAGING_DUTY_SLEEP_MULTIPLIER);
+        }
+    }
+    Ok(())
+}
+
+/// Zero-fill staging: plain (page-cache) handle, `bytes` of zeros
+/// materialised over `[0, bytes)` as *written* extents, then synced.
+///
+/// The header region `[0, ENTRY_OFFSET)` is covered too, so the
+/// adopter's header pwrite also lands in written extents.
+///
+/// Both paths below leave the segment's pages resident in the page
+/// cache. That is deliberate and load-bearing, not an optimisation:
+/// the buffered writer's partial trailing-page appends would otherwise
+/// pay a read-modify-write device read on the hot path.
+///
+/// Both paths are paced by [`paced_over_segment`] and abort on
+/// `shutdown`.
 fn prepare_zero_filled(
     staging: &Path,
     bytes: u64,
@@ -508,14 +589,38 @@ fn prepare_zero_filled(
         .create_new(true)
         .open(staging)?;
 
-    // Fast path: FALLOC_FL_WRITE_ZEROES (kernel ≥ 6.16 with fs
+    // Fast path: FALLOC_FL_WRITE_ZEROES (kernel ≥ 6.16 with filesystem
     // support) allocates *written* zeroed extents via the device's
-    // Write Zeroes command — no data crosses the bus, so there is no
-    // bandwidth burst to pace and no write amplification at all. The
-    // pages are not left resident, so prefault them like the sector
-    // path does (reading zeroed extents is a cheap sequential read).
+    // Write Zeroes command. The fallocate itself moves no data over
+    // the bus and costs no write amplification at all — but it leaves
+    // the pages non-resident, and because the extents are genuinely
+    // *written* (the whole point over ZERO_RANGE) the filesystem no
+    // longer knows the range is zeros: faulting them in is a real
+    // sequential read off the journal device, not the free zero-page
+    // fill the sector path's unwritten extents get.
+    //
+    // So the prefault is paced exactly like the write fallback below.
+    // An unpaced whole-segment read burst alongside the live journal
+    // is the same collision class as the write burst — the trace that
+    // forced the single-window shape showed ~1.2-1.4 ms of in-flight
+    // staging I/O landing directly in p99.9, and reads consume the
+    // same queue slots.
+    //
+    // PROPHYLACTIC: unlike every other claim in this module, this one
+    // is reasoned rather than traced. The path is dormant on the bench
+    // fleet (Debian 6.12; needs ≥ 6.16), so it has never been
+    // exercised under load, and the collision may well be milder than
+    // the write case — on a drive where Write Zeroes is an
+    // FTL-metadata operation the reads may be served from the mapping
+    // table without NAND access. Pacing it costs nothing here and
+    // removes the possibility of a kernel upgrade silently
+    // reintroducing a stall class; measure before assuming the pacing
+    // is what makes it safe.
     if try_fallocate_write_zeroes(&file, bytes) {
-        prefault_pages(&file, 0, bytes);
+        paced_over_segment(bytes, shutdown, |offset, n| {
+            prefault_pages(&file, offset, offset + n as u64);
+            Ok(())
+        })?;
         file.sync_all()?;
         return Ok(PreparedSegment {
             file,
@@ -531,34 +636,13 @@ fn prepare_zero_filled(
     // clock. An unpaced fill saturates the journal device — the ~2 ms
     // fsync beat this mode exists to fix was measured being replaced by
     // ~10 ms fsync stalls whenever a batch fsync queued behind the
-    // staging burst. And pacing must not be clocked off the buffered
-    // `write_all_at` calls: those return at memcpy speed (the writes
-    // only dirty the page cache), so sleeping a multiple of *their*
-    // wall time still dirtied gigabytes per second and left the device
-    // flooded by async writeback — measured as ~7.5 ms rotation-
-    // adjacent fsync stalls that only faded once the kernel's own
-    // dirty-page throttling kicked in mid-run.
+    // staging burst.
     //
-    // The single-window pattern makes the loop device-clocked AND caps
-    // how much staging IO a hot-path flush can ever queue behind:
-    //
-    // - write chunk N (memcpy into cache), then wait for ITS writeback
-    //   to complete (`WAIT_BEFORE|WRITE|WAIT_AFTER`) — exactly one
-    //   chunk is ever in flight, and each iteration's wall time is real
-    //   device time for that chunk;
-    // - sleep 3× that wall time: a genuine ~25% device duty.
-    //   Self-adapting — no bandwidth constant — and staging duration
-    //   stays ≈ 4× (segment bytes / device bandwidth), well inside any
-    //   rotation period whose segment the device can write once.
-    //
-    // The chunk must be SMALL: an off-CPU trace of the journal thread
-    // showed its per-batch fdatasyncs queueing behind in-flight staging
-    // chunks for the duration of the fill — with 2 MiB chunks and a
-    // two-chunk window that was 1-2 ms added to every hot-path flush in
-    // the staging window (~7% of the rotation cycle), which alone put
-    // end-to-end p99.9 at ~1.5 ms. One 256 KiB chunk is ~90 µs of
-    // device time, keeping a colliding flush's detour well under the
-    // hot path's own ~300 µs flush floor.
+    // Each window writes a chunk (memcpy into cache) and then waits for
+    // ITS writeback (`WAIT_BEFORE|WRITE|WAIT_AFTER`), which is what
+    // makes the window's wall time real device time — see
+    // `paced_over_segment` for why that discipline is the load-bearing
+    // part.
     //
     // Data pacing alone is not enough: `sync_file_range` never logs
     // filesystem metadata, so the extent allocations for the entire
@@ -573,52 +657,25 @@ fn prepare_zero_filled(
     // sub-millisecond — and the force runs here, on the preparer
     // thread, off the hot path.
     //
-    // Writes go through the page cache deliberately: the pages the
-    // buffered writer is about to append into stay resident, so its
-    // partial trailing-page writes never pay a read-modify-write
-    // device read on the hot path (which O_DIRECT staging would
-    // reintroduce). std's `write_all_at` handles short writes and
-    // EINTR retries. Heap Vec (not a stack array) to keep the worker's
-    // stack footprint trivial.
-    //
-    // 256 KiB: large enough that sequential NVMe writeback runs at full
-    // per-command efficiency, small enough that the one in-flight chunk
-    // delays a colliding hot-path flush by only ~90 µs (see above).
-    const ZERO_CHUNK: usize = 256 * 1024;
-    // Log-force cadence for the paced fill (see the comment above): at
-    // ~25% device duty this is one small `sync_data` every ~100 ms,
-    // each logging only the allocations made since the previous one.
-    const METADATA_SYNC_INTERVAL: u64 = 64 * 1024 * 1024;
-    let zeros = vec![0u8; ZERO_CHUNK];
-    let mut offset: u64 = 0;
+    // std's `write_all_at` handles short writes and EINTR retries.
+    // Heap Vec (not a stack array) to keep the worker's stack
+    // footprint trivial.
+    let zeros = vec![0u8; STAGING_WINDOW_BYTES];
     let mut last_metadata_sync: u64 = 0;
-    while offset < bytes {
-        if shutdown.load(Ordering::Acquire) {
-            return Err(JournalError::Io(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "zero-fill aborted by shutdown",
-            )));
-        }
-        let chunk_start = std::time::Instant::now();
-        let n = (bytes - offset).min(zeros.len() as u64) as usize;
+    paced_over_segment(bytes, shutdown, |offset, n| {
         std::os::unix::fs::FileExt::write_all_at(&file, &zeros[..n], offset)?;
         wait_for_writeback(&file, offset, n as u64);
-        offset += n as u64;
-
         // Incremental log force for the extent-allocation metadata
         // accumulated since the last force (the data is already on
-        // disk chunk-by-chunk). Runs before the pacing sleep so its
-        // wall time counts toward this iteration's device-duty
-        // accounting.
-        if offset - last_metadata_sync >= METADATA_SYNC_INTERVAL {
+        // disk chunk-by-chunk). Runs inside the window so its wall
+        // time counts toward this iteration's device-duty accounting.
+        let end = offset + n as u64;
+        if end - last_metadata_sync >= METADATA_SYNC_INTERVAL_BYTES {
             file.sync_data()?;
-            last_metadata_sync = offset;
+            last_metadata_sync = end;
         }
-
-        if offset < bytes {
-            std::thread::sleep(chunk_start.elapsed() * 3);
-        }
-    }
+        Ok(())
+    })?;
     // Cheap by construction: at most the final < 64 MiB of allocation
     // metadata (plus timestamps) remains unforced here.
     file.sync_all()?;
@@ -635,11 +692,11 @@ fn prepare_zero_filled(
 
 /// Start writeback of `[offset, offset + len)` and wait for it to
 /// complete (`WAIT_BEFORE|WRITE|WAIT_AFTER`). The device clock of the
-/// zero-fill's single-window pacing — the wait is the point: it makes
-/// the loop's wall time reflect real device time and guarantees no
-/// staging IO stays in flight into the next iteration. Best-effort: on
-/// failure the fill just paces less accurately and the final
-/// `sync_all` remains the durability point.
+/// zero-fill's [`paced_over_segment`] window — the wait is the point:
+/// it makes the window's wall time reflect real device time and
+/// guarantees no staging IO stays in flight into the next one.
+/// Best-effort: on failure the fill just paces less accurately and the
+/// final `sync_all` remains the durability point.
 fn wait_for_writeback(file: &File, offset: u64, len: u64) {
     use std::os::fd::AsRawFd;
     // SAFETY: plain syscall on an owned, open fd; no memory is passed.
@@ -657,9 +714,10 @@ fn wait_for_writeback(file: &File, offset: u64, len: u64) {
 }
 
 /// `FALLOC_FL_WRITE_ZEROES` — not yet in the `libc` crate; merged
-/// upstream in Linux 6.16 (mode bit after UNSHARE_RANGE = 0x40).
-/// Allocates extents as physically-written zeros using the block
-/// device's Write Zeroes command.
+/// upstream in Linux 6.16. `0x80`, the next mode bit above
+/// `FALLOC_FL_UNSHARE_RANGE` (`0x40`). Allocates extents as
+/// physically-written zeros using the block device's Write Zeroes
+/// command.
 const FALLOC_FL_WRITE_ZEROES: libc::c_int = 0x80;
 
 /// Whether `FALLOC_FL_WRITE_ZEROES` is worth attempting. Starts

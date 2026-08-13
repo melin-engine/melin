@@ -176,6 +176,39 @@ fast path, zero sync fallbacks, zero windows with p99.99 above 500 µs
 in 74 k windows, no replica ack-latency spikes. The beat and both
 staging-induced stall classes are gone.
 
+### Prophylactic: the `FALLOC_FL_WRITE_ZEROES` path (2026-08-13)
+
+Everything above is traced. This one is not, and is marked as such in
+the code.
+
+The staging fast path (kernel ≥ 6.16) allocates *written* zeroed
+extents via the device's Write Zeroes command. The fallocate moves no
+data and costs no write amplification — but because the extents end up
+genuinely written (the whole point over `ZERO_RANGE`), the filesystem
+no longer knows the range is zeros, so the prefault that follows is a
+real whole-segment sequential read off the journal device. In sector
+mode the same call is free: unwritten extents fault in from the zero
+page with no device I/O.
+
+An unpaced whole-segment read burst next to the live journal is the
+same collision class as the write burst that produced the ~1.5 ms
+p99.9 — reads consume the same queue slots. So the prefault now runs
+under the same single-window pacing (bounded in-flight window,
+device-clocked duty, shutdown-checked) as the write fallback, factored
+into one shared loop so the discipline can't drift between the two
+paths the way it has twice before.
+
+Caveat on severity: the path is dormant on the bench fleet (Debian
+6.12), so this is reasoned, not measured, and the CIL hypothesis is a
+standing reminder of how that can go. The collision may be much milder
+than the write case — on a drive where Write Zeroes is an FTL-metadata
+operation the reads may be served from the mapping table without NAND
+access. Pacing costs nothing here and removes the possibility of a
+kernel upgrade silently reintroducing a stall class, but the pacing
+should not be *assumed* to be what makes the path safe. Trace it the
+first time a fleet host runs ≥ 6.16 on a filesystem that supports the
+mode.
+
 ## Implication: the sector writer
 
 Both structural advantages the sector writer holds over the buffered
