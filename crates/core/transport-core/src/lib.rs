@@ -36,6 +36,11 @@ pub mod health;
 /// journal thread. Holds the watermark cell, the drain protocol, and the
 /// poison path; the journal stage keeps `pwrite` and encoding.
 pub mod journal_flush;
+/// Journal writer thread — sole owner of the live segment's file. Takes
+/// encoded batches through a queue so exactly one thread issues I/O
+/// against the inode; see
+/// `docs/internal/journal-writer-thread-2026-08.md`.
+pub mod journal_writer;
 pub mod journaled_app;
 pub mod pipeline;
 /// Replication wire protocol, journal-file catch-up, ack queueing,
