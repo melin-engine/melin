@@ -32,13 +32,13 @@ pub mod fence;
 /// Prometheus text exposition body to `GET /metrics`. The state struct
 /// holds only atomics/cursors; the endpoint is fully transport-shaped.
 pub mod health;
-/// Journal flush executor — the seam that moves `fdatasync` off the
-/// journal thread. Holds the watermark cell, the drain protocol, and the
-/// poison path; the journal stage keeps `pwrite` and encoding.
+/// What a completed flush publishes (`FlushWatermark`) and who holds the
+/// handles to publish it (`CursorPublisher`) — the values the journal
+/// thread samples and the writer thread stores.
 pub mod journal_flush;
 /// Journal writer thread — sole owner of the live segment's file. Takes
 /// encoded batches through a queue so exactly one thread issues I/O
-/// against the inode; see
+/// against the inode, with rotation ordered against them; see
 /// `docs/internal/journal-writer-thread-2026-08.md`.
 pub mod journal_writer;
 pub mod journaled_app;

@@ -63,10 +63,6 @@ pub struct WriteBatch {
     /// disagree (asserted in debug builds by the writer).
     pub offset: u64,
     /// What to publish once these bytes are durable.
-    ///
-    /// `FlushWatermark::fd` is unused here — the writer owns the file,
-    /// so there is no descriptor to hand over. It disappears with the
-    /// flush-executor module.
     pub watermark: FlushWatermark,
 }
 
@@ -100,6 +96,16 @@ pub struct RotateCommand {
 enum WriteItem {
     Batch(WriteBatch),
     Rotate(RotateCommand),
+    /// Publish this state, with nothing new to write.
+    ///
+    /// Rotation changes the writer's durable state — a fresh segment,
+    /// hence a new genesis-anchored chain value — without consuming
+    /// input, and observers need a state consistent with the new on-disk
+    /// layout. The publisher lives on the writer thread, so that update
+    /// has to travel the same queue to stay ordered behind the batches it
+    /// follows. It carries no bytes, so it forces no sync: the rotation
+    /// it reports already made everything durable.
+    Publish(FlushWatermark),
 }
 
 /// Producer half, held by the journal thread.
@@ -256,6 +262,28 @@ impl WriteQueue {
         Ok(PendingRotation { replies })
     }
 
+    /// Publish `watermark` with nothing new to write — see
+    /// [`WriteItem::Publish`].
+    ///
+    /// Blocking, like [`rotate`](Self::rotate) and for the same reason:
+    /// its callers are rotation-completion paths that have just waited
+    /// for the writer anyway, and dropping the update would leave
+    /// observers describing a segment layout that no longer exists.
+    pub fn publish_state(&mut self, mut watermark: FlushWatermark) {
+        // The *current* submit count, not the next one: a publish adds
+        // no work, so the writer storing this as `published` must still
+        // read as idle. Leaving it at zero would drive `published`
+        // backwards, and `is_idle` — which shutdown waits on — would
+        // never be true again.
+        watermark.submit_seq = self.submitted;
+        watermark.submit_ts = crate::trace::mono_trace_ns();
+        // Discarded deliberately: the only failure is a writer thread
+        // that unwound, which the journal loop's poison check already
+        // reports. There is nothing useful to do with a state update for
+        // a pipeline that is coming down.
+        let _ = self.work.send(WriteItem::Publish(watermark));
+    }
+
     /// Take a buffer for the next batch: a recycled one if the writer
     /// has returned any, else a fresh allocation.
     ///
@@ -318,9 +346,7 @@ impl PendingRotation {
 fn unwrap_batch(item: WriteItem) -> WriteBatch {
     match item {
         WriteItem::Batch(b) => b,
-        WriteItem::Rotate(_) => {
-            unreachable!("the work channel returned a rotation to the batch submit path")
-        }
+        _ => unreachable!("the work channel returned a non-batch to the batch submit path"),
     }
 }
 
@@ -478,6 +504,7 @@ where
         // covers all of them either way, so writing them together
         // converts queue depth into fewer, larger syncs.
         let mut last = None;
+        let mut wrote = false;
         let mut rotation = None;
         let mut next = Some(first);
         while let Some(item) = next.take() {
@@ -490,12 +517,21 @@ where
                     rotation = Some(c);
                     break;
                 }
+                // Rides to the publish below without forcing a sync of
+                // its own; if batches precede it in this run, their sync
+                // still happens first.
+                WriteItem::Publish(w) => {
+                    last = Some(w);
+                    next = queue.work.try_recv().ok();
+                    continue;
+                }
             };
             if let Err(e) = io.write_at(&b.bytes, b.offset) {
                 poison(&queue.shared, &e);
                 break;
             }
             last = Some(b.watermark);
+            wrote = true;
             // Hand the buffer back for reuse. A full recycle channel
             // cannot happen (same depth as the work queue), but dropping
             // the buffer would only cost an allocation, never
@@ -507,7 +543,10 @@ where
         if !queue.shared.is_poisoned()
             && let Some(watermark) = last
         {
-            if let Err(e) = io.sync() {
+            // Nothing written means nothing to force: a publish-only run
+            // reports state a completed rotation already made durable.
+            let synced = if wrote { io.sync() } else { Ok(()) };
+            if let Err(e) = synced {
                 poison(&queue.shared, &e);
             } else {
                 publish(&watermark);
@@ -554,6 +593,9 @@ fn refuse(queue: &WriteQueueConsumer, item: WriteItem) {
             c.reply,
             Err(writer_gone("the writer failed before the rotation")),
         ),
+        // Dropped: publishing after a failure would advance cursors the
+        // disk never backed.
+        WriteItem::Publish(_) => {}
     }
 }
 
@@ -593,7 +635,6 @@ mod tests {
             ring_progress: RingPos::new(ring_progress),
             input_ring_seq: RingPos::new(ring_progress),
             chain_hash: [journal_seq as u8; 32],
-            fd: crate::journal_flush::NOTHING_TO_SYNC,
             submit_ts: crate::trace::mono_trace_ns(),
         }
     }
@@ -1068,6 +1109,152 @@ mod tests {
             );
 
             shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn a_publish_only_item_advances_cursors_without_a_redundant_sync() {
+        // A batch of queries journals nothing but still advances ring
+        // progress, and a completed rotation changes durable state
+        // without consuming input. Both must publish — freezing ring
+        // progress would eventually stall the producer against a ring
+        // that never drains — and neither owes a sync, because neither
+        // wrote anything.
+        let rec = Recorder::default();
+        let shutdown = AtomicBool::new(false);
+        let (mut q, consumer, _shared) = write_queue(WRITE_QUEUE_DEPTH);
+
+        std::thread::scope(|s| {
+            let _guard = ShutdownGuard(&shutdown);
+            let io = TestIo::new(&rec, &shutdown);
+            s.spawn(|| run_writer(consumer, io, |w| rec.record_publish(w), true, &shutdown));
+
+            q.publish_state(watermark(9, 90));
+            wait_until("the publish to land", || !rec.published().is_empty());
+
+            let (w, _) = rec.published()[0];
+            assert_eq!(w.journal_seq, WireSeq::new(9));
+            assert_eq!(w.ring_progress, RingPos::new(90));
+            assert_eq!(
+                rec.write_count(),
+                0,
+                "a publish carries no bytes, so nothing may be written"
+            );
+            assert_eq!(
+                rec.syncs(),
+                0,
+                "nothing was written, so forcing the disk would be pure latency"
+            );
+            assert!(
+                q.is_idle(),
+                "a publish adds no work, so it must leave the queue idle — a publish that \
+                 drove `published` backwards would wedge the shutdown wait on `is_idle`"
+            );
+
+            shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn a_publish_after_a_batch_leaves_the_queue_idle() {
+        // The same wedge, reached the other way: with submits already
+        // counted, a publish that stamped the wrong counter would leave
+        // `published` behind `submitted` with no work outstanding.
+        let rec = Recorder::default();
+        let shutdown = AtomicBool::new(false);
+        let (mut q, consumer, _shared) = write_queue(WRITE_QUEUE_DEPTH);
+
+        std::thread::scope(|s| {
+            let _guard = ShutdownGuard(&shutdown);
+            let io = TestIo::new(&rec, &shutdown);
+            s.spawn(|| run_writer(consumer, io, |w| rec.record_publish(w), true, &shutdown));
+
+            for i in 1..=3u64 {
+                expect_queued(q.submit(batch(i, i * 10, i * 100, 8)));
+            }
+            wait_until("the batches to drain", || q.is_idle());
+
+            // Not a publication count — the writer coalesces a drained
+            // run into one — so wait on the value this publish carries.
+            q.publish_state(watermark(4, 40));
+            wait_until("the publish to land", || rec.published_seq() == 4);
+            assert!(
+                q.is_idle(),
+                "the queue must be idle after a publish, not stuck one behind"
+            );
+
+            shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn a_batch_followed_by_a_publish_still_syncs_the_batch() {
+        // The publish must not suppress the sync its own run owes: the
+        // batch ahead of it in the queue is real data, and publishing
+        // its position without forcing it would be ack-before-persist.
+        let rec = Recorder::default();
+        let shutdown = AtomicBool::new(false);
+        let (mut q, consumer, _shared) = write_queue(WRITE_QUEUE_DEPTH);
+
+        // Both queued before the writer starts, so they land in one
+        // drained run — the case where the two could interfere.
+        expect_queued(q.submit(batch(1, 10, 0, 8)));
+        q.publish_state(watermark(2, 20));
+
+        std::thread::scope(|s| {
+            let _guard = ShutdownGuard(&shutdown);
+            let io = TestIo::new(&rec, &shutdown);
+            s.spawn(|| run_writer(consumer, io, |w| rec.record_publish(w), true, &shutdown));
+
+            wait_until("the run to drain", || !rec.published().is_empty());
+            for (w, syncs_at_publish) in rec.published() {
+                assert!(
+                    syncs_at_publish >= 1,
+                    "published journal_seq {} with {syncs_at_publish} syncs completed — \
+                     the publish rode past the batch's sync instead of behind it",
+                    w.journal_seq.get()
+                );
+            }
+
+            shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn lag_reports_what_is_submitted_but_not_yet_durable() {
+        // The health gauge operators read to see the pipeline riding
+        // through a stalling disk.
+        let rec = Recorder::default();
+        let shutdown = AtomicBool::new(false);
+        let (mut q, consumer, _shared) = write_queue(WRITE_QUEUE_DEPTH);
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+
+        assert!(q.is_idle(), "nothing submitted yet");
+        assert_eq!(q.lag(WireSeq::new(0)), 0);
+
+        std::thread::scope(|s| {
+            let _guard = ShutdownGuard(&shutdown);
+            let io = TestIo::new(&rec, &shutdown).gated(entered_tx, release_rx);
+            s.spawn(|| run_writer(consumer, io, |_| {}, true, &shutdown));
+
+            expect_queued(q.submit(batch(50, 500, 0, 8)));
+            assert!(!q.is_idle(), "a submit is outstanding");
+            entered_rx
+                .recv_timeout(TERMINATION_TIMEOUT)
+                .expect("sync entered");
+            assert_eq!(
+                q.lag(WireSeq::new(50)),
+                50,
+                "nothing published yet, so everything submitted is lag"
+            );
+
+            release_tx.send(()).expect("writer alive");
+            wait_until("the batch to drain", || q.is_idle());
+            assert_eq!(q.lag(WireSeq::new(50)), 0);
+
+            shutdown.store(true, Ordering::Relaxed);
+            let _ = release_tx.send(());
         });
     }
 

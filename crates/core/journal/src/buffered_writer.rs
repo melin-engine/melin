@@ -49,7 +49,11 @@ const MAX_ENTRY_SIZE: usize = 144;
 /// Batch buffer capacity. Matches `writer::BATCH_BUF_CAPACITY` so the
 /// pipeline's flush cadence (sized against the O_DIRECT writer) applies
 /// here unchanged.
-const BATCH_BUF_CAPACITY: usize = 512 * 1024;
+/// Public so a caller handing batches to a writer thread can size the
+/// replacement buffers it passes to
+/// [`BufferedWriter::take_batch`] — a smaller one would reallocate on
+/// the encode path.
+pub const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
 /// Fixed on-disk offset of the first journal entry. Defined in the codec
 /// (`ENTRY_OFFSET = MAX_SECTOR_SIZE = 4096`) so both writer variants
@@ -1003,23 +1007,20 @@ fn detached() -> JournalError {
 
 /// Force a descriptor's data to stable media.
 ///
-/// Exposed as a free function taking a raw fd because the flush executor
-/// holds nothing else: it is handed a descriptor through the watermark
-/// cell and runs with no reference to the writer (see
-/// `docs/internal/journal-async-flush-2026-08.md`). Keeping the one
-/// implementation here means the inline and asynchronous paths cannot
-/// drift apart in what "durable" means.
+/// A free function taking a raw fd so every caller shares one definition
+/// of what "durable" means — [`SegmentFile::sync`] included — rather than
+/// each growing its own.
 ///
 /// Returns `io::Error` rather than [`JournalError`] deliberately: the
-/// executor records the failure as an `errno` for the operator-facing
-/// message, and wrapping the OS error in another error type erases
-/// `raw_os_error()` — the poison path then reports "no error" for a
-/// disk that is failing.
+/// writer thread records the failure as an `errno` for the
+/// operator-facing message, and wrapping the OS error in another error
+/// type erases `raw_os_error()` — the poison path then reports "no
+/// error" for a disk that is failing.
 ///
 /// # Safety of the descriptor
 /// The caller must guarantee `fd` is open for the duration of the call.
-/// On the async path that is the rotation drain's job — the journal
-/// thread never closes the live segment while a sync is in flight.
+/// The pipeline satisfies this by ownership: the thread that syncs the
+/// live segment is the thread that holds its `File`.
 pub fn fdatasync_raw(fd: RawFd) -> std::io::Result<()> {
     // Safety: borrowed for the duration of the call only; the borrow
     // never outlives this frame and never takes ownership, so the
@@ -1349,10 +1350,11 @@ mod tests {
 
     #[test]
     fn write_batch_names_the_live_segment_across_a_rotation() {
-        // The flush executor syncs a raw fd it was handed earlier, so a
-        // rotation must be visible as a *different* descriptor. This is
-        // what the drain protocol protects: syncing the stale fd after a
-        // swap would target a closed — or recycled — descriptor.
+        // A caller that holds the descriptor from `write_batch` across a
+        // rotation must see a *different* one afterwards: syncing the
+        // stale fd would target a closed — or recycled — descriptor,
+        // forcing the wrong file while the outgoing segment's tail never
+        // reaches the platter.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();

@@ -1509,7 +1509,7 @@ fn thread_cpus_allowed(name: &str) -> Option<String> {
 /// this test stops meaning anything.
 #[cfg(not(feature = "no-persist"))]
 #[test]
-fn flush_executor_does_not_inherit_the_journal_threads_affinity() {
+fn writer_thread_does_not_inherit_the_journal_threads_affinity() {
     if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
         // Nothing to distinguish: every mask is the same single CPU.
         return;
@@ -1536,12 +1536,12 @@ fn flush_executor_does_not_inherit_the_journal_threads_affinity() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let allowed = loop {
-        if let Some(v) = thread_cpus_allowed("journal-flush") {
+        if let Some(v) = thread_cpus_allowed("journal-write") {
             break v;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "journal-flush thread never appeared"
+            "journal-write thread never appeared"
         );
         std::thread::yield_now();
     };
@@ -1551,9 +1551,9 @@ fn flush_executor_does_not_inherit_the_journal_threads_affinity() {
 
     assert_ne!(
         allowed, "0",
-        "flush executor inherited the journal thread's single-core mask — on an \
-         isolated core it would never be scheduled and the durable cursor would \
-         never advance"
+        "writer thread inherited the journal thread's single-core mask — on an \
+         isolated core it would never be scheduled, nothing would ever reach the \
+         disk, and the durable cursor would never advance"
     );
 }
 

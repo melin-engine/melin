@@ -40,11 +40,13 @@ use crate::cursors::{
     AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, RingPos, WireSeq,
 };
 
-use crate::journal_flush::{CursorPublisher, DrainOutcome, FlushHandle};
-// Only the durable build spawns an executor; `no-persist` has no
-// durability call to move off the journal thread.
+use crate::journal_flush::CursorPublisher;
+use crate::journal_writer::WriteQueue;
+// Only the durable build spawns a writer thread; `no-persist` has no
+// I/O to move off the journal thread, so the `Durability::Writer` arm is
+// unreachable there and everything that feeds it is dead code.
 #[cfg(not(feature = "no-persist"))]
-use crate::journal_flush::run_flush_executor;
+use crate::journal_writer::{Submitted, WRITE_QUEUE_DEPTH, WriteBatch, run_writer, write_queue};
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
 
 /// Post-fsync state published by the journal stage after each durable
@@ -473,12 +475,12 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// control-plane advertised tip.
     ///
     /// Grouped rather than held as four fields because publication moves
-    /// to the flush executor, which has no reference to the writer or
-    /// the consumer — see
-    /// `docs/internal/journal-async-flush-2026-08.md`. It also keeps the
-    /// seqlock's single-writer requirement structural: this struct holds
-    /// the only writer handle.
-    publication: Publication,
+    /// to the writer thread, which has no reference to the journal
+    /// writer or the consumer — see
+    /// `docs/internal/journal-writer-thread-2026-08.md`. It also keeps
+    /// the seqlock's single-writer requirement structural: this struct
+    /// holds the only writer handle.
+    durability: Durability,
     /// Ring position of the most recent submit. Rotation-time
     /// publications repeat it rather than sampling `next_read`, which at
     /// a mid-batch mark barrier runs ahead of what has been journaled —
@@ -527,15 +529,15 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// pipeline cores deterministically, same convention as the shadow
     /// and event-publisher threads.
     preparer_core: usize,
-    /// Core the flush executor pins itself to; `0` = unpinned. Set via
-    /// [`set_flush_core`](Self::set_flush_core), same convention as
+    /// Core the writer thread is pinned to; `0` = unpinned. Set via
+    /// [`set_writer_core`](Self::set_writer_core), same convention as
     /// `preparer_core`.
     ///
-    /// The executor spins on the watermark cell, so on a shared core it
-    /// competes with whatever else lands there. Placement guidance and
-    /// the measurement that should settle it are in
-    /// `docs/internal/journal-async-flush-2026-08.md`.
-    flush_core: usize,
+    /// The writer spins on the queue, so on a shared core it competes
+    /// with whatever else lands there. Placement guidance and the
+    /// measurement that should settle it are in
+    /// `docs/internal/journal-writer-thread-2026-08.md`.
+    writer_core: usize,
     /// Primary-announced stream marks to apply (replica mode only;
     /// `None` on primaries/standalone). Pushed by the replication
     /// receiver, popped here. See [`StreamMark`].
@@ -546,45 +548,54 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     pending_mark: Option<StreamMark>,
 }
 
-/// Who owns post-flush publication.
+/// Who writes the journal's bytes, and who publishes the cursors that
+/// say they are durable.
 ///
 /// Exactly one owner at a time, expressed as a type rather than a pair
-/// of `Option`s because the invariant is the point: the `FsyncState`
-/// seqlock admits a single writer, and the whole reason the flush moves
-/// off the journal thread is so cursors advance from the thread that
-/// just returned from `fdatasync`. A shape that let both hold a handle
-/// would make that a documented obligation instead of a checked one.
-enum Publication {
-    /// The journal thread publishes inline, after a synchronous flush.
-    /// Used by the io_uring path, by the synchronous path before its
-    /// executor starts and after it is joined, and by `no-persist`.
+/// of `Option`s because the invariant is the point: the live segment's
+/// file has one owner, and the `FsyncState` seqlock admits one writer. A
+/// shape that let both halves hold a handle would make that a documented
+/// obligation instead of a checked one.
+enum Durability {
+    /// The journal thread writes, syncs and publishes inline. Used by
+    /// the io_uring path, by the synchronous path before its writer
+    /// thread starts and after it is joined, and by `no-persist`.
     Inline(CursorPublisher),
-    /// A flush executor owns the publisher. The journal thread hands it
-    /// watermarks and never publishes directly.
-    Executor(FlushHandle),
+    /// A writer thread owns the segment file and the publisher. The
+    /// journal thread encodes, hands batches over, and never touches the
+    /// inode — the property this whole design exists for.
+    ///
+    /// Never constructed under `no-persist`, which writes nothing and so
+    /// has no I/O to move.
+    #[cfg_attr(feature = "no-persist", expect(dead_code))]
+    Writer(WriteQueue),
 }
 
-/// A running flush executor: the thread plus its stop flag.
+/// A running writer thread: the thread plus its stop flag.
 ///
-/// The thread returns the [`CursorPublisher`] it was given, so joining
-/// it hands publication back to the journal thread — which is what lets
-/// the shutdown tail flush and commit inline exactly as it always has.
-struct FlushExec {
-    /// Stops the executor. Separate from the pipeline's shutdown flag:
-    /// the executor must outlive it long enough to publish the final
-    /// drain, or the last batch's cursor advance is lost.
+/// The thread returns the [`SegmentFile`] and the [`CursorPublisher`] it
+/// was given, so joining it makes the journal writer whole again — which
+/// is what lets the shutdown tail flush and commit inline exactly as it
+/// always has.
+///
+/// [`SegmentFile`]: melin_journal::SegmentFile
+struct WriterExec {
+    /// Stops the writer. Separate from the pipeline's shutdown flag: the
+    /// writer must outlive it long enough to drain the queue, or the
+    /// last batches are never written at all.
     stop: Arc<AtomicBool>,
     /// `Option` so the orderly teardown can take the handle to `join`
     /// it — a type with a `Drop` impl cannot be moved out of.
-    handle: Option<std::thread::JoinHandle<CursorPublisher>>,
+    #[allow(clippy::type_complexity)]
+    handle: Option<std::thread::JoinHandle<(melin_journal::SegmentFile, CursorPublisher)>>,
 }
 
-impl Drop for FlushExec {
-    /// Stop the executor even when the journal thread unwinds.
+impl Drop for WriterExec {
+    /// Stop the writer even when the journal thread unwinds.
     ///
-    /// The orderly teardown in `stop_flush_executor` takes the `Option`,
+    /// The orderly teardown in `stop_writer_thread` takes the `Option`,
     /// so this only runs if the stage panicked before reaching it. The
-    /// executor loop exits solely on this flag, and under `busy_spin` it
+    /// writer loop exits solely on this flag, and under `busy_spin` it
     /// never yields — so without this a panic anywhere in the journal
     /// loop would leave a thread spinning on a core for the life of the
     /// process.
@@ -729,7 +740,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         max_batch: usize,
         busy_spin: bool,
     ) -> Self {
-        let publication = Publication::Inline(crate::journal_flush::CursorPublisher::new(
+        let durability = Durability::Inline(crate::journal_flush::CursorPublisher::new(
             consumer.progress_counter(),
         ));
         Self {
@@ -739,7 +750,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             group_commit_delay,
             max_batch: max_batch.min(MAX_JOURNAL_BATCH),
             repl: Box::default(),
-            publication,
+            durability,
             last_submitted_progress: 0,
             busy_spin,
             utilization: Arc::new(StageUtilization::new()),
@@ -748,7 +759,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             rotation_backoff_until: None,
             preparer: None,
             preparer_core: 0,
-            flush_core: 0,
+            writer_core: 0,
             stream_marks: None,
             pending_mark: None,
         }
@@ -817,42 +828,46 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         self.publisher_mut().set_fsync_state(writer);
     }
 
-    /// Hand `fdatasync` to a named executor thread for the duration of
-    /// the synchronous journal loop.
+    /// Hand the live segment's file to a named writer thread for the
+    /// duration of the synchronous journal loop.
     ///
-    /// Returns `None` when no executor is wanted — under `no-persist`
-    /// there is no durability call to move, and the handoff would only
-    /// add a cross-thread hop to a path whose whole purpose is measuring
-    /// the pipeline without the disk.
+    /// Returns `None` when no writer thread is wanted: under
+    /// `no-persist` there is no I/O to move, and a writer that cannot
+    /// detach its file (`SectorWriter`) keeps flushing inline.
     ///
-    /// The publisher moves onto the thread and comes back on join; see
-    /// [`FlushExec`].
-    fn start_flush_executor(&mut self) -> Result<Option<FlushExec>, JournalError> {
+    /// The file and the publisher move onto the thread and come back on
+    /// join; see [`WriterExec`].
+    fn start_writer_thread(&mut self) -> Result<Option<WriterExec>, JournalError> {
         #[cfg(feature = "no-persist")]
         {
             return Ok(None);
         }
         #[cfg(not(feature = "no-persist"))]
         {
-            if matches!(self.publication, Publication::Executor(_)) {
+            if matches!(self.durability, Durability::Writer(_)) {
                 return Err(JournalError::Io(std::io::Error::other(
-                    "journal stage already has a running flush executor",
+                    "journal stage already has a running writer thread",
                 )));
             }
-            let (handle, cell, shared) = crate::journal_flush::flush_channel();
-            let publisher =
-                match std::mem::replace(&mut self.publication, Publication::Executor(handle)) {
-                    Publication::Inline(p) => p,
-                    // Ruled out above; the stage is unusable if it happens.
-                    Publication::Executor(_) => unreachable!("checked immediately above"),
-                };
+            // The gate. A writer that keeps its file keeps writing
+            // inline, and nothing below happens.
+            let Some(segment) = self.writer.detach_segment() else {
+                return Ok(None);
+            };
+            let (queue, consumer, _shared) = write_queue(WRITE_QUEUE_DEPTH);
+            let publisher = match std::mem::replace(&mut self.durability, Durability::Writer(queue))
+            {
+                Durability::Inline(p) => p,
+                // Ruled out above; the stage is unusable if it happens.
+                Durability::Writer(_) => unreachable!("checked immediately above"),
+            };
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
             let busy_spin = self.busy_spin;
-            let core = self.flush_core;
+            let core = self.writer_core;
 
             let handle = std::thread::Builder::new()
-                .name("journal-flush".to_string())
+                .name("journal-write".to_string())
                 .spawn(move || {
                     // Deliberately does NOT touch its own affinity: it is
                     // spawned from the journal thread, which is pinned
@@ -864,23 +879,18 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     // on an isolated core it never is. The parent
                     // configures it below, after `spawn` returns.
                     let mut publisher = publisher;
-                    run_flush_executor(
-                        cell,
-                        shared,
-                        // The descriptor is the live segment's, and the
-                        // rotation drain guarantees the journal thread
-                        // does not close it while this call is in
-                        // flight.
-                        |fd| melin_journal::fdatasync_raw(fd as std::os::fd::RawFd),
+                    let segment = run_writer(
+                        consumer,
+                        segment,
                         |w| publisher.publish(w),
                         busy_spin,
                         &thread_stop,
                     );
-                    publisher
+                    (segment, publisher)
                 })
                 .map_err(|e| {
                     JournalError::Io(std::io::Error::other(format!(
-                        "spawning journal-flush thread: {e}"
+                        "spawning journal-write thread: {e}"
                     )))
                 })?;
 
@@ -890,136 +900,104 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             // itself: it would have to be scheduled first, and on an
             // isolated core it is a same-priority FIFO peer of this
             // busy-spinning thread, which never yields. Starved before
-            // its first instruction, it would never publish, the durable
+            // its first instruction, it would never write, the durable
             // cursor would never advance, and the pipeline would hang at
             // the seed drain before serving a request.
             use std::os::unix::thread::JoinHandleExt;
             melin_app::affinity::configure_spawned_thread(
-                "journal-flush",
+                "journal-write",
                 handle.as_pthread_t(),
                 core,
             );
 
-            Ok(Some(FlushExec {
+            Ok(Some(WriterExec {
                 stop,
                 handle: Some(handle),
             }))
         }
     }
 
-    /// Drain, stop and join the flush executor, restoring inline
-    /// publication.
+    /// Drain, stop and join the writer thread, taking the file back and
+    /// restoring inline writing.
     ///
     /// Idempotent — takes the `Option` — so the normal exits and the
     /// error paths can both call it. The drain deliberately aborts only
     /// on poison, not on the pipeline's shutdown flag: at this point the
     /// pipeline is already stopping, and giving up here would discard
-    /// the final cursor advance for batches that are on disk.
+    /// batches that are already sequenced and hashed.
     ///
-    /// A poisoned executor is joined without a drain: it will never
-    /// publish again, and the error reaches operators through the
-    /// journal thread's own poison check.
-    fn stop_flush_executor(&mut self, exec: &mut Option<FlushExec>) {
+    /// A poisoned writer is joined without a drain: it will never write
+    /// again, and the error reaches operators through the journal
+    /// thread's own poison check.
+    fn stop_writer_thread(&mut self, exec: &mut Option<WriterExec>) {
         let Some(mut exec) = exec.take() else { return };
         let Some(thread) = exec.handle.take() else {
             return;
         };
-        if let Publication::Executor(handle) = &self.publication {
-            // Hand-rolled rather than `drain`, because this wait needs a
-            // third exit: a thread that unwound. A panicked executor
-            // neither publishes nor poisons, so waiting on those two
-            // conditions alone would hang shutdown forever — and the
-            // panic-reporting arm below would be unreachable.
+        if let Durability::Writer(queue) = &self.durability {
+            // This wait needs a third exit: a thread that unwound. A
+            // panicked writer neither publishes nor poisons, so waiting
+            // on those two conditions alone would hang shutdown forever
+            // — and the panic-reporting arm below would be unreachable.
             let mut idle_spins: u32 = 0;
-            while !handle.is_idle() && !handle.shared().is_poisoned() && !thread.is_finished() {
+            while !queue.is_idle() && !queue.shared().is_poisoned() && !thread.is_finished() {
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
-            if handle.shared().is_poisoned() {
-                tracing::error!("journal flush executor poisoned — final cursors not published");
+            if queue.shared().is_poisoned() {
+                tracing::error!("journal writer poisoned — final batches not written");
             }
         }
         exec.stop.store(true, Ordering::Release);
         match thread.join() {
-            Ok(publisher) => self.publication = Publication::Inline(publisher),
-            // The executor panicked, taking the publisher with it. The
-            // stage cannot publish again; the journal thread is on its
-            // way out regardless, so log rather than propagate.
-            Err(_) => tracing::error!("journal-flush thread panicked"),
-        }
-    }
-
-    /// Quiesce the flush executor so the live segment can be swapped.
-    ///
-    /// Returns `false` when the caller must skip the rotation, which
-    /// happens only if the executor poisoned — the loop's poison check
-    /// surfaces the error on the next iteration.
-    ///
-    /// This is what makes the raw fd in the watermark cell sound. The
-    /// executor syncs a descriptor it was handed earlier; rotating
-    /// closes that file, so a sync still in flight would land on a
-    /// closed — or worse, recycled — descriptor. Ordering is the whole
-    /// guarantee; no epoch on the watermark could substitute, since an
-    /// epoch can only make a stale *publication* inert, never un-issue a
-    /// syscall already in flight.
-    ///
-    /// Waits on nothing but the executor: it is still running, so it
-    /// publishes within one `fdatasync` — the same wait the inline path
-    /// already pays at the top of `rotate_segment_inner`. A device that
-    /// never returns wedges the journal thread here exactly as it would
-    /// inline, so this adds no new hang.
-    fn drain_for_rotation(&self) -> bool {
-        match &self.publication {
-            Publication::Inline(_) => true,
-            Publication::Executor(handle) => {
-                // Never set — only poison ends this wait early.
-                let never = AtomicBool::new(false);
-                handle.drain(&never, self.busy_spin) == DrainOutcome::Drained
+            Ok((segment, publisher)) => {
+                // Whole again: the tail can flush, rotate and be
+                // inspected exactly as a writer that never handed off.
+                self.writer.attach_segment(segment);
+                self.durability = Durability::Inline(publisher);
             }
+            // The writer panicked, taking the file and the publisher
+            // with it. The stage cannot write again; the journal thread
+            // is on its way out regardless, so log rather than
+            // propagate. The journal writer stays detached, so any
+            // further write attempt fails loudly instead of silently
+            // doing nothing.
+            Err(_) => tracing::error!("journal-write thread panicked"),
         }
     }
 
-    /// Surface a failed executor sync as the journal stage's own fatal
-    /// error, so a broken disk tears the pipeline down through the same
-    /// path an inline failure takes.
+    /// Surface a failed writer as the journal stage's own fatal error,
+    /// so a broken disk tears the pipeline down through the same path an
+    /// inline failure takes.
     ///
     /// Keyed on the poison *flag*, not on the errno being non-zero: an
     /// error type that erases `raw_os_error()` would otherwise silently
     /// disable the whole fatal path and leave the pipeline wedged with
     /// frozen cursors and no log line.
-    fn check_flush_poison(&self) -> Result<(), JournalError> {
-        let Publication::Executor(handle) = &self.publication else {
+    fn check_writer_poison(&self) -> Result<(), JournalError> {
+        let Durability::Writer(queue) = &self.durability else {
             return Ok(());
         };
-        if !handle.shared().is_poisoned() {
+        if !queue.shared().is_poisoned() {
             return Ok(());
         }
-        let errno = handle.shared().poison_errno();
+        let errno = queue.shared().poison_errno();
         Err(JournalError::Io(if errno != 0 {
             std::io::Error::from_raw_os_error(errno)
         } else {
-            std::io::Error::other("journal flush executor failed with no OS error")
+            std::io::Error::other("journal writer failed with no OS error")
         }))
-    }
-
-    /// Whether no flush is in flight, so the live segment may be
-    /// swapped. Always true without an executor.
-    fn flush_quiesced(&self) -> bool {
-        match &self.publication {
-            Publication::Inline(_) => true,
-            Publication::Executor(handle) => handle.is_idle(),
-        }
     }
 
     /// The inline publisher, for the construction-time wiring setters.
     ///
-    /// Panics if the stage is already running: from then on the flush
-    /// executor owns the publisher, and installing a handle here would
+    /// Panics if the stage is already running: from then on the writer
+    /// thread owns the publisher, and installing a handle here would
     /// either be lost or break the seqlock's single-writer rule. All
     /// callers are pipeline construction, before `run_*`.
     fn publisher_mut(&mut self) -> &mut CursorPublisher {
-        match &mut self.publication {
-            Publication::Inline(p) => p,
-            Publication::Executor(_) => {
+        match &mut self.durability {
+            Durability::Inline(p) => p,
+            Durability::Writer(_) => {
                 panic!("journal publication handles must be installed before the stage runs")
             }
         }
@@ -1049,25 +1027,26 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     ///
     /// Returns the writer on shutdown for clean resource release.
     ///
-    /// `fdatasync` runs on a `journal-flush` executor thread for the
-    /// duration of the loop, so a stalled disk no longer stalls encoding
-    /// and the replication feed. The executor is torn down before the
-    /// shutdown tail, which then flushes and commits inline exactly as
-    /// it always has — see
-    /// `docs/internal/journal-async-flush-2026-08.md`.
+    /// Both `pwrite` and `fdatasync` run on a `journal-write` thread for
+    /// the duration of the loop, so exactly one thread issues I/O
+    /// against the live segment's inode and a stalled disk no longer
+    /// stalls encoding or the replication feed. The thread is torn down
+    /// before the shutdown tail, which then flushes and commits inline
+    /// exactly as it always has — see
+    /// `docs/internal/journal-writer-thread-2026-08.md`.
     pub fn run_sync(mut self, shutdown: &std::sync::atomic::AtomicBool) -> Result<W, JournalError> {
-        let mut exec = self.start_flush_executor()?;
+        let mut exec = self.start_writer_thread()?;
         let result = self.run_sync_loop(shutdown, &mut exec);
         // Covers the `?` paths; the normal exits stop it themselves so
-        // the tail can publish inline.
-        self.stop_flush_executor(&mut exec);
+        // the tail can write inline.
+        self.stop_writer_thread(&mut exec);
         result.map(|()| self.writer)
     }
 
     fn run_sync_loop(
         &mut self,
         shutdown: &std::sync::atomic::AtomicBool,
-        exec: &mut Option<FlushExec>,
+        exec: &mut Option<WriterExec>,
     ) -> Result<(), JournalError> {
         use std::time::Instant;
 
@@ -1106,13 +1085,13 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             // it is inline: surface it through the same path, one batch
             // later. Cursors are already frozen, so nothing was acked
             // that is not durable.
-            self.check_flush_poison()?;
+            self.check_writer_poison()?;
 
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 // Take publication back before the tail: it flushes and
                 // commits inline, and `commit` must not race the
                 // executor for the `processed` counter.
-                self.stop_flush_executor(exec);
+                self.stop_writer_thread(exec);
                 // Flush any pending data before shutdown.
                 if pending > 0 {
                     #[cfg(not(feature = "no-persist"))]
@@ -1261,7 +1240,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                             // Storage backoff is different: it expires
                             // and the retry can succeed, which is what
                             // the sleep below is for.
-                            self.check_flush_poison()?;
+                            self.check_writer_poison()?;
                             // The rotation failed and is backed off; the
                             // rest of this read batch sits past the
                             // boundary and cannot be encoded until the
@@ -1283,34 +1262,34 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             // window).
             //
             // The idle clause is the self-clock, and it is what keeps
-            // batch sizes where they are today: inline, the flush blocks
-            // the loop, so the next read finds a full ring. With the
-            // flush asynchronous, submitting only when the executor is
-            // free reproduces that pacing instead of free-running into
-            // one tiny write — and one tiny replication frame — per
-            // encode pass.
+            // batch sizes where they are today: inline, the write and
+            // sync block the loop, so the next read finds a full ring.
+            // With both on another thread, submitting only when that
+            // thread is free reproduces that pacing instead of
+            // free-running into one tiny write — and one tiny
+            // replication frame — per encode pass.
             //
             // `delay.is_zero()` is deliberately *not* a trigger any
-            // more: under an executor it would mean "submit every
-            // iteration", which is exactly the free-running case. With
-            // no executor `flush_idle` is always true, so the behaviour
-            // is unchanged.
+            // more: with a writer thread it would mean "submit every
+            // iteration", which is exactly the free-running case.
+            // Writing inline, `disk_idle` is always true, so the
+            // behaviour is unchanged.
             //
             // An operator-set delay suppresses the idle clause rather
             // than racing it. The self-clock only ever *shortens* the
             // wait, so leaving it unconditional would make
-            // `--group-commit-us` a no-op on a healthy disk — the
-            // executor is idle most of the time, so every pending event
-            // would submit immediately instead of accumulating for the
+            // `--group-commit-us` a no-op on a healthy disk — the writer
+            // is idle most of the time, so every pending event would
+            // submit immediately instead of accumulating for the
             // configured window. The knob keeps meaning what it says;
             // the self-clock governs the default (`0`) path.
             if pending > 0 {
-                let flush_idle = match &self.publication {
-                    Publication::Inline(_) => true,
-                    Publication::Executor(handle) => handle.is_idle(),
+                let disk_idle = match &self.durability {
+                    Durability::Inline(_) => true,
+                    Durability::Writer(queue) => queue.is_idle(),
                 };
                 let should_sync = if delay.is_zero() {
-                    flush_idle || pending >= self.max_batch
+                    disk_idle || pending >= self.max_batch
                 } else {
                     pending >= self.max_batch
                         || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay)
@@ -1375,7 +1354,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 // Publication comes back first: the tail commits inline,
                 // and two writers to the `processed` counter would let a
                 // replica ack past what the last flush covered.
-                self.stop_flush_executor(exec);
+                self.stop_writer_thread(exec);
                 if pending > 0 {
                     if self.repl.any_producer() {
                         let end_seq = self.writer.next_sequence() - 1;
@@ -1553,21 +1532,20 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// durable state changed (a fresh segment, hence a new
     /// genesis-anchored chain value) but no new input was consumed.
     ///
-    /// Under an executor this becomes a *submitted* watermark rather
-    /// than a direct publish: the executor owns the only `FsyncState`
-    /// writer handle, so publishing here would need a second one. The
-    /// watermark carries `NOTHING_TO_SYNC` (a rotation already flushed)
-    /// and repeats the last submitted ring progress, so the executor's
-    /// full publish is idempotent on that cursor rather than advancing
-    /// it past what a flush covers.
+    /// With a writer thread this becomes a queued publish rather than a
+    /// direct one: that thread owns the only `FsyncState` writer handle,
+    /// so publishing here would need a second one. It repeats the last
+    /// submitted ring progress, so the publish is idempotent on that
+    /// cursor rather than advancing it past what a flush covers, and it
+    /// carries no bytes — the rotation that prompted it already made
+    /// everything durable.
     #[inline]
     fn publish_fsync_state(&mut self) {
         let progress = self.last_submitted_progress;
-        let mut watermark = self.sample_watermark(progress);
-        watermark.fd = crate::journal_flush::NOTHING_TO_SYNC;
-        match &mut self.publication {
-            Publication::Executor(handle) => handle.submit(watermark),
-            Publication::Inline(publisher) => publisher.publish_state(&watermark),
+        let watermark = self.sample_watermark(progress);
+        match &mut self.durability {
+            Durability::Writer(queue) => queue.publish_state(watermark),
+            Durability::Inline(publisher) => publisher.publish_state(&watermark),
         }
     }
 
@@ -1581,22 +1559,20 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// coincide only at the steady-state sync point.
     ///
     /// Sampling is separated from publishing because the durability call
-    /// between them will move to another thread: `fdatasync` covers only
+    /// between them happens on another thread: `fdatasync` covers only
     /// what was dirty when it was called, so the values published after
-    /// it must be the ones read before it. `fd` is filled in by the
-    /// submit path, which knows what the write left outstanding.
+    /// it must be the ones read before it.
     #[inline]
     fn sample_watermark(&self, ring_progress: u64) -> crate::journal_flush::FlushWatermark {
         crate::journal_flush::FlushWatermark {
-            // Assigned by `FlushHandle::submit`; irrelevant on the
-            // inline path, which publishes without a handoff.
+            // Assigned by `WriteQueue::submit`; irrelevant on the inline
+            // path, which publishes without a handoff.
             submit_seq: 0,
             journal_seq: WireSeq::new(self.writer.next_sequence().saturating_sub(1)),
             ring_progress: RingPos::new(ring_progress),
             input_ring_seq: RingPos::new(self.consumer.next_read()),
             chain_hash: self.writer.chain_hash().unwrap_or([0u8; 32]),
-            fd: crate::journal_flush::NOTHING_TO_SYNC,
-            // Stamped by `FlushHandle::submit`, like `submit_seq`.
+            // Stamped by `WriteQueue::submit`, like `submit_seq`.
             submit_ts: crate::trace::mono_trace_ns(),
         }
     }
@@ -1630,60 +1606,101 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
         }
 
-        // Under an executor the write and the sync are separate: write
-        // here, hand over the descriptor, keep going. Inline, the two
-        // stay welded as `flush_batch_sync` — byte-for-byte the path
-        // this stage has always taken.
-        // Annotated because under `no-persist` the arms that infer it
-        // are compiled out.
-        let to_sync: Option<std::os::fd::RawFd> = match self.publication {
+        // Sampled *before* the write and sync the writer thread is about
+        // to perform. `fdatasync` covers only what was dirty when it was
+        // called, so a watermark read afterwards could claim durability
+        // for bytes the sync never covered. On the inline path the flush
+        // has already happened and the values are identical either way.
+        let watermark = self.sample_watermark(progress);
+        self.last_submitted_progress = progress;
+        #[cfg(not(feature = "no-persist"))]
+        let submitted_seq = watermark.journal_seq;
+
+        match &mut self.durability {
+            // The handoff. The bytes leave the encoder and the file is
+            // somewhere else entirely — this stage issues no I/O at all.
             #[cfg(not(feature = "no-persist"))]
-            Publication::Executor(_) => self.writer.write_batch().map_err(|e| {
-                JournalError::Io(std::io::Error::other(format!("journal write_batch: {e}")))
-            })?,
+            Durability::Writer(queue) => {
+                let replacement = queue.take_buffer(melin_journal::BATCH_BUF_CAPACITY);
+                if let Some((bytes, offset)) = self.writer.take_batch(replacement) {
+                    Self::submit_batch(
+                        queue,
+                        WriteBatch {
+                            bytes,
+                            offset,
+                            watermark,
+                        },
+                        self.busy_spin,
+                    )?;
+                } else {
+                    // An empty batch still has state worth publishing —
+                    // a rotation may have moved the chain — and nothing
+                    // to write, so it goes as a publish.
+                    queue.publish_state(watermark);
+                }
+                self.utilization
+                    .flush_lag
+                    .store(queue.lag(submitted_seq), Ordering::Relaxed);
+            }
             #[cfg(not(feature = "no-persist"))]
-            Publication::Inline(_) => {
+            Durability::Inline(publisher) => {
                 self.writer.flush_batch_sync().map_err(|e| {
                     JournalError::Io(std::io::Error::other(format!(
                         "journal flush_batch_sync: {e}"
                     )))
                 })?;
-                None
+                publisher.publish(&watermark);
             }
             // `no-persist` skips the write syscall, not everything after
             // it: the replication publish above must still run or the
             // response stage's replication-cursor gate deadlocks. With
-            // no bytes written there is nothing to force, so the
-            // executor (if any) publishes without syncing.
+            // no bytes written there is nothing to force.
             #[cfg(feature = "no-persist")]
             _ => {
                 self.writer.discard_batch_buf();
-                None
+                self.publisher_mut().publish(&watermark);
             }
-        };
-
-        // Sampled *before* the sync the executor is about to perform.
-        // `fdatasync` covers only what was dirty when it was called, so
-        // a watermark read afterwards could claim durability for bytes
-        // the sync never covered. On the inline path the flush has
-        // already happened and the values are identical either way.
-        let mut watermark = self.sample_watermark(progress);
-        watermark.fd = to_sync.map_or(crate::journal_flush::NOTHING_TO_SYNC, i64::from);
-        self.last_submitted_progress = progress;
-        let submitted_seq = watermark.journal_seq;
-        match &mut self.publication {
-            Publication::Executor(handle) => handle.submit(watermark),
-            Publication::Inline(publisher) => publisher.publish(&watermark),
-        }
-        // One `Relaxed` store per submit — a few thousand a second, not
-        // per event — so the health endpoint has a live view of how far
-        // durability is trailing dispatch.
-        if let Publication::Executor(handle) = &self.publication {
-            self.utilization
-                .flush_lag
-                .store(handle.lag(submitted_seq), Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Hand a batch to the writer thread, waiting out backpressure.
+    ///
+    /// A full queue means the writer is `WRITE_QUEUE_DEPTH` batches
+    /// behind — the disk is stalling — and the only correct response is
+    /// to wait. The batch cannot be dropped: it is already sequenced,
+    /// hashed and published to the replication rings, so discarding it
+    /// would tear a hole in the journal that replicas do not have.
+    ///
+    /// Blocking here is the backpressure reaching the encoder, which is
+    /// the point at which it should arrive. Queue depth is what keeps
+    /// that from happening during an ordinary sync; if it happens
+    /// anyway, no amount of further buffering helps.
+    #[cfg(not(feature = "no-persist"))]
+    fn submit_batch(
+        queue: &mut WriteQueue,
+        batch: WriteBatch,
+        busy_spin: bool,
+    ) -> Result<(), JournalError> {
+        let mut batch = batch;
+        let mut idle_spins: u32 = 0;
+        loop {
+            match queue.submit(batch) {
+                Submitted::Ok => return Ok(()),
+                Submitted::Full(b) => {
+                    batch = *b;
+                    idle_wait(&mut idle_spins, busy_spin);
+                }
+                // The writer will never drain again. Surfaced as fatal
+                // rather than retried forever — the loop's poison check
+                // reports the underlying errno on the way out.
+                Submitted::Poisoned(_) => {
+                    return Err(JournalError::Io(std::io::Error::other(
+                        "journal writer failed; batch not written",
+                    )));
+                }
+            }
+        }
     }
 
     /// Rotate the live journal segment if a trigger has fired.
@@ -1707,12 +1724,6 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         let Some(manual) = self.local_rotation_armed() else {
             return false;
         };
-        // Quiesce the executor before the segment swap. Losing `manual`
-        // here is acceptable: the only way this fails is a poisoned
-        // executor, and the pipeline is already on its way down.
-        if !self.drain_for_rotation() {
-            return false;
-        }
         let pre_size = self.writer.valid_end();
         let (rotate_result, used_fast_path) = self.rotate_taking_prepared();
         self.finish_local_rotation(rotate_result, manual, used_fast_path, pre_size)
@@ -1726,23 +1737,32 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// size/manual rotation and replica boundary adoption, so a policy
     /// change (e.g. rejecting a stale-sized prepared segment) cannot
     /// skew the two triggers apart.
+    /// With a writer thread the rotation travels the queue, so it is
+    /// ordered behind every batch already handed over — no drain, no
+    /// quiesce, no descriptor to protect. That ordering is why the
+    /// async-flush branch's four-site drain protocol is gone: FIFO does
+    /// structurally what it did by convention.
     fn rotate_taking_prepared(&mut self) -> (Result<std::path::PathBuf, JournalError>, bool) {
-        // Every rotation path must have quiesced the executor first: it
-        // holds a raw fd into the outgoing file, and closing that file
-        // frees the descriptor number for reuse — so a sync still in
-        // flight would silently force the *new* segment while the old
-        // one's tail never reaches the platter. No error, no log; just
-        // data that is not where the cursor says it is. Hence an
-        // assertion at the swap itself rather than trust at each caller.
-        debug_assert!(
-            self.flush_quiesced(),
-            "segment swap with a flush in flight — a rotation path is missing its drain"
-        );
         let prepared = self.preparer.as_ref().and_then(|p| p.take());
         let used_fast_path = prepared.is_some();
-        let result = match prepared {
-            Some(p) => self.writer.rotate_segment_with_prepared(p),
-            None => self.writer.rotate_segment(),
+        let result = match &mut self.durability {
+            Durability::Inline(_) => match prepared {
+                Some(p) => self.writer.rotate_segment_with_prepared(p),
+                None => self.writer.rotate_segment(),
+            },
+            Durability::Writer(queue) => {
+                // The encoder computes the pair, the writer performs the
+                // rotation, and the encoder re-anchors — but only if it
+                // succeeded. A failure leaves the chain where it is and
+                // the live segment in place, so the next batch keeps
+                // writing to it exactly as on the inline path.
+                let (starting_sequence, anchor) = self.writer.rotation_pair();
+                let result = queue.rotate(starting_sequence, anchor, prepared);
+                if result.is_ok() {
+                    self.writer.adopt_rotation(starting_sequence, anchor);
+                }
+                result
+            }
         };
         (result, used_fast_path)
     }
@@ -1767,10 +1787,10 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         }
     }
 
-    /// Core for the flush executor thread (`0` = unpinned). Call before
+    /// Core for the journal writer thread (`0` = unpinned). Call before
     /// the stage runs — `run_sync` reads it when it spawns the thread.
-    pub fn set_flush_core(&mut self, core: usize) {
-        self.flush_core = core;
+    pub fn set_writer_core(&mut self, core: usize) {
+        self.writer_core = core;
     }
 
     /// Set the core the preparer worker pins itself to (`0` =
@@ -2130,14 +2150,6 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             return Ok(false);
         };
         if self.rotation_backed_off() {
-            return Ok(false);
-        }
-        // Quiesce the executor before the segment swap — same reason as
-        // `maybe_rotate`. This covers all three quiesced call sites,
-        // including the idle path, whose "`pending == 0`, so the writer
-        // is quiesced" reasoning no longer holds on its own: a watermark
-        // can be in flight with nothing pending.
-        if !self.drain_for_rotation() {
             return Ok(false);
         }
         // Verified: the local tail equals the primary's, so rotating

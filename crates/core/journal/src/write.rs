@@ -76,12 +76,17 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Write the accumulated batch, leaving durability to a later
     /// `fdatasync` on the returned descriptor.
     ///
-    /// This is the seam that lets the durability call run off the
-    /// journal thread (see
-    /// `docs/internal/journal-async-flush-2026-08.md`). `Some(fd)` means
-    /// bytes are in the page cache and a sync on `fd` is owed; `None`
-    /// means nothing is owed — either the batch was empty, or this
-    /// writer made the bytes durable inline.
+    /// `Some(fd)` means bytes are in the page cache and a sync on `fd`
+    /// is owed; `None` means nothing is owed — either the batch was
+    /// empty, or this writer made the bytes durable inline.
+    ///
+    /// Splitting the write from the sync is not how the pipeline runs
+    /// the buffered path any more — there the whole file moves to a
+    /// writer thread (see
+    /// `docs/internal/journal-writer-thread-2026-08.md`), because
+    /// splitting them still left two threads issuing I/O against one
+    /// inode. This stays for callers that write and sync on one thread
+    /// but want the two steps separable.
     ///
     /// The default is the second case: it performs a full
     /// [`flush_batch_sync`](Self::flush_batch_sync) and reports nothing

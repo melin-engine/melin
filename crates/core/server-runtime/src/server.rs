@@ -91,9 +91,9 @@ pub struct ServerConfig {
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
-    /// Pipeline core IDs: journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,journal-flush
+    /// Pipeline core IDs: journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,journal-write
     /// (comma-separated; the tenth and eleventh entries, journal-prep and
-    /// journal-flush, are optional and default to unpinned when omitted).
+    /// journal-write, are optional and default to unpinned when omitted).
     /// Core 0 is reserved for OS/IRQ handling.
     /// reader pins the io_uring reader (TCP) or DPDK poll thread.
     /// repl-sender is used when replication is enabled, event-publisher when
@@ -454,7 +454,7 @@ impl Default for ServerConfig {
                 repl_handler_0: 8,
                 repl_handler_1: 9,
                 journal_prep: 10,
-                journal_flush: 11,
+                journal_write: 11,
             },
             group_commit_us: 0,
             heartbeat_interval_secs: 10,
@@ -589,7 +589,7 @@ pub struct PipelineCores {
     /// it does not justify moving `matching` off its core on the
     /// strength of an unmeasured guess. See the "Evidence-based
     /// `--cores` layout" roadmap item.
-    pub journal_flush: usize,
+    pub journal_write: usize,
 }
 
 impl PipelineCores {
@@ -635,7 +635,7 @@ impl PipelineCores {
             // the bench client specifically to avoid an HT collision, so
             // there is no core to give it without raising the layout's
             // minimum. It still runs — just OS-scheduled.
-            journal_flush: 0,
+            journal_write: 0,
         };
         Ok((cores, 7))
     }
@@ -645,12 +645,12 @@ impl PipelineCores {
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
     // 9, 10 or 11 entries: the tenth (journal-prep) and eleventh
-    // (journal-flush) were added later, so shorter values — every
+    // (journal-write) were added later, so shorter values — every
     // explicit operator configuration written before they existed — must
     // keep parsing, with the trailing entries left unpinned.
     if !(9..=11).contains(&parts.len()) {
         return Err(format!(
-            "expected 9 to 11 comma-separated core IDs (journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1[,journal-prep[,journal-flush]]), got {}",
+            "expected 9 to 11 comma-separated core IDs (journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1[,journal-prep[,journal-write]]), got {}",
             parts.len()
         ));
     }
@@ -669,7 +669,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         repl_handler_0: parse(parts[7])?,
         repl_handler_1: parse(parts[8])?,
         journal_prep: parts.get(9).map(|p| parse(p)).transpose()?.unwrap_or(0),
-        journal_flush: parts.get(10).map(|p| parse(p)).transpose()?.unwrap_or(0),
+        journal_write: parts.get(10).map(|p| parse(p)).transpose()?.unwrap_or(0),
     })
 }
 
@@ -1444,7 +1444,7 @@ where
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     journal_stage.set_preparer_core(config.cores.journal_prep);
-    journal_stage.set_flush_core(config.cores.journal_flush);
+    journal_stage.set_writer_core(config.cores.journal_write);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
@@ -2623,7 +2623,7 @@ where
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     journal_stage.set_preparer_core(config.cores.journal_prep);
-    journal_stage.set_flush_core(config.cores.journal_flush);
+    journal_stage.set_writer_core(config.cores.journal_write);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
@@ -3584,7 +3584,7 @@ mod tests {
     use super::{BootstrapSource, choose_bootstrap};
 
     /// The tenth and eleventh `--cores` entries (journal-prep,
-    /// journal-flush) are optional: shorter values — every explicit
+    /// journal-write) are optional: shorter values — every explicit
     /// configuration written before each entry existed — parse with the
     /// trailing threads unpinned, longer values pin them, and anything
     /// outside 9..=11 is rejected.
@@ -3597,16 +3597,16 @@ mod tests {
     fn parse_cores_accepts_nine_to_eleven_entries() {
         let nine = super::parse_cores("1,2,3,4,5,6,7,8,9").expect("9 entries must parse");
         assert_eq!(nine.journal_prep, 0, "omitted journal-prep = unpinned");
-        assert_eq!(nine.journal_flush, 0, "omitted journal-flush = unpinned");
+        assert_eq!(nine.journal_write, 0, "omitted journal-write = unpinned");
         assert_eq!(nine.repl_handler_1, 9);
 
         let ten = super::parse_cores("1,2,3,4,5,6,7,8,9,10").expect("10 entries must parse");
         assert_eq!(ten.journal_prep, 10);
-        assert_eq!(ten.journal_flush, 0, "omitted journal-flush = unpinned");
+        assert_eq!(ten.journal_write, 0, "omitted journal-write = unpinned");
 
         let eleven = super::parse_cores("1,2,3,4,5,6,7,8,9,10,11").expect("11 entries must parse");
         assert_eq!(eleven.journal_prep, 10);
-        assert_eq!(eleven.journal_flush, 11);
+        assert_eq!(eleven.journal_write, 11);
 
         assert!(super::parse_cores("1,2,3").is_err());
         assert!(super::parse_cores("1,2,3,4,5,6,7,8,9,10,11,12").is_err());
