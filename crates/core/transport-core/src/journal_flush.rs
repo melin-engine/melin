@@ -76,15 +76,29 @@ pub struct FlushWatermark {
     /// swap; a watermark whose generation no longer matches the live
     /// segment is inert.
     pub generation: u64,
-    /// Descriptor to sync. A raw fd rather than an owned handle: the
-    /// cell is a `Copy` payload and `Arc<File>` is neither `Copy` nor
-    /// padding-free. Validity rests on the rotation drain — the journal
-    /// thread never closes the live `File` while a sync is in flight.
+    /// Descriptor to sync, or [`NOTHING_TO_SYNC`] when the bytes are
+    /// already durable — which is what `JournalWrite::write_batch`
+    /// reports as `None` (an empty batch, or a writer like the
+    /// `O_DIRECT` sector writer that syncs inline). Such a watermark
+    /// still publishes: cursors have to advance even when no new
+    /// durability work was owed.
+    ///
+    /// A raw fd rather than an owned handle: the cell is a `Copy`
+    /// payload and `Arc<File>` is neither `Copy` nor padding-free.
+    /// Validity rests on the rotation drain — the journal thread never
+    /// closes the live `File` while a sync is in flight.
     ///
     /// Widened from `RawFd` (`i32`) to `i64` so the struct stays
     /// padding-free without an explicit filler field.
     pub fd: i64,
 }
+
+/// `fd` value meaning "no sync is owed for this watermark".
+///
+/// Distinct from a real descriptor by construction — the kernel never
+/// hands out a negative fd — so the executor can branch on it without a
+/// second field.
+pub const NOTHING_TO_SYNC: i64 = -1;
 
 // Safety: `repr(C)` over padding-free fields — `WireSeq` and `RingPos`
 // are `repr(transparent)` over `u64`, the rest are primitives and a byte
@@ -256,6 +270,100 @@ impl FlushHandle {
     }
 }
 
+/// The publication half of a flush: everything that follows an inline
+/// `flush_batch_sync` in the journal stage today.
+///
+/// Owns the handles rather than borrowing them from the journal stage,
+/// because the executor thread runs with no reference to the writer or
+/// the input-ring consumer. Collecting them here is what makes the move
+/// off the journal thread a change of *owner* rather than a change of
+/// behaviour — and it keeps the single-writer property on the
+/// `FsyncState` seqlock structural, since this struct holds the only
+/// writer handle.
+pub struct CursorPublisher {
+    /// The journal consumer's `processed` counter. Producers gate slot
+    /// reuse on it and — load-bearing — the replica ack path gates
+    /// persisted acks on it, so it must only ever advance behind a
+    /// completed sync.
+    progress: Arc<melin_pipeline::padding::Sequence>,
+    /// Post-fsync state for the shadow snapshot stage and replica
+    /// handshakes. `None` when shadow snapshots are disabled.
+    fsync_state: Option<SeqLockWriter<crate::pipeline::FsyncState>>,
+    /// Highest wire seq durably persisted, read by the durability gate,
+    /// the health endpoint, and the replica reconnect handshake.
+    durable_wire_seq: Option<crate::cursors::DurableWireSeqCursor>,
+    /// Control-plane advertised tip. Wired on primaries only — on a
+    /// replica the replication receiver owns the tip at its in-memory
+    /// accepted position.
+    advertised_tip: Option<crate::cursors::AdvertisedJournalTip>,
+}
+
+impl CursorPublisher {
+    /// Build a publisher over the journal consumer's progress counter.
+    /// The optional handles are installed separately, matching how the
+    /// pipeline wires them.
+    pub fn new(progress: Arc<melin_pipeline::padding::Sequence>) -> Self {
+        Self {
+            progress,
+            fsync_state: None,
+            durable_wire_seq: None,
+            advertised_tip: None,
+        }
+    }
+
+    pub fn set_fsync_state(&mut self, writer: SeqLockWriter<crate::pipeline::FsyncState>) {
+        self.fsync_state = Some(writer);
+    }
+
+    pub fn set_durable_wire_seq(&mut self, cursor: crate::cursors::DurableWireSeqCursor) {
+        self.durable_wire_seq = Some(cursor);
+    }
+
+    pub fn set_advertised_tip(&mut self, tip: crate::cursors::AdvertisedJournalTip) {
+        self.advertised_tip = Some(tip);
+    }
+
+    /// Publish post-flush writer state *without* advancing ring
+    /// progress.
+    ///
+    /// Used where the writer's durable state changed but no new input
+    /// was consumed — after a rotation, whose fresh segment gives shadow
+    /// observers a new genesis-anchored chain value.
+    pub fn publish_state(&mut self, w: &FlushWatermark) {
+        if let Some(ref mut publisher) = self.fsync_state {
+            publisher.store(crate::pipeline::FsyncState {
+                journal_seq: w.journal_seq,
+                chain_hash: w.chain_hash,
+                input_ring_seq: w.input_ring_seq,
+            });
+        }
+        if let Some(ref cursor) = self.durable_wire_seq {
+            cursor.store(w.journal_seq);
+        }
+        if let Some(ref tip) = self.advertised_tip {
+            // `advance`, not a plain store: across a promotion the
+            // receiver left the tip at its in-memory accepted position,
+            // which the new primary's journal only reaches after the
+            // drained ring is flushed — a plain store would regress the
+            // advertised tip in that window.
+            tip.advance(w.journal_seq);
+        }
+    }
+
+    /// Full post-flush publication: ring progress first, then writer
+    /// state.
+    ///
+    /// The order matches the inline path it replaces. Ring progress is
+    /// the persist-before-ack boundary on replicas, so a caller that
+    /// reaches this must have completed the watermark's sync.
+    pub fn publish(&mut self, w: &FlushWatermark) {
+        self.progress
+            .get()
+            .store(w.ring_progress.get(), Ordering::Release);
+        self.publish_state(w);
+    }
+}
+
 /// Create a linked handle/executor pair.
 ///
 /// The caller spawns a thread running [`run_flush_executor`] with the
@@ -323,12 +431,18 @@ pub fn run_flush_executor<S, P>(
         }
         idle_spins = 0;
 
-        // A batch that journaled nothing (all queries) still advances
-        // ring progress. There are no new bytes to make durable, so the
-        // previous sync already covers everything this watermark claims
-        // — skip the syscall and publish. Cursors stay honest: every
-        // sequence it covers is at or below `last_synced_seq`.
-        if watermark.journal_seq.get() > last_synced_seq {
+        // Two cases skip the syscall and publish anyway, because in both
+        // the watermark claims nothing that is not already durable:
+        //
+        // - a batch that journaled nothing (all queries) still advances
+        //   ring progress, and every sequence it covers is at or below
+        //   `last_synced_seq`;
+        // - `NOTHING_TO_SYNC` — the writer made the bytes durable inline,
+        //   so there is no descriptor to force.
+        //
+        // Skipping the publish instead would freeze ring progress and
+        // eventually stall the producer against a ring that never drains.
+        if watermark.fd != NOTHING_TO_SYNC && watermark.journal_seq.get() > last_synced_seq {
             if let Err(e) = sync_fd(watermark.fd) {
                 // Store the cause before the flag so an `Acquire` reader
                 // of `poisoned` is guaranteed to see it.
@@ -893,6 +1007,94 @@ mod tests {
 
             shutdown.store(true, Ordering::Relaxed);
         });
+    }
+
+    #[test]
+    fn a_nothing_to_sync_watermark_publishes_without_calling_sync() {
+        // `JournalWrite::write_batch` reports `None` when nothing is
+        // owed — an empty batch, or a writer that syncs inline. Cursors
+        // must still advance, or ring progress freezes and the producer
+        // eventually stalls against a ring that never drains.
+        let (mut handle, cell, shared) = flush_channel();
+        let published = Published::default();
+        let shutdown = AtomicBool::new(false);
+        let syncs = AtomicU64::new(0);
+
+        std::thread::scope(|s| {
+            // Fail, don't hang — for a panicking assertion and for a
+            // blocked one respectively.
+            let _guard = ShutdownGuard(&shutdown);
+            arm_watchdog(s, &shutdown);
+            s.spawn(|| {
+                run_flush_executor(
+                    cell,
+                    shared,
+                    |_| {
+                        syncs.fetch_add(1, Ordering::Release);
+                        Ok(())
+                    },
+                    |w| published.record(w),
+                    true,
+                    &shutdown,
+                );
+            });
+
+            let mut w = watermark(9, 90);
+            w.fd = NOTHING_TO_SYNC;
+            handle.submit(w);
+            assert_eq!(handle.drain(&shutdown, true), DrainOutcome::Drained);
+
+            assert_eq!(
+                syncs.load(Ordering::Acquire),
+                0,
+                "nothing was owed — the executor must not force a descriptor"
+            );
+            let got = published.last().expect("cursors must still advance");
+            assert_eq!(got.ring_progress, RingPos::new(90));
+            assert_eq!(got.journal_seq, WireSeq::new(9));
+
+            shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn publisher_advances_ring_progress_only_on_a_full_publish() {
+        // `publish_state` is for the rotation paths, where the writer's
+        // durable state changed but no new input was consumed. Advancing
+        // ring progress there would publish a position no flush covers —
+        // ack-before-persist on a replica.
+        use crate::cursors::{AdvertisedJournalTip, DurableWireSeqCursor};
+        use std::sync::atomic::AtomicU64 as StdAtomicU64;
+
+        let progress = Arc::new(melin_pipeline::padding::Sequence::new(StdAtomicU64::new(0)));
+        let durable = DurableWireSeqCursor::detached(WireSeq::new(0));
+        let tip = AdvertisedJournalTip::new(WireSeq::new(0));
+
+        let mut publisher = CursorPublisher::new(Arc::clone(&progress));
+        publisher.set_durable_wire_seq(durable.clone());
+        publisher.set_advertised_tip(tip.clone());
+
+        let w = FlushWatermark {
+            submit_seq: 1,
+            journal_seq: WireSeq::new(77),
+            ring_progress: RingPos::new(500),
+            input_ring_seq: RingPos::new(505),
+            chain_hash: [1u8; 32],
+            generation: 0,
+            fd: NOTHING_TO_SYNC,
+        };
+
+        publisher.publish_state(&w);
+        assert_eq!(
+            progress.get().load(Ordering::Acquire),
+            0,
+            "publish_state must not move the persist-before-ack boundary"
+        );
+        assert_eq!(durable.load(), WireSeq::new(77));
+        assert_eq!(tip.load(), WireSeq::new(77));
+
+        publisher.publish(&w);
+        assert_eq!(progress.get().load(Ordering::Acquire), 500);
     }
 
     #[test]

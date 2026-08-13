@@ -449,24 +449,19 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// flags). The Box indirection keeps the JournalStage struct the same
     /// cache layout as on main, avoiding tail latency regression.
     repl: Box<ReplicationState>,
-    /// Optional seqlock writer for publishing the BLAKE3 chain hash to the
-    /// shadow snapshot stage. Updated once per fsync batch (cold path). `None`
-    /// when shadow snapshots are disabled — no allocation or write overhead.
-    /// The writer handle is unique, so the journal stage owning it is what
-    /// makes the seqlock's single-writer requirement structural.
-    chain_hash: Option<SeqLockWriter<FsyncState>>,
-    /// Optional typed handle for publishing the writer's `next_sequence - 1`
-    /// (the highest wire seq durably persisted) to readers outside the
-    /// pipeline thread — the durability gate, health endpoint, and the
-    /// replica orchestrator's reconnect handshake all read the same cursor.
-    /// Updated once per fsync batch alongside `chain_hash`.
-    last_seq: Option<DurableWireSeqCursor>,
-    /// Optional handle to the control-plane advertised journal tip
-    /// (raft vote filtering). Wired only on a primary's pipeline — on a
-    /// replica the replication receiver owns the tip at its in-memory
-    /// accepted position instead (see [`AdvertisedJournalTip`]). Advanced
-    /// once per fsync batch alongside `last_seq`, with the same value.
-    advertised_tip: Option<AdvertisedJournalTip>,
+    /// Everything published after a durable flush: the input-ring
+    /// progress cursor, the `FsyncState` seqlock (shadow snapshots,
+    /// replica handshakes), the durable wire-seq cursor (durability
+    /// gate, health endpoint, replica reconnect handshake), and the
+    /// control-plane advertised tip.
+    ///
+    /// Grouped rather than held as four fields because publication moves
+    /// to the flush executor, which has no reference to the writer or
+    /// the consumer — see
+    /// `docs/internal/journal-async-flush-2026-08.md`. It also keeps the
+    /// seqlock's single-writer requirement structural: this struct holds
+    /// the only writer handle.
+    publisher: crate::journal_flush::CursorPublisher,
     /// When true, never yield to the OS scheduler — spin indefinitely with
     /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
     busy_spin: bool,
@@ -655,6 +650,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         max_batch: usize,
         busy_spin: bool,
     ) -> Self {
+        let publisher = crate::journal_flush::CursorPublisher::new(consumer.progress_counter());
         Self {
             writer,
             _marker: std::marker::PhantomData,
@@ -662,9 +658,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             group_commit_delay,
             max_batch: max_batch.min(MAX_JOURNAL_BATCH),
             repl: Box::default(),
-            chain_hash: None,
-            last_seq: None,
-            advertised_tip: None,
+            publisher,
             busy_spin,
             utilization: Arc::new(StageUtilization::new()),
             max_journal_bytes: 0,
@@ -737,7 +731,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// construction when shadow snapshots are enabled. Takes the handle by
     /// value — the stage becomes the only thing that can publish.
     pub fn set_chain_hash_lock(&mut self, writer: SeqLockWriter<FsyncState>) {
-        self.chain_hash = Some(writer);
+        self.publisher.set_fsync_state(writer);
     }
 
     /// Set the cursor handle for publishing the highest wire seq durably
@@ -745,14 +739,14 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// outside the pipeline thread (e.g., the replication-receive
     /// orchestrator) need to read the writer's progress without owning it.
     pub fn set_last_seq_publisher(&mut self, last_seq: DurableWireSeqCursor) {
-        self.last_seq = Some(last_seq);
+        self.publisher.set_durable_wire_seq(last_seq);
     }
 
     /// Set the control-plane advertised-tip handle. Called by the server
     /// wiring on a *primary's* pipeline only — see the field docs for the
     /// replica-side ownership rule.
     pub fn set_advertised_tip_publisher(&mut self, tip: AdvertisedJournalTip) {
-        self.advertised_tip = Some(tip);
+        self.publisher.set_advertised_tip(tip);
     }
 
     /// Synchronous journal loop: `pwrite` blocks until the write completes.
@@ -1183,28 +1177,37 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// struct field.
     #[inline]
     fn publish_fsync_state(&mut self) {
-        let journal_seq = self.writer.next_sequence().saturating_sub(1);
-        // Disjoint field borrows: `chain_hash` mutably (the writer handle),
-        // `writer`/`consumer` immutably. Keeping the state construction
-        // inside the branch preserves the zero-overhead-when-disabled
-        // property — no chain-hash copy when shadow is off.
-        if let Some(ref mut publisher) = self.chain_hash {
-            publisher.store(FsyncState {
-                journal_seq: WireSeq::new(journal_seq),
-                chain_hash: self.writer.chain_hash().unwrap_or([0u8; 32]),
-                input_ring_seq: RingPos::new(self.consumer.next_read()),
-            });
-        }
-        if let Some(ref cursor) = self.last_seq {
-            cursor.store(WireSeq::new(journal_seq));
-        }
-        if let Some(ref tip) = self.advertised_tip {
-            // `advance`, not a plain store: across a promotion the receiver
-            // left the tip at its in-memory accepted position, which the
-            // new primary's journal only reaches after the drained ring is
-            // flushed — a plain store would regress the advertised tip in
-            // that window.
-            tip.advance(WireSeq::new(journal_seq));
+        let watermark = self.sample_watermark(self.consumer.next_read());
+        self.publisher.publish_state(&watermark);
+    }
+
+    /// Sample everything a flush publication needs, at the point the
+    /// batch was written.
+    ///
+    /// `ring_progress` is the position the flush covers, passed in
+    /// rather than read here: at a replica's mid-batch mark barrier only
+    /// a prefix of the read batch is encoded, so it is *not*
+    /// `consumer.next_read()`. `input_ring_seq` is `next_read` — the two
+    /// coincide only at the steady-state sync point.
+    ///
+    /// Sampling is separated from publishing because the durability call
+    /// between them will move to another thread: `fdatasync` covers only
+    /// what was dirty when it was called, so the values published after
+    /// it must be the ones read before it. `fd` and `generation` are
+    /// filled in by the submit path, which knows what the write left
+    /// outstanding.
+    #[inline]
+    fn sample_watermark(&self, ring_progress: u64) -> crate::journal_flush::FlushWatermark {
+        crate::journal_flush::FlushWatermark {
+            // Assigned by `FlushHandle::submit`; irrelevant on the
+            // inline path, which publishes without a handoff.
+            submit_seq: 0,
+            journal_seq: WireSeq::new(self.writer.next_sequence().saturating_sub(1)),
+            ring_progress: RingPos::new(ring_progress),
+            input_ring_seq: RingPos::new(self.consumer.next_read()),
+            chain_hash: self.writer.chain_hash().unwrap_or([0u8; 32]),
+            generation: 0,
+            fd: crate::journal_flush::NOTHING_TO_SYNC,
         }
     }
 
@@ -1245,8 +1248,11 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         #[cfg(feature = "no-persist")]
         self.writer.discard_batch_buf();
 
-        self.consumer.set_progress(progress);
-        self.publish_fsync_state();
+        // Sampled after the flush here because the flush is inline: the
+        // values are the same either way. Once the durability call moves
+        // to the executor this sample must happen *before* it.
+        let watermark = self.sample_watermark(progress);
+        self.publisher.publish(&watermark);
         Ok(())
     }
 
