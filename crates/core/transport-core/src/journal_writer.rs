@@ -70,13 +70,45 @@ pub struct WriteBatch {
     pub watermark: FlushWatermark,
 }
 
+/// One rotation, ordered against the entry stream by riding the same
+/// queue the batches do.
+///
+/// This is what replaces the async-flush branch's drain protocol. There,
+/// the journal thread held the file and the flush thread held a raw
+/// descriptor into it, so rotating meant proving no sync was in flight
+/// before closing it. Here the file never leaves the writer, and FIFO
+/// ordering does the same job structurally: a rotation cannot overtake
+/// the batches that belong to the outgoing segment, because it is behind
+/// them in the queue.
+pub struct RotateCommand {
+    /// First sequence of the new segment (the header's
+    /// `starting_sequence`).
+    pub starting_sequence: u64,
+    /// Chain anchor linking the new segment to the outgoing one's tail.
+    pub anchor: [u8; 32],
+    /// Pre-staged segment from the preparer, when one was ready.
+    pub prepared: Option<melin_journal::preparer::PreparedSegment>,
+    /// Where the archived path (or the failure) goes back.
+    ///
+    /// Every command gets exactly one reply, including from a poisoned
+    /// writer — the journal thread blocks here, so a silently dropped
+    /// command would wedge the pipeline rather than fail it.
+    reply: SyncSender<Result<std::path::PathBuf, melin_journal::JournalError>>,
+}
+
+/// Work handed to the writer, in submission order.
+enum WriteItem {
+    Batch(WriteBatch),
+    Rotate(RotateCommand),
+}
+
 /// Producer half, held by the journal thread.
 ///
 /// Not `Clone`: single-producer is what makes the ordering the writer
 /// relies on — rotation ordered against the entry stream — a property of
 /// the type rather than a convention.
 pub struct WriteQueue {
-    work: SyncSender<WriteBatch>,
+    work: SyncSender<WriteItem>,
     /// Emptied buffers coming back from the writer, so steady state
     /// allocates nothing.
     recycled: Receiver<Vec<u8>>,
@@ -86,7 +118,7 @@ pub struct WriteQueue {
 
 /// Consumer half, moved onto the writer thread.
 pub struct WriteQueueConsumer {
-    work: Receiver<WriteBatch>,
+    work: Receiver<WriteItem>,
     recycled: SyncSender<Vec<u8>>,
     shared: Arc<WriterShared>,
 }
@@ -99,11 +131,6 @@ pub struct WriterShared {
     published: AtomicU64,
     /// Highest `journal_seq` published, for the flush-lag gauge.
     published_journal_seq: AtomicU64,
-    /// Byte offset past the last durable write — the writer's
-    /// `valid_end`, republished because the rotation size trigger lives
-    /// on the journal thread. Monotonic within a segment, so a slightly
-    /// stale read costs at most one batch of lateness.
-    valid_end: AtomicU64,
     /// Latched when a write or sync fails.
     poisoned: AtomicBool,
     /// `errno` behind `poisoned`. Stored before the flag, so an
@@ -115,12 +142,6 @@ impl WriterShared {
     #[inline]
     pub fn published_journal_seq(&self) -> WireSeq {
         WireSeq::new(self.published_journal_seq.load(Ordering::Acquire))
-    }
-
-    /// Byte offset past the last durable write.
-    #[inline]
-    pub fn valid_end(&self) -> u64 {
-        self.valid_end.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -169,20 +190,70 @@ impl WriteQueue {
         self.submitted += 1;
         batch.watermark.submit_seq = self.submitted;
         batch.watermark.submit_ts = crate::trace::mono_trace_ns();
-        match self.work.try_send(batch) {
+        match self.work.try_send(WriteItem::Batch(batch)) {
             Ok(()) => Submitted::Ok,
-            Err(TrySendError::Full(batch)) => {
+            Err(TrySendError::Full(item)) => {
                 // Not queued, so it never happened: roll the counter back
                 // or the next submit would leave a gap and the writer
                 // would publish a `submit_seq` the encoder never sent.
                 self.submitted -= 1;
-                Submitted::Full(Box::new(batch))
+                Submitted::Full(Box::new(unwrap_batch(item)))
             }
-            Err(TrySendError::Disconnected(batch)) => {
+            Err(TrySendError::Disconnected(item)) => {
                 self.submitted -= 1;
-                Submitted::Poisoned(Box::new(batch))
+                Submitted::Poisoned(Box::new(unwrap_batch(item)))
             }
         }
+    }
+
+    /// Rotate the live segment, behind everything already submitted.
+    ///
+    /// Blocks until the writer has done it. Rotation is cold (a few per
+    /// gigabyte) and the caller has nothing useful to do meanwhile: it
+    /// must know whether the rotation succeeded before it re-anchors its
+    /// chain, and a failure has to leave the encoder still writing to the
+    /// *old* segment. Making this asynchronous would mean an encoder
+    /// whose chain has moved to a segment that does not exist.
+    ///
+    /// The wait is bounded by the queue ahead of it plus one rotation, so
+    /// it is the same stall the inline path already pays — minus the
+    /// separate drain the flush-executor design needed.
+    pub fn rotate(
+        &mut self,
+        starting_sequence: u64,
+        anchor: [u8; 32],
+        prepared: Option<melin_journal::preparer::PreparedSegment>,
+    ) -> Result<std::path::PathBuf, melin_journal::JournalError> {
+        self.submit_rotation(starting_sequence, anchor, prepared)?
+            .wait()
+    }
+
+    /// Queue a rotation without waiting for it.
+    ///
+    /// The two halves of [`rotate`](Self::rotate), split so a test can
+    /// establish "the rotation is queued behind these batches" as a fact
+    /// rather than a race — which is the property being tested.
+    fn submit_rotation(
+        &mut self,
+        starting_sequence: u64,
+        anchor: [u8; 32],
+        prepared: Option<melin_journal::preparer::PreparedSegment>,
+    ) -> Result<PendingRotation, melin_journal::JournalError> {
+        // Depth 1: exactly one reply, and the writer never blocks
+        // delivering it.
+        let (reply, replies) = sync_channel(1);
+        let command = RotateCommand {
+            starting_sequence,
+            anchor,
+            prepared,
+            reply,
+        };
+        // Blocking send, unlike `submit`: the caller is already waiting,
+        // and the queue ahead drains on its own.
+        self.work
+            .send(WriteItem::Rotate(command))
+            .map_err(|_| writer_gone("submitting the rotation"))?;
+        Ok(PendingRotation { replies })
     }
 
     /// Take a buffer for the next batch: a recycled one if the writer
@@ -221,6 +292,45 @@ impl WriteQueue {
     }
 }
 
+/// A rotation the writer has been given but has not answered yet.
+struct PendingRotation {
+    replies: Receiver<Result<std::path::PathBuf, melin_journal::JournalError>>,
+}
+
+impl PendingRotation {
+    /// Block until the writer answers.
+    ///
+    /// A poisoned writer still replies (with an error), so this can only
+    /// outlive the writer thread if it unwound — which drops the sender
+    /// and disconnects the channel.
+    fn wait(self) -> Result<std::path::PathBuf, melin_journal::JournalError> {
+        self.replies
+            .recv()
+            .map_err(|_| writer_gone("awaiting the rotation"))?
+    }
+}
+
+/// Recover the batch from an item the channel handed back.
+///
+/// `try_send` returns whatever it could not deliver, and only `submit`
+/// ever sends a `Batch` — a `Rotate` coming back here would mean the
+/// channel returned something nobody put in.
+fn unwrap_batch(item: WriteItem) -> WriteBatch {
+    match item {
+        WriteItem::Batch(b) => b,
+        WriteItem::Rotate(_) => {
+            unreachable!("the work channel returned a rotation to the batch submit path")
+        }
+    }
+}
+
+/// The writer thread is gone without answering — it unwound.
+fn writer_gone(during: &str) -> melin_journal::JournalError {
+    melin_journal::JournalError::Io(std::io::Error::other(format!(
+        "journal writer thread is gone ({during})"
+    )))
+}
+
 /// Create a linked queue pair plus the shared state.
 pub fn write_queue(depth: usize) -> (WriteQueue, WriteQueueConsumer, Arc<WriterShared>) {
     let (work_tx, work_rx) = sync_channel(depth);
@@ -252,6 +362,18 @@ pub trait SegmentIo {
     fn write_at(&mut self, bytes: &[u8], offset: u64) -> std::io::Result<()>;
     /// Force everything written so far to stable media.
     fn sync(&mut self) -> std::io::Result<()>;
+    /// Archive the live segment and open a fresh one anchored to
+    /// `(starting_sequence, anchor)`. Returns the archived path.
+    ///
+    /// A failure must leave the live segment usable, because the encoder
+    /// keeps writing to it: the rotation is reported back and retried
+    /// after a backoff.
+    fn rotate(
+        &mut self,
+        starting_sequence: u64,
+        anchor: [u8; 32],
+        prepared: Option<melin_journal::preparer::PreparedSegment>,
+    ) -> Result<std::path::PathBuf, melin_journal::JournalError>;
 }
 
 impl SegmentIo for melin_journal::SegmentFile {
@@ -271,6 +393,15 @@ impl SegmentIo for melin_journal::SegmentFile {
 
     fn sync(&mut self) -> std::io::Result<()> {
         melin_journal::SegmentFile::sync(self).map_err(io_error)
+    }
+
+    fn rotate(
+        &mut self,
+        starting_sequence: u64,
+        anchor: [u8; 32],
+        prepared: Option<melin_journal::preparer::PreparedSegment>,
+    ) -> Result<std::path::PathBuf, melin_journal::JournalError> {
+        melin_journal::SegmentFile::rotate(self, starting_sequence, anchor, prepared)
     }
 }
 
@@ -296,16 +427,23 @@ fn io_error(e: melin_journal::JournalError) -> std::io::Error {
 /// the *last drained* watermark — every earlier one it covers is
 /// implied, since cursors are monotonic positions rather than events.
 ///
-/// Returns when `shutdown` is set. A poisoned writer keeps idling rather
-/// than exiting, so it stays joinable in every state without a dedicated
-/// wake-up.
+/// A rotation reached mid-drain ends the run: it must land *after* the
+/// batches ahead of it are durable, and `SegmentFile::rotate` archives
+/// the file out from under anything still buffered.
+///
+/// Returns when `shutdown` is set, handing back the segment so the
+/// journal thread can re-attach it. A poisoned writer keeps idling
+/// rather than exiting, so it stays joinable in every state without a
+/// dedicated wake-up — and keeps answering rotations (with an error), so
+/// a journal thread blocked on one is never stranded.
 pub fn run_writer<Io, P>(
     queue: WriteQueueConsumer,
     mut io: Io,
     mut publish: P,
     busy_spin: bool,
     shutdown: &AtomicBool,
-) where
+) -> Io
+where
     Io: SegmentIo,
     P: FnMut(&FlushWatermark),
 {
@@ -318,14 +456,7 @@ pub fn run_writer<Io, P>(
         if shutdown.load(Ordering::Relaxed) {
             #[cfg(feature = "latency-trace")]
             handoff_rec.flush();
-            return;
-        }
-        if queue.shared.is_poisoned() {
-            // Never publish again: a frozen cursor can only be
-            // over-conservative, and the journal thread is already
-            // tearing the pipeline down.
-            crate::pipeline::idle_wait(&mut idle_spins, busy_spin);
-            continue;
+            return io;
         }
 
         let Ok(first) = queue.work.try_recv() else {
@@ -334,54 +465,108 @@ pub fn run_writer<Io, P>(
         };
         idle_spins = 0;
 
-        // Drain everything queued, not just the one batch: the sync
-        // below covers all of them either way, so writing them together
+        if queue.shared.is_poisoned() {
+            // Nothing more will ever reach the disk, and publishing again
+            // would advance a cursor past bytes that never landed. Still
+            // answer rotations: the journal thread blocks on the reply,
+            // so silence here would wedge the teardown it is heading for.
+            refuse(&queue, first);
+            continue;
+        }
+
+        // Drain everything queued, not just the one item: one `fdatasync`
+        // covers all of them either way, so writing them together
         // converts queue depth into fewer, larger syncs.
         let mut last = None;
-        let mut batch = Some(first);
-        while let Some(b) = batch.take() {
+        let mut rotation = None;
+        let mut next = Some(first);
+        while let Some(item) = next.take() {
+            let b = match item {
+                WriteItem::Batch(b) => b,
+                // Stop the run here. The batches already written are
+                // synced and published below, and only then does the
+                // file get archived.
+                WriteItem::Rotate(c) => {
+                    rotation = Some(c);
+                    break;
+                }
+            };
             if let Err(e) = io.write_at(&b.bytes, b.offset) {
                 poison(&queue.shared, &e);
                 break;
             }
-            let end = b.offset + b.bytes.len() as u64;
-            last = Some((b.watermark, end));
+            last = Some(b.watermark);
             // Hand the buffer back for reuse. A full recycle channel
             // cannot happen (same depth as the work queue), but dropping
             // the buffer would only cost an allocation, never
             // correctness.
             let _ = queue.recycled.try_send(b.bytes);
-            batch = queue.work.try_recv().ok();
+            next = queue.work.try_recv().ok();
         }
 
-        let Some((watermark, end)) = last else {
-            continue; // write failed; poisoned above
-        };
-        if queue.shared.is_poisoned() {
-            continue;
+        if !queue.shared.is_poisoned()
+            && let Some(watermark) = last
+        {
+            if let Err(e) = io.sync() {
+                poison(&queue.shared, &e);
+            } else {
+                publish(&watermark);
+                #[cfg(feature = "latency-trace")]
+                handoff_rec.record_elapsed(watermark.submit_ts, crate::trace::mono_trace_ns());
+                // The journal seq before the submit counter: a reader
+                // that sees the counter advance must not then read a
+                // stale companion.
+                queue
+                    .shared
+                    .published_journal_seq
+                    .store(watermark.journal_seq.get(), Ordering::Release);
+                queue
+                    .shared
+                    .published
+                    .store(watermark.submit_seq, Ordering::Release);
+            }
         }
 
-        if let Err(e) = io.sync() {
-            poison(&queue.shared, &e);
-            continue;
+        if let Some(command) = rotation {
+            let result = if queue.shared.is_poisoned() {
+                // The outgoing segment has bytes that never reached the
+                // disk. Sealing it would publish that hole as a complete
+                // segment.
+                Err(writer_gone("the writer failed before the rotation"))
+            } else {
+                io.rotate(command.starting_sequence, command.anchor, command.prepared)
+            };
+            reply(command.reply, result);
         }
-
-        publish(&watermark);
-        #[cfg(feature = "latency-trace")]
-        handoff_rec.record_elapsed(watermark.submit_ts, crate::trace::mono_trace_ns());
-        // `valid_end` and the journal seq before the submit counter: a
-        // reader that sees the counter advance must not then read stale
-        // companions.
-        queue.shared.valid_end.store(end, Ordering::Release);
-        queue
-            .shared
-            .published_journal_seq
-            .store(watermark.journal_seq.get(), Ordering::Release);
-        queue
-            .shared
-            .published
-            .store(watermark.submit_seq, Ordering::Release);
     }
+}
+
+/// Answer a command that arrived at a writer which will never run again.
+///
+/// Batches are dropped — their bytes are already lost with the failed
+/// sync — but a rotation's caller is *blocked*, so it gets its error.
+fn refuse(queue: &WriteQueueConsumer, item: WriteItem) {
+    match item {
+        WriteItem::Batch(b) => {
+            let _ = queue.recycled.try_send(b.bytes);
+        }
+        WriteItem::Rotate(c) => reply(
+            c.reply,
+            Err(writer_gone("the writer failed before the rotation")),
+        ),
+    }
+}
+
+/// Send a rotation's outcome back.
+///
+/// A closed channel means the caller unwound between submitting and
+/// waiting; nothing is owed to a receiver that is gone, and the writer
+/// must keep running so the rest of the teardown can join it.
+fn reply(
+    tx: SyncSender<Result<std::path::PathBuf, melin_journal::JournalError>>,
+    result: Result<std::path::PathBuf, melin_journal::JournalError>,
+) {
+    let _ = tx.send(result);
 }
 
 fn poison(shared: &WriterShared, e: &std::io::Error) {
@@ -426,6 +611,11 @@ mod tests {
     struct Recorder {
         writes: Mutex<Vec<(u64, usize)>>,
         syncs: AtomicU64,
+        /// Each rotation with the highest `journal_seq` published when it
+        /// happened. That is the invariant in one number: a rotation may
+        /// only archive the outgoing segment once everything encoded into
+        /// it is durable, and publication is what says so.
+        rotations: Mutex<Vec<(u64, u64)>>,
         /// Each publication with the sync count observed at that moment.
         /// A publication that happened before its sync shows zero — the
         /// persist-before-ack violation, made visible.
@@ -448,6 +638,17 @@ mod tests {
             let syncs = self.syncs();
             self.published.lock().expect("published").push((*w, syncs));
         }
+        fn rotations(&self) -> Vec<(u64, u64)> {
+            self.rotations.lock().expect("rotations").clone()
+        }
+        /// Highest `journal_seq` published so far, `0` if nothing has been.
+        fn published_seq(&self) -> u64 {
+            self.published
+                .lock()
+                .expect("published")
+                .last()
+                .map_or(0, |(w, _)| w.journal_seq.get())
+        }
     }
 
     /// `SegmentIo` that records, and optionally gates or fails.
@@ -457,7 +658,25 @@ mod tests {
         gate: Option<(Sender<()>, StdReceiver<()>)>,
         fail_write: Option<i32>,
         fail_sync: Option<i32>,
+        fail_rotate: bool,
         shutdown: &'a AtomicBool,
+    }
+
+    impl<'a> TestIo<'a> {
+        fn new(rec: &'a Recorder, shutdown: &'a AtomicBool) -> Self {
+            Self {
+                rec,
+                gate: None,
+                fail_write: None,
+                fail_sync: None,
+                fail_rotate: false,
+                shutdown,
+            }
+        }
+        fn gated(mut self, entered: Sender<()>, release: StdReceiver<()>) -> Self {
+            self.gate = Some((entered, release));
+            self
+        }
     }
 
     impl SegmentIo for TestIo<'_> {
@@ -496,6 +715,28 @@ mod tests {
                 }
             }
             Ok(())
+        }
+
+        fn rotate(
+            &mut self,
+            starting_sequence: u64,
+            _anchor: [u8; 32],
+            _prepared: Option<melin_journal::preparer::PreparedSegment>,
+        ) -> Result<std::path::PathBuf, melin_journal::JournalError> {
+            if self.fail_rotate {
+                return Err(melin_journal::JournalError::Io(
+                    std::io::Error::from_raw_os_error(28), // ENOSPC
+                ));
+            }
+            let published = self.rec.published_seq();
+            self.rec
+                .rotations
+                .lock()
+                .expect("rotations")
+                .push((starting_sequence, published));
+            Ok(std::path::PathBuf::from(format!(
+                "archive-{starting_sequence}"
+            )))
         }
     }
 
@@ -536,13 +777,7 @@ mod tests {
 
         std::thread::scope(|s| {
             let _guard = ShutdownGuard(&shutdown);
-            let io = TestIo {
-                rec: &rec,
-                gate: None,
-                fail_write: None,
-                fail_sync: None,
-                shutdown: &shutdown,
-            };
+            let io = TestIo::new(&rec, &shutdown);
             s.spawn(|| run_writer(consumer, io, |w| rec.record_publish(w), true, &shutdown));
 
             for i in 1..=4u64 {
@@ -589,13 +824,7 @@ mod tests {
 
         std::thread::scope(|s| {
             let _guard = ShutdownGuard(&shutdown);
-            let io = TestIo {
-                rec: &rec,
-                gate: Some((entered_tx, release_rx)),
-                fail_write: None,
-                fail_sync: None,
-                shutdown: &shutdown,
-            };
+            let io = TestIo::new(&rec, &shutdown).gated(entered_tx, release_rx);
             s.spawn(|| run_writer(consumer, io, |w| rec.record_publish(w), true, &shutdown));
 
             // First batch parks the writer inside its sync.
@@ -641,13 +870,7 @@ mod tests {
 
         std::thread::scope(|s| {
             let _guard = ShutdownGuard(&shutdown);
-            let io = TestIo {
-                rec: &rec,
-                gate: Some((entered_tx, release_rx)),
-                fail_write: None,
-                fail_sync: None,
-                shutdown: &shutdown,
-            };
+            let io = TestIo::new(&rec, &shutdown).gated(entered_tx, release_rx);
             s.spawn(|| run_writer(consumer, io, |w| rec.record_publish(w), true, &shutdown));
 
             expect_queued(q.submit(batch(1, 10, 0, 8)));
@@ -696,13 +919,7 @@ mod tests {
 
         std::thread::scope(|s| {
             let _guard = ShutdownGuard(&shutdown);
-            let io = TestIo {
-                rec: &rec,
-                gate: None,
-                fail_write: None,
-                fail_sync: None,
-                shutdown: &shutdown,
-            };
+            let io = TestIo::new(&rec, &shutdown);
             s.spawn(|| run_writer(consumer, io, |_| {}, true, &shutdown));
 
             let mut b = batch(1, 10, 0, 8);
@@ -732,11 +949,8 @@ mod tests {
         std::thread::scope(|s| {
             let _guard = ShutdownGuard(&shutdown);
             let io = TestIo {
-                rec: &rec,
-                gate: None,
-                fail_write: None,
                 fail_sync: Some(5), // EIO
-                shutdown: &shutdown,
+                ..TestIo::new(&rec, &shutdown)
             };
             s.spawn(|| {
                 run_writer(
@@ -779,11 +993,8 @@ mod tests {
         std::thread::scope(|s| {
             let _guard = ShutdownGuard(&shutdown);
             let io = TestIo {
-                rec: &rec,
-                gate: None,
                 fail_write: Some(28), // ENOSPC
-                fail_sync: None,
-                shutdown: &shutdown,
+                ..TestIo::new(&rec, &shutdown)
             };
             s.spawn(|| {
                 run_writer(
@@ -809,10 +1020,97 @@ mod tests {
     }
 
     #[test]
-    fn valid_end_tracks_the_last_durable_write() {
-        // The rotation size trigger reads this from the journal thread,
-        // so it must reflect written-and-synced bytes, never merely
-        // queued ones.
+    fn a_rotation_lands_after_the_batches_queued_before_it() {
+        // The ordering the queue exists to provide. Entries encoded
+        // before a rotation belong to the *outgoing* segment; a rotation
+        // that overtook them would archive the file with their bytes
+        // still unwritten, sealing a segment around a hole.
+        let rec = Recorder::default();
+        let shutdown = AtomicBool::new(false);
+        let (mut q, consumer, _shared) = write_queue(WRITE_QUEUE_DEPTH);
+
+        // Fill the queue *before* the writer exists, so the rotation is
+        // provably behind four unwritten batches rather than racing them.
+        // Parking a running writer and queueing behind it does not
+        // establish that: `spawn` returning does not mean the rotation
+        // has been sent, so the writer can finish the batches first and
+        // meet the rotation on its own — with nothing to overtake, the
+        // ordering goes untested.
+        for i in 1..=4u64 {
+            expect_queued(q.submit(batch(i, i * 10, i * 100, 8)));
+        }
+        let pending = q
+            .submit_rotation(99, [7u8; 32], None)
+            .expect("the queue has room for the rotation");
+
+        std::thread::scope(|s| {
+            let _guard = ShutdownGuard(&shutdown);
+            let io = TestIo::new(&rec, &shutdown);
+            s.spawn(|| run_writer(consumer, io, |w| rec.record_publish(w), true, &shutdown));
+
+            let archived = pending
+                .wait()
+                .expect("the rotation must reach the writer and come back");
+            assert_eq!(archived, std::path::PathBuf::from("archive-99"));
+
+            assert_eq!(
+                rec.write_count(),
+                4,
+                "every batch queued ahead of the rotation must be written first"
+            );
+            let (seq, published_at_rotation) = rec.rotations()[0];
+            assert_eq!(seq, 99);
+            assert_eq!(
+                published_at_rotation, 4,
+                "the segment was archived with only journal_seq {published_at_rotation} durable, \
+                 but batches through 4 belong to it — the rotation overtook them and sealed the \
+                 outgoing segment around bytes that had not been forced"
+            );
+
+            shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn a_failed_rotation_comes_back_as_an_error_rather_than_hanging() {
+        // The journal thread blocks on the reply and only re-anchors its
+        // chain on success. A dropped reply would wedge it; a lost error
+        // would move its chain onto a segment that does not exist.
+        let rec = Recorder::default();
+        let shutdown = AtomicBool::new(false);
+        let (mut q, consumer, _shared) = write_queue(WRITE_QUEUE_DEPTH);
+
+        std::thread::scope(|s| {
+            let _guard = ShutdownGuard(&shutdown);
+            let io = TestIo {
+                fail_rotate: true,
+                ..TestIo::new(&rec, &shutdown)
+            };
+            s.spawn(|| run_writer(consumer, io, |_| {}, true, &shutdown));
+
+            let err = q.rotate(99, [7u8; 32], None).expect_err("rotation fails");
+            let melin_journal::JournalError::Io(io) = err else {
+                panic!("a rotation failure must arrive as the I/O error it was")
+            };
+            assert_eq!(
+                io.raw_os_error(),
+                Some(28),
+                "the errno must survive the trip back, or the operator sees no cause"
+            );
+            // The writer stays usable: a failed rotation leaves the live
+            // segment in place, so the encoder keeps writing to it.
+            expect_queued(q.submit(batch(1, 10, 0, 8)));
+            wait_until("the writer to keep working", || q.is_idle());
+
+            shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn a_poisoned_writer_still_answers_a_rotation() {
+        // Otherwise the journal thread blocks forever on a reply that
+        // never comes — a wedged pipeline instead of a failed one, on
+        // exactly the path (a dying disk) where operators need the error.
         let rec = Recorder::default();
         let shutdown = AtomicBool::new(false);
         let (mut q, consumer, shared) = write_queue(WRITE_QUEUE_DEPTH);
@@ -820,19 +1118,48 @@ mod tests {
         std::thread::scope(|s| {
             let _guard = ShutdownGuard(&shutdown);
             let io = TestIo {
-                rec: &rec,
-                gate: None,
-                fail_write: None,
-                fail_sync: None,
-                shutdown: &shutdown,
+                fail_sync: Some(5), // EIO
+                ..TestIo::new(&rec, &shutdown)
             };
             s.spawn(|| run_writer(consumer, io, |_| {}, true, &shutdown));
 
-            assert_eq!(shared.valid_end(), 0);
-            expect_queued(q.submit(batch(1, 10, 4096, 128)));
-            wait_until("valid_end to advance", || shared.valid_end() == 4096 + 128);
+            expect_queued(q.submit(batch(1, 10, 0, 8)));
+            wait_until("poison to latch", || shared.is_poisoned());
+
+            q.rotate(99, [7u8; 32], None)
+                .expect_err("a poisoned writer must refuse, not seal a segment with a hole");
+            assert!(
+                rec.rotations().is_empty(),
+                "a poisoned writer must not archive the outgoing segment"
+            );
 
             shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn shutdown_hands_the_segment_back() {
+        // The stage re-attaches it, so the writer it returns can flush,
+        // rotate and be inspected like one that never handed off.
+        let rec = Recorder::default();
+        let shutdown = AtomicBool::new(false);
+        let (mut q, consumer, _shared) = write_queue(WRITE_QUEUE_DEPTH);
+
+        std::thread::scope(|s| {
+            let _guard = ShutdownGuard(&shutdown);
+            let io = TestIo::new(&rec, &shutdown);
+            let writer = s.spawn(|| run_writer(consumer, io, |_| {}, true, &shutdown));
+
+            expect_queued(q.submit(batch(1, 10, 0, 8)));
+            wait_until("the batch to drain", || q.is_idle());
+            shutdown.store(true, Ordering::Relaxed);
+
+            let returned = writer.join().expect("the writer exits cleanly");
+            assert_eq!(
+                returned.rec.write_count(),
+                1,
+                "the returned handle must be the one that did the writing"
+            );
         });
     }
 }
