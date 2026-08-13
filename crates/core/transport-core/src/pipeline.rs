@@ -511,6 +511,15 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// pipeline cores deterministically, same convention as the shadow
     /// and event-publisher threads.
     preparer_core: usize,
+    /// Core the flush executor pins itself to; `0` = unpinned. Set via
+    /// [`set_flush_core`](Self::set_flush_core), same convention as
+    /// `preparer_core`.
+    ///
+    /// The executor spins on the watermark cell, so on a shared core it
+    /// competes with whatever else lands there. Placement guidance and
+    /// the measurement that should settle it are in
+    /// `docs/internal/journal-async-flush-2026-08.md`.
+    flush_core: usize,
     /// Primary-announced stream marks to apply (replica mode only;
     /// `None` on primaries/standalone). Pushed by the replication
     /// receiver, popped here. See [`StreamMark`].
@@ -707,6 +716,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             rotation_backoff_until: None,
             preparer: None,
             preparer_core: 0,
+            flush_core: 0,
             stream_marks: None,
             pending_mark: None,
         }
@@ -807,10 +817,28 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
             let busy_spin = self.busy_spin;
+            let core = self.flush_core;
 
             let handle = std::thread::Builder::new()
                 .name("journal-flush".to_string())
                 .spawn(move || {
+                    // `core == 0` is the "do not pin" sentinel — see
+                    // `melin_app::affinity` module docs.
+                    if core == 0 {
+                        tracing::info!(
+                            thread = "journal-flush",
+                            "thread left unpinned (core 0 sentinel)"
+                        );
+                    } else {
+                        match melin_app::affinity::pin_to_core(core) {
+                            Ok(c) => {
+                                tracing::info!(thread = "journal-flush", core = c, "pinned to core")
+                            }
+                            Err(e) => {
+                                tracing::warn!(thread = "journal-flush", core, error = %e, "failed to pin")
+                            }
+                        }
+                    }
                     let mut publisher = publisher;
                     run_flush_executor(
                         cell,
@@ -1646,6 +1674,12 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// unpinned). Call before the stage runs — `enable_preparer` reads
     /// it at spawn time; changing it afterwards has no effect on an
     /// already-running worker.
+    /// Core for the flush executor thread; `0` leaves it unpinned.
+    /// Must be called before the stage runs.
+    pub fn set_flush_core(&mut self, core: usize) {
+        self.flush_core = core;
+    }
+
     pub fn set_preparer_core(&mut self, core: usize) {
         self.preparer_core = core;
     }

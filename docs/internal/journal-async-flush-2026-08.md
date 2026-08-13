@@ -538,37 +538,35 @@ park, and it costs the journal thread nothing either way.
 
 ### Core assignment
 
-Extend `--cores` with a `journal-flush` entry following the
-`journal-prep` precedent: `parse_cores` (`server.rs:624-630`) accepts
-9 or 10 entries today and gains an 11th, with `0 = unpinned`.
+`--cores` gains a `journal-flush` entry following the `journal-prep`
+precedent: `parse_cores` accepts 9, 10 or 11 entries, with
+`0 = unpinned` for anything omitted. The `Default` layout puts it on
+**core 11**, appended after `journal-prep`.
 
-**Ship the default as `0`.** An unpinned flush thread is correct and
-costs nothing structurally; picking a pinned default requires a layout
-decision this spec should not make, for a reason that only became clear
-on audit:
+**Correction to an earlier draft of this spec**, which called same-CCD
+placement load-bearing and proposed reshuffling the layout to seat the
+flush thread beside the journal core. The arithmetic does not support
+that. The watermark cell is touched once per *submit*, not per event —
+submits are clocked by the executor going idle, so a few thousand per
+second under load, against a million events. A cross-CCD transfer at
+~100 ns therefore costs well under a tenth of a percent of one core,
+and adds ~100 ns to each ack's persisted leg against a p50 round trip
+measured in tens of microseconds. Real, but nowhere near enough to
+justify moving `matching` off its core on an unmeasured guess.
 
-The target part, the EPYC 9275F, is **8 CCDs × 3 cores** (256 MB L3 /
-32 MB per CCD). With SMT off, CCD0 is cores 0–2, and the default layout
-already fills it: core 0 for OS/IRQ, `journal` 1, `matching` 2. The
-watermark cell is the first genuinely CCD-sensitive pair in the
-pipeline — it bounces between the journal and flush threads on every
-batch, and a cross-CCD transfer costs ~100 ns+ — so honouring "same CCD
-as the journal core" on this part means displacing `matching` from
-CCD0. That is *probably* harmless, since journal and matching are
-parallel input-ring consumers that never talk to each other and
-matching's real cache partners are the ring producer and the output
-ring, but "probably" is not a basis for changing the default layout on
-the part we recommend to customers.
+The topology finding stands and is still worth recording: the target
+part, the EPYC 9275F, is **8 CCDs × 3 cores** (256 MB L3 / 32 MB per
+CCD), so with SMT off CCD0 is cores 0–2 and the default layout already
+fills it — core 0 for OS/IRQ, `journal` 1, `matching` 2. Seating the
+flush thread beside the journal *would* mean displacing `matching`.
+Whether that trade is worth making is a measurement, tracked as
+**"Evidence-based `--cores` layout"** in [roadmap.md](roadmap.md), whose
+method reduces here to a two-point experiment: same-CCD versus
+appended, read off the submit→publish histogram. Note also that the
+control-plane pinning roadmap item claims an "eleventh `--cores` entry"
+too — journal-flush took it, so that item takes the twelfth.
 
-Deriving that layout properly — including whether core 0's kernel and
-IRQ work pollutes CCD0's 32 MB L3 badly enough to move the pair
-elsewhere — is its own measurement exercise, tracked as **"Evidence-based
-`--cores` layout"** in [roadmap.md](roadmap.md). This spec ships the
-seam and the instruments; that item spends the bench time. Note also
-that the control-plane pinning roadmap item claims an "eleventh
-`--cores` entry" too — whichever lands second takes the twelfth.
-
-Two consequences of the `0` default:
+Two consequences of `0` meaning unpinned:
 
 - **`compact` needs no core.** It reserves core 7 for the bench client
   specifically to avoid an HT collision (`server.rs:591-617`); an
@@ -579,14 +577,14 @@ Two consequences of the `0` default:
   when `journal-flush` is unpinned while the rest of the layout is
   explicit: degraded-but-handled is exactly that level's remit.
 
-When the flush thread *is* pinned, two placement rules hold regardless
-of the layout chosen: same CCD as the journal core, and never an SMT
-sibling of journal, matching, or response — it is a pure spinner and a
-sibling spinner steals issue slots from the thread this design exists
-to protect. (The bench fleet runs SMT off; the `compact` doc comment at
+One placement rule is not a matter of degree: **never an SMT sibling of
+journal, matching, or response.** The flush thread is a pure spinner,
+and a sibling spinner steals issue slots from the thread this design
+exists to protect — unlike the CCD question, that is a first-order
+effect. The bench fleet runs SMT off, but the `compact` doc comment at
 `server.rs:583-587` records that the `Default` layout has sibling
 collisions on a 16-thread part, so the rule needs stating rather than
-assuming.)
+assuming.
 
 ## Observability
 
