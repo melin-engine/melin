@@ -133,6 +133,8 @@ Pre-staging needs spare device *bandwidth*, not just spare endurance. Staging is
 
 The preparer runs on its own thread, pinned via the optional tenth `--cores` entry (`journal-prep`). Leave it unpinned (`0`, the behavior when the entry is omitted) or give it an auxiliary core — never a pipeline core, and never core 0.
 
+`buffered` mode adds a second thread, `journal-flush`, which performs the `fdatasync` off the journal stage so a stalling disk cannot stall encoding or replication — see [pipeline-architecture.md](pipeline-architecture.md#flush-thread). Unlike the preparer it busy-spins, so it wants a core of its own: the eleventh `--cores` entry, defaulting to core 11.
+
 Two boundary cases keep the old behavior: the first segment after process start (including a live segment reopened by crash recovery) is allocated rather than pre-written, so the metadata-commit stall can appear until the first recurring rotation replaces it; and manual-only configurations (`--max-journal-mib 0` on a primary, rotating exclusively via the `ROTATE` admin command) skip pre-staging entirely — each manual rotation pays a synchronous allocate and its segment never gains the pre-written property.
 
 ---

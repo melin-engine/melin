@@ -388,7 +388,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// the writer, which is what makes the handoff a raw fd rather than
     /// a borrow.
     pub fn sync_batch(&self) -> Result<(), JournalError> {
-        fdatasync_raw(self.file.as_raw_fd())
+        fdatasync_raw(self.file.as_raw_fd()).map_err(JournalError::Io)
     }
 
     /// Drop the pending batch without writing it. Used by the
@@ -703,12 +703,6 @@ impl<E: AppEvent> BufferedWriter<E> {
     }
 }
 
-/// Pre-allocate one chunk of disk blocks starting at `from`. Returns
-/// the new end-of-allocation offset.
-///
-/// Allocates only the new range — not `[0, from + chunk)` — so the
-/// fallocate call doesn't walk the entire extent tree on every
-/// extension as the journal grows.
 /// Force a descriptor's data to stable media.
 ///
 /// Exposed as a free function taking a raw fd because the flush executor
@@ -718,19 +712,30 @@ impl<E: AppEvent> BufferedWriter<E> {
 /// implementation here means the inline and asynchronous paths cannot
 /// drift apart in what "durable" means.
 ///
+/// Returns `io::Error` rather than [`JournalError`] deliberately: the
+/// executor records the failure as an `errno` for the operator-facing
+/// message, and wrapping the OS error in another error type erases
+/// `raw_os_error()` — the poison path then reports "no error" for a
+/// disk that is failing.
+///
 /// # Safety of the descriptor
 /// The caller must guarantee `fd` is open for the duration of the call.
 /// On the async path that is the rotation drain's job — the journal
 /// thread never closes the live segment while a sync is in flight.
-pub fn fdatasync_raw(fd: RawFd) -> Result<(), JournalError> {
+pub fn fdatasync_raw(fd: RawFd) -> std::io::Result<()> {
     // Safety: borrowed for the duration of the call only; the borrow
     // never outlives this frame and never takes ownership, so the
     // caller's `File` remains the sole owner.
     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    rustix::fs::fdatasync(borrowed)
-        .map_err(|e| JournalError::Io(std::io::Error::from_raw_os_error(e.raw_os_error())))
+    rustix::fs::fdatasync(borrowed).map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
+/// Pre-allocate one chunk of disk blocks starting at `from`. Returns
+/// the new end-of-allocation offset.
+///
+/// Allocates only the new range — not `[0, from + chunk)` — so the
+/// fallocate call doesn't walk the entire extent tree on every
+/// extension as the journal grows.
 fn fallocate_chunk(file: &File, from: u64) -> Result<u64, JournalError> {
     let chunk = prealloc_chunk_bytes();
     rustix::fs::fallocate(
@@ -875,6 +880,37 @@ mod tests {
             std::fs::read(&split_path).unwrap()[..end],
             "the two paths must produce byte-identical journal data"
         );
+    }
+
+    #[test]
+    fn fdatasync_raw_preserves_the_errno() {
+        // The flush executor records the failure as an `errno` and the
+        // journal stage turns that into its fatal shutdown. Any error
+        // type that erases `raw_os_error()` — e.g. re-wrapping through
+        // `io::Error::other` — silently disables that whole path, so the
+        // OS error has to survive this call intact.
+        // A pipe cannot be synchronised, so this fails with a
+        // deterministic EINVAL. `-1` would not do: `BorrowedFd` rejects
+        // it before the syscall runs.
+        let mut fds = [0i32; 2];
+        // Safety: `fds` is a valid two-element array, which is exactly
+        // what `pipe(2)` writes into.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe()");
+
+        let err = fdatasync_raw(fds[0]).expect_err("a pipe cannot be synced");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EINVAL),
+            "errno must survive: the poison path reports it, and a lost \
+             errno reads as 'no failure'"
+        );
+
+        // Safety: both descriptors came from the successful `pipe` above
+        // and are closed exactly once.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 
     #[test]

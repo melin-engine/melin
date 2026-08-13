@@ -314,6 +314,11 @@ struct HealthSnapshot {
     /// Rotation attempts that failed and left the current segment in
     /// place (the journal keeps growing) — any growth is alert-worthy.
     journal_rotations_failed: u64,
+    /// Wire sequences written but not yet durable — how far the flush
+    /// executor is trailing the journal thread. Zero in steady state;
+    /// a sustained value means the disk is stalling and the pipeline is
+    /// riding through it rather than freezing.
+    journal_flush_lag: u64,
     /// Control-plane raft election state; `None` when raft isn't
     /// configured on this node.
     raft: Option<RaftSnapshot>,
@@ -548,6 +553,7 @@ impl HealthSnapshot {
                 .journal_utilization
                 .rotations_failed
                 .load(Ordering::Relaxed),
+            journal_flush_lag: state.journal_utilization.flush_lag.load(Ordering::Relaxed),
             raft: state.raft.as_ref().map(|r| RaftSnapshot {
                 node_id: r.node_id,
                 term: r.term.load(Ordering::Relaxed),
@@ -675,6 +681,9 @@ impl HealthSnapshot {
              melin_journal_rotations_total{{path=\"fast\"}} {}\n\
              melin_journal_rotations_total{{path=\"sync_fallback\"}} {}\n\
              melin_journal_rotations_total{{path=\"failed\"}} {}\n\
+             # HELP melin_journal_flush_lag Wire sequences written to the journal but not yet made durable by the flush executor. Zero in steady state; a sustained value means the disk is stalling while the pipeline rides through it. Always zero on the io_uring journal path, which does not run an executor.\n\
+             # TYPE melin_journal_flush_lag gauge\n\
+             melin_journal_flush_lag {}\n\
              # HELP melin_durability_policy_degraded Durability policy currently unsatisfiable by the connected cluster shape; the response gate stalls while set (1 = degraded, 0 = healthy).\n\
              # TYPE melin_durability_policy_degraded gauge\n\
              melin_durability_policy_degraded {}\n\
@@ -720,6 +729,7 @@ impl HealthSnapshot {
             self.journal_rotations_fast_path,
             self.journal_rotations_sync_fallback,
             self.journal_rotations_failed,
+            self.journal_flush_lag,
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );

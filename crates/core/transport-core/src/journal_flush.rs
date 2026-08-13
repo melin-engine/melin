@@ -72,10 +72,6 @@ pub struct FlushWatermark {
     /// BLAKE3 chain hash after the batch. `[0u8; 32]` when hash-chain is
     /// disabled.
     pub chain_hash: [u8; 32],
-    /// Rotation epoch. Bumped by the journal thread after a segment
-    /// swap; a watermark whose generation no longer matches the live
-    /// segment is inert.
-    pub generation: u64,
     /// Descriptor to sync, or [`NOTHING_TO_SYNC`] when the bytes are
     /// already durable — which is what `JournalWrite::write_batch`
     /// reports as `None` (an empty batch, or a writer like the
@@ -91,6 +87,14 @@ pub struct FlushWatermark {
     /// Widened from `RawFd` (`i32`) to `i64` so the struct stays
     /// padding-free without an explicit filler field.
     pub fd: i64,
+    /// When the journal thread submitted this watermark. The executor
+    /// measures against it to produce the submit→publish histogram —
+    /// the direct read of "what would have been an inline stall", and
+    /// the instrument the `--cores` placement experiment needs.
+    ///
+    /// `u64` under `latency-trace`, a zero-sized `()` otherwise, so the
+    /// field costs nothing in production builds.
+    pub submit_ts: crate::trace::MonoTraceInstant,
 }
 
 /// `fd` value meaning "no sync is owed for this watermark".
@@ -114,8 +118,8 @@ const _: () = assert!(
             + size_of::<RingPos>()
             + size_of::<RingPos>()
             + size_of::<[u8; 32]>()
-            + size_of::<u64>()
             + size_of::<i64>()
+            + size_of::<crate::trace::MonoTraceInstant>()
 );
 
 /// Cross-thread state shared by the journal thread and its executor.
@@ -159,15 +163,15 @@ impl FlushShared {
         self.poisoned.load(Ordering::Acquire)
     }
 
-    /// The `errno` behind [`is_poisoned`](Self::is_poisoned), or `None`
-    /// if healthy. `0` is reported as `None` — a failed sync always
-    /// carries an OS error.
-    pub fn poison_errno(&self) -> Option<i32> {
-        if !self.is_poisoned() {
-            return None;
-        }
-        let raw = self.poison_errno.load(Ordering::Acquire);
-        (raw != 0).then_some(raw as i32)
+    /// The `errno` behind [`is_poisoned`](Self::is_poisoned).
+    ///
+    /// `0` when the failure carried no OS error — callers must decide
+    /// whether the executor is dead from
+    /// [`is_poisoned`](Self::is_poisoned), never from this value.
+    /// Reporting "no errno" as "not poisoned" would let an error type
+    /// that erases `raw_os_error()` silently disable the fatal path.
+    pub fn poison_errno(&self) -> i32 {
+        self.poison_errno.load(Ordering::Acquire) as i32
     }
 }
 
@@ -208,6 +212,7 @@ impl FlushHandle {
     pub fn submit(&mut self, mut watermark: FlushWatermark) {
         self.last_submitted += 1;
         watermark.submit_seq = self.last_submitted;
+        watermark.submit_ts = crate::trace::mono_trace_ns();
         self.cell.store(watermark);
     }
 
@@ -239,8 +244,11 @@ impl FlushHandle {
     /// Required before any segment swap: the executor holds a raw fd
     /// from the cell, so closing the live `File` with a sync in flight
     /// would land that sync on a closed — or worse, recycled —
-    /// descriptor. The `generation` field guards a stale *publication*;
-    /// only this drain guards the *syscall*.
+    /// descriptor. Nothing else guards it: there is no epoch stamped on
+    /// the watermark, because an epoch could only make a stale
+    /// *publication* inert — it cannot un-issue a syscall already in
+    /// flight against a descriptor the journal thread is about to close.
+    /// Ordering is the whole guarantee.
     ///
     /// Checks "drained" before "poisoned" deliberately: an executor that
     /// published up to the target and then failed on a later watermark
@@ -409,8 +417,20 @@ pub fn run_flush_executor<S, P>(
     let mut last_synced_seq: u64 = 0;
     let mut idle_spins: u32 = 0;
 
+    // The direct measure of "what would have been an inline stall":
+    // everything between the journal thread handing over a watermark and
+    // the cursors moving. Compiles away entirely without `latency-trace`.
+    #[cfg(feature = "latency-trace")]
+    let mut handoff_rec =
+        crate::trace::register_stage("journal-flush: submit → publish (sync + cursor publish)");
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            // Hand over buffered samples on the way out — a recorder
+            // that stops recording keeps them thread-local and they
+            // never reach a snapshot.
+            #[cfg(feature = "latency-trace")]
+            handoff_rec.flush();
             return;
         }
         if shared.poisoned.load(Ordering::Acquire) {
@@ -456,6 +476,8 @@ pub fn run_flush_executor<S, P>(
         }
 
         publish(&watermark);
+        #[cfg(feature = "latency-trace")]
+        handoff_rec.record_elapsed(watermark.submit_ts, crate::trace::mono_trace_ns());
         last_published = watermark.submit_seq;
         // `published_journal_seq` first: a reader that sees the submit
         // counter advance must not then read a stale lag.
@@ -489,8 +511,9 @@ mod tests {
             ring_progress: RingPos::new(ring_progress),
             input_ring_seq: RingPos::new(ring_progress),
             chain_hash: [journal_seq as u8; 32],
-            generation: 0,
             fd: 7,
+            // Overwritten by `submit`, like `submit_seq`.
+            submit_ts: crate::trace::mono_trace_ns(),
         }
     }
 
@@ -606,7 +629,6 @@ mod tests {
         let mut sent = watermark(42, 100);
         sent.chain_hash = [0xAB; 32];
         sent.input_ring_seq = RingPos::new(105);
-        sent.generation = 3;
         sent.fd = 11;
         handle.submit(sent);
 
@@ -638,7 +660,6 @@ mod tests {
             "distinct from ring_progress"
         );
         assert_eq!(got.chain_hash, [0xAB; 32]);
-        assert_eq!(got.generation, 3);
         assert_eq!(got.fd, 11);
         assert_eq!(got.submit_seq, 1, "submit assigns the counter");
     }
@@ -844,7 +865,7 @@ mod tests {
                     .expect("drain must abort on poison, not wait for a cursor that never moves"),
                 DrainOutcome::Poisoned
             );
-            assert_eq!(handle.shared().poison_errno(), Some(28));
+            assert_eq!(handle.shared().poison_errno(), 28);
         });
     }
 
@@ -1080,8 +1101,8 @@ mod tests {
             ring_progress: RingPos::new(500),
             input_ring_seq: RingPos::new(505),
             chain_hash: [1u8; 32],
-            generation: 0,
             fd: NOTHING_TO_SYNC,
+            submit_ts: crate::trace::mono_trace_ns(),
         };
 
         publisher.publish_state(&w);

@@ -213,21 +213,35 @@ The journal stage runs on a dedicated OS thread and is responsible for making ev
 
 ### Processing loop
 
-1. Call `consumer.read_batch()` to copy up to `MAX_JOURNAL_BATCH` (1,024) events from the ring buffer into a local array. This does not advance the consumer's progress cursor.
-2. Batch-encode all events into the `SectorWriter`'s internal buffer. `QueryStats` events are skipped (they cause no state change and are not journaled).
-3. When a sync trigger fires, call `flush_batch_sync()` which issues a single `pwritev2` with `RWF_DSYNC` (Force Unit Access) -- combining write + sync into one syscall. On NVMe with power-loss protection, this achieves approximately 10-100 us sync latency instead of the approximately 1-7 ms of full cache flushes via `fdatasync`.
-4. Call `consumer.commit(pending)` to advance the progress cursor, making the journal's position visible to the response stage.
+1. Call `consumer.read_batch()` to copy events from the ring buffer into a local array. This does not advance the consumer's progress cursor.
+2. Batch-encode all events into the writer's internal buffer. Query events are skipped (they cause no state change and are not journaled).
+3. When a submit trigger fires, publish the batch to the replication rings and write it to the journal.
+4. Hand the write to the flush thread, and continue with the next batch without waiting for it.
 
-### Sync triggers
+The durability call itself runs on a separate thread — see [Flush thread](#flush-thread) below. The progress cursor is advanced by *that* thread, once the data is on stable media, which is what keeps persist-before-ack intact while the journal thread keeps moving.
 
-A batch is synced when any of:
-- The batch reaches `MAX_JOURNAL_BATCH` (1,024 events)
-- The group commit delay has elapsed since the first unsynced write
-- Group commit delay is zero (sync immediately after each read batch)
+### Flush thread
+
+The journal stage's `fdatasync` runs on a dedicated thread named `journal-flush` (buffered writer only; the experimental sector writer keeps its own io_uring path). The journal thread hands it the position it just wrote and carries on encoding and replicating; the flush thread makes the data durable and only then advances the cursors the response stage gates acks on.
+
+The operational consequence is that a stalling disk no longer stops the pipeline. Events keep being encoded and shipped to replicas through the stall, bounded by the input ring, so under a durability mode whose requirement a replica can satisfy (`hybrid`), acks keep flowing. Under `local`, acks wait for the local disk exactly as before — but the stall is now visible as flush lag rather than as a frozen pipeline.
+
+Watch `melin_journal_flush_lag`: sequences written but not yet durable. It sits at zero in steady state; a sustained value means the disk is stalling and the pipeline is riding through it. Rotation is the one point that still waits for an in-flight flush to finish, so a stall coinciding with a segment boundary briefly pauses the journal thread.
+
+Pin it with the eleventh `--cores` entry (`journal-flush`); the default leaves it on core 11. It busy-spins like the other pipeline stages, so never place it on the SMT sibling of a hot core.
+
+### Submit triggers
+
+A batch is written and handed to the flush thread when any of:
+- The batch reaches `--max-journal-batch` events
+- `--group-commit-us` has elapsed since the first unwritten event (when non-zero)
+- The flush thread is idle (when `--group-commit-us` is `0`, the default)
 
 ### Group commit delay
 
-The `group_commit_delay` parameter (configurable via `--group-commit-us`) allows the journal to wait up to a specified duration for more events to accumulate before issuing the durable write. Under high load, the batch fills naturally and the delay rarely fires.
+The `group_commit_delay` parameter (configurable via `--group-commit-us`) makes the journal wait up to a specified duration for more events to accumulate before writing. Under high load, the batch fills naturally and the delay rarely fires.
+
+At the default of `0` there is no timed wait: the stage writes as soon as the flush thread is free. That self-clocking is what keeps batches from collapsing into one tiny write per pass now that the journal thread no longer blocks on the disk — while the disk is busy, events accumulate; when it frees up, they go out together. Setting a non-zero delay replaces that behaviour with the timed wait.
 
 **Important**: Group commit helps throughput only with UDS transport (+34% at 100 us). With TCP transport, it hurts throughput because the delay holds the journal cursor longer, making the response stage block and accumulate larger TCP send buffers. **Keep at 0 for TCP** (the default).
 
@@ -394,7 +408,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3,4,5,6,7,8,9,10` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep (comma-separated). 0 = unpinned. The tenth entry is optional — a 9-entry value parses and leaves the segment preparer unpinned. |
+| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep, journal-flush (comma-separated). 0 = unpinned. The last two entries are optional — a 9- or 10-entry value parses and leaves the trailing threads unpinned, so an existing explicit layout survives an upgrade unchanged. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |

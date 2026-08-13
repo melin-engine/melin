@@ -20,8 +20,14 @@ use melin_journal::replication::REPLICATION_RING_CAPACITY;
 // Only the journal-reading tests touch these, and those are gated off
 // under no-persist (every read needs a really-persisted journal file).
 #[cfg(not(feature = "no-persist"))]
-use melin_journal::{BufferedWriter, JournalReader};
-use melin_journal::{JournalEvent, SectorWriter};
+use melin_journal::JournalReader;
+// `BufferedWriter` is the shared `Writer` alias below, so it is needed
+// in every configuration; `SectorWriter` is only used by the
+// cross-writer equivalence test, which needs a real journal to read
+// back and is therefore gated off under no-persist.
+#[cfg(not(feature = "no-persist"))]
+use melin_journal::SectorWriter;
+use melin_journal::{BufferedWriter, JournalEvent};
 use melin_pipeline::ring;
 
 #[cfg(not(feature = "no-persist"))]

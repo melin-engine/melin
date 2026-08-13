@@ -618,6 +618,20 @@ mod tests {
         }
     }
 
+    /// Shrink the prealloc chunk for a test that builds real journal
+    /// segments.
+    ///
+    /// Every segment `fallocate`s a full chunk, which defaults to
+    /// 256 MiB — so a multi-segment lineage reserves the better part of
+    /// a gigabyte, and the whole module doing it in parallel can exhaust
+    /// a filesystem that has plenty of room for the few kilobytes of
+    /// entries actually written. Bind it to a *named* variable: the
+    /// guard releases the override when dropped.
+    #[must_use]
+    fn small_prealloc() -> crate::prealloc::PreallocOverrideGuard {
+        crate::prealloc::PreallocOverrideGuard::new(64 * 1024)
+    }
+
     /// Build `live` with `events_per_phase` entries between rotations.
     /// `phases.len() - 1` rotations are performed (the last phase stays
     /// in the live segment). A phase count of 0 produces an empty
@@ -709,6 +723,7 @@ mod tests {
     #[cfg(feature = "hash-chain")]
     #[test]
     fn chain_value_at_matches_writer_at_every_prefix() {
+        let _prealloc = small_prealloc();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("chain_at.journal");
 
@@ -740,6 +755,7 @@ mod tests {
     /// target otherwise, `None` past the tail.
     #[test]
     fn read_segment_prefix_returns_exact_byte_prefixes() {
+        let _prealloc = small_prealloc();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("prefix.journal");
         build_lineage(&live, &[3]);
@@ -768,6 +784,7 @@ mod tests {
     /// wrong end sequence, wrong byte length, trailing entries.
     #[test]
     fn verify_segment_prefix_accepts_real_prefixes_and_rejects_lies() {
+        let _prealloc = small_prealloc();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("verify_prefix.journal");
         build_lineage(&live, &[3]);
@@ -800,6 +817,7 @@ mod tests {
 
     #[test]
     fn verify_lineage_accepts_intact_multi_segment_journal() {
+        let _prealloc = small_prealloc();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("j.journal");
         // Includes an empty middle segment from back-to-back rotation.
@@ -817,6 +835,7 @@ mod tests {
 
     #[test]
     fn verify_lineage_rejects_missing_middle_segment() {
+        let _prealloc = small_prealloc();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("j.journal");
         build_lineage(&live, &[2, 2, 2]);
@@ -861,6 +880,7 @@ mod tests {
     /// operator can tell "normal crash tail" from tampering.
     #[test]
     fn verify_lineage_reports_gap_at_live_tail() {
+        let _prealloc = small_prealloc();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("j.journal");
         build_lineage(&live, &[2, 2]); // archive(1-2) + live(3-4)
@@ -877,6 +897,7 @@ mod tests {
     /// artifact — the verifier must fail, exactly like recovery.
     #[test]
     fn verify_lineage_rejects_gap_inside_archive() {
+        let _prealloc = small_prealloc();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("j.journal");
         // One segment with a forged gap, then rotate so it gets sealed.
@@ -907,6 +928,7 @@ mod tests {
         // A trimmed-but-consistent prefix passes verification (no
         // snapshot context here) but the report exposes where history
         // begins so callers can judge.
+        let _prealloc = small_prealloc();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("j.journal");
         build_lineage(&live, &[2, 2, 2]);

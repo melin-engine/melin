@@ -40,7 +40,11 @@ use crate::cursors::{
     AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, RingPos, WireSeq,
 };
 
-use crate::journal_flush::{CursorPublisher, DrainOutcome, FlushHandle, run_flush_executor};
+use crate::journal_flush::{CursorPublisher, DrainOutcome, FlushHandle};
+// Only the durable build spawns an executor; `no-persist` has no
+// durability call to move off the journal thread.
+#[cfg(not(feature = "no-persist"))]
+use crate::journal_flush::run_flush_executor;
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
 
 /// Post-fsync state published by the journal stage after each durable
@@ -147,6 +151,17 @@ pub struct StageUtilization {
     /// (see `BufferedWriter::rotate_segment_with_prepared`). Only used
     /// by the journal stage.
     pub rotations_sync_fallback: AtomicU64,
+    /// Wire sequences submitted to the flush executor but not yet made
+    /// durable and published — `submitted − published`.
+    ///
+    /// Zero in steady state. A sustained non-zero value is a disk that
+    /// is stalling while the pipeline rides through it, which is the
+    /// whole point of the asynchronous flush and the one symptom that is
+    /// otherwise invisible: before it, such a stall showed up as a
+    /// frozen pipeline. Always 0 on the io_uring path and under
+    /// `no-persist`, neither of which runs an executor. Only used by the
+    /// journal stage.
+    pub flush_lag: AtomicU64,
     /// Cumulative rotation *attempts* that failed (ENOSPC, read-only
     /// filesystem, …) and left the current segment in place. The
     /// journal keeps growing past its threshold while this climbs, so
@@ -168,6 +183,7 @@ impl StageUtilization {
             rotations_fast_path: AtomicU64::new(0),
             rotations_sync_fallback: AtomicU64::new(0),
             rotations_failed: AtomicU64::new(0),
+            flush_lag: AtomicU64::new(0),
         }
     }
 }
@@ -558,7 +574,23 @@ struct FlushExec {
     /// the executor must outlive it long enough to publish the final
     /// drain, or the last batch's cursor advance is lost.
     stop: Arc<AtomicBool>,
-    handle: std::thread::JoinHandle<CursorPublisher>,
+    /// `Option` so the orderly teardown can take the handle to `join`
+    /// it — a type with a `Drop` impl cannot be moved out of.
+    handle: Option<std::thread::JoinHandle<CursorPublisher>>,
+}
+
+impl Drop for FlushExec {
+    /// Stop the executor even when the journal thread unwinds.
+    ///
+    /// The orderly teardown in `stop_flush_executor` takes the `Option`,
+    /// so this only runs if the stage panicked before reaching it. The
+    /// executor loop exits solely on this flag, and under `busy_spin` it
+    /// never yields — so without this a panic anywhere in the journal
+    /// loop would leave a thread spinning on a core for the life of the
+    /// process.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 /// How long to suppress size-driven rotation attempts after a failure.
@@ -847,10 +879,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                         // rotation drain guarantees the journal thread
                         // does not close it while this call is in
                         // flight.
-                        |fd| {
-                            melin_journal::fdatasync_raw(fd as std::os::fd::RawFd)
-                                .map_err(std::io::Error::other)
-                        },
+                        |fd| melin_journal::fdatasync_raw(fd as std::os::fd::RawFd),
                         |w| publisher.publish(w),
                         busy_spin,
                         &thread_stop,
@@ -863,7 +892,10 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     )))
                 })?;
 
-            Ok(Some(FlushExec { stop, handle }))
+            Ok(Some(FlushExec {
+                stop,
+                handle: Some(handle),
+            }))
         }
     }
 
@@ -880,16 +912,26 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// publish again, and the error reaches operators through the
     /// journal thread's own poison check.
     fn stop_flush_executor(&mut self, exec: &mut Option<FlushExec>) {
-        let Some(exec) = exec.take() else { return };
+        let Some(mut exec) = exec.take() else { return };
+        let Some(thread) = exec.handle.take() else {
+            return;
+        };
         if let Publication::Executor(handle) = &self.publication {
-            // Never set — only poison ends this wait early.
-            let never = AtomicBool::new(false);
-            if handle.drain(&never, self.busy_spin) == DrainOutcome::Poisoned {
+            // Hand-rolled rather than `drain`, because this wait needs a
+            // third exit: a thread that unwound. A panicked executor
+            // neither publishes nor poisons, so waiting on those two
+            // conditions alone would hang shutdown forever — and the
+            // panic-reporting arm below would be unreachable.
+            let mut idle_spins: u32 = 0;
+            while !handle.is_idle() && !handle.shared().is_poisoned() && !thread.is_finished() {
+                idle_wait(&mut idle_spins, self.busy_spin);
+            }
+            if handle.shared().is_poisoned() {
                 tracing::error!("journal flush executor poisoned — final cursors not published");
             }
         }
         exec.stop.store(true, Ordering::Release);
-        match exec.handle.join() {
+        match thread.join() {
             Ok(publisher) => self.publication = Publication::Inline(publisher),
             // The executor panicked, taking the publisher with it. The
             // stage cannot publish again; the journal thread is on its
@@ -907,9 +949,10 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// This is what makes the raw fd in the watermark cell sound. The
     /// executor syncs a descriptor it was handed earlier; rotating
     /// closes that file, so a sync still in flight would land on a
-    /// closed — or worse, recycled — descriptor. The `generation` field
-    /// guards a stale *publication*; only this drain guards the
-    /// *syscall*.
+    /// closed — or worse, recycled — descriptor. Ordering is the whole
+    /// guarantee; no epoch on the watermark could substitute, since an
+    /// epoch can only make a stale *publication* inert, never un-issue a
+    /// syscall already in flight.
     ///
     /// Waits on nothing but the executor: it is still running, so it
     /// publishes within one `fdatasync` — the same wait the inline path
@@ -925,6 +968,29 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 handle.drain(&never, self.busy_spin) == DrainOutcome::Drained
             }
         }
+    }
+
+    /// Surface a failed executor sync as the journal stage's own fatal
+    /// error, so a broken disk tears the pipeline down through the same
+    /// path an inline failure takes.
+    ///
+    /// Keyed on the poison *flag*, not on the errno being non-zero: an
+    /// error type that erases `raw_os_error()` would otherwise silently
+    /// disable the whole fatal path and leave the pipeline wedged with
+    /// frozen cursors and no log line.
+    fn check_flush_poison(&self) -> Result<(), JournalError> {
+        let Publication::Executor(handle) = &self.publication else {
+            return Ok(());
+        };
+        if !handle.shared().is_poisoned() {
+            return Ok(());
+        }
+        let errno = handle.shared().poison_errno();
+        Err(JournalError::Io(if errno != 0 {
+            std::io::Error::from_raw_os_error(errno)
+        } else {
+            std::io::Error::other("journal flush executor failed with no OS error")
+        }))
     }
 
     /// Whether no flush is in flight, so the live segment may be
@@ -1020,7 +1086,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             crate::trace::register_stage("journal: disruptor wakeup (publish → journal consume)");
         #[cfg(feature = "latency-trace")]
         let mut batch_rec =
-            crate::trace::register_stage("journal: batch processing (write + sync)");
+            // Encode and `pwrite` only — the sync moved to the flush
+            // executor, so this recorder no longer covers it.
+            crate::trace::register_stage("journal: batch processing (encode + write)");
         // Paces the idle-path recorder flush. See `trace::StageRecorder::flush`.
         #[cfg(feature = "latency-trace")]
         let mut stats_flush_timer = melin_app::amortized_timer::AmortizedTimer::new();
@@ -1030,11 +1098,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             // it is inline: surface it through the same path, one batch
             // later. Cursors are already frozen, so nothing was acked
             // that is not durable.
-            if let Publication::Executor(handle) = &self.publication
-                && let Some(errno) = handle.shared().poison_errno()
-            {
-                return Err(JournalError::Io(std::io::Error::from_raw_os_error(errno)));
-            }
+            self.check_flush_poison()?;
 
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 // Take publication back before the tail: it flushes and
@@ -1181,6 +1245,15 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                         if !self.apply_stream_marks(true)?
                             && matches!(self.pending_mark, Some(StreamMark::Rotate(_)))
                         {
+                            // A poisoned executor can never drain, so
+                            // the boundary can never be adopted and this
+                            // barrier would spin forever — it is inside
+                            // the encode loop, which never reaches the
+                            // outer loop's poison and shutdown checks.
+                            // Storage backoff is different: it expires
+                            // and the retry can succeed, which is what
+                            // the sleep below is for.
+                            self.check_flush_poison()?;
                             // The rotation failed and is backed off; the
                             // rest of this read batch sits past the
                             // boundary and cannot be encoded until the
@@ -1214,14 +1287,26 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             // iteration", which is exactly the free-running case. With
             // no executor `flush_idle` is always true, so the behaviour
             // is unchanged.
+            //
+            // An operator-set delay suppresses the idle clause rather
+            // than racing it. The self-clock only ever *shortens* the
+            // wait, so leaving it unconditional would make
+            // `--group-commit-us` a no-op on a healthy disk — the
+            // executor is idle most of the time, so every pending event
+            // would submit immediately instead of accumulating for the
+            // configured window. The knob keeps meaning what it says;
+            // the self-clock governs the default (`0`) path.
             if pending > 0 {
                 let flush_idle = match &self.publication {
                     Publication::Inline(_) => true,
                     Publication::Executor(handle) => handle.is_idle(),
                 };
-                let should_sync = flush_idle
-                    || pending >= self.max_batch
-                    || (!delay.is_zero() && first_write_ts.is_some_and(|ts| ts.elapsed() >= delay));
+                let should_sync = if delay.is_zero() {
+                    flush_idle || pending >= self.max_batch
+                } else {
+                    pending >= self.max_batch
+                        || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay)
+                };
 
                 if should_sync {
                     // Everything read so far is encoded — committing to
@@ -1454,13 +1539,6 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         );
     }
 
-    /// Publish post-fsync writer state to optional readers:
-    /// [`FsyncState`] (for shadow snapshots and replica handshakes) and
-    /// `last_seq` (highest journal sequence durably persisted, used by the
-    /// replica orchestrator on reconnect handshakes). Both `Option`s are
-    /// independent; either can be set or unset. Called once per fsync
-    /// batch (cold path); each `if let Some` is a single branch on a small
-    /// struct field.
     /// Publish post-flush writer state without advancing ring progress.
     ///
     /// Reached from the rotation-completion paths, where the writer's
@@ -1497,9 +1575,8 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// Sampling is separated from publishing because the durability call
     /// between them will move to another thread: `fdatasync` covers only
     /// what was dirty when it was called, so the values published after
-    /// it must be the ones read before it. `fd` and `generation` are
-    /// filled in by the submit path, which knows what the write left
-    /// outstanding.
+    /// it must be the ones read before it. `fd` is filled in by the
+    /// submit path, which knows what the write left outstanding.
     #[inline]
     fn sample_watermark(&self, ring_progress: u64) -> crate::journal_flush::FlushWatermark {
         crate::journal_flush::FlushWatermark {
@@ -1510,8 +1587,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             ring_progress: RingPos::new(ring_progress),
             input_ring_seq: RingPos::new(self.consumer.next_read()),
             chain_hash: self.writer.chain_hash().unwrap_or([0u8; 32]),
-            generation: 0,
             fd: crate::journal_flush::NOTHING_TO_SYNC,
+            // Stamped by `FlushHandle::submit`, like `submit_seq`.
+            submit_ts: crate::trace::mono_trace_ns(),
         }
     }
 
@@ -1548,7 +1626,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         // here, hand over the descriptor, keep going. Inline, the two
         // stay welded as `flush_batch_sync` — byte-for-byte the path
         // this stage has always taken.
-        let to_sync = match self.publication {
+        // Annotated because under `no-persist` the arms that infer it
+        // are compiled out.
+        let to_sync: Option<std::os::fd::RawFd> = match self.publication {
             #[cfg(not(feature = "no-persist"))]
             Publication::Executor(_) => self.writer.write_batch().map_err(|e| {
                 JournalError::Io(std::io::Error::other(format!("journal write_batch: {e}")))
@@ -1582,9 +1662,18 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         let mut watermark = self.sample_watermark(progress);
         watermark.fd = to_sync.map_or(crate::journal_flush::NOTHING_TO_SYNC, i64::from);
         self.last_submitted_progress = progress;
+        let submitted_seq = watermark.journal_seq;
         match &mut self.publication {
             Publication::Executor(handle) => handle.submit(watermark),
             Publication::Inline(publisher) => publisher.publish(&watermark),
+        }
+        // One `Relaxed` store per submit — a few thousand a second, not
+        // per event — so the health endpoint has a live view of how far
+        // durability is trailing dispatch.
+        if let Publication::Executor(handle) = &self.publication {
+            self.utilization
+                .flush_lag
+                .store(handle.lag(submitted_seq), Ordering::Relaxed);
         }
         Ok(())
     }
@@ -1670,16 +1759,16 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         }
     }
 
-    /// Set the core the preparer worker pins itself to (`0` =
-    /// unpinned). Call before the stage runs — `enable_preparer` reads
-    /// it at spawn time; changing it afterwards has no effect on an
-    /// already-running worker.
-    /// Core for the flush executor thread; `0` leaves it unpinned.
-    /// Must be called before the stage runs.
+    /// Core for the flush executor thread (`0` = unpinned). Call before
+    /// the stage runs — `run_sync` reads it when it spawns the thread.
     pub fn set_flush_core(&mut self, core: usize) {
         self.flush_core = core;
     }
 
+    /// Set the core the preparer worker pins itself to (`0` =
+    /// unpinned). Call before the stage runs — `enable_preparer` reads
+    /// it at spawn time; changing it afterwards has no effect on an
+    /// already-running worker.
     pub fn set_preparer_core(&mut self, core: usize) {
         self.preparer_core = core;
     }
