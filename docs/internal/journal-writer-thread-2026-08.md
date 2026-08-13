@@ -179,27 +179,55 @@ into twice.
    thread configuration, errno survival to the poison path, cursor
    advance while running (not only after shutdown).
 
-## Sequencing
+## Sequencing (as built)
 
-1. Command queue + writer thread, rotation still on the journal thread
-   behind a drain (mechanical; keeps the branch bisectable).
-2. Move the replication publish to encode.
-3. Move rotation into the writer as a `Rotate` command; delete the drain
-   protocol, the `RawFd` cell, and the mid-batch barrier.
-4. Delete the `Publication` split.
+1. `BufferedWriter` learns to give up its `SegmentFile`
+   (`detach`/`attach`, `take_batch`, the rotation halves).
+2. The write queue and writer loop, with rotation as a queued command.
+3. The pipeline wiring: `Durability::{Inline, Writer}` replaces the
+   `Publication` split, and the flush executor is deleted.
 
-Steps 1–2 are independently benchmarkable and should already remove the
-stall; 3–4 are the simplification the move pays for.
+Rotation did **not** stay on the journal thread behind a drain, as an
+earlier draft of this plan had it: rotation needs the file, and the file
+is the thing that moved. Putting it in the queue is what deletes the
+drain protocol rather than preserving it.
+
+## Resolved while building
+
+- **Queue depth** is the constant `WRITE_QUEUE_DEPTH = 8`, not a knob —
+  the sizing argument above, plus the `--group-commit-us` drift as
+  precedent.
+- **Rotation is synchronous from the journal thread's side.** It queues
+  the command and blocks for the reply. It must know whether the
+  rotation succeeded before re-anchoring its chain, and a failure has to
+  leave the encoder writing to the *old* segment. An asynchronous
+  rotation would allow an encoder whose chain has moved onto a segment
+  that does not exist. The wait is bounded by the queue ahead of it,
+  which is the same stall the inline path always paid — minus the
+  separate drain.
+- **A poisoned writer still answers rotations** (with an error).
+  Silence would wedge a blocked journal thread rather than fail it, on
+  exactly the path where operators need the error.
+- **`--cores` entry eleven is renamed** `journal-flush` →
+  `journal-write`. Position and default (core 11) unchanged, so only the
+  documented name moves.
 
 ## Open questions
 
-- **Queue depth default and whether it is configurable.** Sizing above
-  argues 4–8 buffers; making it a knob invites the same
-  "`--group-commit-us` became a no-op" class of drift, so prefer a
-  constant until a deployment needs otherwise.
-- **Does the writer thread want `SCHED_FIFO`?** It now does blocking
-  I/O rather than busy-spinning, so the answer is probably no, unlike
-  the flush executor it replaces. Decide against measurement.
-- **What happens to `--cores journal-flush`?** The thread it names still
-  exists but its role changed. Keep the entry and the name, or rename to
-  `journal-write` and accept the config break.
+- **Does the writer thread want `SCHED_FIFO`?** It does blocking I/O
+  rather than busy-spinning between batches, so probably not — unlike
+  the flush executor it replaces. It currently inherits whatever
+  `configure_spawned_thread` grants for its core. Decide against
+  measurement.
+- **Is `valid_end` lagging by the queue depth acceptable for the
+  rotation size trigger?** It now reports what the writer has written,
+  so it trails what the encoder has handed over by at most
+  `WRITE_QUEUE_DEPTH` batches (~4 MiB against segments of hundreds of
+  MiB). Believed negligible; unmeasured.
+
+## Not yet verified
+
+The acceptance benches still need the 9275F fleet: no-regression,
+batching-did-not-collapse, fault-injected stall masking, and the
+deep-rejoin drill. Nothing here has been run against real hardware — the
+stall this branch exists to remove has not been observed to be gone.
