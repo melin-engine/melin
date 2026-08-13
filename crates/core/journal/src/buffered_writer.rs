@@ -59,13 +59,106 @@ const HEADER_OFFSET: u64 = ENTRY_OFFSET;
 // disk-space cadence under matched configuration.
 use crate::prealloc::prealloc_chunk_bytes;
 
+/// The live segment's file, plus everything that describes its on-disk
+/// extent: where the next entry goes, how far space is pre-allocated,
+/// and the pending post-rotation directory fsync.
+///
+/// Split out from [`BufferedWriter`] because these are exactly the
+/// fields a *writer thread* needs and the encode path does not. Keeping
+/// them together makes "one thread owns the file" expressible as
+/// ownership of this struct rather than as a convention — see
+/// `docs/internal/journal-writer-thread-2026-08.md`. The encoder half
+/// keeps the batch buffer, the sequence counter and the hash chain, none
+/// of which touch the disk.
+pub struct SegmentFile {
+    file: File,
+    path: PathBuf,
+    /// Byte offset of the next entry. Always the end of valid data;
+    /// there is no in-memory partial sector, so this is `valid_end`.
+    write_pos: u64,
+    /// Byte offset of the end of pre-allocated space. When `write_pos`
+    /// approaches this, another `prealloc_chunk_bytes()` is allocated.
+    allocated_end: u64,
+    /// Retries a failed post-rotation directory fsync until it succeeds
+    /// (see `crate::segment::DirFsyncRetry`). Polled from the write
+    /// path — a single branch in steady state.
+    dir_fsync_retry: crate::segment::DirFsyncRetry,
+}
+
+impl SegmentFile {
+    /// Append `bytes` at the current position and advance it.
+    ///
+    /// No durability implied — [`sync`](Self::sync) is what makes it
+    /// stable. Pre-allocates ahead when the write would run past the
+    /// allocated extent.
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), JournalError> {
+        // Paced retry of a failed post-rotation dir fsync — a single
+        // branch in steady state.
+        self.dir_fsync_retry.poll();
+        self.ensure_allocated(bytes.len())?;
+        write_all_at(&self.file, bytes, self.write_pos)?;
+        self.write_pos += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Force everything written so far to stable media.
+    ///
+    /// Honest durability: the call doesn't return until the kernel
+    /// reports the data is on stable media. On a drive with a volatile
+    /// write cache this issues a device-side flush; on a PLP drive
+    /// (VWC=0) the flush is a near-no-op.
+    pub fn sync(&self) -> Result<(), JournalError> {
+        fdatasync_raw(self.file.as_raw_fd()).map_err(JournalError::Io)
+    }
+
+    /// Byte offset past the last written entry.
+    #[inline]
+    pub fn valid_end(&self) -> u64 {
+        self.write_pos
+    }
+
+    /// On-disk path of the active segment.
+    #[inline]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Extend the pre-allocated region whenever the next write would
+    /// land past it. Allocates one chunk at a time via
+    /// `posix_fallocate` — extent allocation only, no zero-fill cost.
+    /// In the prepared-segment flow this only fires when a segment
+    /// outgrows its pre-zeroed region (threshold overshoot past the
+    /// preparer's margin, or a replica following larger-than-expected
+    /// primary segments) — appends past here generate extent-conversion
+    /// metadata again until the next rotation.
+    fn ensure_allocated(&mut self, extra: usize) -> Result<(), JournalError> {
+        let need = self.write_pos + extra as u64;
+        if need <= self.allocated_end {
+            return Ok(());
+        }
+        self.allocated_end = fallocate_chunk(&self.file, self.allocated_end)?;
+        Ok(())
+    }
+
+    /// Adopt a freshly created segment file, closing the outgoing one.
+    fn install(&mut self, file: File, allocated_end: u64) {
+        // Dropping the previous `File` closes the outgoing (now
+        // archived) segment's fd.
+        self.file = file;
+        self.write_pos = HEADER_OFFSET;
+        self.allocated_end = allocated_end;
+    }
+}
+
 /// Append-only journal writer that goes through the kernel page cache
 /// and forces durability with `fdatasync` per flush.
 pub struct BufferedWriter<E: AppEvent> {
     // PhantomData carries the app event type for the methods that
     // read/write `JournalEvent<E>`. Zero-size — no runtime cost.
     _marker: PhantomData<fn(E) -> E>,
-    file: File,
+    /// The live segment's file and extent bookkeeping. Held whole so it
+    /// can be handed to a writer thread as a unit — see [`SegmentFile`].
+    segment: SegmentFile,
     // Scratch buffer for single-entry encoding. Fixed-size array — entry
     // sizes are bounded, so avoiding a Vec lets the hot path stay
     // allocation-free.
@@ -82,14 +175,6 @@ pub struct BufferedWriter<E: AppEvent> {
     // `starting_sequence`), kept in memory so emptiness / rotation-
     // boundary checks need no header re-read.
     starting_sequence: u64,
-    path: PathBuf,
-    // Byte offset of the next entry to be written. Always points at the
-    // end of valid data; no sector-tail bookkeeping, so `valid_end() ==
-    // write_pos`.
-    write_pos: u64,
-    // Byte offset of the end of pre-allocated space. When `write_pos`
-    // approaches this, another `prealloc_chunk_bytes()` is allocated.
-    allocated_end: u64,
     #[cfg(feature = "hash-chain")]
     hash_chain: SegmentChain,
     // Debug-only monotonicity guard: every fresh seq must strictly
@@ -101,10 +186,6 @@ pub struct BufferedWriter<E: AppEvent> {
     // without a second encode pass.
     last_user_entry_offset: usize,
     last_user_entry_len: usize,
-    // Retries a failed post-rotation directory fsync until it succeeds
-    // (see `crate::segment::DirFsyncRetry`). Polled from the flush
-    // path — a single branch in steady state.
-    dir_fsync_retry: crate::segment::DirFsyncRetry,
 }
 
 impl<E: AppEvent> BufferedWriter<E> {
@@ -155,22 +236,24 @@ impl<E: AppEvent> BufferedWriter<E> {
 
         Ok(Self {
             _marker: PhantomData,
-            file,
+            segment: SegmentFile {
+                file,
+                path: path.to_path_buf(),
+                write_pos: HEADER_OFFSET,
+                allocated_end,
+                dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
+            },
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
             next_sequence: starting_sequence,
             starting_sequence,
-            path: path.to_path_buf(),
-            write_pos: HEADER_OFFSET,
-            allocated_end,
             #[cfg(feature = "hash-chain")]
             hash_chain: SegmentChain::new(anchor_hash),
             #[cfg(debug_assertions)]
             last_encoded_seq: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
-            dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
 
@@ -222,15 +305,18 @@ impl<E: AppEvent> BufferedWriter<E> {
 
         Ok(Self {
             _marker: PhantomData,
-            file,
+            segment: SegmentFile {
+                file,
+                path: path.to_path_buf(),
+                write_pos: valid_end,
+                allocated_end,
+                dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
+            },
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
             next_sequence: last_seq + 1,
             starting_sequence: info.starting_sequence,
-            path: path.to_path_buf(),
-            write_pos: valid_end,
-            allocated_end,
             #[cfg(feature = "hash-chain")]
             hash_chain: SegmentChain::rebuild_from_file(
                 path,
@@ -242,7 +328,6 @@ impl<E: AppEvent> BufferedWriter<E> {
             last_encoded_seq: last_seq,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
-            dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
 
@@ -359,21 +444,17 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// retrying the batch — so the old ordering's implicit "a failed
     /// sync leaves the batch re-writable" property is not relied upon.
     pub fn write_batch(&mut self) -> Result<Option<RawFd>, JournalError> {
-        // Paced retry of a failed post-rotation dir fsync — a single
-        // branch in steady state.
-        self.dir_fsync_retry.poll();
         if self.batch_len == 0 {
+            // Still poll the paced dir-fsync retry: an empty batch is
+            // the common idle case, and the retry must make progress.
+            self.segment.dir_fsync_retry.poll();
             return Ok(None);
         }
-        self.ensure_allocated()?;
-
         let len = self.batch_len;
-        write_all_at(&self.file, &self.batch_buf[..len], self.write_pos)?;
-
-        self.write_pos += len as u64;
+        self.segment.append(&self.batch_buf[..len])?;
         self.batch_len = 0;
         self.last_user_entry_len = 0;
-        Ok(Some(self.file.as_raw_fd()))
+        Ok(Some(self.segment.file.as_raw_fd()))
     }
 
     /// Durability half of [`flush_batch_sync`](Self::flush_batch_sync).
@@ -388,7 +469,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// the writer, which is what makes the handoff a raw fd rather than
     /// a borrow.
     pub fn sync_batch(&self) -> Result<(), JournalError> {
-        fdatasync_raw(self.file.as_raw_fd()).map_err(JournalError::Io)
+        self.segment.sync()
     }
 
     /// Drop the pending batch without writing it. Used by the
@@ -419,7 +500,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// no in-memory partial sector, so the on-disk end and the logical
     /// end coincide.
     pub fn write_pos(&self) -> u64 {
-        self.write_pos
+        self.segment.valid_end()
     }
 
     /// Byte offset of the end of valid on-disk data. Identical to
@@ -427,11 +508,11 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// substitute the buffered and O_DIRECT writers behind a common
     /// interface without changing semantics.
     pub fn valid_end(&self) -> u64 {
-        self.write_pos
+        self.segment.valid_end()
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.segment.path()
     }
 
     /// Decoded file-header fields of the live segment (read from disk).
@@ -439,7 +520,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// `(starting_sequence, anchor_hash)` so a fresh replica journal is
     /// byte-identical from the segment's first entry onward.
     pub fn read_header_info(&self) -> Result<codec::FileHeaderInfo, JournalError> {
-        crate::segment::read_header_info(&self.path)
+        crate::segment::read_header_info(self.segment.path())
     }
 
     /// First sequence of the active segment (the header's
@@ -525,7 +606,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     ) -> Result<PathBuf, JournalError> {
         self.flush_batch_sync()?;
 
-        let path = self.path.clone();
+        let path = self.segment.path().to_path_buf();
         let next_seq = self.next_sequence;
         // Data end of the outgoing segment, captured post-flush while
         // `self` still describes it — the archive is compacted to this
@@ -555,7 +636,7 @@ impl<E: AppEvent> BufferedWriter<E> {
                 // fsync failure must not surface as a rotation failure
                 // — see `DirFsyncRetry` for why; a failure is retried
                 // from the flush path.
-                self.dir_fsync_retry.after_rotation(&path);
+                self.segment.dir_fsync_retry.after_rotation(&path);
                 // Drop the sealed segment's allocation padding (see
                 // `compact_archive` for why). Best-effort — the
                 // rotation is committed either way.
@@ -665,11 +746,9 @@ impl<E: AppEvent> BufferedWriter<E> {
         // for the next preparer cycle to reclaim.
         std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
 
-        // Commit point — nothing below can fail. Dropping the old
-        // `self.file` closes the outgoing (now archived) segment's fd.
-        self.file = file;
-        self.write_pos = HEADER_OFFSET;
-        self.allocated_end = allocated_end;
+        // Commit point — nothing below can fail. `install` drops the old
+        // `File`, closing the outgoing (now archived) segment's fd.
+        self.segment.install(file, allocated_end);
         self.starting_sequence = starting_sequence;
         self.batch_len = 0;
         self.last_user_entry_offset = 0;
@@ -682,23 +761,6 @@ impl<E: AppEvent> BufferedWriter<E> {
         {
             self.last_encoded_seq = 0;
         }
-        Ok(())
-    }
-
-    /// Extend the file's pre-allocated region whenever the next write
-    /// would land past it. Allocates one chunk at a time via
-    /// `posix_fallocate` — extent allocation only, no zero-fill cost.
-    /// In the prepared-segment flow this only fires when a segment
-    /// outgrows its pre-zeroed region (threshold overshoot past the
-    /// preparer's margin, or a replica following larger-than-expected
-    /// primary segments) — appends past here generate extent-conversion
-    /// metadata again until the next rotation.
-    fn ensure_allocated(&mut self) -> Result<(), JournalError> {
-        let need = self.write_pos + self.batch_len as u64;
-        if need <= self.allocated_end {
-            return Ok(());
-        }
-        self.allocated_end = fallocate_chunk(&self.file, self.allocated_end)?;
         Ok(())
     }
 }
@@ -1160,7 +1222,7 @@ mod tests {
         assert_eq!(writer.next_sequence(), seq_before_rotate);
         // The adopted segment's pre-zeroed region is the allocation —
         // appends must not immediately re-fallocate.
-        assert_eq!(writer.allocated_end, zeroed_end);
+        assert_eq!(writer.segment.allocated_end, zeroed_end);
         // The staging file is gone (renamed onto the live path).
         assert!(!crate::preparer::staging_path(&path).exists());
 
