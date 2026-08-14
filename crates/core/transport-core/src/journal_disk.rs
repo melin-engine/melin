@@ -573,6 +573,62 @@ mod tests {
         assert_eq!(&written[start..start + 9], b"alphabeta");
     }
 
+    /// A backlog deeper than `MAX_IOV` must still land as one ordered
+    /// concatenation, split across as many vectored writes as it takes.
+    ///
+    /// The default ring depth equals `MAX_IOV`, so production never
+    /// reaches the chunking branch — which is precisely why it needs a
+    /// test. A ring built deeper (the capacity is a parameter) would
+    /// otherwise exercise untested code on the durability path, and the
+    /// failure mode is silent: bytes out of order or dropped at the
+    /// 64-batch seam, each entry individually well-formed and passing
+    /// its CRC.
+    #[test]
+    fn a_backlog_deeper_than_one_iovec_batch_lands_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two full iovec passes plus a partial third.
+        const BATCHES: usize = MAX_IOV * 2 + 5;
+        let (mut producer, consumer) = build_journal_write_ring(256);
+        let (cursors, progress, durable) = cursors();
+        let mut disk = JournalDisk::new(
+            segment(dir.path()),
+            consumer,
+            cursors,
+            Arc::new(DiskControl::new()),
+            false,
+        );
+
+        // Distinct, order-revealing payloads: a reordering or a drop at
+        // the seam changes the concatenation.
+        let mut expected = Vec::new();
+        for i in 0..BATCHES {
+            let payload = format!("[batch-{i:04}]");
+            submit(
+                &mut producer,
+                payload.as_bytes(),
+                meta(payload.len(), i as u64 + 1, (i as u64 + 1) * 10),
+            );
+            expected.extend_from_slice(payload.as_bytes());
+        }
+
+        assert!(disk.drain_and_sync().unwrap(), "the whole backlog drains");
+        assert_eq!(durable.load(), WireSeq::new(BATCHES as u64));
+        assert_eq!(
+            progress.get().load(Ordering::Acquire),
+            BATCHES as u64 * 10,
+            "the last batch's cursors are the ones published"
+        );
+        assert!(producer.drained(), "every slot released together");
+
+        let written = std::fs::read(dir.path().join("test.journal")).unwrap();
+        let start = 4096; // entries begin past the header
+        assert_eq!(
+            &written[start..start + expected.len()],
+            &expected[..],
+            "a backlog spanning several vectored writes must concatenate in order"
+        );
+    }
+
     /// Nothing published means nothing to do — and, critically, no
     /// cursor movement. A spurious publication here would advance
     /// durability over data that was never written.

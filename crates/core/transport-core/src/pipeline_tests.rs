@@ -1639,6 +1639,92 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
     assert_eq!(live_seqs, vec![3]);
 }
 
+/// The input-ring progress published at a mid-batch mark barrier must
+/// cover only the entries actually encoded, never the whole read batch.
+///
+/// This is persist-before-ack on a replica. The barrier hands over a
+/// *prefix* of the read batch — everything up to the announced boundary
+/// — while the tail sits unencoded until the rotation completes.
+/// Publishing `next_read` there would advance the cursor the ack path
+/// gates on past entries the journal has not taken, letting the replica
+/// acknowledge data it has not persisted. Segment placement stays
+/// correct either way, which is why the existing adoption tests cannot
+/// see this: the entries still land in the right files, the *cursor*
+/// just lies about them.
+///
+/// Driven with a deliberately wrong tail hash so the stage stops at the
+/// barrier with a divergence error, freezing the cursor at exactly the
+/// value the barrier published.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn mid_batch_barrier_commits_only_the_encoded_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("barrier_progress.journal");
+    let anchor = [0x5Cu8; 32];
+
+    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    // The cursor the ack path reads. Captured before the stage takes
+    // the consumer — the disk thread publishes into this same counter.
+    let progress = consumer.progress_counter();
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let marks: crate::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    marks
+        .lock()
+        .unwrap()
+        .push_back(StreamMark::Rotate(AdoptedRotation {
+            boundary_seq: 2,
+            // Not the local tail: the barrier submits the prefix, then
+            // the quiesced resolve rejects the rotation and the stage
+            // exits, leaving the cursor where the barrier put it.
+            tail_hash: [0xEEu8; 32],
+        }));
+    stage.set_stream_marks(Arc::clone(&marks));
+
+    // All three pre-published, so one `read_batch` spans the boundary
+    // and the split is forced.
+    for seq in 1..=3u64 {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+    }
+
+    let shutdown = AtomicBool::new(false);
+    // `expect_err` needs the Ok type to be Debug, and the writer is not.
+    let err = match stage.run(&shutdown) {
+        Err(e) => e,
+        Ok(_) => panic!("a wrong tail hash must be reported as divergence"),
+    };
+    assert!(
+        matches!(
+            err,
+            melin_journal::JournalError::ReplicaChainDivergence { sequence: 2, .. }
+        ),
+        "expected divergence at the boundary, got: {err}"
+    );
+
+    // Ring slots 0 and 1 hold seqs 1 and 2 — the boundary. Slot 2
+    // (seq 3) sits past it and was never encoded.
+    assert_eq!(
+        progress.get().load(Ordering::Acquire),
+        2,
+        "progress must stop at the boundary; publishing the whole read \
+         batch would let the replica ack seq 3, which was never journaled"
+    );
+
+    // Corroborate from the journal itself: the cursor claims two
+    // entries are durable, and exactly two are.
+    let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+    let mut seqs = Vec::new();
+    while let Some(e) = reader.next_entry().unwrap() {
+        seqs.push(e.sequence);
+    }
+    assert_eq!(seqs, vec![1, 2], "only the encoded prefix may be on disk");
+}
+
 /// Regression: a `Rotate` with a trailing `ChainCheck` queued inside
 /// the SAME read batch. After adopting the rotation mid-batch, the
 /// encode loop must re-bound the remaining span at the chain check
@@ -2598,6 +2684,69 @@ fn fsync_state_carries_the_real_chain_hash_when_a_publisher_is_attached() {
         fsync_state.load().chain_hash,
         expected,
         "published chain value disagrees with the on-disk journal at seq {EVENTS}"
+    );
+}
+
+/// A batch that encodes no bytes still has to travel to the disk
+/// thread, because the input-ring slots its events occupy are released
+/// by the cursors it carries — not by the write.
+///
+/// Queries are never journaled, so a query-only batch is byte-empty;
+/// under `no-persist` *every* batch is. Dropping such a batch as
+/// "nothing to write" leaves those slots held forever: the input ring
+/// fills, producers block on backpressure, and the pipeline wedges with
+/// no error anywhere. A hang, not a failure — which is exactly why it
+/// needs a test rather than trust.
+///
+/// Deliberately not gated on `no-persist`: the query path makes the
+/// batch byte-empty under every feature configuration, so this guards
+/// the same code in both.
+#[test]
+fn cursor_only_batches_still_release_their_input_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queries_only.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let progress = consumer.progress_counter();
+
+    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    const QUERIES: u64 = 6;
+    for n in 0..QUERIES {
+        producer.publish(TestInput {
+            event: JournalEvent::App(TestEvent::Query),
+            ..add_slot(n, 1_000_000_000 + n)
+        });
+    }
+
+    // Nothing is written, so durability cannot be observed through the
+    // journal — the released slots are the only evidence, and they are
+    // the thing that matters.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut spins = 0u32;
+    while progress.get().load(Ordering::Acquire) < QUERIES {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "query-only batches never released their input slots (progress {}) \
+             — the input ring would fill and the pipeline would wedge",
+            progress.get().load(Ordering::Acquire)
+        );
+        drain_backoff(&mut spins, std::time::Instant::now(), "slot release");
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    let writer = handle.join().unwrap().unwrap();
+    assert_eq!(
+        writer.next_sequence(),
+        1,
+        "queries must consume no journal sequence"
     );
 }
 
