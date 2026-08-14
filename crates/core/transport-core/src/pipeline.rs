@@ -2772,6 +2772,16 @@ impl<A: Application> MatchingStage<A> {
             }
             idle_spins = 0;
 
+            // One clock read for the whole batch, taken as soon as the
+            // batch is visible — the same point the journal stage takes
+            // its `batch_start`. Reading inside the slot loop instead
+            // made slot `i`'s "wakeup" include the execute time of slots
+            // `0..i`, so at saturation the percentiles reported in-batch
+            // queueing rather than the publish → consume delay the stage
+            // is named for, and cost one clock read per event.
+            #[cfg(feature = "latency-trace")]
+            let batch_consume_ts = mono_trace_ns();
+
             // Build ApplyCtx once per batch — the counters are advisory
             // (stats queries, health endpoint) so batch-stale values are
             // fine. `now_ns` and `key_hash` are overwritten per-event
@@ -2853,7 +2863,7 @@ impl<A: Application> MatchingStage<A> {
                 busy_count += 1;
 
                 #[cfg(feature = "latency-trace")]
-                wakeup_rec.record_elapsed(slot.publish_ts, mono_trace_ns());
+                wakeup_rec.record_elapsed(slot.publish_ts, batch_consume_ts);
 
                 reports.clear();
                 let mut query_report: Option<A::QueryResponse> = None;
