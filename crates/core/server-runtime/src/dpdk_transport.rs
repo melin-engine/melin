@@ -174,18 +174,18 @@ pub fn run_dpdk_poll<A: Application>(
     // state watermark and stays there.
     let mut conn_range_end: usize = 0;
 
-    // Reader-stage histogram. Single sample per published frame
-    // covering recv_ts → batch.push_with completion (decode + auth
-    // dispatch + slot construction + push). DPDK has no separate
-    // publish-call histogram because `batch.push_with` is a slot
-    // assignment in a pre-allocated batch — the work is dominated by
-    // the surrounding decode + dedup, which is what `ingest` measures.
+    // Reader-stage histograms. Both are recorded inside the shared
+    // `process_client_frames`, so they carry the same spans as the
+    // kernel reader: `publish` brackets the ring push alone (decode has
+    // already run), `ingest` covers recv_ts → publish complete and so
+    // includes decode + auth dispatch + slot construction.
     #[cfg(feature = "latency-trace")]
     let mut publish_rec =
-        melin_transport_core::trace::register_stage("dpdk: publish (decode → disruptor publish)");
+        melin_transport_core::trace::register_stage("reader: publish (ring push)");
     #[cfg(feature = "tick-to-trade")]
-    let mut ingest_rec =
-        melin_transport_core::trace::register_stage("reader: ingest (recv_ts → publish complete)");
+    let mut ingest_rec = melin_transport_core::trace::register_stage(
+        "reader: ingest (recv_ts → publish complete, incl. decode)",
+    );
 
     // Pre-allocated parse buffer pool. Avoids heap allocation on accept
     // by recycling buffers from disconnected connections.

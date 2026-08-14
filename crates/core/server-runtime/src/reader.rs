@@ -400,17 +400,20 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // Submit the initial eventfd read so we wake on first connection.
     push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
 
-    // Stage histograms via the global registry. `publish` is the
-    // narrow ring-publish call cost (lightweight, gated on
-    // `latency-trace`); `ingest` is the full per-frame reader cost
-    // and feeds the bench's tick-to-trade decomposition (heavier,
-    // gated on `tick-to-trade`).
+    // Stage histograms via the global registry. `publish` brackets the
+    // ring-push call alone — decode has already happened by then, so
+    // the span is the slot write and nothing else (lightweight, gated
+    // on `latency-trace`). `ingest` is the full per-frame reader cost
+    // *including* decode, and feeds the bench's tick-to-trade
+    // decomposition (heavier, gated on `tick-to-trade`). Decode cost is
+    // therefore `ingest - publish`, not a stage of its own.
     #[cfg(feature = "latency-trace")]
     let mut publish_rec =
-        melin_transport_core::trace::register_stage("reader: publish (decode → disruptor publish)");
+        melin_transport_core::trace::register_stage("reader: publish (ring push)");
     #[cfg(feature = "tick-to-trade")]
-    let mut ingest_rec =
-        melin_transport_core::trace::register_stage("reader: ingest (recv_ts → publish complete)");
+    let mut ingest_rec = melin_transport_core::trace::register_stage(
+        "reader: ingest (recv_ts → publish complete, incl. decode)",
+    );
     // Paces the recorder flush at the tail of each loop iteration. This
     // thread parks in `submit_and_wait` when there is no traffic, so
     // without an explicit flush its samples never reach the registry.
