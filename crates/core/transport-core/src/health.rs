@@ -2516,7 +2516,15 @@ mod tests {
         client
             .write_all(b"POST /metrics HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
             .unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
+        // Half-close is a courtesy — the server classifies from the
+        // first 16 bytes and never waits for EOF. It is also racy: the
+        // unread tail of this request makes the server's close an RST
+        // rather than a FIN, and once that lands `shutdown` reports
+        // ENOTCONN. Descheduling this thread anywhere between the write
+        // above and the call below is enough to lose that race, so the
+        // error is dropped rather than unwrapped — the same expected
+        // reset the read below already tolerates.
+        let _ = client.shutdown(std::net::Shutdown::Write);
         let mut buf = String::new();
         // RST from the server's close (unread bytes in recv buffer) is
         // expected on Linux — tolerate the read error and inspect what
