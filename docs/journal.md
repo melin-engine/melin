@@ -378,7 +378,7 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 - **Journal and Matching run in parallel** on the same events. Matching does not wait for the journal — it executes immediately. This overlaps matching latency with journal I/O latency.
 - **Response Stage gates on the journal cursor** — it will not send a response to the client until the journal stage has committed (synced) that event's sequence number. This enforces persist-before-ack without blocking the matching engine.
 - **Input ring capacity**: 1,048,576 slots (~72 bytes each, ~72 MiB). At 10M orders/sec, this provides ~100 ms of buffering.
-- **Max journal batch**: 1,024 events per sync. Limits encoding time before the sync call, bounding worst-case latency.
+- **Max journal batch**: 4,096 events per batch handed to the disk thread. Limits encoding time before hand-off, bounding worst-case latency. One `fdatasync` may cover several such batches when the device is behind.
 
 ### Feature Gates
 

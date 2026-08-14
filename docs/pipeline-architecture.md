@@ -209,21 +209,29 @@ Because the journal and matching consumers are gated only on the producer, they 
 
 Defined in `crates/core/transport-core/src/pipeline.rs` as `JournalStage`.
 
-The journal stage runs on a dedicated OS thread and is responsible for making every event durable before it can be acknowledged to clients. It uses `read_batch` + `commit` (not `consume_batch`) to decouple reading from cursor advancement -- the cursor is advanced only **after** the durable write completes.
+The journal stage is responsible for making every event durable before it can be acknowledged to clients. It runs on **two** dedicated OS threads -- a sequencing thread and a disk thread (see [The journal's two threads](#the-journals-two-threads)). Reading from the input ring is decoupled from advancing the progress cursor, and the cursor is advanced only **after** the durable write completes -- by the disk thread, which is the only one that knows when that moment is.
 
 ### Processing loop
 
-1. Call `consumer.read_batch()` to copy up to `MAX_JOURNAL_BATCH` (1,024) events from the ring buffer into a local array. This does not advance the consumer's progress cursor.
-2. Batch-encode all events into the writer's internal buffer. `QueryStats` events are skipped (they cause no state change and are not journaled).
-3. When a sync trigger fires, call `flush_batch_sync()`, which issues one `pwrite` covering the whole batch followed by `fdatasync`. The call returns only once the kernel reports the data is on stable media: approximately 10-30 us per batch on NVMe with power-loss protection, approximately 50-200 us on consumer drives where the device flush dominates.
-4. Call `consumer.commit(pending)` to advance the progress cursor, making the journal's position visible to the response stage.
+The sequencing thread:
+
+1. Reads up to `MAX_JOURNAL_BATCH` (4,096) events from the input ring into a local array. This does not advance the progress cursor.
+2. Batch-encodes them directly into a slot of the hand-off ring shared with the disk thread. Queries are skipped (they cause no state change and are not journaled), and each encoded entry is also appended to the batch being sent to replicas.
+3. When a sync trigger fires, publishes the slot -- the batch's bytes plus everything the disk thread must make true once it is durable. This does not wait for the device; the sequencing thread returns immediately to reading and encoding.
+
+The disk thread:
+
+4. Writes every published batch (`pwrite`), then issues a single `fdatasync` covering all of them. A backlog therefore costs one sync to clear, not one per batch. The call returns only once the kernel reports the data is on stable media: approximately 10-30 us on NVMe with power-loss protection, approximately 50-200 us on consumer drives where the device flush dominates.
+5. Publishes the durability cursors -- including the input-ring progress the response stage's gate reads -- and only then releases the hand-off slots.
+
+The hand-off ring holds 64 batches. A device stall is absorbed up to that depth before the sequencing thread stalls at its next batch and producers feel backpressure.
 
 ### Sync triggers
 
-A batch is synced when any of:
-- The batch reaches `MAX_JOURNAL_BATCH` (1,024 events)
+A batch is handed to the disk thread when any of:
+- The batch reaches `max_batch` (`MAX_JOURNAL_BATCH` = 4,096 events by default)
 - The group commit delay has elapsed since the first unsynced write
-- Group commit delay is zero (sync immediately after each read batch)
+- Group commit delay is zero (hand over after each read batch)
 
 ### Group commit delay
 
