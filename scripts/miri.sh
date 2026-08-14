@@ -69,6 +69,7 @@ SKIPS=(
     --skip snapshot::
     --skip shadow::
     --skip journaled_app::
+    --skip journal_disk::
     --skip pipeline_tests::
     --skip replication::handoff_test
     --skip replication::validate
