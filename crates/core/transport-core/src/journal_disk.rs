@@ -31,13 +31,18 @@
 //! poison flag and surfaces the original error through the usual fatal
 //! shutdown path.
 //!
-//! An *unexpected* exit — a panic — must reach the same flag. Every
-//! wait on this thread (claim a slot, drain, await a rotation) spins on
-//! `poisoned`, so a thread that unwound silently would strand the
-//! sequencer in a loop with no timeout and no diagnostic. Before the
-//! split the same panic unwound the journal thread itself and the
-//! server's liveness watchdog caught it; [`PoisonOnUnwind`] restores
-//! that.
+//! An *unexpected* exit — a panic — must not hang the pipeline either.
+//! Every wait on this thread (claim a slot, drain, await a rotation)
+//! spins on `poisoned` with no timeout, so a thread that unwound
+//! silently would strand the sequencer with no diagnostic.
+//!
+//! Which mechanism prevents that depends on the profile. Release builds
+//! set `panic = "abort"`, so a panic here takes the process down
+//! immediately — loud, and impossible to hang. Debug and test builds
+//! unwind, and there [`PoisonOnUnwind`] converts the unwind into the
+//! same poison a write failure produces, so the sequencer reports a
+//! broken journal instead of spinning. The guarantee holds in both;
+//! only the failure's shape differs.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -195,6 +200,11 @@ impl DiskControl {
 /// `poisoned`, with no timeout — a panic that left the flag clear would
 /// hang the pipeline rather than fail it. Disarmed on the normal exits,
 /// so this only ever fires on a panic.
+///
+/// Dead code in release builds, which are `panic = "abort"`: there the
+/// process is already gone. This covers debug and test builds, and it
+/// keeps the guarantee from depending on a profile setting that lives
+/// in a different file.
 struct PoisonOnUnwind {
     control: Arc<DiskControl>,
     armed: bool,
@@ -648,8 +658,11 @@ mod tests {
     /// this thread — claiming a slot, draining, awaiting a rotation —
     /// is an untimed spin gated on that flag, so a thread that unwound
     /// without setting it would hang the whole pipeline instead of
-    /// failing it. Before the split the same panic unwound the journal
-    /// thread and the server's liveness watchdog caught it.
+    /// failing it.
+    ///
+    /// This is the unwinding half of the guarantee, which is the half
+    /// tests can reach: release builds are `panic = "abort"` and never
+    /// get here, because the process is already gone.
     #[test]
     fn a_panicking_disk_thread_poisons_rather_than_stranding_the_sequencer() {
         let dir = tempfile::tempdir().unwrap();

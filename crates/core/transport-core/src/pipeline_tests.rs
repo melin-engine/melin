@@ -2532,6 +2532,75 @@ fn size_trigger_tracks_the_segments_real_size() {
     );
 }
 
+/// The sequencer skips the per-batch chain value when nothing reads it
+/// (`chain_hash_observed`) — it costs a BLAKE3 clone and finalize on
+/// the hand-off path. This is the other half of that bargain: with a
+/// publisher attached, `FsyncState.chain_hash` must carry the real
+/// chain at the batch's last sequence.
+///
+/// The shadow stage stamps this value into every snapshot it writes, so
+/// a regression to a constant would produce snapshots that fail chain
+/// verification against the journal they claim to describe — and only
+/// at recovery time, on a node that has already lost its memory state.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn fsync_state_carries_the_real_chain_hash_when_a_publisher_is_attached() {
+    use melin_pipeline::seqlock;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("observed_chain.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let (fsync_writer, fsync_state) = seqlock::split(crate::pipeline::FsyncState::default());
+    stage.set_chain_hash_lock(fsync_writer);
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    // One event per batch, so the published state describes exactly the
+    // sequence we then verify against the file.
+    const EVENTS: u64 = 8;
+    for seq in 1..=EVENTS {
+        producer.publish(add_slot(seq, 1_000_000_000 + seq));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while fsync_state.load().journal_seq.get() < seq {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seq {seq} never became durable"
+            );
+            std::hint::spin_loop();
+        }
+        let published = fsync_state.load();
+        assert_eq!(published.journal_seq.get(), seq);
+        assert_ne!(
+            published.chain_hash, [0u8; 32],
+            "seq {seq}: the chain value was not computed"
+        );
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+
+    // The published value must equal the chain the journal file itself
+    // produces at that sequence — not merely be non-zero.
+    let expected = match melin_journal::segment::chain_value_at(&path, EVENTS).unwrap() {
+        melin_journal::segment::ChainValueAt::Value(v) => v,
+        other => panic!("journal ends before seq {EVENTS}: {other:?}"),
+    };
+    assert_eq!(
+        fsync_state.load().chain_hash,
+        expected,
+        "published chain value disagrees with the on-disk journal at seq {EVENTS}"
+    );
+}
+
 /// `melin_journal_disk_lag_batches` is documented as zero in steady
 /// state, and operators are told to alert on a *sustained* non-zero
 /// value. That only holds if the gauge is refreshed after the disk

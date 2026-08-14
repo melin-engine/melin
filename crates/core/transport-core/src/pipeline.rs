@@ -574,6 +574,17 @@ struct Sequencer<E: AppEvent> {
     disk: Arc<DiskControl>,
     /// The disk thread, joined at shutdown to recover the file half.
     disk_thread: Option<std::thread::JoinHandle<SegmentFile>>,
+    /// Whether anything downstream reads the per-batch chain value.
+    ///
+    /// `FsyncState.chain_hash` has exactly one consumer — the shadow
+    /// stage's snapshot writer — and it is wired only when snapshots
+    /// are enabled. Producing the value costs a BLAKE3 hasher clone and
+    /// finalize, ~400 ns, on the hand-off path of *every* batch; with
+    /// no publisher attached that is pure waste, which is what this
+    /// flag removes. It does not gate the chain itself: rotation
+    /// anchors, `Rotate` announces, and replication chain checks all
+    /// still read the encoder directly.
+    chain_hash_observed: bool,
     /// Bytes encoded into the live segment. The size-driven rotation
     /// trigger reads this instead of the file's end: the file is on
     /// another thread, and the boundary is a property of the stream
@@ -848,6 +859,10 @@ impl<E: AppEvent> JournalStage<E> {
             build_journal_write_ring(melin_journal::write_ring::DEFAULT_CAPACITY);
         let control = Arc::new(DiskControl::new());
         let segment_bytes = segment.valid_end();
+        // Decided once, here, because this is the only place that still
+        // sees both halves: past this point the publisher lives on the
+        // disk thread and the encoder on the sequencer.
+        let chain_hash_observed = self.chain_hash.is_some();
 
         // The cursors that mean "durable" move with the file half —
         // only the disk thread knows when a batch has become durable.
@@ -893,6 +908,7 @@ impl<E: AppEvent> JournalStage<E> {
             claim: None,
             disk: control,
             disk_thread: Some(disk_thread),
+            chain_hash_observed,
             segment_bytes,
             consumer: self.consumer,
             group_commit_delay: self.group_commit_delay,
@@ -1446,7 +1462,13 @@ impl<E: AppEvent> Sequencer<E> {
         let meta = JournalWriteMeta {
             len,
             journal_seq: self.encoder.next_sequence().saturating_sub(1),
-            chain_hash: self.encoder.chain_hash().unwrap_or([0u8; 32]),
+            // ~400 ns of BLAKE3 per batch, skipped outright when no
+            // publisher is attached — see `chain_hash_observed`.
+            chain_hash: if self.chain_hash_observed {
+                self.encoder.chain_hash().unwrap_or([0u8; 32])
+            } else {
+                [0u8; 32]
+            },
             ring_progress: progress,
             input_ring_seq: self.consumer.next_read(),
         };

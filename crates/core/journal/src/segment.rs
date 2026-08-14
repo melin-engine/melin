@@ -556,7 +556,15 @@ impl DirFsyncRetry {
     /// Retry a pending fsync, paced to one attempt per
     /// [`DIR_FSYNC_RETRY_INTERVAL`]. A single branch when nothing is
     /// pending — safe to call from per-batch paths.
+    ///
+    /// The emptiness check comes before the clock read, not after: this
+    /// runs once per journal drain, and `Instant::now()` is a ~20 ns
+    /// vDSO call that the steady state (nothing pending, forever) has
+    /// no use for.
     pub fn poll(&mut self) {
+        if self.pending.is_none() {
+            return;
+        }
         self.poll_at(Instant::now());
     }
 

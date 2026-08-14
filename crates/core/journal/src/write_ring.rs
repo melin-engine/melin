@@ -85,6 +85,11 @@ pub struct JournalWriteMeta {
 
 /// Pre-allocated chunks, one per ring slot.
 ///
+/// A boxed slice of whole chunks, so all 64 slots are one contiguous
+/// allocation rather than 64 scattered ones — the slots are written in
+/// rotation, and consecutive batches land [`CHUNK_SIZE`] apart, so the
+/// encode path's locality depends on it.
+///
 /// Thread safety: the disruptor protocol provides mutual exclusion. The
 /// producer writes slot N only after every consumer has advanced past it
 /// (backpressure), and the consumer reads slot N only after the producer
@@ -204,8 +209,16 @@ impl JournalWriteProducer {
     }
 
     /// Batches published but not yet durable — the flush-lag gauge.
+    ///
+    /// `Relaxed`, unlike [`drained`](Self::drained): this feeds a gauge,
+    /// and nothing is ordered against it. `drained` is the read that
+    /// carries the acquire edge.
     pub fn in_flight(&self) -> u64 {
-        self.inner.peek_cursor().saturating_sub(self.consumed())
+        let consumed = self
+            .consumer_progress
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.inner.peek_cursor().saturating_sub(consumed)
     }
 }
 
