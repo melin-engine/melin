@@ -212,6 +212,80 @@ pub fn clear_affinity() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Number of CPUs in the calling thread's affinity mask.
+    #[cfg(test)]
+    fn affinity_width() -> usize {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set),
+                0,
+                "sched_getaffinity failed: {}",
+                std::io::Error::last_os_error()
+            );
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&c| libc::CPU_ISSET(c, &set))
+                .count()
+        }
+    }
+
+    /// A thread spawned from a pinned parent inherits the parent's
+    /// single-core mask, and [`clear_affinity`] — called *from the
+    /// child* — widens the child's own mask without touching the
+    /// parent's.
+    ///
+    /// The journal's disk thread depends on exactly this: it is spawned
+    /// from the pinned sequencing thread, and if it kept the inherited
+    /// mask it would busy-spin on the sequencer's core. Both halves are
+    /// asserted because both are load-bearing — inheritance is why the
+    /// call is needed, and `tid 0 = self` is why it is safe.
+    #[test]
+    fn child_inherits_parent_affinity_and_can_clear_its_own() {
+        let full_width = affinity_width();
+        if full_width < 2 {
+            // A single-CPU machine cannot distinguish inherited from
+            // cleared. Assert what still holds and stop.
+            assert!(pin_to_core(0).is_ok());
+            return;
+        }
+
+        // Pin a parent thread (not the test thread — the pin would
+        // outlive the test and skew whatever runs next on it).
+        let widths = std::thread::spawn(|| {
+            pin_to_core(0).expect("core 0 always exists");
+            let parent_before = affinity_width();
+
+            let child = std::thread::spawn(|| {
+                let inherited = affinity_width();
+                clear_affinity().expect("clear affinity");
+                (inherited, affinity_width())
+            })
+            .join()
+            .expect("child thread");
+
+            (parent_before, child, affinity_width())
+        })
+        .join()
+        .expect("parent thread");
+
+        let (parent_before, (child_inherited, child_cleared), parent_after) = widths;
+
+        assert_eq!(parent_before, 1, "the parent pinned itself to one core");
+        assert_eq!(
+            child_inherited, 1,
+            "child must inherit the parent's single-core mask — if this ever \
+             stops holding, the disk thread's clear_affinity call is obsolete"
+        );
+        assert_eq!(
+            child_cleared, full_width,
+            "clear_affinity must restore the full mask on the calling thread"
+        );
+        assert_eq!(
+            parent_after, 1,
+            "the child's clear_affinity must not touch the parent's pin"
+        );
+    }
+
     #[test]
     fn pin_to_core_0_succeeds() {
         // Core 0 always exists on any machine.
