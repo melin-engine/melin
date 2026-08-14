@@ -408,11 +408,14 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // decomposition (heavier, gated on `tick-to-trade`). Decode cost is
     // therefore `ingest - publish`, not a stage of its own.
     #[cfg(feature = "latency-trace")]
-    let mut publish_rec =
-        melin_transport_core::trace::register_stage("reader: publish (ring push)");
+    let mut publish_rec = melin_transport_core::trace::register_stage(
+        "reader: publish (ring push)",
+        melin_transport_core::trace::StageUnit::Frame,
+    );
     #[cfg(feature = "tick-to-trade")]
     let mut ingest_rec = melin_transport_core::trace::register_stage(
         "reader: ingest (recv_ts → publish complete, incl. decode)",
+        melin_transport_core::trace::StageUnit::Frame,
     );
     // Paces the recorder flush at the tail of each loop iteration. This
     // thread parks in `submit_and_wait` when there is no traffic, so
@@ -1304,9 +1307,15 @@ mod tests {
         producer: &mut ring::Producer<InputSlot<TestEvent>>,
     ) -> (bool, mpsc::Receiver<ControlEvent>) {
         #[cfg(feature = "latency-trace")]
-        let mut publish_rec = melin_transport_core::trace::register_stage("test: publish");
+        let mut publish_rec = melin_transport_core::trace::register_stage(
+            "test: publish",
+            melin_transport_core::trace::StageUnit::Frame,
+        );
         #[cfg(feature = "tick-to-trade")]
-        let mut ingest_rec = melin_transport_core::trace::register_stage("test: ingest");
+        let mut ingest_rec = melin_transport_core::trace::register_stage(
+            "test: ingest",
+            melin_transport_core::trace::StageUnit::Frame,
+        );
 
         #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
         let recv_ts = melin_transport_core::trace::mono_trace_ns();
@@ -1431,9 +1440,15 @@ mod tests {
         // recv site; distinct from the wall-clock stamp (0xDEAD_BEEF).
         const RECV_TS: u64 = 0x5EED_5EED;
 
-        let mut publish_rec = melin_transport_core::trace::register_stage("test: publish recv_ts");
+        let mut publish_rec = melin_transport_core::trace::register_stage(
+            "test: publish recv_ts",
+            melin_transport_core::trace::StageUnit::Frame,
+        );
         #[cfg(feature = "tick-to-trade")]
-        let mut ingest_rec = melin_transport_core::trace::register_stage("test: ingest recv_ts");
+        let mut ingest_rec = melin_transport_core::trace::register_stage(
+            "test: ingest recv_ts",
+            melin_transport_core::trace::StageUnit::Frame,
+        );
 
         let (control_tx, _control_rx) = mpsc::channel();
         let disconnect = process_frames::<TestApp, UnixStream>(

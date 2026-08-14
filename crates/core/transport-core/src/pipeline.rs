@@ -785,11 +785,15 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         // after all stage threads join, so dev runs still see the
         // stderr breakdown.
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_rec =
-            crate::trace::register_stage("journal: disruptor wakeup (publish → journal consume)");
+        let mut wakeup_rec = crate::trace::register_stage(
+            "journal: disruptor wakeup (publish → journal consume)",
+            crate::trace::StageUnit::Slot,
+        );
         #[cfg(feature = "latency-trace")]
-        let mut batch_rec =
-            crate::trace::register_stage("journal: batch processing (write + sync)");
+        let mut batch_rec = crate::trace::register_stage(
+            "journal: batch processing (write + sync)",
+            crate::trace::StageUnit::Batch,
+        );
         // Paces the idle-path recorder flush. See `trace::StageRecorder::flush`.
         #[cfg(feature = "latency-trace")]
         let mut stats_flush_timer = melin_app::amortized_timer::AmortizedTimer::new();
@@ -2716,10 +2720,15 @@ impl<A: Application> MatchingStage<A> {
         // the server prints them via `trace::print_report_all` once
         // all stage threads have joined.
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_rec =
-            crate::trace::register_stage("matching: disruptor wakeup (publish → matching consume)");
+        let mut wakeup_rec = crate::trace::register_stage(
+            "matching: disruptor wakeup (publish → matching consume)",
+            crate::trace::StageUnit::Slot,
+        );
         #[cfg(feature = "latency-trace")]
-        let mut execute_rec = crate::trace::register_stage("matching: execute (process_event)");
+        let mut execute_rec = crate::trace::register_stage(
+            "matching: execute (process_event)",
+            crate::trace::StageUnit::Slot,
+        );
         // Paces the idle-path recorder flush. See `trace::StageRecorder::flush`.
         #[cfg(feature = "latency-trace")]
         let mut stats_flush_timer = melin_app::amortized_timer::AmortizedTimer::new();

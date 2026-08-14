@@ -295,12 +295,20 @@ pub fn run<A: Application>(
     // tick-to-trade decomposition; spsc/dispatch/server-e2e are kept
     // alongside as overall sanity checks.
     #[cfg(feature = "latency-trace")]
-    let mut spsc_rec =
-        trace::register_stage("response: SPSC wakeup (matching publish → response consume)");
+    let mut spsc_rec = trace::register_stage(
+        "response: SPSC wakeup (matching publish → response consume)",
+        trace::StageUnit::Slot,
+    );
     #[cfg(feature = "latency-trace")]
-    let mut dispatch_rec = trace::register_stage("response: dispatch (consume → socket write)");
+    let mut dispatch_rec = trace::register_stage(
+        "response: dispatch (consume → socket write)",
+        trace::StageUnit::Batch,
+    );
     #[cfg(feature = "latency-trace")]
-    let mut server_e2e_rec = trace::register_stage("server e2e (reader recv → response flush)");
+    let mut server_e2e_rec = trace::register_stage(
+        "server e2e (reader recv → response flush)",
+        trace::StageUnit::Request,
+    );
     // Tick-to-trade breakdown: per-slot wait observed for each
     // durability path (recorded only when the gate actually held us
     // up — cache-hit paths skip to avoid inflating the metric with
@@ -311,16 +319,25 @@ pub fn run<A: Application>(
     // stages roughly double the hot-path mutex traffic vs the lighter
     // 4-stage mode.
     #[cfg(feature = "tick-to-trade")]
-    let mut journal_wait_rec =
-        trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
+    let mut journal_wait_rec = trace::register_stage(
+        "response: journal-wait (match_complete → journal cursor crossed)",
+        trace::StageUnit::BlockedSlot,
+    );
     #[cfg(feature = "tick-to-trade")]
     let mut replica_wait_rec = trace::register_stage(
         "response: replica-wait (match_complete → replication cursor crossed)",
+        trace::StageUnit::BlockedSlot,
     );
     #[cfg(feature = "tick-to-trade")]
-    let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
+    let mut encode_rec = trace::register_stage(
+        "response: encode (per-kind wire encoding)",
+        trace::StageUnit::Frame,
+    );
     #[cfg(feature = "tick-to-trade")]
-    let mut egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
+    let mut egress_rec = trace::register_stage(
+        "response: egress (flush_sends elapsed)",
+        trace::StageUnit::Flush,
+    );
     // Paces the idle-path recorder flush. Without it, every sample this
     // thread recorded stays in its thread-local buffer once traffic
     // stops — which is exactly when the bench scrapes /stats-dump.
@@ -1887,7 +1904,10 @@ mod tests {
         super::discard_e2e_samples(&mut pending, &[]);
         assert_eq!(pending.len(), 3, "an empty drop list must lose nothing");
 
-        let mut rec = melin_transport_core::trace::register_stage("test::response_e2e_close");
+        let mut rec = melin_transport_core::trace::register_stage(
+            "test::response_e2e_close",
+            melin_transport_core::trace::StageUnit::Request,
+        );
         super::close_e2e_samples(&mut pending, &mut rec);
         assert!(pending.is_empty(), "a flush closes the whole queue");
     }

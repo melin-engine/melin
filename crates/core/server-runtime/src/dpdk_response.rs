@@ -196,22 +196,35 @@ pub fn run<A: Application>(
     // sampling here would only capture SPSC-publish time and
     // mislead the bench's tick-to-trade breakdown.
     #[cfg(feature = "latency-trace")]
-    let mut spsc_rec =
-        trace::register_stage("response: SPSC wakeup (matching publish → response consume)");
+    let mut spsc_rec = trace::register_stage(
+        "response: SPSC wakeup (matching publish → response consume)",
+        trace::StageUnit::Slot,
+    );
     #[cfg(feature = "latency-trace")]
-    let mut dispatch_rec = trace::register_stage("response: dispatch (consume → SPSC publish)");
+    let mut dispatch_rec = trace::register_stage(
+        "response: dispatch (consume → SPSC publish)",
+        trace::StageUnit::Batch,
+    );
     #[cfg(feature = "latency-trace")]
-    let mut server_e2e_rec =
-        trace::register_stage("server e2e (reader recv → response SPSC publish)");
+    let mut server_e2e_rec = trace::register_stage(
+        "server e2e (reader recv → response SPSC publish)",
+        trace::StageUnit::Request,
+    );
     #[cfg(feature = "tick-to-trade")]
-    let mut journal_wait_rec =
-        trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
+    let mut journal_wait_rec = trace::register_stage(
+        "response: journal-wait (match_complete → journal cursor crossed)",
+        trace::StageUnit::BlockedSlot,
+    );
     #[cfg(feature = "tick-to-trade")]
     let mut replica_wait_rec = trace::register_stage(
         "response: replica-wait (match_complete → replication cursor crossed)",
+        trace::StageUnit::BlockedSlot,
     );
     #[cfg(feature = "tick-to-trade")]
-    let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
+    let mut encode_rec = trace::register_stage(
+        "response: encode (per-kind wire encoding)",
+        trace::StageUnit::Frame,
+    );
     // Paces the idle-path recorder flush — see `response::run`.
     #[cfg(feature = "latency-trace")]
     let mut last_stats_flush = Instant::now();

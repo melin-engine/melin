@@ -98,6 +98,55 @@ pub fn mono_trace_elapsed_ns(start: MonoTraceInstant, end: MonoTraceInstant) -> 
 // StageRecorder + StatsRegistry
 // ---------------------------------------------------------------------------
 
+/// What one sample of a stage counts.
+///
+/// Declared per stage because the dump puts stages side by side and so
+/// invites summing their percentiles — which is only meaningful between
+/// stages sharing a denominator. `egress` takes one sample per io_uring
+/// flush covering many slots; `journal-wait` takes one only for slots
+/// that actually blocked, so its percentiles are conditional on having
+/// waited and its sample count is not the event count. Publishing the
+/// unit lets a consumer tell those apart without reading the pipeline.
+///
+/// Not gated on `latency-trace`: `register_stage` takes one in both
+/// build configurations so call sites need no `#[cfg]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageUnit {
+    /// One sample per pipeline slot — an input event or an output.
+    Slot,
+    /// One sample per decoded wire frame.
+    Frame,
+    /// One sample per client request, however many frames it produced.
+    Request,
+    /// One sample per disruptor batch, however many slots it held.
+    Batch,
+    /// One sample per I/O flush, covering every slot whose bytes it
+    /// shipped.
+    Flush,
+    /// One sample per slot that actually blocked. The fast path records
+    /// nothing, so percentiles describe only the slots that waited —
+    /// never comparable to a per-slot stage, and never summable with
+    /// one.
+    BlockedSlot,
+    /// One sample per poll-loop iteration that found work.
+    Iteration,
+}
+
+impl StageUnit {
+    /// Stable wire token for the dump's `unit` field.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Slot => "slot",
+            Self::Frame => "frame",
+            Self::Request => "request",
+            Self::Batch => "batch",
+            Self::Flush => "flush",
+            Self::BlockedSlot => "blocked-slot",
+            Self::Iteration => "iteration",
+        }
+    }
+}
+
 /// Snapshot of a stage's histogram percentiles. Returned by
 /// `StatsRegistry::snapshot_all` — the stable structure the health
 /// endpoint serializes to wire format.
@@ -105,6 +154,8 @@ pub fn mono_trace_elapsed_ns(start: MonoTraceInstant, end: MonoTraceInstant) -> 
 #[derive(Debug, Clone)]
 pub struct StageSnapshot {
     pub name: &'static str,
+    /// What one `samples` count represents — see [`StageUnit`].
+    pub unit: StageUnit,
     pub samples: u64,
     pub min_ns: u64,
     pub p50_ns: u64,
@@ -291,6 +342,8 @@ impl StageRecorder {
 #[cfg(feature = "latency-trace")]
 struct StageEntry {
     name: &'static str,
+    /// Fixed at first registration; siblings inherit it.
+    unit: StageUnit,
     sync: std::sync::Mutex<hdrhistogram::sync::SyncHistogram<u64>>,
     /// Count of samples clamped to [`MAX_TRACKED_NS`] on record.
     ///
@@ -327,13 +380,23 @@ impl StatsRegistry {
     /// Register a stage and return a `Recorder` for it. Idempotent —
     /// calling twice with the same name returns sibling recorders that
     /// feed the same underlying `SyncHistogram`.
-    pub fn register(&self, name: &'static str) -> StageRecorder {
+    ///
+    /// `unit` declares what one sample counts; the first registration
+    /// fixes it and siblings inherit it. Two stages sharing a name but
+    /// disagreeing on their unit would merge samples with different
+    /// denominators into one histogram, so that is a bug in the caller
+    /// rather than something to reconcile here — debug builds assert.
+    pub fn register(&self, name: &'static str, unit: StageUnit) -> StageRecorder {
         let mut entries = match self.entries.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         for existing in entries.iter() {
             if existing.name == name {
+                debug_assert_eq!(
+                    existing.unit, unit,
+                    "stage {name:?} registered with conflicting units"
+                );
                 let rec = {
                     let sync = match existing.sync.lock() {
                         Ok(g) => g,
@@ -356,6 +419,7 @@ impl StatsRegistry {
         let recorder = sync.recorder();
         let entry = std::sync::Arc::new(StageEntry {
             name,
+            unit,
             sync: std::sync::Mutex::new(sync),
             clipped: std::sync::atomic::AtomicU64::new(0),
         });
@@ -432,6 +496,7 @@ impl StatsRegistry {
                 // but meaningless; report explicit zeros instead.
                 out.push(StageSnapshot {
                     name: entry.name,
+                    unit: entry.unit,
                     samples: 0,
                     min_ns: 0,
                     p50_ns: 0,
@@ -445,6 +510,7 @@ impl StatsRegistry {
             }
             out.push(StageSnapshot {
                 name: entry.name,
+                unit: entry.unit,
                 samples: sync.len(),
                 min_ns: sync.min(),
                 p50_ns: sync.value_at_quantile(0.50),
@@ -471,7 +537,11 @@ impl StatsRegistry {
                 // Printing the percentile block would show seven
                 // `0.00 µs` rows that read as measurements rather than
                 // as an absence of them.
-                let buf = format!("  {}\n\x20   samples: 0 (never recorded)\n", snap.name);
+                let buf = format!(
+                    "  {}\n\x20   samples: 0 (never recorded, per {})\n",
+                    snap.name,
+                    snap.unit.as_str()
+                );
                 // Best-effort diagnostic output on shutdown.
                 let _ = std::io::stderr().lock().write_all(buf.as_bytes());
                 continue;
@@ -486,7 +556,7 @@ impl StatsRegistry {
             };
             let buf = format!(
                 "  {name}\n\
-                 \x20   samples: {samples}\n\
+                 \x20   samples: {samples} (per {unit})\n\
                  \x20   min:    {min:>8.2} µs\n\
                  \x20   p50:    {p50:>8.2} µs\n\
                  \x20   p90:    {p90:>8.2} µs\n\
@@ -495,6 +565,7 @@ impl StatsRegistry {
                  \x20   max:    {max:>8.2} µs{max_note}\n",
                 name = snap.name,
                 samples = snap.samples,
+                unit = snap.unit.as_str(),
                 min = us(snap.min_ns),
                 p50 = us(snap.p50_ns),
                 p90 = us(snap.p90_ns),
@@ -530,17 +601,18 @@ pub fn global_registry() -> &'static StatsRegistry {
 
 /// Register a stage with the global registry and return a recorder.
 ///
-/// Convenience for the common case `let mut h = register_stage("…");`.
+/// Convenience for the common case
+/// `let mut h = register_stage("…", StageUnit::Slot);`.
 /// Idempotent — calling twice with the same name returns sibling
 /// recorders that feed the same underlying `SyncHistogram`.
 #[cfg(feature = "latency-trace")]
-pub fn register_stage(name: &'static str) -> StageRecorder {
-    global_registry().register(name)
+pub fn register_stage(name: &'static str, unit: StageUnit) -> StageRecorder {
+    global_registry().register(name, unit)
 }
 
 #[cfg(not(feature = "latency-trace"))]
 #[inline]
-pub fn register_stage(_name: &'static str) -> StageRecorder {
+pub fn register_stage(_name: &'static str, _unit: StageUnit) -> StageRecorder {
     StageRecorder
 }
 
@@ -564,7 +636,7 @@ mod tests {
     fn registry_register_returns_recorder_that_records() {
         let reg = StatsRegistry::new();
         {
-            let mut rec = reg.register("test::stage_one");
+            let mut rec = reg.register("test::stage_one", StageUnit::Slot);
             rec.record_ns(1_000);
             rec.record_ns(2_000);
             rec.record_ns(3_000);
@@ -583,8 +655,8 @@ mod tests {
     fn registry_register_is_idempotent() {
         let reg = StatsRegistry::new();
         {
-            let mut a = reg.register("test::dup");
-            let mut b = reg.register("test::dup");
+            let mut a = reg.register("test::dup", StageUnit::Slot);
+            let mut b = reg.register("test::dup", StageUnit::Slot);
             a.record_ns(100);
             b.record_ns(200);
             // Both recorders dropped at end of scope.
@@ -601,9 +673,9 @@ mod tests {
         // makes a stage that recorded nothing indistinguishable from a
         // stage that was never compiled in.
         let reg = StatsRegistry::new();
-        let _empty = reg.register("test::empty");
+        let _empty = reg.register("test::empty", StageUnit::Slot);
         {
-            let mut used = reg.register("test::used");
+            let mut used = reg.register("test::used", StageUnit::Slot);
             used.record_ns(500);
         }
 
@@ -645,7 +717,7 @@ mod tests {
 
         let worker_reg = Arc::clone(&reg);
         let worker = thread::spawn(move || {
-            let mut rec = worker_reg.register("test::dormant");
+            let mut rec = worker_reg.register("test::dormant", StageUnit::Slot);
             for i in 0..1_000u64 {
                 rec.record_ns(1_000 + i);
             }
@@ -679,7 +751,7 @@ mod tests {
         // ceiling (that is what saturation means), but `clipped` says
         // the real tail ran past it.
         let reg = StatsRegistry::new();
-        let mut rec = reg.register("test::clipped");
+        let mut rec = reg.register("test::clipped", StageUnit::BlockedSlot);
         rec.record_ns(5_000);
         rec.record_ns(MAX_TRACKED_NS + 1);
         rec.record_ns(MAX_TRACKED_NS * 30);
@@ -711,7 +783,7 @@ mod tests {
         // so counting it would overstate censoring on a stage whose
         // tail merely touches the ceiling.
         let reg = StatsRegistry::new();
-        let mut rec = reg.register("test::at_bound");
+        let mut rec = reg.register("test::at_bound", StageUnit::Slot);
         rec.record_ns(MAX_TRACKED_NS);
         rec.flush();
 
@@ -730,8 +802,8 @@ mod tests {
         // clipped count, or a per-thread count would under-report by
         // however many threads happened to record the stage.
         let reg = StatsRegistry::new();
-        let mut a = reg.register("test::clipped_siblings");
-        let mut b = reg.register("test::clipped_siblings");
+        let mut a = reg.register("test::clipped_siblings", StageUnit::Slot);
+        let mut b = reg.register("test::clipped_siblings", StageUnit::Slot);
         a.record_ns(MAX_TRACKED_NS + 1);
         b.record_ns(MAX_TRACKED_NS + 1);
         a.flush();
@@ -748,7 +820,7 @@ mod tests {
     #[test]
     fn flush_is_idempotent_and_loses_nothing() {
         let reg = StatsRegistry::new();
-        let mut rec = reg.register("test::double_flush");
+        let mut rec = reg.register("test::double_flush", StageUnit::Slot);
         rec.record_ns(10_000);
         rec.record_ns(20_000);
         rec.flush();
@@ -796,7 +868,7 @@ mod tests {
             "test::budget_4",
             "test::budget_5",
         ] {
-            let mut rec = reg.register(name);
+            let mut rec = reg.register(name, StageUnit::Slot);
             rec.record_ns(7_000);
             rec.flush();
             recorders.push(rec);
@@ -842,7 +914,7 @@ mod tests {
         // measurable at all.
         let mut recorders = Vec::new();
         for name in ["test::concurrent_a", "test::concurrent_b"] {
-            let mut rec = reg.register(name);
+            let mut rec = reg.register(name, StageUnit::Slot);
             rec.record_ns(1_000);
             rec.flush();
             recorders.push(rec);
@@ -886,7 +958,7 @@ mod tests {
 
         let worker_reg = Arc::clone(&reg);
         let worker = thread::spawn(move || {
-            let mut rec = worker_reg.register("test::contended");
+            let mut rec = worker_reg.register("test::contended", StageUnit::Slot);
             rec.record_ns(4_000);
             recorded_tx.send(()).expect("main thread alive");
             // Let the snapshot get inside `refresh_timeout` and take
@@ -939,7 +1011,7 @@ mod tests {
         let writer_reg = Arc::clone(&reg);
         let writer_stop = Arc::clone(&stop);
         let writer = thread::spawn(move || {
-            let mut rec = writer_reg.register("test::active");
+            let mut rec = writer_reg.register("test::active", StageUnit::Slot);
             while !writer_stop.load(Ordering::Relaxed) {
                 rec.record_ns(42);
                 std::thread::sleep(std::time::Duration::from_micros(100));

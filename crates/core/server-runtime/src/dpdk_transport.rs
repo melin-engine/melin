@@ -180,11 +180,14 @@ pub fn run_dpdk_poll<A: Application>(
     // already run), `ingest` covers recv_ts → publish complete and so
     // includes decode + auth dispatch + slot construction.
     #[cfg(feature = "latency-trace")]
-    let mut publish_rec =
-        melin_transport_core::trace::register_stage("reader: publish (ring push)");
+    let mut publish_rec = melin_transport_core::trace::register_stage(
+        "reader: publish (ring push)",
+        melin_transport_core::trace::StageUnit::Frame,
+    );
     #[cfg(feature = "tick-to-trade")]
     let mut ingest_rec = melin_transport_core::trace::register_stage(
         "reader: ingest (recv_ts → publish complete, incl. decode)",
+        melin_transport_core::trace::StageUnit::Frame,
     );
 
     // Pre-allocated parse buffer pool. Avoids heap allocation on accept
@@ -236,6 +239,7 @@ pub fn run_dpdk_poll<A: Application>(
     #[cfg(feature = "latency-trace")]
     let mut poll_iter_rec = melin_transport_core::trace::register_stage(
         "dpdk poll: outer iteration (work-iterations only)",
+        melin_transport_core::trace::StageUnit::Iteration,
     );
     #[cfg(feature = "latency-trace")]
     let mut poll_iter_start = mono_trace_ns();
