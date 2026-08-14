@@ -652,6 +652,64 @@ impl<T: Copy + Default> Consumer<T> {
             .store(self.next_read, Ordering::Release);
     }
 
+    /// Borrow up to `max` ready entries as one contiguous slice,
+    /// advancing `next_read` past them — the borrow analog of
+    /// [`read_batch`]: no copy out of the ring, and the published
+    /// progress counter does **not** move. Publishing progress stays
+    /// the caller's job, via [`set_progress`] (or [`commit`]) once the
+    /// entries are durably processed — exactly as after `read_batch`.
+    ///
+    /// At the ring's wrap point the run is truncated at the end of the
+    /// slot array; the next call returns the remainder from index 0.
+    /// Callers see that as one shorter batch — batching is pure
+    /// amortization, so a short batch once per lap of the ring costs
+    /// nothing, and it keeps every caller single-slice (no two-slice
+    /// index arithmetic in consumer loops).
+    ///
+    /// Do NOT pair this with [`commit_consumed`]: that is
+    /// [`peek_batch`]'s other half — it advances `next_read` (which
+    /// this call has already done) and it publishes progress at consume
+    /// time, which a durability-gated consumer must never do.
+    ///
+    /// The returned slice borrows the consumer, so no other consumer
+    /// method can run while it is alive. The slots stay valid even
+    /// though `next_read` has moved past them: the producer's overwrite
+    /// gate is the published progress counter, which this call leaves
+    /// alone.
+    ///
+    /// [`read_batch`]: Self::read_batch
+    /// [`set_progress`]: Self::set_progress
+    /// [`commit`]: Self::commit
+    /// [`commit_consumed`]: Self::commit_consumed
+    /// [`peek_batch`]: Self::peek_batch
+    pub fn read_contiguous(&mut self, max: usize) -> &[T] {
+        // Always re-read dependency for batch operations.
+        self.cached_dep = self.dependency.load();
+        let available = self.cached_dep.saturating_sub(self.next_read);
+        if available == 0 {
+            return &[];
+        }
+        let cap = self.shared.buffer.slots.len();
+        let start_idx = (self.next_read & self.shared.buffer.mask) as usize;
+        let count = (available.min(max as u64) as usize).min(cap - start_idx);
+
+        // Safety: same argument as `peek_batch` — the slots in
+        // `[next_read, next_read + count)` are published (the dependency
+        // load covers them) and the producer cannot overwrite them until
+        // the published progress counter passes them, which this method
+        // does not advance. The pointer is derived from the whole
+        // `slots` allocation for provenance (an element-derived pointer
+        // would make the multi-element slice UB — see `peek_batch`).
+        // The run is truncated at the wrap point, so it is contiguous
+        // by construction.
+        let base: *const UnsafeCell<T> = self.shared.buffer.slots.as_ptr();
+        let slice = unsafe {
+            std::slice::from_raw_parts(UnsafeCell::raw_get(base.add(start_idx)) as *const T, count)
+        };
+        self.next_read += count as u64;
+        slice
+    }
+
     /// Publish read progress: stores `next_read` into the progress
     /// counter, making **everything read so far** visible to downstream
     /// consumers and the producer (for backpressure).
@@ -1291,6 +1349,81 @@ mod tests {
 
         let (first, _second) = consumer.peek_batch(100);
         assert_eq!(first, &[3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn read_contiguous_returns_entries_and_advances_next_read() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8).add_consumer().build();
+        for i in 0..5u64 {
+            producer.publish(i * 10);
+        }
+        let consumer = &mut consumers[0];
+
+        assert_eq!(consumer.read_contiguous(8), &[0, 10, 20, 30, 40]);
+        // `next_read` advanced with the borrow — unlike `peek_batch`, a
+        // second call must NOT return the same entries again.
+        assert!(consumer.read_contiguous(8).is_empty());
+        assert_eq!(consumer.next_read(), 5);
+    }
+
+    /// The property the journal stage's persist-before-ack hangs on:
+    /// reading in place must not move the published progress counter.
+    /// That counter is the producer's overwrite gate and, on a replica,
+    /// the persisted-ack gate — durability publishes it, never the read.
+    #[test]
+    fn read_contiguous_never_publishes_progress() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        for i in 0..4u64 {
+            producer.publish(i);
+        }
+        assert_eq!(producer.try_publish(99), Err(Full));
+
+        let consumer = &mut consumers[0];
+        let progress = consumer.progress_counter();
+        assert_eq!(consumer.read_contiguous(4).len(), 4);
+
+        assert_eq!(
+            progress.get().load(Ordering::Acquire),
+            0,
+            "an in-place read must leave the published cursor untouched"
+        );
+        assert_eq!(
+            producer.try_publish(99),
+            Err(Full),
+            "the producer must stay gated until progress is published"
+        );
+
+        // `set_progress` is the release point, exactly as after `read_batch`.
+        consumer.set_progress(4);
+        assert!(producer.try_publish(99).is_ok());
+    }
+
+    #[test]
+    fn read_contiguous_truncates_at_the_wrap_and_resumes() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        // Fill, drain 3, publish 3 more so the live window [3, 7)
+        // crosses the wrap boundary: index 3, then indices 0..3.
+        for i in 0..4u64 {
+            producer.publish(i);
+        }
+        let consumer = &mut consumers[0];
+        for _ in 0..3 {
+            consumer.try_consume();
+        }
+        for i in 4..7u64 {
+            producer.publish(i);
+        }
+
+        assert_eq!(
+            consumer.read_contiguous(4),
+            &[3],
+            "the run stops at the wrap point"
+        );
+        assert_eq!(
+            consumer.read_contiguous(4),
+            &[4, 5, 6],
+            "the next call resumes from index 0 with the remainder"
+        );
     }
 
     #[test]
