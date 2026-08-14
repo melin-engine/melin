@@ -1079,7 +1079,13 @@ mod tests {
             frames.push(buf.to_vec());
             Ok(())
         };
-        let res = snapshot_transfer_with::<TestEvent>(&live, &mut publish, &shutdown).unwrap();
+        // Opaque at this layer (the mode enum lives in the server
+        // crate) — a distinctive non-default byte so the StreamStart
+        // assertion below proves it is carried through rather than
+        // defaulted.
+        const ACKING_MODE: u8 = 2;
+        let res = snapshot_transfer_with::<TestEvent>(&live, &mut publish, &shutdown, ACKING_MODE)
+            .unwrap();
         assert_eq!(res, CatchUpResult::Ok(5), "catch-up must reach the tip");
 
         // Walk the frame sequence, reassembling the two chunked bodies.
@@ -1135,11 +1141,16 @@ mod tests {
                 segment_start_sequence,
                 anchor_hash,
                 epoch,
+                durability_mode,
             } => {
                 assert_eq!(start_sequence, 4);
                 assert_eq!(segment_start_sequence, live_info.starting_sequence);
                 assert_eq!(anchor_hash, live_info.anchor_hash);
                 assert_eq!(epoch, 7, "snapshot's epoch rides StreamStart");
+                assert_eq!(
+                    durability_mode, ACKING_MODE,
+                    "primary's acking mode rides StreamStart"
+                );
             }
             other => panic!("expected StreamStart, got {other:?}"),
         }
