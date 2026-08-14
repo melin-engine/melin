@@ -334,29 +334,38 @@ impl JournalDisk {
     }
 
     /// Write every published batch, sync once, then publish and
-    /// release. Returns whether anything was written.
+    /// release. Returns whether anything was consumed.
     ///
     /// One `fdatasync` per drain rather than per batch is where the
     /// group-commit win lives: a backlog built up during a stall costs
     /// exactly one sync to clear.
     fn drain_and_sync(&mut self) -> Result<bool, JournalError> {
         let mut last: Option<JournalWriteMeta> = None;
+        let mut bytes_written = 0usize;
         while let Some((meta, bytes)) = self.batches.try_read() {
             self.segment.write_batch(bytes)?;
+            bytes_written += bytes.len();
             last = Some(meta);
         }
         let Some(meta) = last else {
             return Ok(false);
         };
 
-        // Paced retry of a failed post-rotation dir fsync — a single
-        // branch, kept next to the sync it accompanies.
-        self.segment.poll_dir_fsync_retry();
-        #[cfg(test)]
-        if let Some(injected) = self.fail_next_sync.take() {
-            return Err(injected);
+        // A batch can be byte-empty and still carry cursors: one made
+        // only of queries (never journaled), or any batch under
+        // `no-persist`. There is nothing to make durable, so skip the
+        // sync — but still publish, because the input-ring slots those
+        // events occupy have to be released upstream.
+        if bytes_written > 0 {
+            // Paced retry of a failed post-rotation dir fsync — a
+            // single branch, kept next to the sync it accompanies.
+            self.segment.poll_dir_fsync_retry();
+            #[cfg(test)]
+            if let Some(injected) = self.fail_next_sync.take() {
+                return Err(injected);
+            }
+            self.segment.sync()?;
         }
-        self.segment.sync()?;
 
         // Durable: publish first, release second. The sequencer's drain
         // test observes the release, so this order is what makes

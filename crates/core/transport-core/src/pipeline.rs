@@ -1,12 +1,15 @@
 //! Pipeline stages for the LMAX disruptor architecture.
 //!
 //! Two hot-path stages consume from an input disruptor in **parallel**:
-//! 1. **Journal stage**: batch-encodes events, then writes and syncs them via
-//!    `BufferedWriter` (`pwrite` + `fdatasync`).
-//!    Advances its cursor only after the durable write completes. When replication is enabled,
-//!    sends a copy of each encoded batch to the replication sender thread via a bounded
-//!    channel. The bytes are identical to what was written to disk — same sequences,
-//!    timestamps, CRC checksums, and checkpoint entries.
+//! 1. **Journal stage**: batch-encodes events and hands each batch to the
+//!    disk thread, which writes and syncs it (`pwrite` + `fdatasync`) and
+//!    then publishes the cursors that mean durable — so the sequencing
+//!    thread never waits on the device. When replication is enabled, the
+//!    sequencer also sends a copy of each encoded batch to the replication
+//!    sender thread via a bounded channel, *before* handing it to the disk
+//!    thread, so replicas never wait on local storage either. The bytes are
+//!    identical to what is written to disk — same sequences, timestamps,
+//!    CRC checksums, and checkpoint entries. See [`crate::journal_disk`].
 //! 2. **Matching stage**: executes commands on the `Exchange`, publishes responses
 //!    to the output SPSC. Runs concurrently with the journal — no waiting for sync.
 //!
@@ -17,8 +20,10 @@
 //! durability requirement is met (e.g. on disk **and** acknowledged by a
 //! replica when replication is active).
 //!
-//! This gives maximum pipeline parallelism (matching overlaps journal I/O)
-//! while preserving persist-before-ack at the response boundary.
+//! This gives maximum pipeline parallelism (matching overlaps journal I/O,
+//! and encoding overlaps the device) while preserving persist-before-ack at
+//! the response boundary: the cursors the gate reads are published by the
+//! thread that performed the sync, after it returned.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -29,7 +34,14 @@ use crate::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
+use melin_journal::encoder::JournalEncoder;
 use melin_journal::preparer::SegmentPreparer;
+use melin_journal::segment_file::SegmentFile;
+use melin_journal::write_ring::{
+    ClaimedChunk, JournalWriteMeta, JournalWriteProducer, build_journal_write_ring,
+};
+
+use crate::journal_disk::{DiskControl, DurabilityCursors, JournalDisk, RotateRequest};
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
 
 use melin_pipeline::padding::Sequence;
@@ -42,7 +54,7 @@ use crate::cursors::{
 
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
 
-/// Post-fsync state published by the journal stage after each durable
+/// Post-fsync state published by the disk thread after each durable
 /// write. The seqlock guarantees all fields are read atomically —
 /// no TOCTOU between `journal_seq` and `chain_hash`.
 ///
@@ -52,16 +64,16 @@ use crate::replication_wire::{finalize_input_batch, init_input_batch};
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct FsyncState {
-    /// Highest journal sequence durably persisted
-    /// (`writer.next_sequence() - 1`). Wire-seq space — the same value the
-    /// journal stage publishes through `PipelineCursors::durable_wire_seq`
-    /// (both are written in the same `publish_fsync_state` call).
+    /// Highest journal sequence in the batch that just became durable.
+    /// Wire-seq space — the same value published through
+    /// `PipelineCursors::durable_wire_seq` (both are written in the
+    /// disk thread's single publication step, after the sync).
     pub journal_seq: WireSeq,
     /// BLAKE3 chain hash after the fsync. `[0u8; 32]` when hash-chain
     /// is disabled.
     pub chain_hash: [u8; 32],
-    /// Input ring cursor at the fsync commit boundary
-    /// (`consumer.next_read()` right after `commit`/`set_progress`).
+    /// Input ring read cursor at the batch's sync point, captured by
+    /// the sequencer when it handed the batch over.
     /// The shadow compares this against its own `next_read` to confirm
     /// it has caught up to the exact fsync boundary.
     pub input_ring_seq: RingPos,
@@ -421,17 +433,27 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 }
 
 /// Journal stage: consumes from the input disruptor, batch-encodes events,
-/// and writes them durably via `BufferedWriter`.
+/// and hands the encoded bytes to the disk thread.
 ///
-/// Runs on a dedicated OS thread. Uses `read_batch` + `commit` so its
-/// cursor only advances **after** the durable write. The response stage
-/// reads this cursor to know when events are durable.
+/// This type is the stage before it runs: configuration, plus the
+/// composed writer. [`run`](Self::run) splits the writer, starts the
+/// disk thread on the file half, and drives a [`Sequencer`] over the
+/// stream half.
 ///
-/// When replication is enabled, the journal stage also sends a copy of
-/// each encoded batch to the replication sender thread via a bounded
-/// channel. The bytes are identical to what was written to disk — same
+/// The sequencing thread never touches the device. It orders events,
+/// allocates sequences, encodes, chains, and feeds replicas; the disk
+/// thread writes, syncs, and publishes the cursors that mean durable.
+/// The response stage reads those cursors to know when events are
+/// durable, so persist-before-ack is preserved by *where* they are
+/// published (see [`crate::journal_disk`]).
+///
+/// When replication is enabled, the stage also sends a copy of each
+/// encoded batch to the replication sender thread via a bounded
+/// channel. The bytes are identical to what is written to disk — same
 /// sequences, timestamps, CRC checksums, and checkpoint entries.
 pub struct JournalStage<E: AppEvent> {
+    /// Composed writer, split by `run` into the stream half (kept by
+    /// the sequencer) and the file half (moved to the disk thread).
     writer: BufferedWriter<E>,
     _marker: std::marker::PhantomData<fn() -> E>,
     consumer: ring::Consumer<InputSlot<E>>,
@@ -514,6 +536,49 @@ pub struct JournalStage<E: AppEvent> {
     /// Front of the stream-mark queue — the next position this stage
     /// must act at. Held locally so the steady-state cost is one
     /// `Option` check, not a mutex lock.
+    pending_mark: Option<StreamMark>,
+    /// Core the disk thread pins itself to; `0` = unpinned. Set via
+    /// [`set_disk_core`](Self::set_disk_core) before the stage runs.
+    disk_core: usize,
+}
+
+/// The running half of the journal stage: everything the sequencing
+/// thread owns while the pipeline is live.
+///
+/// Built by [`JournalStage::run`] once the writer has been split. The
+/// file half is gone by then — it lives on the disk thread — so every
+/// field here is either in-memory stream state or a hand-off handle.
+/// That is the point: a field this type cannot reach is a device
+/// operation the sequencing thread cannot accidentally perform.
+struct Sequencer<E: AppEvent> {
+    /// Stream half of the writer: sequences, framing, chain.
+    encoder: JournalEncoder<E>,
+    /// Hand-off to the disk thread.
+    batches: JournalWriteProducer,
+    /// Slot currently being encoded into, claimed lazily at the first
+    /// event of a batch and given up at the submit point.
+    claim: Option<ClaimedChunk>,
+    /// Shared control: poison, rotation rendezvous, stop, lag gauge.
+    disk: Arc<DiskControl>,
+    /// The disk thread, joined at shutdown to recover the file half.
+    disk_thread: Option<std::thread::JoinHandle<SegmentFile>>,
+    /// Bytes encoded into the live segment. The size-driven rotation
+    /// trigger reads this instead of the file's end: the file is on
+    /// another thread, and the boundary is a property of the stream
+    /// anyway. Tracks `SegmentFile::valid_end` exactly once the disk
+    /// thread has caught up.
+    segment_bytes: u64,
+    consumer: ring::Consumer<InputSlot<E>>,
+    group_commit_delay: Duration,
+    max_batch: usize,
+    repl: Box<ReplicationState>,
+    busy_spin: bool,
+    utilization: Arc<StageUtilization>,
+    max_journal_bytes: u64,
+    rotate_requested: Option<Arc<AtomicBool>>,
+    rotation_backoff_until: Option<Instant>,
+    preparer: Option<SegmentPreparer>,
+    stream_marks: Option<StreamMarkQueue>,
     pending_mark: Option<StreamMark>,
 }
 
@@ -672,6 +737,7 @@ impl<E: AppEvent> JournalStage<E> {
             preparer_core: 0,
             stream_marks: None,
             pending_mark: None,
+            disk_core: 0,
         }
     }
 
@@ -752,18 +818,121 @@ impl<E: AppEvent> JournalStage<E> {
         self.advertised_tip = Some(tip);
     }
 
-    /// Synchronous journal loop: `pwrite` blocks until the write completes.
+    /// Set the core the disk thread pins itself to (`0` = unpinned).
+    /// Call before the stage runs; `run` reads it when it spawns.
+    pub fn set_disk_core(&mut self, core: usize) {
+        self.disk_core = core;
+    }
+
+    /// Split the writer, start the disk thread on the file half, and
+    /// build the sequencer over the stream half.
     ///
-    /// Uses `read_batch` + `commit` (not `consume_batch`) to ensure the
-    /// journal cursor is only advanced **after** the write is durable.
-    /// The response stage checks this cursor before sending — this is
-    /// the persist-before-ack boundary.
+    /// The split flushes anything the writer still holds, so the disk
+    /// thread starts from a quiesced segment and no encoded bytes can
+    /// be stranded on the wrong side of the boundary.
+    fn into_sequencer(self) -> Result<Sequencer<E>, JournalError> {
+        let (encoder, segment) = self.writer.into_halves()?;
+        let (batches, batch_consumer) =
+            build_journal_write_ring(melin_journal::write_ring::DEFAULT_CAPACITY);
+        let control = Arc::new(DiskControl::new());
+        let segment_bytes = segment.valid_end();
+
+        // The cursors that mean "durable" move with the file half —
+        // only the disk thread knows when a batch has become durable.
+        let cursors = DurabilityCursors {
+            input_progress: self.consumer.progress_counter(),
+            durable_wire_seq: self.last_seq,
+            advertised_tip: self.advertised_tip,
+            fsync_state: self.chain_hash,
+        };
+        let disk = JournalDisk::new(
+            segment,
+            batch_consumer,
+            cursors,
+            Arc::clone(&control),
+            self.busy_spin,
+        );
+        let disk_core = self.disk_core;
+        let disk_thread = std::thread::Builder::new()
+            .name("journal-disk".into())
+            .spawn(move || {
+                // Spawned from the journal thread, which is pinned and
+                // runs SCHED_FIFO on a tuned deployment — and children
+                // inherit both. Left alone, this thread would busy-spin
+                // on the sequencer's own core, which is the one place
+                // it must never run. Reset to the full mask and
+                // SCHED_OTHER first, then apply its own pin (which
+                // re-grants FIFO if that core is isolated).
+                if let Err(e) = melin_app::affinity::clear_affinity() {
+                    tracing::warn!(error = e, "failed to clear journal-disk affinity");
+                }
+                melin_app::affinity::pin_thread("journal-disk", disk_core);
+                disk.run()
+            })
+            .map_err(|e| {
+                JournalError::Io(std::io::Error::other(format!(
+                    "spawn journal-disk thread: {e}"
+                )))
+            })?;
+
+        Ok(Sequencer {
+            encoder,
+            batches,
+            claim: None,
+            disk: control,
+            disk_thread: Some(disk_thread),
+            segment_bytes,
+            consumer: self.consumer,
+            group_commit_delay: self.group_commit_delay,
+            max_batch: self.max_batch,
+            repl: self.repl,
+            busy_spin: self.busy_spin,
+            utilization: self.utilization,
+            max_journal_bytes: self.max_journal_bytes,
+            rotate_requested: self.rotate_requested,
+            rotation_backoff_until: self.rotation_backoff_until,
+            preparer: self.preparer,
+            stream_marks: self.stream_marks,
+            pending_mark: self.pending_mark,
+        })
+    }
+
+    /// Drive the stage to completion on this (the sequencing) thread.
     ///
-    /// Returns the writer on shutdown for clean resource release.
+    /// Returns the writer, reassembled from both halves, on shutdown.
     pub fn run_sync(
+        self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<BufferedWriter<E>, JournalError> {
+        self.into_sequencer()?.run(shutdown)
+    }
+}
+
+impl<E: AppEvent> Sequencer<E> {
+    /// Drive the sequencing loop, then tear the disk thread down.
+    ///
+    /// The wrapper exists so the thread is stopped and joined on *every*
+    /// exit, including the fatal ones: a sequencer that returned an
+    /// error without joining would leak a spinning thread holding the
+    /// live segment's descriptor.
+    fn run(
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<BufferedWriter<E>, JournalError> {
+        match self.sequence(shutdown) {
+            Ok(()) => self.finish(),
+            Err(e) => {
+                self.halt_disk_thread();
+                Err(e)
+            }
+        }
+    }
+
+    /// The sequencing loop: read, encode, publish to replicas, hand the
+    /// batch to the disk thread. Never blocks on the device.
+    ///
+    /// Returns `Ok(())` when the stage should shut down cleanly.
+    fn sequence(&mut self, shutdown: &std::sync::atomic::AtomicBool) -> Result<(), JournalError> {
         use std::time::Instant;
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
@@ -795,28 +964,31 @@ impl<E: AppEvent> JournalStage<E> {
         let mut stats_flush_timer = melin_app::amortized_timer::AmortizedTimer::new();
 
         loop {
+            // A broken journal is fatal. The disk thread has stopped
+            // publishing, so nothing downstream can ack past the
+            // failure; surface the original cause and tear down.
+            if self.disk.poisoned() {
+                return Err(self.take_poison());
+            }
+
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                // Flush any pending data before shutdown.
+                // Hand over anything encoded before shutting down.
                 if pending > 0 {
-                    #[cfg(not(feature = "no-persist"))]
-                    if let Err(e) = self.writer.flush_batch_sync() {
-                        tracing::error!(error = %e, "journal sync error on shutdown");
-                    }
-                    self.consumer.commit();
+                    self.submit_batch(self.consumer.next_read())?;
                 }
                 self.drain_remaining(&mut batch);
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("journal", busy_count, idle_count);
-                return Ok(self.writer);
+                return Ok(());
             }
 
             // Read entries WITHOUT advancing the cursor.
             // Ring position before this read — the mark barrier computes
             // its mid-batch commit target as `read_start + encoded slots`
             // (publishing `next_read` there would over-commit; see
-            // `sync_point`).
+            // `submit_batch`).
             let read_start = self.consumer.next_read();
             let remaining = MAX_JOURNAL_BATCH.saturating_sub(pending);
             let count = if remaining > 0 {
@@ -881,13 +1053,19 @@ impl<E: AppEvent> JournalStage<E> {
                             continue;
                         }
                         let seq = if slot.sequence != 0 {
-                            self.writer.set_next_sequence(slot.sequence + 1);
+                            self.encoder.set_next_sequence(slot.sequence + 1);
                             slot.sequence
                         } else {
-                            self.writer.allocate_sequence()
+                            self.encoder.allocate_sequence()
                         };
-                        self.writer
+                        // Encode straight into the hand-off slot — the
+                        // disk thread writes these exact bytes, so the
+                        // split costs no copy.
+                        self.claim_slot()?;
+                        let chunk = self.claim.as_mut().expect("claimed above");
+                        self.encoder
                             .encode_event(
+                                chunk.bytes_mut(),
                                 seq,
                                 slot.timestamp_ns,
                                 &slot.event,
@@ -896,10 +1074,12 @@ impl<E: AppEvent> JournalStage<E> {
                             )
                             .map_err(|e| {
                                 JournalError::Io(std::io::Error::other(format!(
-                                    "journal encode (run_sync, seq {seq}): {e}"
+                                    "journal encode (sequencer, seq {seq}): {e}"
                                 )))
                             })?;
-                        let journal_slice = self.writer.last_user_entry_replication_slice();
+                        let journal_slice = self
+                            .encoder
+                            .last_user_entry_replication_slice(chunk.bytes());
                         Self::record_slot_for_replication(&mut self.repl, journal_slice);
                     }
                     pending += span_consumed;
@@ -911,16 +1091,17 @@ impl<E: AppEvent> JournalStage<E> {
                     }
                     // Mark barrier: the pending mark sits between
                     // batch[stop - 1] and batch[stop]. Chain checks
-                    // resolve against the encoded chain — no flush
-                    // needed. A rotation requires the flush + commit
-                    // first so the writer is quiesced exactly at the
-                    // boundary. The commit target is the boundary slot's
-                    // ring position — NOT the whole read batch, whose
-                    // tail is not encoded yet.
+                    // resolve against the encoded chain — nothing has
+                    // to reach the disk. A rotation must hand the batch
+                    // over first, so the boundary the disk thread
+                    // rotates at is exactly the marked entry. The
+                    // progress target is the boundary slot's ring
+                    // position — NOT the whole read batch, whose tail
+                    // is not encoded yet.
                     self.apply_stream_marks(false)?;
                     if matches!(self.pending_mark, Some(StreamMark::Rotate(_))) {
                         if pending > 0 {
-                            self.sync_point(read_start + stop as u64)?;
+                            self.submit_batch(read_start + stop as u64)?;
                             pending = 0;
                             first_write_ts = None;
                         }
@@ -950,16 +1131,17 @@ impl<E: AppEvent> JournalStage<E> {
                     || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
 
                 if should_sync {
-                    // Everything read so far is encoded — committing to
-                    // `next_read` is exact here.
-                    self.sync_point(self.consumer.next_read())?;
+                    // Everything read so far is encoded — publishing
+                    // progress at `next_read` is exact here.
+                    self.submit_batch(self.consumer.next_read())?;
                     self.maybe_publish_chain_check();
                     let _ = self.maybe_rotate();
                     // Replica mode: act on a mark that landed exactly at
                     // this batch's end — no later slot exists yet to
                     // trigger the mid-batch barrier, and waiting for one
                     // would leave it unapplied until traffic resumes.
-                    // Just synced, so the writer is quiesced.
+                    // The batch is handed over, so the stream is
+                    // quiesced at the boundary.
                     self.apply_stream_marks(true)?;
 
                     pending = 0;
@@ -1001,28 +1183,18 @@ impl<E: AppEvent> JournalStage<E> {
 
             if saw_shutdown {
                 // Sentinel — by FIFO, every slot the receiver published
-                // before it has now been consumed. Sync any encoded-but-
-                // not-yet-flushed events so the persist-before-ack
-                // boundary holds for the final batch, then exit.
+                // before it has now been consumed. Hand over any
+                // encoded-but-unsubmitted events; `finish` waits for
+                // them to land, so the persist-before-ack boundary
+                // holds for the final batch too.
                 if pending > 0 {
-                    if self.repl.any_producer() {
-                        let end_seq = self.writer.next_sequence() - 1;
-                        Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
-                    }
-                    #[cfg(not(feature = "no-persist"))]
-                    if let Err(e) = self.writer.flush_batch_sync() {
-                        tracing::error!(error = %e, "journal sync error on sentinel exit");
-                    }
-                    #[cfg(feature = "no-persist")]
-                    self.writer.discard_batch_buf();
-                    self.consumer.commit();
-                    self.publish_fsync_state();
+                    self.submit_batch(self.consumer.next_read())?;
                 }
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("journal", busy_count, idle_count);
-                return Ok(self.writer);
+                return Ok(());
             }
         }
     }
@@ -1131,10 +1303,10 @@ impl<E: AppEvent> JournalStage<E> {
             return;
         }
         self.repl.batches_since_chain_check = 0;
-        let Some(hash) = self.writer.chain_hash() else {
+        let Some(hash) = self.encoder.chain_hash() else {
             return;
         };
-        let sequence = self.writer.next_sequence() - 1;
+        let sequence = self.encoder.next_sequence() - 1;
         // Local buffer: the frame is 45 bytes and checks are sparse.
         let mut buf = Vec::with_capacity(64);
         crate::replication::protocol::encode_chain_check(sequence, &hash, &mut buf);
@@ -1155,12 +1327,12 @@ impl<E: AppEvent> JournalStage<E> {
     /// An evicted ring is skipped exactly like a data batch would be:
     /// the replica re-learns the boundary from journal catch-up on
     /// reconnect.
-    fn publish_rotate_to_rings(repl: &mut ReplicationState, writer: &BufferedWriter<E>) {
+    fn publish_rotate_to_rings(repl: &mut ReplicationState, encoder: &JournalEncoder<E>) {
         if !repl.any_producer() {
             return;
         }
-        let boundary_seq = writer.next_sequence() - 1;
-        let tail_hash = writer.chain_hash().unwrap_or([0u8; 32]);
+        let boundary_seq = encoder.next_sequence() - 1;
+        let tail_hash = encoder.chain_hash().unwrap_or([0u8; 32]);
         // Local buffer: the frame is 45 bytes and rotations are cold —
         // not worth a dedicated reusable buffer on ReplicationState.
         let mut buf = Vec::with_capacity(64);
@@ -1181,44 +1353,44 @@ impl<E: AppEvent> JournalStage<E> {
     /// independent; either can be set or unset. Called once per fsync
     /// batch (cold path); each `if let Some` is a single branch on a small
     /// struct field.
-    #[inline]
-    fn publish_fsync_state(&mut self) {
-        let journal_seq = self.writer.next_sequence().saturating_sub(1);
-        // Disjoint field borrows: `chain_hash` mutably (the writer handle),
-        // `writer`/`consumer` immutably. Keeping the state construction
-        // inside the branch preserves the zero-overhead-when-disabled
-        // property — no chain-hash copy when shadow is off.
-        if let Some(ref mut publisher) = self.chain_hash {
-            publisher.store(FsyncState {
-                journal_seq: WireSeq::new(journal_seq),
-                chain_hash: self.writer.chain_hash().unwrap_or([0u8; 32]),
-                input_ring_seq: RingPos::new(self.consumer.next_read()),
-            });
+    /// Claim a hand-off slot if the batch doesn't have one yet.
+    ///
+    /// A full ring means the disk thread is behind by the whole staging
+    /// depth. Spinning here is the backpressure: the sequencer stops
+    /// draining the input disruptor, which backpressures its producers
+    /// — the same chain a slow journal has always had, with a deeper
+    /// buffer in front of it.
+    fn claim_slot(&mut self) -> Result<(), JournalError> {
+        if self.claim.is_some() {
+            return Ok(());
         }
-        if let Some(ref cursor) = self.last_seq {
-            cursor.store(WireSeq::new(journal_seq));
-        }
-        if let Some(ref tip) = self.advertised_tip {
-            // `advance`, not a plain store: across a promotion the receiver
-            // left the tip at its in-memory accepted position, which the
-            // new primary's journal only reaches after the drained ring is
-            // flushed — a plain store would regress the advertised tip in
-            // that window.
-            tip.advance(WireSeq::new(journal_seq));
+        let mut idle_spins: u32 = 0;
+        loop {
+            match self.batches.try_claim() {
+                Ok(claim) => {
+                    self.claim = Some(claim);
+                    return Ok(());
+                }
+                Err(_) => {
+                    // A poisoned disk thread never drains again — the
+                    // spin would be forever.
+                    if self.disk.poisoned() {
+                        return Err(self.take_poison());
+                    }
+                    idle_wait(&mut idle_spins, self.busy_spin);
+                }
+            }
         }
     }
 
-    /// One durable sync point on the synchronous path: publish the
-    /// accumulated `InputBatch` frame to the replication rings BEFORE
-    /// the flush or discard clears the buffer (the frame was built
-    /// alongside the journal-codec writes via
-    /// `record_slot_for_replication`), persist (`no-persist`: drop the
-    /// buffer — "skip the write syscall," not "skip everything that
-    /// follows"; the replication publish must still run or the response
-    /// stage's replication-cursor gate deadlocks), advance the journal
-    /// cursor to `progress`, and publish fsync state.
+    /// Hand the encoded batch to the disk thread: publish the
+    /// accumulated `InputBatch` frame to the replication rings first
+    /// (the frame was built alongside the journal-codec writes via
+    /// `record_slot_for_replication`), then publish the slot with
+    /// everything the disk thread must make true once the batch is
+    /// durable.
     ///
-    /// `progress` is the ring position of the last slot the flush
+    /// `progress` is the ring position of the last slot this batch
     /// covers — an explicit value, NOT `Consumer::commit`, because
     /// `commit` publishes `next_read`, which after a `read_batch` spans
     /// the WHOLE read batch. At the mid-batch mark barrier only a
@@ -1228,26 +1400,116 @@ impl<E: AppEvent> JournalStage<E> {
     /// persist-before-ack). The steady-state caller passes
     /// `consumer.next_read()`, which is then equivalent to `commit`.
     ///
-    /// A journal I/O failure is fatal: surface the error so the
-    /// pipeline shuts down rather than spinning forever on a broken
-    /// disk (e.g., ENOSPC).
-    fn sync_point(&mut self, progress: u64) -> Result<(), JournalError> {
+    /// Returns once the batch is *submitted*, not once it is durable.
+    /// That is the point of the split: the sequencer keeps encoding and
+    /// feeding replicas while the device works.
+    fn submit_batch(&mut self, progress: u64) -> Result<(), JournalError> {
         if self.repl.any_producer() {
-            let end_seq = self.writer.next_sequence() - 1;
+            let end_seq = self.encoder.next_sequence() - 1;
             Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
         }
-        #[cfg(not(feature = "no-persist"))]
-        self.writer.flush_batch_sync().map_err(|e| {
-            JournalError::Io(std::io::Error::other(format!(
-                "journal flush_batch_sync: {e}"
-            )))
-        })?;
-        #[cfg(feature = "no-persist")]
-        self.writer.discard_batch_buf();
 
-        self.consumer.set_progress(progress);
-        self.publish_fsync_state();
+        // A batch of nothing but queries encodes no bytes, yet its ring
+        // slots still have to be released upstream — so it travels as a
+        // zero-length batch carrying only cursors. `no-persist` uses
+        // the same shape: "skip the write syscall", not "skip
+        // everything that follows" (the replication publish above must
+        // still run or the response stage's replication-cursor gate
+        // deadlocks).
+        #[cfg(not(feature = "no-persist"))]
+        let len = self.encoder.batch_len() as u32;
+        #[cfg(feature = "no-persist")]
+        let len = 0u32;
+
+        let meta = JournalWriteMeta {
+            len,
+            journal_seq: self.encoder.next_sequence().saturating_sub(1),
+            chain_hash: self.encoder.chain_hash().unwrap_or([0u8; 32]),
+            ring_progress: progress,
+            input_ring_seq: self.consumer.next_read(),
+        };
+
+        // Every batch needs a slot, even an empty one, because the slot
+        // is what carries the cursors.
+        self.claim_slot()?;
+        let claim = self.claim.take().expect("claimed above");
+        self.batches.publish(claim, meta);
+        self.encoder.clear_batch();
+        self.segment_bytes += u64::from(len);
+        self.disk.set_lag(self.batches.in_flight());
         Ok(())
+    }
+
+    /// Block until every submitted batch is durable and its cursors are
+    /// published.
+    ///
+    /// The rotation rendezvous and shutdown both need this: the disk
+    /// thread must have nothing in flight before the segment is swapped
+    /// or the thread is stopped.
+    fn drain_disk(&mut self) -> Result<(), JournalError> {
+        let mut idle_spins: u32 = 0;
+        while !self.batches.drained() {
+            if self.disk.poisoned() {
+                return Err(self.take_poison());
+            }
+            idle_wait(&mut idle_spins, self.busy_spin);
+        }
+        Ok(())
+    }
+
+    /// The failure the disk thread latched, with a fallback for the
+    /// (unreachable) case of a poison flag without a stored cause.
+    fn take_poison(&self) -> JournalError {
+        self.disk.take_error().unwrap_or_else(|| {
+            JournalError::Io(std::io::Error::other(
+                "journal disk thread failed without recording a cause",
+            ))
+        })
+    }
+
+    /// Stop the disk thread and discard the segment. The journal is
+    /// already broken (or the stream hit a fatal condition), so there is
+    /// nothing to hand back — but the thread must not be left running.
+    fn halt_disk_thread(&mut self) {
+        self.disk.stop();
+        if let Some(handle) = self.disk_thread.take()
+            && handle.join().is_err()
+        {
+            tracing::error!("journal-disk thread panicked");
+        }
+    }
+
+    /// Wait for everything submitted to land, stop the disk thread, and
+    /// reassemble the writer from both halves.
+    ///
+    /// Consumes the sequencer: the stream half it owns becomes half of
+    /// the returned writer, which recovery and promotion then drive
+    /// single-threaded.
+    fn finish(mut self) -> Result<BufferedWriter<E>, JournalError> {
+        // A drain failure still has to stop the thread — the journal is
+        // broken, but leaking a spinning thread on top of that helps
+        // nobody.
+        if let Err(e) = self.drain_disk() {
+            self.halt_disk_thread();
+            return Err(e);
+        }
+        self.disk.stop();
+        let segment = match self.disk_thread.take() {
+            Some(handle) => handle.join().map_err(|_| {
+                JournalError::Io(std::io::Error::other("journal-disk thread panicked"))
+            })?,
+            None => {
+                return Err(JournalError::Io(std::io::Error::other(
+                    "journal-disk thread already joined",
+                )));
+            }
+        };
+        // A poison latched during the final drain still has to surface:
+        // the batches it covers were never made durable.
+        if self.disk.poisoned() {
+            return Err(self.take_poison());
+        }
+        Ok(BufferedWriter::from_halves(self.encoder, segment))
     }
 
     /// Rotate the live journal segment if a trigger has fired.
@@ -1269,7 +1531,7 @@ impl<E: AppEvent> JournalStage<E> {
         let Some(manual) = self.local_rotation_armed() else {
             return false;
         };
-        let pre_size = self.writer.valid_end();
+        let pre_size = self.segment_bytes;
         let (rotate_result, used_fast_path) = self.rotate_taking_prepared();
         self.finish_local_rotation(rotate_result, manual, used_fast_path, pre_size)
     }
@@ -1282,45 +1544,65 @@ impl<E: AppEvent> JournalStage<E> {
     /// size/manual rotation and replica boundary adoption, so a policy
     /// change (e.g. rejecting a stale-sized prepared segment) cannot
     /// skew the two triggers apart.
+    ///
+    /// A rotation is the one place the sequencer waits for the disk
+    /// thread. It has to: the outgoing segment must hold everything
+    /// encoded before the boundary, the new segment's header carries
+    /// values only the stream half knows (the boundary sequence and the
+    /// chain tail), and the `Rotate` frame replicas receive must
+    /// reflect what actually happened. The wait is one drain plus the
+    /// rotation itself — strictly less than the inline rotation it
+    /// replaces, and a few times per gigabyte.
     fn rotate_taking_prepared(&mut self) -> (Result<std::path::PathBuf, JournalError>, bool) {
+        // Encoded-but-unsubmitted bytes belong to the OUTGOING segment.
+        // Every caller reaches here right after a submit (steady state,
+        // mark barrier) or with nothing encoded (idle), so this holds by
+        // construction — but silently rotating over a pending batch
+        // would write those bytes into the new segment and misframe
+        // both journals, so pin it.
+        debug_assert_eq!(
+            self.encoder.batch_len(),
+            0,
+            "rotation with an unsubmitted batch would move it into the new segment"
+        );
+        if let Err(e) = self.drain_disk() {
+            return (Err(e), false);
+        }
         let prepared = self.preparer.as_ref().and_then(|p| p.take());
         let used_fast_path = prepared.is_some();
-        let result = match prepared {
-            Some(p) => self.writer.rotate_segment_with_prepared(p),
-            None => self.writer.rotate_segment(),
-        };
+        // No sequence is consumed: the next event still gets
+        // `next_sequence`, and the new segment's header anchor is the
+        // outgoing segment's tail — which makes the chain value across
+        // the boundary unchanged.
+        let starting_sequence = self.encoder.next_sequence();
+        let anchor_hash = self.encoder.chain_hash().unwrap_or([0u8; 32]);
+        self.disk.request_rotation(RotateRequest {
+            prepared,
+            starting_sequence,
+            anchor_hash,
+        });
+
+        let result = self.await_rotation();
+        if result.is_ok() {
+            self.encoder.begin_segment(starting_sequence, anchor_hash);
+            self.segment_bytes = melin_journal::codec::ENTRY_OFFSET;
+        }
         (result, used_fast_path)
     }
 
-    /// Spawn a preparer via `spawn` iff rotation recurs on a
-    /// predictable cadence — size-driven rotation, or replica mode
-    /// (primary-announced boundaries arrive at the primary's cadence;
-    /// a replica's rotation stall sits on the ack path, where under
-    /// `hybrid`/`durably-replicated` gating it delays the primary's
-    /// durability gate, so the fast path matters *more* there than on
-    /// the primary itself). Deliberately NOT armed for manual-only
-    /// rotation (`ROTATE` with `max_journal_bytes == 0`): the cadence
-    /// is unpredictable and the staged segment's disk + thread cost may
-    /// never pay off.
-    fn arm_preparer_if_recurring(&mut self, spawn: impl FnOnce(&Self) -> SegmentPreparer) {
-        let rotation_recurs = self.max_journal_bytes > 0 || self.stream_marks.is_some();
-        if rotation_recurs && self.preparer.is_none() {
-            self.preparer = Some(spawn(self));
+    /// Wait for the disk thread's rotation outcome.
+    fn await_rotation(&mut self) -> Result<std::path::PathBuf, JournalError> {
+        let mut idle_spins: u32 = 0;
+        loop {
+            if let Some(result) = self.disk.take_rotation_result() {
+                return result;
+            }
+            // A poisoned thread has stopped and will never answer.
+            if self.disk.poisoned() {
+                return Err(self.take_poison());
+            }
+            idle_wait(&mut idle_spins, self.busy_spin);
         }
-    }
-
-    /// Set the core the preparer worker pins itself to (`0` =
-    /// unpinned). Call before the stage runs — `enable_preparer` reads
-    /// it at spawn time; changing it afterwards has no effect on an
-    /// already-running worker.
-    pub fn set_preparer_core(&mut self, core: usize) {
-        self.preparer_core = core;
-    }
-
-    /// Test-only probe: whether `enable_preparer` armed the preparer.
-    #[cfg(test)]
-    pub(crate) fn preparer_enabled(&self) -> bool {
-        self.preparer.is_some()
     }
 
     /// Trigger/guard half of [`JournalStage::maybe_rotate`]: consume the
@@ -1338,7 +1620,7 @@ impl<E: AppEvent> JournalStage<E> {
             })
             .unwrap_or(false);
         let size_triggered =
-            self.max_journal_bytes > 0 && self.writer.valid_end() >= self.max_journal_bytes;
+            self.max_journal_bytes > 0 && self.segment_bytes >= self.max_journal_bytes;
         if !(manual || size_triggered) {
             return None;
         }
@@ -1358,20 +1640,21 @@ impl<E: AppEvent> JournalStage<E> {
         // boundary already exists at this exact sequence. Also keeps
         // "live starts at boundary+1" an unambiguous already-adopted
         // signal on replicas (no zero-length segment can sit between).
-        if self.writer.next_sequence() == self.writer.segment_starting_sequence() {
+        if self.encoder.next_sequence() == self.encoder.segment_starting_sequence() {
             if manual {
                 tracing::info!(
-                    next_sequence = self.writer.next_sequence(),
+                    next_sequence = self.encoder.next_sequence(),
                     "manual rotation skipped: live segment is empty (already at a boundary)"
                 );
             }
             return None;
         }
         // Entries encoded for replication but not yet published belong
-        // to the outgoing segment (`rotate_segment` flushes them to it),
-        // so they must precede the Rotate frame on the rings.
+        // to the outgoing segment (the rotation drains everything
+        // submitted into it), so they must precede the Rotate frame on
+        // the rings.
         if self.repl.any_producer() {
-            let end_seq = self.writer.next_sequence() - 1;
+            let end_seq = self.encoder.next_sequence() - 1;
             Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
         }
         Some(manual)
@@ -1410,7 +1693,7 @@ impl<E: AppEvent> JournalStage<E> {
                 tracing::info!(
                     archive = %archived.display(),
                     pre_rotate_bytes = pre_size,
-                    next_sequence = self.writer.next_sequence(),
+                    next_sequence = self.encoder.next_sequence(),
                     trigger = if manual { "manual" } else { "size" },
                     fast_path = used_fast_path,
                     rotations_fast_path =
@@ -1430,8 +1713,13 @@ impl<E: AppEvent> JournalStage<E> {
                 if let Some(p) = self.preparer.as_ref() {
                     p.arm_with_observed_len(pre_size);
                 }
-                self.publish_fsync_state();
-                Self::publish_rotate_to_rings(&mut self.repl, &self.writer);
+                // No cursor republish: a rotation consumes no sequence
+                // and the new segment's anchor *is* the outgoing tail,
+                // so `journal_seq` and the chain value are unchanged —
+                // and the rendezvous drained the ring, so ring progress
+                // is unchanged too. The state observers already hold is
+                // the state after the rotation.
+                Self::publish_rotate_to_rings(&mut self.repl, &self.encoder);
                 true
             }
             Err(e) => {
@@ -1514,7 +1802,7 @@ impl<E: AppEvent> JournalStage<E> {
                 return Ok(None);
             };
             let position = mark.sequence();
-            let at = self.writer.next_sequence() - 1;
+            let at = self.encoder.next_sequence() - 1;
             if at < position {
                 return Ok(None);
             }
@@ -1536,7 +1824,7 @@ impl<E: AppEvent> JournalStage<E> {
                     }
                     // `None` only with `hash-chain` disabled — nothing to
                     // compare, the check passes by construction.
-                    let local = self.writer.chain_hash().unwrap_or(chain_hash);
+                    let local = self.encoder.chain_hash().unwrap_or(chain_hash);
                     if local != chain_hash {
                         return Err(JournalError::ReplicaChainDivergence {
                             sequence,
@@ -1555,7 +1843,7 @@ impl<E: AppEvent> JournalStage<E> {
                     // also carries — never through a second real rotation:
                     // the primary skips empty-live rotations, so two
                     // distinct rotations at one sequence cannot exist.
-                    if self.writer.segment_starting_sequence() == r.boundary_seq + 1 {
+                    if self.encoder.segment_starting_sequence() == r.boundary_seq + 1 {
                         self.pending_mark = None;
                         continue;
                     }
@@ -1578,7 +1866,7 @@ impl<E: AppEvent> JournalStage<E> {
                     // ChainCheck arm and the handshake validator: a
                     // mixed-feature pair runs with reduced verification
                     // instead of falsely diverging on every rotation.
-                    let local_tail = self.writer.chain_hash().unwrap_or(r.tail_hash);
+                    let local_tail = self.encoder.chain_hash().unwrap_or(r.tail_hash);
                     if r.tail_hash != [0u8; 32] && local_tail != r.tail_hash {
                         return Err(JournalError::ReplicaChainDivergence {
                             sequence: r.boundary_seq,
@@ -1609,7 +1897,7 @@ impl<E: AppEvent> JournalStage<E> {
         // encoded straight past the successor, and the next resolve
         // would report it "already passed" and kill the stage.
         self.refresh_pending_mark();
-        self.publish_fsync_state();
+        // Nothing to republish — see `finish_local_rotation`.
     }
 
     /// True while a failed rotation attempt's backoff window is still
@@ -1673,7 +1961,7 @@ impl<E: AppEvent> JournalStage<E> {
         // Adopt a pre-staged segment when one is ready — on a replica
         // the rotation stall sits on the ack path, so the fast path
         // matters *more* here than on the primary.
-        let pre_size = self.writer.valid_end();
+        let pre_size = self.segment_bytes;
         let (rotate_result, used_fast_path) = self.rotate_taking_prepared();
         // Re-arm regardless of outcome so the next boundary also has a
         // chance at the fast path, tuning the zero-fill target to the
@@ -1711,47 +1999,48 @@ impl<E: AppEvent> JournalStage<E> {
             if count == 0 {
                 break;
             }
-            #[cfg(not(feature = "no-persist"))]
-            {
-                for slot in &batch[..count] {
-                    if slot.event.is_query() || slot.event.is_shutdown() {
-                        // Sentinel is never persisted (codec rejects it).
-                        // Reaching this path means the shutdown flag fired
-                        // before the sentinel was consumed — skip it.
-                        continue;
-                    }
-                    let seq = if slot.sequence != 0 {
-                        self.writer.set_next_sequence(slot.sequence + 1);
-                        slot.sequence
-                    } else {
-                        self.writer.allocate_sequence()
-                    };
-                    if let Err(e) = self.writer.encode_event(
-                        seq,
-                        slot.timestamp_ns,
-                        &slot.event,
-                        slot.key_hash,
-                        slot.request_seq,
-                    ) {
-                        tracing::error!(error = %e, "journal encode error on drain");
-                        continue;
-                    }
-                    let journal_slice = self.writer.last_user_entry_replication_slice();
-                    Self::record_slot_for_replication(&mut self.repl, journal_slice);
+            for slot in &batch[..count] {
+                if slot.event.is_query() || slot.event.is_shutdown() {
+                    // Sentinel is never persisted (codec rejects it).
+                    // Reaching this path means the shutdown flag fired
+                    // before the sentinel was consumed — skip it.
+                    continue;
                 }
-
-                // Publish accumulated InputBatch frame to replication rings
-                // before flush, mirroring the steady-state sync path.
-                if self.repl.any_producer() {
-                    let end_seq = self.writer.next_sequence() - 1;
-                    Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
+                let seq = if slot.sequence != 0 {
+                    self.encoder.set_next_sequence(slot.sequence + 1);
+                    slot.sequence
+                } else {
+                    self.encoder.allocate_sequence()
+                };
+                if let Err(e) = self.claim_slot() {
+                    tracing::error!(error = %e, "journal hand-off failed on drain");
+                    return;
                 }
-
-                if let Err(e) = self.writer.flush_batch_sync() {
-                    tracing::error!(error = %e, "journal sync error on drain");
+                let chunk = self.claim.as_mut().expect("claimed above");
+                if let Err(e) = self.encoder.encode_event(
+                    chunk.bytes_mut(),
+                    seq,
+                    slot.timestamp_ns,
+                    &slot.event,
+                    slot.key_hash,
+                    slot.request_seq,
+                ) {
+                    tracing::error!(error = %e, "journal encode error on drain");
+                    continue;
                 }
+                let journal_slice = self
+                    .encoder
+                    .last_user_entry_replication_slice(chunk.bytes());
+                Self::record_slot_for_replication(&mut self.repl, journal_slice);
             }
-            self.consumer.commit();
+
+            // Hand the batch over exactly as the steady-state path
+            // does — replication frame first, then the slot carrying
+            // the cursors. `finish` waits for it to become durable.
+            if let Err(e) = self.submit_batch(self.consumer.next_read()) {
+                tracing::error!(error = %e, "journal hand-off failed on drain");
+                return;
+            }
         }
     }
 }
@@ -1800,6 +2089,37 @@ impl<E: AppEvent> JournalStage<E> {
                 stage.preparer_core,
             )
         });
+    }
+
+    /// Spawn a preparer via `spawn` iff rotation recurs on a
+    /// predictable cadence — size-driven rotation, or replica mode
+    /// (primary-announced boundaries arrive at the primary's cadence;
+    /// a replica's rotation stall sits on the ack path, where under
+    /// `hybrid`/`durably-replicated` gating it delays the primary's
+    /// durability gate, so the fast path matters *more* there than on
+    /// the primary itself). Deliberately NOT armed for manual-only
+    /// rotation (`ROTATE` with `max_journal_bytes == 0`): the cadence
+    /// is unpredictable and the staged segment's disk + thread cost may
+    /// never pay off.
+    fn arm_preparer_if_recurring(&mut self, spawn: impl FnOnce(&Self) -> SegmentPreparer) {
+        let rotation_recurs = self.max_journal_bytes > 0 || self.stream_marks.is_some();
+        if rotation_recurs && self.preparer.is_none() {
+            self.preparer = Some(spawn(self));
+        }
+    }
+
+    /// Set the core the preparer worker pins itself to (`0` =
+    /// unpinned). Call before the stage runs — `enable_preparer` reads
+    /// it at spawn time; changing it afterwards has no effect on an
+    /// already-running worker.
+    pub fn set_preparer_core(&mut self, core: usize) {
+        self.preparer_core = core;
+    }
+
+    /// Test-only probe: whether `enable_preparer` armed the preparer.
+    #[cfg(test)]
+    pub(crate) fn preparer_enabled(&self) -> bool {
+        self.preparer.is_some()
     }
 }
 
@@ -2671,10 +2991,11 @@ fn setup_chain_hash_publisher<E: AppEvent>(
 /// Build the pipeline with optional replication support.
 ///
 /// When `enable_replication` is true, builds a replication ring (pre-allocated,
-/// lock-free) and wires the producer into the `JournalStage`. After each
-/// `flush_batch_sync()`, the journal stage copies the encoded bytes into a
-/// pre-allocated ring slot (no heap allocation). The returned consumer(s)
-/// are for replica sender threads.
+/// lock-free) and wires the producer into the `JournalStage`. At each
+/// batch boundary the sequencer copies the encoded bytes into a
+/// pre-allocated ring slot (no heap allocation) — before the batch is
+/// handed to the disk thread, so replication never waits on the device.
+/// The returned consumer(s) are for replica sender threads.
 ///
 /// When replication is disabled, the replica slot cursors stay disengaged
 /// (standalone mode) and the derived quorum view reads "no replica".

@@ -2452,6 +2452,86 @@ fn preparer_arms_for_size_and_replica_modes_only() {
     );
 }
 
+/// The size-driven rotation trigger measures the live segment from a
+/// counter the sequencer keeps, because the file itself now lives on
+/// the disk thread. That counter has to track the segment's real size:
+/// if it drifted the deployment would rotate at the wrong cadence, or
+/// (drifting low) never rotate at all while the journal grew unbounded.
+///
+/// Rotate at a real threshold and check the archive against it — the
+/// counter runs at most one in-flight batch ahead of the file, so the
+/// sealed segment must land within a batch of the threshold rather than
+/// wildly past it.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn size_trigger_tracks_the_segments_real_size() {
+    const THRESHOLD: u64 = 16 * 1024;
+    /// Generous bound on one encoded entry (`MAX_ENTRY_SIZE` is 144).
+    const ONE_ENTRY: u64 = 256;
+
+    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sized.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    stage.set_rotation(THRESHOLD, None);
+    // One event per batch: publish, wait for it to become durable, then
+    // publish the next. Free-running publication would batch hundreds
+    // of events per rotation check, and the overshoot from batching
+    // would swamp the counter error this test exists to detect.
+    let durable = DurableWireSeqCursor::detached(WireSeq::new(0));
+    stage.set_last_seq_publisher(durable.clone());
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    let archive = std::path::PathBuf::from(format!("{}.000001", path.display()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut n = 0u64;
+    while !archive.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no size-driven rotation within deadline after {n} events"
+        );
+        n += 1;
+        producer.publish(add_slot(n, 1_000_000_000 + n));
+        let mut spins = 0u32;
+        while durable.load() < WireSeq::new(n) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event {n} never became durable"
+            );
+            drain_backoff(&mut spins, std::time::Instant::now(), "durable cursor");
+        }
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+
+    // With one event in flight at a time, the sealed segment must land
+    // within a single entry of the threshold. A counter running ahead
+    // of the segment rotates early and seals short; one lagging behind
+    // seals long.
+    let sealed = std::fs::metadata(&archive).unwrap().len();
+    assert!(
+        sealed >= THRESHOLD,
+        "rotated before the threshold: sealed {sealed} < {THRESHOLD} — \
+         the size counter is running ahead of the segment"
+    );
+    assert!(
+        sealed <= THRESHOLD + ONE_ENTRY,
+        "rotated past the threshold: sealed {sealed} > {THRESHOLD} + {ONE_ENTRY} — \
+         the size counter is lagging the segment"
+    );
+}
+
 /// ROTATE storm: many rapid sets of the flag between fsync
 /// boundaries collapse to a single rotation, not one rotation per
 /// store. Validates the `compare_exchange(true → false)` consume in
