@@ -2772,6 +2772,10 @@ fn pipeline_journals_every_event_in_order() {
 /// recovery, where the journal ring cursor restarts near zero while the
 /// durable cursor resumes at the recovered high-water mark. Guards the
 /// space fix that moved the stats surface off the ring cursor.
+///
+/// Requires a really-persisted journal: the second half recovers from
+/// the file the first half wrote, and `no-persist` writes none.
+#[cfg(not(feature = "no-persist"))]
 #[test]
 fn stats_query_reports_durable_wire_seq_across_recovery() {
     let dir = tempfile::tempdir().unwrap();
