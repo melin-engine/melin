@@ -1172,6 +1172,16 @@ impl<E: AppEvent> Sequencer<E> {
                 if idle_count.is_multiple_of(1024) {
                     self.utilization.busy.store(busy_count, Ordering::Relaxed);
                     self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                    // The lag gauge falls on this path, never on the
+                    // submit path: the value stored at submit time is
+                    // the batch just handed over, so it is at least 1
+                    // by construction. Left to that store alone the
+                    // gauge would freeze non-zero every time traffic
+                    // stopped — a permanent phantom stall on a metric
+                    // operators are told to alert on.
+                    self.utilization
+                        .journal_disk_lag
+                        .store(self.batches.in_flight(), Ordering::Relaxed);
                     self.apply_stream_marks(true)?;
                 }
                 // Hand buffered latency samples to the stats registry

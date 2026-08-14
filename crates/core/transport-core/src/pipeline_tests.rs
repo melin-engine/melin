@@ -2532,6 +2532,76 @@ fn size_trigger_tracks_the_segments_real_size() {
     );
 }
 
+/// `melin_journal_disk_lag_batches` is documented as zero in steady
+/// state, and operators are told to alert on a *sustained* non-zero
+/// value. That only holds if the gauge is refreshed after the disk
+/// catches up. Stored solely at submit time it freezes at whatever was
+/// in flight when the last batch was handed over, so every burst that
+/// ends leaves a permanent phantom stall on the dashboard — the exact
+/// false positive the alert is supposed to distinguish from a real one.
+///
+/// Publish enough to put the disk behind, then let the stage idle and
+/// require the gauge to come back to zero on its own.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn disk_lag_gauge_returns_to_zero_once_the_journal_quiesces() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lag.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    const EVENTS: u64 = 512;
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let utilization = stage.utilization();
+    // Durability of the last event is the "the stage has quiesced"
+    // signal. Without it the gauge would be read before the stage ever
+    // submitted a batch, and its untouched initial zero would satisfy
+    // the assertion for the wrong reason.
+    let durable = DurableWireSeqCursor::detached(WireSeq::new(0));
+    stage.set_last_seq_publisher(durable.clone());
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    for n in 1..=EVENTS {
+        producer.publish(add_slot(n, 1_000_000_000 + n));
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut spins = 0u32;
+    while durable.load() < WireSeq::new(EVENTS) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the burst never became durable"
+        );
+        drain_backoff(&mut spins, std::time::Instant::now(), "durable cursor");
+    }
+
+    // Everything is on disk and no further batch will ever be
+    // submitted. The gauge must reflect that.
+    loop {
+        let lag = utilization.journal_disk_lag.load(Ordering::Relaxed);
+        if lag == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disk lag gauge stuck at {lag} long after the journal quiesced — \
+             it is only refreshed when a batch is submitted"
+        );
+        drain_backoff(&mut spins, std::time::Instant::now(), "disk lag gauge");
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+}
+
 /// ROTATE storm: many rapid sets of the flag between fsync
 /// boundaries collapse to a single rotation, not one rotation per
 /// store. Validates the `compare_exchange(true → false)` consume in
