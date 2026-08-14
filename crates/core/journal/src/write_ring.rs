@@ -224,53 +224,81 @@ impl JournalWriteProducer {
 
 /// Consumer end, owned by the disk thread.
 ///
-/// Two-phase like the replication consumer: [`try_read`](Self::try_read)
-/// yields the next batch without releasing its slot, and
-/// [`commit`](Self::commit) releases every slot read so far. The byte
-/// slices stay valid until that commit.
+/// Two-phase like the replication consumer:
+/// [`stage_ready`](Self::stage_ready) takes every published batch
+/// without releasing any slot, and [`commit`](Self::commit) releases
+/// them all. The byte slices stay valid until that commit.
+///
+/// Staging returns positions rather than slices so the caller can hold
+/// *all* of them at once — that is what lets the disk thread build one
+/// iovec array and issue a single `pwritev` for a whole backlog. A
+/// `try_read`-per-batch shape cannot: each call would borrow the
+/// consumer mutably, so no two slices could coexist.
 pub struct JournalWriteConsumer {
     inner: ring::Consumer<JournalWriteMeta>,
     chunks: Arc<SharedChunks>,
-    /// Slots read since the last commit — released together, because
-    /// one `fdatasync` covers all of them.
-    uncommitted: usize,
+    /// Ring sequences staged since the last commit, in order. Released
+    /// together, because one `fdatasync` covers all of them.
+    staged: Vec<u64>,
+    /// Valid byte length of each staged slot, parallel to `staged`.
+    staged_len: Vec<u32>,
 }
 
 impl JournalWriteConsumer {
-    /// Take the next published batch, leaving its slot held.
-    pub fn try_read(&mut self) -> Option<(JournalWriteMeta, &[u8])> {
+    /// Take every published batch, leaving all their slots held.
+    ///
+    /// Returns the last batch's descriptor — the one whose cursors
+    /// become true once the whole staged run is durable, since every
+    /// earlier batch is durable by then too. `None` when nothing is
+    /// published.
+    pub fn stage_ready(&mut self) -> Option<JournalWriteMeta> {
         let mut buf = [JournalWriteMeta::default(); 1];
-        if self.inner.read_batch(&mut buf, 1) == 0 {
-            return None;
+        let mut last = None;
+        while self.inner.read_batch(&mut buf, 1) == 1 {
+            // `read_batch` advanced `next_read` but not the published
+            // progress counter, so the slot stays ours until `commit`.
+            self.staged.push(self.inner.next_read() - 1);
+            self.staged_len.push(buf[0].len);
+            last = Some(buf[0]);
         }
-        let meta = buf[0];
-        // `read_batch` advanced `next_read` but not the published
-        // progress counter, so the slot stays ours until `commit`.
-        let seq = self.inner.next_read() - 1;
+        last
+    }
+
+    /// Number of batches staged since the last commit.
+    pub fn staged(&self) -> usize {
+        self.staged.len()
+    }
+
+    /// The `i`th staged batch's bytes.
+    ///
+    /// Borrows `&self`, so every staged slice can be held at once —
+    /// see the type docs.
+    pub fn staged_bytes(&self, i: usize) -> &[u8] {
+        let seq = self.staged[i];
+        let len = self.staged_len[i] as usize;
         let idx = (seq & self.chunks.mask) as usize;
         // Safety: the slot is published (the producer cannot touch it)
         // and not yet committed (no other reader can take it).
-        let data = unsafe {
+        unsafe {
             let chunk = &*self.chunks.chunks[idx].get();
-            &chunk[..meta.len as usize]
-        };
-        self.uncommitted += 1;
-        Some((meta, data))
-    }
-
-    /// Release every slot read since the last commit. Call only once
-    /// the batches are durable — this is what lets the sequencer reuse
-    /// them, and what its drain test observes.
-    pub fn commit(&mut self) {
-        if self.uncommitted > 0 {
-            self.inner.commit();
-            self.uncommitted = 0;
+            &chunk[..len]
         }
     }
 
-    /// Batches read but not yet released.
-    pub fn uncommitted(&self) -> usize {
-        self.uncommitted
+    /// Total bytes across everything staged.
+    pub fn staged_total_bytes(&self) -> usize {
+        self.staged_len.iter().map(|&l| l as usize).sum()
+    }
+
+    /// Release every slot staged since the last commit. Call only once
+    /// the batches are durable — this is what lets the sequencer reuse
+    /// them, and what its drain test observes.
+    pub fn commit(&mut self) {
+        if !self.staged.is_empty() {
+            self.inner.commit();
+            self.staged.clear();
+            self.staged_len.clear();
+        }
     }
 }
 
@@ -307,7 +335,10 @@ pub fn build_journal_write_ring(capacity: usize) -> (JournalWriteProducer, Journ
     let consumer = JournalWriteConsumer {
         inner: inner_consumer,
         chunks,
-        uncommitted: 0,
+        // Sized to the ring: staging can never exceed its depth, so
+        // the disk thread never allocates on the drain path.
+        staged: Vec::with_capacity(capacity),
+        staged_len: Vec::with_capacity(capacity),
     };
     (producer, consumer)
 }
@@ -336,13 +367,14 @@ mod tests {
         claim.bytes_mut()[..5].copy_from_slice(b"hello");
         producer.publish(claim, meta(5, 7));
 
-        let (got_meta, bytes) = consumer.try_read().expect("batch must be visible");
-        assert_eq!(bytes, b"hello");
+        let got_meta = consumer.stage_ready().expect("batch must be visible");
+        assert_eq!(consumer.staged(), 1);
+        assert_eq!(consumer.staged_bytes(0), b"hello");
         assert_eq!(got_meta.journal_seq, 7);
         assert_eq!(got_meta.ring_progress, 70);
         assert_eq!(got_meta.input_ring_seq, 71);
         assert!(
-            consumer.try_read().is_none(),
+            consumer.stage_ready().is_none(),
             "only one batch was published"
         );
     }
@@ -360,10 +392,10 @@ mod tests {
         producer.publish(claim, meta(0, 1));
         assert!(!producer.drained(), "published but not consumed");
 
-        consumer.try_read().expect("batch available");
+        consumer.stage_ready().expect("batch available");
         assert!(
             !producer.drained(),
-            "read is not durable — drain must still block"
+            "staging is not durable — drain must still block"
         );
 
         consumer.commit();
@@ -386,8 +418,8 @@ mod tests {
         );
         assert_eq!(producer.in_flight(), 2);
 
-        // Draining one slot frees exactly one claim.
-        consumer.try_read();
+        // Releasing the staged run frees the claims it covered.
+        consumer.stage_ready().expect("batches available");
         consumer.commit();
         assert!(producer.try_claim().is_ok());
     }
@@ -403,8 +435,12 @@ mod tests {
             claim.bytes_mut()[..4].copy_from_slice(&[lap; 4]);
             producer.publish(claim, meta(4, lap as u64));
 
-            let (got, bytes) = consumer.try_read().expect("batch available");
-            assert_eq!(bytes, &[lap; 4], "lap {lap} read stale bytes");
+            let got = consumer.stage_ready().expect("batch available");
+            assert_eq!(
+                consumer.staged_bytes(0),
+                &[lap; 4],
+                "lap {lap} read stale bytes"
+            );
             assert_eq!(got.journal_seq, lap as u64);
             consumer.commit();
         }
@@ -420,14 +456,15 @@ mod tests {
             let claim = producer.try_claim().unwrap();
             producer.publish(claim, meta(0, seq));
         }
-        for _ in 0..3 {
-            consumer.try_read().expect("batch available");
-        }
-        assert_eq!(consumer.uncommitted(), 3);
+        // One staging pass takes all three — that is what lets the disk
+        // thread hold every slice at once for a single vectored write.
+        let last = consumer.stage_ready().expect("batches available");
+        assert_eq!(consumer.staged(), 3);
+        assert_eq!(last.journal_seq, 2, "the last descriptor is returned");
         assert!(!producer.drained());
 
         consumer.commit();
-        assert_eq!(consumer.uncommitted(), 0);
+        assert_eq!(consumer.staged(), 0);
         assert!(producer.drained(), "all three slots released together");
     }
 }
