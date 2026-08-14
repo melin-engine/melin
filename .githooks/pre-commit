@@ -7,7 +7,8 @@
 #   1. Cargo.lock is staged when modified (prevents dep drift)
 #   2. cargo fmt (formatting)
 #   3. cargo clippy on all targets with warnings as errors
-#   4. cargo check on all targets with `hash-chain` enabled
+#   4. off-by-default features: `hash-chain` builds, `no-persist` builds
+#      and passes its tests
 #   5. cargo nextest run, falling back to cargo test if nextest is missing
 
 set -e
@@ -44,10 +45,10 @@ fi
 # without anything noticing: the `hash-chain` tests in
 # `replication/catchup.rs` sat broken for a month and a full release
 # that way, because nothing in the loop ever enabled the feature.
-# `hash-chain` is the one that matters — it is a production durability
-# feature (the tamper-evident audit chain), not a dev toggle. `check`
-# rather than `clippy`/`nextest`: catching the compile rot is the whole
-# point, and the extra minute of lint/test time per commit is not.
+# `hash-chain` is a production durability feature (the tamper-evident
+# audit chain). `check` rather than `clippy`/`nextest`: catching the
+# compile rot is the whole point, and the extra minute of lint/test
+# time per commit is not.
 #
 # Enabled per package because a virtual workspace has no features of
 # its own. Deliberately WITHOUT `--no-default-features` — stripping
@@ -61,6 +62,35 @@ for pkg in "${HASH_CHAIN_PKGS[@]}"; do
         exit 1
     fi
 done
+
+# `no-persist` needs more than a compile check. Its rot was a *test*
+# failure, not a build failure: a recovery test recovering from a
+# journal this mode never writes. It compiled, and it passed under
+# default features, so nothing short of running the suite with the
+# feature on would have caught it. It is a bench/eval toggle rather
+# than a shipped durability mode, but a broken one silently invalidates
+# a fleet bench run, and the guard costs a few seconds warm.
+#
+# Only `melin-transport-core` is tested: it owns the semantics, and its
+# suite is already written to be valid under the feature (tests that
+# need a real journal are `cfg`-gated out). `melin-server-runtime` only
+# re-exports the feature, and its integration tests — recovery,
+# failover — are meaningless against a journal that is never written,
+# so it gets a build check.
+#
+# Output is captured whole (stdout too, unlike the `check` steps above)
+# because a test failure reports on stdout: successful commits stay
+# quiet, failing ones keep the report that says which test broke.
+if ! cargo test -q -p melin-transport-core --features no-persist >"$STDERR_LOG" 2>&1; then
+    cat "$STDERR_LOG" >&2
+    echo "error: melin-transport-core fails with --features no-persist."
+    exit 1
+fi
+if ! cargo check -p melin-server-runtime --all-targets --features no-persist 2>"$STDERR_LOG"; then
+    cat "$STDERR_LOG" >&2
+    echo "error: melin-server-runtime does not build with --features no-persist."
+    exit 1
+fi
 
 # 5. Tests. Prefer cargo-nextest (~3× faster on the failover suite via
 # per-test process isolation) and fall back to cargo test if it isn't
