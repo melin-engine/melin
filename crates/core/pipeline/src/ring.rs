@@ -677,6 +677,22 @@ impl<T: Copy + Default> Consumer<T> {
     /// gate is the published progress counter, which this call leaves
     /// alone.
     ///
+    /// # Publishing progress while the slice is alive
+    ///
+    /// A caller that publishes progress *covering part of this slice*
+    /// before dropping it — the journal stage does exactly that at its
+    /// mid-batch mark barrier, and the store may even come from another
+    /// thread — hands those slots back to the producer while the slice
+    /// still spans them. That is sound only under one rule:
+    ///
+    /// > never access a position at or below the progress you published.
+    ///
+    /// Reading one afterwards races the producer's overwrite, and the
+    /// entry it returns is whatever lap of the ring won. Publishing
+    /// progress for the whole slice is therefore only safe once the
+    /// slice is dead. Callers that publish a prefix must be structured
+    /// so the rest of the work only ever looks forward.
+    ///
     /// [`read_batch`]: Self::read_batch
     /// [`set_progress`]: Self::set_progress
     /// [`commit`]: Self::commit

@@ -1206,6 +1206,17 @@ impl<E: AppEvent> Sequencer<E> {
                     self.core.apply_stream_marks(false)?;
                     if matches!(self.core.pending_mark, Some(StreamMark::Rotate(_))) {
                         if pending > 0 {
+                            // This submit publishes ring progress for
+                            // `slots[..stop]` — from the disk thread,
+                            // possibly before this loop ends — which
+                            // hands those slots back to the producer
+                            // while `slots` still spans them. Sound
+                            // because everything past this point looks
+                            // only forward: `start` becomes `stop`, and
+                            // both the encode span and `mark_split`
+                            // read `slots[start..]`. Re-reading the
+                            // prefix here would race the producer's
+                            // overwrite — see `read_contiguous`.
                             self.core.submit_batch(read_start + stop as u64, read_end)?;
                             pending = 0;
                             first_write_ts = None;
