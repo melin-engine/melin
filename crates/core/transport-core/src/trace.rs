@@ -112,7 +112,31 @@ pub struct StageSnapshot {
     pub p99_ns: u64,
     pub p99_9_ns: u64,
     pub max_ns: u64,
+    /// How many of `samples` exceeded [`MAX_TRACKED_NS`] and were
+    /// clamped to it on the way in. When non-zero, `max_ns` is the
+    /// ceiling bucket's upper edge (marginally above `MAX_TRACKED_NS`
+    /// at 3 significant digits), not an observed duration.
+    ///
+    /// Reported because a clamped sample is otherwise
+    /// indistinguishable from a real one at the ceiling: a replica
+    /// wait that spanned a failover and a wait that happened to take
+    /// exactly 100 ms produce the same `max_ns`. A non-zero count says
+    /// "the tail is longer than this histogram can express" — which is
+    /// information; a silently clamped max is not.
+    pub clipped: u64,
 }
+
+/// Upper bound of every stage histogram. Samples above it are clamped
+/// on record and counted in [`StageSnapshot::clipped`].
+///
+/// 100 ms is generous for the per-stage spans this feature exists to
+/// measure (sub-microsecond to low-millisecond). The durability-gate
+/// waits can exceed it during a failover, which is exactly why the
+/// clamp is counted rather than widened: a wider bound costs bucket
+/// memory on every stage to accommodate an event that is better
+/// reported as "off the scale" than measured imprecisely.
+#[cfg(feature = "latency-trace")]
+pub const MAX_TRACKED_NS: u64 = 100_000_000;
 
 /// How often a stage thread should call [`StageRecorder::flush`] from
 /// its idle path.
@@ -171,12 +195,22 @@ impl Clone for StageRecorder {
 impl StageRecorder {
     /// Record a single sample in nanoseconds.
     ///
-    /// Saturates instead of returning an error when `ns` exceeds the
-    /// histogram's max bound — diagnostic samples are best-effort, and
+    /// Saturates instead of returning an error when `ns` exceeds
+    /// [`MAX_TRACKED_NS`] — diagnostic samples are best-effort, and
     /// dropping a single very-out-of-range sample is preferable to
-    /// crashing the trading thread.
+    /// crashing the trading thread. Saturated samples are counted so
+    /// the snapshot can say the tail ran off the scale.
+    ///
+    /// The out-of-range branch is the only added hot-path cost: one
+    /// compare, predicted not-taken, and the atomic increment is
+    /// reached only by samples that were already pathological.
     #[inline]
     pub fn record_ns(&mut self, ns: u64) {
+        if ns > MAX_TRACKED_NS {
+            self.entry
+                .clipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.rec.saturating_record(ns);
     }
 
@@ -258,6 +292,14 @@ impl StageRecorder {
 struct StageEntry {
     name: &'static str,
     sync: std::sync::Mutex<hdrhistogram::sync::SyncHistogram<u64>>,
+    /// Count of samples clamped to [`MAX_TRACKED_NS`] on record.
+    ///
+    /// An atomic on the entry rather than a field on `StageRecorder`
+    /// because every sibling recorder for a stage must contribute to
+    /// one count, and the snapshot reads it without taking the stage
+    /// mutex. Relaxed throughout: the count is diagnostic and is not
+    /// ordered against anything.
+    clipped: std::sync::atomic::AtomicU64,
 }
 
 /// Process-wide registry of stage histograms.
@@ -305,16 +347,17 @@ impl StatsRegistry {
                 };
             }
         }
-        // Range: 1 ns to 100 ms, 3 significant digits — same as the
-        // pre-SyncHistogram design; matches the expected per-stage
+        // Range: 1 ns to MAX_TRACKED_NS, 3 significant digits — same as
+        // the pre-SyncHistogram design; matches the expected per-stage
         // percentile shape.
-        let hist = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 100_000_000, 3)
+        let hist = hdrhistogram::Histogram::<u64>::new_with_bounds(1, MAX_TRACKED_NS, 3)
             .expect("valid histogram bounds");
         let sync: hdrhistogram::sync::SyncHistogram<u64> = hist.into();
         let recorder = sync.recorder();
         let entry = std::sync::Arc::new(StageEntry {
             name,
             sync: std::sync::Mutex::new(sync),
+            clipped: std::sync::atomic::AtomicU64::new(0),
         });
         entries.push(std::sync::Arc::clone(&entry));
         StageRecorder {
@@ -370,6 +413,7 @@ impl StatsRegistry {
             // the budget is spent, which still performs the drain — see
             // the doc on `snapshot_all`.
             sync.refresh_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+            let clipped = entry.clipped.load(std::sync::atomic::Ordering::Relaxed);
             if sync.is_empty() {
                 // Percentile queries on an empty histogram are defined
                 // but meaningless; report explicit zeros instead.
@@ -382,6 +426,7 @@ impl StatsRegistry {
                     p99_ns: 0,
                     p99_9_ns: 0,
                     max_ns: 0,
+                    clipped,
                 });
                 continue;
             }
@@ -394,6 +439,7 @@ impl StatsRegistry {
                 p99_ns: sync.value_at_quantile(0.99),
                 p99_9_ns: sync.value_at_quantile(0.999),
                 max_ns: sync.max(),
+                clipped,
             });
         }
         out
@@ -417,6 +463,14 @@ impl StatsRegistry {
                 let _ = std::io::stderr().lock().write_all(buf.as_bytes());
                 continue;
             }
+            // A clipped count means `max` is the ceiling, not the real
+            // worst case — say so on the same line rather than leaving
+            // the reader to notice a separate row.
+            let max_note = if snap.clipped > 0 {
+                format!(" (ceiling; {} sample(s) clipped)", snap.clipped)
+            } else {
+                String::new()
+            };
             let buf = format!(
                 "  {name}\n\
                  \x20   samples: {samples}\n\
@@ -425,7 +479,7 @@ impl StatsRegistry {
                  \x20   p90:    {p90:>8.2} µs\n\
                  \x20   p99:    {p99:>8.2} µs\n\
                  \x20   p99.9:  {p999:>8.2} µs\n\
-                 \x20   max:    {max:>8.2} µs\n",
+                 \x20   max:    {max:>8.2} µs{max_note}\n",
                 name = snap.name,
                 samples = snap.samples,
                 min = us(snap.min_ns),
@@ -602,6 +656,80 @@ mod tests {
             .expect("dormant stage missing from snapshot");
         assert_eq!(stage.samples, 1_000);
         assert!(stage.min_ns >= 1_000);
+    }
+
+    #[test]
+    fn out_of_range_samples_are_counted_not_silently_clamped() {
+        // A wait longer than the histogram's ceiling — a failover-scale
+        // replica wait — must not read back as an ordinary sample that
+        // happened to land at 100 ms. `max_ns` still reports the
+        // ceiling (that is what saturation means), but `clipped` says
+        // the real tail ran past it.
+        let reg = StatsRegistry::new();
+        let mut rec = reg.register("test::clipped");
+        rec.record_ns(5_000);
+        rec.record_ns(MAX_TRACKED_NS + 1);
+        rec.record_ns(MAX_TRACKED_NS * 30);
+        rec.flush();
+
+        let snaps = reg.snapshot_all();
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::clipped")
+            .expect("stage missing");
+        assert_eq!(stage.samples, 3, "clipped samples must still be recorded");
+        assert_eq!(stage.clipped, 2);
+        // `max_ns` pins to the ceiling bucket regardless of how far the
+        // real value overshot — 30× the bound reads back the same as
+        // 1 ns past it, which is precisely why `clipped` exists. The
+        // reported value is the bucket's upper edge, so it sits a
+        // fraction of a percent above the bound at 3 significant
+        // digits rather than exactly on it.
+        assert!(
+            stage.max_ns >= MAX_TRACKED_NS && stage.max_ns < MAX_TRACKED_NS + MAX_TRACKED_NS / 100,
+            "expected max pinned to the ceiling bucket, got {}",
+            stage.max_ns
+        );
+    }
+
+    #[test]
+    fn a_sample_exactly_at_the_bound_is_not_clipped() {
+        // The boundary is inclusive — MAX_TRACKED_NS is representable,
+        // so counting it would overstate censoring on a stage whose
+        // tail merely touches the ceiling.
+        let reg = StatsRegistry::new();
+        let mut rec = reg.register("test::at_bound");
+        rec.record_ns(MAX_TRACKED_NS);
+        rec.flush();
+
+        let snaps = reg.snapshot_all();
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::at_bound")
+            .expect("stage missing");
+        assert_eq!(stage.samples, 1);
+        assert_eq!(stage.clipped, 0);
+    }
+
+    #[test]
+    fn clipped_count_is_shared_across_sibling_recorders() {
+        // Sibling recorders feed one histogram; they must also feed one
+        // clipped count, or a per-thread count would under-report by
+        // however many threads happened to record the stage.
+        let reg = StatsRegistry::new();
+        let mut a = reg.register("test::clipped_siblings");
+        let mut b = reg.register("test::clipped_siblings");
+        a.record_ns(MAX_TRACKED_NS + 1);
+        b.record_ns(MAX_TRACKED_NS + 1);
+        a.flush();
+        b.flush();
+
+        let snaps = reg.snapshot_all();
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::clipped_siblings")
+            .expect("stage missing");
+        assert_eq!(stage.clipped, 2);
     }
 
     #[test]

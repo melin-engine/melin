@@ -854,7 +854,13 @@ fn detect_request(stream: &mut TcpStream) -> RequestKind {
 ///
 /// Format (one line per stage, '\n'-terminated):
 ///
-///   stage\t<name>\t<samples>\t<min_ns>\t<p50_ns>\t<p90_ns>\t<p99_ns>\t<p99_9_ns>\t<max_ns>
+///   stage\t<name>\t<samples>\t<min_ns>\t<p50_ns>\t<p90_ns>\t<p99_ns>\t<p99_9_ns>\t<max_ns>\t<clipped>
+///
+/// `clipped` counts samples that exceeded the histogram's upper bound
+/// and were clamped to it. Non-zero means `max_ns` is the ceiling
+/// rather than the observed worst case, and the tail is longer than
+/// the histogram can express — a consumer plotting the max should
+/// mark it as censored rather than reporting it as a measurement.
 ///
 /// Tab as the field delimiter so stage names containing spaces / colons
 /// / parens parse unambiguously. The bench (phase 3) parses this and
@@ -893,7 +899,7 @@ fn write_stats_dump(buf: &mut [u8]) -> usize {
                 // stop mid-line. Allocation is fine here — this runs
                 // once per /stats-dump request, not per event.
                 let line = format!(
-                    "stage\t{name}\t{samples}\t{min}\t{p50}\t{p90}\t{p99}\t{p99_9}\t{max}\n",
+                    "stage\t{name}\t{samples}\t{min}\t{p50}\t{p90}\t{p99}\t{p99_9}\t{max}\t{clipped}\n",
                     name = s.name,
                     samples = s.samples,
                     min = s.min_ns,
@@ -902,6 +908,7 @@ fn write_stats_dump(buf: &mut [u8]) -> usize {
                     p99 = s.p99_ns,
                     p99_9 = s.p99_9_ns,
                     max = s.max_ns,
+                    clipped = s.clipped,
                 );
                 if c.position() as usize + line.len() > limit {
                     break;
@@ -1937,7 +1944,7 @@ mod tests {
         let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
 
         // Body lines look like:
-        //   stage\t<name>\t<samples>\t<min>\t<p50>\t<p90>\t<p99>\t<p99_9>\t<max>
+        //   stage\t<name>\t<samples>\t<min>\t<p50>\t<p90>\t<p99>\t<p99_9>\t<max>\t<clipped>
         assert!(
             response.contains("stage\ttest::stats_dump_emit_marker\t3\t"),
             "expected stage record with 3 samples, got: {response}"
@@ -1984,7 +1991,7 @@ mod tests {
             if let Some(rest) = line.strip_prefix("stage\t") {
                 assert_eq!(
                     rest.split('\t').count(),
-                    8,
+                    9,
                     "emitted stage line is incomplete: {line:?}"
                 );
             }
@@ -2002,7 +2009,7 @@ mod tests {
         let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
 
         assert!(
-            response.contains("stage\ttest::stats_dump_zero_sample\t0\t0\t0\t0\t0\t0\t0"),
+            response.contains("stage\ttest::stats_dump_zero_sample\t0\t0\t0\t0\t0\t0\t0\t0"),
             "expected zero-sample stage record, got: {response}"
         );
 
@@ -2014,8 +2021,9 @@ mod tests {
     #[test]
     fn stats_dump_body_line_format() {
         // Pin the wire contract that phase 3's bench parser will rely
-        // on: every non-comment body line is exactly 9 tab-separated
-        // fields — `stage`, name, then 7 numeric percentile fields.
+        // on: every non-comment body line is exactly 10 tab-separated
+        // fields — `stage`, name, 7 numeric percentile fields, and the
+        // clipped-sample count.
         // Recorder dropped before the snapshot fetch — see the
         // SyncHistogram caveat in `crates/core/transport-core/src/trace.rs`
         // tests.
@@ -2042,14 +2050,16 @@ mod tests {
         let fields: Vec<&str> = line.split('\t').collect();
         assert_eq!(
             fields.len(),
-            9,
-            "expected 9 tab-separated fields, got {}: {fields:?}",
+            10,
+            "expected 10 tab-separated fields, got {}: {fields:?}",
             fields.len(),
         );
         assert_eq!(fields[0], "stage");
         assert_eq!(fields[1], "test::stats_dump_line_format_marker");
         assert_eq!(fields[2], "3");
-        // Fields 3..9 are min/p50/p90/p99/p99_9/max — must parse as u64.
+        // No sample here is anywhere near the ceiling.
+        assert_eq!(fields[9], "0", "unexpected clipped count");
+        // Fields 3..10 are min/p50/p90/p99/p99_9/max/clipped — all u64.
         for (i, f) in fields.iter().enumerate().skip(2) {
             f.parse::<u64>()
                 .unwrap_or_else(|_| panic!("field {i} not a u64: {f:?}"));
