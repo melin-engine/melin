@@ -880,27 +880,51 @@ impl<E: AppEvent> JournalStage<E> {
             self.busy_spin,
         );
         let disk_core = self.disk_core;
-        let disk_thread = std::thread::Builder::new()
+
+        // The child's scheduling context must be set HERE, by the
+        // parent, before the thread exists.
+        //
+        // This runs on the journal thread, which on a tuned deployment
+        // is pinned to an isolated core at SCHED_FIFO and busy-spins
+        // without ever yielding. A child inherits both the mask and the
+        // policy at creation, so a child left to fix itself would have
+        // to run first — on a core whose real-time occupant never
+        // yields it. It never executes its first instruction, not even
+        // the one that sets its name. Doing the reset child-side is the
+        // bug this codebase already fixed once, in "configure spawned
+        // threads from the parent, not the child".
+        //
+        // So: adopt the child's context, spawn, put ours back. The
+        // window is a few microseconds at startup, before this thread
+        // consumes anything.
+        let saved = melin_app::affinity::take_context();
+        if let Err(ref e) = saved {
+            tracing::warn!(error = %e, "journal-disk: cannot snapshot scheduling context");
+        }
+        if let Err(e) = melin_app::affinity::prepare_child_context(disk_core) {
+            tracing::warn!(error = %e, "journal-disk: cannot prepare child context");
+        }
+        let spawned = std::thread::Builder::new()
             .name("journal-disk".into())
             .spawn(move || {
-                // Spawned from the journal thread, which is pinned and
-                // runs SCHED_FIFO on a tuned deployment — and children
-                // inherit both. Left alone, this thread would busy-spin
-                // on the sequencer's own core, which is the one place
-                // it must never run. Reset to the full mask and
-                // SCHED_OTHER first, then apply its own pin (which
-                // re-grants FIFO if that core is isolated).
-                if let Err(e) = melin_app::affinity::clear_affinity() {
-                    tracing::warn!(error = e, "failed to clear journal-disk affinity");
-                }
+                // Already on the right core under SCHED_OTHER, courtesy
+                // of the parent. This only promotes to SCHED_FIFO when
+                // the core is isolated.
                 melin_app::affinity::pin_thread("journal-disk", disk_core);
                 disk.run()
-            })
-            .map_err(|e| {
-                JournalError::Io(std::io::Error::other(format!(
-                    "spawn journal-disk thread: {e}"
-                )))
-            })?;
+            });
+        // Restore before handling the spawn result: a failed spawn must
+        // not leave the journal thread on the disk core.
+        if let Ok(ctx) = saved
+            && let Err(e) = melin_app::affinity::restore_context(&ctx)
+        {
+            tracing::error!(error = %e, "journal thread could not restore its own affinity");
+        }
+        let disk_thread = spawned.map_err(|e| {
+            JournalError::Io(std::io::Error::other(format!(
+                "spawn journal-disk thread: {e}"
+            )))
+        })?;
 
         Ok(Sequencer {
             encoder,

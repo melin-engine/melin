@@ -197,10 +197,32 @@ impl SegmentPreparer {
         });
 
         let worker_state = Arc::clone(&state);
-        let handle = std::thread::Builder::new()
+        // Hand the worker its scheduling context before it exists. This
+        // runs on the journal thread, which in a tuned deployment is
+        // pinned to an isolated core at SCHED_FIFO; a child inherits
+        // both at creation and cannot move itself off a core whose
+        // busy-spinning real-time occupant never yields, because moving
+        // itself requires running. Doing the reset inside the worker —
+        // as this did — could never work for exactly the reason its own
+        // comment gave.
+        let saved = melin_app::affinity::take_context();
+        if let Err(ref e) = saved {
+            tracing::warn!(error = %e, "journal-prep: cannot snapshot scheduling context");
+        }
+        if let Err(e) = melin_app::affinity::prepare_child_context(pin_core) {
+            tracing::warn!(error = %e, "journal-prep: cannot prepare child context");
+        }
+        let spawned = std::thread::Builder::new()
             .name("journal-prep".into())
-            .spawn(move || worker_loop(worker_state))
-            .expect("failed to spawn journal-prep thread");
+            .spawn(move || worker_loop(worker_state));
+        // Restore before unwrapping: a failed spawn must not strand the
+        // journal thread on the preparer's core.
+        if let Ok(ctx) = saved
+            && let Err(e) = melin_app::affinity::restore_context(&ctx)
+        {
+            tracing::error!(error = %e, "journal thread could not restore its own affinity");
+        }
+        let handle = spawned.expect("failed to spawn journal-prep thread");
 
         Self {
             state,
@@ -290,18 +312,11 @@ impl Drop for SegmentPreparer {
 /// (interrupted by shutdown) so transient ENOSPC / RO-FS conditions
 /// don't busy-loop the thread.
 fn worker_loop(state: Arc<State>) {
-    // Spawned from the journal thread, which is pinned to a single core
-    // and runs SCHED_FIFO in tuned deployments — child threads inherit
-    // both. Left in place, this worker either starves behind the
-    // busy-spinning journal thread (a same-priority FIFO peer on the
-    // same core never runs, so the fast path never arms) or executes
-    // the staging work ON the journal core whenever the journal thread
-    // blocks. Reset to the default mask and SCHED_OTHER first, like
-    // every other child of a pinned thread — then apply the configured
-    // pin (if any) on top, so a pinned worker still runs SCHED_OTHER.
-    if let Err(e) = melin_app::affinity::clear_affinity() {
-        tracing::warn!(error = e, "failed to clear segment-preparer affinity");
-    }
+    // Affinity and policy are already correct: `spawn_zero_fill` set
+    // them on the journal thread before creating this one, because a
+    // child of a pinned SCHED_FIFO parent cannot reconfigure itself —
+    // it would have to run first, on a core whose occupant never
+    // yields. Nothing to reset here.
     melin_app::affinity::pin_thread("journal-prep", state.pin_core);
     loop {
         // Wait for arm or shutdown.
