@@ -29,16 +29,30 @@ use crate::codec::ENTRY_OFFSET;
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 
-/// Maximum encoded entry size. Mirrors `writer::MAX_ENTRY_SIZE` — actual
-/// entries are ~81-101 bytes; the array is sized generously so the
-/// per-event encode scratch never spills to the heap.
-const MAX_ENTRY_SIZE: usize = 144;
-
-/// Batch buffer capacity. Sized so the pipeline's normal flush cadence
-/// never has to grow it.
-const BATCH_BUF_CAPACITY: usize = 512 * 1024;
+/// Maximum encoded entry size. Actual entries are ~81-101 bytes; the
+/// bound is generous so the per-event encode scratch never spills to
+/// the heap.
+///
+/// Public because every caller has to guarantee the destination buffer
+/// has this much headroom before each [`JournalEncoder::encode_event`]
+/// — the encoder cannot grow a buffer it does not own.
+pub const MAX_ENTRY_SIZE: usize = 144;
 
 /// Sequencing, framing, and chaining for one journal segment.
+///
+/// # The destination buffer
+///
+/// The encoder tracks *where* it is in the batch but does not own the
+/// bytes: every call takes the destination. That is what lets the
+/// pipeline encode straight into a hand-off ring slot while the
+/// single-threaded writer encodes into its own `Vec` — one encoder, no
+/// copy in either case.
+///
+/// The caller must pass the **same** destination for every event of a
+/// batch, and must not disturb the bytes already in it; the offsets
+/// this type records index into that buffer. A batch ends at
+/// [`clear_batch`](Self::clear_batch), after which a different
+/// destination is fine.
 pub struct JournalEncoder<E: AppEvent> {
     // PhantomData carries the app event type for the methods that
     // encode `JournalEvent<E>`. Zero-size — no runtime cost.
@@ -47,12 +61,9 @@ pub struct JournalEncoder<E: AppEvent> {
     // sizes are bounded, so avoiding a Vec lets the hot path stay
     // allocation-free.
     buffer: [u8; MAX_ENTRY_SIZE],
-    // Batch write buffer. Plain Vec<u8> because the page-cache path has
-    // no alignment requirement. Pre-reserved to BATCH_BUF_CAPACITY at
-    // construction; clearing only resets `batch_len`, not capacity.
-    batch_buf: Vec<u8>,
-    // Number of valid bytes in `batch_buf`. Acts as the write cursor —
-    // new entries land at `batch_buf[batch_len..]`. Reset on every flush.
+    // Bytes written into the caller's destination so far. Acts as the
+    // write cursor — new entries land at `dst[batch_len..]`. Reset by
+    // `clear_batch`.
     batch_len: usize,
     next_sequence: u64,
     // First sequence of the active segment (the header's
@@ -65,9 +76,9 @@ pub struct JournalEncoder<E: AppEvent> {
     // exceed this. Excluded from release builds — zero hot-path cost.
     #[cfg(debug_assertions)]
     last_encoded_seq: u64,
-    // Byte range of the most-recent user entry within `batch_buf` —
-    // `last_user_entry_replication_slice` ships it to replication
-    // without a second encode pass.
+    // Byte range of the most-recent user entry within the destination
+    // buffer — `replication_slice` ships it to replication without a
+    // second encode pass.
     last_user_entry_offset: usize,
     last_user_entry_len: usize,
 }
@@ -86,7 +97,6 @@ impl<E: AppEvent> JournalEncoder<E> {
         Self {
             _marker: PhantomData,
             buffer: [0u8; MAX_ENTRY_SIZE],
-            batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
             next_sequence: starting_sequence,
             starting_sequence,
@@ -121,7 +131,6 @@ impl<E: AppEvent> JournalEncoder<E> {
         Ok(Self {
             _marker: PhantomData,
             buffer: [0u8; MAX_ENTRY_SIZE],
-            batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
             next_sequence: last_seq + 1,
             starting_sequence,
@@ -144,8 +153,7 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// and the batch is empty.
     ///
     /// No sequence is consumed — the next event still gets
-    /// `starting_sequence`. Keeps the existing `batch_buf` allocation
-    /// rather than building a throwaway replacement per rotation.
+    /// `starting_sequence`.
     pub fn begin_segment(&mut self, starting_sequence: u64, anchor_hash: [u8; 32]) {
         self.starting_sequence = starting_sequence;
         self.batch_len = 0;
@@ -173,7 +181,8 @@ impl<E: AppEvent> JournalEncoder<E> {
         seq
     }
 
-    /// Encode a single event with a pre-assigned sequence number.
+    /// Encode a single event with a pre-assigned sequence number into
+    /// `dst`, appending at the batch's current offset.
     ///
     /// Does not advance the internal sequence counter — the caller
     /// owns sequencing (via [`allocate_sequence`](Self::allocate_sequence)
@@ -181,8 +190,16 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// on a replica). The entry's raw bytes are absorbed into the
     /// segment hash chain; nothing else is emitted — the chain has no
     /// in-stream metadata.
+    ///
+    /// `dst` must have [`MAX_ENTRY_SIZE`] bytes free past
+    /// [`batch_len`](Self::batch_len) — the encoder cannot grow a
+    /// buffer it does not own, so a short destination is a caller bug
+    /// and is refused rather than silently truncated. It must also be
+    /// the same buffer used for the rest of the batch (see the type
+    /// docs).
     pub fn encode_event(
         &mut self,
+        dst: &mut [u8],
         seq: u64,
         timestamp_ns: u64,
         event: &JournalEvent<E>,
@@ -209,50 +226,48 @@ impl<E: AppEvent> JournalEncoder<E> {
             &mut self.buffer,
         )?;
 
+        let offset = self.batch_len;
+        if dst.len() - offset < written {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "journal batch destination too small: {} bytes free at offset {offset}, \
+                     entry needs {written} (caller must reserve MAX_ENTRY_SIZE per event)",
+                    dst.len() - offset
+                ),
+            )));
+        }
+
         // Absorb the full on-disk bytes (incl. CRC) — see crate::chain
-        // for why the CRC is included.
+        // for why the CRC is included. After the capacity check, so a
+        // refused entry leaves the chain untouched and the batch
+        // re-encodable into a fresh destination.
         #[cfg(feature = "hash-chain")]
         self.hash_chain.absorb(&self.buffer[..written]);
 
-        self.reserve_batch(written);
-        let offset = self.batch_len;
         self.last_user_entry_offset = offset;
-        self.batch_buf[offset..offset + written].copy_from_slice(&self.buffer[..written]);
+        dst[offset..offset + written].copy_from_slice(&self.buffer[..written]);
         self.last_user_entry_len = written;
         self.batch_len += written;
 
         Ok(())
     }
 
-    /// Grow the batch buffer if the incoming bytes wouldn't fit. The
-    /// pre-reserved capacity covers the pipeline's normal flush cadence,
-    /// so this is the rare oversize-batch fallback — Vec's amortised
-    /// growth absorbs the cost.
-    #[inline]
-    fn reserve_batch(&mut self, adding: usize) {
-        let needed = self.batch_len + adding;
-        if needed > self.batch_buf.len() {
-            tracing::warn!(
-                current_len = self.batch_len,
-                adding,
-                capacity = self.batch_buf.len(),
-                "buffered journal batch exceeded preallocated capacity — \
-                 caller is batching more than capacity between flushes; \
-                 raise BATCH_BUF_CAPACITY or flush more often"
-            );
-            self.batch_buf.resize(needed, 0);
-        }
+    /// Bytes encoded into the destination since the last
+    /// [`clear_batch`](Self::clear_batch).
+    pub fn batch_len(&self) -> usize {
+        self.batch_len
     }
 
-    /// Encoded bytes accumulated since the last flush — what the disk
-    /// half writes.
-    pub fn pending_batch_bytes(&self) -> &[u8] {
-        &self.batch_buf[..self.batch_len]
+    /// The pending batch's bytes, read back out of the destination the
+    /// caller has been encoding into — what the disk half writes.
+    pub fn pending_batch_bytes<'a>(&self, dst: &'a [u8]) -> &'a [u8] {
+        &dst[..self.batch_len]
     }
 
-    /// Drop the pending batch. Called once its bytes have been written
-    /// (or, under `no-persist`, deliberately discarded) — the buffer
-    /// keeps its capacity either way.
+    /// End the batch. Called once its bytes have been written (or,
+    /// under `no-persist`, deliberately discarded); the destination is
+    /// the caller's to reuse or replace afterwards.
     pub fn clear_batch(&mut self) {
         self.batch_len = 0;
         self.last_user_entry_len = 0;
@@ -299,20 +314,21 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// [`last_user_entry_replication_slice`](Self::last_user_entry_replication_slice),
     /// which the replication-framing test compares against.
     #[cfg(test)]
-    pub(crate) fn last_user_entry_bytes(&self) -> &[u8] {
+    pub(crate) fn last_user_entry_bytes<'a>(&self, dst: &'a [u8]) -> &'a [u8] {
         let start = self.last_user_entry_offset;
-        &self.batch_buf[start..start + self.last_user_entry_len]
+        &dst[start..start + self.last_user_entry_len]
     }
 
-    /// Slice of the most-recent user entry, with the 2-byte magic
-    /// stripped from the front and the 4-byte CRC stripped from the
-    /// back — exact wire shape consumed by the replication stage.
-    pub fn last_user_entry_replication_slice(&self) -> &[u8] {
+    /// Slice of the most-recent user entry within `dst`, with the
+    /// 2-byte magic stripped from the front and the 4-byte CRC stripped
+    /// from the back — exact wire shape consumed by the replication
+    /// stage.
+    pub fn last_user_entry_replication_slice<'a>(&self, dst: &'a [u8]) -> &'a [u8] {
         if self.last_user_entry_len == 0 {
             return &[];
         }
         let start = self.last_user_entry_offset;
         let end = start + self.last_user_entry_len;
-        &self.batch_buf[start + 2..end - 4]
+        &dst[start + 2..end - 4]
     }
 }

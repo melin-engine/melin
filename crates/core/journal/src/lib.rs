@@ -30,6 +30,7 @@ pub mod replication;
 pub mod segment;
 pub mod segment_file;
 pub mod write;
+pub mod write_ring;
 
 #[cfg(feature = "test-utils")]
 pub mod test_utils;

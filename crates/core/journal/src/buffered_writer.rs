@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use melin_app::AppEvent;
 
 use crate::codec;
-use crate::encoder::JournalEncoder;
+use crate::encoder::{JournalEncoder, MAX_ENTRY_SIZE};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 use crate::segment_file::SegmentFile;
@@ -57,11 +57,21 @@ use crate::segment_file::SegmentFile;
 /// Owns both halves of the journal (see the module docs) and drives
 /// them from one thread.
 pub struct BufferedWriter<E: AppEvent> {
-    /// Entry stream: sequences, framing, chain, pending batch.
+    /// Entry stream: sequences, framing, chain, batch offsets.
     encoder: JournalEncoder<E>,
     /// Live segment on disk: descriptor, position, rotation.
     segment: SegmentFile,
+    /// Destination the encoder appends into. Owned here because this
+    /// writer is the single-threaded composition; the pipeline instead
+    /// encodes straight into a hand-off ring slot. Pre-sized to
+    /// [`BATCH_BUF_CAPACITY`] and grown only if a caller batches past
+    /// it — flushing resets the length, never the allocation.
+    batch_buf: Vec<u8>,
 }
+
+/// Destination capacity for the composed writer's batches. Sized so the
+/// pipeline's normal flush cadence never has to grow it.
+const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
 impl<E: AppEvent> BufferedWriter<E> {
     /// Create a fresh journal file. The chain anchor is random salt so
@@ -83,6 +93,7 @@ impl<E: AppEvent> BufferedWriter<E> {
         Ok(Self {
             segment: SegmentFile::create_continuing(path, starting_sequence, anchor_hash)?,
             encoder: JournalEncoder::new(starting_sequence, anchor_hash),
+            batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
         })
     }
 
@@ -111,7 +122,11 @@ impl<E: AppEvent> BufferedWriter<E> {
             last_seq,
             valid_end,
         )?;
-        Ok(Self { encoder, segment })
+        Ok(Self {
+            encoder,
+            segment,
+            batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
+        })
     }
 
     /// Allocate and return the next sequence number, advancing the
@@ -136,8 +151,30 @@ impl<E: AppEvent> BufferedWriter<E> {
         key_hash: u64,
         request_seq: u64,
     ) -> Result<(), JournalError> {
-        self.encoder
-            .encode_event(seq, timestamp_ns, event, key_hash, request_seq)
+        // The encoder cannot grow a buffer it does not own, so keep a
+        // whole entry's headroom ahead of it. Growth is the rare
+        // oversize-batch fallback — Vec's amortised growth absorbs it.
+        let headroom = self.batch_buf.len() - self.encoder.batch_len();
+        if headroom < MAX_ENTRY_SIZE {
+            let grown = self.batch_buf.len() + BATCH_BUF_CAPACITY;
+            tracing::warn!(
+                batch_len = self.encoder.batch_len(),
+                capacity = self.batch_buf.len(),
+                grown,
+                "journal batch exceeded preallocated capacity — caller is \
+                 batching more than capacity between flushes; raise \
+                 BATCH_BUF_CAPACITY or flush more often"
+            );
+            self.batch_buf.resize(grown, 0);
+        }
+        self.encoder.encode_event(
+            &mut self.batch_buf,
+            seq,
+            timestamp_ns,
+            event,
+            key_hash,
+            request_seq,
+        )
     }
 
     /// Write the accumulated batch and force it to stable media.
@@ -148,11 +185,11 @@ impl<E: AppEvent> BufferedWriter<E> {
         // Paced retry of a failed post-rotation dir fsync — a single
         // branch in steady state.
         self.segment.poll_dir_fsync_retry();
-        if self.encoder.pending_batch_bytes().is_empty() {
+        if self.encoder.batch_len() == 0 {
             return Ok(());
         }
         self.segment
-            .write_batch(self.encoder.pending_batch_bytes())?;
+            .write_batch(self.encoder.pending_batch_bytes(&self.batch_buf))?;
         self.segment.sync()?;
         self.encoder.clear_batch();
         Ok(())
@@ -220,14 +257,39 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// not yet flushed. Used by the journal stage to snapshot the
     /// pending bytes for replication.
     pub fn pending_batch_bytes(&self) -> &[u8] {
-        self.encoder.pending_batch_bytes()
+        self.encoder.pending_batch_bytes(&self.batch_buf)
     }
 
     /// Slice of the most-recent user entry, with the 2-byte magic
     /// stripped from the front and the 4-byte CRC stripped from the
     /// back — exact wire shape consumed by the replication stage.
     pub fn last_user_entry_replication_slice(&self) -> &[u8] {
-        self.encoder.last_user_entry_replication_slice()
+        self.encoder
+            .last_user_entry_replication_slice(&self.batch_buf)
+    }
+
+    /// Take the writer apart into its two halves so they can be driven
+    /// from separate threads — the stream half stays with the
+    /// sequencer, the file half moves to the disk thread.
+    ///
+    /// Any pending batch is flushed first: the halves are handed over
+    /// quiesced, so nothing encoded-but-unwritten can be stranded on
+    /// the wrong side of the boundary.
+    pub fn into_halves(mut self) -> Result<(JournalEncoder<E>, SegmentFile), JournalError> {
+        self.flush_batch_sync()?;
+        Ok((self.encoder, self.segment))
+    }
+
+    /// Reassemble the writer from halves that were split by
+    /// [`into_halves`](Self::into_halves) — how the pipeline hands the
+    /// journal back on shutdown, for recovery and promotion to use
+    /// single-threaded.
+    pub fn from_halves(encoder: JournalEncoder<E>, segment: SegmentFile) -> Self {
+        Self {
+            encoder,
+            segment,
+            batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
+        }
     }
 
     /// Rotate the live segment in place.
@@ -666,7 +728,7 @@ mod tests {
 
         // The full encoded entry is [magic(2) | header | payload | CRC(4)].
         // The replication slice strips the leading magic and trailing CRC.
-        let full = writer.encoder.last_user_entry_bytes();
+        let full = writer.encoder.last_user_entry_bytes(&writer.batch_buf);
         let repl = writer.last_user_entry_replication_slice();
         assert_eq!(repl.len(), full.len() - 6);
         assert_eq!(repl, &full[2..full.len() - 4]);
