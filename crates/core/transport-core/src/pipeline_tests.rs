@@ -34,8 +34,8 @@ use crate::pipeline::build_replica_pipeline;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::{AdoptedRotation, StreamMark};
 use crate::pipeline::{
-    InputSlot, JournalStage, JournalStageRun, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload,
-    OutputSlot, build_pipeline_with_replication,
+    InputSlot, JournalStage, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload, OutputSlot,
+    build_pipeline_with_replication,
 };
 use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport};
 use crate::trace::mono_trace_ns;

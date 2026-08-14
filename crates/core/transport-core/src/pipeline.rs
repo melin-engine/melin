@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
+use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
-use melin_journal::JournalWrite;
 use melin_journal::preparer::SegmentPreparer;
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
 
@@ -431,8 +431,8 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 /// each encoded batch to the replication sender thread via a bounded
 /// channel. The bytes are identical to what was written to disk — same
 /// sequences, timestamps, CRC checksums, and checkpoint entries.
-pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
-    writer: W,
+pub struct JournalStage<E: AppEvent> {
+    writer: BufferedWriter<E>,
     _marker: std::marker::PhantomData<fn() -> E>,
     consumer: ring::Consumer<InputSlot<E>>,
     /// Group commit coalescing window. The journal stage waits up to this
@@ -639,7 +639,7 @@ impl ReplicationState {
     }
 }
 
-impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
+impl<E: AppEvent> JournalStage<E> {
     /// Create a new journal stage.
     ///
     /// `group_commit_delay`: coalescing window for sync batching. The
@@ -647,7 +647,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// issuing the durable write. Zero means sync immediately after each
     /// batch read.
     pub fn new(
-        writer: W,
+        writer: BufferedWriter<E>,
         consumer: ring::Consumer<InputSlot<E>>,
         group_commit_delay: Duration,
         max_batch: usize,
@@ -760,7 +760,10 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// the persist-before-ack boundary.
     ///
     /// Returns the writer on shutdown for clean resource release.
-    pub fn run_sync(mut self, shutdown: &std::sync::atomic::AtomicBool) -> Result<W, JournalError> {
+    pub fn run_sync(
+        mut self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<BufferedWriter<E>, JournalError> {
         use std::time::Instant;
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
@@ -1152,7 +1155,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// An evicted ring is skipped exactly like a data batch would be:
     /// the replica re-learns the boundary from journal catch-up on
     /// reconnect.
-    fn publish_rotate_to_rings(repl: &mut ReplicationState, writer: &W) {
+    fn publish_rotate_to_rings(repl: &mut ReplicationState, writer: &BufferedWriter<E>) {
         if !repl.any_producer() {
             return;
         }
@@ -1753,26 +1756,14 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     }
 }
 
-/// Trait abstracting the journal stage's `run` entry point so generic
-/// code (server boot, replica receivers) can drive the stage without
-/// naming the concrete writer. The one implementation drives
-/// `BufferedWriter` through `run_sync`; the trait stays because the
-/// generic call sites (`W: JournalWrite<E>`) cannot name an inherent
-/// method on a specialisation.
-pub trait JournalStageRun<E: AppEvent>: Sized {
-    /// The concrete writer the stage owns and returns on clean shutdown.
-    type Writer: JournalWrite<E>;
-    /// Drive the journal stage to completion.
-    fn run(self, shutdown: &std::sync::atomic::AtomicBool) -> Result<Self::Writer, JournalError>;
-}
-
-impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::BufferedWriter<E>> {
-    type Writer = melin_journal::BufferedWriter<E>;
+impl<E: AppEvent> JournalStage<E> {
+    /// Drive the journal stage to completion, returning the writer on
+    /// clean shutdown.
     #[inline]
-    fn run(
+    pub fn run(
         self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::BufferedWriter<E>, JournalError> {
+    ) -> Result<BufferedWriter<E>, JournalError> {
         // Under `no-persist` the sync point discards batches instead of
         // writing, `valid_end` never advances, and the size trigger can
         // never fire — arming the preparer would zero-write a full
@@ -1788,9 +1779,7 @@ impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::Buffered
             stage.run_sync(shutdown)
         }
     }
-}
 
-impl<E: AppEvent> JournalStage<E, melin_journal::BufferedWriter<E>> {
     /// Spawn the background segment preparer in zero-fill mode. Called
     /// from the stage's `run` before entering `run_sync`; no-op if
     /// already spawned. Arming policy lives in
@@ -2533,9 +2522,9 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 /// (and replication cursor when active) instead.
 ///
 /// Assembled pipeline stages and handles returned by [`build_pipeline_with_replication`].
-pub struct Pipeline<A: Application, W: JournalWrite<A::Event>> {
+pub struct Pipeline<A: Application> {
     pub input_producer: ring::Producer<InputSlot<A::Event>>,
-    pub journal_stage: JournalStage<A::Event, W>,
+    pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
     pub output_consumers: Vec<ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>>,
     pub events_processed: Arc<AtomicU64>,
@@ -2555,9 +2544,9 @@ pub struct Pipeline<A: Application, W: JournalWrite<A::Event>> {
 }
 
 /// Assembled replica pipeline stages and handles returned by [`build_replica_pipeline`].
-pub struct ReplicaPipeline<A: Application, W: JournalWrite<A::Event>> {
+pub struct ReplicaPipeline<A: Application> {
     pub input_producer: ring::Producer<InputSlot<A::Event>>,
-    pub journal_stage: JournalStage<A::Event, W>,
+    pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
     pub drain_consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
@@ -2666,8 +2655,8 @@ fn build_input_disruptor<E: AppEvent + Send + 'static>(
 ///
 /// The journal stage taking the only writer handle is what makes it
 /// impossible for a second thread to publish fsync state.
-fn setup_chain_hash_publisher<E: AppEvent, W: JournalWrite<E>>(
-    journal_stage: &mut JournalStage<E, W>,
+fn setup_chain_hash_publisher<E: AppEvent>(
+    journal_stage: &mut JournalStage<E>,
     enable_shadow: bool,
 ) -> Option<SeqLockReader<FsyncState>> {
     if enable_shadow {
@@ -2690,9 +2679,9 @@ fn setup_chain_hash_publisher<E: AppEvent, W: JournalWrite<E>>(
 /// When replication is disabled, the replica slot cursors stay disengaged
 /// (standalone mode) and the derived quorum view reads "no replica".
 #[allow(clippy::too_many_arguments)]
-pub fn build_pipeline_with_replication<A, W>(
+pub fn build_pipeline_with_replication<A>(
     app: A,
-    writer: W,
+    writer: BufferedWriter<A::Event>,
     group_commit_delay: Duration,
     active_connections: Arc<AtomicU64>,
     enable_replication: bool,
@@ -2702,12 +2691,11 @@ pub fn build_pipeline_with_replication<A, W>(
     enable_event_publisher: bool,
     enable_shadow: bool,
     fence_state: Arc<crate::fence::FenceState>,
-) -> Pipeline<A, W>
+) -> Pipeline<A>
 where
     A: Application + Send + 'static,
     A::Event: Send + 'static,
     A::Report: Send + 'static,
-    W: JournalWrite<A::Event>,
 {
     let InputDisruptorParts {
         input_producer,
@@ -2867,20 +2855,19 @@ where
 /// events) but not byte-identical (each node stamps its own wall-clock
 /// on the batch when `slot.sequence == 0`, and checkpoint timing may
 /// vary after journal rotation).
-pub fn build_replica_pipeline<A, W>(
+pub fn build_replica_pipeline<A>(
     app: A,
-    writer: W,
+    writer: BufferedWriter<A::Event>,
     max_journal_batch: usize,
     group_commit_delay: Duration,
     busy_spin: bool,
     enable_shadow: bool,
     fence_state: Arc<crate::fence::FenceState>,
-) -> ReplicaPipeline<A, W>
+) -> ReplicaPipeline<A>
 where
     A: Application + Send + 'static,
     A::Event: Send + 'static,
     A::Report: Send + 'static,
-    W: JournalWrite<A::Event>,
 {
     let InputDisruptorParts {
         input_producer,

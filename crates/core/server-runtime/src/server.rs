@@ -26,14 +26,14 @@ use melin_journal::JournalError;
 use melin_journal::JournalWrite;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
-    InputSlot, JournalStage, JournalStageRun, OutputSlot as GenericOutputSlot,
-    Pipeline as GenericPipeline, build_pipeline_with_replication,
+    InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline,
+    build_pipeline_with_replication,
 };
 /// Internal alias for the disruptor-built pipeline, used only by
 /// destructuring `let Pipeline { … }` patterns inside the boot path.
 /// Not part of the public API — callers reach the underlying type
 /// through `melin_transport_core::pipeline`.
-type Pipeline<A, W> = GenericPipeline<A, W>;
+type Pipeline<A> = GenericPipeline<A>;
 
 use crate::reader::RequestDecoderArc;
 use crate::response::ResponseEncoderArc;
@@ -747,7 +747,7 @@ where
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
 {
-    run_impl::<A, L, BufferedWriter<A::Event>>(
+    run_impl::<A, L>(
         listener,
         config,
         factory,
@@ -758,7 +758,7 @@ where
     )
 }
 
-fn run_impl<A, L, W>(
+fn run_impl<A, L>(
     listener: L,
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = A>>,
@@ -773,8 +773,6 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
-    W: JournalWrite<A::Event> + Send + 'static,
-    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
     // Shared durability-mode atomic, constructed once per process and
     // threaded through both modes. Wiring it on the replica path
@@ -935,7 +933,7 @@ where
         // stay bitwise mirrors of the primary's. `--max-journal-mib`
         // and the admin `ROTATE` command only act on primaries.
 
-        match crate::replication::run_receiver::<A, W>(
+        match crate::replication::run_receiver::<A>(
             primary_addr,
             &config.journal,
             &signing_key,
@@ -974,7 +972,7 @@ where
                 // the (already exited) promotion thread — after this
                 // returns, so the driver serves elections and the fencing
                 // channel for the whole primary tenure.
-                return run_as_primary::<A, L, W>(
+                return run_as_primary::<A, L>(
                     exchange,
                     writer,
                     listener,
@@ -1027,7 +1025,7 @@ where
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — seed events will flow through the pipeline later.
     let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, W>(&config, &*factory)?;
+        init_engine::<A, BufferedWriter<A::Event>>(&config, &*factory)?;
 
     // Pre-fault any application-owned memory (slabs, indices) so page
     // faults happen now, not on the hot path. Default trait impl is a
@@ -1071,7 +1069,7 @@ where
     let raft_status = raft.status();
 
     // The raft guard drops — stopping the driver — after this returns.
-    run_as_primary::<A, L, W>(
+    run_as_primary::<A, L>(
         exchange,
         writer,
         listener,
@@ -1238,9 +1236,9 @@ fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
 /// admin endpoint, which was spawned once at process start, keeps
 /// driving the new stage's rotation.
 #[allow(clippy::too_many_arguments)]
-fn run_as_primary<A, L, W>(
+fn run_as_primary<A, L>(
     exchange: A,
-    writer: W,
+    writer: BufferedWriter<A::Event>,
     mut listener: L,
     // Pre-bound replication listener (non-blocking by construction),
     // `Some` iff `--replication-bind` is set. Bound in `run_impl` before
@@ -1271,8 +1269,6 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
-    W: JournalWrite<A::Event> + Send + 'static,
-    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
     // Active connection counter shared between accept loop, response
     // stage, and matching stage (for stats queries).
@@ -2099,7 +2095,7 @@ where
 {
     let dpdk_config = dpdk_config_from(&config);
 
-    run_dpdk_impl::<A, BufferedWriter<A::Event>>(
+    run_dpdk_impl::<A>(
         config,
         factory,
         decoder,
@@ -2138,7 +2134,7 @@ fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
 }
 
 #[cfg(feature = "dpdk")]
-fn run_dpdk_impl<A, W>(
+fn run_dpdk_impl<A>(
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = A>>,
     decoder: RequestDecoderArc<A>,
@@ -2152,8 +2148,6 @@ where
     A::Event: Send + Sync + 'static,
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
-    W: JournalWrite<A::Event> + Send + 'static,
-    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
     // Mirrors the kernel-TCP `run` path: one atomic per
     // process, threaded into both replica (pre-staging for promotion)
@@ -2298,7 +2292,7 @@ where
             }
         };
 
-        match crate::replication::run_receiver_dpdk::<A, W>(
+        match crate::replication::run_receiver_dpdk::<A>(
             repl_transport,
             primary_ipv4,
             primary_addr.port(),
@@ -2345,7 +2339,7 @@ where
                 // The raft guard drops — stopping the driver and joining
                 // the (already exited) promotion thread — after this
                 // returns; see the kernel-TCP promotion path.
-                return run_as_primary::<A, _, W>(
+                return run_as_primary::<A, _>(
                     exchange,
                     writer,
                     listener,
@@ -2399,7 +2393,7 @@ where
 
     // Initialize or recover the exchange.
     let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, W>(&config, &*factory)?;
+        init_engine::<A, BufferedWriter<A::Event>>(&config, &*factory)?;
     <A as Application>::prefault(&mut exchange);
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.

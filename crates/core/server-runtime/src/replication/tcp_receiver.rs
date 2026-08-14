@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
 use melin_app::Application;
-use melin_journal::JournalWrite;
-use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
+use melin_journal::BufferedWriter;
 
 use super::auth::authenticate_with_primary;
 use super::receiver_transport::{
@@ -400,7 +399,7 @@ impl ControlFrameSource for TcpFrameSource<'_> {
 pub type ReceiverResult<A, W> = Result<Option<(A, W)>, Box<dyn std::error::Error>>;
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_receiver<A, W>(
+pub fn run_receiver<A>(
     primary_addr: SocketAddr,
     journal_path: &std::path::Path,
     signing_key: &ed25519_dalek::SigningKey,
@@ -417,14 +416,12 @@ pub fn run_receiver<A, W>(
     busy_spin: bool,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
-) -> ReceiverResult<A, W>
+) -> ReceiverResult<A, BufferedWriter<A::Event>>
 where
     A: Application + Send + 'static,
     A::Event: Send + Sync + 'static,
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
-    W: JournalWrite<A::Event> + Send + 'static,
-    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
     let super::ReplicaControlPlane {
         promote,
@@ -438,7 +435,7 @@ where
     // fresh replicas get `(None, None, 0, zeros)`. See
     // `recover_replica_state` for the lineage rules.
     let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
-        recover_replica_state::<A, W>(
+        recover_replica_state::<A, BufferedWriter<A::Event>>(
             journal_path,
             &snapshot_path,
             factory.as_ref(),
@@ -459,7 +456,7 @@ where
     let mut divergence_resyncs: u32 = 0;
 
     let mut send_buf = Vec::with_capacity(64);
-    let mut pipeline: Option<ReplicaPipelineHandles<A, W>> = None;
+    let mut pipeline: Option<ReplicaPipelineHandles<A, BufferedWriter<A::Event>>> = None;
 
     // --- Outer reconnect loop ---
     loop {
@@ -491,7 +488,7 @@ where
         // exactly once.
         if shutdown.load(Ordering::Relaxed) {
             if let Some(p) = pipeline.take() {
-                let _ = teardown_replica_pipeline::<A, W>(p);
+                let _ = teardown_replica_pipeline::<A, BufferedWriter<A::Event>>(p);
             }
             return Ok(None);
         }
@@ -680,7 +677,8 @@ where
         // across rotations (bitwise mirror).
         if pipeline.is_none() && journal_writer.is_none() {
             let (lineage_start, lineage_anchor) = stream_lineage;
-            let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
+            let writer =
+                BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
             let mut fresh = factory.empty();
             factory.apply_operator_policy(&mut fresh);
             exchange = Some(fresh);
@@ -691,7 +689,7 @@ where
         if pipeline.is_none() {
             let cur_exchange = exchange.take().expect("exchange initialized");
             let cur_writer = journal_writer.take().expect("journal_writer initialized");
-            pipeline = Some(build_replica_pipeline_with_threads::<A, W>(
+            pipeline = Some(build_replica_pipeline_with_threads::<A>(
                 cur_exchange,
                 cur_writer,
                 cores,
@@ -1119,7 +1117,7 @@ mod tests {
                 let shutdown = Arc::clone(&shutdown);
                 let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
-                    run_receiver::<App, BufferedWriter<EvtAdd>>(
+                    run_receiver::<App>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
@@ -1290,7 +1288,7 @@ mod tests {
                 let shutdown = Arc::clone(&shutdown);
                 let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
-                    run_receiver::<App, BufferedWriter<EvtAdd>>(
+                    run_receiver::<App>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
@@ -1459,7 +1457,7 @@ mod tests {
                 let shutdown = Arc::clone(&shutdown);
                 let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
-                    run_receiver::<App, BufferedWriter<EvtAdd>>(
+                    run_receiver::<App>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
@@ -1701,7 +1699,7 @@ mod tests {
                 let shutdown = Arc::clone(&shutdown);
                 let control = control.clone();
                 std::thread::spawn(move || -> Result<bool, String> {
-                    run_receiver::<App, BufferedWriter<EvtAdd>>(
+                    run_receiver::<App>(
                         addr,
                         &journal,
                         &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
