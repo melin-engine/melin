@@ -397,9 +397,22 @@ impl StatsRegistry {
     /// rolled over into the next snapshot. Worst case the data is
     /// slightly stale; never wrong, never hung.
     pub fn snapshot_all(&self) -> Vec<StageSnapshot> {
-        let entries = match self.entries.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
+        // Copy the entry handles out and release the registry lock
+        // before refreshing anything. The refresh below can block for
+        // the whole budget; holding the registry lock across it made
+        // concurrent scrapes strictly serial, and because each waiting
+        // caller starts its deadline only after acquiring the lock, N
+        // overlapping scrapes cost N × REFRESH_BUDGET rather than one.
+        // It also stalled any stage thread still in `register`, which
+        // takes the same lock. Per-stage mutexes still serialize the
+        // refreshes themselves, but a second caller now arrives with
+        // its deadline already running and finishes promptly.
+        //
+        // Cost is a refcount bump per stage, on a path that runs once
+        // per `/stats-dump`.
+        let entries: Vec<std::sync::Arc<StageEntry>> = match self.entries.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         };
         let deadline = std::time::Instant::now() + REFRESH_BUDGET;
         let mut out = Vec::with_capacity(entries.len());
@@ -809,6 +822,51 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing from snapshot"));
             assert_eq!(stage.samples, 1, "{name} lost its sample to the budget");
         }
+    }
+
+    #[test]
+    fn concurrent_snapshots_do_not_serialize_budgets() {
+        // Overlapping scrapes must not each pay a fresh REFRESH_BUDGET.
+        // While the registry lock was held across the refresh, a waiting
+        // caller only started its deadline after acquiring it, so N
+        // concurrent dumps took N × budget — enough to blow past a
+        // client read timeout with a handful of scrapers.
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Instant;
+
+        let reg = Arc::new(StatsRegistry::new());
+        // Dormant recorders held for the test's duration: they never
+        // acknowledge the phase shift, so every refresh burns its full
+        // remaining budget. That is what makes the serialization
+        // measurable at all.
+        let mut recorders = Vec::new();
+        for name in ["test::concurrent_a", "test::concurrent_b"] {
+            let mut rec = reg.register(name);
+            rec.record_ns(1_000);
+            rec.flush();
+            recorders.push(rec);
+        }
+
+        const SCRAPERS: usize = 3;
+        let start = Instant::now();
+        let handles: Vec<_> = (0..SCRAPERS)
+            .map(|_| {
+                let reg = Arc::clone(&reg);
+                thread::spawn(move || reg.snapshot_all())
+            })
+            .collect();
+        for h in handles {
+            let snaps = h.join().expect("scraper did not panic");
+            assert!(!snaps.is_empty(), "scrape returned no stages");
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < REFRESH_BUDGET * 2,
+            "{SCRAPERS} concurrent scrapes took {elapsed:?}; a single shared \
+             budget is {REFRESH_BUDGET:?}"
+        );
     }
 
     #[test]
