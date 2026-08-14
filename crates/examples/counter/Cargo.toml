@@ -29,4 +29,3 @@ tempfile = "3"
 [features]
 default = []
 hash-chain = ["melin-server-runtime/hash-chain"]
-no-o-direct = ["melin-server-runtime/no-o-direct"]

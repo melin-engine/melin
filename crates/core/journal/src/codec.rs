@@ -73,11 +73,12 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 ///
 /// v12 → v13: entry offset fixed at [`ENTRY_OFFSET`] (= [`MAX_SECTOR_SIZE`]
 /// = 4096) regardless of the device's logical sector size, so journals
-/// can be opened under either [`crate::SectorWriter`] (O_DIRECT) or
-/// [`crate::BufferedWriter`] (page cache + fdatasync) without
-/// recreation. The header's `sector_size` field is now always 4096 in
-/// newly-written files; SectorWriter derives its O_DIRECT alignment
-/// from the device (`detect_sector_size`) rather than the header.
+/// written by the then-current O_DIRECT writer and by
+/// [`crate::BufferedWriter`] (page cache + fdatasync) are mutually
+/// readable without recreation. The header's `sector_size` field is
+/// always 4096 in newly-written files. The O_DIRECT writer has since
+/// been retired, but journals it wrote still open unchanged — the
+/// field is retained so those files keep decoding.
 ///
 /// v13 → v14: hash-chain metadata moved out of the entry stream. The
 /// file header gained `starting_sequence`, `anchor_hash`, and its own

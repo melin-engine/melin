@@ -18,14 +18,6 @@ path = "src/lib.rs"
 ## segment boundaries and snapshot anchors. Catches deliberate
 ## tampering (CRC32C only catches corruption). Adds ~15-30 ns per event.
 hash-chain = ["dep:blake3"]
-## Open the journal *without* `O_DIRECT`. Writes still go through the
-## same sector-aligned path but land in the kernel page cache instead
-## of bypassing it. For benchmarking on consumer NVMe drives that lack
-## Power Loss Protection — every O_DIRECT submit on those drives pays
-## the full device-side latency. Production deployments on PLP drives
-## must leave this off; with `no-o-direct` enabled, durability becomes
-## best-effort (no per-batch flush).
-no-o-direct = []
 ## Expose `test_utils` hooks used by consuming crates' tests — notably
 ## an in-process override for the prealloc chunk size, so recovery
 ## stress tests avoid the 256 MiB fallocate per iteration. Activate
@@ -36,7 +28,6 @@ test-utils = []
 blake3 = { version = "1", optional = true }
 crc32c = "0.6"
 getrandom = "0.4"
-io-uring = "0.7"
 libc = { workspace = true }
 # Safe wrappers for `pwrite`, `pwritev2`, `fallocate` so the journal hot
 # path can drop the corresponding `unsafe { libc::… }` blocks. Already

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use melin_app::{AppEvent, CodecError};
-use melin_journal::sector_writer::SectorWriter;
+use melin_journal::buffered_writer::BufferedWriter;
 use melin_journal::write::JournalWrite;
 use melin_journal::{JournalEvent, JournalReader};
 
@@ -53,14 +53,15 @@ impl AppEvent for BenchEvent {
 }
 
 fn write_synthetic(path: &Path, n: u64) {
-    let mut writer = SectorWriter::<BenchEvent>::create(path).expect("create journal");
+    let mut writer = BufferedWriter::<BenchEvent>::create(path).expect("create journal");
     for i in 0..n {
         let ev = JournalEvent::App(BenchEvent {
             fields: [i, i.wrapping_mul(7), i ^ 0xdead, i.rotate_left(13), i + 1],
         });
         writer.append(&ev).expect("append");
     }
-    // Drop forces final flush via Drop impl on SectorWriter.
+    // `append` flushes each event durably, so the writer holds nothing
+    // pending here — the drop just closes the fd.
     drop(writer);
 }
 

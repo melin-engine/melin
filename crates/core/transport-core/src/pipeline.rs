@@ -1,8 +1,8 @@
 //! Pipeline stages for the LMAX disruptor architecture.
 //!
 //! Two hot-path stages consume from an input disruptor in **parallel**:
-//! 1. **Journal stage**: batch-encodes events, then writes and syncs via the active writer
-//!    (`SectorWriter`: `O_DIRECT`; `BufferedWriter`: `pwrite` + `fdatasync`).
+//! 1. **Journal stage**: batch-encodes events, then writes and syncs them via
+//!    `BufferedWriter` (`pwrite` + `fdatasync`).
 //!    Advances its cursor only after the durable write completes. When replication is enabled,
 //!    sends a copy of each encoded batch to the replication sender thread via a bounded
 //!    channel. The bytes are identical to what was written to disk — same sequences,
@@ -421,7 +421,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 }
 
 /// Journal stage: consumes from the input disruptor, batch-encodes events,
-/// and writes durably via the active writer (`SectorWriter` or `BufferedWriter`).
+/// and writes them durably via `BufferedWriter`.
 ///
 /// Runs on a dedicated OS thread. Uses `read_batch` + `commit` so its
 /// cursor only advances **after** the durable write. The response stage
@@ -492,12 +492,10 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// a fresh error log on each command.
     rotation_backoff_until: Option<Instant>,
     /// Background preparer that pre-stages the next segment off the
-    /// rotation hot path. `Some` once the writer-specific
-    /// `enable_preparer` arms it at run startup (size-driven rotation
-    /// or replica adoption; sector and buffered stages each spawn
-    /// their own staging mode); `None` when rotation can't recur (no
-    /// point spending disk + a thread on speculation that may never
-    /// pay off). Survives every
+    /// rotation hot path. `Some` once `enable_preparer` arms it at run
+    /// startup (size-driven rotation or replica adoption); `None` when
+    /// rotation can't recur (no point spending disk + a thread on
+    /// speculation that may never pay off). Survives every
     /// rotation — only the writer's file is swapped, the preparer
     /// keeps preparing the same live-path sidecar across the rotation
     /// boundary. Rotation outcome counters live in
@@ -688,10 +686,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     pub fn set_rotation(&mut self, max_journal_bytes: u64, rotate_flag: Option<Arc<AtomicBool>>) {
         self.max_journal_bytes = max_journal_bytes;
         self.rotate_requested = rotate_flag;
-        // The preparer fast path is wired per writer by the
-        // `enable_preparer` specializations, called from each stage's
-        // run path: sector mode pre-allocates an O_DIRECT sidecar,
-        // buffered mode pre-writes physical zeros so appends stop
+        // The preparer fast path is wired by `enable_preparer`, called
+        // from the stage's run path: it pre-writes physical zeros so
+        // appends stop
         // generating extent-conversion metadata (the fdatasync
         // journal-force beat — see the preparer module docs).
     }
@@ -1031,7 +1028,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// Lazily initializes the buffer header on the first slot of each batch.
     /// Append the just-encoded journal entry's bytes to the InputBatch
     /// buffer. `journal_slice` comes from
-    /// [`SectorWriter::last_user_entry_replication_slice`] and is laid
+    /// `BufferedWriter::last_user_entry_replication_slice` and is laid
     /// out exactly as the on-the-wire slot — the journal codec's frame
     /// minus its 2-byte magic and 4-byte CRC. No re-encode on the
     /// hot path; the hand-off is a single `extend_from_slice`.
@@ -1252,20 +1249,18 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
 
     /// Rotate the live journal segment if a trigger has fired.
     ///
-    /// Called at fsync boundaries from both the sync and uring paths.
-    /// Two triggers: a manual `rotate_requested` flag (consumed via
-    /// CAS so duplicate signals collapse into one rotation) and a
-    /// size threshold against the live segment's on-disk size. After
-    /// a successful rotation, re-publishes the chain hash so shadow
-    /// observers pick up the new genesis-anchored value.
+    /// Called at fsync boundaries. Two triggers: a manual
+    /// `rotate_requested` flag (consumed via CAS so duplicate signals
+    /// collapse into one rotation) and a size threshold against the
+    /// live segment's on-disk size. After a successful rotation,
+    /// re-publishes the chain hash so shadow observers pick up the new
+    /// genesis-anchored value.
     ///
     /// Errors are logged but do not abort the pipeline: the live
-    /// segment is restored by `SectorWriter::rotate_segment` on
+    /// segment is restored by `BufferedWriter::rotate_segment` on
     /// failure, so the next batch can continue writing to it.
     ///
-    /// Returns `true` when a rotation actually happened — the caller
-    /// in the io_uring path uses this to refresh the registered file
-    /// slot, since the writer's fd has changed.
+    /// Returns `true` when a rotation actually happened.
     #[inline]
     fn maybe_rotate(&mut self) -> bool {
         let Some(manual) = self.local_rotation_armed() else {
@@ -1277,8 +1272,8 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     }
 
     /// Rotate, adopting a pre-staged sidecar segment when the
-    /// background preparer (spawned by the writer-specific
-    /// `enable_preparer`) has one ready; synchronous `rotate_segment`
+    /// background preparer (spawned by `enable_preparer`) has one
+    /// ready; synchronous `rotate_segment`
     /// otherwise. Returns the rotation result and whether the fast
     /// path was used — the single fast-path selection point shared by
     /// size/manual rotation and replica boundary adoption, so a policy
@@ -1303,10 +1298,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// the primary itself). Deliberately NOT armed for manual-only
     /// rotation (`ROTATE` with `max_journal_bytes == 0`): the cadence
     /// is unpredictable and the staged segment's disk + thread cost may
-    /// never pay off. Shared by both writers' `enable_preparer` so the
-    /// policy cannot drift between them (it already regressed once when
-    /// the sector call went unwired — see the `JournalStageRun` impl
-    /// docs).
+    /// never pay off.
     fn arm_preparer_if_recurring(&mut self, spawn: impl FnOnce(&Self) -> SegmentPreparer) {
         let rotation_recurs = self.max_journal_bytes > 0 || self.stream_marks.is_some();
         if rotation_recurs && self.preparer.is_none() {
@@ -1763,10 +1755,10 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
 
 /// Trait abstracting the journal stage's `run` entry point so generic
 /// code (server boot, replica receivers) can drive the stage without
-/// knowing which concrete writer was picked. Each writer specialisation
-/// provides its own implementation: `BufferedWriter` always means
-/// `run_sync`; `SectorWriter` picks `run_uring` in production and
-/// `run_sync` under the `no-persist` feature.
+/// naming the concrete writer. The one implementation drives
+/// `BufferedWriter` through `run_sync`; the trait stays because the
+/// generic call sites (`W: JournalWrite<E>`) cannot name an inherent
+/// method on a specialisation.
 pub trait JournalStageRun<E: AppEvent>: Sized {
     /// The concrete writer the stage owns and returns on clean shutdown.
     type Writer: JournalWrite<E>;
@@ -1785,8 +1777,6 @@ impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::Buffered
         // writing, `valid_end` never advances, and the size trigger can
         // never fire — arming the preparer would zero-write a full
         // segment at boot for a staging file nothing ever adopts.
-        // Mirrors the sector impl, whose `no-persist` arm also skips
-        // `enable_preparer`.
         #[cfg(feature = "no-persist")]
         {
             self.run_sync(shutdown)
@@ -1802,9 +1792,9 @@ impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::Buffered
 
 impl<E: AppEvent> JournalStage<E, melin_journal::BufferedWriter<E>> {
     /// Spawn the background segment preparer in zero-fill mode. Called
-    /// from the buffered stage's `run` before entering `run_sync`;
-    /// no-op if already spawned. Arming policy is shared with the
-    /// sector variant (see [`JournalStage::arm_preparer_if_recurring`]).
+    /// from the stage's `run` before entering `run_sync`; no-op if
+    /// already spawned. Arming policy lives in
+    /// [`JournalStage::arm_preparer_if_recurring`].
     ///
     /// Zero-fill — physical zeros, not `FALLOC_FL_ZERO_RANGE` — is the
     /// load-bearing detail: appends into pre-written extents generate
@@ -1821,745 +1811,6 @@ impl<E: AppEvent> JournalStage<E, melin_journal::BufferedWriter<E>> {
                 stage.preparer_core,
             )
         });
-    }
-}
-
-/// Registered-slot lookup for a journal batch buffer about to be
-/// submitted: pointer identity against the two regions registered at
-/// ring setup. A miss means the writer's defensive replacement-alloc
-/// path produced an unregistered buffer — it must go out as a plain
-/// `Write`, since `WriteFixed` against a wrong slot would fail (or
-/// worse, write the wrong region's bytes).
-///
-/// `u16` because that is the SQE's `buf_index` width.
-pub(crate) fn journal_fixed_slot(
-    registered: Option<&[*const u8; 2]>,
-    buf_ptr: *const u8,
-) -> Option<u16> {
-    registered.and_then(|regs| {
-        regs.iter()
-            .position(|&p| std::ptr::eq(p, buf_ptr))
-            .map(|i| i as u16)
-    })
-}
-
-/// Build the journal write SQE: `WriteFixed` against a registered slot
-/// when the batch buffer is one of the two registered at setup — the
-/// pages were pinned once at registration, so the submit skips the
-/// `get_user_pages` walk a plain `Write` pays under O_DIRECT — and
-/// `Write` otherwise (unregistered replacement buffer, or registration
-/// failed at setup). `user_data(1)` on both: the reap path does not
-/// distinguish the variants, a CQE is a CQE.
-fn journal_write_sqe(
-    registered: Option<&[*const u8; 2]>,
-    batch: &melin_journal::AsyncWriteBatch,
-    rw_flags: i32,
-) -> io_uring::squeue::Entry {
-    use io_uring::{opcode, types};
-    let ptr = batch.buf.as_ptr();
-    match journal_fixed_slot(registered, ptr) {
-        Some(slot) => opcode::WriteFixed::new(types::Fixed(0), ptr, batch.len as u32, slot)
-            .offset(batch.offset)
-            .rw_flags(rw_flags)
-            .build()
-            .user_data(1),
-        None => opcode::Write::new(types::Fixed(0), ptr, batch.len as u32)
-            .offset(batch.offset)
-            .rw_flags(rw_flags)
-            .build()
-            .user_data(1),
-    }
-}
-
-/// Sector-specialized implementation: io_uring overlapped journal loop
-/// and the preparer fast-path rotation. Only meaningful for
-/// `SectorWriter` because the io_uring submit/complete path operates on
-/// its `O_DIRECT` fd and its aligned batch buffer.
-///
-/// `run_uring` arms the segment preparer at startup. If a persistent
-/// sector run path other than `run_uring` is ever added (the `run_sync`
-/// arm below is `no-persist`-only), it must call `enable_preparer` too
-/// — forgetting it silently reverts every rotation to the synchronous
-/// allocate stall (see 8a8b9771's unwired-call regression).
-impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::SectorWriter<E>> {
-    type Writer = melin_journal::SectorWriter<E>;
-    #[inline]
-    fn run(
-        self,
-        shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
-        #[cfg(feature = "no-persist")]
-        {
-            self.run_sync(shutdown)
-        }
-        #[cfg(not(feature = "no-persist"))]
-        {
-            self.run_uring(shutdown)
-        }
-    }
-}
-
-impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
-    /// Spawn the background segment preparer in sector mode. Called
-    /// from `run_uring` startup; no-op if already spawned. Arming
-    /// policy is shared with the buffered variant (see
-    /// [`JournalStage::arm_preparer_if_recurring`]); operators that
-    /// want fast manual rotation can set `--max-journal-mib` high
-    /// enough to never trigger.
-    pub fn enable_preparer(&mut self) {
-        self.arm_preparer_if_recurring(|stage| {
-            SegmentPreparer::spawn(
-                stage.writer.path().to_path_buf(),
-                stage.writer.sector_size(),
-                stage.preparer_core,
-            )
-        });
-    }
-
-    /// Update the io_uring fixed-file slot 0 to point at `new_fd`.
-    ///
-    /// Called after rotation: rotation closes the old live fd and opens
-    /// a new one for the new live segment, but io_uring's registered
-    /// file table still references the old fd. Subsequent SQEs that use
-    /// `types::Fixed(0)` would write to the now-archived inode (rename
-    /// moves the directory entry, not the kernel's file reference).
-    /// `register_files_update` swaps slot 0 atomically.
-    fn reregister_journal_fd(
-        ring: &io_uring::IoUring,
-        new_fd: std::os::unix::io::RawFd,
-    ) -> Result<(), JournalError> {
-        ring.submitter()
-            .register_files_update(0, &[new_fd])
-            .map_err(|e| {
-                JournalError::Io(std::io::Error::other(format!(
-                    "io_uring register_files_update after rotation: {e}"
-                )))
-            })?;
-        Ok(())
-    }
-
-    /// Post-rotation refresh of everything io_uring holds registered
-    /// for the journal: swap fixed-file slot 0 to the new segment's fd
-    /// and verify the fixed-buffer registration still matches the
-    /// writer's batch buffers.
-    ///
-    /// The writer guarantees the buffer addresses survive rotation
-    /// (`SectorWriter::batch_buffer_regions`), so a mismatch is a bug —
-    /// asserted in debug builds. In release the registration is demoted
-    /// (`registered_bufs = None`, journal writes fall back to plain
-    /// `Write`) rather than trusted: a stale registration whose address
-    /// got *reused* would make `WriteFixed` DMA from the old pinned
-    /// pages and journal stale bytes with a clean CQE.
-    fn refresh_journal_registration(
-        &self,
-        ring: &io_uring::IoUring,
-        registered_bufs: &mut Option<[*const u8; 2]>,
-    ) -> Result<(), JournalError> {
-        Self::reregister_journal_fd(ring, self.writer.fd())?;
-        if let Some(expected) = *registered_bufs {
-            // Order-insensitive compare: which allocation currently
-            // holds the batch vs spare role is not part of the
-            // contract, only the address set is.
-            let matches = self.writer.batch_buffer_regions().is_some_and(|regions| {
-                let current = [regions[0].0, regions[1].0];
-                current == expected || current == [expected[1], expected[0]]
-            });
-            debug_assert!(
-                matches,
-                "journal batch buffers moved across rotation — \
-                 SectorWriter's address-stability contract is broken"
-            );
-            if !matches {
-                tracing::error!(
-                    "journal batch buffers moved across rotation — demoting journal \
-                     writes to plain Write (stale fixed-buffer registration)"
-                );
-                *registered_bufs = None;
-            }
-        }
-        Ok(())
-    }
-
-    /// Quiesce the writer mid-cycle for a rotation barrier on the
-    /// io_uring path: reap any in-flight write, publish the accumulated
-    /// replication batch, submit-and-wait everything encoded so far,
-    /// and advance the consumer to `progress` — the ring position of
-    /// the last encoded slot. Mid-batch the steady-state pattern
-    /// (`set_progress(consumer.next_read())`) would over-commit: the
-    /// read cursor already covers slots past the boundary that are not
-    /// encoded yet, and committing them would let the ack path
-    /// overstate durability.
-    fn flush_pending_uring(
-        &mut self,
-        ring: &mut io_uring::IoUring,
-        registered_bufs: Option<&[*const u8; 2]>,
-        inflight: &mut Option<(melin_journal::AsyncWriteBatch, u64)>,
-        progress: u64,
-    ) -> Result<(), JournalError> {
-        if let Some((batch_data, seq)) = inflight.take() {
-            self.wait_for_cqe(ring, batch_data.len)?;
-            self.consumer.set_progress(seq);
-            self.publish_fsync_state();
-            self.writer.confirm_async_write(batch_data);
-        }
-        if self.repl.any_producer() {
-            let end_seq = self.writer.next_sequence() - 1;
-            Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
-        }
-        // `None` needs no write — either query-only, or the bytes fit
-        // the partial tail sector and were written synchronously inside
-        // `take_batch_for_async_write`. Both are durable already.
-        if let Some(async_batch) = self.writer.take_batch_for_async_write()? {
-            let len = async_batch.len;
-            let sqe = journal_write_sqe(
-                registered_bufs,
-                &async_batch,
-                self.writer.io_uring_rw_flags(),
-            );
-            // SAFETY: `async_batch.buf` stays alive until the CQE is
-            // reaped by `wait_for_cqe` immediately below; the ring
-            // is single-threaded.
-            unsafe {
-                ring.submission().push(&sqe).expect("SQ full");
-            }
-            ring.submit().map_err(|e| {
-                JournalError::Io(std::io::Error::other(format!(
-                    "io_uring submit (rotation barrier): {e}"
-                )))
-            })?;
-            self.wait_for_cqe(ring, len)?;
-            self.writer.confirm_async_write(async_batch);
-        }
-        self.consumer.set_progress(progress);
-        self.publish_fsync_state();
-        Ok(())
-    }
-
-    /// Stream-mark hook for the io_uring loop. Chain checks resolve at
-    /// any call; a rotation is performed only when the writer is fully
-    /// quiesced (nothing buffered, nothing in flight) — otherwise it
-    /// stays pending for a later, quiesced call. Refreshes the journal
-    /// registration when a rotation happened (the writer's fd changes).
-    /// No-op outside replica mode. Returns whether a rotation happened
-    /// — same contract as [`JournalStage::apply_stream_marks`].
-    fn apply_stream_marks_uring(
-        &mut self,
-        ring: &io_uring::IoUring,
-        registered_bufs: &mut Option<[*const u8; 2]>,
-        quiesced: bool,
-    ) -> Result<bool, JournalError> {
-        if self.stream_marks.is_none() {
-            return Ok(false);
-        }
-        let rotated = self.apply_stream_marks(quiesced)?;
-        if rotated {
-            self.refresh_journal_registration(ring, registered_bufs)?;
-        }
-        Ok(rotated)
-    }
-
-    /// Overlapped io_uring journal loop: submits `Write` asynchronously and
-    /// accumulates the next batch in a second buffer while the NVMe write is
-    /// in flight. Doubles effective throughput when journal I/O is the bottleneck.
-    ///
-    /// Cursor only advances after the CQE confirms durability — the
-    /// persist-before-ack guarantee is preserved.
-    pub fn run_uring(
-        mut self,
-        shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
-        use io_uring::IoUring;
-        use std::time::Instant;
-
-        // Arm the background segment preparer so recurring rotations
-        // (size-driven or primary-announced) take the pre-staged fast
-        // path instead of the synchronous allocate stall.
-        self.enable_preparer();
-
-        // SINGLE_ISSUER: only one thread submits SQEs — lets the kernel skip
-        // internal locking on the SQ.
-        //
-        // COOP_TASKRUN is deliberately NOT used: it defers CQE delivery to
-        // io_uring_enter() calls, requiring an extra syscall (~200ns) at
-        // every reap point. Without it, CQEs are posted directly to the
-        // shared CQ ring in interrupt context (on core 0 per IRQ affinity),
-        // and the journal thread reads them via the memory-mapped CQ with
-        // zero syscall overhead.
-        let mut ring: IoUring = IoUring::builder()
-            .setup_single_issuer()
-            .build(4)
-            .map_err(|e| JournalError::Io(std::io::Error::other(format!("io_uring init: {e}"))))?;
-
-        // Register the journal fd so the kernel skips fget/fput (fd table
-        // lookup + atomic refcount) on every SQE. Use types::Fixed(0) in
-        // SQEs instead of types::Fd(raw_fd).
-        let raw_fd = self.writer.fd();
-        let rw_flags = self.writer.io_uring_rw_flags();
-        ring.submitter().register_files(&[raw_fd]).map_err(|e| {
-            JournalError::Io(std::io::Error::other(format!(
-                "io_uring register_files: {e}"
-            )))
-        })?;
-
-        // Pin io-wq worker threads to core 0 (OS/IRQ core). Without this,
-        // io-wq workers inherit the journal thread's CPU affinity (core 1)
-        // and contend with the busy-spinning journal thread. With nohz_full,
-        // timer ticks are suppressed on core 1, so the worker can be starved
-        // for up to 4ms (HZ=250) waiting for preemption — causing ~6ms p99.9
-        // tail latency spikes. Core 0 is non-isolated and always has ticks.
-        {
-            let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-            unsafe { libc::CPU_SET(0, &mut cpuset) };
-            ring.submitter().register_iowq_aff(&cpuset).map_err(|e| {
-                JournalError::Io(std::io::Error::other(format!(
-                    "io_uring register_iowq_aff: {e}"
-                )))
-            })?;
-        }
-
-        // Register the two batch buffers so steady-state journal writes
-        // go out as `WriteFixed`: their pages are pinned once here
-        // instead of `get_user_pages` walking the buffer on every
-        // O_DIRECT submit — a fixed per-batch cost (and an occasional
-        // page-migration stall) sitting directly on the durability-
-        // critical path. Registration counts against RLIMIT_MEMLOCK on
-        // top of the writer's own mlock, so failure degrades to plain
-        // `Write` with a warn (operator should raise the limit) rather
-        // than refusing to start.
-        // Mutable: `refresh_journal_registration` demotes it to `None`
-        // if the buffer addresses ever stop matching after a rotation.
-        let mut registered_bufs: Option<[*const u8; 2]> = match self.writer.batch_buffer_regions() {
-            Some(regions) => {
-                let iovecs = regions.map(|(ptr, len)| libc::iovec {
-                    iov_base: ptr as *mut libc::c_void,
-                    iov_len: len,
-                });
-                // SAFETY: the regions are owned by `self.writer`, are
-                // mlocked, never move or shrink (fixed-capacity boxes
-                // exchanged by ownership with in-flight batches; segment
-                // rotation installs the new file into the same writer
-                // without touching the buffers — see
-                // `SectorWriter::batch_buffer_regions`), and outlive
-                // `ring` — the writer is returned to the caller only
-                // after the shutdown path has reaped every in-flight
-                // write and this function's locals are gone.
-                match unsafe { ring.submitter().register_buffers(&iovecs) } {
-                    Ok(()) => Some([regions[0].0, regions[1].0]),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "io_uring register_buffers failed — journal writes fall back \
-                             to plain Write; raise RLIMIT_MEMLOCK to enable WriteFixed"
-                        );
-                        None
-                    }
-                }
-            }
-            // A batch already in flight at setup cannot happen (nothing
-            // has been submitted yet); degrading beats asserting on it.
-            None => None,
-        };
-
-        let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
-        let delay = self.group_commit_delay;
-        let mut idle_spins: u32 = 0;
-        let mut pending: usize = 0;
-        let mut first_write_ts: Option<Instant> = None;
-
-        // In-flight state: the batch being written and the sequence to commit
-        // when the CQE arrives. `inflight_seq` is the consumer's `next_read`
-        // at the time of submission — committing it advances the cursor to
-        // exactly the events covered by the durable write.
-        let mut inflight: Option<(melin_journal::AsyncWriteBatch, u64)> = None;
-
-        let mut busy_count: u64 = 0;
-        let mut idle_count: u64 = 0;
-
-        loop {
-            // --- Check shutdown ---
-            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                self.reap_inflight_on_shutdown(&mut ring, &mut inflight)?;
-                // Flush any pending buffered data through the same async path
-                // as steady-state — submit + reap one CQE — instead of falling
-                // back to a synchronous pwrite. Keeps the production write path
-                // symmetric and removes the last sync-flush call from the
-                // hot/critical lifecycle.
-                if pending > 0 {
-                    if let Some(async_batch) = self.writer.take_batch_for_async_write()? {
-                        let seq = self.consumer.next_read();
-                        let len = async_batch.len;
-                        let sqe =
-                            journal_write_sqe(registered_bufs.as_ref(), &async_batch, rw_flags);
-                        unsafe {
-                            ring.submission().push(&sqe).expect("SQ full");
-                        }
-                        ring.submit().expect("io_uring submit failed");
-                        self.wait_for_cqe(&mut ring, len)?;
-                        self.consumer.set_progress(seq);
-                        self.publish_fsync_state();
-                        self.writer.confirm_async_write(async_batch);
-                    } else {
-                        // Buffer was empty (read-only queries only) — just commit.
-                        self.consumer.commit();
-                    }
-                }
-                self.drain_remaining(&mut batch);
-                self.utilization.busy.store(busy_count, Ordering::Relaxed);
-                self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                #[cfg(feature = "pipeline-stats")]
-                print_utilization("journal", busy_count, idle_count);
-                return Ok(self.writer);
-            }
-
-            // --- Reap CQE from previous in-flight write (non-blocking) ---
-            // CQEs are posted directly to the shared CQ ring in interrupt
-            // context — no syscall needed to make them visible.
-            let mut rotated_top = false;
-            if let Some((ref batch_data, seq)) = inflight
-                && let Some(cqe) = ring.completion().next()
-            {
-                let result = cqe.result();
-                if result < 0 {
-                    return Err(JournalError::Io(std::io::Error::other(format!(
-                        "io_uring journal write failed (errno {})",
-                        -result
-                    ))));
-                } else if (result as usize) != batch_data.len {
-                    return Err(JournalError::Io(std::io::Error::other(format!(
-                        "io_uring journal short write ({} of {} bytes)",
-                        result, batch_data.len
-                    ))));
-                }
-                // Advance cursor: these events are now durable.
-                self.consumer.set_progress(seq);
-                self.publish_fsync_state();
-                let completed = inflight.take().expect("checked above");
-                self.writer.confirm_async_write(completed.0);
-                rotated_top = self.maybe_rotate();
-            }
-            if rotated_top {
-                self.refresh_journal_registration(&ring, &mut registered_bufs)?;
-            }
-            // Replica mode: act on a mark reached at the previous submit
-            // (no later slot has arrived to trigger the mid-batch
-            // barrier). Gated on a mark already being held locally —
-            // this runs every loop iteration, and an ungated call would
-            // take the queue mutex per busy-spin. Discovery happens at
-            // the batch-start refresh and the amortized idle hook.
-            if self.pending_mark.is_some() {
-                self.apply_stream_marks_uring(
-                    &ring,
-                    &mut registered_bufs,
-                    inflight.is_none() && pending == 0,
-                )?;
-            }
-
-            // --- Read events from disruptor ---
-            // Ring position before this read — the barrier path computes
-            // mid-batch commit targets as `read_start + encoded slots`.
-            let read_start = self.consumer.next_read();
-            let remaining = MAX_JOURNAL_BATCH.saturating_sub(pending);
-            let count = if remaining > 0 {
-                self.consumer.read_batch(&mut batch, remaining)
-            } else {
-                0
-            };
-
-            // `saw_shutdown` becomes true the moment we observe a sentinel
-            // slot in the input ring. Set on the inner loop, checked on the
-            // outer loop to break out into the shutdown-flush path. We
-            // process every slot up to (and excluding) the sentinel — the
-            // disruptor's FIFO order guarantees we've consumed everything
-            // the receiver published before the sentinel.
-            let mut saw_shutdown = false;
-
-            if count > 0 {
-                idle_spins = 0;
-                busy_count += 1;
-
-                // Replica mode: a primary-announced stream mark (rotation
-                // boundary or chain check) may fall inside this batch.
-                // `mark_split` bounds each encode span at the pending
-                // mark; between spans the barrier acts at exactly the
-                // marked entry, then encoding resumes.
-                self.refresh_pending_mark();
-                let mut start = 0usize;
-                loop {
-                    let stop = self.mark_split(&batch, start, count);
-                    for slot in &batch[start..stop] {
-                        if slot.event.is_shutdown() {
-                            saw_shutdown = true;
-                            break;
-                        }
-                        if slot.event.is_query() {
-                            continue;
-                        }
-                        let seq = if slot.sequence != 0 {
-                            self.writer.set_next_sequence(slot.sequence + 1);
-                            slot.sequence
-                        } else {
-                            self.writer.allocate_sequence()
-                        };
-                        self.writer
-                            .encode_event(
-                                seq,
-                                slot.timestamp_ns,
-                                &slot.event,
-                                slot.key_hash,
-                                slot.request_seq,
-                            )
-                            .map_err(|e| {
-                                JournalError::Io(std::io::Error::other(format!(
-                                    "journal encode (run_uring, seq {seq}): {e}"
-                                )))
-                            })?;
-                        let journal_slice = self.writer.last_user_entry_replication_slice();
-                        Self::record_slot_for_replication(&mut self.repl, journal_slice);
-                    }
-                    pending += stop - start;
-                    if first_write_ts.is_none() {
-                        first_write_ts = Some(Instant::now());
-                    }
-                    if stop == count || saw_shutdown {
-                        break;
-                    }
-                    // Mark barrier: the pending mark sits between
-                    // batch[stop - 1] and batch[stop]. Chain checks
-                    // resolve against the encoded chain — no flush
-                    // needed. A rotation requires the flush + commit
-                    // first (progress = exactly the boundary slot's ring
-                    // position) so the writer is quiesced.
-                    self.apply_stream_marks_uring(&ring, &mut registered_bufs, false)?;
-                    if matches!(self.pending_mark, Some(StreamMark::Rotate(_))) {
-                        self.flush_pending_uring(
-                            &mut ring,
-                            registered_bufs.as_ref(),
-                            &mut inflight,
-                            read_start + stop as u64,
-                        )?;
-                        pending = 0;
-                        first_write_ts = None;
-                        if !self.apply_stream_marks_uring(&ring, &mut registered_bufs, true)?
-                            && matches!(self.pending_mark, Some(StreamMark::Rotate(_)))
-                        {
-                            // The rotation failed and is backed off; the
-                            // rest of this read batch sits past the
-                            // boundary and cannot be encoded until the
-                            // retry succeeds. Sleep instead of spinning
-                            // hot on the barrier — the stage is stalled
-                            // on storage either way.
-                            std::thread::sleep(ADOPTION_STALL_POLL);
-                        }
-                    }
-                    start = stop;
-                }
-            }
-
-            if saw_shutdown {
-                // Drain anything in flight + any pending batch, then exit.
-                // Same shape as the shutdown-flag path above — we just got
-                // here via the sentinel rather than the flag.
-                self.reap_inflight_on_shutdown(&mut ring, &mut inflight)?;
-                if pending > 0 {
-                    self.writer.flush_batch_sync()?;
-                    self.consumer.commit();
-                }
-                self.drain_remaining(&mut batch);
-                self.utilization.busy.store(busy_count, Ordering::Relaxed);
-                self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                #[cfg(feature = "pipeline-stats")]
-                print_utilization("journal", busy_count, idle_count);
-                return Ok(self.writer);
-            }
-
-            // --- Eagerly reap CQE after encoding ---
-            // The non-blocking check at the top of the loop may have missed
-            // a CQE that arrived while we were encoding events. Reap it now
-            // so the cursor advances sooner and the slot frees up for
-            // immediate submission.
-            let mut rotated_eager = false;
-            if let Some((ref batch_data, seq)) = inflight
-                && let Some(cqe) = ring.completion().next()
-            {
-                let result = cqe.result();
-                if result < 0 {
-                    return Err(JournalError::Io(std::io::Error::other(format!(
-                        "io_uring journal write failed (errno {})",
-                        -result
-                    ))));
-                } else if (result as usize) != batch_data.len {
-                    return Err(JournalError::Io(std::io::Error::other(format!(
-                        "io_uring journal short write ({} of {} bytes)",
-                        result, batch_data.len
-                    ))));
-                }
-                self.consumer.set_progress(seq);
-                self.publish_fsync_state();
-                let completed = inflight.take().expect("checked above");
-                self.writer.confirm_async_write(completed.0);
-                rotated_eager = self.maybe_rotate();
-            }
-            if rotated_eager {
-                self.refresh_journal_registration(&ring, &mut registered_bufs)?;
-            }
-            // Gated like the top-of-loop hook: per-iteration site, mutex
-            // only when a mark is already held.
-            if self.pending_mark.is_some() {
-                self.apply_stream_marks_uring(
-                    &ring,
-                    &mut registered_bufs,
-                    inflight.is_none() && pending == 0,
-                )?;
-            }
-
-            // --- Decide whether to submit ---
-            if pending > 0 {
-                // With overlapping: only submit when either (a) there's no
-                // in-flight write (slot is free), or (b) batch is full
-                // (backpressure — must drain before accumulating more).
-                // When a write IS in-flight and the batch isn't full, we
-                // continue accumulating — the CQE reap at the top of the
-                // loop will free the slot, and the NEXT iteration submits.
-                let slot_free = inflight.is_none();
-                let batch_full = pending >= self.max_batch;
-                let delay_expired =
-                    delay.is_zero() || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
-
-                let should_submit = (slot_free && delay_expired) || batch_full;
-
-                if should_submit {
-                    // If a write is still in-flight, block until it completes
-                    // (backpressure — both buffers full).
-                    if let Some((batch_data, seq)) = inflight.take() {
-                        self.wait_for_cqe(&mut ring, batch_data.len)?;
-                        self.consumer.set_progress(seq);
-                        self.publish_fsync_state();
-                        self.writer.confirm_async_write(batch_data);
-                        if self.maybe_rotate() {
-                            self.refresh_journal_registration(&ring, &mut registered_bufs)?;
-                        }
-                    }
-
-                    // Publish the accumulated InputBatch frame to
-                    // replication rings BEFORE take_batch_for_async_write
-                    // (which swaps the journal-codec buffer). The InputBatch
-                    // buffer is independent of that swap, but publish at the
-                    // same boundary so the ring's `end_sequence` matches the
-                    // batch about to be submitted.
-                    if self.repl.any_producer() {
-                        let end_seq = self.writer.next_sequence() - 1;
-                        Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
-                        self.maybe_publish_chain_check();
-                    }
-
-                    // Take the batch buffer and submit async write.
-                    match self.writer.take_batch_for_async_write() {
-                        Ok(Some(async_batch)) => {
-                            let seq = self.consumer.next_read();
-                            let sqe =
-                                journal_write_sqe(registered_bufs.as_ref(), &async_batch, rw_flags);
-
-                            unsafe {
-                                ring.submission().push(&sqe).expect("SQ full");
-                            }
-                            ring.submit().expect("io_uring submit failed");
-
-                            inflight = Some((async_batch, seq));
-                        }
-                        Ok(None) => {
-                            // No async write was needed — either the batch
-                            // contained only read-only queries, or the
-                            // bytes fit entirely in the partial-tail sector
-                            // and were written synchronously by
-                            // `take_batch_for_async_write`. In both cases
-                            // the data is durable, so commit, publish chain
-                            // state, and check for rotation triggers.
-                            self.consumer.commit();
-                            self.publish_fsync_state();
-                            if self.maybe_rotate() {
-                                self.refresh_journal_registration(&ring, &mut registered_bufs)?;
-                            }
-                            // Replica mode: writer is durable + quiesced
-                            // right here — adopt a boundary that landed
-                            // exactly at this batch's end.
-                            self.apply_stream_marks_uring(&ring, &mut registered_bufs, true)?;
-                        }
-                        Err(e) => {
-                            return Err(JournalError::Io(std::io::Error::other(format!(
-                                "journal take_batch_for_async_write: {e}"
-                            ))));
-                        }
-                    }
-                    pending = 0;
-                    first_write_ts = None;
-                }
-            } else {
-                idle_count += 1;
-                if idle_count.is_multiple_of(1024) {
-                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
-                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                    // Replica mode: adopt a trailing rotation while idle
-                    // (primary rotated, then went quiet). Amortized so
-                    // the queue mutex isn't touched per idle spin.
-                    // `pending == 0` here (no-pending branch); quiesced
-                    // once the last in-flight write has been reaped.
-                    self.apply_stream_marks_uring(&ring, &mut registered_bufs, inflight.is_none())?;
-                }
-                idle_wait(&mut idle_spins, self.busy_spin);
-            }
-        }
-    }
-
-    /// Busy-poll until the in-flight io_uring CQE arrives.
-    ///
-    /// Pure userspace spin on the memory-mapped CQ ring — no syscalls.
-    /// CQEs are posted by the kernel in interrupt context (on core 0 per
-    /// IRQ affinity) and become visible here via the shared memory mapping.
-    /// The journal thread is pinned to a dedicated core, so busy-polling
-    /// is appropriate and avoids kernel sleep/wake jitter entirely.
-    /// Drain a single in-flight async write at shutdown: wait for its
-    /// CQE, advance the consumer cursor past those events, publish the
-    /// chain hash, and hand the buffer back to the writer. No-op if no
-    /// write is in flight. Used by both shutdown paths in `run_uring`
-    /// (the shutdown-flag check at the loop top, and the sentinel
-    /// observed mid-batch).
-    fn reap_inflight_on_shutdown(
-        &mut self,
-        ring: &mut io_uring::IoUring,
-        inflight: &mut Option<(melin_journal::AsyncWriteBatch, u64)>,
-    ) -> Result<(), JournalError> {
-        if let Some((batch_data, seq)) = inflight.take() {
-            self.wait_for_cqe(ring, batch_data.len)?;
-            self.consumer.set_progress(seq);
-            self.publish_fsync_state();
-            self.writer.confirm_async_write(batch_data);
-        }
-        Ok(())
-    }
-
-    fn wait_for_cqe(
-        &self,
-        ring: &mut io_uring::IoUring,
-        expected_len: usize,
-    ) -> Result<(), JournalError> {
-        loop {
-            if let Some(cqe) = ring.completion().next() {
-                let result = cqe.result();
-                if result < 0 {
-                    return Err(JournalError::Io(std::io::Error::other(format!(
-                        "io_uring journal write failed (errno {})",
-                        -result
-                    ))));
-                } else if (result as usize) != expected_len {
-                    return Err(JournalError::Io(std::io::Error::other(format!(
-                        "io_uring journal short write ({} of {expected_len} bytes)",
-                        result,
-                    ))));
-                }
-                return Ok(());
-            }
-            std::hint::spin_loop();
-        }
     }
 }
 

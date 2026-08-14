@@ -15,7 +15,7 @@ set -euo pipefail
 #
 # Out of scope (Miri cannot run them):
 #   - melin-dpdk / melin-server-runtime: FFI and real sockets.
-#   - melin-journal: O_DIRECT file I/O and io_uring syscalls.
+#   - melin-journal: real file I/O (pwrite, fdatasync, fallocate).
 #
 # Usage:
 #   scripts/miri.sh                  # full run

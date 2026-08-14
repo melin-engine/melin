@@ -1,17 +1,14 @@
-//! Shared trait implemented by both concrete journal writers
-//! ([`SectorWriter`] and [`BufferedWriter`]).
+//! Trait implemented by the journal writer ([`BufferedWriter`]).
 //!
 //! The trait is what `JournalStage`, `Pipeline`, and `JournaledApp`
-//! are generic over. Each call site picks a concrete writer at
-//! construction time, so the trait is statically dispatched — no
-//! runtime `match` on a writer variant.
+//! are generic over, statically dispatched — no runtime `match` on a
+//! writer variant.
 //!
 //! The trait is intentionally **not** dyn-compatible-by-design: it has
 //! no consumers that need `Box<dyn JournalWrite>` and several methods
 //! return `Self`. Keep it that way — the whole point of the refactor
 //! is monomorphisation.
 //!
-//! [`SectorWriter`]: crate::sector_writer::SectorWriter
 //! [`BufferedWriter`]: crate::buffered_writer::BufferedWriter
 
 use std::path::{Path, PathBuf};
@@ -21,14 +18,11 @@ use melin_app::{AppEvent, unix_epoch_nanos};
 use crate::buffered_writer::BufferedWriter;
 use crate::error::JournalError;
 use crate::event::JournalEvent;
-use crate::sector_writer::SectorWriter;
 
 /// Operations a journal writer must support to be drivable by the
-/// pipeline's `JournalStage`. Excludes the variant-specific surfaces
-/// (io_uring registration, async submit/confirm on the sector path;
-/// `append`/`batch_append` convenience wrappers used only by tests
-/// and benches) — those stay as inherent methods on the concrete
-/// types.
+/// pipeline's `JournalStage`. Excludes the `append`/`batch_append`
+/// convenience wrappers used only by tests and benches — those stay as
+/// inherent methods on the concrete type.
 pub trait JournalWrite<E: AppEvent>: Sized {
     // ---- constructors ----
     //
@@ -109,10 +103,7 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     fn rotate_segment(&mut self) -> Result<PathBuf, JournalError>;
     /// Rotate adopting a pre-staged segment from the
     /// [`crate::preparer::SegmentPreparer`] (the fast path — no file
-    /// creation/allocation on the calling thread). Each writer requires
-    /// a preparer spawned in its matching mode: `spawn` for
-    /// `SectorWriter`, `spawn_zero_fill` for `BufferedWriter`; both
-    /// adopters reject a mismatched staging file.
+    /// creation/allocation on the calling thread).
     ///
     /// The default body discards the prepared segment and rotates
     /// synchronously — correct (the orphaned staging file is reclaimed
@@ -161,107 +152,6 @@ pub trait JournalWrite<E: AppEvent>: Sized {
         let seq = self.allocate_sequence();
         self.encode_event(seq, timestamp_ns, event, key_hash, request_seq)?;
         Ok(seq)
-    }
-}
-
-impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
-    #[inline]
-    fn create(path: &Path) -> Result<Self, JournalError> {
-        SectorWriter::create(path)
-    }
-
-    #[inline]
-    fn create_continuing(
-        path: &Path,
-        starting_sequence: u64,
-        anchor_hash: [u8; 32],
-    ) -> Result<Self, JournalError> {
-        SectorWriter::create_continuing(path, starting_sequence, anchor_hash)
-    }
-
-    #[inline]
-    fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
-        SectorWriter::open_append(path, last_seq, valid_end)
-    }
-
-    #[inline]
-    fn allocate_sequence(&mut self) -> u64 {
-        SectorWriter::allocate_sequence(self)
-    }
-
-    #[inline]
-    fn encode_event(
-        &mut self,
-        seq: u64,
-        timestamp_ns: u64,
-        event: &JournalEvent<E>,
-        key_hash: u64,
-        request_seq: u64,
-    ) -> Result<(), JournalError> {
-        SectorWriter::encode_event(self, seq, timestamp_ns, event, key_hash, request_seq)
-    }
-
-    #[inline]
-    fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
-        SectorWriter::flush_batch_sync(self)
-    }
-
-    #[inline]
-    fn discard_batch_buf(&mut self) {
-        SectorWriter::discard_batch_buf(self)
-    }
-
-    #[inline]
-    fn next_sequence(&self) -> u64 {
-        SectorWriter::next_sequence(self)
-    }
-
-    #[inline]
-    fn segment_starting_sequence(&self) -> u64 {
-        SectorWriter::segment_starting_sequence(self)
-    }
-
-    #[inline]
-    fn set_next_sequence(&mut self, seq: u64) {
-        SectorWriter::set_next_sequence(self, seq)
-    }
-
-    #[inline]
-    fn valid_end(&self) -> u64 {
-        SectorWriter::valid_end(self)
-    }
-
-    #[inline]
-    fn path(&self) -> &Path {
-        SectorWriter::path(self)
-    }
-
-    #[inline]
-    fn chain_hash(&self) -> Option<[u8; 32]> {
-        SectorWriter::chain_hash(self)
-    }
-
-    #[inline]
-    fn last_user_entry_replication_slice(&self) -> &[u8] {
-        SectorWriter::last_user_entry_replication_slice(self)
-    }
-
-    #[inline]
-    fn rotate_segment(&mut self) -> Result<PathBuf, JournalError> {
-        SectorWriter::rotate_segment(self)
-    }
-
-    #[inline]
-    fn rotate_segment_with_prepared(
-        &mut self,
-        prepared: crate::preparer::PreparedSegment,
-    ) -> Result<PathBuf, JournalError> {
-        SectorWriter::rotate_segment_with_prepared(self, prepared)
-    }
-
-    #[inline]
-    fn read_header_info(&self) -> Result<crate::codec::FileHeaderInfo, JournalError> {
-        SectorWriter::read_header_info(self)
     }
 }
 
@@ -395,13 +285,12 @@ mod tests {
 
     // Exercises every trait method against a fresh writer. Acts as a
     // typecheck (the bound `W: JournalWrite<TestEvent>` must hold for
-    // both concrete writers) and a routing check (each delegate must
-    // hit the matching inherent method).
+    // the concrete writer) and a routing check (each delegate must hit
+    // the matching inherent method).
     fn exercise<W: JournalWrite<TestEvent>>(writer: &mut W, expected_path: &Path) {
         assert_eq!(writer.path(), expected_path);
-        // Use `valid_end` as the durability watermark: it advances on
-        // both writers after a flush. `write_pos` is sector-aligned on
-        // the O_DIRECT path and won't tip over for a single small event.
+        // `valid_end` is the durability watermark — it advances once a
+        // flush lands the batch on disk.
         let initial_valid_end = writer.valid_end();
         assert!(initial_valid_end > 0);
         // Header info round-trips through the trait: fresh journals
@@ -442,14 +331,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("buf.journal");
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        exercise(&mut writer, &path);
-    }
-
-    #[test]
-    fn trait_drives_sector_writer() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sec.journal");
-        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         exercise(&mut writer, &path);
     }
 }

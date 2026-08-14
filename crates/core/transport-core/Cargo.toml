@@ -26,9 +26,6 @@ no-persist = []
 ## a SeqLock gated on this feature so downstream snapshot consumers see
 ## the same value.
 hash-chain = ["melin-journal/hash-chain"]
-## Open the journal without `O_DIRECT`. Passthrough — see the
-## `melin-journal` feature of the same name. Benchmarking only.
-no-o-direct = ["melin-journal/no-o-direct"]
 ## Expose `JournaledApp::apply_journaled` / `tick_journaled` /
 ## `writer_mut` — synchronous test-only primitives that journal an
 ## event then apply it on the calling thread — and `test_ports`, the

@@ -1,7 +1,6 @@
-//! Journal pre-allocation chunk size, shared between `SectorWriter` and
-//! `BufferedWriter`. Centralising the policy avoids drift between the
-//! two writers — a switch between them must not change the disk-space
-//! cadence under matched configuration.
+//! Journal pre-allocation chunk size for `BufferedWriter`. Kept in its
+//! own module so the policy sits next to the test override that tunes
+//! it, rather than buried in the writer's hot path.
 //!
 //! Resolution order, highest precedence first:
 //!

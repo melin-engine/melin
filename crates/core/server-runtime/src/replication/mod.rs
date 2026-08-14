@@ -314,8 +314,8 @@ pub(super) enum TeardownOutcome<A, W> {
     Panicked,
 }
 
-/// Shut down the replica pipeline and extract Exchange + SectorWriter from
-/// the stage threads.
+/// Shut down the replica pipeline and extract Exchange + journal writer
+/// from the stage threads.
 ///
 /// Relies on the caller having published a `JournalEvent::Shutdown`
 /// sentinel to the input ring before invoking this — the journal and
@@ -583,7 +583,7 @@ where
 }
 
 /// Tear down the pipeline: publish the shutdown sentinel, join all
-/// threads, return the recovered (App, SectorWriter) so the orchestrator
+/// threads, return the recovered (App, journal writer) so the orchestrator
 /// can use them for the next pipeline build (e.g., post-snapshot) or
 /// pass them up on promotion.
 pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send + 'static>(

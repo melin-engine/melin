@@ -4,11 +4,11 @@
 //! ## Why
 //!
 //! With size-driven rotation enabled, every `max_journal_bytes` written
-//! the journal stage calls `SectorWriter::rotate_segment`, which creates
-//! the next segment file via `posix_fallocate(+chunk)` +
-//! `FALLOC_FL_ZERO_RANGE` + `prefault_pages` + `sync_all`. On PLP-class
-//! NVMe drives that ceremony is a ~38 ms synchronous stall — directly
-//! visible in p99.99 of the order pipeline.
+//! the journal stage calls `BufferedWriter::rotate_segment`, which
+//! creates the next segment file and materialises its extents before
+//! the first append can land. On PLP-class NVMe drives that ceremony is
+//! a ~38 ms synchronous stall — directly visible in p99.99 of the order
+//! pipeline.
 //!
 //! The preparer moves that work to a dedicated thread:
 //!
@@ -26,94 +26,51 @@
 //!      rotation arrived early, or preparation errored), the writer
 //!      falls back to today's synchronous path.
 //!
-//! ## Prepare modes
+//! ## Zero-fill staging
 //!
-//! The staging work differs by writer:
-//!
-//! - **Sector** ([`SegmentPreparer::spawn`]): `posix_fallocate` +
-//!   `FALLOC_FL_ZERO_RANGE` + prefault, matching what
-//!   `SectorWriter::create_bare_inner` does synchronously. Extents stay
-//!   *unwritten* — fine for O_DIRECT, which never calls `fdatasync`.
-//!
-//! - **Zero-fill** ([`SegmentPreparer::spawn_zero_fill`]): physically
-//!   writes zeros over the whole segment and syncs. This is the
-//!   `BufferedWriter` mode, and the physical writes are the point:
-//!   `FALLOC_FL_ZERO_RANGE` leaves extents unwritten, so every append
-//!   still converts them and every conversion is a logged filesystem
-//!   metadata transaction. Those transactions periodically force the
-//!   filesystem journal *inside the writer's `fdatasync`* (measured on
-//!   XFS as a ~2 ms CIL-force stall every 10.24 s that froze the whole
-//!   order pipeline — see `docs/internal/journal-fsync-beat-2026-08.md`).
-//!   Appends into pre-written extents carry no metadata, so `fdatasync`
-//!   stays on its data-only fast path. The cost is writing every
-//!   segment twice (zeros, then data) — sequential, off the hot path,
-//!   and documented as the write-amplification trade-off.
+//! Staging ([`SegmentPreparer::spawn_zero_fill`]) physically writes
+//! zeros over the whole segment and syncs, and the physical writes are
+//! the point: `FALLOC_FL_ZERO_RANGE` leaves extents unwritten, so every
+//! append still converts them and every conversion is a logged
+//! filesystem metadata transaction. Those transactions periodically
+//! force the filesystem journal *inside the writer's `fdatasync`*
+//! (measured on XFS as a ~2 ms CIL-force stall every 10.24 s that froze
+//! the whole order pipeline — see
+//! `docs/internal/journal-fsync-beat-2026-08.md`). Appends into
+//! pre-written extents carry no metadata, so `fdatasync` stays on its
+//! data-only fast path. The cost is writing every segment twice (zeros,
+//! then data) — sequential, off the hot path, and documented as the
+//! write-amplification trade-off.
 
 use std::fs::{File, OpenOptions};
 use std::io;
-#[cfg(not(feature = "no-o-direct"))]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::codec::ENTRY_OFFSET;
 use crate::error::JournalError;
-use crate::sector_writer::{preallocate, prefault_pages, zero_range_extents};
 
-/// A fully-prepared journal segment file ready to be adopted by a
+/// A fully-prepared journal segment file ready to be adopted by the
 /// writer on the next rotation.
 ///
-/// In sector mode ([`SegmentPreparer::spawn`]) the file has:
-///   - extents allocated for `[sector_size, allocated_end)` via
-///     `posix_fallocate`,
-///   - those extents marked zeroed via `FALLOC_FL_ZERO_RANGE`,
-///   - the corresponding pages prefaulted into the page cache,
-///   - `sync_all` issued so the allocation is durable across crashes.
-///
-/// In zero-fill mode ([`SegmentPreparer::spawn_zero_fill`]) the file has
-/// real zeros physically written over `[0, allocated_end)` and synced,
-/// so every extent is *written* (not merely allocated) — see the module
-/// docs for why that distinction is the entire point.
+/// The file has real zeros physically written over `[0, allocated_end)`
+/// and synced, so every extent is *written* (not merely allocated) —
+/// see the module docs for why that distinction is the entire point.
 ///
 /// The file header is *not* yet written — the adopting writer
-/// (`SectorWriter::install_new_segment` /
-/// `BufferedWriter::install_prepared_segment`) writes it at adopt time
+/// (`BufferedWriter::install_prepared_segment`) writes it at adopt time
 /// so it reflects the rotation boundary's sequence + chain anchor.
 pub struct PreparedSegment {
-    /// File handle, reused by the writer after rename. Opened with
-    /// O_DIRECT in sector mode, plain in zero-fill mode.
+    /// File handle, reused by the writer after rename.
     pub file: File,
     /// Path of the staging file (`<live>.next-staging`). The adopter
     /// renames it onto the live path.
     pub path: PathBuf,
-    /// End of the pre-allocated (sector) / pre-zeroed (zero-fill)
-    /// region (matches the writer's `allocated_end`).
+    /// End of the pre-zeroed region (matches the writer's
+    /// `allocated_end`).
     pub allocated_end: u64,
-    /// Sector size detected at open time — must match the live file.
-    /// `0` in zero-fill mode: the buffered writer has no alignment
-    /// requirement and ignores it.
-    pub sector_size: usize,
-}
-
-/// How the worker stages a segment. Fixed at spawn time — one preparer
-/// serves one writer, and the two writers need incompatible staging
-/// (O_DIRECT + fallocate vs plain fd + physical zeros).
-///
-/// Copy: two words, read once per prepare cycle. The zero-fill *size*
-/// is deliberately not in here — it adapts to observed segment sizes
-/// at every re-arm (see `State::zero_fill_target`), so freezing it at
-/// spawn would be wrong.
-#[derive(Clone, Copy)]
-enum PrepareMode {
-    /// `posix_fallocate` + `FALLOC_FL_ZERO_RANGE` + prefault, O_DIRECT
-    /// handle. For `SectorWriter`.
-    Sector { sector_size: usize },
-    /// Physically write zeros (current `State::zero_fill_target` bytes)
-    /// and sync, plain handle. For `BufferedWriter`.
-    ZeroFill,
 }
 
 /// Extra zeroed bytes past the rotation threshold in zero-fill mode.
@@ -142,10 +99,8 @@ struct State {
     /// Path of the live journal segment. The staging path is derived as
     /// `<live_path>.next-staging`.
     live_path: PathBuf,
-    /// Staging strategy, fixed at spawn (see [`PrepareMode`]).
-    mode: PrepareMode,
-    /// Zero-fill mode only: how many bytes the next staged segment is
-    /// zeroed to. Seeded at spawn (threshold + margin, or one prealloc
+    /// How many bytes the next staged segment is zeroed
+    /// to. Seeded at spawn (threshold + margin, or one prealloc
     /// chunk + margin when the threshold is unknown) and updated on
     /// every [`SegmentPreparer::arm_with_observed_len`] so the target
     /// tracks the segment sizes the deployment actually produces —
@@ -183,31 +138,15 @@ struct State {
 }
 
 impl SegmentPreparer {
-    /// Spawn the worker thread. Arms immediately so the first rotation
+    /// Spawn the worker thread, staging segments by physically writing
+    /// zeros (see the module docs for why real writes rather than
+    /// `FALLOC_FL_ZERO_RANGE`). Arms immediately so the first rotation
     /// can adopt instead of paying the sync cost.
     ///
     /// Also clears any orphan `<live>.next-staging` file left behind by
     /// a crashed prior run — these files have no header and are not
     /// recognised by `segment::list_archives`, but leaving them on disk
     /// would cause `create_new` to fail at the next prepare.
-    /// `pin_core`: core to pin the worker to, `0` = unpinned (the
-    /// worker floats on the default mask at `SCHED_OTHER`). Pinning
-    /// keeps staging I/O bursts off the IRQ core and the pipeline
-    /// cores deterministically — same convention as the shadow and
-    /// event-publisher threads.
-    pub fn spawn(live_path: PathBuf, sector_size: usize, pin_core: usize) -> Self {
-        Self::spawn_with_mode(
-            live_path,
-            PrepareMode::Sector { sector_size },
-            0,
-            0,
-            pin_core,
-        )
-    }
-
-    /// Spawn a worker that stages segments by physically writing zeros
-    /// (buffered-writer mode — see the module docs for why real writes
-    /// rather than `FALLOC_FL_ZERO_RANGE`).
     ///
     /// `rotate_threshold_bytes` is the size trigger the pipeline rotates
     /// at (`max_journal_bytes`); the staged file is initially zeroed to
@@ -219,37 +158,32 @@ impl SegmentPreparer {
     /// rotation retunes it to the segment sizes actually observed, so a
     /// replica converges on the primary's real segment size after its
     /// first adoption regardless of configuration mismatch.
-    /// `pin_core` as on [`spawn`](Self::spawn): `0` = unpinned.
+    ///
+    /// `pin_core`: core to pin the worker to, `0` = unpinned (the
+    /// worker floats on the default mask at `SCHED_OTHER`). Pinning
+    /// keeps staging I/O bursts off the IRQ core and the pipeline
+    /// cores deterministically — same convention as the shadow and
+    /// event-publisher threads.
     pub fn spawn_zero_fill(
         live_path: PathBuf,
         rotate_threshold_bytes: u64,
         pin_core: usize,
     ) -> Self {
-        let floor = if rotate_threshold_bytes > 0 {
+        let zero_fill_floor = if rotate_threshold_bytes > 0 {
             rotate_threshold_bytes + ZERO_FILL_MARGIN_BYTES
         } else {
             0
         };
-        let initial = if floor > 0 {
-            floor
+        let zero_fill_target = if zero_fill_floor > 0 {
+            zero_fill_floor
         } else {
             crate::prealloc::prealloc_chunk_bytes() + ZERO_FILL_MARGIN_BYTES
         };
-        Self::spawn_with_mode(live_path, PrepareMode::ZeroFill, initial, floor, pin_core)
-    }
 
-    fn spawn_with_mode(
-        live_path: PathBuf,
-        mode: PrepareMode,
-        zero_fill_target: u64,
-        zero_fill_floor: u64,
-        pin_core: usize,
-    ) -> Self {
         cleanup_staging_orphan(&live_path);
 
         let state = Arc::new(State {
             live_path,
-            mode,
             zero_fill_target: AtomicU64::new(zero_fill_target),
             zero_fill_floor,
             pin_core,
@@ -278,10 +212,9 @@ impl SegmentPreparer {
     /// of the segment that just rotated out. Called by the journal
     /// stage after every rotation so staged segments track the sizes
     /// the deployment actually produces (a replica's only source of
-    /// truth for the primary's segment size). No-op sizing-wise in
-    /// sector mode.
+    /// truth for the primary's segment size).
     pub fn arm_with_observed_len(&self, observed_len: u64) {
-        if matches!(self.state.mode, PrepareMode::ZeroFill) && observed_len > 0 {
+        if observed_len > 0 {
             let target = (observed_len + ZERO_FILL_MARGIN_BYTES).max(self.state.zero_fill_floor);
             self.state.zero_fill_target.store(target, Ordering::Relaxed);
         }
@@ -305,7 +238,7 @@ impl SegmentPreparer {
 
     /// Drain the prepared-segment slot. Returns `Some` only if the
     /// worker has finished a preparation that has not yet been adopted.
-    /// Called by `SectorWriter::rotate_segment` to decide between the
+    /// Called by `BufferedWriter::rotate_segment` to decide between the
     /// fast adopt path and the sync fallback.
     pub fn take(&self) -> Option<PreparedSegment> {
         self.state
@@ -457,39 +390,53 @@ fn prepare_one(state: &State) -> Result<PreparedSegment, JournalError> {
         }
     }
 
-    match state.mode {
-        PrepareMode::Sector { sector_size } => prepare_sector(&staging, sector_size),
-        PrepareMode::ZeroFill => prepare_zero_filled(
-            &staging,
-            state.zero_fill_target.load(Ordering::Relaxed),
-            &state.shutdown,
-        ),
-    }
+    prepare_zero_filled(
+        &staging,
+        state.zero_fill_target.load(Ordering::Relaxed),
+        &state.shutdown,
+    )
 }
 
-/// Sector-mode staging: O_DIRECT handle, allocation-only preparation.
-/// Mirrors the prep done in `SectorWriter::create_bare_inner`.
-fn prepare_sector(staging: &Path, sector_size: usize) -> Result<PreparedSegment, JournalError> {
-    let mut opts = OpenOptions::new();
-    opts.read(true).write(true).create_new(true);
-    #[cfg(not(feature = "no-o-direct"))]
-    opts.custom_flags(libc::O_DIRECT);
-    let file = opts.open(staging)?;
+/// Fault a file range into the page cache, best-effort.
+///
+/// The buffered writer's partial trailing-page appends would otherwise
+/// pay a read-modify-write device read on the hot path, and a cold
+/// page fault under load costs far more than the mapping does here.
+///
+/// `start` is aligned down to a 4 KiB page boundary (mmap offset
+/// requirement). `Advice::PopulateRead` (kernel 5.14+) faults the pages
+/// as *clean*, so a following `sync_all` doesn't have to write them
+/// back — `PopulateWrite` would dirty the whole staged region and force
+/// a full writeback even though nothing has been written yet.
+///
+/// Best-effort: silently skips on failure (e.g. insufficient VA space).
+fn prefault_pages(file: &File, start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    let aligned_start = start & !4095;
+    let size = (end - aligned_start) as usize;
 
-    // Reserve `ENTRY_OFFSET` for the file header (written later by
-    // `install_new_segment`) — matches `create_bare_inner` so adoption
-    // is a simple header pwrite, not a re-allocate.
-    let allocated_end = preallocate(&file, ENTRY_OFFSET)?;
-    zero_range_extents(&file, ENTRY_OFFSET, allocated_end);
-    prefault_pages(&file, ENTRY_OFFSET, allocated_end);
-    file.sync_all()?;
-
-    Ok(PreparedSegment {
-        file,
-        path: staging.to_path_buf(),
-        allocated_end,
-        sector_size,
-    })
+    // SAFETY: A read-only shared mapping of an owned `File`. The `Mmap`
+    // guard ties the mapping lifetime to the value below and calls
+    // `munmap` on drop; we drop it before this function returns. The
+    // pages are read-only and never exposed to callers, so there is no
+    // way for the rest of the program to observe stale or aliased memory
+    // through this mapping.
+    let mmap = unsafe {
+        memmap2::MmapOptions::new()
+            .offset(aligned_start)
+            .len(size)
+            .map(file)
+    };
+    let Ok(mmap) = mmap else {
+        return;
+    };
+    // Best-effort kernel hint: `PopulateRead` faults pages in eagerly so the
+    // next read avoids a synchronous page fault on the hot path. If the
+    // kernel rejects the advice (older kernel, unusual mapping) we silently
+    // proceed — the read will simply fault pages in lazily as before.
+    let _ = mmap.advise(memmap2::Advice::PopulateRead);
 }
 
 /// Staging window size for both paced passes.
@@ -626,9 +573,6 @@ fn prepare_zero_filled(
             file,
             path: staging.to_path_buf(),
             allocated_end: bytes,
-            // Not applicable — the buffered writer has no alignment
-            // requirement and ignores this field.
-            sector_size: 0,
         });
     }
 
@@ -684,9 +628,6 @@ fn prepare_zero_filled(
         file,
         path: staging.to_path_buf(),
         allocated_end: bytes,
-        // Not applicable — the buffered writer has no alignment
-        // requirement and ignores this field.
-        sector_size: 0,
     })
 }
 
@@ -772,11 +713,12 @@ fn try_fallocate_write_zeroes(file: &File, bytes: u64) -> bool {
 /// staged segment.
 ///
 /// Called from two places:
-///   - [`SegmentPreparer::spawn`] when rotation is enabled (the
-///     preparer would otherwise fail at `create_new` on the same path).
-///   - [`crate::sector_writer::SectorWriter::create`] and `::open_append` so
-///     the orphan is reclaimed even when rotation is disabled (no
-///     preparer ever runs).
+///   - [`SegmentPreparer::spawn_zero_fill`] when rotation is enabled
+///     (the preparer would otherwise fail at `create_new` on the same
+///     path).
+///   - [`crate::buffered_writer::BufferedWriter::create`] and
+///     `::open_append` so the orphan is reclaimed even when rotation is
+///     disabled (no preparer ever runs).
 ///
 /// Must NOT be called once the preparer is alive — the worker may have
 /// an in-flight staging file whose fd is still valid even after
@@ -830,10 +772,11 @@ mod tests {
         // Live file doesn't need to exist — the preparer only touches
         // the staging sibling.
 
-        let preparer = SegmentPreparer::spawn(live.clone(), 4096, 0);
+        let threshold: u64 = 1024 * 1024;
+        let preparer = SegmentPreparer::spawn_zero_fill(live.clone(), threshold, 0);
 
         // Wait up to 5 s for the worker to publish a prepared segment.
-        // 256 MiB fallocate on tmpfs is sub-millisecond, but the bounded
+        // Staging a few MiB on tmpfs is milliseconds, but the bounded
         // wait protects against an unexpectedly slow CI host.
         let mut prepared = None;
         for _ in 0..500 {
@@ -845,9 +788,8 @@ mod tests {
         }
         let prepared = prepared.expect("preparer should publish a segment within 5 s");
 
-        assert_eq!(prepared.sector_size, 4096);
         assert_eq!(prepared.path, staging_path(&live));
-        assert!(prepared.allocated_end > 4096);
+        assert_eq!(prepared.allocated_end, threshold + ZERO_FILL_MARGIN_BYTES);
 
         // Drop the file before shutdown so the staging file can be
         // cleaned by the test harness.
@@ -872,7 +814,7 @@ mod tests {
         std::fs::write(&staging, b"orphan from prior crash").expect("write orphan");
         assert!(staging.exists());
 
-        let preparer = SegmentPreparer::spawn(live, 4096, 0);
+        let preparer = SegmentPreparer::spawn_zero_fill(live, 1024 * 1024, 0);
 
         // The orphan should be gone immediately; the worker will then
         // create a fresh staging file.
@@ -918,7 +860,6 @@ mod tests {
 
         let expected = threshold + ZERO_FILL_MARGIN_BYTES;
         assert_eq!(prepared.allocated_end, expected);
-        assert_eq!(prepared.sector_size, 0, "not applicable in zero-fill mode");
         assert_eq!(
             std::fs::metadata(&prepared.path)
                 .expect("stat staging")
@@ -1000,7 +941,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
 
-        let preparer = SegmentPreparer::spawn(live, 4096, 0);
+        let preparer = SegmentPreparer::spawn_zero_fill(live, 1024 * 1024, 0);
 
         // First prepared segment.
         let mut first = None;

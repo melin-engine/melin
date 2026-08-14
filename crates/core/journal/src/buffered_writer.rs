@@ -1,10 +1,11 @@
 //! Buffered journal writer — page-cache writes with explicit `fdatasync`.
 //!
-//! Alternative to [`crate::sector_writer::SectorWriter`] for deployments that
-//! cannot rely on capacitor-backed power-loss protection on the storage
-//! device. The on-disk format is identical to the O_DIRECT writer
-//! (`crate::codec` framing), so [`crate::reader::JournalReader`] and
-//! [`crate::segment`] recovery work without modification.
+//! The journal's only writer. Durability never depends on
+//! capacitor-backed power-loss protection on the storage device, and
+//! the on-disk format (`crate::codec` framing) is the same one the
+//! retired O_DIRECT writer produced, so [`crate::reader::JournalReader`]
+//! and [`crate::segment`] recovery read journals from either lineage
+//! without modification.
 //!
 //! ## Durability contract
 //!
@@ -15,15 +16,14 @@
 //! cache (NVMe `VWC=1`) this pays one device flush per batch; on a drive
 //! that reports `VWC=0` (full PLP) the flush is a near-no-op.
 //!
-//! ## Why a separate writer
+//! ## Why buffered
 //!
-//! The O_DIRECT writer carries machinery that exists *only* to satisfy
+//! An O_DIRECT writer carries machinery that exists *only* to satisfy
 //! sector alignment: a partial-tail sector kept in memory, sector-rounded
 //! `pwrite`, sector-aligned scratch buffers, sector-size detection. None
-//! of it applies once writes go through the page cache, so duplicating
-//! those code paths into a single struct with `#[cfg]`s tangles the hot
-//! path. This module is the clean half: a `Vec<u8>` batch buffer, plain
-//! `pwrite_all`, and `fdatasync` for durability.
+//! of it applies once writes go through the page cache. This module is
+//! the clean half: a `Vec<u8>` batch buffer, plain `pwrite_all`, and
+//! `fdatasync` for durability.
 
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
@@ -50,13 +50,12 @@ const MAX_ENTRY_SIZE: usize = 144;
 const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
 /// Fixed on-disk offset of the first journal entry. Defined in the codec
-/// (`ENTRY_OFFSET = MAX_SECTOR_SIZE = 4096`) so both writer variants
-/// produce interchangeable layouts. Renamed locally for legibility.
+/// (`ENTRY_OFFSET = MAX_SECTOR_SIZE = 4096`), independent of the
+/// device's sector size. Renamed locally for legibility.
 const HEADER_OFFSET: u64 = ENTRY_OFFSET;
 
 // Pre-allocation chunk size is resolved by the shared `prealloc` module
-// so a switch between this writer and `SectorWriter` doesn't change
-// disk-space cadence under matched configuration.
+// so the policy stays in one place, next to its test override.
 use crate::prealloc::prealloc_chunk_bytes;
 
 /// Append-only journal writer that goes through the kernel page cache
@@ -137,8 +136,8 @@ impl<E: AppEvent> BufferedWriter<E> {
 
         // Write the file header at offset 0. The codec reserves the
         // first `MAX_SECTOR_SIZE` (= 4096) bytes for the header
-        // regardless of writer mode or device sector size, so a
-        // journal created here is layout-compatible with SectorWriter.
+        // regardless of the device's sector size, so the layout is
+        // fixed across deployments.
         let mut header_buf = [0u8; MAX_SECTOR_SIZE];
         codec::encode_file_header(
             &mut header_buf,
@@ -208,9 +207,9 @@ impl<E: AppEvent> BufferedWriter<E> {
         // bytes between `valid_end` and the previous file length
         // survive on disk; subsequent readers (or offline tooling)
         // could mistake them for entries if they happen to start with
-        // the journal magic. The CRC check would catch the lie, but
-        // SectorWriter scrubs its tail sector for the same reason and
-        // BufferedWriter should match the defensive posture. Truncate
+        // the journal magic. The CRC check would catch the lie; this is
+        // the belt-and-braces half — no stale bytes past the valid end
+        // in the first place. Truncate
         // then re-fallocate to restore the chunk-ahead allocation;
         // the kernel zero-fills the freshly extended region.
         let pre_truncate_len = file.metadata()?.len();
@@ -555,7 +554,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// Point this writer at a freshly prepared (zero-filled) segment
     /// file, keeping the writer's own buffers.
     ///
-    /// Mirrors `SectorWriter::install_new_segment`: all fallible work
+    /// All fallible work
     /// (rename, header pwrite, fsync) happens before any field is
     /// assigned, so on error the writer continues on the current
     /// segment unchanged — the caller's rename-back rollback restores
@@ -575,21 +574,7 @@ impl<E: AppEvent> BufferedWriter<E> {
             file,
             path: staging_path,
             allocated_end,
-            sector_size,
         } = prepared;
-
-        // Mode guard: a sector-mode staging file carries an O_DIRECT
-        // handle and unwritten extents — adopting it here would fail
-        // with EINVAL on the first unaligned pwrite (after the commit
-        // point) and silently lose the pre-written-extents property.
-        // Zero-fill mode marks itself with `sector_size == 0`. Erroring
-        // out lands the caller on its sync-fallback rollback path.
-        if sector_size != 0 {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "prepared segment was staged in sector mode; BufferedWriter requires zero-fill",
-            )));
-        }
 
         // Write the file header into the staging file *before* the
         // rename, so the file appearing at the live path is always
@@ -960,63 +945,6 @@ mod tests {
         // Same observable layout as the sync-rotation test above.
         assert_eq!(read_all_payloads(&path), vec![3]);
         assert_eq!(read_all_payloads(&archived), vec![1, 2]);
-    }
-
-    /// Mode guard: a sector-mode staging file (O_DIRECT handle,
-    /// unwritten extents) must be *rejected*, not adopted — adopting
-    /// one fails on the first unaligned pwrite after the commit point
-    /// and silently loses the pre-written-extents property this mode
-    /// exists for. The failed rotation must roll back cleanly: live
-    /// segment back at the canonical path, no archive left behind,
-    /// writer still usable.
-    #[test]
-    fn rotate_with_sector_prepared_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.journal");
-
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        writer.append(&sample(1)).unwrap();
-
-        // Wrong mode on purpose: the *sector* writer's preparer.
-        let preparer = crate::preparer::SegmentPreparer::spawn(path.clone(), 4096, 0);
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let prepared = prepared.expect("preparer should stage a segment within 5 s");
-        assert_ne!(
-            prepared.sector_size, 0,
-            "sector staging carries a non-zero sector size"
-        );
-
-        let err = writer
-            .rotate_segment_with_prepared(prepared)
-            .expect_err("sector staging must not be adopted by the buffered writer");
-        assert!(
-            err.to_string().contains("sector mode"),
-            "unexpected error: {err}"
-        );
-
-        assert!(path.exists(), "rename-back must restore the live segment");
-        assert!(
-            crate::segment::list_archives(&path).unwrap().is_empty(),
-            "a rejected rotation must leave no archive behind"
-        );
-
-        // Still usable on the original segment.
-        writer.append(&sample(2)).unwrap();
-        drop(writer);
-        preparer.shutdown();
-
-        assert_eq!(
-            read_all_payloads(&path),
-            vec![1, 2],
-            "both entries must survive the rejected rotation"
-        );
     }
 
     /// A crash between prepared adoption and the first append must

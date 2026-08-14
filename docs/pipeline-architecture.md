@@ -27,7 +27,7 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
    - **io_uring**: the reader arms an `IORING_OP_TIMEOUT` SQE at the cadence; the deadline wakes `submit_and_wait` even when no client traffic is flowing, and the loop emits a `JournalEvent::Tick { now_ns }` when the deadline passes.
    - **DPDK**: the poll thread compares the wall clock to the deadline once every ~4096 poll iterations (negligible cost on a 100% busy spin loop) and emits the tick the same way.
 2. **Tick semantics** -- the matching stage advances its scheduler clock from `slot.timestamp_ns` on every event, so under load each order/cancel implicitly fires due tasks at microsecond precision. The 250 ms tick is the safety net that keeps time moving forward during quiet periods (no client traffic).
-3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwrite` + `O_DIRECT` (PLP drives required). Advances its cursor only after the write completes.
+3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwrite` + `fdatasync`. Advances its cursor only after the write is durable.
 4. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
 5. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
 6. **Event publisher** (optional) -- second consumer on the output ring, enabled by `--event-bind`. Broadcasts all execution events to TCP subscribers for market data gateways, analytics, and audit loggers. Ed25519 auth required.
@@ -214,8 +214,8 @@ The journal stage runs on a dedicated OS thread and is responsible for making ev
 ### Processing loop
 
 1. Call `consumer.read_batch()` to copy up to `MAX_JOURNAL_BATCH` (1,024) events from the ring buffer into a local array. This does not advance the consumer's progress cursor.
-2. Batch-encode all events into the `SectorWriter`'s internal buffer. `QueryStats` events are skipped (they cause no state change and are not journaled).
-3. When a sync trigger fires, call `flush_batch_sync()` which issues a single `pwritev2` with `RWF_DSYNC` (Force Unit Access) -- combining write + sync into one syscall. On NVMe with power-loss protection, this achieves approximately 10-100 us sync latency instead of the approximately 1-7 ms of full cache flushes via `fdatasync`.
+2. Batch-encode all events into the writer's internal buffer. `QueryStats` events are skipped (they cause no state change and are not journaled).
+3. When a sync trigger fires, call `flush_batch_sync()`, which issues one `pwrite` covering the whole batch followed by `fdatasync`. The call returns only once the kernel reports the data is on stable media: approximately 10-30 us per batch on NVMe with power-loss protection, approximately 50-200 us on consumer drives where the device flush dominates.
 4. Call `consumer.commit(pending)` to advance the progress cursor, making the journal's position visible to the response stage.
 
 ### Sync triggers

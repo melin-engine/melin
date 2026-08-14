@@ -2,7 +2,7 @@
 //!
 //! On startup:
 //! 1. Recovers or creates the `JournaledApp<A>`.
-//! 2. Decomposes it into `(A, W)` via `into_parts()`, where `W` is the writer selected by `--journal-writer`.
+//! 2. Decomposes it into `(A, W)` via `into_parts()`, where `W` is the journal writer.
 //! 3. Builds the disruptor pipeline (input ring + output ring).
 //! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
 //! 5. Runs the accept loop, registering connections with the io_uring reader.
@@ -24,7 +24,6 @@ use tracing::{debug, error, info, warn};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
-use melin_journal::SectorWriter;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
     InputSlot, JournalStage, JournalStageRun, OutputSlot as GenericOutputSlot,
@@ -135,20 +134,6 @@ pub struct ServerConfig {
     /// and starts a fresh journal. Set to 0 to disable. Default: 256 MiB.
     #[arg(long, default_value_t = 256)]
     pub max_journal_mib: u64,
-    /// Journal writer mode. `buffered` (default) writes through the page
-    /// cache and calls `fdatasync` per batch — honest durability on any
-    /// drive. `sector` (EXPERIMENTAL) uses `O_DIRECT` with sector-
-    /// aligned writes — lowest latency on enterprise NVMe with
-    /// capacitor-backed PLP (VWC=0), but silently loses acknowledged
-    /// writes on power loss without PLP, and shows unresolved ~1 Hz
-    /// tail latency spikes on some NVMe firmware. Not recommended for
-    /// production. See docs/journal-writer-modes.md.
-    #[arg(
-        long,
-        default_value_t = melin_journal::JournalWriterMode::default(),
-        value_parser = melin_journal::JournalWriterMode::parse,
-    )]
-    pub journal_writer: melin_journal::JournalWriterMode,
     /// Maximum number of open orders (resting limits + pending stops, across
     /// all instruments) per account. New submissions are rejected with
     /// `ExceedsMaxOpenOrders` once an account hits this cap. `0` means
@@ -463,7 +448,6 @@ impl Default for ServerConfig {
             instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
-            journal_writer: melin_journal::JournalWriterMode::default(),
             max_orders_per_account: 10_000,
             max_orders_per_second: 1_000,
             max_orders_burst: 5_000,
@@ -763,26 +747,15 @@ where
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
 {
-    match config.journal_writer {
-        melin_journal::JournalWriterMode::Buffered => run_impl::<A, L, BufferedWriter<A::Event>>(
-            listener,
-            config,
-            factory,
-            decoder,
-            encoder,
-            event_publisher,
-            shutdown,
-        ),
-        melin_journal::JournalWriterMode::Sector => run_impl::<A, L, SectorWriter<A::Event>>(
-            listener,
-            config,
-            factory,
-            decoder,
-            encoder,
-            event_publisher,
-            shutdown,
-        ),
-    }
+    run_impl::<A, L, BufferedWriter<A::Event>>(
+        listener,
+        config,
+        factory,
+        decoder,
+        encoder,
+        event_publisher,
+        shutdown,
+    )
 }
 
 fn run_impl<A, L, W>(
@@ -2126,26 +2099,15 @@ where
 {
     let dpdk_config = dpdk_config_from(&config);
 
-    match config.journal_writer {
-        melin_journal::JournalWriterMode::Buffered => run_dpdk_impl::<A, BufferedWriter<A::Event>>(
-            config,
-            factory,
-            decoder,
-            encoder,
-            event_publisher,
-            dpdk_config,
-            shutdown,
-        ),
-        melin_journal::JournalWriterMode::Sector => run_dpdk_impl::<A, SectorWriter<A::Event>>(
-            config,
-            factory,
-            decoder,
-            encoder,
-            event_publisher,
-            dpdk_config,
-            shutdown,
-        ),
-    }
+    run_dpdk_impl::<A, BufferedWriter<A::Event>>(
+        config,
+        factory,
+        decoder,
+        encoder,
+        event_publisher,
+        dpdk_config,
+        shutdown,
+    )
 }
 
 #[cfg(feature = "dpdk")]
@@ -3050,45 +3012,41 @@ where
     let journal_exists = config.journal.exists();
     let archives_exist = !melin_journal::segment::list_archives(&config.journal)?.is_empty();
     let snapshot_exists = snap_path.is_some_and(|p| p.exists());
-    let writer_mode = config.journal_writer;
-    let mut engine: JournaledApp<A, W> = match choose_bootstrap(
-        snapshot_exists,
-        journal_exists,
-        archives_exist,
-    ) {
-        BootstrapSource::SnapshotAndJournal => {
-            let snap_path = snap_path.expect("snapshot_exists implies snap_path");
-            info!(snapshot = %snap_path.display(), writer_mode = %writer_mode, "recovering from snapshot + journal");
-            JournaledApp::<A, W>::recover_from_snapshot(snap_path, &config.journal)?
-        }
-        BootstrapSource::SnapshotOnly => {
-            // Snapshot exists but no journal segment survives at all —
-            // recover from the snapshot alone and start a fresh segment
-            // continuing its sequence and chain.
-            let snap_path = snap_path.expect("snapshot_exists implies snap_path");
-            info!(
-                snapshot = %snap_path.display(),
-                writer_mode = %writer_mode,
-                "recovering from snapshot only (no journal segments on disk)"
-            );
-            let (app, snap_sequence, snap_chain_hash, snap_epoch) =
-                melin_transport_core::snapshot::load::<A>(snap_path)?;
-            let writer = W::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
-            JournaledApp::<A, W>::from_parts(app, writer, snap_epoch)
-        }
-        BootstrapSource::JournalOnly => {
-            info!(writer_mode = %writer_mode, "recovering from journal");
-            let mut app = factory.empty();
-            factory.prefault(&mut app);
-            JournaledApp::<A, W>::recover(app, &config.journal)?
-        }
-        BootstrapSource::Fresh => {
-            info!(writer_mode = %writer_mode, "creating new journal");
-            let mut app = factory.empty();
-            factory.prefault(&mut app);
-            JournaledApp::<A, W>::create(app, &config.journal)?
-        }
-    };
+    let mut engine: JournaledApp<A, W> =
+        match choose_bootstrap(snapshot_exists, journal_exists, archives_exist) {
+            BootstrapSource::SnapshotAndJournal => {
+                let snap_path = snap_path.expect("snapshot_exists implies snap_path");
+                info!(snapshot = %snap_path.display(), "recovering from snapshot + journal");
+                JournaledApp::<A, W>::recover_from_snapshot(snap_path, &config.journal)?
+            }
+            BootstrapSource::SnapshotOnly => {
+                // Snapshot exists but no journal segment survives at all —
+                // recover from the snapshot alone and start a fresh segment
+                // continuing its sequence and chain.
+                let snap_path = snap_path.expect("snapshot_exists implies snap_path");
+                info!(
+                    snapshot = %snap_path.display(),
+                    "recovering from snapshot only (no journal segments on disk)"
+                );
+                let (app, snap_sequence, snap_chain_hash, snap_epoch) =
+                    melin_transport_core::snapshot::load::<A>(snap_path)?;
+                let writer =
+                    W::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
+                JournaledApp::<A, W>::from_parts(app, writer, snap_epoch)
+            }
+            BootstrapSource::JournalOnly => {
+                info!("recovering from journal");
+                let mut app = factory.empty();
+                factory.prefault(&mut app);
+                JournaledApp::<A, W>::recover(app, &config.journal)?
+            }
+            BootstrapSource::Fresh => {
+                info!("creating new journal");
+                let mut app = factory.empty();
+                factory.prefault(&mut app);
+                JournaledApp::<A, W>::create(app, &config.journal)?
+            }
+        };
 
     // Seed only on a genuinely fresh start — any surviving lineage
     // (live or archived) already contains the seed events.

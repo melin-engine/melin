@@ -28,10 +28,6 @@ hash-chain = [
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
 ]
-no-o-direct = [
-    "melin-journal/no-o-direct",
-    "melin-transport-core/no-o-direct",
-]
 
 [dependencies]
 melin-app = { path = "../app", version = "0.13.0" }
