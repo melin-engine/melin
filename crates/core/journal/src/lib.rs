@@ -19,6 +19,7 @@ pub mod buffered_writer;
 #[cfg(feature = "hash-chain")]
 pub(crate) mod chain;
 pub mod codec;
+pub mod encoder;
 pub mod error;
 pub mod event;
 pub(crate) mod le;
@@ -27,6 +28,7 @@ pub mod preparer;
 pub mod reader;
 pub mod replication;
 pub mod segment;
+pub mod segment_file;
 pub mod write;
 
 #[cfg(feature = "test-utils")]
@@ -34,9 +36,11 @@ pub mod test_utils;
 
 pub use buffered_writer::BufferedWriter;
 pub use codec::FileHeaderInfo;
+pub use encoder::JournalEncoder;
 pub use error::JournalError;
 pub use event::JournalEvent;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
+pub use segment_file::SegmentFile;
 pub use write::JournalWrite;
 
 /// Random 32-byte chain anchor for a brand-new journal. Randomness (not
