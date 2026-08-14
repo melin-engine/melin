@@ -215,7 +215,7 @@ The journal stage is responsible for making every event durable before it can be
 
 The sequencing thread:
 
-1. Reads up to `MAX_JOURNAL_BATCH` (4,096) events from the input ring into a local array. This does not advance the progress cursor.
+1. Borrows up to `MAX_JOURNAL_BATCH` (4,096) events in place from the input ring — no copy out of the ring. This does not advance the progress cursor.
 2. Batch-encodes them directly into a slot of the hand-off ring shared with the disk thread. Queries are skipped (they cause no state change and are not journaled), and each encoded entry is also appended to the batch being sent to replicas.
 3. When a sync trigger fires, publishes the slot -- the batch's bytes plus everything the disk thread must make true once it is durable. This does not wait for the device; the sequencing thread returns immediately to reading and encoding.
 
@@ -439,7 +439,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 |----------|-------|----------|
 | `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
 | `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
-| `MAX_JOURNAL_BATCH` | `1024` | `crates/core/transport-core/src/pipeline.rs` |
+| `MAX_JOURNAL_BATCH` | `4096` | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_BATCH` (response) | `1024` | `crates/core/server-runtime/src/response.rs` |
 | `MAX_RESPONSE_BUF` | `512` bytes | `crates/core/server-runtime/src/response.rs` |
 | `NUM_BUFFERS` | `2048` | `crates/core/server-runtime/src/reader.rs` (io_uring provided buffer pool) |
