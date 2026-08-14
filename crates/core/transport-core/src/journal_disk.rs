@@ -30,6 +30,14 @@
 //! correct), records the error, and parks. The sequencer notices the
 //! poison flag and surfaces the original error through the usual fatal
 //! shutdown path.
+//!
+//! An *unexpected* exit — a panic — must reach the same flag. Every
+//! wait on this thread (claim a slot, drain, await a rotation) spins on
+//! `poisoned`, so a thread that unwound silently would strand the
+//! sequencer in a loop with no timeout and no diagnostic. Before the
+//! split the same panic unwound the journal thread itself and the
+//! server's liveness watchdog caught it; [`PoisonOnUnwind`] restores
+//! that.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -181,6 +189,48 @@ impl DiskControl {
     }
 }
 
+/// Latches poison if the disk thread leaves its loop by unwinding.
+///
+/// The sequencer's every wait on this thread is a spin gated on
+/// `poisoned`, with no timeout — a panic that left the flag clear would
+/// hang the pipeline rather than fail it. Disarmed on the normal exits,
+/// so this only ever fires on a panic.
+struct PoisonOnUnwind {
+    control: Arc<DiskControl>,
+    armed: bool,
+}
+
+impl PoisonOnUnwind {
+    fn new(control: Arc<DiskControl>) -> Self {
+        Self {
+            control,
+            armed: true,
+        }
+    }
+
+    /// The loop returned normally — whatever it recorded stands.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PoisonOnUnwind {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Do not overwrite a cause already latched: a poisoning error
+        // followed by a panic in the same teardown should still report
+        // the error the operator needs.
+        if self.control.poisoned() {
+            return;
+        }
+        self.control.poison(JournalError::Io(std::io::Error::other(
+            "journal disk thread panicked",
+        )));
+    }
+}
+
 /// The cursors a batch's durability makes true. Held by the disk thread
 /// because it is the only thread that knows when that moment is.
 ///
@@ -248,6 +298,12 @@ pub struct JournalDisk {
     /// too important to leave unexercised.
     #[cfg(test)]
     fail_next_sync: Option<JournalError>,
+    /// Test-only panic injection, for the same reason: a panic on this
+    /// thread cannot be provoked from outside it, and the guarantee it
+    /// drives — the sequencer fails instead of spinning forever — is
+    /// otherwise untestable.
+    #[cfg(test)]
+    panic_next_drain: bool,
 }
 
 impl JournalDisk {
@@ -266,6 +322,8 @@ impl JournalDisk {
             busy_spin,
             #[cfg(test)]
             fail_next_sync: None,
+            #[cfg(test)]
+            panic_next_drain: false,
         }
     }
 
@@ -273,6 +331,12 @@ impl JournalDisk {
     #[cfg(test)]
     fn inject_sync_failure(&mut self, error: JournalError) {
         self.fail_next_sync = Some(error);
+    }
+
+    /// Make the next drain panic (tests only).
+    #[cfg(test)]
+    fn inject_panic(&mut self) {
+        self.panic_next_drain = true;
     }
 
     /// Run until the sequencer stops the thread, returning the live
@@ -284,6 +348,16 @@ impl JournalDisk {
     /// return type, because the sequencer polls for it long before the
     /// thread is joined.
     pub fn run(mut self) -> SegmentFile {
+        let guard = PoisonOnUnwind::new(Arc::clone(&self.control));
+        self.run_loop();
+        guard.disarm();
+        self.segment
+    }
+
+    /// The loop proper, split out so [`PoisonOnUnwind`] covers every
+    /// path through it — including the ones that are not supposed to
+    /// exist.
+    fn run_loop(&mut self) {
         let mut idle_spins: u32 = 0;
         loop {
             match self.drain_and_sync() {
@@ -296,7 +370,7 @@ impl JournalDisk {
                 Err(e) => {
                     tracing::error!(error = %e, "journal disk write failed — journal is broken");
                     self.control.poison(e);
-                    return self.segment;
+                    return;
                 }
             }
 
@@ -310,7 +384,7 @@ impl JournalDisk {
             }
 
             if self.control.stop.load(Ordering::Acquire) {
-                return self.segment;
+                return;
             }
 
             idle_wait(&mut idle_spins, self.busy_spin);
@@ -324,6 +398,12 @@ impl JournalDisk {
     /// group-commit win lives: a backlog built up during a stall costs
     /// exactly one sync to clear.
     fn drain_and_sync(&mut self) -> Result<bool, JournalError> {
+        #[cfg(test)]
+        assert!(
+            !self.panic_next_drain,
+            "injected journal disk panic (test seam)"
+        );
+
         let mut last: Option<JournalWriteMeta> = None;
         let mut bytes_written = 0usize;
         while let Some((meta, bytes)) = self.batches.try_read() {
@@ -335,15 +415,20 @@ impl JournalDisk {
             return Ok(false);
         };
 
+        // Paced retry of a failed post-rotation dir fsync. Driven per
+        // *drain*, not per sync: a byte-empty batch still ticks it, so a
+        // `no-persist` node — which never writes and so would otherwise
+        // never retry — and a journal that goes quiet right after a
+        // failed rotation both still recover their un-synced dirent.
+        // One branch when nothing is pending.
+        self.segment.poll_dir_fsync_retry();
+
         // A batch can be byte-empty and still carry cursors: one made
         // only of queries (never journaled), or any batch under
         // `no-persist`. There is nothing to make durable, so skip the
         // sync — but still publish, because the input-ring slots those
         // events occupy have to be released upstream.
         if bytes_written > 0 {
-            // Paced retry of a failed post-rotation dir fsync — a
-            // single branch, kept next to the sync it accompanies.
-            self.segment.poll_dir_fsync_retry();
             #[cfg(test)]
             if let Some(injected) = self.fail_next_sync.take() {
                 return Err(injected);
@@ -557,6 +642,112 @@ mod tests {
             !producer.drained(),
             "slots stay held — the batch was never made durable"
         );
+    }
+
+    /// A panic must latch poison. Every wait the sequencer performs on
+    /// this thread — claiming a slot, draining, awaiting a rotation —
+    /// is an untimed spin gated on that flag, so a thread that unwound
+    /// without setting it would hang the whole pipeline instead of
+    /// failing it. Before the split the same panic unwound the journal
+    /// thread and the server's liveness watchdog caught it.
+    #[test]
+    fn a_panicking_disk_thread_poisons_rather_than_stranding_the_sequencer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, consumer) = build_journal_write_ring(4);
+        let (cursors, progress, durable) = cursors();
+        let control = Arc::new(DiskControl::new());
+        let mut disk = JournalDisk::new(
+            segment(dir.path()),
+            consumer,
+            cursors,
+            Arc::clone(&control),
+            false,
+        );
+        disk.inject_panic();
+
+        submit(&mut producer, b"unreachable", meta(11, 3, 30));
+
+        // Panic on the thread, exactly as it would reach the sequencer.
+        let joined = std::thread::spawn(move || disk.run()).join();
+        assert!(joined.is_err(), "the injected panic must unwind the thread");
+
+        assert!(
+            control.poisoned(),
+            "a panic must latch poison — the sequencer's waits spin on this flag \
+             with no timeout"
+        );
+        let error = control.take_error().expect("a cause must be recorded");
+        assert!(
+            error.to_string().contains("panicked"),
+            "the cause must name the panic, got: {error}"
+        );
+
+        // Nothing became durable, so nothing may have been published.
+        assert_eq!(durable.load(), WireSeq::new(0));
+        assert_eq!(progress.get().load(Ordering::Acquire), 0);
+        assert!(!producer.drained());
+    }
+
+    /// A clean exit must NOT poison — otherwise every shutdown would
+    /// surface a phantom journal failure.
+    #[test]
+    fn a_clean_exit_leaves_the_journal_unpoisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_producer, consumer) = build_journal_write_ring(4);
+        let (cursors, _, _) = cursors();
+        let control = Arc::new(DiskControl::new());
+        let disk = JournalDisk::new(
+            segment(dir.path()),
+            consumer,
+            cursors,
+            Arc::clone(&control),
+            false,
+        );
+
+        control.stop();
+        let _segment = disk.run();
+
+        assert!(!control.poisoned(), "a stop is not a failure");
+        assert!(control.take_error().is_none());
+    }
+
+    /// A byte-empty batch — every batch under `no-persist`, and any
+    /// query-only batch — is still a full drain: it skips only the
+    /// sync. Everything else has to run, because the cursors it carries
+    /// are what release the input-ring slots upstream, and the drain is
+    /// also what paces the post-rotation dir-fsync retry.
+    #[test]
+    fn a_byte_empty_batch_skips_only_the_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, consumer) = build_journal_write_ring(4);
+        let (cursors, progress, _) = cursors();
+        let mut disk = JournalDisk::new(
+            segment(dir.path()),
+            consumer,
+            cursors,
+            Arc::new(DiskControl::new()),
+            false,
+        );
+        // A sync failure injected but never consumed proves the sync
+        // was skipped; the drain still has to do everything else.
+        disk.inject_sync_failure(JournalError::Io(std::io::Error::other("must not fire")));
+
+        submit(&mut producer, b"", meta(0, 9, 90));
+        assert!(
+            disk.drain_and_sync().unwrap(),
+            "a cursor-only batch is still work"
+        );
+
+        assert!(
+            disk.fail_next_sync.is_some(),
+            "an empty batch must not reach the sync"
+        );
+        assert_eq!(
+            progress.get().load(Ordering::Acquire),
+            90,
+            "the cursors ride an empty batch"
+        );
+        assert!(producer.drained(), "the slot is released");
     }
 
     /// A rotation that fails is not poison: the file half restores the
