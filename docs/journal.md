@@ -188,7 +188,7 @@ Expires all GTD orders with `expiry_ns <= timestamp_ns`.
 
 ### Write Path
 
-Each batch is written with `pwrite` plus `fdatasync`. This is honest durability on any drive: `fdatasync` flushes the page cache to the drive and waits for the drive to acknowledge a flush of its own write cache. When it returns, every byte in the batch is in non-volatile storage regardless of whether the drive has power-loss protection — the kernel always issues a flush command (`REQ_OP_FLUSH`) to the device, and the device must acknowledge it before the syscall returns. On a drive with a volatile write cache the flush physically flushes the cache to media; on a PLP drive with the volatile write cache disabled (`VWC=0`) the flush is a near-no-op, because the device acknowledges writes only once the capacitor protects them.
+Each batch is written with `pwrite` plus `fdatasync`, on the journal's disk thread — the sequencing thread hands the batch over and moves on, so encoding and the replica feed keep flowing while the device works. This is honest durability on any drive: `fdatasync` flushes the page cache to the drive and waits for the drive to acknowledge a flush of its own write cache. When it returns, every byte in the batch is in non-volatile storage regardless of whether the drive has power-loss protection — the kernel always issues a flush command (`REQ_OP_FLUSH`) to the device, and the device must acknowledge it before the syscall returns. On a drive with a volatile write cache the flush physically flushes the cache to media; on a PLP drive with the volatile write cache disabled (`VWC=0`) the flush is a near-no-op, because the device acknowledges writes only once the capacitor protects them.
 
 Latency: ~10–30 µs per batch on PLP NVMe, ~50–200 µs on consumer NVMe, where the device flush dominates.
 
@@ -198,7 +198,9 @@ On creation and when space runs low, the writer calls `posix_fallocate` to exten
 
 ### Batch Amortization
 
-In the pipeline architecture, the journal stage reads a batch of events from the disruptor, encodes them all into a contiguous buffer, and issues a single `pwrite` for the batch. Under load, one write covers many events. The disruptor naturally accumulates events while the previous write is in flight, providing implicit batching without any artificial delay.
+In the pipeline architecture, the journal stage reads a batch of events from the disruptor, encodes them all into a contiguous buffer, and hands it to the disk thread, which issues a single `pwrite` for the batch. Under load, one write covers many events. The disruptor naturally accumulates events while the previous write is in flight, providing implicit batching without any artificial delay.
+
+Batches that queue up behind a slow device coalesce further: the disk thread writes every batch waiting for it and then issues **one** `fdatasync` covering all of them. A backlog built up during a stall therefore costs a single sync to clear, not one per batch.
 
 An explicit group commit delay (`group_commit_delay`) can be configured but is set to zero for TCP. Testing showed that any delay hurts TCP throughput because it holds the journal cursor longer, stalling the response stage. It only helps with UDS transport where response sends are near-free.
 
@@ -493,6 +495,18 @@ Adding a field to an existing event (as done in v1→v2 with `SelfTradeProtectio
 Inserting a field in the middle or changing field sizes breaks all entries in the file. Appending is always safe and preferred.
 
 ## Operational Notes
+
+### Watching the disk keep up
+
+`melin_journal_disk_lag_batches` on `/metrics` is the number of batches handed to the journal's disk thread that are not yet durable.
+
+- **0** in steady state: the device finishes each batch before the next one arrives.
+- **Briefly non-zero** under load bursts or a slow flush: normal, and precisely what the split is for — the sequencer kept ordering, encoding, and feeding replicas through it.
+- **Sustained, and climbing toward 64** (the hand-off depth): the device is not keeping up with the write rate. At the depth the sequencer stalls at its next batch, the input ring fills, and clients feel backpressure. Alert here, not on the metric merely being non-zero.
+
+A sustained non-zero lag with a healthy device usually means the journal is sharing a device with something else, or `journal-disk` is unpinned and competing for its core.
+
+Two related signals: `melin_journal_rotations_total{path="sync_fallback"}` climbing means segment staging is falling behind (see [Journal Rotation & Recovery](journal-rotation.md)), and under a `local` durability policy a stalled device shows up directly as client latency, because no replica can supply the durability the gate needs.
 
 ### Journal File Growth
 

@@ -237,7 +237,7 @@ When no events are available, the journal stage uses adaptive spinning: 1,000 `s
 
 ### Shutdown
 
-On shutdown, the journal stage flushes any pending data, then drains all remaining entries from the ring buffer (encoding and syncing each batch), ensuring no event is lost.
+On shutdown, the journal stage hands over any pending data, then drains all remaining entries from the ring buffer (encoding each batch and handing it over), waits for the disk thread to make every one of them durable, and stops it. No event is lost, and the process does not exit before the last batch is on stable media.
 
 ## Matching Stage
 
@@ -342,11 +342,12 @@ The SPSC uses two cache-line-padded atomic counters (`head` and `tail`) for coor
 
 ## Threading Model
 
-The server spawns three always-on pipeline threads plus one reader thread, and up to six more depending on configuration:
+The server spawns four always-on pipeline threads plus one reader thread, and up to six more depending on configuration:
 
 | Thread | Default Core | Role | Optional? |
 |--------|-------------|------|-----------|
-| Journal | 1 | Durable write-ahead log | No |
+| Journal | 1 | Sequencing, encoding, hash chain, replica feed | No |
+| Journal Disk | 11 | Writes and syncs the journal; publishes durability | No |
 | Matching | 2 | Order execution (single-writer) | No |
 | Response | 3 | Client socket writes | No |
 | Reader | 4 | io_uring-based connection multiplexing + tick generation | No |
@@ -356,7 +357,22 @@ The server spawns three always-on pipeline threads plus one reader thread, and u
 | Repl Handler 0/1 | 8, 9 | Per-replica connection handling | Yes (one per connected replica) |
 | Segment Preparer | 10 | Pre-stage the next journal segment off the rotation path | Yes (recurring rotation only) |
 
-Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core, or be left unpinned with `0`; only the four mandatory threads need a core to themselves.
+Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core, or be left unpinned with `0`; only the five mandatory threads need a core to themselves.
+
+### The journal's two threads
+
+The journal stage runs on two threads, and the division decides what a disk stall can and cannot stop:
+
+- **Journal** orders events, assigns sequence numbers, encodes entries, extends the hash chain, and hands batches to replicas. All in memory — it issues no device call.
+- **Journal Disk** writes each batch (`pwrite`), syncs it (`fdatasync`), and then publishes the cursors that mean *durable*: the durable wire sequence the response gate reads, the input-ring progress a replica's acks are gated on, and the post-fsync state snapshots and handshakes consume.
+
+Publication happens on the disk thread because only it knows when a batch became durable. Publishing at hand-off time would let a replica acknowledge entries its disk had not taken.
+
+The practical consequence: while the device is slow, the sequencer keeps ordering, encoding, and **feeding replicas**. Under a durability policy that can be satisfied by a replica (`hybrid`), acknowledgements continue through the replica leg during a local stall. Under `local` they wait, correctly — but the stall now shows up as journal disk lag rather than a frozen pipeline.
+
+Absorption is bounded by the hand-off ring (64 batches). Past that the sequencer stalls at its next batch, the input ring fills, and producers backpressure — the same chain as before, with a deeper buffer in front of it. Watch `melin_journal_disk_lag_batches`.
+
+Give the disk thread a core on the same CCD as the journal thread: the two exchange a cache line per batch, and a cross-CCD transfer adds roughly 100 ns to each. On a box that cannot spare the core, leave the entry off (or `0`) — the thread then floats on the shared mask at default scheduling; it still spins and still makes progress, but it competes for whatever core it lands on.
 
 ### CPU core pinning
 
@@ -383,7 +399,7 @@ Without this invariant, a crash between matching and journal sync could cause:
 
 ### How it is enforced
 
-1. The journal stage reads events from the input disruptor and writes them to disk. Its consumer progress cursor advances **only after** `flush_batch_sync()` completes (durable write confirmed by the kernel/NVMe controller).
+1. The journal stage reads events from the input disruptor, encodes them, and hands each batch to the disk thread, which writes and syncs it. The consumer progress cursor advances **only after** that sync completes (durable write confirmed by the kernel/NVMe controller), and it is the disk thread that advances it.
 2. The matching stage stamps each response with the journal sequence number of the event that produced it. Query responses are stamped with the last event applied before the query, since that is the state they report.
 3. The response stage spin-waits until the durable position reaches that number — for each response individually, not once per batch.
 4. Only then is that response encoded and written to its client socket.
@@ -394,7 +410,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3,4,5,6,7,8,9,10` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep (comma-separated). 0 = unpinned. The tenth entry is optional — a 9-entry value parses and leaves the segment preparer unpinned. |
+| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep, journal-disk (comma-separated). 0 = unpinned. The last two entries are optional — a 9- or 10-entry value still parses, leaving the omitted threads unpinned, so a configuration written before either existed keeps working. Place journal-disk on the same CCD as journal. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |

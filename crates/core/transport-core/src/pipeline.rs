@@ -165,6 +165,17 @@ pub struct StageUtilization {
     /// pathology is visible only in logs. Only used by the journal
     /// stage.
     pub rotations_failed: AtomicU64,
+    /// Batches handed to the disk thread that are not yet durable.
+    ///
+    /// Zero in steady state: the disk thread keeps up, so a batch is
+    /// written and synced before the next one arrives. A sustained
+    /// non-zero value is the disk falling behind — which the pipeline
+    /// now rides through instead of freezing on, up to the hand-off
+    /// ring's depth. At the depth it becomes backpressure: the
+    /// sequencer stalls, then the input ring fills, then producers
+    /// stall. Alert on it approaching the ring depth, not on it being
+    /// briefly non-zero. Only used by the journal stage.
+    pub journal_disk_lag: AtomicU64,
 }
 
 impl StageUtilization {
@@ -179,6 +190,7 @@ impl StageUtilization {
             rotations_fast_path: AtomicU64::new(0),
             rotations_sync_fallback: AtomicU64::new(0),
             rotations_failed: AtomicU64::new(0),
+            journal_disk_lag: AtomicU64::new(0),
         }
     }
 }
@@ -1436,7 +1448,11 @@ impl<E: AppEvent> Sequencer<E> {
         self.batches.publish(claim, meta);
         self.encoder.clear_batch();
         self.segment_bytes += u64::from(len);
-        self.disk.set_lag(self.batches.in_flight());
+        // One `Relaxed` store per batch, off the encode path — the only
+        // cost of making a stalling disk visible to operators.
+        self.utilization
+            .journal_disk_lag
+            .store(self.batches.in_flight(), Ordering::Relaxed);
         Ok(())
     }
 

@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use melin_journal::JournalError;
 use melin_journal::preparer::PreparedSegment;
@@ -85,10 +85,6 @@ pub struct DiskControl {
     error: Mutex<Option<JournalError>>,
     /// Rotation rendezvous — see [`RotateSlot`].
     rotate: Mutex<RotateSlot>,
-    /// Batches published but not yet durable. Published for `/healthz`:
-    /// zero in steady state, and a growing value is a stalling disk the
-    /// pipeline is riding through rather than freezing on.
-    lag: AtomicU64,
 }
 
 impl Default for DiskControl {
@@ -104,7 +100,6 @@ impl DiskControl {
             poisoned: AtomicBool::new(false),
             error: Mutex::new(None),
             rotate: Mutex::new(RotateSlot::Idle),
-            lag: AtomicU64::new(0),
         }
     }
 
@@ -125,17 +120,6 @@ impl DiskControl {
             .lock()
             .expect("journal disk error mutex poisoned")
             .take()
-    }
-
-    /// Batches published but not yet durable.
-    pub fn lag(&self) -> u64 {
-        self.lag.load(Ordering::Relaxed)
-    }
-
-    /// Record the current hand-off depth. Called by the sequencer after
-    /// publishing a batch — one `Relaxed` store, off the encode path.
-    pub fn set_lag(&self, batches: u64) {
-        self.lag.store(batches, Ordering::Relaxed);
     }
 
     /// Submit a rotation. The caller must have drained the write ring
@@ -394,6 +378,7 @@ impl JournalDisk {
 mod tests {
     use super::*;
     use melin_journal::write_ring::{JournalWriteProducer, build_journal_write_ring};
+    use std::sync::atomic::AtomicU64;
 
     fn cursors() -> (DurabilityCursors, Arc<Sequence>, DurableWireSeqCursor) {
         let progress = Arc::new(Sequence::new(AtomicU64::new(0)));

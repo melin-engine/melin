@@ -314,6 +314,11 @@ struct HealthSnapshot {
     /// Rotation attempts that failed and left the current segment in
     /// place (the journal keeps growing) — any growth is alert-worthy.
     journal_rotations_failed: u64,
+    /// Batches handed to the journal's disk thread that are not yet
+    /// durable. Zero in steady state; a sustained non-zero value is a
+    /// disk falling behind the sequencer, which the pipeline absorbs up
+    /// to the hand-off ring's depth before backpressuring producers.
+    journal_disk_lag: u64,
     /// Control-plane raft election state; `None` when raft isn't
     /// configured on this node.
     raft: Option<RaftSnapshot>,
@@ -548,6 +553,10 @@ impl HealthSnapshot {
                 .journal_utilization
                 .rotations_failed
                 .load(Ordering::Relaxed),
+            journal_disk_lag: state
+                .journal_utilization
+                .journal_disk_lag
+                .load(Ordering::Relaxed),
             raft: state.raft.as_ref().map(|r| RaftSnapshot {
                 node_id: r.node_id,
                 term: r.term.load(Ordering::Relaxed),
@@ -675,6 +684,9 @@ impl HealthSnapshot {
              melin_journal_rotations_total{{path=\"fast\"}} {}\n\
              melin_journal_rotations_total{{path=\"sync_fallback\"}} {}\n\
              melin_journal_rotations_total{{path=\"failed\"}} {}\n\
+             # HELP melin_journal_disk_lag_batches Journal batches handed to the disk thread that are not yet durable. Zero in steady state; a sustained non-zero value is the disk falling behind the sequencer, which the pipeline absorbs up to the hand-off ring depth before backpressuring producers.\n\
+             # TYPE melin_journal_disk_lag_batches gauge\n\
+             melin_journal_disk_lag_batches {}\n\
              # HELP melin_durability_policy_degraded Durability policy currently unsatisfiable by the connected cluster shape; the response gate stalls while set (1 = degraded, 0 = healthy).\n\
              # TYPE melin_durability_policy_degraded gauge\n\
              melin_durability_policy_degraded {}\n\
@@ -720,6 +732,7 @@ impl HealthSnapshot {
             self.journal_rotations_fast_path,
             self.journal_rotations_sync_fallback,
             self.journal_rotations_failed,
+            self.journal_disk_lag,
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );
@@ -1711,6 +1724,10 @@ mod tests {
             .rotations_sync_fallback
             .store(3, Ordering::Relaxed);
         journal_util.rotations_failed.store(2, Ordering::Relaxed);
+        // A disk falling behind: batches handed over but not yet
+        // durable. Operators alert on this approaching the hand-off
+        // ring's depth, so it has to actually reach /metrics.
+        journal_util.journal_disk_lag.store(11, Ordering::Relaxed);
 
         let matching_util = Arc::new(StageUtilization::new());
         matching_util.busy.store(2000, Ordering::Relaxed);
@@ -1769,6 +1786,10 @@ mod tests {
         assert!(
             response.contains("melin_journal_rotations_total{path=\"failed\"} 2\n"),
             "failed rotation count not found in: {response}"
+        );
+        assert!(
+            response.contains("melin_journal_disk_lag_batches 11\n"),
+            "journal disk lag not found in: {response}"
         );
 
         shutdown.store(true, Ordering::Relaxed);
