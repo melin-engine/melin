@@ -2961,10 +2961,18 @@ impl<A: Application> MatchingStage<A> {
                     }
                 }
 
+                // Execute ends at the instant the output slots are stamped
+                // with, so one read serves both. Taking it here rather
+                // than after the block below also keeps the recording
+                // cost of a traced build out of `match_complete_ts` —
+                // every downstream stage measures from it.
+                #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
+                let match_complete_ts = mono_trace_ns();
+
                 #[cfg(feature = "latency-trace")]
                 {
-                    let exec_end = mono_trace_ns();
-                    let elapsed_ns = crate::trace::mono_trace_elapsed_ns(exec_start, exec_end);
+                    let elapsed_ns =
+                        crate::trace::mono_trace_elapsed_ns(exec_start, match_complete_ts);
                     // Outlier log: any execute > 1 ms is well into pathological
                     // territory for a path whose p50 is ~200 ns. Capture the
                     // event variant + correlation IDs so we can pin down what
@@ -2989,9 +2997,6 @@ impl<A: Application> MatchingStage<A> {
                     }
                     execute_rec.record_ns(elapsed_ns);
                 }
-
-                #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
-                let match_complete_ts = mono_trace_ns();
 
                 // Push execution reports into the output batch.
                 // All output slots for this request carry the same

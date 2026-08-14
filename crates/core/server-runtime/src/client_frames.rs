@@ -112,8 +112,10 @@ pub(crate) fn process_client_frames<E: AppEvent>(
         let ts = if event.is_query() { 0 } else { batch_wall_ns };
         let event = JournalEvent::App(event);
 
-        #[cfg(feature = "latency-trace")]
-        let pre_publish = mono_trace_ns();
+        // One clock read serves both the slot stamp and the publish
+        // stage's start. Reading twice also put a clock read of skew
+        // between where `publish` starts and the `publish_ts` the
+        // downstream wakeup stages measure from.
         #[allow(clippy::let_unit_value)]
         let publish_ts = mono_trace_ns();
 
@@ -133,13 +135,14 @@ pub(crate) fn process_client_frames<E: AppEvent>(
             break;
         }
 
+        // Both stages close at the same instant, so they share the read.
         #[cfg(feature = "latency-trace")]
         {
             let publish_done = mono_trace_ns();
-            publish_rec.record_elapsed(pre_publish, publish_done);
+            publish_rec.record_elapsed(publish_ts, publish_done);
+            #[cfg(feature = "tick-to-trade")]
+            ingest_rec.record_elapsed(recv_ts, publish_done);
         }
-        #[cfg(feature = "tick-to-trade")]
-        ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
 
         if batch.len() >= COMMIT_EVERY {
             batch.commit();
