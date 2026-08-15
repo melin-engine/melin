@@ -20,8 +20,8 @@ use melin_journal::replication::REPLICATION_RING_CAPACITY;
 // Only the journal-reading tests touch these, and those are gated off
 // under no-persist (every read needs a really-persisted journal file).
 #[cfg(not(feature = "no-persist"))]
-use melin_journal::{BufferedWriter, JournalReader};
-use melin_journal::{JournalEvent, SectorWriter};
+use melin_journal::JournalReader;
+use melin_journal::{BufferedWriter, JournalEvent};
 use melin_pipeline::ring;
 
 #[cfg(not(feature = "no-persist"))]
@@ -34,16 +34,13 @@ use crate::pipeline::build_replica_pipeline;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::{AdoptedRotation, StreamMark};
 use crate::pipeline::{
-    InputSlot, JournalStage, JournalStageRun, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload,
-    OutputSlot, build_pipeline_with_replication,
+    InputSlot, JournalStage, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload, OutputSlot,
+    build_pipeline_with_replication,
 };
 use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport};
 use crate::trace::mono_trace_ns;
 
-// Pipeline tests historically exercised the io_uring path under the
-// sector writer; keep them on that writer here so the io_uring
-// specialization stays covered by the infrastructure tests.
-type Writer = SectorWriter<TestEvent>;
+type Writer = BufferedWriter<TestEvent>;
 type TestInput = InputSlot<TestEvent>;
 type TestOutput = OutputSlot<TestReport, TestQuery>;
 
@@ -1642,6 +1639,92 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
     assert_eq!(live_seqs, vec![3]);
 }
 
+/// The input-ring progress published at a mid-batch mark barrier must
+/// cover only the entries actually encoded, never the whole read batch.
+///
+/// This is persist-before-ack on a replica. The barrier hands over a
+/// *prefix* of the read batch — everything up to the announced boundary
+/// — while the tail sits unencoded until the rotation completes.
+/// Publishing `next_read` there would advance the cursor the ack path
+/// gates on past entries the journal has not taken, letting the replica
+/// acknowledge data it has not persisted. Segment placement stays
+/// correct either way, which is why the existing adoption tests cannot
+/// see this: the entries still land in the right files, the *cursor*
+/// just lies about them.
+///
+/// Driven with a deliberately wrong tail hash so the stage stops at the
+/// barrier with a divergence error, freezing the cursor at exactly the
+/// value the barrier published.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn mid_batch_barrier_commits_only_the_encoded_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("barrier_progress.journal");
+    let anchor = [0x5Cu8; 32];
+
+    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    // The cursor the ack path reads. Captured before the stage takes
+    // the consumer — the disk thread publishes into this same counter.
+    let progress = consumer.progress_counter();
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let marks: crate::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    marks
+        .lock()
+        .unwrap()
+        .push_back(StreamMark::Rotate(AdoptedRotation {
+            boundary_seq: 2,
+            // Not the local tail: the barrier submits the prefix, then
+            // the quiesced resolve rejects the rotation and the stage
+            // exits, leaving the cursor where the barrier put it.
+            tail_hash: [0xEEu8; 32],
+        }));
+    stage.set_stream_marks(Arc::clone(&marks));
+
+    // All three pre-published, so one `read_batch` spans the boundary
+    // and the split is forced.
+    for seq in 1..=3u64 {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+    }
+
+    let shutdown = AtomicBool::new(false);
+    // `expect_err` needs the Ok type to be Debug, and the writer is not.
+    let err = match stage.run(&shutdown) {
+        Err(e) => e,
+        Ok(_) => panic!("a wrong tail hash must be reported as divergence"),
+    };
+    assert!(
+        matches!(
+            err,
+            melin_journal::JournalError::ReplicaChainDivergence { sequence: 2, .. }
+        ),
+        "expected divergence at the boundary, got: {err}"
+    );
+
+    // Ring slots 0 and 1 hold seqs 1 and 2 — the boundary. Slot 2
+    // (seq 3) sits past it and was never encoded.
+    assert_eq!(
+        progress.get().load(Ordering::Acquire),
+        2,
+        "progress must stop at the boundary; publishing the whole read \
+         batch would let the replica ack seq 3, which was never journaled"
+    );
+
+    // Corroborate from the journal itself: the cursor claims two
+    // entries are durable, and exactly two are.
+    let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+    let mut seqs = Vec::new();
+    while let Some(e) = reader.next_entry().unwrap() {
+        seqs.push(e.sequence);
+    }
+    assert_eq!(seqs, vec![1, 2], "only the encoded prefix may be on disk");
+}
+
 /// Regression: a `Rotate` with a trailing `ChainCheck` queued inside
 /// the SAME read batch. After adopting the rotation mid-batch, the
 /// encode loop must re-bound the remaining span at the chain check
@@ -2350,10 +2433,13 @@ fn journal_stage_rotates_on_size_threshold() {
 }
 
 /// The run-startup sequence must arm the background preparer when
-/// rotation recurs, so steady-state rotations adopt the pre-staged
+/// rotation recurs, so steady-state rotations adopt the pre-zeroed
 /// segment instead of stalling on the synchronous allocate.
 /// Regression test for the unwired `enable_preparer` — without the
-/// startup call, every rotation is a sync fallback forever.
+/// startup call, every rotation is a sync fallback forever, and each
+/// fallback segment also re-introduces per-append extent-conversion
+/// metadata inside `fdatasync` until the next rotation (see
+/// `docs/internal/journal-fsync-beat-2026-08.md`).
 #[cfg(not(feature = "no-persist"))]
 #[test]
 fn size_rotation_uses_prepared_fast_path_after_warmup() {
@@ -2400,104 +2486,6 @@ fn size_rotation_uses_prepared_fast_path_after_warmup() {
 
     shutdown.store(true, Ordering::Relaxed);
     handle.join().unwrap().unwrap();
-}
-
-/// Buffered-writer twin of the fast-path warmup test above: the
-/// buffered stage's `run` must arm the zero-fill preparer, and
-/// steady-state size rotations must adopt pre-zeroed segments. This is
-/// the wiring half of the fdatasync journal-force fix (see
-/// `docs/internal/journal-fsync-beat-2026-08.md`): a sync-fallback
-/// segment still works but re-introduces per-append extent-conversion
-/// metadata until the next rotation.
-#[cfg(not(feature = "no-persist"))]
-#[test]
-fn buffered_size_rotation_uses_prepared_fast_path_after_warmup() {
-    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("buf_fast_rotate.journal");
-    let writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-
-    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
-        .add_consumer()
-        .build();
-    let consumer = consumers.pop().unwrap();
-
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
-    // Tiny threshold — every non-empty fsync rotates.
-    stage.set_rotation(/* max_journal_bytes */ 1, None);
-    let util = stage.utilization();
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let s = Arc::clone(&shutdown);
-    let handle = std::thread::spawn(move || stage.run(&s));
-
-    // Early rotations may race the preparer's initial staging and fall
-    // back; once the worker catches up, a rotation must hit the fast
-    // path. Keep publishing until one does (bounded by the deadline).
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut n = 0u64;
-    while util.rotations_fast_path.load(Ordering::Relaxed) == 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no fast-path rotation within deadline (sync fallbacks: {})",
-            util.rotations_sync_fallback.load(Ordering::Relaxed)
-        );
-        n += 1;
-        producer.publish(add_slot(n, 1_000_000_000 + n));
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    shutdown.store(true, Ordering::Relaxed);
-    handle.join().unwrap().unwrap();
-}
-
-/// The buffered `enable_preparer` follows the same arming policy as
-/// the sector variant: size-driven rotation and replica adoption arm
-/// it, manual-only rotation does not. Separate code path from the
-/// sector impl, so it gets its own regression test.
-#[cfg(not(feature = "no-persist"))]
-#[test]
-fn buffered_preparer_arms_for_size_and_replica_modes_only() {
-    let dir = tempfile::tempdir().unwrap();
-    let mk_stage = |name: &str| {
-        let writer = BufferedWriter::<TestEvent>::create(&dir.path().join(name)).unwrap();
-        let (_p, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
-            .add_consumer()
-            .build();
-        JournalStage::new(
-            writer,
-            consumers.pop().unwrap(),
-            Duration::ZERO,
-            MAX_JOURNAL_BATCH,
-            false,
-        )
-    };
-
-    let mut size_driven = mk_stage("buf_size.journal");
-    size_driven.set_rotation(1024, None);
-    size_driven.enable_preparer();
-    assert!(
-        size_driven.preparer_enabled(),
-        "size-driven rotation must arm the preparer"
-    );
-
-    let mut replica = mk_stage("buf_replica.journal");
-    replica.set_stream_marks(Arc::new(std::sync::Mutex::new(
-        std::collections::VecDeque::new(),
-    )));
-    replica.enable_preparer();
-    assert!(
-        replica.preparer_enabled(),
-        "replica adoption must arm the preparer"
-    );
-
-    let mut manual_only = mk_stage("buf_manual.journal");
-    manual_only.set_rotation(0, Some(Arc::new(AtomicBool::new(false))));
-    manual_only.enable_preparer();
-    assert!(
-        !manual_only.preparer_enabled(),
-        "manual-only rotation must not arm the preparer"
-    );
 }
 
 /// `enable_preparer` arms exactly when rotation recurs on a
@@ -2548,6 +2536,288 @@ fn preparer_arms_for_size_and_replica_modes_only() {
         !manual_only.preparer_enabled(),
         "manual-only rotation must not arm the preparer"
     );
+}
+
+/// The size-driven rotation trigger measures the live segment from a
+/// counter the sequencer keeps, because the file itself now lives on
+/// the disk thread. That counter has to track the segment's real size:
+/// if it drifted the deployment would rotate at the wrong cadence, or
+/// (drifting low) never rotate at all while the journal grew unbounded.
+///
+/// Rotate at a real threshold and check the archive against it — the
+/// counter runs at most one in-flight batch ahead of the file, so the
+/// sealed segment must land within a batch of the threshold rather than
+/// wildly past it.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn size_trigger_tracks_the_segments_real_size() {
+    const THRESHOLD: u64 = 16 * 1024;
+    /// Generous bound on one encoded entry (`MAX_ENTRY_SIZE` is 144).
+    const ONE_ENTRY: u64 = 256;
+
+    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sized.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    stage.set_rotation(THRESHOLD, None);
+    // One event per batch: publish, wait for it to become durable, then
+    // publish the next. Free-running publication would batch hundreds
+    // of events per rotation check, and the overshoot from batching
+    // would swamp the counter error this test exists to detect.
+    let durable = DurableWireSeqCursor::detached(WireSeq::new(0));
+    stage.set_last_seq_publisher(durable.clone());
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    let archive = std::path::PathBuf::from(format!("{}.000001", path.display()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut n = 0u64;
+    while !archive.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no size-driven rotation within deadline after {n} events"
+        );
+        n += 1;
+        producer.publish(add_slot(n, 1_000_000_000 + n));
+        let mut spins = 0u32;
+        while durable.load() < WireSeq::new(n) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event {n} never became durable"
+            );
+            drain_backoff(&mut spins, std::time::Instant::now(), "durable cursor");
+        }
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+
+    // With one event in flight at a time, the sealed segment must land
+    // within a single entry of the threshold. A counter running ahead
+    // of the segment rotates early and seals short; one lagging behind
+    // seals long.
+    let sealed = std::fs::metadata(&archive).unwrap().len();
+    assert!(
+        sealed >= THRESHOLD,
+        "rotated before the threshold: sealed {sealed} < {THRESHOLD} — \
+         the size counter is running ahead of the segment"
+    );
+    assert!(
+        sealed <= THRESHOLD + ONE_ENTRY,
+        "rotated past the threshold: sealed {sealed} > {THRESHOLD} + {ONE_ENTRY} — \
+         the size counter is lagging the segment"
+    );
+}
+
+/// The sequencer skips the per-batch chain value when nothing reads it
+/// (`chain_hash_observed`) — it costs a BLAKE3 clone and finalize on
+/// the hand-off path. This is the other half of that bargain: with a
+/// publisher attached, `FsyncState.chain_hash` must carry the real
+/// chain at the batch's last sequence.
+///
+/// The shadow stage stamps this value into every snapshot it writes, so
+/// a regression to a constant would produce snapshots that fail chain
+/// verification against the journal they claim to describe — and only
+/// at recovery time, on a node that has already lost its memory state.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn fsync_state_carries_the_real_chain_hash_when_a_publisher_is_attached() {
+    use melin_pipeline::seqlock;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("observed_chain.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let (fsync_writer, fsync_state) = seqlock::split(crate::pipeline::FsyncState::default());
+    stage.set_chain_hash_lock(fsync_writer);
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    // One event per batch, so the published state describes exactly the
+    // sequence we then verify against the file.
+    const EVENTS: u64 = 8;
+    for seq in 1..=EVENTS {
+        producer.publish(add_slot(seq, 1_000_000_000 + seq));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while fsync_state.load().journal_seq.get() < seq {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seq {seq} never became durable"
+            );
+            std::hint::spin_loop();
+        }
+        let published = fsync_state.load();
+        assert_eq!(published.journal_seq.get(), seq);
+        assert_ne!(
+            published.chain_hash, [0u8; 32],
+            "seq {seq}: the chain value was not computed"
+        );
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+
+    // The published value must equal the chain the journal file itself
+    // produces at that sequence — not merely be non-zero.
+    let expected = match melin_journal::segment::chain_value_at(&path, EVENTS).unwrap() {
+        melin_journal::segment::ChainValueAt::Value(v) => v,
+        other => panic!("journal ends before seq {EVENTS}: {other:?}"),
+    };
+    assert_eq!(
+        fsync_state.load().chain_hash,
+        expected,
+        "published chain value disagrees with the on-disk journal at seq {EVENTS}"
+    );
+}
+
+/// A batch that encodes no bytes still has to travel to the disk
+/// thread, because the input-ring slots its events occupy are released
+/// by the cursors it carries — not by the write.
+///
+/// Queries are never journaled, so a query-only batch is byte-empty;
+/// under `no-persist` *every* batch is. Dropping such a batch as
+/// "nothing to write" leaves those slots held forever: the input ring
+/// fills, producers block on backpressure, and the pipeline wedges with
+/// no error anywhere. A hang, not a failure — which is exactly why it
+/// needs a test rather than trust.
+///
+/// Deliberately not gated on `no-persist`: the query path makes the
+/// batch byte-empty under every feature configuration, so this guards
+/// the same code in both.
+#[test]
+fn cursor_only_batches_still_release_their_input_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queries_only.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let progress = consumer.progress_counter();
+
+    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    const QUERIES: u64 = 6;
+    for n in 0..QUERIES {
+        producer.publish(TestInput {
+            event: JournalEvent::App(TestEvent::Query),
+            ..add_slot(n, 1_000_000_000 + n)
+        });
+    }
+
+    // Nothing is written, so durability cannot be observed through the
+    // journal — the released slots are the only evidence, and they are
+    // the thing that matters.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut spins = 0u32;
+    while progress.get().load(Ordering::Acquire) < QUERIES {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "query-only batches never released their input slots (progress {}) \
+             — the input ring would fill and the pipeline would wedge",
+            progress.get().load(Ordering::Acquire)
+        );
+        drain_backoff(&mut spins, std::time::Instant::now(), "slot release");
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    let writer = handle.join().unwrap().unwrap();
+    assert_eq!(
+        writer.next_sequence(),
+        1,
+        "queries must consume no journal sequence"
+    );
+}
+
+/// `melin_journal_disk_lag_batches` is documented as zero in steady
+/// state, and operators are told to alert on a *sustained* non-zero
+/// value. That only holds if the gauge is refreshed after the disk
+/// catches up. Stored solely at submit time it freezes at whatever was
+/// in flight when the last batch was handed over, so every burst that
+/// ends leaves a permanent phantom stall on the dashboard — the exact
+/// false positive the alert is supposed to distinguish from a real one.
+///
+/// Publish enough to put the disk behind, then let the stage idle and
+/// require the gauge to come back to zero on its own.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn disk_lag_gauge_returns_to_zero_once_the_journal_quiesces() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lag.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    const EVENTS: u64 = 512;
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let utilization = stage.utilization();
+    // Durability of the last event is the "the stage has quiesced"
+    // signal. Without it the gauge would be read before the stage ever
+    // submitted a batch, and its untouched initial zero would satisfy
+    // the assertion for the wrong reason.
+    let durable = DurableWireSeqCursor::detached(WireSeq::new(0));
+    stage.set_last_seq_publisher(durable.clone());
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    for n in 1..=EVENTS {
+        producer.publish(add_slot(n, 1_000_000_000 + n));
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut spins = 0u32;
+    while durable.load() < WireSeq::new(EVENTS) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the burst never became durable"
+        );
+        drain_backoff(&mut spins, std::time::Instant::now(), "durable cursor");
+    }
+
+    // Everything is on disk and no further batch will ever be
+    // submitted. The gauge must reflect that.
+    loop {
+        let lag = utilization.journal_disk_lag.load(Ordering::Relaxed);
+        if lag == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disk lag gauge stuck at {lag} long after the journal quiesced — \
+             it is only refreshed when a batch is submitted"
+        );
+        drain_backoff(&mut spins, std::time::Instant::now(), "disk lag gauge");
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
 }
 
 /// ROTATE storm: many rapid sets of the flag between fsync
@@ -2625,13 +2895,10 @@ fn rotate_storm_collapses_to_single_rotation() {
 }
 
 /// Post-rotation events must land in the *live* segment, not in the
-/// just-archived one. Regression test for the io_uring fixed-file-
-/// registration bug: rotation closes the old live fd (now pointing
-/// at the archived inode) and opens a new one, but io_uring's
-/// `register_files` table still references the old fd unless we call
-/// `register_files_update`. Without the update, every subsequent SQE
-/// submitted with `types::Fixed(0)` writes into the archived inode
-/// rather than the new live file.
+/// just-archived one. Rotation closes the old live fd (now pointing at
+/// the archived inode) and opens a new one; anything that keeps
+/// writing through a stale handle silently appends to the archive,
+/// which recovery then reads as a segment overlap.
 #[cfg(not(feature = "no-persist"))]
 #[test]
 fn post_rotation_events_land_in_live_not_archive() {
@@ -2670,9 +2937,8 @@ fn post_rotation_events_land_in_live_not_archive() {
         });
     };
 
-    // Phase 1 — enough events to cross one sector so io_uring's async-
-    // write path engages (not the partial-tail sync fallback that
-    // bypasses the registered fd).
+    // Phase 1 — a batch of events written and synced before the
+    // rotation is requested.
     const PRE: u64 = 50;
     for i in 1..=PRE {
         publish(&mut producer, i);
@@ -2731,81 +2997,61 @@ fn post_rotation_events_land_in_live_not_archive() {
     for s in &live_seqs {
         assert!(
             !archive_set.contains(s),
-            "seq {s} present in both archive and live — io_uring fd \
-             reregistration regression?"
+            "seq {s} present in both archive and live — the rotation \
+             left a stale write handle behind"
         );
     }
 }
 
-/// Cross-writer parity: the same input sequence published through
-/// the pipeline must produce the same on-disk app sequences and
-/// event count under both writer specializations. Guards against
-/// either writer silently dropping or reordering events when one is
-/// changed in isolation.
+/// Every event published through the pipeline must land on disk in
+/// input order, exactly once. The end-to-end floor for the journal
+/// stage: publish five events, shut down, read the segment back.
 #[cfg(not(feature = "no-persist"))]
 #[test]
-fn pipeline_journal_contents_match_across_writer_modes() {
-    // Macro instead of a generic fn because each writer has its own
-    // `run` method (no common trait beyond what JournalStageRun
-    // exposes here, which is enough — but the macro keeps the test
-    // shape identical to the original).
-    macro_rules! run_for {
-        ($writer_ty:ty) => {{
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("parity.journal");
-            let writer = <$writer_ty>::create(&path).unwrap();
+fn pipeline_journals_every_event_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("parity.journal");
+    let writer = Writer::create(&path).unwrap();
 
-            let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
-                .add_consumer()
-                .build();
-            let consumer = consumers.pop().unwrap();
-            let stage = JournalStage::<TestEvent, $writer_ty>::new(
-                writer,
-                consumer,
-                Duration::ZERO,
-                MAX_JOURNAL_BATCH,
-                false,
-            );
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
 
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown2 = Arc::clone(&shutdown);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown2 = Arc::clone(&shutdown);
 
-            for amount in [10u64, 20, 30, 40, 50] {
-                producer.publish(InputSlot {
-                    connection_id: 1,
-                    key_hash: 0,
-                    request_seq: 0,
-                    sequence: 0,
-                    timestamp_ns: 1_000_000_000 + amount,
-                    event: JournalEvent::App(TestEvent::Add(amount)),
-                    publish_ts: mono_trace_ns(),
-                    recv_ts: mono_trace_ns(),
-                });
-            }
-
-            let handle = std::thread::spawn(move || stage.run(&shutdown2));
-            std::thread::sleep(Duration::from_millis(100));
-            shutdown.store(true, Ordering::Relaxed);
-            let _writer = handle.join().unwrap();
-
-            let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
-            let mut seqs = Vec::new();
-            while let Some(entry) = reader.next_entry().unwrap() {
-                if let JournalEvent::App(_) = entry.event {
-                    seqs.push(entry.sequence);
-                }
-            }
-            seqs
-        }};
+    for amount in [10u64, 20, 30, 40, 50] {
+        producer.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000 + amount,
+            event: JournalEvent::App(TestEvent::Add(amount)),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        });
     }
 
-    let sector = run_for!(SectorWriter<TestEvent>);
-    let buffered = run_for!(BufferedWriter<TestEvent>);
+    let handle = std::thread::spawn(move || stage.run(&shutdown2));
+    std::thread::sleep(Duration::from_millis(100));
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = handle.join().unwrap();
+
+    let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+    let mut seqs = Vec::new();
+    while let Some(entry) = reader.next_entry().unwrap() {
+        if let JournalEvent::App(_) = entry.event {
+            seqs.push(entry.sequence);
+        }
+    }
     assert_eq!(
-        sector, buffered,
-        "writer modes diverged on app-event sequences"
+        seqs,
+        vec![1, 2, 3, 4, 5],
+        "every published event must be journaled once, in input order"
     );
-    assert_eq!(sector.len(), 5);
 }
 
 /// End-to-end pin for the stats-query surface: `ApplyCtx.journal_sequence`
@@ -2814,6 +3060,10 @@ fn pipeline_journal_contents_match_across_writer_modes() {
 /// recovery, where the journal ring cursor restarts near zero while the
 /// durable cursor resumes at the recovered high-water mark. Guards the
 /// space fix that moved the stats surface off the ring cursor.
+///
+/// Requires a really-persisted journal: the second half recovers from
+/// the file the first half wrote, and `no-persist` writes none.
+#[cfg(not(feature = "no-persist"))]
 #[test]
 fn stats_query_reports_durable_wire_seq_across_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -2945,31 +3195,4 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     shutdown.store(true, Ordering::Relaxed);
     let _writer = t_journal.join().unwrap();
     let _app = t_matching.join().unwrap();
-}
-
-/// `journal_fixed_slot` decides WriteFixed-vs-Write per submit. The
-/// miss cases matter most: an unregistered replacement buffer submitted
-/// as `WriteFixed` against a stale slot would write the *wrong region's
-/// bytes* to the journal.
-#[test]
-fn journal_fixed_slot_matches_only_registered_pointers() {
-    use crate::pipeline::journal_fixed_slot;
-
-    let a = [0u8; 8];
-    let b = [0u8; 8];
-    let c = [0u8; 8];
-    let regs = [a.as_ptr(), b.as_ptr()];
-
-    assert_eq!(journal_fixed_slot(Some(&regs), a.as_ptr()), Some(0));
-    assert_eq!(journal_fixed_slot(Some(&regs), b.as_ptr()), Some(1));
-    assert_eq!(
-        journal_fixed_slot(Some(&regs), c.as_ptr()),
-        None,
-        "replacement buffer must fall back to a plain Write"
-    );
-    assert_eq!(
-        journal_fixed_slot(None, a.as_ptr()),
-        None,
-        "no registration (setup failure) means never WriteFixed"
-    );
 }

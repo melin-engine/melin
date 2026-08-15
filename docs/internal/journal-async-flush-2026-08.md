@@ -1,8 +1,22 @@
 # Async journal flush — watermark flush thread (spec)
 
-Status: **proposed** (2026-08). Follow-up to
-[journal-fsync-beat-2026-08.md](journal-fsync-beat-2026-08.md). Not yet
-implemented.
+Status: **superseded, not implemented** (2026-08). Follow-up to
+[journal-fsync-beat-2026-08.md](journal-fsync-beat-2026-08.md).
+
+The design below moves only `fdatasync` off the journal thread, keeping
+`pwrite` inline and handing over a watermark rather than bytes. It was
+built as far as the executor seam and tested, and did not hold up. What
+shipped instead splits the stage properly: the sequencing thread encodes
+into a hand-off ring and never touches the device, while a disk thread
+owns `pwrite`, `fdatasync`, rotation, and every cursor that means
+durable (`crates/core/transport-core/src/journal_disk.rs`).
+
+Kept for the reasoning that survived the change and still explains the
+implementation's shape: why publication must happen *after* the sync and
+from the thread that performed it, why ring progress has to move with
+durability rather than with submission, why rotation needs a drain, and
+why a dedicated spinning core is the right default. Read it for those;
+do not read it as a description of the code.
 
 ## Motivation
 

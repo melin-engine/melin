@@ -81,8 +81,9 @@ audit this is a product capability, not an optimisation.
 
 Counting BLAKE3 compression invocations, split into serial depth
 (dependency-chained) and parallel width (SIMD-fillable). Assumptions: AVX2
-(`simd_degree` 8), `CHUNK_LEN` 1024, entries of ~90 bytes (`sector_writer.rs`
-documents ~81–101), N entries per flush batch.
+(`simd_degree` 8), `CHUNK_LEN` 1024, entries of ~90 bytes (`codec.rs`
+documents the framing: 20-byte header + 17-byte metadata + payload +
+4-byte CRC), N entries per flush batch.
 
 Two structural facts drive the result:
 

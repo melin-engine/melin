@@ -6,15 +6,14 @@
 //!
 //! # Levels
 //!
-//! Two levels matter on this hardware (`O_DIRECT` + PLP-backed NVMe):
+//! Two levels matter:
 //!
 //! - [`Level::InMemory`] — the event has been accepted into the node's
 //!   pipeline. Survives nothing — process death loses it. Useful as a
 //!   "received this far" signal in cross-node policies.
-//! - [`Level::Persisted`] — `pwrite` returned, the bytes are in NVMe
-//!   DRAM behind power-loss-protection capacitors. Survives power loss.
-//!   No `RWF_DSYNC` round-trip is needed; PLP makes write-and-durable a
-//!   single event.
+//! - [`Level::Persisted`] — `pwrite` *and* `fdatasync` have returned, so
+//!   the kernel reports the bytes on stable media. Survives power loss
+//!   on any drive, with or without power-loss-protection capacitors.
 //!
 //! # Policy shape
 //!
@@ -52,9 +51,11 @@ pub enum Level {
     /// Event has been accepted into the node's pipeline. No durability
     /// guarantee — process crash or power loss loses it.
     InMemory,
-    /// Event has been written to NVMe via `O_DIRECT` `pwrite`. With
-    /// PLP-backed devices this survives power loss without an explicit
-    /// fsync.
+    /// Event has been written to the journal and `fdatasync` has
+    /// returned. Survives power loss on any drive — the guarantee rests
+    /// on the sync, not on the device's power-loss-protection
+    /// capacitors. Published by the journal disk thread only after the
+    /// sync completes.
     Persisted,
 }
 

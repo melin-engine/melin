@@ -32,6 +32,7 @@ pub mod fence;
 /// Prometheus text exposition body to `GET /metrics`. The state struct
 /// holds only atomics/cursors; the endpoint is fully transport-shaped.
 pub mod health;
+pub mod journal_disk;
 pub mod journaled_app;
 pub mod pipeline;
 /// Replication wire protocol, journal-file catch-up, ack queueing,

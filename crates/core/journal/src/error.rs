@@ -49,10 +49,6 @@ pub enum JournalError {
     SequenceDuplicate { sequence: u64, previous_seq: u64 },
     /// Entry is incomplete (likely a crash during write).
     TruncatedEntry,
-    /// The journal's recorded sector size is smaller than the device's physical
-    /// sector size. O_DIRECT writes would fail with EINVAL. The journal must be
-    /// re-created on the target device or moved back to the original device.
-    SectorSizeMismatch { journal: usize, device: usize },
     /// A successor segment's header anchor does not equal the preceding
     /// segment's final chain hash. Indicates tampering with an archived
     /// segment's contents, a missing segment between two surviving
@@ -111,11 +107,6 @@ impl fmt::Display for JournalError {
                  (immediately after seq {previous_seq})"
             ),
             Self::TruncatedEntry => write!(f, "truncated entry at end of journal"),
-            Self::SectorSizeMismatch { journal, device } => write!(
-                f,
-                "journal sector size ({journal}) is smaller than the device's physical \
-                 sector size ({device}); re-create the journal or move it to the original device"
-            ),
             Self::SegmentChainBreak {
                 index,
                 expected,

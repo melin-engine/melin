@@ -1172,7 +1172,6 @@ dependencies = [
  "blake3",
  "crc32c",
  "getrandom 0.4.2",
- "io-uring",
  "libc",
  "melin-app",
  "melin-pipeline",

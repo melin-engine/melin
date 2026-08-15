@@ -1,10 +1,11 @@
 //! Buffered journal writer — page-cache writes with explicit `fdatasync`.
 //!
-//! Alternative to [`crate::sector_writer::SectorWriter`] for deployments that
-//! cannot rely on capacitor-backed power-loss protection on the storage
-//! device. The on-disk format is identical to the O_DIRECT writer
-//! (`crate::codec` framing), so [`crate::reader::JournalReader`] and
-//! [`crate::segment`] recovery work without modification.
+//! The journal's only writer. Durability never depends on
+//! capacitor-backed power-loss protection on the storage device, and
+//! the on-disk format (`crate::codec` framing) is the same one the
+//! retired O_DIRECT writer produced, so [`crate::reader::JournalReader`]
+//! and [`crate::segment`] recovery read journals from either lineage
+//! without modification.
 //!
 //! ## Durability contract
 //!
@@ -15,97 +16,62 @@
 //! cache (NVMe `VWC=1`) this pays one device flush per batch; on a drive
 //! that reports `VWC=0` (full PLP) the flush is a near-no-op.
 //!
-//! ## Why a separate writer
+//! ## Why buffered
 //!
-//! The O_DIRECT writer carries machinery that exists *only* to satisfy
+//! An O_DIRECT writer carries machinery that exists *only* to satisfy
 //! sector alignment: a partial-tail sector kept in memory, sector-rounded
 //! `pwrite`, sector-aligned scratch buffers, sector-size detection. None
-//! of it applies once writes go through the page cache, so duplicating
-//! those code paths into a single struct with `#[cfg]`s tangles the hot
-//! path. This module is the clean half: a `Vec<u8>` batch buffer, plain
-//! `pwrite_all`, and `fdatasync` for durability.
+//! of it applies once writes go through the page cache. This module is
+//! the clean half: a `Vec<u8>` batch buffer, plain `pwrite_all`, and
+//! `fdatasync` for durability.
+//!
+//! ## Two halves
+//!
+//! The writer is a composition, not a monolith:
+//! [`JournalEncoder`] owns the entry stream (sequence allocation,
+//! framing, the hash chain, the batch buffer) and
+//! [`SegmentFile`] owns the file (descriptor, write position,
+//! pre-allocation, rotation). Nothing is shared between them — the
+//! encoder produces bytes, the segment writes them.
+//!
+//! That is the same line the pipeline draws between its sequencing
+//! thread and its disk thread, which is why it is a type boundary here
+//! rather than a comment: a field can only be reached from the half
+//! that owns it. `BufferedWriter` composes the two back together for
+//! every caller that is single-threaded anyway — recovery, offline
+//! tooling, `JournaledApp`, and the tests.
 
-use std::fs::{File, OpenOptions};
-use std::marker::PhantomData;
-use std::os::fd::AsFd;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use melin_app::AppEvent;
 
-#[cfg(feature = "hash-chain")]
-use crate::chain::SegmentChain;
-use crate::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
+use crate::codec;
+use crate::encoder::{JournalEncoder, MAX_ENTRY_SIZE};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
-
-/// Maximum encoded entry size. Mirrors `writer::MAX_ENTRY_SIZE` — actual
-/// entries are ~81-101 bytes; the array is sized generously so the
-/// per-event encode scratch never spills to the heap.
-const MAX_ENTRY_SIZE: usize = 144;
-
-/// Batch buffer capacity. Matches `writer::BATCH_BUF_CAPACITY` so the
-/// pipeline's flush cadence (sized against the O_DIRECT writer) applies
-/// here unchanged.
-const BATCH_BUF_CAPACITY: usize = 512 * 1024;
-
-/// Fixed on-disk offset of the first journal entry. Defined in the codec
-/// (`ENTRY_OFFSET = MAX_SECTOR_SIZE = 4096`) so both writer variants
-/// produce interchangeable layouts. Renamed locally for legibility.
-const HEADER_OFFSET: u64 = ENTRY_OFFSET;
-
-// Pre-allocation chunk size is resolved by the shared `prealloc` module
-// so a switch between this writer and `SectorWriter` doesn't change
-// disk-space cadence under matched configuration.
-use crate::prealloc::prealloc_chunk_bytes;
+use crate::segment_file::SegmentFile;
 
 /// Append-only journal writer that goes through the kernel page cache
 /// and forces durability with `fdatasync` per flush.
+///
+/// Owns both halves of the journal (see the module docs) and drives
+/// them from one thread.
 pub struct BufferedWriter<E: AppEvent> {
-    // PhantomData carries the app event type for the methods that
-    // read/write `JournalEvent<E>`. Zero-size — no runtime cost.
-    _marker: PhantomData<fn(E) -> E>,
-    file: File,
-    // Scratch buffer for single-entry encoding. Fixed-size array — entry
-    // sizes are bounded, so avoiding a Vec lets the hot path stay
-    // allocation-free.
-    buffer: [u8; MAX_ENTRY_SIZE],
-    // Batch write buffer. Plain Vec<u8> because the page-cache path has
-    // no alignment requirement. Pre-reserved to BATCH_BUF_CAPACITY at
-    // construction; flushing only resets `batch_len`, not capacity.
+    /// Entry stream: sequences, framing, chain, batch offsets.
+    encoder: JournalEncoder<E>,
+    /// Live segment on disk: descriptor, position, rotation.
+    segment: SegmentFile,
+    /// Destination the encoder appends into. Owned here because this
+    /// writer is the single-threaded composition; the pipeline instead
+    /// encodes straight into a hand-off ring slot. Pre-sized to
+    /// [`BATCH_BUF_CAPACITY`] and grown only if a caller batches past
+    /// it — flushing resets the length, never the allocation.
     batch_buf: Vec<u8>,
-    // Number of valid bytes in `batch_buf`. Acts as the write cursor —
-    // new entries land at `batch_buf[batch_len..]`. Reset on every flush.
-    batch_len: usize,
-    next_sequence: u64,
-    // First sequence of the active segment (the header's
-    // `starting_sequence`), kept in memory so emptiness / rotation-
-    // boundary checks need no header re-read.
-    starting_sequence: u64,
-    path: PathBuf,
-    // Byte offset of the next entry to be written. Always points at the
-    // end of valid data; no sector-tail bookkeeping, so `valid_end() ==
-    // write_pos`.
-    write_pos: u64,
-    // Byte offset of the end of pre-allocated space. When `write_pos`
-    // approaches this, another `prealloc_chunk_bytes()` is allocated.
-    allocated_end: u64,
-    #[cfg(feature = "hash-chain")]
-    hash_chain: SegmentChain,
-    // Debug-only monotonicity guard: every fresh seq must strictly
-    // exceed this. Excluded from release builds — zero hot-path cost.
-    #[cfg(debug_assertions)]
-    last_encoded_seq: u64,
-    // Byte range of the most-recent user entry within `batch_buf` —
-    // `last_user_entry_replication_slice` ships it to replication
-    // without a second encode pass.
-    last_user_entry_offset: usize,
-    last_user_entry_len: usize,
-    // Retries a failed post-rotation directory fsync until it succeeds
-    // (see `crate::segment::DirFsyncRetry`). Polled from the flush
-    // path — a single branch in steady state.
-    dir_fsync_retry: crate::segment::DirFsyncRetry,
 }
+
+/// Destination capacity for the composed writer's batches. Sized so the
+/// pipeline's normal flush cadence never has to grow it.
+const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
 impl<E: AppEvent> BufferedWriter<E> {
     /// Create a fresh journal file. The chain anchor is random salt so
@@ -124,53 +90,10 @@ impl<E: AppEvent> BufferedWriter<E> {
         starting_sequence: u64,
         anchor_hash: [u8; 32],
     ) -> Result<Self, JournalError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-
-        // Pre-allocate the first chunk so flushes don't pay extent-tree
-        // growth latency for a while. ext4/xfs/btrfs all back this with
-        // unwritten extents (no zero-fill cost) on the supported targets.
-        let allocated_end = fallocate_chunk(&file, 0)?;
-
-        // Write the file header at offset 0. The codec reserves the
-        // first `MAX_SECTOR_SIZE` (= 4096) bytes for the header
-        // regardless of writer mode or device sector size, so a
-        // journal created here is layout-compatible with SectorWriter.
-        let mut header_buf = [0u8; MAX_SECTOR_SIZE];
-        codec::encode_file_header(
-            &mut header_buf,
-            MAX_SECTOR_SIZE,
-            starting_sequence,
-            anchor_hash,
-        );
-        write_all_at(&file, &header_buf, 0)?;
-
-        // Flush the header durably before returning. Subsequent batch
-        // flushes layer on top of a known-good header — a crash before
-        // the next user write still leaves a parseable empty journal.
-        file.sync_all()?;
-
         Ok(Self {
-            _marker: PhantomData,
-            file,
-            buffer: [0u8; MAX_ENTRY_SIZE],
+            segment: SegmentFile::create_continuing(path, starting_sequence, anchor_hash)?,
+            encoder: JournalEncoder::new(starting_sequence, anchor_hash),
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
-            batch_len: 0,
-            next_sequence: starting_sequence,
-            starting_sequence,
-            path: path.to_path_buf(),
-            write_pos: HEADER_OFFSET,
-            allocated_end,
-            #[cfg(feature = "hash-chain")]
-            hash_chain: SegmentChain::new(anchor_hash),
-            #[cfg(debug_assertions)]
-            last_encoded_seq: 0,
-            last_user_entry_offset: 0,
-            last_user_entry_len: 0,
-            dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
 
@@ -187,71 +110,29 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// those two inputs, so no chain state needs to be threaded in from
     /// the recovery walk.
     pub fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
-        crate::preparer::cleanup_staging_orphan(path);
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-
-        // Validate the file header and extract the chain anchor. A
-        // header that fails to decode means the file isn't a journal —
-        // bail rather than overwrite it.
-        let mut header_buf = [0u8; FILE_HEADER_SIZE];
-        let n = file.read_at(&mut header_buf, 0)?;
-        if n < FILE_HEADER_SIZE {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "journal file too short to read file header",
-            )));
-        }
-        let info = codec::decode_file_header(&header_buf)?;
-
-        // Truncate down to `valid_end` so any torn-write garbage past
-        // it is gone before we resume appending. Without this, the
-        // bytes between `valid_end` and the previous file length
-        // survive on disk; subsequent readers (or offline tooling)
-        // could mistake them for entries if they happen to start with
-        // the journal magic. The CRC check would catch the lie, but
-        // SectorWriter scrubs its tail sector for the same reason and
-        // BufferedWriter should match the defensive posture. Truncate
-        // then re-fallocate to restore the chunk-ahead allocation;
-        // the kernel zero-fills the freshly extended region.
-        let pre_truncate_len = file.metadata()?.len();
-        if pre_truncate_len > valid_end {
-            file.set_len(valid_end)?;
-        }
-        let allocated_end = fallocate_chunk(&file, valid_end)?;
-        file.sync_all()?;
-
+        // The segment half opens and scrubs the file, and hands back
+        // the decoded header the stream half needs to resume: the
+        // anchor to rebuild the chain from, and the segment's first
+        // sequence.
+        let (segment, info) = SegmentFile::open_append(path, valid_end)?;
+        let encoder = JournalEncoder::resume(
+            path,
+            info.starting_sequence,
+            info.anchor_hash,
+            last_seq,
+            valid_end,
+        )?;
         Ok(Self {
-            _marker: PhantomData,
-            file,
-            buffer: [0u8; MAX_ENTRY_SIZE],
+            encoder,
+            segment,
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
-            batch_len: 0,
-            next_sequence: last_seq + 1,
-            starting_sequence: info.starting_sequence,
-            path: path.to_path_buf(),
-            write_pos: valid_end,
-            allocated_end,
-            #[cfg(feature = "hash-chain")]
-            hash_chain: SegmentChain::rebuild_from_file(
-                path,
-                info.anchor_hash,
-                ENTRY_OFFSET,
-                valid_end,
-            )?,
-            #[cfg(debug_assertions)]
-            last_encoded_seq: last_seq,
-            last_user_entry_offset: 0,
-            last_user_entry_len: 0,
-            dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
 
     /// Allocate and return the next sequence number, advancing the
     /// internal counter.
     pub fn allocate_sequence(&mut self) -> u64 {
-        let seq = self.next_sequence;
-        self.next_sequence += 1;
-        seq
+        self.encoder.allocate_sequence()
     }
 
     /// Encode a single event with a pre-assigned sequence number.
@@ -270,59 +151,30 @@ impl<E: AppEvent> BufferedWriter<E> {
         key_hash: u64,
         request_seq: u64,
     ) -> Result<(), JournalError> {
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                seq > self.last_encoded_seq,
-                "encode_event: seq {seq} <= last_encoded_seq {} — \
-                 this would emit a duplicate/backward sequence",
-                self.last_encoded_seq
+        // The encoder cannot grow a buffer it does not own, so keep a
+        // whole entry's headroom ahead of it. Growth is the rare
+        // oversize-batch fallback — Vec's amortised growth absorbs it.
+        let headroom = self.batch_buf.len() - self.encoder.batch_len();
+        if headroom < MAX_ENTRY_SIZE {
+            let grown = self.batch_buf.len() + BATCH_BUF_CAPACITY;
+            tracing::warn!(
+                batch_len = self.encoder.batch_len(),
+                capacity = self.batch_buf.len(),
+                grown,
+                "journal batch exceeded preallocated capacity — caller is \
+                 batching more than capacity between flushes; raise \
+                 BATCH_BUF_CAPACITY or flush more often"
             );
-            self.last_encoded_seq = seq;
+            self.batch_buf.resize(grown, 0);
         }
-
-        let written = codec::encode(
+        self.encoder.encode_event(
+            &mut self.batch_buf,
             seq,
             timestamp_ns,
+            event,
             key_hash,
             request_seq,
-            event,
-            &mut self.buffer,
-        )?;
-
-        // Absorb the full on-disk bytes (incl. CRC) — see crate::chain
-        // for why the CRC is included.
-        #[cfg(feature = "hash-chain")]
-        self.hash_chain.absorb(&self.buffer[..written]);
-
-        self.reserve_batch(written);
-        let offset = self.batch_len;
-        self.last_user_entry_offset = offset;
-        self.batch_buf[offset..offset + written].copy_from_slice(&self.buffer[..written]);
-        self.last_user_entry_len = written;
-        self.batch_len += written;
-
-        Ok(())
-    }
-
-    /// Grow the batch buffer if the incoming bytes wouldn't fit. The
-    /// pre-reserved capacity covers the pipeline's normal flush cadence,
-    /// so this is the rare oversize-batch fallback — Vec's amortised
-    /// growth absorbs the cost.
-    #[inline]
-    fn reserve_batch(&mut self, adding: usize) {
-        let needed = self.batch_len + adding;
-        if needed > self.batch_buf.len() {
-            tracing::warn!(
-                current_len = self.batch_len,
-                adding,
-                capacity = self.batch_buf.len(),
-                "buffered journal batch exceeded preallocated capacity — \
-                 caller is batching more than capacity between flushes; \
-                 raise BATCH_BUF_CAPACITY or flush more often"
-            );
-            self.batch_buf.resize(needed, 0);
-        }
+        )
     }
 
     /// Write the accumulated batch and force it to stable media.
@@ -332,24 +184,14 @@ impl<E: AppEvent> BufferedWriter<E> {
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
         // Paced retry of a failed post-rotation dir fsync — a single
         // branch in steady state.
-        self.dir_fsync_retry.poll();
-        if self.batch_len == 0 {
+        self.segment.poll_dir_fsync_retry();
+        if self.encoder.batch_len() == 0 {
             return Ok(());
         }
-        self.ensure_allocated()?;
-
-        let len = self.batch_len;
-        write_all_at(&self.file, &self.batch_buf[..len], self.write_pos)?;
-
-        // Honest durability: the call doesn't return until the kernel
-        // reports the data is on stable media. On a drive with a
-        // volatile write cache this issues a device-side flush; on a
-        // PLP drive (VWC=0) the flush is a near-no-op.
-        self.file.sync_data()?;
-
-        self.write_pos += len as u64;
-        self.batch_len = 0;
-        self.last_user_entry_len = 0;
+        self.segment
+            .write_batch(self.encoder.pending_batch_bytes(&self.batch_buf))?;
+        self.segment.sync()?;
+        self.encoder.clear_batch();
         Ok(())
     }
 
@@ -357,23 +199,17 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// `no-persist` path of the journal stage to keep the buffer
     /// bounded after replication has snapshotted the bytes.
     pub fn discard_batch_buf(&mut self) {
-        self.batch_len = 0;
-        self.last_user_entry_len = 0;
+        self.encoder.clear_batch();
     }
 
     pub fn next_sequence(&self) -> u64 {
-        self.next_sequence
+        self.encoder.next_sequence()
     }
 
     /// Set the next sequence number — used by the replica receiver to
     /// keep the writer's counter aligned with primary-assigned sequences.
     pub fn set_next_sequence(&mut self, seq: u64) {
-        debug_assert!(
-            seq >= self.next_sequence,
-            "set_next_sequence({seq}) moves counter backward from {}",
-            self.next_sequence
-        );
-        self.next_sequence = seq;
+        self.encoder.set_next_sequence(seq);
     }
 
     /// Current byte offset of the next entry. Always equal to
@@ -381,19 +217,18 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// no in-memory partial sector, so the on-disk end and the logical
     /// end coincide.
     pub fn write_pos(&self) -> u64 {
-        self.write_pos
+        self.segment.valid_end()
     }
 
     /// Byte offset of the end of valid on-disk data. Identical to
-    /// `write_pos` here — kept as a separate method so callers can
-    /// substitute the buffered and O_DIRECT writers behind a common
-    /// interface without changing semantics.
+    /// `write_pos` here; kept as a separate method because callers
+    /// speak in terms of the durable end, not the write cursor.
     pub fn valid_end(&self) -> u64 {
-        self.write_pos
+        self.segment.valid_end()
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.segment.path()
     }
 
     /// Decoded file-header fields of the live segment (read from disk).
@@ -401,45 +236,60 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// `(starting_sequence, anchor_hash)` so a fresh replica journal is
     /// byte-identical from the segment's first entry onward.
     pub fn read_header_info(&self) -> Result<codec::FileHeaderInfo, JournalError> {
-        crate::segment::read_header_info(&self.path)
+        self.segment.read_header_info()
     }
 
     /// First sequence of the active segment (the header's
     /// `starting_sequence`). `next_sequence() == segment_starting_sequence()`
     /// means the live segment is empty.
     pub fn segment_starting_sequence(&self) -> u64 {
-        self.starting_sequence
+        self.encoder.segment_starting_sequence()
     }
 
     /// Current chain value: `BLAKE3(entry bytes so far || anchor)`, or
     /// the anchor itself for an empty segment. `None` when `hash-chain`
     /// is disabled. Non-destructive (clone + finalize).
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
-        #[cfg(feature = "hash-chain")]
-        {
-            Some(self.hash_chain.value())
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        None
+        self.encoder.chain_hash()
     }
 
     /// Encoded bytes that have been appended to the batch buffer but
     /// not yet flushed. Used by the journal stage to snapshot the
     /// pending bytes for replication.
     pub fn pending_batch_bytes(&self) -> &[u8] {
-        &self.batch_buf[..self.batch_len]
+        self.encoder.pending_batch_bytes(&self.batch_buf)
     }
 
     /// Slice of the most-recent user entry, with the 2-byte magic
     /// stripped from the front and the 4-byte CRC stripped from the
     /// back — exact wire shape consumed by the replication stage.
     pub fn last_user_entry_replication_slice(&self) -> &[u8] {
-        if self.last_user_entry_len == 0 {
-            return &[];
+        self.encoder
+            .last_user_entry_replication_slice(&self.batch_buf)
+    }
+
+    /// Take the writer apart into its two halves so they can be driven
+    /// from separate threads — the stream half stays with the
+    /// sequencer, the file half moves to the disk thread.
+    ///
+    /// Any pending batch is flushed first: the halves are handed over
+    /// quiesced, so nothing encoded-but-unwritten can be stranded on
+    /// the wrong side of the boundary.
+    pub fn into_halves(mut self) -> Result<(JournalEncoder<E>, SegmentFile), JournalError> {
+        self.flush_batch_sync()?;
+        Ok((self.encoder, self.segment))
+    }
+
+    /// Reassemble the writer from halves that were split by
+    /// [`into_halves`](Self::into_halves) — how the pipeline hands the
+    /// journal back on shutdown, for recovery and promotion to use
+    /// single-threaded.
+    pub fn from_halves(encoder: JournalEncoder<E>, segment: SegmentFile) -> Self {
+        Self {
+            encoder,
+            segment,
+            batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
         }
-        let start = self.last_user_entry_offset;
-        let end = start + self.last_user_entry_len;
-        &self.batch_buf[start + 2..end - 4]
     }
 
     /// Rotate the live segment in place.
@@ -481,232 +331,34 @@ impl<E: AppEvent> BufferedWriter<E> {
     }
 
     /// Shared rotation body. `prepared.is_some()` takes the fast path.
+    ///
+    /// Order matters across the two halves: flush first so the outgoing
+    /// segment holds everything encoded, take the boundary values from
+    /// the stream half, let the file half swap the segment, and
+    /// re-anchor the stream only once that succeeded — on failure the
+    /// live file is restored and the stream must keep describing it.
     fn rotate_segment_inner(
         &mut self,
         prepared: Option<crate::preparer::PreparedSegment>,
     ) -> Result<PathBuf, JournalError> {
         self.flush_batch_sync()?;
 
-        let path = self.path.clone();
-        let next_seq = self.next_sequence;
-        // Data end of the outgoing segment, captured post-flush while
-        // `self` still describes it — the archive is compacted to this
-        // after the rotation commits.
-        let sealed_end = self.valid_end();
-
+        let next_seq = self.encoder.next_sequence();
         // The new segment's header anchor is the outgoing segment's tail
         // chain hash, giving recovery a verifiable cross-segment link.
         // Zeros when hash-chain is disabled (nothing verifies them).
-        let anchor = self.chain_hash().unwrap_or([0u8; 32]);
+        let anchor = self.encoder.chain_hash().unwrap_or([0u8; 32]);
 
-        let archived = crate::segment::archive_live(&path)?;
-
-        let installed = match prepared {
-            Some(p) => self.install_prepared_segment(p, &path, next_seq, anchor),
-            None => Self::create_continuing(&path, next_seq, anchor).map(|new_writer| {
-                *self = new_writer;
-            }),
-        };
-
-        match installed {
-            Ok(()) => {
-                // Persist both the rename (archive_live) and the new
-                // live file's dirent in a single dir fsync so recovery
-                // sees a consistent post-rotation layout after a crash.
-                // The rotation is already committed at this point, so a
-                // fsync failure must not surface as a rotation failure
-                // — see `DirFsyncRetry` for why; a failure is retried
-                // from the flush path.
-                self.dir_fsync_retry.after_rotation(&path);
-                // Drop the sealed segment's allocation padding (see
-                // `compact_archive` for why). Best-effort — the
-                // rotation is committed either way.
-                crate::segment::compact_archive(&archived, sealed_end);
-                Ok(archived)
-            }
-            Err(e) => {
-                // Best-effort rollback so the next recovery still finds
-                // a live file at the canonical path. If rename-back
-                // fails we surface the original error — recovery's
-                // Phase B handles "archive present, no live" but the
-                // in-process writer is unusable.
-                if let Err(restore_err) = std::fs::rename(&archived, &path) {
-                    tracing::warn!(
-                        "rotate_segment: rename-back failed after segment install error: \
-                         original={e}, restore={restore_err}"
-                    );
-                } else if let Err(fsync_err) = crate::segment::fsync_parent_dir(&path) {
-                    // The rename succeeded but the dirent isn't durable
-                    // yet. A crash here would leave recovery seeing the
-                    // archive without the restored live, the same
-                    // Phase-B state the success-path fsync protects
-                    // against. Best-effort: log and surface the
-                    // original error.
-                    tracing::warn!(
-                        "rotate_segment: dir fsync after rename-back failed: \
-                         original={e}, fsync={fsync_err}"
-                    );
-                }
-                Err(e)
-            }
-        }
+        let archived = self.segment.rotate(prepared, next_seq, anchor)?;
+        self.encoder.begin_segment(next_seq, anchor);
+        Ok(archived)
     }
-
-    /// Point this writer at a freshly prepared (zero-filled) segment
-    /// file, keeping the writer's own buffers.
-    ///
-    /// Mirrors `SectorWriter::install_new_segment`: all fallible work
-    /// (rename, header pwrite, fsync) happens before any field is
-    /// assigned, so on error the writer continues on the current
-    /// segment unchanged — the caller's rename-back rollback restores
-    /// the archived live file.
-    ///
-    /// Installing in place (rather than `*self = create_continuing(…)`)
-    /// also keeps the existing `batch_buf` allocation instead of
-    /// building a throwaway replacement per rotation.
-    fn install_prepared_segment(
-        &mut self,
-        prepared: crate::preparer::PreparedSegment,
-        live_path: &Path,
-        starting_sequence: u64,
-        anchor_hash: [u8; 32],
-    ) -> Result<(), JournalError> {
-        let crate::preparer::PreparedSegment {
-            file,
-            path: staging_path,
-            allocated_end,
-            sector_size,
-        } = prepared;
-
-        // Mode guard: a sector-mode staging file carries an O_DIRECT
-        // handle and unwritten extents — adopting it here would fail
-        // with EINVAL on the first unaligned pwrite (after the commit
-        // point) and silently lose the pre-written-extents property.
-        // Zero-fill mode marks itself with `sector_size == 0`. Erroring
-        // out lands the caller on its sync-fallback rollback path.
-        if sector_size != 0 {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "prepared segment was staged in sector mode; BufferedWriter requires zero-fill",
-            )));
-        }
-
-        // Write the file header into the staging file *before* the
-        // rename, so the file appearing at the live path is always
-        // complete. The reverse order would open a window where a
-        // header-write failure plus a failed rename-back leaves an
-        // all-zeros live file that recovery rejects as invalid instead
-        // of handling as the "no live file" Phase-B case. The staging
-        // file is zero-filled including `[0, ENTRY_OFFSET)`, so this
-        // pwrite lands in already-written extents like every append
-        // after it.
-        let mut header_buf = [0u8; MAX_SECTOR_SIZE];
-        codec::encode_file_header(
-            &mut header_buf,
-            MAX_SECTOR_SIZE,
-            starting_sequence,
-            anchor_hash,
-        );
-        write_all_at(&file, &header_buf, 0)?;
-        // Commit the header durably before the rename — a crash before
-        // the next user write must still leave a parseable empty
-        // journal, matching `create_continuing`. `sync_data`, not
-        // `sync_all`: this runs on the journal thread at every
-        // rotation, and a full fsync forces the filesystem log for the
-        // timestamp metadata — the stall class this whole design
-        // removes. The header pwrite changes no file size (the staging
-        // file is pre-written to full length) and no allocation (the
-        // extents are written), so the data-only flush covers
-        // everything the header needs; the preparer already made the
-        // file's size and allocation durable at staging time.
-        file.sync_data()?;
-
-        // Rename staging onto the live path. `archive_live` has already
-        // moved the previous live segment aside, so the destination is
-        // free. On failure the fully-written staging file stays on disk
-        // for the next preparer cycle to reclaim.
-        std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
-
-        // Commit point — nothing below can fail. Dropping the old
-        // `self.file` closes the outgoing (now archived) segment's fd.
-        self.file = file;
-        self.write_pos = HEADER_OFFSET;
-        self.allocated_end = allocated_end;
-        self.starting_sequence = starting_sequence;
-        self.batch_len = 0;
-        self.last_user_entry_offset = 0;
-        self.last_user_entry_len = 0;
-        #[cfg(feature = "hash-chain")]
-        {
-            self.hash_chain = SegmentChain::new(anchor_hash);
-        }
-        #[cfg(debug_assertions)]
-        {
-            self.last_encoded_seq = 0;
-        }
-        Ok(())
-    }
-
-    /// Extend the file's pre-allocated region whenever the next write
-    /// would land past it. Allocates one chunk at a time via
-    /// `posix_fallocate` — extent allocation only, no zero-fill cost.
-    /// In the prepared-segment flow this only fires when a segment
-    /// outgrows its pre-zeroed region (threshold overshoot past the
-    /// preparer's margin, or a replica following larger-than-expected
-    /// primary segments) — appends past here generate extent-conversion
-    /// metadata again until the next rotation.
-    fn ensure_allocated(&mut self) -> Result<(), JournalError> {
-        let need = self.write_pos + self.batch_len as u64;
-        if need <= self.allocated_end {
-            return Ok(());
-        }
-        self.allocated_end = fallocate_chunk(&self.file, self.allocated_end)?;
-        Ok(())
-    }
-}
-
-/// Pre-allocate one chunk of disk blocks starting at `from`. Returns
-/// the new end-of-allocation offset.
-///
-/// Allocates only the new range — not `[0, from + chunk)` — so the
-/// fallocate call doesn't walk the entire extent tree on every
-/// extension as the journal grows.
-fn fallocate_chunk(file: &File, from: u64) -> Result<u64, JournalError> {
-    let chunk = prealloc_chunk_bytes();
-    rustix::fs::fallocate(
-        file.as_fd(),
-        rustix::fs::FallocateFlags::empty(),
-        from,
-        chunk,
-    )
-    .map_err(|e| JournalError::Io(std::io::Error::from_raw_os_error(e.raw_os_error())))?;
-    Ok(from + chunk)
-}
-
-/// Write `buf` in full at `offset`, retrying short writes. `pwrite`
-/// can return fewer bytes than requested on signal interruption or
-/// when the kernel decides to split a large write; we loop until the
-/// whole buffer is on its way.
-fn write_all_at(file: &File, buf: &[u8], offset: u64) -> Result<(), JournalError> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = file
-            .write_at(&buf[written..], offset + written as u64)
-            .map_err(JournalError::Io)?;
-        if n == 0 {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "buffered journal write returned 0",
-            )));
-        }
-        written += n;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prealloc::prealloc_chunk_bytes;
     use crate::reader::JournalReader;
     use crate::write::JournalWrite;
     use melin_app::CodecError;
@@ -949,7 +601,7 @@ mod tests {
         assert_eq!(writer.next_sequence(), seq_before_rotate);
         // The adopted segment's pre-zeroed region is the allocation —
         // appends must not immediately re-fallocate.
-        assert_eq!(writer.allocated_end, zeroed_end);
+        assert_eq!(writer.segment.allocated_end(), zeroed_end);
         // The staging file is gone (renamed onto the live path).
         assert!(!crate::preparer::staging_path(&path).exists());
 
@@ -960,63 +612,6 @@ mod tests {
         // Same observable layout as the sync-rotation test above.
         assert_eq!(read_all_payloads(&path), vec![3]);
         assert_eq!(read_all_payloads(&archived), vec![1, 2]);
-    }
-
-    /// Mode guard: a sector-mode staging file (O_DIRECT handle,
-    /// unwritten extents) must be *rejected*, not adopted — adopting
-    /// one fails on the first unaligned pwrite after the commit point
-    /// and silently loses the pre-written-extents property this mode
-    /// exists for. The failed rotation must roll back cleanly: live
-    /// segment back at the canonical path, no archive left behind,
-    /// writer still usable.
-    #[test]
-    fn rotate_with_sector_prepared_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.journal");
-
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        writer.append(&sample(1)).unwrap();
-
-        // Wrong mode on purpose: the *sector* writer's preparer.
-        let preparer = crate::preparer::SegmentPreparer::spawn(path.clone(), 4096, 0);
-        let mut prepared = None;
-        for _ in 0..500 {
-            if let Some(p) = preparer.take() {
-                prepared = Some(p);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let prepared = prepared.expect("preparer should stage a segment within 5 s");
-        assert_ne!(
-            prepared.sector_size, 0,
-            "sector staging carries a non-zero sector size"
-        );
-
-        let err = writer
-            .rotate_segment_with_prepared(prepared)
-            .expect_err("sector staging must not be adopted by the buffered writer");
-        assert!(
-            err.to_string().contains("sector mode"),
-            "unexpected error: {err}"
-        );
-
-        assert!(path.exists(), "rename-back must restore the live segment");
-        assert!(
-            crate::segment::list_archives(&path).unwrap().is_empty(),
-            "a rejected rotation must leave no archive behind"
-        );
-
-        // Still usable on the original segment.
-        writer.append(&sample(2)).unwrap();
-        drop(writer);
-        preparer.shutdown();
-
-        assert_eq!(
-            read_all_payloads(&path),
-            vec![1, 2],
-            "both entries must survive the rejected rotation"
-        );
     }
 
     /// A crash between prepared adoption and the first append must
@@ -1133,9 +728,7 @@ mod tests {
 
         // The full encoded entry is [magic(2) | header | payload | CRC(4)].
         // The replication slice strips the leading magic and trailing CRC.
-        let entry_start = writer.last_user_entry_offset;
-        let entry_end = entry_start + writer.last_user_entry_len;
-        let full = &writer.batch_buf[entry_start..entry_end];
+        let full = writer.encoder.last_user_entry_bytes(&writer.batch_buf);
         let repl = writer.last_user_entry_replication_slice();
         assert_eq!(repl.len(), full.len() - 6);
         assert_eq!(repl, &full[2..full.len() - 4]);

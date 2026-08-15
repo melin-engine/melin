@@ -14,9 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tracing::{debug, error, info, warn};
 
 use melin_app::Application;
-use melin_journal::JournalWrite;
+use melin_journal::BufferedWriter;
 use melin_journal::replication::ReplicationConsumer;
-use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
 use super::auth::{
     AuthChallenge, AuthOutcome, AuthTransport, PolledAuthStream, authenticate_with_primary,
@@ -1044,7 +1043,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
 /// The protocol is identical to `run_receiver` — same wire format, same
 /// fsync-then-ack-then-replay pattern. Only the I/O primitives differ.
 #[allow(clippy::too_many_arguments)]
-pub fn run_receiver_dpdk<A, W>(
+pub fn run_receiver_dpdk<A>(
     mut transport: melin_dpdk::DpdkTransport,
     primary_ip: std::net::Ipv4Addr,
     primary_port: u16,
@@ -1065,20 +1064,18 @@ pub fn run_receiver_dpdk<A, W>(
     // ...) alongside the empty-app constructor.
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-) -> ReceiverResult<A, W>
+) -> ReceiverResult<A, BufferedWriter<A::Event>>
 where
     A: Application + Send + 'static,
     A::Event: Send + Sync + 'static,
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
-    W: JournalWrite<A::Event> + Send + 'static,
-    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
     // Recover local state from journal whenever any segment survives —
     // live OR archived; fresh replicas get `(None, None, 0, zeros)`.
     // See `recover_replica_state` for the lineage rules.
     let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
-        recover_replica_state::<A, W>(
+        recover_replica_state::<A, BufferedWriter<A::Event>>(
             journal_path,
             &snapshot_path,
             factory.as_ref(),
@@ -1120,7 +1117,7 @@ where
     // None = no pipeline yet (first iteration, or just torn down for
     // snapshot transfer); Some = running pipeline with threads + atomics
     // we can read for the next reconnect handshake.
-    let mut pipeline: Option<ReplicaPipelineHandles<A, W>> = None;
+    let mut pipeline: Option<ReplicaPipelineHandles<A, BufferedWriter<A::Event>>> = None;
 
     // --- Outer reconnect loop ---
     //
@@ -1156,7 +1153,7 @@ where
         // exactly once.
         if shutdown.load(Ordering::Relaxed) {
             if let Some(p) = pipeline.take() {
-                let _ = teardown_replica_pipeline::<A, W>(p);
+                let _ = teardown_replica_pipeline::<A, BufferedWriter<A::Event>>(p);
             }
             return Ok(None);
         }
@@ -1305,7 +1302,7 @@ where
         macro_rules! fatal_err_dpdk {
             ($msg:expr) => {{
                 if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline::<A, W>(p);
+                    let _ = teardown_replica_pipeline::<A, BufferedWriter<A::Event>>(p);
                 }
                 return Err($msg);
             }};
@@ -1447,7 +1444,8 @@ where
         // byte-identical to the primary's, and adopted `Rotate`
         // boundaries keep it that way across rotations (bitwise mirror).
         if pipeline.is_none() && journal_writer.is_none() {
-            let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
+            let writer =
+                BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
             let mut fresh = factory.empty();
             factory.apply_operator_policy(&mut fresh);
             exchange = Some(fresh);
@@ -1477,7 +1475,7 @@ where
                 tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
             }
 
-            pipeline = Some(build_replica_pipeline_with_threads::<A, W>(
+            pipeline = Some(build_replica_pipeline_with_threads::<A>(
                 cur_exchange,
                 cur_writer,
                 cores,

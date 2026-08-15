@@ -73,11 +73,12 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 ///
 /// v12 → v13: entry offset fixed at [`ENTRY_OFFSET`] (= [`MAX_SECTOR_SIZE`]
 /// = 4096) regardless of the device's logical sector size, so journals
-/// can be opened under either [`crate::SectorWriter`] (O_DIRECT) or
-/// [`crate::BufferedWriter`] (page cache + fdatasync) without
-/// recreation. The header's `sector_size` field is now always 4096 in
-/// newly-written files; SectorWriter derives its O_DIRECT alignment
-/// from the device (`detect_sector_size`) rather than the header.
+/// written by the then-current O_DIRECT writer and by
+/// [`crate::BufferedWriter`] (page cache + fdatasync) are mutually
+/// readable without recreation. The header's `sector_size` field is
+/// always 4096 in newly-written files. The O_DIRECT writer has since
+/// been retired, but journals it wrote still open unchanged — the
+/// field is retained so those files keep decoding.
 ///
 /// v13 → v14: hash-chain metadata moved out of the entry stream. The
 /// file header gained `starting_sequence`, `anchor_hash`, and its own
@@ -242,8 +243,10 @@ pub const MAX_PAYLOAD_SIZE: usize = u16::MAX as usize - 17;
 ///
 /// `buf` must be exactly `sector_size` bytes long. Writes the meaningful
 /// fields into the first `FILE_HEADER_FIELDS_SIZE` bytes and zero-fills
-/// the rest, so the buffer can be written directly as one sector-aligned
-/// O_DIRECT pwrite. `sector_size` must be 512 or 4096.
+/// the rest, so the whole header region goes out as one pwrite.
+/// `sector_size` must be 512 or 4096 — new journals always use
+/// [`MAX_SECTOR_SIZE`]; the smaller value stays supported so headers
+/// written before the offset was fixed still decode.
 ///
 /// `starting_sequence` is the sequence the segment's first entry will
 /// carry; `anchor_hash` seeds the segment's hash chain (zeros when the

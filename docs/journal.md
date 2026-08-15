@@ -188,12 +188,9 @@ Expires all GTD orders with `expiry_ns <= timestamp_ns`.
 
 ### Write Path
 
-The journal stage offers two write paths, selected at startup via `--journal-writer`:
+Each batch is written with `pwrite` plus `fdatasync`, on the journal's disk thread — the sequencing thread hands the batch over and moves on, so encoding and the replica feed keep flowing while the device works. This is honest durability on any drive: `fdatasync` flushes the page cache to the drive and waits for the drive to acknowledge a flush of its own write cache. When it returns, every byte in the batch is in non-volatile storage regardless of whether the drive has power-loss protection — the kernel always issues a flush command (`REQ_OP_FLUSH`) to the device, and the device must acknowledge it before the syscall returns. On a drive with a volatile write cache the flush physically flushes the cache to media; on a PLP drive with the volatile write cache disabled (`VWC=0`) the flush is a near-no-op, because the device acknowledges writes only once the capacitor protects them.
 
-- **`buffered`** *(default, production)* — `pwrite` plus `fdatasync` per batch. Honest durability on any drive: `fdatasync` flushes the page cache to the drive and waits for the drive to acknowledge a flush of its own write cache. Latency: ~10–30 µs per batch on PLP NVMe, ~50–200 µs on consumer NVMe.
-- **`sector`** *(experimental)* — `pwrite` with `O_DIRECT`, no `fdatasync`. Bypasses the page cache and skips the device-level flush command. Durability depends entirely on the drive having capacitor-backed Power Loss Protection (PLP) with the volatile write cache disabled (`VWC=0`). Latency: ~5–15 µs per batch. **Silently loses acknowledged writes on power loss without PLP**, and shows unresolved ~1 Hz tail-latency spikes on some NVMe firmware. Not recommended for production.
-
-See [Journal Writer Modes](journal-writer-modes.md) for the full operator decision guide, PLP verification commands, and migration procedure.
+Latency: ~10–30 µs per batch on PLP NVMe, ~50–200 µs on consumer NVMe, where the device flush dominates.
 
 ### Pre-allocation
 
@@ -201,7 +198,9 @@ On creation and when space runs low, the writer calls `posix_fallocate` to exten
 
 ### Batch Amortization
 
-In the pipeline architecture, the journal stage reads a batch of events from the disruptor, encodes them all into a contiguous buffer, and issues a single `pwrite` for the batch. Under load, one write covers many events. The disruptor naturally accumulates events while the previous write is in flight, providing implicit batching without any artificial delay.
+In the pipeline architecture, the journal stage reads a batch of events from the disruptor, encodes them all into a contiguous buffer, and hands it to the disk thread, which issues a single `pwrite` for the batch. Under load, one write covers many events. The disruptor naturally accumulates events while the previous write is in flight, providing implicit batching without any artificial delay.
+
+Batches that queue up behind a slow device coalesce further: the disk thread writes every batch waiting for it and then issues **one** `fdatasync` covering all of them. A backlog built up during a stall therefore costs a single sync to clear, not one per batch.
 
 An explicit group commit delay (`group_commit_delay`) can be configured but is set to zero for TCP. Testing showed that any delay hurts TCP throughput because it holds the journal cursor longer, stalling the response stage. It only helps with UDS transport where response sends are near-free.
 
@@ -379,7 +378,7 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 - **Journal and Matching run in parallel** on the same events. Matching does not wait for the journal — it executes immediately. This overlaps matching latency with journal I/O latency.
 - **Response Stage gates on the journal cursor** — it will not send a response to the client until the journal stage has committed (synced) that event's sequence number. This enforces persist-before-ack without blocking the matching engine.
 - **Input ring capacity**: 1,048,576 slots (~72 bytes each, ~72 MiB). At 10M orders/sec, this provides ~100 ms of buffering.
-- **Max journal batch**: 1,024 events per sync. Limits encoding time before the sync call, bounding worst-case latency.
+- **Max journal batch**: 4,096 events per batch handed to the disk thread. Limits encoding time before hand-off, bounding worst-case latency. One `fdatasync` may cover several such batches when the device is behind.
 
 ### Feature Gates
 
@@ -407,7 +406,7 @@ Both the journal and snapshot have independent `format_version` fields. Current 
 | 8 | Added `post_only` flag to Limit order type (wire tag=4); `LimitPostOnly` variant |
 | 9 | Added `ExpireOrders` (tag=15), `EndOfDay` (tag=14), `DisableInstrument` (tag=16), `EnableInstrument` (tag=17), `RemoveInstrument` (tag=18); conditional `expiry_ns` in Order encoding for GTD; Day and GTD time-in-force variants |
 | 10-12 | Per-entry `key_hash` + `request_seq` metadata (idempotency dedup); transport/application event-tag split |
-| 13 | Entry offset fixed at 4096 regardless of device sector size, so journals are interchangeable between the buffered and O_DIRECT writers |
+| 13 | Entry offset fixed at 4096 regardless of device sector size. Journals stay interchangeable across devices, and across the writer change that followed — the since-retired O_DIRECT writer produced this same layout |
 | 14 | Chain metadata moved out of the entry stream: file header gained `starting_sequence`, `anchor_hash`, and a header CRC; `GenesisHash` and `Checkpoint` entry tags retired. The chain is anchored per segment and schedule-free; sequence numbers are dense over real events |
 
 ### Snapshot Version History
@@ -496,6 +495,18 @@ Adding a field to an existing event (as done in v1→v2 with `SelfTradeProtectio
 Inserting a field in the middle or changing field sizes breaks all entries in the file. Appending is always safe and preferred.
 
 ## Operational Notes
+
+### Watching the disk keep up
+
+`melin_journal_disk_lag_batches` on `/metrics` is the number of batches handed to the journal's disk thread that are not yet durable.
+
+- **0** in steady state: the device finishes each batch before the next one arrives.
+- **Briefly non-zero** under load bursts or a slow flush: normal, and precisely what the split is for — the sequencer kept ordering, encoding, and feeding replicas through it.
+- **Sustained, and climbing toward 64** (the hand-off depth): the device is not keeping up with the write rate. At the depth the sequencer stalls at its next batch, the input ring fills, and clients feel backpressure. Alert here, not on the metric merely being non-zero.
+
+A sustained non-zero lag with a healthy device usually means the journal is sharing a device with something else, or `journal-disk` is unpinned and competing for its core.
+
+Two related signals: `melin_journal_rotations_total{path="sync_fallback"}` climbing means segment staging is falling behind (see [Journal Rotation & Recovery](journal-rotation.md)), and under a `local` durability policy a stalled device shows up directly as client latency, because no replica can supply the durability the gate needs.
 
 ### Journal File Growth
 

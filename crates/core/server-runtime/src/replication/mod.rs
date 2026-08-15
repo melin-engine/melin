@@ -60,8 +60,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use melin_journal::JournalWrite;
-use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
+use melin_journal::{BufferedWriter, JournalWrite};
 
 use melin_app::Application;
 use melin_transport_core::pipeline::{InputSlot, OutputSlot};
@@ -314,8 +313,8 @@ pub(super) enum TeardownOutcome<A, W> {
     Panicked,
 }
 
-/// Shut down the replica pipeline and extract Exchange + SectorWriter from
-/// the stage threads.
+/// Shut down the replica pipeline and extract Exchange + journal writer
+/// from the stage threads.
 ///
 /// Relies on the caller having published a `JournalEvent::Shutdown`
 /// sentinel to the input ring before invoking this — the journal and
@@ -414,13 +413,20 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// [`ReplicaPipelineHandles`] over the journal's writer — the only
+/// instantiation that exists. The struct keeps its writer parameter
+/// because the teardown helpers are writer-agnostic plumbing; this
+/// alias spares every signature from spelling the concrete type out.
+pub(super) type ReplicaHandles<A> =
+    ReplicaPipelineHandles<A, BufferedWriter<<A as Application>::Event>>;
+
 /// Build the replica pipeline and spawn its stage threads on the configured
 /// cores. Returns the bundle of state the orchestrator keeps across
 /// `Disconnected` reconnects.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_replica_pipeline_with_threads<A, W>(
+pub(super) fn build_replica_pipeline_with_threads<A>(
     exchange: A,
-    writer: W,
+    writer: BufferedWriter<A::Event>,
     cores: crate::server::PipelineCores,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
@@ -433,14 +439,12 @@ pub(super) fn build_replica_pipeline_with_threads<A, W>(
     // thread's failure wrapper, alongside the per-pipeline
     // `journal_failed` latch.
     pipeline_healthy: Arc<AtomicBool>,
-) -> Result<ReplicaPipelineHandles<A, W>, Box<dyn std::error::Error>>
+) -> Result<ReplicaHandles<A>, Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
     A::Event: Send + Sync + 'static,
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
-    W: JournalWrite<A::Event> + Send + 'static,
-    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
     let shadow_exchange = <A as Application>::clone_via_snapshot(&exchange)?;
 
@@ -471,6 +475,7 @@ where
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     journal_stage.set_stream_marks(Arc::clone(&stream_marks));
     journal_stage.set_preparer_core(cores.journal_prep);
+    journal_stage.set_disk_core(cores.journal_disk);
     let journal_failed = Arc::new(AtomicBool::new(false));
     let journal_failed_latch = Arc::clone(&journal_failed);
     // A fresh pipeline is healthy — this also clears the latch after a
@@ -583,7 +588,7 @@ where
 }
 
 /// Tear down the pipeline: publish the shutdown sentinel, join all
-/// threads, return the recovered (App, SectorWriter) so the orchestrator
+/// threads, return the recovered (App, journal writer) so the orchestrator
 /// can use them for the next pipeline build (e.g., post-snapshot) or
 /// pass them up on promotion.
 pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send + 'static>(

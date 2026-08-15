@@ -87,7 +87,7 @@ pub struct Handshake {
 /// `crate::durability_policy`):
 ///
 /// - `acked_sequence` — highest sequence persisted on the replica
-///   (`O_DIRECT` `pwrite` returned, durable behind PLP).
+///   (`pwrite` and `fdatasync` returned, durable on any drive).
 /// - `in_memory_sequence` — highest sequence the replica has accepted
 ///   into its pipeline pre-journal. Always `>= acked_sequence`.
 #[derive(Debug, Clone, Copy)]

@@ -27,7 +27,7 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
    - **io_uring**: the reader arms an `IORING_OP_TIMEOUT` SQE at the cadence; the deadline wakes `submit_and_wait` even when no client traffic is flowing, and the loop emits a `JournalEvent::Tick { now_ns }` when the deadline passes.
    - **DPDK**: the poll thread compares the wall clock to the deadline once every ~4096 poll iterations (negligible cost on a 100% busy spin loop) and emits the tick the same way.
 2. **Tick semantics** -- the matching stage advances its scheduler clock from `slot.timestamp_ns` on every event, so under load each order/cancel implicitly fires due tasks at microsecond precision. The 250 ms tick is the safety net that keeps time moving forward during quiet periods (no client traffic).
-3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwrite` + `O_DIRECT` (PLP drives required). Advances its cursor only after the write completes.
+3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwrite` + `fdatasync`. Advances its cursor only after the write is durable.
 4. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
 5. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
 6. **Event publisher** (optional) -- second consumer on the output ring, enabled by `--event-bind`. Broadcasts all execution events to TCP subscribers for market data gateways, analytics, and audit loggers. Ed25519 auth required.
@@ -209,21 +209,29 @@ Because the journal and matching consumers are gated only on the producer, they 
 
 Defined in `crates/core/transport-core/src/pipeline.rs` as `JournalStage`.
 
-The journal stage runs on a dedicated OS thread and is responsible for making every event durable before it can be acknowledged to clients. It uses `read_batch` + `commit` (not `consume_batch`) to decouple reading from cursor advancement -- the cursor is advanced only **after** the durable write completes.
+The journal stage is responsible for making every event durable before it can be acknowledged to clients. It runs on **two** dedicated OS threads -- a sequencing thread and a disk thread (see [The journal's two threads](#the-journals-two-threads)). Reading from the input ring is decoupled from advancing the progress cursor, and the cursor is advanced only **after** the durable write completes -- by the disk thread, which is the only one that knows when that moment is.
 
 ### Processing loop
 
-1. Call `consumer.read_batch()` to copy up to `MAX_JOURNAL_BATCH` (1,024) events from the ring buffer into a local array. This does not advance the consumer's progress cursor.
-2. Batch-encode all events into the `SectorWriter`'s internal buffer. `QueryStats` events are skipped (they cause no state change and are not journaled).
-3. When a sync trigger fires, call `flush_batch_sync()` which issues a single `pwritev2` with `RWF_DSYNC` (Force Unit Access) -- combining write + sync into one syscall. On NVMe with power-loss protection, this achieves approximately 10-100 us sync latency instead of the approximately 1-7 ms of full cache flushes via `fdatasync`.
-4. Call `consumer.commit(pending)` to advance the progress cursor, making the journal's position visible to the response stage.
+The sequencing thread:
+
+1. Borrows up to `MAX_JOURNAL_BATCH` (4,096) events in place from the input ring — no copy out of the ring. This does not advance the progress cursor.
+2. Batch-encodes them directly into a slot of the hand-off ring shared with the disk thread. Queries are skipped (they cause no state change and are not journaled), and each encoded entry is also appended to the batch being sent to replicas.
+3. When a sync trigger fires, publishes the slot -- the batch's bytes plus everything the disk thread must make true once it is durable. This does not wait for the device; the sequencing thread returns immediately to reading and encoding.
+
+The disk thread:
+
+4. Writes every published batch (`pwrite`), then issues a single `fdatasync` covering all of them. A backlog therefore costs one sync to clear, not one per batch. The call returns only once the kernel reports the data is on stable media: approximately 10-30 us on NVMe with power-loss protection, approximately 50-200 us on consumer drives where the device flush dominates.
+5. Publishes the durability cursors -- including the input-ring progress the response stage's gate reads -- and only then releases the hand-off slots.
+
+The hand-off ring holds 64 batches. A device stall is absorbed up to that depth before the sequencing thread stalls at its next batch and producers feel backpressure.
 
 ### Sync triggers
 
-A batch is synced when any of:
-- The batch reaches `MAX_JOURNAL_BATCH` (1,024 events)
+A batch is handed to the disk thread when any of:
+- The batch reaches `max_batch` (`MAX_JOURNAL_BATCH` = 4,096 events by default)
 - The group commit delay has elapsed since the first unsynced write
-- Group commit delay is zero (sync immediately after each read batch)
+- Group commit delay is zero (hand over after each read batch)
 
 ### Group commit delay
 
@@ -237,7 +245,7 @@ When no events are available, the journal stage uses adaptive spinning: 1,000 `s
 
 ### Shutdown
 
-On shutdown, the journal stage flushes any pending data, then drains all remaining entries from the ring buffer (encoding and syncing each batch), ensuring no event is lost.
+On shutdown, the journal stage hands over any pending data, then drains all remaining entries from the ring buffer (encoding each batch and handing it over), waits for the disk thread to make every one of them durable, and stops it. No event is lost, and the process does not exit before the last batch is on stable media.
 
 ## Matching Stage
 
@@ -342,11 +350,12 @@ The SPSC uses two cache-line-padded atomic counters (`head` and `tail`) for coor
 
 ## Threading Model
 
-The server spawns three always-on pipeline threads plus one reader thread, and up to six more depending on configuration:
+The server spawns four always-on pipeline threads plus one reader thread, and up to six more depending on configuration:
 
 | Thread | Default Core | Role | Optional? |
 |--------|-------------|------|-----------|
-| Journal | 1 | Durable write-ahead log | No |
+| Journal | 1 | Sequencing, encoding, hash chain, replica feed | No |
+| Journal Disk | 11 | Writes and syncs the journal; publishes durability | No |
 | Matching | 2 | Order execution (single-writer) | No |
 | Response | 3 | Client socket writes | No |
 | Reader | 4 | io_uring-based connection multiplexing + tick generation | No |
@@ -356,7 +365,22 @@ The server spawns three always-on pipeline threads plus one reader thread, and u
 | Repl Handler 0/1 | 8, 9 | Per-replica connection handling | Yes (one per connected replica) |
 | Segment Preparer | 10 | Pre-stage the next journal segment off the rotation path | Yes (recurring rotation only) |
 
-Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core, or be left unpinned with `0`; only the four mandatory threads need a core to themselves.
+Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core, or be left unpinned with `0`; only the five mandatory threads need a core to themselves.
+
+### The journal's two threads
+
+The journal stage runs on two threads, and the division decides what a disk stall can and cannot stop:
+
+- **Journal** orders events, assigns sequence numbers, encodes entries, extends the hash chain, and hands batches to replicas. All in memory — it issues no device call.
+- **Journal Disk** writes each batch (`pwrite`), syncs it (`fdatasync`), and then publishes the cursors that mean *durable*: the durable wire sequence the response gate reads, the input-ring progress a replica's acks are gated on, and the post-fsync state snapshots and handshakes consume.
+
+Publication happens on the disk thread because only it knows when a batch became durable. Publishing at hand-off time would let a replica acknowledge entries its disk had not taken.
+
+The practical consequence: while the device is slow, the sequencer keeps ordering, encoding, and **feeding replicas**. Under a durability policy that can be satisfied by a replica (`hybrid`), acknowledgements continue through the replica leg during a local stall. Under `local` they wait, correctly — but the stall now shows up as journal disk lag rather than a frozen pipeline.
+
+Absorption is bounded by the hand-off ring (64 batches). Past that the sequencer stalls at its next batch, the input ring fills, and producers backpressure — the same chain as before, with a deeper buffer in front of it. Watch `melin_journal_disk_lag_batches`.
+
+Give the disk thread a core on the same CCD as the journal thread: the two exchange a cache line per batch, and a cross-CCD transfer adds roughly 100 ns to each. On a box that cannot spare the core, leave the entry off (or `0`) — the thread then floats on the shared mask at default scheduling; it still spins and still makes progress, but it competes for whatever core it lands on.
 
 ### CPU core pinning
 
@@ -383,7 +407,7 @@ Without this invariant, a crash between matching and journal sync could cause:
 
 ### How it is enforced
 
-1. The journal stage reads events from the input disruptor and writes them to disk. Its consumer progress cursor advances **only after** `flush_batch_sync()` completes (durable write confirmed by the kernel/NVMe controller).
+1. The journal stage reads events from the input disruptor, encodes them, and hands each batch to the disk thread, which writes and syncs it. The consumer progress cursor advances **only after** that sync completes (durable write confirmed by the kernel/NVMe controller), and it is the disk thread that advances it.
 2. The matching stage stamps each response with the journal sequence number of the event that produced it. Query responses are stamped with the last event applied before the query, since that is the state they report.
 3. The response stage spin-waits until the durable position reaches that number — for each response individually, not once per batch.
 4. Only then is that response encoded and written to its client socket.
@@ -394,7 +418,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3,4,5,6,7,8,9,10` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep (comma-separated). 0 = unpinned. The tenth entry is optional — a 9-entry value parses and leaves the segment preparer unpinned. |
+| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep, journal-disk (comma-separated). 0 = unpinned. The last two entries are optional — a 9- or 10-entry value still parses, leaving the omitted threads unpinned, so a configuration written before either existed keeps working. Place journal-disk on the same CCD as journal. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |
@@ -415,7 +439,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 |----------|-------|----------|
 | `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
 | `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
-| `MAX_JOURNAL_BATCH` | `1024` | `crates/core/transport-core/src/pipeline.rs` |
+| `MAX_JOURNAL_BATCH` | `4096` | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_BATCH` (response) | `1024` | `crates/core/server-runtime/src/response.rs` |
 | `MAX_RESPONSE_BUF` | `512` bytes | `crates/core/server-runtime/src/response.rs` |
 | `NUM_BUFFERS` | `2048` | `crates/core/server-runtime/src/reader.rs` (io_uring provided buffer pool) |

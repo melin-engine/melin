@@ -307,6 +307,20 @@ loop restructured so the borrow ends before each barrier. Worth doing, but
 not a mechanical change — and correctness here is load-bearing (the
 deferred-commit-until-fsync contract).
 
+**Resolved (2026-08)** — with one correction to the proposal above:
+`commit_consumed` must NOT be used here. It publishes the progress
+counter at consume time, and after the journal-disk split that counter
+means *durable* (it is the replica ack gate) — the disk thread owns it.
+What shipped instead is `Consumer::read_contiguous`, the borrow analog
+of `read_batch`: slots are borrowed in place, `next_read` advances, the
+progress counter does not move (pinned by
+`ring::tests::read_contiguous_never_publishes_progress`). The run
+truncates at the ring's wrap point so callers stay single-slice — one
+shorter batch per lap of the ring, nothing more. The borrow conflict was
+resolved by splitting the sequencer into the consumer plus a
+`SequencerCore` holding everything else, so the borrowed slice and the
+core's `&mut` methods go through disjoint fields.
+
 **Same shape, cheaper fix:** `response.rs:178` copies up to 1024
 `OutputSlot`s out of the SPSC per iteration, because `spsc::Consumer` has
 no `peek_batch` counterpart to the disruptor's. Adding one to

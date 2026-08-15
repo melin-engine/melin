@@ -671,7 +671,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::sector_writer::SectorWriter;
+    use crate::buffered_writer::BufferedWriter;
     use crate::write::JournalWrite;
     use melin_app::CodecError;
 
@@ -708,7 +708,7 @@ mod tests {
 
     fn write_sample(path: &Path) -> Vec<JournalEvent<TestEvent>> {
         let events = sample_events();
-        let mut writer = SectorWriter::<TestEvent>::create(path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(path).unwrap();
         for event in &events {
             writer.append(event).unwrap();
         }
@@ -719,7 +719,7 @@ mod tests {
     fn open_validates_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
-        let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        let _writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         let _reader = JournalReader::<TestEvent>::open(&path).unwrap();
     }
 
@@ -754,8 +754,7 @@ mod tests {
             header[48..52].copy_from_slice(&crc.to_le_bytes());
             f.seek(SeekFrom::Start(0)).unwrap();
             f.write_all(&header).unwrap();
-            // The writer used O_DIRECT; flush the buffered patch so a
-            // direct-I/O reader can't see a stale page.
+            // Flush the patched header before reopening it below.
             f.sync_all().unwrap();
         }
 
@@ -799,7 +798,7 @@ mod tests {
         let path = dir.path().join("test.journal");
         const N: u64 = 100;
         {
-            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
             for i in 0..N {
                 writer.append(&JournalEvent::App(TestEvent(i))).unwrap();
             }
@@ -824,7 +823,7 @@ mod tests {
     fn no_entries_empty_journal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
-        let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        let _writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
 
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
         assert!(reader.next_entry().unwrap().is_none());
@@ -838,7 +837,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(7))).unwrap();
         }
 
@@ -861,7 +860,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
 
@@ -897,7 +896,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
@@ -949,7 +948,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
@@ -1003,7 +1002,7 @@ mod tests {
         let path = dir.path().join("test.journal");
         {
             // Create the file header only; no user events.
-            let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            let _writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         }
 
         let mut scratch = [0u8; 256];
@@ -1044,7 +1043,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
@@ -1111,7 +1110,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
@@ -1154,7 +1153,7 @@ mod tests {
         {
             // Continue from sequence 100 — header records 100.
             let mut writer =
-                SectorWriter::<TestEvent>::create_continuing(&path, 100, [0u8; 32]).unwrap();
+                BufferedWriter::<TestEvent>::create_continuing(&path, 100, [0u8; 32]).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
 
