@@ -1113,8 +1113,8 @@ impl<E: AppEvent> Sequencer<E> {
                 }
 
                 // Batch-encode all events into the writer's internal buffer.
-                // Data stays in the buffer until the write point — one
-                // O_DIRECT pwrite covers the entire batch.
+                // Data stays in the buffer until the write point — the
+                // disk thread's pwritev covers the entire batch.
                 // QueryStats/QueryPosition are not journaled (no state change).
                 //
                 // The journal stage is the authoritative sequence allocator

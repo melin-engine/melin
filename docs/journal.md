@@ -406,7 +406,7 @@ Both the journal and snapshot have independent `format_version` fields. Current 
 | 8 | Added `post_only` flag to Limit order type (wire tag=4); `LimitPostOnly` variant |
 | 9 | Added `ExpireOrders` (tag=15), `EndOfDay` (tag=14), `DisableInstrument` (tag=16), `EnableInstrument` (tag=17), `RemoveInstrument` (tag=18); conditional `expiry_ns` in Order encoding for GTD; Day and GTD time-in-force variants |
 | 10-12 | Per-entry `key_hash` + `request_seq` metadata (idempotency dedup); transport/application event-tag split |
-| 13 | Entry offset fixed at 4096 regardless of device sector size, so journals are interchangeable between the buffered and O_DIRECT writers |
+| 13 | Entry offset fixed at 4096 regardless of device sector size. Journals stay interchangeable across devices, and across the writer change that followed — the since-retired O_DIRECT writer produced this same layout |
 | 14 | Chain metadata moved out of the entry stream: file header gained `starting_sequence`, `anchor_hash`, and a header CRC; `GenesisHash` and `Checkpoint` entry tags retired. The chain is anchored per segment and schedule-free; sequence numbers are dense over real events |
 
 ### Snapshot Version History

@@ -754,8 +754,7 @@ mod tests {
             header[48..52].copy_from_slice(&crc.to_le_bytes());
             f.seek(SeekFrom::Start(0)).unwrap();
             f.write_all(&header).unwrap();
-            // The writer used O_DIRECT; flush the buffered patch so a
-            // direct-I/O reader can't see a stale page.
+            // Flush the patched header before reopening it below.
             f.sync_all().unwrap();
         }
 

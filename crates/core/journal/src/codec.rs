@@ -243,8 +243,10 @@ pub const MAX_PAYLOAD_SIZE: usize = u16::MAX as usize - 17;
 ///
 /// `buf` must be exactly `sector_size` bytes long. Writes the meaningful
 /// fields into the first `FILE_HEADER_FIELDS_SIZE` bytes and zero-fills
-/// the rest, so the buffer can be written directly as one sector-aligned
-/// O_DIRECT pwrite. `sector_size` must be 512 or 4096.
+/// the rest, so the whole header region goes out as one pwrite.
+/// `sector_size` must be 512 or 4096 — new journals always use
+/// [`MAX_SECTOR_SIZE`]; the smaller value stays supported so headers
+/// written before the offset was fixed still decode.
 ///
 /// `starting_sequence` is the sequence the segment's first entry will
 /// carry; `anchor_hash` seeds the segment's hash chain (zeros when the
