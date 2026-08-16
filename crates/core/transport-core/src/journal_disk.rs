@@ -280,11 +280,18 @@ impl DurabilityCursors {
         self.input_progress
             .get()
             .store(meta.ring_progress, Ordering::Release);
+        // `input_ring_seq` is the SAME position as the progress just
+        // stored — the pair (journal_seq, input_ring_seq) must describe
+        // one prefix. Progress lands first, so between the two stores
+        // the shadow can read progress for this batch beside the
+        // previous batch's `FsyncState`; that stale pair is still
+        // self-consistent, so its alignment gate cannot pass at a ring
+        // position its `journal_seq` does not cover.
         if let Some(ref mut publisher) = self.fsync_state {
             publisher.store(FsyncState {
                 journal_seq: WireSeq::new(meta.journal_seq),
                 chain_hash: meta.chain_hash,
-                input_ring_seq: RingPos::new(meta.input_ring_seq),
+                input_ring_seq: RingPos::new(meta.ring_progress),
             });
         }
         if let Some(ref cursor) = self.durable_wire_seq {
@@ -537,7 +544,6 @@ mod tests {
             journal_seq,
             chain_hash: [journal_seq as u8; 32],
             ring_progress: progress,
-            input_ring_seq: progress,
         }
     }
 

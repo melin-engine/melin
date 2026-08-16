@@ -1725,6 +1725,169 @@ fn mid_batch_barrier_commits_only_the_encoded_prefix() {
     assert_eq!(seqs, vec![1, 2], "only the encoded prefix may be on disk");
 }
 
+/// Regression: the shadow-snapshot double-apply window.
+///
+/// The `FsyncState` pair a mid-batch mark barrier publishes must be
+/// self-consistent — `input_ring_seq` at the encoded prefix, the same
+/// position as ring progress, not the read cursor. It used to be the
+/// read cursor, and two facts then combined into a wrong snapshot:
+///
+/// (a) the barrier's pair claimed a ring position one whole tail past
+///     what its `journal_seq` covered;
+/// (b) `DurabilityCursors::publish` stores ring progress *before* the
+///     seqlock, so when the tail batch became durable there was a window
+///     in which progress already read the tail's end while `FsyncState`
+///     still held the barrier's stale pair.
+///
+/// Inside that window the shadow — gated on journal progress — consumed
+/// through the tail, landed exactly on the stale `input_ring_seq`,
+/// passed the exact-equality alignment gate, and persisted a snapshot
+/// whose state held the tail but whose header resumed recovery from the
+/// prefix — replaying the tail onto itself.
+///
+/// Fixture: same divergence freeze as
+/// `mid_batch_barrier_commits_only_the_encoded_prefix` — the stage
+/// stops with exactly the barrier's pair published through the real
+/// disk thread. Fact (b) is then reconstructed by hand: the first store
+/// of `publish` (progress → tail end) is performed, the second (the
+/// seqlock) is not. The real shadow stage runs against the same ring,
+/// in the window, and must NOT snapshot: it sits at the tail's end,
+/// which the stale pair — now consistent — no longer claims.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
+    use crate::pipeline::FsyncState;
+    use crate::{shadow, snapshot};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shadow_window.journal");
+    let snap_path = dir.path().join("shadow_window.snapshot");
+    let anchor = [0x5Cu8; 32];
+
+    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    // journal(0), shadow(1) gated on journal — the production wiring
+    // (`build_input_disruptor`) minus the matching stage.
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .add_consumer_after(0)
+        .build();
+    let shadow_consumer = consumers.pop().unwrap();
+    let journal_consumer = consumers.pop().unwrap();
+    let progress = journal_consumer.progress_counter();
+    // Lets the test observe how far the shadow has consumed.
+    let shadow_progress = shadow_consumer.progress_counter();
+
+    let mut stage = JournalStage::new(
+        writer,
+        journal_consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        false,
+    );
+    let (fsync_writer, fsync_reader) = melin_pipeline::seqlock::split(FsyncState::default());
+    stage.set_chain_hash_lock(fsync_writer);
+    let marks: crate::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    marks
+        .lock()
+        .unwrap()
+        .push_back(StreamMark::Rotate(AdoptedRotation {
+            boundary_seq: 2,
+            // Wrong tail: barrier submits the prefix, then the quiesced
+            // resolve rejects the rotation and the stage exits with the
+            // barrier's pair as the last thing published.
+            tail_hash: [0xEEu8; 32],
+        }));
+    stage.set_stream_marks(Arc::clone(&marks));
+
+    // One read batch spanning the boundary: seqs 1,2 | 3.
+    for seq in 1..=3u64 {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+    }
+    let shutdown = AtomicBool::new(false);
+    match stage.run(&shutdown) {
+        Err(melin_journal::JournalError::ReplicaChainDivergence { sequence: 2, .. }) => {}
+        Err(e) => panic!("expected divergence at the boundary, got: {e}"),
+        Ok(_) => panic!("a wrong tail hash must be reported as divergence"),
+    }
+
+    // The pair the barrier published: both halves at the encoded
+    // prefix (ring slots 0,1 = seqs 1,2), never the read cursor (3).
+    let barrier = fsync_reader.load();
+    assert_eq!(progress.get().load(Ordering::Acquire), 2, "prefix progress");
+    assert_eq!(
+        barrier.journal_seq.get(),
+        2,
+        "journal_seq covers the prefix"
+    );
+    assert_eq!(
+        barrier.input_ring_seq.get(),
+        2,
+        "input_ring_seq must be the position journal_seq covers, not the read cursor"
+    );
+
+    // The real shadow stage against the same ring. Gated on progress
+    // (2), it consumes seqs 1,2, aligns with the pair, and snapshots
+    // the correct (state, header) — the positive half of the contract.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown2 = Arc::clone(&shutdown);
+    let snap_path2 = snap_path.clone();
+    let handle = std::thread::Builder::new()
+        .name("test-shadow-window".into())
+        .spawn(move || {
+            shadow::run(
+                shadow_consumer,
+                TestApp::new(),
+                snap_path2,
+                Duration::from_millis(20),
+                fsync_reader,
+                &shutdown2,
+                false,
+                0,
+            );
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !snap_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(snap_path.exists(), "the aligned shadow must snapshot");
+    let (restored, journal_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+    assert_eq!(
+        restored.total, 3,
+        "state = Add(1)+Add(2), exactly the prefix"
+    );
+    assert_eq!(journal_seq, 2);
+
+    // Now the window: the disk thread, publishing the tail batch, stores
+    // progress first and the seqlock second. Freeze it between the two.
+    // The shadow consumes seq 3 (state = 6) and sits at next_read == 3
+    // beside a stale pair claiming 2 — the gate must reject, over
+    // several timer intervals, and the file must stay the prefix
+    // snapshot. Before the fix the stale pair claimed 3 and this is
+    // where the shadow wrote (total 6, journal_seq 2).
+    progress.get().store(3, Ordering::Release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while shadow_progress.get().load(Ordering::Acquire) < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shadow must consume the tail once progress reaches it"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Several 20 ms snapshot intervals with the shadow parked at 3.
+    std::thread::sleep(Duration::from_millis(200));
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+
+    let (restored, journal_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+    assert_eq!(
+        (restored.total, journal_seq),
+        (3, 2),
+        "a stale-but-consistent pair must not let the shadow snapshot past its journal_seq"
+    );
+}
+
 /// Regression: a `Rotate` with a trailing `ChainCheck` queued inside
 /// the SAME read batch. After adopting the rotation mid-batch, the
 /// encode loop must re-bound the remaining span at the chain check

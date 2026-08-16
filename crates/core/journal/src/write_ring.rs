@@ -75,12 +75,15 @@ pub struct JournalWriteMeta {
     /// progress once the batch is durable. This is what gates slot
     /// reuse upstream and, on a replica, persisted acks — so it must
     /// never be published before the sync returns.
+    ///
+    /// Also published as `FsyncState.input_ring_seq`, deliberately the
+    /// same value: it is the ring position `journal_seq` covers, and the
+    /// shadow snapshot's alignment gate relies on the two describing
+    /// the same prefix. Publishing the read cursor there instead let a
+    /// mid-batch mark barrier (prefix encoded, tail not) hand the shadow
+    /// a pair whose `journal_seq` covered less than its ring position —
+    /// a snapshot header that under-reported the folded-in events.
     pub ring_progress: u64,
-    /// Input-ring read cursor at the sync point, for
-    /// `FsyncState.input_ring_seq`. Distinct from `ring_progress`: at a
-    /// mid-batch mark barrier only a prefix of the read batch is
-    /// encoded, and progress must not overstate that.
-    pub input_ring_seq: u64,
 }
 
 /// Pre-allocated chunks, one per ring slot.
@@ -353,7 +356,6 @@ mod tests {
             journal_seq,
             chain_hash: [journal_seq as u8; 32],
             ring_progress: journal_seq * 10,
-            input_ring_seq: journal_seq * 10 + 1,
         }
     }
 
@@ -372,7 +374,6 @@ mod tests {
         assert_eq!(consumer.staged_bytes(0), b"hello");
         assert_eq!(got_meta.journal_seq, 7);
         assert_eq!(got_meta.ring_progress, 70);
-        assert_eq!(got_meta.input_ring_seq, 71);
         assert!(
             consumer.stage_ready().is_none(),
             "only one batch was published"

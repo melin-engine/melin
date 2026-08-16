@@ -72,10 +72,12 @@ pub struct FsyncState {
     /// BLAKE3 chain hash after the fsync. `[0u8; 32]` when hash-chain
     /// is disabled.
     pub chain_hash: [u8; 32],
-    /// Input ring read cursor at the batch's sync point, captured by
-    /// the sequencer when it handed the batch over.
-    /// The shadow compares this against its own `next_read` to confirm
-    /// it has caught up to the exact fsync boundary.
+    /// Input ring position one past the last slot `journal_seq` covers
+    /// — the same value the disk thread publishes as journal-consumer
+    /// progress for this batch (not the read cursor, which at a
+    /// mid-batch mark barrier runs ahead of what was encoded). The
+    /// shadow compares this against its own `next_read` to confirm it
+    /// has caught up to exactly the boundary `journal_seq` describes.
     pub input_ring_seq: RingPos,
 }
 
@@ -1058,7 +1060,7 @@ impl<E: AppEvent> Sequencer<E> {
                 // Hand over anything encoded before shutting down.
                 if pending > 0 {
                     let next_read = self.consumer.next_read();
-                    self.core.submit_batch(next_read, next_read)?;
+                    self.core.submit_batch(next_read)?;
                 }
                 self.drain_remaining();
                 self.core
@@ -1199,10 +1201,13 @@ impl<E: AppEvent> Sequencer<E> {
                     // rotates at is exactly the marked entry. The
                     // progress target is the boundary slot's ring
                     // position — NOT the whole read batch, whose tail
-                    // is not encoded yet. (`read_end` — the read cursor
-                    // — is fine as the `input_ring_seq` snapshot: it
-                    // reports where reading stands, and the shadow's
-                    // alignment check treats it conservatively.)
+                    // is not encoded yet. The same position feeds
+                    // `FsyncState.input_ring_seq`: publishing the read
+                    // cursor (`read_end`) there once let the shadow —
+                    // after progress later reached `read_end` — pair
+                    // this batch's stale `journal_seq` with a state that
+                    // already held the tail, i.e. a snapshot recovery
+                    // would replay the tail onto.
                     self.core.apply_stream_marks(false)?;
                     if matches!(self.core.pending_mark, Some(StreamMark::Rotate(_))) {
                         if pending > 0 {
@@ -1217,7 +1222,7 @@ impl<E: AppEvent> Sequencer<E> {
                             // read `slots[start..]`. Re-reading the
                             // prefix here would race the producer's
                             // overwrite — see `read_contiguous`.
-                            self.core.submit_batch(read_start + stop as u64, read_end)?;
+                            self.core.submit_batch(read_start + stop as u64)?;
                             pending = 0;
                             first_write_ts = None;
                         }
@@ -1253,7 +1258,7 @@ impl<E: AppEvent> Sequencer<E> {
                     // borrow advanced it there, and nothing else moves
                     // it (on a no-read iteration, `count == 0` leaves
                     // `read_end == read_start`, the current cursor).
-                    self.core.submit_batch(read_end, read_end)?;
+                    self.core.submit_batch(read_end)?;
                     self.core.maybe_publish_chain_check();
                     let _ = self.core.maybe_rotate();
                     // Replica mode: act on a mark that landed exactly at
@@ -1325,7 +1330,7 @@ impl<E: AppEvent> Sequencer<E> {
                 // them to land, so the persist-before-ack boundary
                 // holds for the final batch too.
                 if pending > 0 {
-                    self.core.submit_batch(read_end, read_end)?;
+                    self.core.submit_batch(read_end)?;
                 }
                 self.core
                     .utilization
@@ -1403,7 +1408,7 @@ impl<E: AppEvent> Sequencer<E> {
             // Hand the batch over exactly as the steady-state path
             // does — replication frame first, then the slot carrying
             // the cursors. `finish` waits for it to become durable.
-            if let Err(e) = self.core.submit_batch(read_end, read_end) {
+            if let Err(e) = self.core.submit_batch(read_end) {
                 tracing::error!(error = %e, "journal hand-off failed on drain");
                 return;
             }
@@ -1636,25 +1641,23 @@ impl<E: AppEvent> SequencerCore<E> {
     /// everything the disk thread must make true once the batch is
     /// durable.
     ///
-    /// `progress` is the ring position of the last slot this batch
-    /// covers — an explicit value, because the read cursor spans the
-    /// WHOLE read batch. At the mid-batch mark barrier only a prefix of
-    /// the batch has been encoded; publishing the read cursor there
+    /// `progress` is the ring position one past the last slot this
+    /// batch covers — an explicit value, because the read cursor spans
+    /// the WHOLE read batch. At the mid-batch mark barrier only a prefix
+    /// of the batch has been encoded; publishing the read cursor there
     /// would let the replica ack entries past the boundary that are not
     /// yet journaled (the ack path gates on this cursor —
-    /// persist-before-ack). The steady-state caller passes the read
-    /// cursor for both arguments.
-    ///
-    /// `input_ring_seq` is the input-ring read cursor at this sync
-    /// point — the value `FsyncState.input_ring_seq` reports. Passed in
+    /// persist-before-ack), and would hand the shadow snapshot stage a
+    /// `FsyncState` whose `journal_seq` covers less than its ring
+    /// position (see `JournalWriteMeta::ring_progress`). Passed in
     /// because this half of the sequencer deliberately cannot reach the
-    /// consumer (see [`SequencerCore`]); the caller reads it before the
-    /// batch borrow, or derives it as `read_start + count`.
+    /// consumer (see [`SequencerCore`]); the steady-state caller passes
+    /// the read cursor.
     ///
     /// Returns once the batch is *submitted*, not once it is durable.
     /// That is the point of the split: the sequencer keeps encoding and
     /// feeding replicas while the device works.
-    fn submit_batch(&mut self, progress: u64, input_ring_seq: u64) -> Result<(), JournalError> {
+    fn submit_batch(&mut self, progress: u64) -> Result<(), JournalError> {
         if self.repl.any_producer() {
             let end_seq = self.encoder.next_sequence() - 1;
             Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
@@ -1683,7 +1686,6 @@ impl<E: AppEvent> SequencerCore<E> {
                 [0u8; 32]
             },
             ring_progress: progress,
-            input_ring_seq,
         };
 
         // Every batch needs a slot, even an empty one, because the slot
