@@ -226,7 +226,11 @@ fn queue_stream_mark(
 pub(super) struct StreamingFrameOutcome {
     /// Bytes consumed from the recv buffer.
     pub consumed: usize,
-    /// Sequence of the last slot pushed (for `pending_acks.push`).
+    /// Journal-cursor position one past the last slot pushed (for
+    /// `pending_acks.push`). The journal ring cursor is next-to-consume,
+    /// so the pushed slots are durable exactly when the cursor reaches
+    /// this value — never the slot index itself, which the cursor
+    /// reaches while that slot is still un-fsynced.
     pub last_target: u64,
     /// Whether any slot was pushed this cycle.
     pub any_published: bool,
@@ -337,7 +341,11 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                     |s| *s = slot,
                                     || journal_failed.load(Ordering::Relaxed),
                                 ) {
-                                    Ok(target) => last_target = target,
+                                    // `push` returns the slot index; the
+                                    // journal cursor is next-to-consume,
+                                    // so the slot is durable once the
+                                    // cursor reaches index + 1.
+                                    Ok(index) => last_target = index + 1,
                                     Err(_full) => {
                                         frame_err = Some(
                                             "replica journal stage failed \
@@ -445,6 +453,8 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
 /// Outcome of [`process_drain_frames`] for one drain recv-cycle.
 pub(super) struct DrainFrameOutcome {
     pub consumed: usize,
+    /// Journal-cursor position one past the last slot pushed — see
+    /// [`StreamingFrameOutcome::last_target`].
     pub last_target: u64,
     pub any_published: bool,
     pub accum_end_sequence: u64,
@@ -506,7 +516,9 @@ pub(super) fn process_drain_frames<E: AppEvent>(
                             |s| *s = slot,
                             || journal_failed.load(Ordering::Relaxed),
                         ) {
-                            Ok(target) => last_target = target,
+                            // Slot index → journal-cursor space (index + 1),
+                            // as in `process_streaming_frames`.
+                            Ok(index) => last_target = index + 1,
                             Err(_full) => {
                                 tracing::warn!(
                                     "journal stage failed during promotion drain — \
@@ -1430,6 +1442,74 @@ mod tests {
         assert_eq!(slots.len(), 4);
         let ids: Vec<u64> = slots.iter().map(|s| s.request_seq).collect();
         assert_eq!(ids, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    }
+
+    /// The ack target must live in the journal cursor's space. The
+    /// journal cursor is next-to-consume: `cursor == i` means ring slots
+    /// `< i` are durable and slot `i` is NOT. `push` returns the slot
+    /// index, so a frame whose last slot lands at index `i` is durable
+    /// only once the cursor reaches `i + 1`. Releasing at `i` acked the
+    /// primary for a sequence still sitting un-fsynced in the input ring
+    /// — one event of overstated durability, reachable whenever a
+    /// journal batch ends exactly at `i` (ring wrap, batch-size
+    /// truncation, mid-batch mark barrier).
+    #[test]
+    fn streaming_ack_target_is_one_past_the_last_slot_index() {
+        let (mut producer, _consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let mut buf = Vec::new();
+        // Fresh ring: these land at slot indices 0 and 1.
+        append_input_batch_frame(&mut buf, &[slot(10, 0xA0), slot(11, 0xA1)]);
+
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            9,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+        assert!(outcome.frame_err.is_none());
+        assert_eq!(outcome.accum_end_sequence, 11);
+
+        let mut q = crate::replication::PendingAckQueue::new(4);
+        q.push(outcome.last_target, outcome.accum_end_sequence);
+
+        // Cursor at 1: slot 0 durable, slot 1 (seq 11) is not.
+        assert_eq!(
+            q.pop_ready(&journal_cursor(1)),
+            None,
+            "seq 11 sits at slot index 1, which cursor 1 has not covered"
+        );
+        // Cursor at 2: both slots durable — ack through 11.
+        assert_eq!(q.pop_ready(&journal_cursor(2)), Some(11));
+    }
+
+    /// Same contract on the promotion drain path.
+    #[test]
+    fn drain_ack_target_is_one_past_the_last_slot_index() {
+        let (mut producer, _consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(1, 0x01)]);
+
+        let outcome = process_drain_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            0,
+            &mut slot_buf,
+            &AtomicBool::new(false),
+        );
+        assert!(outcome.any_published);
+
+        let mut q = crate::replication::PendingAckQueue::new(4);
+        q.push(outcome.last_target, outcome.accum_end_sequence);
+        assert_eq!(
+            q.pop_ready(&journal_cursor(0)),
+            None,
+            "slot index 0 is not durable at cursor 0"
+        );
+        assert_eq!(q.pop_ready(&journal_cursor(1)), Some(1));
     }
 
     /// A Rotate frame arriving exactly at the stream position is queued

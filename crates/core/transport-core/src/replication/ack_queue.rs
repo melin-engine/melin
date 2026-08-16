@@ -17,8 +17,10 @@ use super::protocol::Ack;
 /// Pending ack waiting for journal durability confirmation.
 #[derive(Clone)]
 pub struct PendingAck {
-    /// Disruptor sequence target — ack is safe to send once the journal
-    /// cursor reaches this value.
+    /// Journal-cursor target — ack is safe to send once the journal
+    /// cursor reaches this value. Same space as the cursor itself
+    /// (next-to-consume): a batch whose last slot has ring index `i`
+    /// must be queued with target `i + 1`, not `i`.
     journal_target: u64,
     /// Wire-protocol sequence to include in the ack frame.
     acked_sequence: u64,
