@@ -1,9 +1,15 @@
 [package]
 name = "melin-example-counter"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license-file.workspace = true
 description = "Minimal example: a durable, replicated counter built on the Melin core runtime."
+# Not publishable, and not just by policy: this crate and
+# `melin-server-runtime` form a dev-dependency cycle (the runtime's tests
+# use the counter as a concrete `Application`). Cargo permits the cycle
+# only because it is never published. Inheriting the workspace version
+# keeps the example labelled with the runtime release it demonstrates; it
+# does not make the crate publishable.
 publish = false
 
 [lib]
@@ -15,15 +21,15 @@ name = "counter-server"
 path = "src/main.rs"
 
 [dependencies]
-melin-app = { path = "../../core/app" }
-melin-server-runtime = { path = "../../core/server-runtime" }
+melin-app = { workspace = true }
+melin-server-runtime = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
-melin-wire-protocol = { path = "../../core/wire-protocol" }
+melin-wire-protocol = { workspace = true }
 tempfile = "3"
 
 [features]

@@ -1,6 +1,6 @@
 [package]
 name = "melin-raft"
-version = "0.13.0"
+version.workspace = true
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -35,8 +35,8 @@ crc32c = "0.6"
 ed25519-dalek = { workspace = true }
 getrandom = "0.4"
 tracing = { workspace = true }
-melin-app = { path = "../app", version = "0.13.0" }
-melin-transport-core = { path = "../transport-core", version = "0.13.0" }
+melin-app = { workspace = true }
+melin-transport-core = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
@@ -44,4 +44,4 @@ tempfile = "3"
 proptest = "1"
 # Re-pull melin-transport-core with `test-utils` for the race-safe
 # localhost port allocator (`test_ports::free_addr`).
-melin-transport-core = { path = "../transport-core", version = "0.13.0", features = ["test-utils"] }
+melin-transport-core = { workspace = true, features = ["test-utils"] }

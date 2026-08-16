@@ -6,12 +6,35 @@ members = ["crates/core/*", "crates/examples/*"]
 resolver = "3"
 
 [workspace.package]
+# Single source of truth for the release version — every member inherits it
+# via `version.workspace = true`. Bumping a release means editing this line
+# plus the `melin-*` pins in `[workspace.dependencies]` below, all in this
+# file. Keep the two in lockstep: a member's inherited version and the
+# version requirement its dependents resolve against must always match.
+version = "0.13.0"
 license-file = "LICENSE"
 repository = "https://github.com/melin-engine/melin"
 homepage = "https://github.com/melin-engine/melin"
 authors = ["P.L.S.C."]
 
 [workspace.dependencies]
+# Intra-workspace crates. `path` is resolved from the workspace root (not
+# the member), and `version` is what dependents get on crates.io — path is
+# used for local builds, the version requirement for published ones. Both
+# must be carried here so `cargo publish` accepts the member manifests.
+#
+# `melin-example-counter` is deliberately absent: it is `publish = false`
+# and must stay version-less. See the dev-dependency note in
+# crates/core/server-runtime/Cargo.toml.
+melin-app = { path = "crates/core/app", version = "0.13.0" }
+melin-dpdk = { path = "crates/core/dpdk", version = "0.13.0" }
+melin-journal = { path = "crates/core/journal", version = "0.13.0" }
+melin-pipeline = { path = "crates/core/pipeline", version = "0.13.0" }
+melin-raft = { path = "crates/core/raft", version = "0.13.0" }
+melin-server-runtime = { path = "crates/core/server-runtime", version = "0.13.0" }
+melin-transport-core = { path = "crates/core/transport-core", version = "0.13.0" }
+melin-wire-protocol = { path = "crates/core/wire-protocol", version = "0.13.0" }
+
 base64 = "0.22"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }

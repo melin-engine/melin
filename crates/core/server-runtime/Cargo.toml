@@ -1,6 +1,6 @@
 [package]
 name = "melin-server-runtime"
-version = "0.13.0"
+version.workspace = true
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -30,12 +30,12 @@ hash-chain = [
 ]
 
 [dependencies]
-melin-app = { path = "../app", version = "0.13.0" }
-melin-pipeline = { path = "../pipeline", version = "0.13.0" }
-melin-journal = { path = "../journal", version = "0.13.0" }
-melin-wire-protocol = { path = "../wire-protocol", version = "0.13.0" }
-melin-transport-core = { path = "../transport-core", version = "0.13.0" }
-melin-raft = { path = "../raft", version = "0.13.0" }
+melin-app = { workspace = true }
+melin-pipeline = { workspace = true }
+melin-journal = { workspace = true }
+melin-wire-protocol = { workspace = true }
+melin-transport-core = { workspace = true }
+melin-raft = { workspace = true }
 blake3 = "1"
 base64 = { workspace = true }
 clap = { workspace = true }
@@ -48,7 +48,7 @@ rand = { workspace = true }
 rustc-hash = "2"
 tracing = { workspace = true }
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-dpdk = { path = "../dpdk", version = "0.13.0", optional = true }
+melin-dpdk = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The runtime's library API is application-agnostic. Tests that need a
@@ -59,13 +59,16 @@ melin-dpdk = { path = "../dpdk", version = "0.13.0", optional = true }
 # frames directly from `melin-wire-protocol::control_codec` (already a
 # normal dependency), the same path the runtime itself uses.
 #
-# Path-only (no version): `melin-example-counter` is `publish = false`, so
-# it must not carry a version requirement, and `cargo publish` strips
+# Path-only (no version), and deliberately NOT inherited from
+# `[workspace.dependencies]`: `melin-example-counter` is `publish = false`,
+# so it must not carry a version requirement, and `cargo publish` strips
 # version-less dev-dependencies. This is a dev-only dependency cycle
-# (counter depends on the runtime), which Cargo permits.
+# (counter depends on the runtime), which Cargo permits. The counter's own
+# package version tracks the workspace, but that is unrelated — declaring a
+# version requirement here would break `cargo publish` for this crate.
 melin-example-counter = { path = "../../examples/counter" }
 tempfile = "3"
 serial_test = "3"
 proptest = "1"
-melin-journal = { path = "../journal", version = "0.13.0", features = ["test-utils"] }
-melin-transport-core = { path = "../transport-core", version = "0.13.0", features = ["test-utils"] }
+melin-journal = { workspace = true, features = ["test-utils"] }
+melin-transport-core = { workspace = true, features = ["test-utils"] }
