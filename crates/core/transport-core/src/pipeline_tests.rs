@@ -1888,6 +1888,245 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
     );
 }
 
+/// Invariant sweep for the shadow's (journal_seq, input_ring_seq,
+/// chain_hash) triple across a replica run with several adopted
+/// rotations, real disk thread, real shadow, events arriving in bursts
+/// so batch edges fall wherever they fall relative to the marks.
+///
+/// Two independent nets, neither of which depends on hitting a timing
+/// window:
+///
+/// 1. A sampler spins on the `FsyncState` seqlock for the whole run
+///    and records every distinct pair it sees. Every ring slot `i`
+///    holds `Add(i + 1)` (sentinel last), so a pair is consistent iff
+///    `journal_seq == min(input_ring_seq, N)`. Any batch — steady
+///    state, mid-batch barrier, batch-end mark, shutdown drain — that
+///    published a pair covering different prefixes fails here, no
+///    matter how briefly it was published (a pair stays visible until
+///    the next batch is durable, ≥ one fsync).
+/// 2. The shadow snapshots on every aligned landing (interval zero).
+///    Every distinct snapshot the test manages to copy is recovered
+///    with `JournaledApp::recover_from_snapshot` against the real
+///    multi-segment journal: the header's `journal_seq` and
+///    `chain_hash` must let replay reach exactly the full-run total,
+///    whatever point the snapshot was taken at.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
+    use crate::pipeline::FsyncState;
+    use crate::{shadow, snapshot};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const N: u64 = 40;
+    // Mixed placement: early in the first burst, at a burst edge, and
+    // deep inside later bursts.
+    const BOUNDARIES: [u64; 4] = [3, 5, 12, 25];
+    const BURSTS: [std::ops::RangeInclusive<u64>; 4] = [1..=5, 6..=10, 11..=20, 21..=N];
+    let anchor = [0x3Du8; 32];
+    let dir = tempfile::tempdir().unwrap();
+
+    // Reference chain tails at each announced boundary; the reference
+    // rotates where the primary would, so its chain is comparable.
+    let tails: Vec<[u8; 32]> = {
+        let ref_dir = dir.path().join("reference");
+        std::fs::create_dir(&ref_dir).unwrap();
+        let mut w =
+            Writer::create_continuing(&ref_dir.join("reference.journal"), 1, anchor).unwrap();
+        let mut tails = Vec::new();
+        for seq in 1..=N {
+            assert_eq!(w.allocate_sequence(), seq);
+            w.encode_event(
+                seq,
+                1_000_000_000 + seq,
+                &JournalEvent::App(TestEvent::Add(seq)),
+                0,
+                0,
+            )
+            .unwrap();
+            if BOUNDARIES.contains(&seq) {
+                w.flush_batch_sync().unwrap();
+                tails.push(w.chain_hash().expect("hash-chain enabled"));
+                w.rotate_segment().unwrap();
+            }
+        }
+        w.flush_batch_sync().unwrap();
+        tails
+    };
+
+    let path = dir.path().join("sweep.journal");
+    let snap_path = dir.path().join("sweep.snapshot");
+    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .add_consumer_after(0)
+        .build();
+    let shadow_consumer = consumers.pop().unwrap();
+    let journal_consumer = consumers.pop().unwrap();
+    let shadow_progress = shadow_consumer.progress_counter();
+
+    let mut stage = JournalStage::new(
+        writer,
+        journal_consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        false,
+    );
+    let (fsync_writer, fsync_reader) = melin_pipeline::seqlock::split(FsyncState::default());
+    stage.set_chain_hash_lock(fsync_writer);
+    let marks: crate::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    for (boundary_seq, tail_hash) in BOUNDARIES.into_iter().zip(tails) {
+        marks
+            .lock()
+            .unwrap()
+            .push_back(StreamMark::Rotate(AdoptedRotation {
+                boundary_seq,
+                tail_hash,
+            }));
+    }
+    stage.set_stream_marks(Arc::clone(&marks));
+
+    // Net 1: the sampler.
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let reader = fsync_reader.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("test-fsync-sampler".into())
+            .spawn(move || {
+                // BTreeSet: small, and sorted output reads well on failure.
+                let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let s = reader.load();
+                    seen.insert((s.journal_seq.get(), s.input_ring_seq.get()));
+                    std::thread::yield_now();
+                }
+                seen
+            })
+            .unwrap()
+    };
+
+    // Net 2: the shadow, snapshotting on every aligned landing.
+    let shadow_shutdown = Arc::new(AtomicBool::new(false));
+    let shadow_handle = {
+        let shutdown = Arc::clone(&shadow_shutdown);
+        let snap_path = snap_path.clone();
+        std::thread::Builder::new()
+            .name("test-shadow-sweep".into())
+            .spawn(move || {
+                shadow::run(
+                    shadow_consumer,
+                    TestApp::new(),
+                    snap_path,
+                    Duration::ZERO,
+                    fsync_reader,
+                    &shutdown,
+                    false,
+                    0,
+                );
+            })
+            .unwrap()
+    };
+    // Snapshot copies keyed by header journal_seq. Best-effort sampling:
+    // each `save` is tmp-write + rename, so any file we open is
+    // complete, but between its two renames (`path` → `.prev`, then
+    // `.tmp` → `path`) there is briefly no file at `path` at all — a
+    // NotFound here just means "try again next round".
+    let mut snapshots: BTreeMap<u64, std::path::PathBuf> = BTreeMap::new();
+    let collect = |snapshots: &mut BTreeMap<u64, std::path::PathBuf>| {
+        if let Ok((_, seq, _, _)) = snapshot::load::<TestApp>(&snap_path)
+            && !snapshots.contains_key(&seq)
+        {
+            let copy = dir.path().join(format!("snap-{seq}.snapshot"));
+            // The shadow may replace the file between our load and copy;
+            // a copy of a *newer* complete snapshot is still a valid
+            // sample, keyed by whatever it turns out to hold.
+            match std::fs::copy(&snap_path, &copy) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => panic!("copying the shadow snapshot: {e}"),
+            }
+            let (_, actual, _, _) = snapshot::load::<TestApp>(&copy).unwrap();
+            snapshots.insert(actual, copy);
+        }
+    };
+
+    let stage_shutdown = Arc::new(AtomicBool::new(false));
+    let stage_handle = {
+        let shutdown = Arc::clone(&stage_shutdown);
+        std::thread::Builder::new()
+            .name("test-journal-sweep".into())
+            .spawn(move || stage.run(&shutdown))
+            .unwrap()
+    };
+    for burst in BURSTS {
+        for seq in burst {
+            producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+        }
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(5));
+            collect(&mut snapshots);
+        }
+    }
+    producer.publish(TestInput::shutdown_sentinel());
+    let writer = stage_handle
+        .join()
+        .unwrap()
+        .expect("every announced tail matches the reference chain");
+    assert_eq!(writer.next_sequence(), N + 1);
+
+    // Let the shadow reach the last event and write its final snapshot,
+    // sampling copies along the way. (The sentinel slot itself is never
+    // released by progress when it arrives with nothing pending, so the
+    // shadow ends at `N`.)
+    let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+    loop {
+        collect(&mut snapshots);
+        if snapshots.contains_key(&N) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shadow must snapshot at seq {N}; shadow progress {}, snapshots seen at {:?}",
+            shadow_progress.get().load(Ordering::Acquire),
+            snapshots.keys().collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    shadow_shutdown.store(true, Ordering::Relaxed);
+    shadow_handle.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    let seen = sampler.join().unwrap();
+
+    // Net 1: every published pair describes one prefix.
+    assert!(
+        seen.len() >= 2,
+        "sampler must have observed several distinct pairs, saw {seen:?}"
+    );
+    for &(journal_seq, ring_pos) in &seen {
+        assert_eq!(
+            journal_seq,
+            ring_pos.min(N),
+            "FsyncState pair (journal_seq {journal_seq}, input_ring_seq {ring_pos}) covers \
+             two different prefixes; all pairs seen: {seen:?}"
+        );
+    }
+
+    // Net 2: snapshot + replay ≡ full replay, for every snapshot taken.
+    let full_total: u64 = N * (N + 1) / 2;
+    for (seq, copy) in &snapshots {
+        let recovered = JournaledApp::<TestApp, Writer>::recover_from_snapshot(copy, &path)
+            .unwrap_or_else(|e| {
+                panic!("snapshot at seq {seq} must recover against the journal: {e}")
+            });
+        assert_eq!(
+            recovered.app().total,
+            full_total,
+            "snapshot at seq {seq} + replay must reach the full-run total"
+        );
+    }
+}
+
 /// Regression: a `Rotate` with a trailing `ChainCheck` queued inside
 /// the SAME read batch. After adopting the rotation mid-batch, the
 /// encode loop must re-bound the remaining span at the chain check
