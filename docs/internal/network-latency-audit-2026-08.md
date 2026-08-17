@@ -224,6 +224,28 @@ the harness.
 Gain: sub-µs per gate wake; needs measurement. Risk: low. Effort: S–M.
 Confidence: high that it is wrong, medium that it is visible.
 
+### 9. Hygiene bundle
+
+**Landed** (the five items in the triage row):
+
+- `FxHashMap` for the response stage's connection table (keys are
+  server-generated ids; SipHash bought nothing).
+- Dirty set → `ConnectionEntry::dirty` flag + `Vec<u64>` list;
+  `mark_dirty`/`unmark_dirty` keep the two in lockstep.
+- Payload and `BatchEnd` append in one `append_frames` call against a
+  pre-encoded terminator (one cap check, one dirty mark, no per-request
+  re-encode).
+- Idle spin's two unconditional `Instant::now()` calls per iteration are
+  now one `AmortizedTimer` tick; the inner cadences are unchanged.
+- `TCP_QUICKACK` re-armed once per *silent* receive cycle instead of
+  once per RECV CQE.
+
+Not done, deliberately: reusing `batch_now` for the post-batch
+`degraded_logger` tick. That clock read is per batch (not per slot) and
+its freshness is load-bearing — the comment at the call site explains
+why the batch's opening timestamp is the wrong one now that the gate is
+evaluated per slot.
+
 ### 9 (replication part). `TCP_QUICKACK` re-armed with a syscall per RECV CQE
 
 **Where:** `tcp_receiver.rs` (`set_quickack`, called per completed recv).

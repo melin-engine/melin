@@ -33,8 +33,13 @@ use melin_transport_core::replication::protocol::{
 
 /// Force the kernel to send a TCP ACK immediately rather than holding
 /// it in the delayed-ACK timer (~40 ms on Linux). Linux clears
-/// `TCP_QUICKACK` after each ACK it sends, so this must be re-armed
-/// after every received batch.
+/// `TCP_QUICKACK` after each ACK it sends, so it has to be re-armed.
+///
+/// A `setsockopt` is ~0.5–1 µs on the receive path's critical section,
+/// so the re-arm is not unconditional: an outgoing ack frame already
+/// carries the TCP ACK, and the replica sends one per receive cycle in
+/// steady state. Only a cycle that produced no ack re-arms — see
+/// `UringTransport::acked_since_recv`.
 #[inline]
 fn arm_tcp_quickack(fd: RawFd) {
     let on: libc::c_int = 1;
@@ -51,7 +56,15 @@ fn arm_tcp_quickack(fd: RawFd) {
         )
     };
     if rc != 0 {
-        let _ = rc;
+        // Best-effort tuning: a kernel that refuses TCP_QUICKACK (or a
+        // socket that just went away) costs delayed-ACK latency, not
+        // correctness, and the caller has no better recovery than
+        // continuing. Nothing to log per cycle either — it would fire on
+        // every receive.
+        debug_assert!(
+            std::io::Error::last_os_error().raw_os_error() != Some(libc::EFAULT),
+            "TCP_QUICKACK setsockopt got EFAULT — bad option pointer"
+        );
     }
 }
 
@@ -101,6 +114,11 @@ struct UringTransport {
     /// independent SQEs, and interleaved partial sends would corrupt
     /// the frame stream).
     pending_ack: Option<Ack>,
+    /// Whether an ack frame has been handed to the kernel since the last
+    /// receive cycle. An outgoing data segment carries the TCP ACK with
+    /// it, so an acking cycle needs no `TCP_QUICKACK` re-arm — only a
+    /// silent one does. See [`arm_tcp_quickack`].
+    acked_since_recv: bool,
 }
 
 impl UringTransport {
@@ -173,6 +191,7 @@ impl UringTransport {
             ack_offset: 0,
             ack_in_flight: false,
             pending_ack: None,
+            acked_since_recv: false,
         })
     }
 
@@ -200,6 +219,7 @@ impl UringTransport {
         unsafe { self.ring.submission().push(&sqe).expect("SQ full") };
         self.ack_in_flight = true;
         self.ack_offset = 0;
+        self.acked_since_recv = true;
     }
 }
 
@@ -265,7 +285,6 @@ impl ReceiverTransport for UringTransport {
                         return Err(io::Error::other("recv cqe missing F_BUFFER flag"));
                     }
 
-                    arm_tcp_quickack(self.tcp_fd);
                     let n = result as usize;
                     let buf_id = (flags >> IORING_CQE_BUFFER_SHIFT) as usize;
                     // SAFETY: buf_id from kernel CQE for a buffer we
@@ -345,6 +364,20 @@ impl ReceiverTransport for UringTransport {
         // carries any multishot resubmission pushed above).
         if submit_chained_ack {
             self.ring.submit()?;
+        }
+
+        if any_recv {
+            // One decision per receive cycle rather than a setsockopt per
+            // RECV CQE — and none at all while the replica is acking,
+            // since each ack frame is an outgoing segment that carries
+            // the TCP ACK. A cycle that produces no ack re-arms, so a
+            // stream that goes app-level silent waits at most one cycle
+            // (not a delayed-ACK timer) for its next immediate ACK.
+            if self.acked_since_recv {
+                self.acked_since_recv = false;
+            } else {
+                arm_tcp_quickack(self.tcp_fd);
+            }
         }
 
         Ok(any_recv)

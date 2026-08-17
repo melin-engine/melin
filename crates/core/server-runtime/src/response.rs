@@ -8,7 +8,6 @@
 //! Same SPSC consumption and journal cursor gating as `response.rs`.
 //! Runs on a dedicated OS thread.
 
-use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +15,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
+use rustc_hash::FxHashMap;
 use tracing::{debug, error};
 
 use melin_pipeline::ring;
@@ -89,6 +89,14 @@ const FLUSH_BYTES_THRESHOLD: usize = 1400;
 /// the per-slot cost at 1 M/s) and caps the wait at the time to encode
 /// 256 responses — tens of microseconds — however the load is spread.
 const FLUSH_SLOT_INTERVAL: usize = 256;
+
+/// Idle iterations spent spinning before the loop falls back to
+/// `yield_now` (only reached when `--yield-idle` is set; production
+/// busy-spins). Also tells the idle housekeeping timer whether its
+/// clock-read mask applies — a yielding loop iterates orders of
+/// magnitude slower, so the mask would stretch a one-second check into
+/// minutes.
+const IDLE_SPIN_LIMIT: u32 = 1000;
 
 /// The consumed path's flush cadence: both triggers plus the counter
 /// they share.
@@ -229,6 +237,12 @@ struct ConnectionEntry {
     /// Last SEND attempt. Read only while blocked, to pace retries at
     /// [`BLOCKED_RETRY_INTERVAL`].
     last_send_attempt: Instant,
+    /// Whether this connection is on the dirty list. A flag on the entry
+    /// rather than set membership: the append path already holds the
+    /// entry (and just wrote its `send_buf`), so the dedup test is a
+    /// byte in a cache line that is hot, instead of a hash + probe on
+    /// every one of the ~2 frames per request. See `dirty_connections`.
+    dirty: bool,
 }
 
 /// Run the io_uring response stage loop. Blocks the calling thread until shutdown.
@@ -284,8 +298,15 @@ pub fn run<A: Application>(
         .expect("failed to create io_uring instance for response stage");
 
     // Connection table: maps connection IDs to their state.
-    // HashMap for O(1) lookup. Pre-sized for a reasonable number of concurrent clients.
-    let mut connections: HashMap<u64, ConnectionEntry> = HashMap::with_capacity(256);
+    //
+    // `FxHashMap` rather than std's SipHash-1-3 map: this is looked up
+    // once per output slot on the hot path, and the keys are
+    // server-generated monotonic connection ids — a client cannot choose
+    // them, so the HashDoS resistance SipHash buys is worth nothing here
+    // while its ~20 ns/lookup is not. Pre-sized for a reasonable number
+    // of concurrent clients.
+    let mut connections: FxHashMap<u64, ConnectionEntry> =
+        FxHashMap::with_capacity_and_hasher(256, Default::default());
 
     let mut batch = [OutputSlot::<A::Report, A::QueryResponse>::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
@@ -322,6 +343,12 @@ pub fn run<A: Application>(
     /// (`AmortizedTimer::CHECK_MASK` is `2^16`), finer than the 10 ms
     /// here, so this cadence is the binding one and is realized in full.
     const GATE_ACCRUAL_INTERVAL: Duration = Duration::from_millis(10);
+    /// Cadence at which the idle spin does its housekeeping *clock read*.
+    /// The heartbeat scan, the policy re-check and the trace-stats flush
+    /// each keep their own (coarser) interval; this only bounds how
+    /// often the loop asks the clock what time it is, so it must stay at
+    /// or below the finest of them (`trace::IDLE_FLUSH_INTERVAL`, 100 ms).
+    const IDLE_HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(10);
 
     // Initial evaluation so the cached durable position and the
     // `/healthz` gauge reflect the cluster's startup shape before
@@ -418,8 +445,15 @@ pub fn run<A: Application>(
     #[cfg(feature = "latency-trace")]
     let mut pending_e2e: Vec<(u64, trace::MonoTraceInstant)> = Vec::with_capacity(MAX_BATCH);
 
-    // Track connections with buffered (unflushed) writes across batches.
-    let mut dirty_connections: HashSet<u64> = HashSet::new();
+    // Connections with buffered (unflushed) writes, carried across
+    // batches.
+    //
+    // `Vec<u64>` paired with `ConnectionEntry::dirty` rather than a
+    // `HashSet`: membership is never *queried*, only iterated and
+    // rebuilt, so the set's only contribution on the hot path was
+    // deduplicating repeat appends — which the entry flag does with a
+    // branch instead of a hash. Pre-sized to the connection table.
+    let mut dirty_connections: Vec<u64> = Vec::with_capacity(256);
 
     // Flush triggers for the consumed path. Lives across batches because
     // the regime the age bound exists for is a ring that never empties:
@@ -459,8 +493,26 @@ pub fn run<A: Application>(
         buf[..written].to_vec()
     };
 
+    // Pre-encode the BatchEnd terminator once. Unlike the two above this
+    // one is on the hot path — every request ends with it — and its
+    // bytes are a constant, so re-encoding it per request was pure
+    // overhead.
+    let batch_end_wire_frame = {
+        let mut buf = [0u8; 8];
+        let written =
+            control_codec::encode_transport_response(&TransportResponse::BatchEnd, &mut buf)
+                .expect("BatchEnd encodes");
+        buf[..written].to_vec()
+    };
+
     // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.
     let mut last_heartbeat_scan = Instant::now();
+
+    // Gates the idle path's housekeeping clock read. The idle spin used
+    // to call `Instant::now()` twice per iteration (heartbeat scan gate,
+    // policy re-check) to decide it had nothing to do — the same vDSO
+    // tax the DPDK stage removed with this timer.
+    let mut idle_housekeeping_timer = AmortizedTimer::new();
 
     // Adaptive spin: spin first (fast wakeup), yield after threshold.
     let mut idle_spins: u32 = 0;
@@ -564,6 +616,7 @@ pub fn run<A: Application>(
                             last_send: Instant::now(),
                             blocked_since: None,
                             last_send_attempt: Instant::now(),
+                            dirty: false,
                         },
                     );
                 }
@@ -576,7 +629,7 @@ pub fn run<A: Application>(
                     if connections.remove(&connection_id).is_some() {
                         active_connections.fetch_sub(1, Ordering::Relaxed);
                     }
-                    dirty_connections.remove(&connection_id);
+                    unmark_dirty(connection_id, &mut dirty_connections);
                     // Anything this connection had buffered goes with
                     // it, so its queued samples measure bytes that will
                     // never be sent.
@@ -593,7 +646,7 @@ pub fn run<A: Application>(
                         if entry.send_buf.len() + server_busy_wire_frame.len() <= MAX_SEND_BUF {
                             entry.send_buf.extend_from_slice(&server_busy_wire_frame);
                             entry.last_send = Instant::now();
-                            dirty_connections.insert(connection_id);
+                            mark_dirty(entry, connection_id, &mut dirty_connections);
                         }
                     }
                 }
@@ -629,25 +682,45 @@ pub fn run<A: Application>(
                 }
             }
 
-            // Send heartbeats to idle connections. Only checked during
-            // idle periods (SPSC empty) to avoid overhead on the hot path.
-            //
-            // No end-to-end samples to close here: the sample queue's
-            // invariant is that a queued entry implies a dirty
-            // connection, so the flush above — which closes the queue
-            // whenever anything was dirty — leaves it empty. Anything
-            // dirtied from here on is heartbeat frames, which carry no
-            // samples.
-            if let Some(interval) = heartbeat_interval {
+            // Everything below is periodic housekeeping on
+            // sub-second-to-second cadences, and each check needs the
+            // current time only to discover it has nothing to do. One
+            // amortized tick per idle iteration replaces the two
+            // unconditional `Instant::now()` calls that decision used to
+            // cost; the inner intervals are unchanged, so cadences are
+            // the same (see `IDLE_HOUSEKEEPING_INTERVAL`). `spinning` is
+            // the loop's real spin/yield state — under `--yield-idle`
+            // the mask must not apply, or a yielding loop would take a
+            // minute to notice a second has passed.
+            if idle_housekeeping_timer
+                .tick(
+                    IDLE_HOUSEKEEPING_INTERVAL,
+                    busy_spin || idle_spins < IDLE_SPIN_LIMIT,
+                )
+                .is_some()
+            {
                 let now = Instant::now();
-                // Coarse gate: only scan at most once per second.
-                if now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1) {
+
+                // Send heartbeats to idle connections. Only checked
+                // during idle periods (SPSC empty) to avoid overhead on
+                // the hot path.
+                //
+                // No end-to-end samples to close here: the sample
+                // queue's invariant is that a queued entry implies a
+                // dirty connection, so the flush above — which closes
+                // the queue whenever anything was dirty — leaves it
+                // empty. Anything dirtied from here on is heartbeat
+                // frames, which carry no samples.
+                if let Some(interval) = heartbeat_interval
+                    // Coarse gate: only scan at most once per second.
+                    && now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1)
+                {
                     last_heartbeat_scan = now;
                     for (&conn_id, entry) in connections.iter_mut() {
                         if heartbeat_due(entry, now, interval, heartbeat_wire_frame.len()) {
                             entry.send_buf.extend_from_slice(&heartbeat_wire_frame);
-                            dirty_connections.insert(conn_id);
                             entry.last_send = now;
+                            mark_dirty(entry, conn_id, &mut dirty_connections);
                         }
                     }
                     // Flush the heartbeat sends immediately.
@@ -659,6 +732,7 @@ pub fn run<A: Application>(
                             &mut to_remove,
                             &mut cqes,
                         );
+                        flush.on_flush();
                         for conn_id in to_remove.drain(..) {
                             if let Some(entry) = connections.remove(&conn_id) {
                                 teardown_dropped(entry, &active_connections);
@@ -666,18 +740,15 @@ pub fn run<A: Application>(
                         }
                     }
                 }
-            }
 
-            // Re-evaluate the durability policy on a slow timer so the
-            // `policy_degraded` flag and the periodic warn track the
-            // cluster's real state even on idle / quiet venues. The
-            // gate-open block also calls `update_degraded_state` after
-            // each consumed batch; this is the equivalent for the
-            // no-batch path.
-            {
-                let now_ts = Instant::now();
-                if now_ts.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
-                    last_policy_check = now_ts;
+                // Re-evaluate the durability policy on a slow timer so
+                // the `policy_degraded` flag and the periodic warn track
+                // the cluster's real state even on idle / quiet venues.
+                // The gate-open block also calls `update_degraded_state`
+                // after each consumed batch; this is the equivalent for
+                // the no-batch path.
+                if now.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
+                    last_policy_check = now;
                     let journal_pos = journal_persisted_wire_seq.load();
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
@@ -686,7 +757,7 @@ pub fn run<A: Application>(
                         &policy,
                         &utilization,
                         status.degraded,
-                        now_ts,
+                        now,
                         DEGRADED_LOG_INTERVAL,
                     );
                     // Cache the position so the next batch's gate sees a
@@ -695,12 +766,12 @@ pub fn run<A: Application>(
                 }
 
                 // Hand buffered latency samples to the stats registry
-                // while we have nothing better to do. Reuses the policy
-                // check's clock read, so the spin path picks up no
+                // while we have nothing better to do. Reuses the
+                // housekeeping clock read, so the spin path picks up no
                 // extra `clock_gettime`.
                 #[cfg(feature = "latency-trace")]
-                if now_ts.duration_since(last_stats_flush) >= trace::IDLE_FLUSH_INTERVAL {
-                    last_stats_flush = now_ts;
+                if now.duration_since(last_stats_flush) >= trace::IDLE_FLUSH_INTERVAL {
+                    last_stats_flush = now;
                     spsc_rec.flush();
                     dispatch_rec.flush();
                     server_e2e_rec.flush();
@@ -719,7 +790,7 @@ pub fn run<A: Application>(
                 utilization.busy.store(busy_count, Ordering::Relaxed);
                 utilization.idle.store(idle_count, Ordering::Relaxed);
             }
-            if busy_spin || idle_spins < 1000 {
+            if busy_spin || idle_spins < IDLE_SPIN_LIMIT {
                 idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
             } else {
@@ -1016,54 +1087,39 @@ pub fn run<A: Application>(
                     OutputPayload::BatchEnd => None,
                 };
 
-                let payload_handled = if let Some(result) = payload_result {
-                    #[cfg(feature = "tick-to-trade")]
-                    let encode_start = trace::mono_trace_ns();
-                    let outcome = append_frame(
-                        result,
-                        slot.connection_id,
-                        entry,
-                        &encode_buf,
-                        batch_now,
-                        &mut dirty_connections,
-                        &mut to_remove,
-                    );
-                    #[cfg(feature = "tick-to-trade")]
-                    encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
-                    outcome
+                // Frame 2: the pre-encoded BatchEnd terminator, appended
+                // with the payload in one call.
+                let trailer: &[u8] = if slot.is_last_in_request {
+                    &batch_end_wire_frame
                 } else {
-                    AppendOutcome::Continue
+                    &[]
                 };
 
-                // Frame 2: BatchEnd terminator. Skipped if the payload
-                // append dropped the connection.
-                if matches!(payload_handled, AppendOutcome::Continue) && slot.is_last_in_request {
-                    let result = control_codec::encode_transport_response(
-                        &TransportResponse::BatchEnd,
-                        &mut encode_buf,
-                    )
-                    .map_err(|_| "encode error");
-                    let outcome = append_frame(
-                        result,
-                        slot.connection_id,
-                        entry,
-                        &encode_buf,
-                        batch_now,
-                        &mut dirty_connections,
-                        &mut to_remove,
-                    );
-                    // Queue the server-side end-to-end sample: reader
-                    // recv -> response flush. Only the BatchEnd frame
-                    // carries this measurement; queued here after the
-                    // append so a dropped connection doesn't skew the
-                    // metric, and closed by whichever flush ships the
-                    // bytes.
-                    #[cfg(feature = "latency-trace")]
-                    if matches!(outcome, AppendOutcome::Continue) {
-                        pending_e2e.push((slot.connection_id, slot.recv_ts));
-                    }
-                    let _ = outcome;
+                #[cfg(feature = "tick-to-trade")]
+                let encode_start = trace::mono_trace_ns();
+                let outcome = append_frames(
+                    payload_result,
+                    trailer,
+                    slot.connection_id,
+                    entry,
+                    &encode_buf,
+                    batch_now,
+                    &mut dirty_connections,
+                    &mut to_remove,
+                );
+                #[cfg(feature = "tick-to-trade")]
+                encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
+
+                // Queue the server-side end-to-end sample: reader recv ->
+                // response flush. Only a request's last slot carries this
+                // measurement; queued after the append so a dropped
+                // connection doesn't skew the metric, and closed by
+                // whichever flush ships the bytes.
+                #[cfg(feature = "latency-trace")]
+                if slot.is_last_in_request && matches!(outcome, AppendOutcome::Continue) {
+                    pending_e2e.push((slot.connection_id, slot.recv_ts));
                 }
+                let _ = outcome;
 
                 flush.on_append(entry.send_buf.len());
             }
@@ -1100,7 +1156,7 @@ pub fn run<A: Application>(
                     if let Some(entry) = connections.remove(&conn_id) {
                         teardown_dropped(entry, &active_connections);
                     }
-                    dirty_connections.remove(&conn_id);
+                    unmark_dirty(conn_id, &mut dirty_connections);
                 }
                 #[cfg(feature = "tick-to-trade")]
                 let egress_start = trace::mono_trace_ns();
@@ -1134,7 +1190,7 @@ pub fn run<A: Application>(
             if let Some(entry) = connections.remove(&conn_id) {
                 teardown_dropped(entry, &active_connections);
             }
-            dirty_connections.remove(&conn_id);
+            unmark_dirty(conn_id, &mut dirty_connections);
         }
 
         // Log degradation transitions / re-emit the reminder. Same
@@ -1266,24 +1322,16 @@ fn teardown_dropped(entry: ConnectionEntry, active_connections: &AtomicU64) {
     active_connections.fetch_sub(1, Ordering::Relaxed);
 }
 
-/// Outcome of a single per-frame append. `Continue` means the
-/// caller may proceed to the next frame for this slot;
-/// `ConnectionDropped` means the connection's send buffer overflowed
-/// or the encode failed, and the connection has been queued for
-/// removal — no further frames should be appended for this slot.
+/// Outcome of a slot's append. `Continue` means the slot's bytes are
+/// buffered (or there were none); `ConnectionDropped` means the
+/// connection's send buffer overflowed and the connection has been
+/// queued for removal — nothing further should be appended for it.
 #[derive(Clone, Copy)]
 enum AppendOutcome {
     Continue,
     ConnectionDropped,
 }
 
-/// Copy an encoded frame into the connection's send buffer with
-/// overflow checking. Splits the responsibilities the inline encode
-/// loop used to have: the caller passes in the encode result (so it
-/// can come from the `ResponseEncoder` trait for application
-/// payloads, or `encode_transport_response` for transport-shaped
-/// frames), and this helper handles size accounting + dirty
-/// tracking uniformly.
 /// Whether the idle-path heartbeat scan should append a frame to this
 /// connection: idle for a full interval — and able to receive it.
 ///
@@ -1299,6 +1347,24 @@ enum AppendOutcome {
 /// designed. Residual: a trickling client still holds its permit while
 /// it drains — bounded memory, and the reader's idle timeout covers
 /// clients that stop sending entirely.
+/// Put a connection on the dirty list if it isn't already there.
+/// Idempotent — the entry flag is the dedup that the old `HashSet`
+/// membership provided.
+#[inline]
+fn mark_dirty(entry: &mut ConnectionEntry, connection_id: u64, dirty: &mut Vec<u64>) {
+    if !entry.dirty {
+        entry.dirty = true;
+        dirty.push(connection_id);
+    }
+}
+
+/// Take a connection off the dirty list — teardown paths only. `retain`
+/// rather than a swap-remove scan because the ordering is cheap to keep
+/// and this runs once per dropped connection, never per frame.
+fn unmark_dirty(connection_id: u64, dirty: &mut Vec<u64>) {
+    dirty.retain(|&id| id != connection_id);
+}
+
 fn heartbeat_due(
     entry: &ConnectionEntry,
     now: Instant,
@@ -1310,28 +1376,50 @@ fn heartbeat_due(
         && entry.send_buf.len() + frame_len <= MAX_SEND_BUF
 }
 
+/// Copy a slot's wire bytes into the connection's send buffer with
+/// overflow checking and dirty tracking: the encoded payload (from the
+/// `ResponseEncoder` for application shapes, or
+/// `encode_transport_response` for transport ones) followed by an
+/// optional pre-encoded `trailer`.
+///
+/// One call per slot rather than one per frame. A request's last slot
+/// carries a `BatchEnd` terminator behind its payload, and appending
+/// them separately paid the cap check, the `last_send` stamp and the
+/// dirty marking twice for every request — plus a re-encode of a frame
+/// whose bytes never change.
 #[allow(clippy::too_many_arguments)]
-fn append_frame(
-    result: Result<usize, &'static str>,
+fn append_frames(
+    payload: Option<Result<usize, &'static str>>,
+    trailer: &[u8],
     connection_id: u64,
     entry: &mut ConnectionEntry,
     encode_buf: &[u8],
     batch_now: Instant,
-    dirty_connections: &mut HashSet<u64>,
+    dirty_connections: &mut Vec<u64>,
     to_remove: &mut Vec<u64>,
 ) -> AppendOutcome {
-    let written = match result {
-        Ok(n) => n,
-        Err(reason) => {
+    // An encode failure is this server's bug, not the client's — log it
+    // and carry on with the trailer, exactly as when the two frames were
+    // appended by separate calls.
+    let written = match payload {
+        Some(Ok(n)) => n,
+        Some(Err(reason)) => {
             tracing::error!(connection_id, reason, "encode error");
-            return AppendOutcome::Continue;
+            0
         }
+        None => 0,
     };
+    let total = written + trailer.len();
+    if total == 0 {
+        return AppendOutcome::Continue;
+    }
 
     // Drop slow clients whose send buffer has grown too large. This
     // prevents unbounded memory growth from a single laggy connection
-    // causing allocator pressure and tail latency spikes.
-    if entry.send_buf.len() + written > MAX_SEND_BUF {
+    // causing allocator pressure and tail latency spikes. Checked
+    // against both frames together, so a request is never delivered
+    // without its terminator.
+    if entry.send_buf.len() + total > MAX_SEND_BUF {
         debug!(
             connection_id,
             send_buf_len = entry.send_buf.len(),
@@ -1341,12 +1429,13 @@ fn append_frame(
         return AppendOutcome::ConnectionDropped;
     }
 
-    // Append the full wire frame to the connection's send buffer.
+    // Append the full wire frames to the connection's send buffer.
     // The encoder writes [length(4) | payload], which is the complete
     // wire format — no extra framing needed.
     entry.send_buf.extend_from_slice(&encode_buf[..written]);
+    entry.send_buf.extend_from_slice(trailer);
     entry.last_send = batch_now;
-    dirty_connections.insert(connection_id);
+    mark_dirty(entry, connection_id, dirty_connections);
     AppendOutcome::Continue
 }
 
@@ -1371,8 +1460,8 @@ fn append_frame(
 /// caller to purge from `connections`.
 fn flush_sends(
     ring: &mut IoUring,
-    connections: &mut HashMap<u64, ConnectionEntry>,
-    dirty: &mut HashSet<u64>,
+    connections: &mut FxHashMap<u64, ConnectionEntry>,
+    dirty: &mut Vec<u64>,
     to_remove: &mut Vec<u64>,
     cqes: &mut Vec<(u64, i32)>,
 ) {
@@ -1520,12 +1609,18 @@ fn flush_sends(
 
     // Keep exactly the connections that still hold undelivered bytes and
     // survived this flush. Runs even when nothing was submitted so a
-    // blocked-timeout drop above still leaves the dirty set consistent.
+    // blocked-timeout drop above still leaves the dirty list consistent.
+    // The entry flag is cleared in lockstep — it is what keeps a
+    // connection off the list until its next append.
     dirty.retain(|conn_id| {
-        !to_remove.contains(conn_id)
+        let keep = !to_remove.contains(conn_id)
             && connections
                 .get(conn_id)
-                .is_some_and(|e| !e.send_buf.is_empty())
+                .is_some_and(|e| !e.send_buf.is_empty());
+        if !keep && let Some(entry) = connections.get_mut(conn_id) {
+            entry.dirty = false;
+        }
+        keep
     });
 }
 
@@ -2953,6 +3048,43 @@ mod tests {
         assert!(!final_state);
     }
 
+    /// Dirty tracking: an entry flag for dedup plus a flat list for
+    /// iteration, replacing the per-append `HashSet` insert.
+    mod dirty_tracking {
+        use super::super::{mark_dirty, unmark_dirty};
+        use super::flush_sends::entry_for;
+        use std::os::unix::net::UnixStream;
+
+        fn entry() -> super::super::ConnectionEntry {
+            let (tx, _rx) = UnixStream::pair().expect("socketpair");
+            let mut e = entry_for(tx, b"payload");
+            e.dirty = false;
+            e
+        }
+
+        #[test]
+        fn repeat_appends_enqueue_a_connection_once() {
+            let mut e = entry();
+            let mut dirty = Vec::new();
+            for _ in 0..8 {
+                mark_dirty(&mut e, 42, &mut dirty);
+            }
+            assert_eq!(dirty, vec![42], "the flag is the dedup");
+            assert!(e.dirty);
+        }
+
+        #[test]
+        fn teardown_takes_a_connection_off_the_list() {
+            let mut a = entry();
+            let mut b = entry();
+            let mut dirty = Vec::new();
+            mark_dirty(&mut a, 1, &mut dirty);
+            mark_dirty(&mut b, 2, &mut dirty);
+            unmark_dirty(1, &mut dirty);
+            assert_eq!(dirty, vec![2], "order of the survivors is preserved");
+        }
+    }
+
     /// The consumed path's two flush triggers. The byte threshold bounds
     /// a connection's buffered *bytes*; the slot interval bounds their
     /// *age*, which is what many-low-rate-client deployments need (2026-08
@@ -3095,7 +3227,7 @@ mod tests {
             BLOCKED_RETRY_INTERVAL, BLOCKED_SEND_TIMEOUT, ConnectionEntry, flush_sends,
         };
         use io_uring::IoUring;
-        use std::collections::{HashMap, HashSet};
+        use rustc_hash::FxHashMap;
         use std::io::Read as _;
         use std::os::unix::io::{AsRawFd, RawFd};
         use std::os::unix::net::UnixStream;
@@ -3109,6 +3241,9 @@ mod tests {
                 last_send: Instant::now(),
                 blocked_since: None,
                 last_send_attempt: Instant::now(),
+                // Every entry these tests build is handed to `flush_sends`
+                // on the dirty list, so the flag has to agree with it.
+                dirty: true,
             }
         }
 
@@ -3143,10 +3278,10 @@ mod tests {
             let (fast_tx, mut fast_rx) = UnixStream::pair().unwrap();
             fill_socket(slow_tx.as_raw_fd());
 
-            let mut connections = HashMap::new();
+            let mut connections = FxHashMap::default();
             connections.insert(1u64, entry_for(slow_tx, &[0xAA; 1024]));
             connections.insert(2u64, entry_for(fast_tx, b"hello"));
-            let mut dirty: HashSet<u64> = [1, 2].into_iter().collect();
+            let mut dirty: Vec<u64> = vec![1, 2];
             let mut to_remove = Vec::new();
             let mut cqes = Vec::new();
 
@@ -3174,9 +3309,14 @@ mod tests {
             );
             assert!(slow.blocked_since.is_some(), "slow peer marked blocked");
             assert!(dirty.contains(&1), "slow peer stays dirty for retry");
+            assert!(slow.dirty, "and its flag agrees with the list");
 
             assert!(connections[&2].send_buf.is_empty(), "healthy peer drained");
             assert!(!dirty.contains(&2), "healthy peer leaves the dirty set");
+            // Flag and list must clear together: a stale `true` would
+            // keep the connection off the list forever, since `mark_dirty`
+            // only pushes when the flag is down.
+            assert!(!connections[&2].dirty, "and its flag clears with it");
             fast_rx
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
@@ -3219,9 +3359,9 @@ mod tests {
             entry.blocked_since = Some(stale_block);
             entry.last_send_attempt = stale_block;
 
-            let mut connections = HashMap::new();
+            let mut connections = FxHashMap::default();
             connections.insert(1u64, entry);
-            let mut dirty: HashSet<u64> = [1].into_iter().collect();
+            let mut dirty: Vec<u64> = vec![1];
             let mut to_remove = Vec::new();
             let mut cqes = Vec::new();
 
@@ -3262,9 +3402,9 @@ mod tests {
                 return;
             };
             entry.blocked_since = Some(expired);
-            let mut connections = HashMap::new();
+            let mut connections = FxHashMap::default();
             connections.insert(7u64, entry);
-            let mut dirty: HashSet<u64> = [7].into_iter().collect();
+            let mut dirty: Vec<u64> = vec![7];
             let mut to_remove = Vec::new();
             let mut cqes = Vec::new();
 
@@ -3297,9 +3437,9 @@ mod tests {
             // read can open the 100 µs window and flake the assertion.
             entry.last_send_attempt = Instant::now() + Duration::from_secs(1);
             let attempted_at = entry.last_send_attempt;
-            let mut connections = HashMap::new();
+            let mut connections = FxHashMap::default();
             connections.insert(3u64, entry);
-            let mut dirty: HashSet<u64> = [3].into_iter().collect();
+            let mut dirty: Vec<u64> = vec![3];
             let mut to_remove = Vec::new();
             let mut cqes = Vec::new();
 
