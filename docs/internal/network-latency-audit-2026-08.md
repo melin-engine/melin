@@ -12,6 +12,10 @@ reference, not a quantified regression. Price each with the
 `tick-to-trade` per-stage trace before landing it, and expect null
 results on some.
 
+Items landed are removed from this document as they ship; the numbering
+below is the original audit's, so the gaps are done work, not omissions.
+See "First pass" for what that was and what it bought.
+
 ## Framing — where loaded latency actually is
 
 Measured 2026-08-12 (LAN suite, tcp-dual-repl, ~1.2 M orders/s, see
@@ -39,15 +43,11 @@ unless marked DPDK. Ratings are judgement calls from code reading.
 
 | # | Option | Gain (est.) | Risk | Effort | Value |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Never block the replica receiver on `PendingAckQueue` full | replica fsync tail out of hybrid p99.9 (100 µs–ms events) | None to durability | S | **Very high** |
-| 2 | Receiver commits ring / pushes ack target per frame, bounded work per call | tens–hundreds of µs at p99.9 after hiccups | Low | M | **High** |
-| 3 | Slot-count bound on response flush age | bounds buffered age to ~one batch regardless of client count | Low | S | **High** |
 | 4 | Real NIC busy-poll on ack + ingress sockets (`SO_BUSY_POLL` is inert under io_uring) | several µs per hop × 3 hops, plausibly | Ops / kernel version | M | **High** (measure first) |
 | 5 | Sub-batch replication publish every K encoded slots; publish regardless of group-commit | up to tens of µs on heads of large batches | Low | M | Med–High |
 | 6 | Pad the gate's cursors (`ReplicationMetrics`, `DurableWireSeqCursor`) | sub-µs per gate wake; cross-CCD miss per spin at ack rate | Low | S–M | Med |
 | 7 | `DEFER_TASKRUN` on the reader ring; skip enter when CQ non-empty | 5–25 % reader-core cycles at ~1 M msg/s, less jitter | Med (CQ-read sites) | S | Med |
 | 8 | Response stage `peek_batch` instead of copying ≤1024 `OutputSlot`s | ~10 µs+ on the head slot after a stall | Low | S–M | Med |
-| 9 | Hygiene bundle (FxHash, dirty flag, single append, amortized clock, `TCP_QUICKACK` re-arm) | ~50–100 ns/request, ~1 µs/replica cycle | None | S | Med (free) |
 | 10 | Shard egress across K response consumers | divides per-flush xmit cost by K; only >32 dirty conns | Med | M–L | Low–Med |
 | 11 | DPDK: fastcp TCP 4-tuple index caps at 64 and leaks on close | 10×+ per-packet ingest cost after churn | Low | S+S | **Very high** (DPDK) |
 | 12 | DPDK: zero-copy RX cap of 32 segments/socket drops the excess | likely the DPDK throughput limiter; ≥1 RTT stalls | Med | M | **High** (DPDK) |
@@ -56,102 +56,43 @@ unless marked DPDK. Ratings are judgement calls from code reading.
 
 ### Suggested order
 
-Kernel-TCP: 1 → 3 → 9 → 2 → 6, then instrument and decide 4 / 5 / 7 on
-numbers. DPDK: 11 → 14 (neighbor cache, mempool) → 12 → 13.
+Kernel-TCP: 6, then instrument and decide 4 / 5 / 7 on numbers; 8 and 10
+only with a profile that has more than ~16 connections. DPDK: 11 → 14
+(neighbor cache, mempool) → 12 → 13.
 
-Item 1 stands out: small, provably safe, and it is the one place where
-the replica's *disk* leaks into a client latency mode (`hybrid`) that
-was designed not to wait on it.
+### First pass (landed, 2026-08-17)
 
-**Status:** 1, 3, 9 and 2 landed (branch
-`perf/loaded-tail-audit-2026-08`, one commit each) — see the "Landed"
-note in each finding for what shipped and what was deliberately left.
-None of them is measured yet; that is the next step, not more items.
+Items 1, 3, 9 and 2 shipped in that order, one commit each, and are cut
+from this document. What they did: the replica's pending-ack queue
+merges instead of blocking the receiver; the response stage bounds
+buffered-response *age* by slot count as well as bytes; the hygiene
+bundle (FxHash connection table, dirty flag + list, single append per
+slot against a pre-encoded `BatchEnd`, amortized idle clock,
+`TCP_QUICKACK` re-armed only on a silent receive cycle); and the
+receiver commits + records an ack target per frame with a bounded slot
+count per call.
+
+Two of them still need the regime that motivated them before their
+headline claim can be believed:
+
+- **Item 1** removes a *stall mode* — a replica fsync outlier freezing
+  the receiver. A profile where that never fires cannot show it.
+  `PendingAckQueue::merged()` on the replica is the tell: 0 for a run
+  means the path never engaged. Exercise it with a slow journal (EBS) or
+  a single replica, so there is no fastest-of-two smoothing to hide it.
+- **Item 3** bounds buffered-response age across *many* connections; at
+  a handful of closed-loop clients the idle-path flush already fires
+  constantly. Needs > 32 connections, ideally open-loop.
+
+The rest of the first pass is per-cycle CPU and syscall cost — the kind
+that shows up on every path in absolute µs. Price it that way, not as a
+percentage: the same saving is a large fraction of a short local path
+and a small one of a loaded LAN path, so a percentage says more about
+the profile than about the change.
 
 ---
 
 ## Kernel-TCP: replication path
-
-### 1. `PendingAckQueue` depth 8 blocks the receiver on the replica's fsync
-
-**Where:** `crates/core/server-runtime/src/replication/receiver_transport.rs`
-(backpressure branch in `streaming_loop`, `pop_oldest_blocking`),
-`crates/core/transport-core/src/replication/ack_queue.rs`
-(`pop_oldest_blocking`), `crates/core/server-runtime/src/server.rs`
-(`DEFAULT_REPLICATION_PIPELINE_DEPTH = 8`).
-
-One entry is pushed per receive cycle. When 8 cycles are pending an
-fsync, the loop **stops receiving** and spins in `wait_for_journal_cursor`
-until the *oldest* cycle is durable. Under load a receive cycle takes a
-few µs, so 8 fill in ~10–30 µs; any replica fsync slower than that
-(p99/p99.9 NVMe stalls, or EBS always) freezes the receiver — and with
-it the **in-memory** ack that `hybrid` (`persisted>=1 && in_memory>=2`)
-actually gates on. The input ring is 1 M slots, so this queue is the only
-backpressure that bites: the replica's disk tail is transplanted into the
-primary's client p99.9 in the mode whose whole point is not waiting on
-the replica's disk.
-
-**Fix.** Never block. On full, merge the newest two entries
-`(t1,s1),(t2,s2) → (max t, max s)`. Acks are cumulative and the merged
-entry acks `s2` only when the cursor ≥ `t2`, so this is strictly
-conservative — it coarsens persisted granularity under pressure, never
-overstates. Also raise the default depth (entries are 16 B; 256 costs
-nothing). Pairs with item 2 (per-frame targets need merge-on-full so
-they cannot block).
-
-Gain: removes replica-fsync tail from hybrid p99.9; frequency needs
-measurement (`gate_replication` counter, replica `journal_disk_lag`).
-Risk: none to durability. Effort: S. Confidence: high on mechanism,
-medium on frequency.
-
-**Landed.** `PendingAckQueue::push` merges into the newest entry at
-capacity and the receiver's backpressure branch is gone; default depth
-8 → 256. `PendingAckQueue::merged()` counts the coarsenings (logged at
-session exit) — that is the frequency measurement the paragraph above
-asks for.
-
-### 2. Receiver commits the ring and pushes the ack target once per receive cycle
-
-**Where:** `receiver_transport.rs` — `process_streaming_frames` takes one
-`input_producer.batch()`, one `batch.commit()`, one `pending_acks.push`
-per cycle; ack flush only at loop top; `compact_recv_buf` copies the
-remainder each iteration.
-
-All frames in `recv_buf` are decoded and pushed under one `Batch`; the
-replica's journal stage sees nothing until the whole cycle commits, and
-the in-memory ack for the cycle's first frame is composed only at the
-next loop top. In steady state a cycle is small, but after any stall
-(item 1, a scheduler hiccup, a large coalesced send from the primary — up
-to `replication_batch_size = 128` chunks) the receiver drains a
-multi-hundred-KB buffer: thousands of slots × ~30–60 ns decode + two
-128 B copies before the first slot is acked or fsync-able. A hiccup
-amplifier feeding both `in_memory` (hybrid) and `acked`
-(durably-replicated).
-
-**Fix.** (a) commit the batch every N slots / every frame (mirrors
-`COMMIT_EVERY` on client ingress); (b) push a pending-ack entry per
-`InputBatch` frame (with item 1's merge-on-full); (c) bound the work per
-`process_streaming_frames` call and keep an offset instead of compacting,
-so an ack SEND interleaves with a long drain. Under `durably-replicated`,
-per-frame targets also stop the first frame's persisted ack from waiting
-on the last frame's fsync.
-
-Gain: tens–hundreds of µs at p99.9 under bursty load; small at p50.
-Risk: low — the contiguity gate and `last_target = index + 1` semantics
-are unchanged; keep the `journal_tip.advance` / commit ordering.
-Effort: M. Confidence: medium-high.
-
-**Landed**, all three parts. The ring commits per frame (and every
-`COMMIT_EVERY = 16` slots within one), each `InputBatch` frame records
-its own pending-ack entry, and a call publishes at most
-`MAX_SLOTS_PER_CYCLE = 512` slots before returning to the loop's ack
-flush. The loop tracks a read offset into `recv_buf` instead of
-memmoving the remainder every cycle — it clears the buffer when a cycle
-drains it (the steady-state case) and compacts only past a 64 KiB dead
-prefix. The mark-ordering invariant `resolve_stream_marks` relies on
-("marks are queued before any slot past their position is published")
-still holds: marks are queued while parsing their own frame, ahead of
-every later frame's commit.
 
 ### 4. `SO_BUSY_POLL` is set on every hot socket and inert under io_uring RECV
 
@@ -241,71 +182,17 @@ the harness.
 Gain: sub-µs per gate wake; needs measurement. Risk: low. Effort: S–M.
 Confidence: high that it is wrong, medium that it is visible.
 
-### 9. Hygiene bundle
+### 9 (residue). Replica receiver copies and legacy provided buffers
 
-**Landed** (the five items in the triage row):
+**Where:** `tcp_receiver.rs`, `receiver_transport.rs`.
 
-- `FxHashMap` for the response stage's connection table (keys are
-  server-generated ids; SipHash bought nothing).
-- Dirty set → `ConnectionEntry::dirty` flag + `Vec<u64>` list;
-  `mark_dirty`/`unmark_dirty` keep the two in lockstep.
-- Payload and `BatchEnd` append in one `append_frames` call against a
-  pre-encoded terminator (one cap check, one dirty mark, no per-request
-  re-encode).
-- Idle spin's two unconditional `Instant::now()` calls per iteration are
-  now one `AmortizedTimer` tick; the inner cadences are unchanged.
-- `TCP_QUICKACK` re-armed once per *silent* receive cycle instead of
-  once per RECV CQE.
-
-Not done, deliberately: reusing `batch_now` for the post-batch
-`degraded_logger` tick. That clock read is per batch (not per slot) and
-its freshness is load-bearing — the comment at the call site explains
-why the batch's opening timestamp is the wrong one now that the gate is
-evaluated per slot.
-
-### 9 (replication part). `TCP_QUICKACK` re-armed with a syscall per RECV CQE
-
-**Where:** `tcp_receiver.rs` (`set_quickack`, called per completed recv).
-
-~0.5–1 µs syscall on the critical path per cycle, redundant in the
-common case: the replica sends an app-level ack per cycle, which
-piggybacks the TCP ACK. It only matters when the receiver stalls (item
-1) — which item 1's fix removes. Arm only when a cycle produced no ack,
-or every Nth cycle. Also still on the receiver: legacy `ProvideBuffers`
-re-provision per RECV (the client reader moved to `buf_ring`; the replica
-receiver did not — low gain, do for consistency), and two 128 B copies
-per slot (decode into `slot_buf`, then into the ring) — same shape as
-July #9, ~10–30 ns/slot.
+Left over after the hygiene bundle landed: the replica receiver still
+re-provisions buffers with legacy `ProvideBuffers` per RECV (the client
+reader moved to `buf_ring`; low gain, worth doing for consistency), and
+still pays two 128 B copies per slot — decode into `slot_buf`, then into
+the ring — the same shape as July #9, ~10–30 ns/slot.
 
 ## Kernel-TCP: response egress
-
-### 3. Flush cadence has no age bound when the ring never empties and the gate is open
-
-**Where:** `crates/core/server-runtime/src/response.rs` — consumed-path
-flush trigger is `FLUSH_BYTES_THRESHOLD` (1400 B) on *some* connection;
-`flush_sends` then flushes all dirty connections.
-
-With a persistently non-empty output ring and an open gate, the interval
-to the next flush is the time for the *busiest* connection to accumulate
-1400 B — fine at 4 clients (measured), but with many low-rate connections
-(e.g. 100 × ~12 k/s × 40 B → ~3 ms) every connection's buffered
-responses wait that long. Closed-loop clients partially self-limit it;
-open-loop or mixed traffic does not.
-
-**Fix.** Add a slot-count bound: set `flush_due` when a consumed batch
-reaches `MAX_BATCH` (the stage is genuinely behind), or after every K
-slots since the last flush. One extra `io_uring_enter` per ~1024 slots
-is well amortized.
-
-Gain: bounds buffered age to ~one batch (~50–100 µs) regardless of
-connection count; needs measurement with > 16 clients. Risk: low.
-Effort: S. Confidence: medium-high.
-
-**Landed.** Both triggers now live in one `FlushCadence`
-(`FLUSH_BYTES_THRESHOLD` OR `FLUSH_SLOT_INTERVAL = 256` appended slots
-since the last flush of any kind), so the buffered-age bound is the time
-to encode 256 responses rather than the time for the busiest connection
-to reach an MSS.
 
 ### 8. `consume_batch` copies up to 1024 `OutputSlot`s before touching the first (July #5, response half)
 
@@ -344,19 +231,6 @@ Measure with a > 32-connection profile before investing. Related, cheap:
 client fds are unregistered `types::Fd` on the response ring (fget/fput
 per SEND) — a sparse fixed table updated on connect/teardown saves
 ~50–100 ns per SEND.
-
-### 9 (egress part). Hygiene
-
-- `HashMap<u64, ConnectionEntry>` / `HashSet<u64>` dirty set with SipHash
-  (July #3, still open): `get_mut` per request + two `dirty.insert` per
-  request (payload and `BatchEnd`) + per-flush lookups. Switch to
-  `FxHashMap`, replace the dirty set with a `dirty: bool` on the entry
-  plus a `Vec<u64>` of dirty ids, and append payload + `BatchEnd` in one
-  `append_frame`. ~50–100 ns per request on the response thread.
-- Idle spin does two unconditional vDSO clock reads per iteration where
-  the DPDK stage uses `AmortizedTimer` (its perf-annotate showed ~22 % on
-  the vDSO); busy path reads twice per consumed batch. Gate the idle reads
-  behind an `AmortizedTimer`, reuse `batch_now` for the post-batch tick.
 
 ## Kernel-TCP: client ingress
 
