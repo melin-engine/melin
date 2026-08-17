@@ -192,7 +192,8 @@ pub(super) fn receive_chunked_body<S: ControlFrameSource>(
 /// journal stage's split logic relies on. A mark strictly behind the
 /// position is redundant re-delivery (handoff overlap) and is dropped
 /// like a duplicate slot; one ahead implies missing entries — the same
-/// fatal contract as a slot-sequence gap.
+/// contiguity-break contract as a slot-sequence gap
+/// ([`FrameError::SequenceGap`]: end the session, reconnect).
 fn queue_stream_mark(
     stream_marks: &StreamMarkQueue,
     pending_accum: u64,
@@ -222,6 +223,24 @@ fn queue_stream_mark(
     }
 }
 
+/// Why [`process_streaming_frames`] stopped consuming frames.
+///
+/// Two outcomes that both end the session but must not be handled the
+/// same way: a contiguity break is a *stream* problem the replica
+/// recovers from by re-handshaking at its durable position, whereas a
+/// protocol violation or journal death is unrecoverable in-process.
+#[derive(Debug)]
+pub(super) enum FrameError {
+    /// The wire stream skipped past the contiguous prefix — a slot at
+    /// `seq > accum + 1`, or a stream mark announced ahead of the
+    /// stream position. Everything before the gap is committed; the
+    /// local journal is intact. Reconnect and re-handshake.
+    SequenceGap(Box<dyn std::error::Error + Send + Sync>),
+    /// Anything else — malformed/oversized frames, an unexpected
+    /// primary message, or the journal stage dying mid-publish.
+    Fatal(Box<dyn std::error::Error + Send + Sync>),
+}
+
 /// Outcome of [`process_streaming_frames`] for one recv-cycle.
 pub(super) struct StreamingFrameOutcome {
     /// Bytes consumed from the recv buffer.
@@ -241,8 +260,10 @@ pub(super) struct StreamingFrameOutcome {
     /// or a `Heartbeat`. Session-level liveness evidence; see
     /// [`StreamingResult::heard_from_primary`].
     pub heard_from_primary: bool,
-    /// Fatal frame error — caller should break with `SessionExit::Fatal`.
-    pub frame_err: Option<Box<dyn std::error::Error + Send + Sync>>,
+    /// Why frame processing stopped, if it did — the caller maps a
+    /// `SequenceGap` to `SessionExit::StreamGap` (reconnect) and a
+    /// `Fatal` to `SessionExit::Fatal`.
+    pub frame_err: Option<FrameError>,
     /// The primary's acking mode as advertised by the last `Heartbeat`
     /// in this cycle, if any — the caller folds it into the
     /// control-plane gauge (`ReplicaControlPlane::primary_acking_mode`).
@@ -268,13 +289,15 @@ pub(super) struct StreamingFrameOutcome {
 ///   live handoff drains ring chunks whole, and a chunk straddling the
 ///   catch-up end legitimately re-carries covered slots.
 /// - `seq == accum + 1` — accepted.
-/// - `seq > accum + 1` — fatal. A gap can never be repaired
-///   downstream: acking past it overstates durability to the
-///   primary's response gate, and the hole surfaces only at lineage
-///   audit (the 2026-06-07 bench failure). The contiguous prefix is
-///   committed (progress preserved — mirrors the oversize-frame
-///   semantics); the session tears down and re-handshakes from its
-///   true position.
+/// - `seq > accum + 1` — a [`FrameError::SequenceGap`]. A gap can never
+///   be repaired downstream: acking past it overstates durability to
+///   the primary's response gate, and the hole surfaces only at
+///   lineage audit (the 2026-06-07 bench failure). The contiguous
+///   prefix is committed (progress preserved — mirrors the
+///   oversize-frame semantics); the session ends with
+///   `SessionExit::StreamGap`, and the receiver reconnects and
+///   re-handshakes from its durable position — the local journal is
+///   intact, so this is a reconnect, not a restart.
 pub(super) fn process_streaming_frames<E: AppEvent>(
     recv_buf: &[u8],
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
@@ -287,7 +310,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     let mut last_target = 0u64;
     let mut any_published = false;
     let mut heard_from_primary = false;
-    let mut frame_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    let mut frame_err: Option<FrameError> = None;
     let mut observed_acking_mode: Option<u8> = None;
     let mut batch = input_producer.batch();
     let mut pending_accum = accum_end_sequence;
@@ -299,7 +322,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
         // per-frame so at most one frame's slots are published after
         // the failure latch flips.
         if journal_failed.load(Ordering::Relaxed) {
-            frame_err = Some("replica journal stage failed".into());
+            frame_err = Some(FrameError::Fatal("replica journal stage failed".into()));
             break;
         }
         let remaining = &recv_buf[consumed..];
@@ -320,14 +343,14 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                     continue;
                                 }
                                 if primary_seq != pending_accum + 1 {
-                                    frame_err = Some(
+                                    frame_err = Some(FrameError::SequenceGap(
                                         format!(
                                             "sequence gap in replication stream: \
                                              expected {}, got {primary_seq}",
                                             pending_accum + 1
                                         )
                                         .into(),
-                                    );
+                                    ));
                                     break;
                                 }
                                 // Abortable push: the loop-top latch check
@@ -347,11 +370,11 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                     // cursor reaches index + 1.
                                     Ok(index) => last_target = index + 1,
                                     Err(_full) => {
-                                        frame_err = Some(
+                                        frame_err = Some(FrameError::Fatal(
                                             "replica journal stage failed \
                                              (ring full mid-publish)"
                                                 .into(),
-                                        );
+                                        ));
                                         break;
                                     }
                                 }
@@ -388,7 +411,10 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                     tail_hash,
                                 }),
                             ) {
-                                frame_err = Some(e);
+                                // A mark ahead of the stream position is
+                                // the same contiguity break as a skipped
+                                // slot: something before it never arrived.
+                                frame_err = Some(FrameError::SequenceGap(e));
                                 break;
                             }
                         }
@@ -405,25 +431,28 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                     chain_hash,
                                 },
                             ) {
-                                frame_err = Some(e);
+                                frame_err = Some(FrameError::SequenceGap(e));
                                 break;
                             }
                         }
                         Ok(PrimaryMessage::NeedSnapshot) => {
-                            frame_err =
-                                Some("primary says we need a snapshot transfer mid-stream".into());
+                            frame_err = Some(FrameError::Fatal(
+                                "primary says we need a snapshot transfer mid-stream".into(),
+                            ));
                             break;
                         }
                         Ok(PrimaryMessage::HashMismatch) => {
-                            frame_err = Some("chain hash mismatch from primary".into());
+                            frame_err =
+                                Some(FrameError::Fatal("chain hash mismatch from primary".into()));
                             break;
                         }
                         Ok(_) => {
                             debug!("unexpected message during streaming");
                         }
                         Err(e) => {
-                            frame_err =
-                                Some(format!("failed to decode primary message: {e}").into());
+                            frame_err = Some(FrameError::Fatal(
+                                format!("failed to decode primary message: {e}").into(),
+                            ));
                             break;
                         }
                     },
@@ -431,7 +460,9 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                 consumed += frame_end;
             }
             FrameResult::Oversized => {
-                frame_err = Some("oversized frame from primary during streaming".into());
+                frame_err = Some(FrameError::Fatal(
+                    "oversized frame from primary during streaming".into(),
+                ));
                 break;
             }
             FrameResult::Incomplete => break,
@@ -553,7 +584,18 @@ pub(super) fn process_drain_frames<E: AppEvent>(
 pub(super) enum SessionExit {
     Shutdown,
     Promote,
+    /// The transport dropped. Reconnect with backoff.
     Disconnected,
+    /// The stream broke contiguity (see [`FrameError::SequenceGap`]).
+    /// The contiguous prefix is committed and the local journal is
+    /// intact, so this is handled like a disconnect — reconnect and
+    /// re-handshake from the durable position — but logged with the
+    /// reason, since it is the primary's stream, not the network, that
+    /// misbehaved.
+    StreamGap(Box<dyn std::error::Error + Send + Sync>),
+    /// Unrecoverable in this process (protocol violation, journal
+    /// death); mid-stream chain divergence is the one fatal the exit
+    /// handler repairs by in-process resync.
     Fatal(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -830,8 +872,10 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         heard_from_primary |= outcome.heard_from_primary;
         compact_recv_buf(&mut recv_buf, outcome.consumed);
 
-        if let Some(e) = outcome.frame_err {
-            break SessionExit::Fatal(e);
+        match outcome.frame_err {
+            Some(FrameError::SequenceGap(e)) => break SessionExit::StreamGap(e),
+            Some(FrameError::Fatal(e)) => break SessionExit::Fatal(e),
+            None => {}
         }
 
         if outcome.any_published && !pending_acks.is_full() {
@@ -1618,9 +1662,10 @@ mod tests {
     }
 
     /// A Rotate ahead of the stream position implies missing entries —
-    /// same fatal contract as a slot-sequence gap.
+    /// same contiguity-break contract as a slot-sequence gap: the
+    /// session ends as a `SequenceGap` (reconnect), not a `Fatal`.
     #[test]
-    fn streaming_rotate_ahead_of_stream_is_fatal_gap() {
+    fn streaming_rotate_ahead_of_stream_is_a_sequence_gap() {
         let (mut producer, mut consumer) = ring(16);
         let mut slot_buf = Vec::new();
         let rotations = no_marks();
@@ -1639,8 +1684,8 @@ mod tests {
         );
 
         assert!(
-            outcome.frame_err.is_some(),
-            "rotate past stream position => fatal"
+            matches!(outcome.frame_err, Some(FrameError::SequenceGap(_))),
+            "rotate past stream position => sequence gap"
         );
         assert_eq!(outcome.accum_end_sequence, 6, "prefix still committed");
         assert_eq!(drain(&mut consumer).len(), 1);
@@ -1794,9 +1839,11 @@ mod tests {
     //                       live chunk after catch-up may straddle the
     //                       catch-up end and re-carry covered slots)
     //   seq == accum + 1  → accept
-    //   seq >  accum + 1  → fatal — a gap can never be repaired
+    //   seq >  accum + 1  → SequenceGap — a gap can never be repaired
     //                       downstream; acking past it overstates
     //                       durability and corrupts the journal lineage.
+    //                       The session ends and reconnects from the
+    //                       durable position.
     // ---------------------------------------------------------------
 
     #[test]
@@ -1819,9 +1866,9 @@ mod tests {
         );
 
         assert!(
-            outcome.frame_err.is_some(),
-            "a sequence gap (11 → 14) must be a fatal protocol violation, \
-             not silently accepted"
+            matches!(outcome.frame_err, Some(FrameError::SequenceGap(_))),
+            "a sequence gap (11 → 14) must end the session as a SequenceGap, \
+             not be silently accepted"
         );
         let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
         assert_eq!(
@@ -1854,15 +1901,15 @@ mod tests {
         );
 
         assert!(
-            outcome.frame_err.is_some(),
-            "an intra-frame sequence gap (11 → 13) must be fatal"
+            matches!(outcome.frame_err, Some(FrameError::SequenceGap(_))),
+            "an intra-frame sequence gap (11 → 13) must end the session as a SequenceGap"
         );
         let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
         assert_eq!(
             published,
             vec![10, 11],
             "the contiguous prefix is committed; the slot past the gap is not \
-             (mirrors the oversize-frame semantics: commit prior progress, then fatal)"
+             (mirrors the oversize-frame semantics: commit prior progress, then stop)"
         );
         assert_eq!(outcome.accum_end_sequence, 11);
     }
@@ -1934,13 +1981,15 @@ mod tests {
     }
 
     /// Loop-level pin of the durability contract: after a gapped wire
-    /// stream, the session must end fatally and no ack — persisted or
-    /// in-memory — may ever name a sequence past the last contiguous
-    /// slot. In the bench failure the replica kept acking for the rest
-    /// of the 60s run with a 212-entry hole behind its cursors,
-    /// overstating durability to the primary's response gate.
+    /// stream, the session must end with `StreamGap` (reconnect from
+    /// the durable position — the local journal is intact) and no ack
+    /// — persisted or in-memory — may ever name a sequence past the
+    /// last contiguous slot. In the bench failure the replica kept
+    /// acking for the rest of the 60s run with a 212-entry hole behind
+    /// its cursors, overstating durability to the primary's response
+    /// gate.
     #[test]
-    fn streaming_loop_sequence_gap_is_fatal_and_never_acked_past() {
+    fn streaming_loop_sequence_gap_ends_session_and_never_acks_past() {
         let (mut producer, mut consumer) = ring(16);
         // Journal cursor at u64::MAX so pending acks are immediately
         // durable — ack content is what's under test, not flush timing.
@@ -1974,8 +2023,9 @@ mod tests {
         );
 
         assert!(
-            matches!(result.exit, SessionExit::Fatal(_)),
-            "a gapped stream must end the session fatally (got a clean exit)"
+            matches!(result.exit, SessionExit::StreamGap(_)),
+            "a gapped stream must end the session as a StreamGap (reconnect), \
+             not a clean exit and not a process-fatal error"
         );
         let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
         assert_eq!(
@@ -2006,8 +2056,8 @@ mod tests {
     ///
     /// Here the replica resumes at 100 (e.g. a snapshot at sequence 100)
     /// and the first frame jumps to 102 — sequence 101 is missing. The
-    /// session must die fatally with nothing published and no ack past
-    /// 100.
+    /// session must end as a `StreamGap` with nothing published and no
+    /// ack past 100.
     #[test]
     fn streaming_loop_anchors_contiguity_at_the_resume_point() {
         let (mut producer, mut consumer) = ring(16);
@@ -2038,9 +2088,9 @@ mod tests {
         );
 
         assert!(
-            matches!(result.exit, SessionExit::Fatal(_)),
-            "a first slot past resume_point+1 must be fatal — the gate is \
-             not anchored at the resume point"
+            matches!(result.exit, SessionExit::StreamGap(_)),
+            "a first slot past resume_point+1 must end the session as a gap — \
+             the gate is not anchored at the resume point"
         );
         assert!(
             drain(&mut consumer).is_empty(),

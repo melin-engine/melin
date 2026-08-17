@@ -713,9 +713,9 @@ pub(in crate::replication) enum AfterSession<A, W> {
         last_sequence: u64,
         chain_hash: [u8; 32],
     },
-    /// A plain disconnect — backoff has already been applied (and the
-    /// flags checked); the caller reconnects, reusing the still-live
-    /// pipeline.
+    /// A plain disconnect or a stream contiguity break — backoff has
+    /// already been applied (and the flags checked); the caller
+    /// reconnects, reusing the still-live pipeline.
     Reconnect,
 }
 
@@ -734,9 +734,9 @@ pub(in crate::replication) enum AfterSession<A, W> {
 /// reconnect — the DPDK receiver closes its smoltcp socket so the
 /// primary's slot and the local socket-set entry are freed; the
 /// kernel-TCP receiver passes a no-op (its `TcpStream` is dropped by the
-/// caller on the next loop turn). It is invoked only on the two
-/// reconnecting paths (in-process resync, plain disconnect), matching
-/// the pre-refactor behaviour.
+/// caller on the next loop turn). It is invoked only on the
+/// reconnecting paths (in-process resync, plain disconnect, stream
+/// gap), never on a terminal return.
 // Twelve arguments is a lot, but each is a distinct piece of the
 // receiver loop's state; bundling them would only move the noise.
 #[allow(clippy::too_many_arguments)]
@@ -830,6 +830,26 @@ where
                 },
                 Err(e) => AfterSession::Return(Err(e)),
             }
+        }
+
+        SessionExit::StreamGap(e) => {
+            // The primary's stream skipped past what we hold; the
+            // contiguous prefix is committed and the journal stage keeps
+            // flushing it, so re-handshaking at the durable position
+            // (re-read from `FsyncState` at the top of the reconnect
+            // loop, after the backoff) lets the primary re-stream the
+            // hole. The primary evidently spoke, so the backoff resets
+            // exactly as a heard-from disconnect does. Not a resync:
+            // nothing on disk is wrong.
+            close();
+            *backoff = std::time::Duration::from_secs(1);
+            tracing::warn!(
+                error = %e,
+                last_sequence,
+                "replication stream broke contiguity — reconnecting from the durable position"
+            );
+            sleep_then_double_backoff(backoff, shutdown, promote);
+            AfterSession::Reconnect
         }
 
         SessionExit::Disconnected => {
@@ -2703,6 +2723,87 @@ mod tests {
     #[test]
     fn disconnect_keeps_escalated_backoff_when_primary_silent() {
         assert_eq!(backoff_after_disconnect(false), MAX_BACKOFF);
+    }
+
+    /// A stream contiguity break is a reconnect, never a process exit:
+    /// the contiguous prefix is committed and the journal is intact, so
+    /// the receiver re-handshakes from its durable position and the
+    /// primary re-streams the hole. It used to fall through the `Fatal`
+    /// arm and take the replica down for a documented-benign primary
+    /// handoff corner. The pipeline must be left standing (it is what
+    /// the reconnect resumes into) and the backoff reset — the primary
+    /// was evidently speaking.
+    #[test]
+    fn stream_gap_reconnects_and_keeps_pipeline() {
+        use melin_app::app_factory::AppFactory;
+        let dir = tempfile::tempdir().expect("tempdir");
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        // Same shape as `teardown_fixture`, but with a real writer type:
+        // `handle_session_exit` is bounded on `JournalWrite` for the
+        // resync arm even though this path never touches it.
+        let (input_producer, mut consumers) =
+            melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(4)
+                .add_consumer()
+                .build();
+        let _consumer = consumers.pop().expect("one consumer");
+        let writer_path = dir.path().join("w.journal");
+        let handles = ReplicaPipelineHandles {
+            input_producer,
+            journal_cursor: Arc::new(make_journal_cursor(0)),
+            last_seq: melin_transport_core::DurableWireSeqCursor::detached(
+                melin_transport_core::WireSeq::new(0),
+            ),
+            chain_hash_lock: None,
+            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            journal_failed: Arc::new(AtomicBool::new(false)),
+            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
+            journal_handle: std::thread::spawn(move || Writer::create(&writer_path)),
+            matching_handle: std::thread::spawn(|| counter_server::CounterFactory.empty()),
+            drain_handle: std::thread::spawn(|| {}),
+            shadow_handle: None,
+        };
+        let mut pipeline: Option<ReplicaPipelineHandles<counter_server::Counter, Writer>> =
+            Some(handles);
+        let mut divergence_resyncs = 0u32;
+        let mut backoff = MAX_BACKOFF;
+        let shutdown = AtomicBool::new(true);
+        let promote = crate::promotion::PromotionRequest::new();
+        let mut closed = false;
+        let after = handle_session_exit::<counter_server::Counter, Writer>(
+            StreamingResult {
+                exit: SessionExit::StreamGap("sequence gap: expected 3, got 5".into()),
+                heard_from_primary: true,
+            },
+            &mut pipeline,
+            &mut divergence_resyncs,
+            &mut backoff,
+            2,
+            &dir.path().join("r.journal"),
+            &dir.path().join("r.snapshot"),
+            &counter_server::CounterFactory,
+            &melin_transport_core::fence::FenceState::new(0),
+            &shutdown,
+            &promote,
+            || closed = true,
+        );
+        assert!(
+            matches!(after, AfterSession::Reconnect),
+            "a stream gap must reconnect, not return an error"
+        );
+        assert!(
+            pipeline.is_some(),
+            "the pipeline must survive for the reconnect"
+        );
+        assert!(closed, "the transport must be closed before redialing");
+        assert_eq!(
+            backoff,
+            std::time::Duration::from_secs(2),
+            "backoff reset to 1s then doubled by the shared helper"
+        );
+        assert_eq!(divergence_resyncs, 0, "not a resync");
+        if let Some(p) = pipeline.take() {
+            let _ = teardown_replica_pipeline::<counter_server::Counter, Writer>(p);
+        }
     }
 
     /// With the journal-failure latch set and the ring full — the state
