@@ -262,6 +262,12 @@ Gain: bounds buffered age to ~one batch (~50–100 µs) regardless of
 connection count; needs measurement with > 16 clients. Risk: low.
 Effort: S. Confidence: medium-high.
 
+**Landed.** Both triggers now live in one `FlushCadence`
+(`FLUSH_BYTES_THRESHOLD` OR `FLUSH_SLOT_INTERVAL = 256` appended slots
+since the last flush of any kind), so the buffered-age bound is the time
+to encode 256 responses rather than the time for the busiest connection
+to reach an MSS.
+
 ### 8. `consume_batch` copies up to 1024 `OutputSlot`s before touching the first (July #5, response half)
 
 **Where:** `response.rs`, `dpdk_response.rs` — `read_batch` memcpys each

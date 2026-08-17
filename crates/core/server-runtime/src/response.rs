@@ -74,6 +74,60 @@ const BLOCKED_RETRY_INTERVAL: Duration = Duration::from_micros(100);
 /// cap instead of zero.
 const FLUSH_BYTES_THRESHOLD: usize = 1400;
 
+/// Slot-count flush trigger: how many appended slots may pass between
+/// flushes before one is forced, regardless of how few bytes any single
+/// connection has buffered.
+///
+/// [`FLUSH_BYTES_THRESHOLD`] bounds a *connection's* buffered bytes but
+/// not their *age*: the interval to the next flush is the time the
+/// busiest connection needs to accumulate an MSS, which grows with
+/// client count. At 4 clients that is microseconds; at 100 clients each
+/// sending ~40 B responses at a modest rate it is milliseconds, and every
+/// connection's already-encoded responses wait that long. Counting slots
+/// instead makes the bound depend on the stage's own throughput: one
+/// extra `io_uring_enter` per 256 responses is well amortized (~0.1 % of
+/// the per-slot cost at 1 M/s) and caps the wait at the time to encode
+/// 256 responses — tens of microseconds — however the load is spread.
+const FLUSH_SLOT_INTERVAL: usize = 256;
+
+/// The consumed path's flush cadence: both triggers plus the counter
+/// they share.
+///
+/// A struct rather than loose locals because the age counter has to be
+/// restarted by *every* flush site (consumed path, pre-gate-wait, idle),
+/// and a missed reset silently shortens the bound. One `on_flush` call
+/// per site is checkable by eye.
+#[derive(Default)]
+struct FlushCadence {
+    /// Slots appended since the last flush — the age bound.
+    slots_since_flush: usize,
+    /// Latched by the byte trigger, cleared by [`Self::on_flush`].
+    due: bool,
+}
+
+impl FlushCadence {
+    /// Record one appended slot on a connection that now holds
+    /// `buffered_bytes` unflushed.
+    #[inline]
+    fn on_append(&mut self, buffered_bytes: usize) {
+        self.slots_since_flush += 1;
+        self.due |= buffered_bytes >= FLUSH_BYTES_THRESHOLD;
+    }
+
+    /// Whether a flush must run before the next slot is encoded.
+    #[inline]
+    fn is_due(&self) -> bool {
+        self.due || self.slots_since_flush >= FLUSH_SLOT_INTERVAL
+    }
+
+    /// Restart both triggers. Call immediately after any `flush_sends`.
+    #[inline]
+    fn on_flush(&mut self) {
+        self.due = false;
+        self.slots_since_flush = 0;
+    }
+}
+
 /// How long a connection's socket may accept *zero* bytes while it has
 /// undelivered data before it is dropped. Partial progress restarts the
 /// clock — a slow-but-draining client is `MAX_SEND_BUF`'s problem, not
@@ -367,6 +421,13 @@ pub fn run<A: Application>(
     // Track connections with buffered (unflushed) writes across batches.
     let mut dirty_connections: HashSet<u64> = HashSet::new();
 
+    // Flush triggers for the consumed path. Lives across batches because
+    // the regime the age bound exists for is a ring that never empties:
+    // the byte threshold is per connection, so with many low-rate
+    // clients no single `send_buf` reaches an MSS for milliseconds while
+    // the stage encodes continuously.
+    let mut flush = FlushCadence::default();
+
     // Connections to remove after flush (send errors).
     let mut to_remove: Vec<u64> = Vec::new();
 
@@ -556,6 +617,7 @@ pub fn run<A: Application>(
                     &mut to_remove,
                     &mut cqes,
                 );
+                flush.on_flush();
                 #[cfg(feature = "tick-to-trade")]
                 egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
                 #[cfg(feature = "latency-trace")]
@@ -717,18 +779,16 @@ pub fn run<A: Application>(
         // wait more often.
         let batch_now = Instant::now();
 
-        // Set when a connection's send_buf crosses
-        // FLUSH_BYTES_THRESHOLD; checked after every slot so the flush
-        // runs *within* the batch. Deferring it to the end of the batch
-        // would reopen the defect the threshold exists to close: one
-        // MAX_BATCH batch of large frames (anything over ~64 bytes
-        // average) can push a healthy connection from empty past
-        // `MAX_SEND_BUF` before a batch-end flush ever ran, tearing it
-        // down with nothing written. A flag written at append time
-        // rather than a per-slot scan of the dirty set: the scan would
-        // cost a hash lookup per dirty connection on the hot path.
-        let mut flush_due = false;
-
+        // `flush` (see `FlushCadence`) is fed at append time and checked
+        // after every slot, so the flush runs *within* the batch.
+        // Deferring it to the end of the batch would reopen the defect
+        // the byte threshold exists to close: one MAX_BATCH batch of
+        // large frames (anything over ~64 bytes average) can push a
+        // healthy connection from empty past `MAX_SEND_BUF` before a
+        // batch-end flush ever ran, tearing it down with nothing
+        // written. A flag written at append time rather than a per-slot
+        // scan of the dirty set: the scan would cost a hash lookup per
+        // dirty connection on the hot path.
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
@@ -783,6 +843,7 @@ pub fn run<A: Application>(
                         &mut to_remove,
                         &mut cqes,
                     );
+                    flush.on_flush();
                     #[cfg(feature = "tick-to-trade")]
                     egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
                     #[cfg(feature = "latency-trace")]
@@ -1004,27 +1065,29 @@ pub fn run<A: Application>(
                     let _ = outcome;
                 }
 
-                flush_due |= entry.send_buf.len() >= FLUSH_BYTES_THRESHOLD;
+                flush.on_append(entry.send_buf.len());
             }
 
-            // Byte-threshold flush on the consumed path — the still-
-            // open half of July-audit finding 4. Under sustained load
-            // with an open gate this is the ONLY flush that runs: the
-            // idle path needs an empty SPSC, the gate path needs a
-            // durability wait, and heartbeats need idleness. Without
-            // it, delivery on a busy stretch degenerates to
-            // `MAX_SEND_BUF` evicting the very clients being served.
-            // Threshold-gated so light traffic keeps full batching;
-            // once a connection holds ~an MSS the extra submit no
-            // longer costs wire efficiency. MSG_DONTWAIT flushes cannot
-            // block, so this adds no head-of-line exposure (the hazard
-            // that deferred this trigger in July). Runs between slots,
-            // not after the batch, so `MAX_SEND_BUF` can never trip on
-            // a healthy connection within a single batch — a blocked
-            // peer re-arms the flag on its later slots, but its paced
-            // retry inside `flush_sends` keeps that cheap.
-            if flush_due {
-                flush_due = false;
+            // Consumed-path flush — the still-open half of July-audit
+            // finding 4, plus its age bound (August audit finding 3).
+            // Under sustained load with an open gate this is the ONLY
+            // flush that runs: the idle path needs an empty SPSC, the
+            // gate path needs a durability wait, and heartbeats need
+            // idleness. Without it, delivery on a busy stretch
+            // degenerates to `MAX_SEND_BUF` evicting the very clients
+            // being served. Trigger-gated so light traffic keeps full
+            // batching; once a connection holds ~an MSS — or the stage
+            // has encoded `FLUSH_SLOT_INTERVAL` responses since the last
+            // flush, whichever comes first — the extra submit no longer
+            // costs wire efficiency. MSG_DONTWAIT flushes cannot block,
+            // so this adds no head-of-line exposure (the hazard that
+            // deferred this trigger in July). Runs between slots, not
+            // after the batch, so `MAX_SEND_BUF` can never trip on a
+            // healthy connection within a single batch — a blocked peer
+            // re-arms the flag on its later slots, but its paced retry
+            // inside `flush_sends` keeps that cheap.
+            if flush.is_due() {
+                flush.on_flush();
                 // Overflow-dropped connections leave first so the flush
                 // skips them — same order as the batch-end cleanup, and
                 // their queued samples go with them (they measure bytes
@@ -2888,6 +2951,61 @@ mod tests {
             Duration::from_millis(500),
         );
         assert!(!final_state);
+    }
+
+    /// The consumed path's two flush triggers. The byte threshold bounds
+    /// a connection's buffered *bytes*; the slot interval bounds their
+    /// *age*, which is what many-low-rate-client deployments need (2026-08
+    /// network audit, finding 3).
+    mod flush_cadence {
+        use super::super::{FLUSH_BYTES_THRESHOLD, FLUSH_SLOT_INTERVAL, FlushCadence};
+
+        #[test]
+        fn byte_threshold_fires_on_a_single_fat_connection() {
+            let mut c = FlushCadence::default();
+            c.on_append(FLUSH_BYTES_THRESHOLD - 1);
+            assert!(!c.is_due());
+            c.on_append(FLUSH_BYTES_THRESHOLD);
+            assert!(c.is_due());
+        }
+
+        #[test]
+        fn slot_interval_bounds_the_age_of_tiny_buffers() {
+            // Every connection stays far below an MSS — the byte
+            // trigger never fires, so before the age bound these
+            // responses sat in `send_buf` until the ring went idle.
+            let mut c = FlushCadence::default();
+            for _ in 0..FLUSH_SLOT_INTERVAL - 1 {
+                c.on_append(40);
+                assert!(!c.is_due());
+            }
+            c.on_append(40);
+            assert!(
+                c.is_due(),
+                "age bound must fire on the {FLUSH_SLOT_INTERVAL}th slot"
+            );
+        }
+
+        #[test]
+        fn flushing_restarts_both_triggers() {
+            let mut c = FlushCadence::default();
+            for _ in 0..FLUSH_SLOT_INTERVAL {
+                c.on_append(FLUSH_BYTES_THRESHOLD);
+            }
+            assert!(c.is_due());
+            c.on_flush();
+            assert!(
+                !c.is_due(),
+                "a flush restarts the byte flag and the counter"
+            );
+            // And the age bound counts from the flush, not from start.
+            for _ in 0..FLUSH_SLOT_INTERVAL - 1 {
+                c.on_append(1);
+            }
+            assert!(!c.is_due());
+            c.on_append(1);
+            assert!(c.is_due());
+        }
     }
 
     /// Regression tests for the slow-client head-of-line block fixed in
