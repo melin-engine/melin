@@ -63,6 +63,11 @@ Item 1 stands out: small, provably safe, and it is the one place where
 the replica's *disk* leaks into a client latency mode (`hybrid`) that
 was designed not to wait on it.
 
+**Status:** 1, 3, 9 and 2 landed (branch
+`perf/loaded-tail-audit-2026-08`, one commit each) — see the "Landed"
+note in each finding for what shipped and what was deliberately left.
+None of them is measured yet; that is the next step, not more items.
+
 ---
 
 ## Kernel-TCP: replication path

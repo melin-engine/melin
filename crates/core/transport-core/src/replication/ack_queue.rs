@@ -38,6 +38,11 @@ pub struct PendingAck {
 /// for as long as its own fsync took, transplanting the replica's disk
 /// tail into the primary's client latency.
 ///
+/// A replica that is *durably* slower than the wire is still bounded,
+/// just further downstream: its input ring fills, the publish stalls,
+/// the TCP window closes, and the primary's replication ring evicts it
+/// into a resync. This queue only decides ack granularity.
+///
 /// `Box<[PendingAck]>` rather than `Vec<PendingAck>`: the capacity is
 /// fixed at construction; a slice avoids the `Vec`'s capacity field on
 /// every push/pop. `cap` is constrained to a power of two so the

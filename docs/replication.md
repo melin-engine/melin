@@ -28,6 +28,20 @@ makes `persisted` a meaningful guarantee without an explicit fsync
 round-trip on every event — the device commits the write to flash
 across a power loss.
 
+### A replica's disk is not on the `hybrid` critical path
+
+`hybrid` asks the second node to confirm *receipt in RAM*, not a second
+fsync, so a replica whose own device stalls — a p99.9 NVMe hiccup, a
+network-attached volume, a rotation pause — must not show up in client
+latency. It doesn't: the replica keeps receiving and keeps confirming
+receipt while its disk catches up. Only its *persisted* confirmation
+falls behind, and that is the one `durably-replicated` waits for.
+
+Under `durably-replicated` the replica's disk is on the critical path by
+definition — that is the guarantee the mode buys. A replica running
+behind its own device is visible on that node's
+`melin_journal_disk_lag_batches`.
+
 ### Strict fail-closed semantics
 
 Every mode is **strict**. If the configured guarantee can't be met by

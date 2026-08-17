@@ -1103,7 +1103,13 @@ pub fn run<A: Application>(
 
                 #[cfg(feature = "tick-to-trade")]
                 let encode_start = trace::mono_trace_ns();
-                let outcome = append_frames(
+                // Underscored: with both frames in one call there is no
+                // second append to skip, so the outcome is purely
+                // informational — `append_frames` has already queued an
+                // overflowing connection for removal. Only the traced
+                // build reads it, to avoid measuring bytes that were
+                // never buffered.
+                let _outcome = append_frames(
                     payload_result,
                     trailer,
                     slot.connection_id,
@@ -1122,10 +1128,9 @@ pub fn run<A: Application>(
                 // connection doesn't skew the metric, and closed by
                 // whichever flush ships the bytes.
                 #[cfg(feature = "latency-trace")]
-                if slot.is_last_in_request && matches!(outcome, AppendOutcome::Continue) {
+                if slot.is_last_in_request && matches!(_outcome, AppendOutcome::Continue) {
                     pending_e2e.push((slot.connection_id, slot.recv_ts));
                 }
-                let _ = outcome;
 
                 flush.on_append(entry.send_buf.len());
             }
@@ -3088,6 +3093,129 @@ mod tests {
             mark_dirty(&mut b, 2, &mut dirty);
             unmark_dirty(1, &mut dirty);
             assert_eq!(dirty, vec![2], "order of the survivors is preserved");
+        }
+    }
+
+    /// One append per slot: the encoded payload plus the request's
+    /// pre-encoded `BatchEnd` terminator, sharing a single cap check and
+    /// a single dirty marking.
+    mod append_frames {
+        use super::super::{AppendOutcome, ConnectionEntry, MAX_SEND_BUF, append_frames};
+        use super::flush_sends::entry_for;
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+
+        const TRAILER: &[u8] = &[0xEE, 0xEE];
+
+        fn entry(prefill: usize) -> ConnectionEntry {
+            let (tx, _rx) = UnixStream::pair().expect("socketpair");
+            let mut e = entry_for(tx, &vec![0u8; prefill]);
+            e.dirty = false;
+            e
+        }
+
+        #[test]
+        fn payload_and_terminator_land_in_one_append() {
+            let mut e = entry(0);
+            let mut dirty = Vec::new();
+            let mut to_remove = Vec::new();
+            let encoded = [1u8, 2, 3, 4, 0xFF];
+
+            let outcome = append_frames(
+                Some(Ok(4)),
+                TRAILER,
+                7,
+                &mut e,
+                &encoded,
+                Instant::now(),
+                &mut dirty,
+                &mut to_remove,
+            );
+
+            assert!(matches!(outcome, AppendOutcome::Continue));
+            assert_eq!(
+                e.send_buf,
+                vec![1, 2, 3, 4, 0xEE, 0xEE],
+                "payload then terminator, nothing past the encoder's length"
+            );
+            assert_eq!(dirty, vec![7], "one dirty marking for the pair");
+            assert!(to_remove.is_empty());
+        }
+
+        #[test]
+        fn a_slot_with_no_bytes_does_not_dirty_the_connection() {
+            // `OutputPayload::BatchEnd` mid-request: no payload, no
+            // terminator. Marking it dirty would queue an empty send.
+            let mut e = entry(0);
+            let mut dirty = Vec::new();
+            let mut to_remove = Vec::new();
+
+            let outcome = append_frames(
+                None,
+                &[],
+                7,
+                &mut e,
+                &[],
+                Instant::now(),
+                &mut dirty,
+                &mut to_remove,
+            );
+
+            assert!(matches!(outcome, AppendOutcome::Continue));
+            assert!(e.send_buf.is_empty());
+            assert!(dirty.is_empty());
+            assert!(!e.dirty);
+        }
+
+        #[test]
+        fn the_cap_is_checked_against_both_frames_together() {
+            // Payload alone fits; payload + terminator does not. The
+            // connection must be dropped *before* the payload lands —
+            // never delivered without its terminator.
+            let mut e = entry(MAX_SEND_BUF - 5);
+            let mut dirty = Vec::new();
+            let mut to_remove = Vec::new();
+            let encoded = [1u8, 2, 3, 4];
+
+            let outcome = append_frames(
+                Some(Ok(4)),
+                TRAILER,
+                7,
+                &mut e,
+                &encoded,
+                Instant::now(),
+                &mut dirty,
+                &mut to_remove,
+            );
+
+            assert!(matches!(outcome, AppendOutcome::ConnectionDropped));
+            assert_eq!(to_remove, vec![7]);
+            assert_eq!(e.send_buf.len(), MAX_SEND_BUF - 5, "no partial append");
+            assert!(dirty.is_empty(), "a dropped connection is not queued");
+        }
+
+        #[test]
+        fn an_encode_failure_still_terminates_the_request() {
+            // The payload is this server's bug; the client still needs
+            // the terminator or it waits forever for the batch to end.
+            let mut e = entry(0);
+            let mut dirty = Vec::new();
+            let mut to_remove = Vec::new();
+
+            let outcome = append_frames(
+                Some(Err("encode error")),
+                TRAILER,
+                7,
+                &mut e,
+                &[],
+                Instant::now(),
+                &mut dirty,
+                &mut to_remove,
+            );
+
+            assert!(matches!(outcome, AppendOutcome::Continue));
+            assert_eq!(e.send_buf, TRAILER);
+            assert_eq!(dirty, vec![7]);
         }
     }
 
