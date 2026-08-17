@@ -318,6 +318,31 @@ impl<R> ConnectionSlab<R> {
 // Main loop
 // ---------------------------------------------------------------------------
 
+/// How the reader should approach the kernel before draining the CQ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RingEntry {
+    /// Completions are visible and there is nothing to hand over — drain
+    /// from the mmap'd ring without a syscall.
+    Skip,
+    /// SQEs to submit, but completions are already visible: hand them
+    /// over and come straight back rather than asking to wait.
+    Submit,
+    /// Nothing to process yet — submit whatever is queued and park.
+    SubmitAndWait,
+}
+
+/// The reader's enter policy. Two rules: never park while completions
+/// are already visible, and never skip the syscall while SQEs are
+/// waiting to be handed over.
+#[inline]
+fn ring_entry(sq_pending: usize, cq_ready: bool) -> RingEntry {
+    match (sq_pending > 0, cq_ready) {
+        (false, true) => RingEntry::Skip,
+        (true, true) => RingEntry::Submit,
+        (_, false) => RingEntry::SubmitAndWait,
+    }
+}
+
 /// Main io_uring reader loop. Runs until channel disconnection.
 ///
 /// When `tick_cadence` is `Some`, the loop also generates the engine's
@@ -512,12 +537,38 @@ fn reader_loop<A: Application, R: AsRawFd>(
             }
         }
 
-        // Submit any pending SQEs and block until at least 1 CQE is ready.
-        match ring.submit_and_wait(1) {
+        // Enter the kernel only when there is a reason to.
+        //
+        // Under load the CQ usually already holds completions by the
+        // time we get here: in the ring's default task-work mode the
+        // kernel posts them while this thread is in userspace parsing.
+        // Reading that is pure userspace — the CQ is mmap'd and
+        // `completion()` loads the tail with `Acquire` — so when there
+        // is also nothing to hand over, the `io_uring_enter` is a
+        // ~200 ns mode switch that buys nothing. The replication sender
+        // measured the same skip at ~6 % of its thread's cycles
+        // (`tcp_sender.rs`); this loop makes one enter per drain.
+        //
+        // When there ARE SQEs to submit we still enter, but we do not
+        // ask the kernel to *wait* if completions are already visible.
+        // Only a genuinely empty CQ parks the thread.
+        //
+        // Note this is the half of the io_uring-audit item that pairs
+        // *against* `DEFER_TASKRUN`: deferred task work only runs on an
+        // enter with GETEVENTS, so under that flag the CQ would be empty
+        // here and the skip would simply never fire.
+        let sq_pending = ring.submission().len();
+        let cq_ready = !ring.completion().is_empty();
+        let entered = match ring_entry(sq_pending, cq_ready) {
+            RingEntry::Skip => Ok(0),
+            RingEntry::Submit => ring.submit(),
+            RingEntry::SubmitAndWait => ring.submit_and_wait(1),
+        };
+        match entered {
             Ok(_) => {}
             Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(e) => {
-                error!(error = %e, "io_uring submit_and_wait error");
+                error!(error = %e, "io_uring submit/wait error");
                 break;
             }
         }
@@ -1135,6 +1186,36 @@ mod tests {
     use std::io::{ErrorKind, Read};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
+
+    /// The reader's enter policy. Each case is a syscall-per-drain
+    /// decision on the hot path, and getting one wrong is either a lost
+    /// wakeup (skipping with an empty CQ) or unsubmitted SQEs (skipping
+    /// with a non-empty SQ) — both silent.
+    mod ring_entry {
+        use super::super::{RingEntry, ring_entry};
+
+        #[test]
+        fn visible_completions_and_nothing_to_submit_need_no_syscall() {
+            assert_eq!(ring_entry(0, true), RingEntry::Skip);
+        }
+
+        #[test]
+        fn queued_sqes_are_always_handed_over() {
+            // Never skip with work in the SQ: those entries would sit
+            // there until some later iteration happened to enter.
+            assert_eq!(ring_entry(1, true), RingEntry::Submit);
+            assert_eq!(ring_entry(8, false), RingEntry::SubmitAndWait);
+        }
+
+        #[test]
+        fn an_empty_cq_is_the_only_thing_that_parks_the_thread() {
+            assert_eq!(ring_entry(0, false), RingEntry::SubmitAndWait);
+            // ...and visible work never does, whatever the SQ holds.
+            for sq in [0, 1, 64] {
+                assert_ne!(ring_entry(sq, true), RingEntry::SubmitAndWait);
+            }
+        }
+    }
 
     /// Minimal `AppEvent` for these tests. `Copy` is required by `AppEvent`;
     /// the on-wire codec is unused because [`TagDecoder`] never invokes it
