@@ -136,6 +136,18 @@ Risk: low — the contiguity gate and `last_target = index + 1` semantics
 are unchanged; keep the `journal_tip.advance` / commit ordering.
 Effort: M. Confidence: medium-high.
 
+**Landed**, all three parts. The ring commits per frame (and every
+`COMMIT_EVERY = 16` slots within one), each `InputBatch` frame records
+its own pending-ack entry, and a call publishes at most
+`MAX_SLOTS_PER_CYCLE = 512` slots before returning to the loop's ack
+flush. The loop tracks a read offset into `recv_buf` instead of
+memmoving the remainder every cycle — it clears the buffer when a cycle
+drains it (the steady-state case) and compacts only past a 64 KiB dead
+prefix. The mark-ordering invariant `resolve_stream_marks` relies on
+("marks are queued before any slot past their position is published")
+still holds: marks are queued while parsing their own frame, ahead of
+every later frame's commit.
+
 ### 4. `SO_BUSY_POLL` is set on every hot socket and inert under io_uring RECV
 
 **Where:** `server.rs` (client accept: `set_busy_poll` with a comment

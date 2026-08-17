@@ -241,16 +241,29 @@ pub(super) enum FrameError {
     Fatal(Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// Slots published under one `Producer::batch` before it is committed
+/// and reopened. Caps how long a decoded slot stays invisible to the
+/// replica's journal stage; mirrors `COMMIT_EVERY` on client ingress.
+const COMMIT_EVERY: u64 = 16;
+
+/// Slots published per [`process_streaming_frames`] call, checked at
+/// frame boundaries.
+///
+/// The cap is what lets the receive loop breathe during a catch-up
+/// burst: after a stall the primary can hand over hundreds of kilobytes
+/// at once, and without a bound the loop decodes all of it — thousands
+/// of slots — before returning to the ack flush at the top of the loop.
+/// Both ack tracks (in-memory, which the primary's `hybrid` gate runs
+/// on, and persisted) would then sit still for the whole drain. At ~50 ns
+/// a slot this bounds that blind spot to a few tens of microseconds; the
+/// remainder stays in the recv buffer and is picked up on the next
+/// iteration, one ack later.
+const MAX_SLOTS_PER_CYCLE: usize = 512;
+
 /// Outcome of [`process_streaming_frames`] for one recv-cycle.
 pub(super) struct StreamingFrameOutcome {
     /// Bytes consumed from the recv buffer.
     pub consumed: usize,
-    /// Journal-cursor position one past the last slot pushed (for
-    /// `pending_acks.push`). The journal ring cursor is next-to-consume,
-    /// so the pushed slots are durable exactly when the cursor reaches
-    /// this value — never the slot index itself, which the cursor
-    /// reaches while that slot is still un-fsynced.
-    pub last_target: u64,
     /// Whether any slot was pushed this cycle.
     pub any_published: bool,
     /// Updated `accum_end_sequence` — only names slots that were
@@ -270,11 +283,22 @@ pub(super) struct StreamingFrameOutcome {
     pub observed_acking_mode: Option<u8>,
 }
 
-/// Process every complete frame in `recv_buf`, publishing decoded slots
-/// onto `input_producer` under a single `Producer::batch`.
+/// Process complete frames from `recv_buf`, publishing decoded slots
+/// onto `input_producer` and recording one pending-ack entry per
+/// `InputBatch` frame.
 ///
 /// Uses `try_decode_input_batch_into` to decode into a reusable
 /// `slot_buf`, avoiding per-batch heap allocation on the hot path.
+///
+/// # Publication granularity
+///
+/// A frame's slots are committed to the input ring and their ack target
+/// recorded before the next frame is decoded (and mid-frame every
+/// [`COMMIT_EVERY`] slots). One commit and one ack entry per *cycle*
+/// meant the replica's journal stage saw nothing until every byte in the
+/// recv buffer had been decoded, and the first frame's persisted ack
+/// waited on the last frame's fsync. At most [`MAX_SLOTS_PER_CYCLE`]
+/// slots are published per call so the caller gets back to its ack flush.
 ///
 /// # Sequence contiguity
 ///
@@ -305,10 +329,12 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     slot_buf: &mut Vec<InputSlot<E>>,
     stream_marks: &StreamMarkQueue,
     journal_failed: &AtomicBool,
+    pending_acks: &mut PendingAckQueue,
 ) -> StreamingFrameOutcome {
     let mut consumed = 0;
     let mut last_target = 0u64;
     let mut any_published = false;
+    let mut published_this_cycle = 0usize;
     let mut heard_from_primary = false;
     let mut frame_err: Option<FrameError> = None;
     let mut observed_acking_mode: Option<u8> = None;
@@ -333,6 +359,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                     Ok(()) => {
                         if !slot_buf.is_empty() {
                             heard_from_primary = true;
+                            let mut frame_published = false;
                             for slot in slot_buf.drain(..) {
                                 let primary_seq = slot.sequence;
                                 if primary_seq <= pending_accum {
@@ -380,6 +407,25 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                 }
                                 pending_accum = primary_seq;
                                 any_published = true;
+                                frame_published = true;
+                                published_this_cycle += 1;
+                                if batch.len() >= COMMIT_EVERY {
+                                    batch.commit();
+                                    batch = input_producer.batch();
+                                }
+                            }
+                            if frame_published {
+                                // Publish this frame's slots and record
+                                // their ack target before decoding the
+                                // next one: the journal stage can start
+                                // on them now, and their persisted ack
+                                // no longer waits on the rest of the
+                                // cycle's fsync. Committed first so the
+                                // queued target names slots the ring has
+                                // actually published.
+                                batch.commit();
+                                batch = input_producer.batch();
+                                pending_acks.push(last_target, pending_accum);
                             }
                             if frame_err.is_some() {
                                 break;
@@ -458,6 +504,13 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                     },
                 }
                 consumed += frame_end;
+                if published_this_cycle >= MAX_SLOTS_PER_CYCLE {
+                    // Hand control back so an ack can go out; the rest of
+                    // the buffer is still there next iteration. Checked
+                    // at a frame boundary, so a single oversized frame
+                    // can overshoot by its own slot count.
+                    break;
+                }
             }
             FrameResult::Oversized => {
                 frame_err = Some(FrameError::Fatal(
@@ -472,7 +525,6 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     batch.commit();
     StreamingFrameOutcome {
         consumed,
-        last_target,
         any_published,
         accum_end_sequence: pending_accum,
         heard_from_primary,
@@ -698,6 +750,16 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
 
+    // Bytes of `recv_buf` already parsed. The parser reads from here and
+    // `poll_recv` appends at the end, so a cycle that stops early
+    // (`MAX_SLOTS_PER_CYCLE`) leaves its remainder in place instead of
+    // memmoving it to the front on every iteration — which is exactly
+    // the catch-up burst the cap exists for. Compaction happens when the
+    // buffer drains (the steady-state case: a single `clear`) or when
+    // the dead prefix grows past `RECV_COMPACT_THRESHOLD`.
+    let mut recv_offset: usize = 0;
+    const RECV_COMPACT_THRESHOLD: usize = 64 * 1024;
+
     let exit = loop {
         // --- Check flags ---
         if shutdown.load(Ordering::Relaxed) {
@@ -726,6 +788,9 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         }
         if promote.is_requested() {
             info!("promotion triggered — stopping replication, transitioning to primary");
+            // Normalise the parse position: the drain loop below owns the
+            // buffer outright and compacts from the front.
+            compact_recv_buf(&mut recv_buf, std::mem::take(&mut recv_offset));
             // Drain remaining data from the transport.
             loop {
                 let got_more = transport.poll_recv(&mut recv_buf).unwrap_or(false);
@@ -790,9 +855,9 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             Err(_) => break SessionExit::Disconnected,
         };
 
-        // Check connection after recv — if disconnected and recv_buf is
-        // empty there's nothing left to process.
-        if !transport.is_connected() && recv_buf.is_empty() {
+        // Check connection after recv — if disconnected and nothing is
+        // left unparsed there's nothing more to process.
+        if !transport.is_connected() && recv_offset == recv_buf.len() {
             drain_pending_acks(
                 transport,
                 &mut pending_acks,
@@ -806,13 +871,19 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         }
 
         // --- Parse frames ---
+        //
+        // Ack targets are recorded per frame inside the call (never
+        // gated on queue occupancy: a full queue merges into its newest
+        // entry, so receiving continues at wire rate however far behind
+        // the local fsync is).
         let outcome = process_streaming_frames(
-            &recv_buf,
+            &recv_buf[recv_offset..],
             input_producer,
             accum_end_sequence,
             &mut slot_buf,
             stream_marks,
             journal_failed,
+            &mut pending_acks,
         );
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
@@ -823,20 +894,20 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             primary_acking_mode.store(mode, Ordering::Release);
         }
         heard_from_primary |= outcome.heard_from_primary;
-        compact_recv_buf(&mut recv_buf, outcome.consumed);
+
+        recv_offset += outcome.consumed;
+        if recv_offset == recv_buf.len() {
+            recv_buf.clear();
+            recv_offset = 0;
+        } else if recv_offset >= RECV_COMPACT_THRESHOLD {
+            compact_recv_buf(&mut recv_buf, recv_offset);
+            recv_offset = 0;
+        }
 
         match outcome.frame_err {
             Some(FrameError::SequenceGap(e)) => break SessionExit::StreamGap(e),
             Some(FrameError::Fatal(e)) => break SessionExit::Fatal(e),
             None => {}
-        }
-
-        if outcome.any_published {
-            // Never gated on queue occupancy: a full queue merges into
-            // its newest entry (conservative — the merged target is the
-            // later one), so receiving continues at the replica's wire
-            // rate no matter how far behind its own fsync is.
-            pending_acks.push(outcome.last_target, accum_end_sequence);
         }
 
         // --- Idle wait ---
@@ -963,6 +1034,30 @@ mod tests {
             out.push(slot);
         }
         out
+    }
+
+    /// `process_streaming_frames` against a scratch ack queue, handing
+    /// both back. Most tests only assert on what was published; the ones
+    /// that care about ack targets read the returned queue.
+    fn stream_frames(
+        buf: &[u8],
+        producer: &mut melin_pipeline::ring::Producer<InputSlot<TestEvent>>,
+        accum_end_sequence: u64,
+        slot_buf: &mut Vec<InputSlot<TestEvent>>,
+        marks: &StreamMarkQueue,
+        journal_failed: &AtomicBool,
+    ) -> (StreamingFrameOutcome, PendingAckQueue) {
+        let mut acks = PendingAckQueue::new(16);
+        let outcome = process_streaming_frames::<TestEvent>(
+            buf,
+            producer,
+            accum_end_sequence,
+            slot_buf,
+            marks,
+            journal_failed,
+            &mut acks,
+        );
+        (outcome, acks)
     }
 
     fn ring(
@@ -1297,6 +1392,56 @@ mod tests {
         );
     }
 
+    /// A burst larger than `MAX_SLOTS_PER_CYCLE` spans several parse
+    /// calls, so the loop's read offset — not a memmove per cycle — is
+    /// what tracks the parse position. Every slot must be published
+    /// exactly once, in order, and the buffer must end up drained.
+    #[test]
+    fn loop_drains_a_burst_larger_than_one_cycle_without_losing_bytes() {
+        let total = (MAX_SLOTS_PER_CYCLE * 2 + 37) as u64;
+        let (mut producer, mut consumer) = ring(4096);
+        let cursor = journal_cursor(u64::MAX);
+        let shutdown = AtomicBool::new(false);
+        let control = control();
+        let mut transport = MockTransport::new();
+
+        // One chunk: the whole burst lands in recv_buf at once, which is
+        // what a primary catching up after a stall looks like.
+        let mut data = Vec::new();
+        for i in 1..=total {
+            append_input_batch_frame(&mut data, &[slot(i, i)]);
+        }
+        transport.push_data(data);
+        transport.disconnect_after_data();
+
+        let result = streaming_loop::<MockTransport, TestEvent>(
+            &mut transport,
+            &mut producer,
+            &cursor,
+            &shutdown,
+            &control,
+            16,
+            false,
+            0,
+            Vec::new(),
+            None,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+
+        assert!(matches!(result.exit, SessionExit::Disconnected));
+        let seqs: Vec<u64> = drain(&mut consumer)
+            .into_iter()
+            .map(|s| s.sequence)
+            .collect();
+        assert_eq!(seqs.len(), total as usize, "every slot published once");
+        assert_eq!(seqs, (1..=total).collect::<Vec<_>>(), "and in order");
+        assert_eq!(
+            transport.sent_acks.last().map(|a| a.in_memory_sequence),
+            Some(total)
+        );
+    }
+
     /// A stalled local fsync must never stop the receiver. With
     /// `pipeline_depth = 1` the pending-ack queue is full after the
     /// first batch and the journal cursor never moves, which is exactly
@@ -1502,7 +1647,7 @@ mod tests {
         encode_heartbeat(99, 1, &mut buf);
         append_input_batch_frame(&mut buf, &[slot(9, 0xA3)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             5,
@@ -1528,6 +1673,84 @@ mod tests {
         assert_eq!(ids, vec![0xA0, 0xA1, 0xA2, 0xA3]);
     }
 
+    /// Each `InputBatch` frame gets its own pending-ack entry, so the
+    /// first frame's persisted ack is released by the first frame's
+    /// fsync instead of waiting on the last frame in the cycle.
+    #[test]
+    fn streaming_records_one_ack_target_per_frame() {
+        let (mut producer, _consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let mut buf = Vec::new();
+        // Three frames of two slots — fresh ring, so slot indices 0..5
+        // and per-frame targets 2, 4, 6.
+        for f in 0..3u64 {
+            append_input_batch_frame(
+                &mut buf,
+                &[slot(f * 2 + 1, f * 2 + 1), slot(f * 2 + 2, f * 2 + 2)],
+            );
+        }
+
+        let (outcome, mut q) = stream_frames(
+            &buf,
+            &mut producer,
+            0,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+        assert!(outcome.frame_err.is_none());
+        assert_eq!(outcome.accum_end_sequence, 6);
+
+        // A single whole-cycle entry would hold everything back to
+        // cursor 6; per-frame entries release as the journal walks.
+        assert_eq!(q.pop_ready(&journal_cursor(2)), Some(2));
+        assert_eq!(q.pop_ready(&journal_cursor(4)), Some(4));
+        assert_eq!(q.pop_ready(&journal_cursor(6)), Some(6));
+    }
+
+    /// A long drain must not lock the receiver out of its ack flush: the
+    /// call stops at `MAX_SLOTS_PER_CYCLE` and leaves the rest in the
+    /// buffer for the next iteration.
+    #[test]
+    fn streaming_stops_at_the_slot_cap_and_leaves_the_remainder() {
+        let total = MAX_SLOTS_PER_CYCLE + 100;
+        let (mut producer, _consumer) = ring(2048);
+        let mut slot_buf = Vec::new();
+        let mut buf = Vec::new();
+        for i in 1..=total as u64 {
+            append_input_batch_frame(&mut buf, &[slot(i, i)]);
+        }
+
+        let (first, _acks) = stream_frames(
+            &buf,
+            &mut producer,
+            0,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+        assert!(first.frame_err.is_none());
+        assert_eq!(
+            first.accum_end_sequence, MAX_SLOTS_PER_CYCLE as u64,
+            "stops at the cap"
+        );
+        assert!(first.consumed < buf.len(), "remainder stays buffered");
+
+        // The caller resumes from where it stopped — no byte parsed
+        // twice, none skipped.
+        let (second, _acks) = stream_frames(
+            &buf[first.consumed..],
+            &mut producer,
+            first.accum_end_sequence,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+        assert!(second.frame_err.is_none());
+        assert_eq!(second.accum_end_sequence, total as u64);
+        assert_eq!(first.consumed + second.consumed, buf.len());
+    }
+
     /// The ack target must live in the journal cursor's space. The
     /// journal cursor is next-to-consume: `cursor == i` means ring slots
     /// `< i` are durable and slot `i` is NOT. `push` returns the slot
@@ -1545,7 +1768,7 @@ mod tests {
         // Fresh ring: these land at slot indices 0 and 1.
         append_input_batch_frame(&mut buf, &[slot(10, 0xA0), slot(11, 0xA1)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, mut q) = stream_frames(
             &buf,
             &mut producer,
             9,
@@ -1555,9 +1778,6 @@ mod tests {
         );
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.accum_end_sequence, 11);
-
-        let mut q = crate::replication::PendingAckQueue::new(4);
-        q.push(outcome.last_target, outcome.accum_end_sequence);
 
         // Cursor at 1: slot 0 durable, slot 1 (seq 11) is not.
         assert_eq!(
@@ -1610,7 +1830,7 @@ mod tests {
         melin_transport_core::replication::protocol::encode_rotate(6, &[0x66; 32], &mut buf);
         append_input_batch_frame(&mut buf, &[slot(7, 0xE1)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             5,
@@ -1646,7 +1866,7 @@ mod tests {
         append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
         melin_transport_core::replication::protocol::encode_chain_check(6, &[0x77; 32], &mut buf);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             5,
@@ -1686,7 +1906,7 @@ mod tests {
         melin_transport_core::replication::protocol::encode_rotate(3, &[0x33; 32], &mut buf);
         append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             5,
@@ -1714,7 +1934,7 @@ mod tests {
         append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
         melin_transport_core::replication::protocol::encode_rotate(9, &[0x99; 32], &mut buf);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             5,
@@ -1743,7 +1963,7 @@ mod tests {
         let oversize_len = (MAX_DATA_FRAME as u32) + 1;
         buf.extend_from_slice(&oversize_len.to_le_bytes());
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             6,
@@ -1769,7 +1989,7 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.push(0xFF);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             2,
@@ -1794,7 +2014,7 @@ mod tests {
         let complete_len = buf.len();
         buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             0,
@@ -1818,7 +2038,7 @@ mod tests {
         encode_heartbeat(42, 1, &mut buf);
         encode_heartbeat(43, 1, &mut buf);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             100,
@@ -1842,7 +2062,7 @@ mod tests {
         let (mut producer, mut consumer) = ring(4);
         let mut slot_buf = Vec::new();
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &[],
             &mut producer,
             77,
@@ -1896,7 +2116,7 @@ mod tests {
         // 11 → 14: entries 12..=13 are missing from the wire.
         append_input_batch_frame(&mut buf, &[slot(14, 0xA2), slot(15, 0xA3)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             9,
@@ -1931,7 +2151,7 @@ mod tests {
         // 11 → 13 inside a single InputBatch: entry 12 is missing.
         append_input_batch_frame(&mut buf, &[slot(10, 0xB0), slot(11, 0xB1), slot(13, 0xB2)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             9,
@@ -1966,7 +2186,7 @@ mod tests {
         // duplicate must be dropped, the new slot accepted.
         append_input_batch_frame(&mut buf, &[slot(11, 0xC1), slot(12, 0xC2)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(
+        let (outcome, _acks) = stream_frames(
             &buf,
             &mut producer,
             9,
