@@ -739,7 +739,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 accum_end_sequence = outcome.accum_end_sequence;
                 journal_tip.advance(melin_transport_core::WireSeq::new(accum_end_sequence));
                 compact_recv_buf(&mut recv_buf, outcome.consumed);
-                if outcome.any_published && !pending_acks.is_full() {
+                if outcome.any_published {
                     pending_acks.push(outcome.last_target, accum_end_sequence);
                 }
                 if !got_more {
@@ -780,53 +780,6 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                     last_sent_in_memory_seq = ack.in_memory_sequence;
                 }
                 Ok(false) => {} // in flight, try next iteration
-                Err(_) => break SessionExit::Disconnected,
-            }
-        }
-
-        // --- Backpressure: pending_acks full ---
-        if pending_acks.is_full() {
-            // Wait for any in-flight ack to complete first.
-            let mut bp_idle_spins: u32 = 0;
-            while transport.ack_in_flight() {
-                // poll_recv also processes SEND CQEs (io_uring) to clear
-                // the in-flight flag.
-                if transport.poll_recv(&mut recv_buf).is_err() {
-                    break;
-                }
-                if busy_spin || bp_idle_spins < 1000 {
-                    bp_idle_spins = bp_idle_spins.wrapping_add(1);
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-
-            let Some(seq) =
-                pending_acks.pop_oldest_blocking(journal_cursor, busy_spin, journal_failed)
-            else {
-                // Journal stage died mid-wait — the cursor will never
-                // reach the pending target.
-                break SessionExit::Fatal(
-                    "replica journal stage failed — tearing down for reconnect/resync".into(),
-                );
-            };
-            let in_mem_now = accum_end_sequence;
-            debug_assert!(
-                in_mem_now <= last_committed_primary_seq,
-                "backpressure in_memory ack ahead of committed: in_memory={}, last_committed={}",
-                in_mem_now,
-                last_committed_primary_seq,
-            );
-            let ack = Ack {
-                acked_sequence: seq,
-                in_memory_sequence: in_mem_now,
-            };
-            match transport.send_ack(&ack) {
-                Ok(_) => {
-                    last_sent_acked_seq = seq;
-                    last_sent_in_memory_seq = in_mem_now;
-                }
                 Err(_) => break SessionExit::Disconnected,
             }
         }
@@ -878,7 +831,11 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             None => {}
         }
 
-        if outcome.any_published && !pending_acks.is_full() {
+        if outcome.any_published {
+            // Never gated on queue occupancy: a full queue merges into
+            // its newest entry (conservative — the merged target is the
+            // later one), so receiving continues at the replica's wire
+            // rate no matter how far behind its own fsync is.
             pending_acks.push(outcome.last_target, accum_end_sequence);
         }
 
@@ -896,6 +853,18 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             idle_spins = 0;
         }
     };
+
+    if pending_acks.merged() > 0 {
+        // Not an error: the session kept receiving and acking, only the
+        // persisted-ack granularity was coarsened. Worth a line because
+        // it means the local journal stage spent time more than a full
+        // queue behind the wire.
+        debug!(
+            merged = pending_acks.merged(),
+            depth = pipeline_depth,
+            "replica ack queue coarsened — journal fsync ran behind the wire"
+        );
+    }
 
     if let Some(u) = utilization {
         u.busy.store(busy_count, Ordering::Relaxed);
@@ -1281,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_backpressure_waits_for_in_flight_ack() {
+    fn loop_full_ack_queue_still_acks_every_batch() {
         let (mut producer, mut consumer) = ring(16);
         let cursor = journal_cursor(u64::MAX);
         let shutdown = AtomicBool::new(false);
@@ -1289,10 +1258,11 @@ mod tests {
         let mut transport = MockTransport::new();
         transport.simulate_in_flight = true;
 
-        // Pipeline depth of 1 means the queue fills after a single push,
-        // triggering the backpressure path on the second batch.
-        // With simulate_in_flight=true, the first ack sets in_flight;
-        // the backpressure loop calls poll_recv which clears it.
+        // Pipeline depth of 1 means the queue is full after a single
+        // push, so the second batch takes the merge path. With
+        // simulate_in_flight=true the first ack is still on the wire
+        // when the second batch lands — the ack for it must not be
+        // lost, only deferred to the next iteration.
         let mut data1 = Vec::new();
         append_input_batch_frame(&mut data1, &[slot(1, 0x01)]);
         let mut data2 = Vec::new();
@@ -1324,6 +1294,76 @@ mod tests {
             transport.sent_acks.len() >= 2,
             "should have sent acks for both batches (got {})",
             transport.sent_acks.len()
+        );
+    }
+
+    /// A stalled local fsync must never stop the receiver. With
+    /// `pipeline_depth = 1` the pending-ack queue is full after the
+    /// first batch and the journal cursor never moves, which is exactly
+    /// the state that used to park the loop in `pop_oldest_blocking` —
+    /// freezing the *in-memory* ack track the primary's `hybrid` gate
+    /// runs on, i.e. putting the replica's disk tail on the client
+    /// critical path.
+    #[test]
+    fn loop_keeps_receiving_while_the_journal_cursor_is_frozen() {
+        let (mut producer, mut consumer) = ring(16);
+        // Frozen at 0: nothing this session publishes ever becomes durable.
+        let cursor = journal_cursor(0);
+        let shutdown = AtomicBool::new(false);
+        let control = control();
+        let mut transport = MockTransport::new();
+        for i in 1..=4u64 {
+            let mut data = Vec::new();
+            append_input_batch_frame(&mut data, &[slot(i, i)]);
+            transport.push_data(data);
+        }
+        transport.disconnect_after_data();
+
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                // Collect what the receiver publishes, then release the
+                // cursor: the *exit* drain does legitimately wait for
+                // durability before its final ack.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut seen: Vec<u64> = Vec::new();
+                while seen.len() < 4 && std::time::Instant::now() < deadline {
+                    seen.extend(drain(&mut consumer).into_iter().map(|sl| sl.sequence));
+                    std::hint::spin_loop();
+                }
+                cursor.get().store(u64::MAX, Ordering::Release);
+                seen
+            });
+
+            let result = streaming_loop::<MockTransport, TestEvent>(
+                &mut transport,
+                &mut producer,
+                &cursor,
+                &shutdown,
+                &control,
+                1, // cap 1 → full after the first batch
+                false,
+                0,
+                Vec::new(),
+                None,
+                &no_marks(),
+                &AtomicBool::new(false),
+            );
+
+            assert!(matches!(result.exit, SessionExit::Disconnected));
+            assert_eq!(
+                reader.join().expect("reader thread"),
+                vec![1, 2, 3, 4],
+                "every batch must be published while the cursor is frozen"
+            );
+        });
+
+        assert!(
+            transport
+                .sent_acks
+                .iter()
+                .any(|a| a.acked_sequence == 0 && a.in_memory_sequence > 0),
+            "in-memory acks must keep flowing while nothing is durable: {:?}",
+            transport.sent_acks
         );
     }
 

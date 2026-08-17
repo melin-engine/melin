@@ -99,6 +99,12 @@ measurement (`gate_replication` counter, replica `journal_disk_lag`).
 Risk: none to durability. Effort: S. Confidence: high on mechanism,
 medium on frequency.
 
+**Landed.** `PendingAckQueue::push` merges into the newest entry at
+capacity and the receiver's backpressure branch is gone; default depth
+8 → 256. `PendingAckQueue::merged()` counts the coarsenings (logged at
+session exit) — that is the frequency measurement the paragraph above
+asks for.
+
 ### 2. Receiver commits the ring and pushes the ack target once per receive cycle
 
 **Where:** `receiver_transport.rs` — `process_streaming_frames` takes one

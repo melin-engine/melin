@@ -2509,6 +2509,56 @@ mod tests {
         assert!(q.is_full());
     }
 
+    /// A full queue must absorb the push by merging it into the newest
+    /// entry — never block, never drop, and never release a sequence
+    /// before its own journal target. The merge is a *coarsening*: the
+    /// entry it absorbed is acked later than it would have been.
+    #[test]
+    fn pending_ack_queue_merges_into_the_newest_entry_when_full() {
+        let mut q = PendingAckQueue::new(4);
+        for i in 1..=4u64 {
+            q.push(i * 10, i * 100);
+        }
+        assert!(q.is_full());
+        assert_eq!(q.merged(), 0);
+
+        // Fifth batch: target 50, sequence 500. Merges into (40, 400).
+        q.push(50, 500);
+        assert_eq!(q.merged(), 1);
+        assert_eq!(q.len(), 4, "merge must not grow the queue");
+
+        // Cursor at 40 would have released 400 before the merge; now the
+        // newest entry needs 50, so 300 is the highest safe ack.
+        let cursor = make_journal_cursor(40);
+        assert_eq!(q.pop_ready(&cursor), Some(300));
+        assert!(!q.is_empty(), "merged entry is not durable yet");
+
+        // Cursor reaches the merged target — the merged entry releases
+        // the newer sequence, subsuming the one it absorbed.
+        cursor.get().store(50, Ordering::Relaxed);
+        assert_eq!(q.pop_ready(&cursor), Some(500));
+        assert!(q.is_empty());
+    }
+
+    /// Repeated merges keep collapsing onto the same slot, so a journal
+    /// stall of any length costs granularity and nothing else.
+    #[test]
+    fn pending_ack_queue_merges_repeatedly_without_growing() {
+        let mut q = PendingAckQueue::new(2);
+        for i in 1..=100u64 {
+            q.push(i, i * 10);
+        }
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.merged(), 98);
+
+        // Nothing releases before its target...
+        let cursor = make_journal_cursor(99);
+        assert_eq!(q.pop_ready(&cursor), Some(10), "only the first entry");
+        // ...and the merged tail carries the newest pair.
+        cursor.get().store(100, Ordering::Relaxed);
+        assert_eq!(q.pop_ready(&cursor), Some(1000));
+    }
+
     #[test]
     fn pending_ack_queue_pop_oldest_blocking() {
         let mut q = PendingAckQueue::new(8);

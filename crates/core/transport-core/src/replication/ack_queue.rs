@@ -31,6 +31,13 @@ pub struct PendingAck {
 /// the journal stage before any ack is sent. Acks are flushed in FIFO
 /// order as the journal cursor advances.
 ///
+/// The queue never refuses a push and never makes the caller wait: at
+/// capacity it *coarsens* instead (see [`PendingAckQueue::push`]). A
+/// replica receiver that blocked here would stop receiving — and stop
+/// producing the in-memory acks the primary's `hybrid` gate depends on —
+/// for as long as its own fsync took, transplanting the replica's disk
+/// tail into the primary's client latency.
+///
 /// `Box<[PendingAck]>` rather than `Vec<PendingAck>`: the capacity is
 /// fixed at construction; a slice avoids the `Vec`'s capacity field on
 /// every push/pop. `cap` is constrained to a power of two so the
@@ -44,6 +51,12 @@ pub struct PendingAckQueue {
     head: usize,
     /// Number of pending acks in the queue.
     len: usize,
+    /// How many pushes were absorbed by the newest entry because the
+    /// queue was full. Diagnostic only — a non-zero value means the
+    /// journal stage fell more than `cap` receive cycles behind the
+    /// wire, so persisted-ack granularity was coarsened. `u64`: a
+    /// free-running counter over the session's lifetime.
+    merged: u64,
 }
 
 impl PendingAckQueue {
@@ -65,6 +78,7 @@ impl PendingAckQueue {
             cap,
             head: 0,
             len: 0,
+            merged: 0,
         }
     }
 
@@ -80,9 +94,34 @@ impl PendingAckQueue {
         self.len
     }
 
-    /// Record a pending ack. Caller must ensure `!is_full()`.
+    /// How many pushes have been merged into the newest entry because
+    /// the queue was full — see [`Self::push`].
+    pub fn merged(&self) -> u64 {
+        self.merged
+    }
+
+    /// Record a pending ack. Never blocks and never drops progress.
+    ///
+    /// When the queue is full the entry is *merged* into the newest one:
+    /// `(t_old, s_old) + (t_new, s_new) → (max t, max s)`. Both cursors
+    /// are monotonic — the ring position a batch ends at and the primary
+    /// sequence it covers only grow — so the merged entry releases
+    /// `s_new` when the journal cursor reaches `t_new`, exactly the
+    /// condition the un-merged entry would have had. What is lost is
+    /// granularity: `s_old` is no longer acked at `t_old`, it waits for
+    /// `t_new`. That is strictly conservative (the ack is later, never
+    /// earlier, and never covers a sequence that is not durable), and it
+    /// is what lets the receiver keep receiving while its own journal
+    /// stage is behind.
     pub fn push(&mut self, journal_target: u64, acked_sequence: u64) {
-        debug_assert!(!self.is_full());
+        if self.is_full() {
+            let newest = (self.head + self.len - 1) & (self.cap - 1);
+            let entry = &mut self.buf[newest];
+            entry.journal_target = entry.journal_target.max(journal_target);
+            entry.acked_sequence = entry.acked_sequence.max(acked_sequence);
+            self.merged = self.merged.wrapping_add(1);
+            return;
+        }
         let idx = (self.head + self.len) & (self.cap - 1);
         self.buf[idx] = PendingAck {
             journal_target,
@@ -118,6 +157,9 @@ impl PendingAckQueue {
     /// `abort` flipped while waiting — the journal stage has died and
     /// the cursor will never advance; the caller must tear the session
     /// down instead of waiting forever.
+    ///
+    /// Exit-path helper (via [`Self::pop_all_blocking`]): the streaming
+    /// receive path never blocks on durability, it merges instead.
     pub fn pop_oldest_blocking(
         &mut self,
         journal_cursor: &Sequence,

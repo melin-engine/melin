@@ -75,7 +75,12 @@ use melin_wire_protocol::control::ConnectionId;
 use melin_wire_protocol::transport::BlockingTransportListener;
 
 /// Default replica pipeline depth (pending ack queue capacity).
-const DEFAULT_REPLICATION_PIPELINE_DEPTH: usize = 8;
+///
+/// Only bounds persisted-ack *granularity*, never the receive rate: the
+/// queue merges instead of blocking when it fills. 256 entries × 16 B is
+/// 4 KiB, so the depth is chosen to keep granularity through an fsync
+/// hiccup rather than to save memory.
+const DEFAULT_REPLICATION_PIPELINE_DEPTH: usize = 256;
 
 /// Server configuration, parsed from CLI arguments via clap.
 #[derive(clap::Parser)]
@@ -210,11 +215,11 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 5)]
     pub replication_heartbeat_secs: u64,
 
-    /// Number of receive batches the replica can have awaiting local
-    /// journal fsync before the receiver applies backpressure. Must be a
-    /// power of two. Higher values allow the primary to stay further ahead
-    /// of the replica's fsync, which helps when group-commit delay is
-    /// non-zero. Default: 8.
+    /// Number of receive batches the replica tracks individually while
+    /// they await local journal fsync. Must be a power of two. Beyond
+    /// this depth the receiver keeps receiving and coalesces pending
+    /// acks (a later ack, never an early one) — it never applies
+    /// backpressure to the primary. Default: 256.
     #[arg(long, default_value_t = DEFAULT_REPLICATION_PIPELINE_DEPTH)]
     pub replication_pipeline_depth: usize,
 
