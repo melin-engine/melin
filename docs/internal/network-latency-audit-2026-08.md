@@ -45,9 +45,8 @@ unless marked DPDK. Ratings are judgement calls from code reading.
 | --- | --- | --- | --- | --- | --- |
 | 4 | Real NIC busy-poll on ack + ingress sockets (`SO_BUSY_POLL` is inert under io_uring) | several µs per hop × 3 hops, plausibly | Ops / kernel version | M | **High** (measure first) |
 | 5 | Sub-batch replication publish every K encoded slots; publish regardless of group-commit | up to tens of µs on heads of large batches | Low | M | Med–High |
-| 6 | Pad the gate's cursors (`ReplicationMetrics`, `DurableWireSeqCursor`) | sub-µs per gate wake; cross-CCD miss per spin at ack rate | Low | S–M | Med |
-| 7 | `DEFER_TASKRUN` on the reader ring; skip enter when CQ non-empty | 5–25 % reader-core cycles at ~1 M msg/s, less jitter | Med (CQ-read sites) | S | Med |
-| 8 | Response stage `peek_batch` instead of copying ≤1024 `OutputSlot`s | ~10 µs+ on the head slot after a stall | Low | S–M | Med |
+| 6 | Pad the gate's cursors — **tried, measured, reverted**; read the entry first | sub-µs per gate wake, and a measured throughput cost as implemented | Demonstrated | M | **Low** |
+| 7 | `DEFER_TASKRUN` on the reader ring (residue) | 5–25 % reader-core cycles at ~1 M msg/s, less jitter | Med (CQ-read sites) | S | Med |
 | 10 | Shard egress across K response consumers | divides per-flush xmit cost by K; only >32 dirty conns | Med | M–L | Low–Med |
 | 11 | DPDK: fastcp TCP 4-tuple index caps at 64 and leaks on close | 10×+ per-packet ingest cost after churn | Low | S+S | **Very high** (DPDK) |
 | 12 | DPDK: zero-copy RX cap of 32 segments/socket drops the excess | likely the DPDK throughput limiter; ≥1 RTT stalls | Med | M | **High** (DPDK) |
@@ -56,9 +55,10 @@ unless marked DPDK. Ratings are judgement calls from code reading.
 
 ### Suggested order
 
-Kernel-TCP: 6, then instrument and decide 4 / 5 / 7 on numbers; 8 and 10
-only with a profile that has more than ~16 connections. DPDK: 11 → 14
-(neighbor cache, mempool) → 12 → 13.
+Kernel-TCP: instrument and decide 4 / 5 / 7 on numbers; 10 only with a
+profile that has more than ~16 connections; 6 only after a microbenchmark
+justifies a second attempt. DPDK: 11 → 14 (neighbor cache, mempool) →
+12 → 13.
 
 ### First pass (landed, 2026-08-17)
 
@@ -89,6 +89,25 @@ that shows up on every path in absolute µs. Price it that way, not as a
 percentage: the same saving is a large fraction of a short local path
 and a small one of a loaded LAN path, so a percentage says more about
 the profile than about the change.
+
+### Second pass (2026-08-17)
+
+Landed: item 8 in full — both response stages borrow the output batch in
+place (`read_contiguous`) instead of memcpying up to 1024 slots before
+touching the first — and the cheap half of 7, where the reader skips its
+`io_uring_enter` when completions are already visible and the SQ is
+empty. The residue of 7 is in its entry below.
+
+**Reverted: item 6.** Its cache-line padding cost sustained replication
+throughput, reproducibly, and a second attempt at the same idea did not
+recover it. The entry below records what that rules out and what a retry
+would have to do differently. It is the only item here with a measured
+negative result, and the general lesson is worth more than the item: a
+change justified by a *reader's* cache behaviour has to be validated on
+a profile where that reader exists — the in-process replication bench
+runs no durability gate at all.
+
+Same caveat as the first pass for what did land: unmeasured per item.
 
 ---
 
@@ -153,34 +172,53 @@ Gain: needs measurement; up to tens of µs on the heads of large batches;
 equal to the configured delay when group-commit is set. Risk: low.
 Effort: M (S for the group-commit part). Confidence: medium.
 
-### 6. The gate spins on lines written per ack and per SEND (July #1 + #7, still open)
+### 6. The gate spins on lines written per ack and per SEND — TRIED AND REVERTED
 
 **Where:** `crates/core/transport-core/src/replication/metrics.rs`
-(`ReplicationMetrics`, ~104 B of bare atomics), `cursors.rs`
-(`DurableWireSeqCursor` is a bare `Arc<AtomicU64>` allocated in
-`PipelineCursors::new` immediately before `Arc<ReplicaSlotCursors>`),
-`response.rs` (`with_cursor_view` in the gate spin).
+(`ReplicationMetrics`), `cursors.rs` (`ReplicaSlotCursors`,
+`DurableWireSeqCursor`), `response.rs` (`with_cursor_view` in the gate
+spin).
 
-Every spin iteration Acquire-loads the journal cursor, both
-`replica_active` flags, and both replica cursor pairs. `bytes_sent`
-(RMW per completed SEND), `ack_latency_us` (store per ack) and
-`acks_received` (RMW per ack) share the line(s) with the two gate
-cursors; with two replicas the two sender threads also false-share. The
-two 32/48 B allocations for the durable cursor and the slot cursors
-almost certainly share a line, and `ReplicaSlotCursors::store` is
-written on every ack while the disk thread stores the durable cursor per
-fsync. One cross-core (cross-CCD on EPYC) miss per spin iteration after
-each ack/SEND completion instead of an L1 hit — contention that scales
-with replication rate, i.e. precisely under load. The July verdict
-("noise at concurrency 1") did not cover this case.
+The mechanism is real: the gate's spin Acquire-loads both cursor arrays
+every iteration, and `bytes_sent` (an RMW per completed SEND) shares
+their line, so a write the gate does not care about invalidates the line
+it is spinning on at SEND rate. Two replicas also false-share
+`acked_sequence[0]` against `acked_sequence[1]`, 8 bytes apart.
 
-**Fix.** Per-slot `#[repr(align(128))]` `{in_memory, acked}` pair; move
-the telemetry counters off that line; box the durable cursor in its own
-padded allocation. `crates/core/pipeline/examples/false_sharing.rs` is
-the harness.
+**Read this before trying again.** The "cheap half" — `repr(C)` plus
+padding to separate the writer-hot counters, and `#[repr(align(128))]`
+on the two cursor allocations — was implemented, measured, and reverted.
+It cost sustained throughput on the in-process replication bench,
+consistently and reproducibly, and a follow-up that regrouped the fields
+by *writing event* (the four fields `record_ack` touches together
+compacted onto one line) recovered essentially none of it. What that
+rules out is the field grouping being the mechanism; what is left is
+that the same commit grew three allocations several-fold and forced
+128-byte alignment on them, which moves every later allocation in the
+arena. That is a layout effect, not a sharing effect, and no amount of
+further field-shuffling addresses it.
 
-Gain: sub-µs per gate wake; needs measurement. Risk: low. Effort: S–M.
-Confidence: high that it is wrong, medium that it is visible.
+Note also that the bench which showed the cost runs no durability gate
+(it drains the output ring with a no-op), so it sees this item's cost
+with none of its benefit. That does not make the cost less real — it is
+a throughput ceiling the sender path pays in production too — but it
+means the item was never actually disproven, only shown to be a bad
+trade as implemented.
+
+A retry needs, in order: a microbenchmark
+(`crates/core/pipeline/examples/false_sharing.rs`) establishing the win
+in isolation, a change that does not alter allocation sizes or
+alignments of anything on the sender's path, and validation on the
+in-process replication bench *before* the latency benches. Absent that,
+leave it alone — this is the one item in this document with a measured
+negative result.
+
+Also open and independent of the above: the gate re-reads two separately
+allocated `Arc<AtomicBool>` `replica_active` flags per iteration, so its
+read set spans more lines than it needs to.
+
+Gain: sub-µs per gate wake; will not show in an end-to-end bench. Risk:
+demonstrated. Value: **Low** until the microbenchmark exists.
 
 ### 9 (residue). Replica receiver copies and legacy provided buffers
 
@@ -193,22 +231,6 @@ still pays two 128 B copies per slot — decode into `slot_buf`, then into
 the ring — the same shape as July #9, ~10–30 ns/slot.
 
 ## Kernel-TCP: response egress
-
-### 8. `consume_batch` copies up to 1024 `OutputSlot`s before touching the first (July #5, response half)
-
-**Where:** `response.rs`, `dpdk_response.rs` — `read_batch` memcpys each
-slot into a stack array sized `1024 × sizeof(OutputSlot)`; the slot
-embeds the app's largest query response (~330 B for the exchange), so a
-full batch is ~350–400 KB of copy and stack. The July doc said the
-output side was an SPSC without `peek_batch`; it is now a
-`ring::Consumer`, so `peek_batch` + `commit_consumed` already exist and
-the 1 M-deep ring makes holding ≤ 1024 borrowed slots across gate waits
-harmless.
-
-Gain: proportional to batch depth — negligible when keeping up, ~10 µs+
-for the head slot of a full batch after a stall; removes ~400 KB of
-stack traffic per iteration. Risk: low (the loop body does not touch
-`consumer`). Effort: S–M. Confidence: medium.
 
 ### 10. `flush_sends` does all TCP transmit work inline on the gate thread
 
@@ -262,16 +284,25 @@ is still only processed in the next drain, so no latency is added.
 site: with `DEFER_TASKRUN`, `submit()` (no GETEVENTS) does not run local
 task work, so the shutdown quiesce (submit then poll `completion()`)
 would see nothing until its deadline — use `submit_and_wait(1)` there.
-Independently, in default mode a drain that starts with a non-empty CQ
-still pays an `enter` (~0.3–1 µs): peek `completion().is_empty()` and
-skip the wait when there is work and the SQ is empty; `register_ring_fd`
-saves the fdget/fdput per enter.
+That failure mode is silent (a slower shutdown, nothing logged), which
+is the main risk in the item.
+
+Note the flag and the landed enter-skip below pull against each other:
+the skip works precisely *because* default-mode task work posts CQEs
+while the reader is in userspace. Under `DEFER_TASKRUN` the CQ would be
+empty at that check and the skip would simply never fire. Bench them as
+alternatives, not as a pair.
 
 Gain: unknown, needs measurement; plausibly 5–25 % of reader-core cycles
 at ~1 M msg/s and a jitter reduction. Risk: M (correctness of CQ-read
 sites; behaviour otherwise identical). Effort: S. Confidence: medium.
 Overlaps io_uring audit #5, which declined the flags without a bench —
 this is the argument for running that bench.
+
+**Landed from this item:** the enter-skip. The reader now enters the
+kernel only when it has SQEs to hand over or an empty CQ, via
+`ring_entry`. `register_ring_fd` is still open — it needs io-uring
+0.7.14 and the workspace pins 0.7.12.
 
 ### Lower priority, ingress
 
