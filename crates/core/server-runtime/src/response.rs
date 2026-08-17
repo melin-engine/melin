@@ -90,12 +90,10 @@ const FLUSH_BYTES_THRESHOLD: usize = 1400;
 /// 256 responses — tens of microseconds — however the load is spread.
 const FLUSH_SLOT_INTERVAL: usize = 256;
 
-/// Idle iterations spent spinning before the loop falls back to
+/// Consecutive idle iterations before the loop falls back to
 /// `yield_now` (only reached when `--yield-idle` is set; production
-/// busy-spins). Also tells the idle housekeeping timer whether its
-/// clock-read mask applies — a yielding loop iterates orders of
-/// magnitude slower, so the mask would stretch a one-second check into
-/// minutes.
+/// busy-spins). Doubles as the "sustained idle" threshold past which the
+/// idle housekeeping timer may mask its clock read — see the call site.
 const IDLE_SPIN_LIMIT: u32 = 1000;
 
 /// The consumed path's flush cadence: both triggers plus the counter
@@ -688,14 +686,22 @@ pub fn run<A: Application>(
             // amortized tick per idle iteration replaces the two
             // unconditional `Instant::now()` calls that decision used to
             // cost; the inner intervals are unchanged, so cadences are
-            // the same (see `IDLE_HOUSEKEEPING_INTERVAL`). `spinning` is
-            // the loop's real spin/yield state — under `--yield-idle`
-            // the mask must not apply, or a yielding loop would take a
-            // minute to notice a second has passed.
+            // the same (see `IDLE_HOUSEKEEPING_INTERVAL`).
+            //
+            // The timer's iteration mask is only engaged once the stage
+            // has been idle for a sustained stretch (`idle_spins` resets
+            // on every consumed batch). That is deliberate: the mask
+            // trades cadence for clock reads, and it should only do so
+            // when clock reads are the loop's whole cost. A stage that
+            // is nearly saturated reaches this path a handful of times
+            // between batches — there the read is already rare, and
+            // masking it would stretch the one-second heartbeat scan
+            // into minutes. `--yield-idle` never masks either: the yield
+            // syscall dwarfs a vDSO read.
             if idle_housekeeping_timer
                 .tick(
                     IDLE_HOUSEKEEPING_INTERVAL,
-                    busy_spin || idle_spins < IDLE_SPIN_LIMIT,
+                    busy_spin && idle_spins >= IDLE_SPIN_LIMIT,
                 )
                 .is_some()
             {
