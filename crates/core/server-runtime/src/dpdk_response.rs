@@ -130,7 +130,6 @@ pub fn run<A: Application>(
     // Track known connections (for heartbeat scheduling).
     let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
 
-    let mut batch = [OutputSlot::<A::Report, A::QueryResponse>::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position (see response.rs for full explanation).
@@ -267,9 +266,12 @@ pub fn run<A: Application>(
             last_heartbeat_scan,
         );
 
-        // Consume output slots from matching stage.
-        let count = consumer.consume_batch(&mut batch, MAX_BATCH);
-        if count == 0 {
+        // Borrow output slots from the matching stage in place — see
+        // `response::run` for why this is a borrow and not a copy, and
+        // for the consequence of publishing progress after the batch
+        // instead of before it.
+        let slots = consumer.read_contiguous(MAX_BATCH);
+        if slots.is_empty() {
             idle_count += 1;
             if idle_count.is_multiple_of(1024) {
                 utilization.busy.store(busy_count, Ordering::Relaxed);
@@ -383,7 +385,7 @@ pub fn run<A: Application>(
         // The durability gate is evaluated per slot, inline — see
         // `response::run` for why batch-max gating was a head-of-line
         // block and why the extra waits are self-limiting.
-        for slot in &batch[..count] {
+        for slot in slots {
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
@@ -579,6 +581,10 @@ pub fn run<A: Application>(
                 state.last_send = batch_now;
             }
         }
+
+        // Borrowed slots are dead here — hand the batch back to the
+        // producer now that every one of them has cleared its gate.
+        consumer.commit();
 
         // Log degradation transitions / heartbeat. Same scheme as the
         // TCP response stage, including ticking after dispatch off a

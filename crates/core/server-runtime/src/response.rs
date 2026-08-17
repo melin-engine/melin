@@ -306,7 +306,6 @@ pub fn run<A: Application>(
     let mut connections: FxHashMap<u64, ConnectionEntry> =
         FxHashMap::with_capacity_and_hasher(256, Default::default());
 
-    let mut batch = [OutputSlot::<A::Report, A::QueryResponse>::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position to avoid atomic reads on every slot.
@@ -651,9 +650,24 @@ pub fn run<A: Application>(
             }
         }
 
-        // Consume output slots from matching stage.
-        let count = consumer.consume_batch(&mut batch, MAX_BATCH);
-        if count == 0 {
+        // Borrow output slots from the matching stage in place.
+        //
+        // `read_contiguous` rather than `consume_batch`: the latter
+        // memcpy'd every ready slot into a stack array before the first
+        // one was touched, and `OutputSlot` embeds the application's
+        // largest query response (~330 B for the exchange), so the head
+        // slot of a deep batch paid for the whole copy before it could
+        // be encoded. Borrowing costs nothing and the loop below reads
+        // each slot exactly once anyway.
+        //
+        // The progress counter now moves *after* the batch instead of
+        // before it (`consume_batch` committed up front), so the
+        // matching stage cannot reclaim these slots until the loop —
+        // durability gate waits included — is done with them. That is
+        // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
+        // the same rate either way.
+        let slots = consumer.read_contiguous(MAX_BATCH);
+        if slots.is_empty() {
             // SPSC is empty — flush all dirty connections via io_uring.
             // This is the response-data egress path; heartbeat flushes
             // below aren't sampled because they're admin traffic, not
@@ -866,7 +880,7 @@ pub fn run<A: Application>(
         // written. A flag written at append time rather than a per-slot
         // scan of the dirty set: the scan would cost a hash lookup per
         // dirty connection on the hot path.
-        for slot in &batch[..count] {
+        for slot in slots {
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
@@ -1189,6 +1203,12 @@ pub fn run<A: Application>(
                 }
             }
         }
+
+        // The borrowed slots are dead here, so the batch can be handed
+        // back to the producer. Publishing progress is deliberately the
+        // last thing the iteration does with the ring: every slot has
+        // cleared its durability gate and been encoded by now.
+        consumer.commit();
 
         // Remove connections that exceeded the send buffer limit. Like
         // the disconnect handler, this un-dirties a connection without
