@@ -10,7 +10,7 @@
 //! This decoupling is necessary because smoltcp is single-threaded — only
 //! the DPDK poll thread can call `socket.send_slice()`.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -38,8 +38,18 @@ const MAX_BATCH: usize = 1024;
 /// at up to 330 bytes.
 const MAX_RESPONSE_BUF: usize = 512;
 
-/// Maximum wire frame size: 4-byte length prefix + MAX_RESPONSE_BUF payload.
-const MAX_TX_FRAME: usize = 4 + MAX_RESPONSE_BUF;
+/// Upper bound on the encoded `BatchEnd` terminator, which is a fixed byte
+/// string (a length prefix and a discriminant).
+const MAX_BATCH_END_FRAME: usize = 8;
+
+/// Maximum wire frame size: 4-byte length prefix + MAX_RESPONSE_BUF payload,
+/// plus room for the `BatchEnd` terminator carried in the same frame when the
+/// slot closes a request.
+const MAX_TX_FRAME: usize = 4 + MAX_RESPONSE_BUF + MAX_BATCH_END_FRAME;
+
+// The buffer has to hold the largest response the encoder can produce *and*
+// the terminator, or folding the two would truncate the response.
+const _: () = assert!(MAX_TX_FRAME >= 4 + MAX_RESPONSE_BUF + MAX_BATCH_END_FRAME);
 
 /// An encoded frame destined for a specific connection.
 /// Sent from the response stage to the DPDK poll thread via lock-free SPSC.
@@ -47,6 +57,11 @@ const MAX_TX_FRAME: usize = 4 + MAX_RESPONSE_BUF;
 /// Fixed-size and `Copy` to fit the SPSC queue's requirements (no heap
 /// allocation per frame). Trading responses are small (~20-80 bytes),
 /// well within the 132-byte slot.
+///
+/// A frame carries the response *and* the `BatchEnd` terminator when the slot
+/// closes a request. The struct is copied by value out of the SPSC on the poll
+/// thread, which is also the ingress thread, so one frame per request rather
+/// than two halves both that copy and the per-frame `queue_send` work.
 #[derive(Clone, Copy)]
 pub struct TxFrame {
     pub connection_id: u64,
@@ -128,9 +143,23 @@ pub fn run<A: Application>(
         });
     let mut policy = active_policy.to_policy();
     // Track known connections (for heartbeat scheduling).
-    let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
+    // FxHash over SipHash: keys are server-generated connection ids, never
+    // attacker-chosen, so HashDoS resistance buys nothing and the default
+    // hasher costs more per lookup than the lookup itself.
+    let mut connections: FxHashMap<u64, ConnectionHeartbeat> =
+        FxHashMap::with_capacity_and_hasher(256, Default::default());
 
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
+
+    // The BatchEnd terminator is the same bytes on every request, so it is
+    // encoded once here instead of per slot.
+    let batch_end_wire_frame = {
+        let mut buf = [0u8; MAX_BATCH_END_FRAME];
+        let written =
+            control_codec::encode_transport_response(&TransportResponse::BatchEnd, &mut buf)
+                .expect("BatchEnd encodes");
+        buf[..written].to_vec()
+    };
 
     // Cached durability position (see response.rs for full explanation).
     // Initialised below from the policy's startup evaluation.
@@ -509,9 +538,12 @@ pub fn run<A: Application>(
                 replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
             }
 
-            if !connections.contains_key(&slot.connection_id) {
+            // One lookup, not two: the entry decides whether the connection is
+            // still known, and the same borrow stamps its heartbeat clock once
+            // the frame is queued.
+            let Some(conn_state) = connections.get_mut(&slot.connection_id) else {
                 continue;
-            }
+            };
 
             // All frames for this slot share the same destination tid
             // (single connection_id), so we can compute it once and
@@ -545,25 +577,26 @@ pub fn run<A: Application>(
                 OutputPayload::BatchEnd => None,
             };
 
-            if let Some(result) = payload_result {
-                #[cfg(feature = "tick-to-trade")]
-                let encode_start = trace::mono_trace_ns();
-                push_frame(result, conn_id, &mut tx_producers[tid], &encode_buf);
-                #[cfg(feature = "tick-to-trade")]
-                encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
-            }
+            // The BatchEnd terminator rides in the same frame. It is
+            // transport-shaped and byte-identical every time, so it is
+            // encoded once at startup rather than per slot.
+            let trailer: &[u8] = if slot.is_last_in_request {
+                &batch_end_wire_frame
+            } else {
+                &[]
+            };
 
-            // Frame 2: BatchEnd terminator. Transport-shaped, encoded
-            // directly via codec — never reaches the application
-            // encoder trait.
-            if slot.is_last_in_request {
-                let result = control_codec::encode_transport_response(
-                    &TransportResponse::BatchEnd,
-                    &mut encode_buf,
-                )
-                .map_err(|_| "encode error");
-                push_frame(result, conn_id, &mut tx_producers[tid], &encode_buf);
-            }
+            #[cfg(feature = "tick-to-trade")]
+            let encode_start = trace::mono_trace_ns();
+            push_frame(
+                payload_result,
+                conn_id,
+                &mut tx_producers[tid],
+                &encode_buf,
+                trailer,
+            );
+            #[cfg(feature = "tick-to-trade")]
+            encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
 
             // Release this slot's frames as a unit. `flush` is a no-op
             // when nothing was pushed (e.g. every kind hit an encode
@@ -577,9 +610,7 @@ pub fn run<A: Application>(
                 server_e2e_rec.record_elapsed(slot.recv_ts, trace::mono_trace_ns());
             }
 
-            if let Some(state) = connections.get_mut(&slot.connection_id) {
-                state.last_send = batch_now;
-            }
+            conn_state.last_send = batch_now;
         }
 
         // Borrowed slots are dead here — hand the batch back to the
@@ -606,31 +637,41 @@ pub fn run<A: Application>(
     }
 }
 
-/// Push one encoded wire frame onto the DPDK tx ring. Logs encode
-/// failures at error level and silently drops the frame — same
-/// behaviour as the pre-refactor inline loop. Splitting the
-/// responsibility into a helper lets the slot-processing code call
-/// it uniformly for application payloads (via the `ResponseEncoder`
-/// trait) and transport-shaped frames (via `encode_transport_response`).
+/// Push one SPSC frame carrying an encoded payload and/or a pre-encoded
+/// trailer onto the DPDK tx ring.
+///
+/// `payload` is `None` for slot kinds with no body (`BatchEnd`), and `trailer`
+/// is empty for slots that do not close a request; a call with neither pushes
+/// nothing. Encode failures are logged at error level and drop the payload,
+/// but still ship the trailer, so a request that fails to encode one response
+/// is still terminated rather than leaving the client waiting.
 #[inline]
 fn push_frame(
-    result: Result<usize, &'static str>,
+    payload: Option<Result<usize, &'static str>>,
     conn_id: u64,
     tx: &mut spsc::Producer<TxFrame>,
     encode_buf: &[u8],
+    trailer: &[u8],
 ) {
-    let written = match result {
-        Ok(n) => n,
-        Err(reason) => {
+    let written = match payload {
+        Some(Ok(n)) => n,
+        Some(Err(reason)) => {
             tracing::error!(connection_id = conn_id, reason, "encode error");
-            return;
+            0
         }
+        None => 0,
     };
-    let len = written as u16;
+    if written == 0 && trailer.is_empty() {
+        return;
+    }
+    let total = written + trailer.len();
+    debug_assert!(total <= MAX_TX_FRAME);
+    let len = total as u16;
     tx.push_with(|frame| {
         frame.connection_id = conn_id;
         frame.len = len;
         frame.data[..written].copy_from_slice(&encode_buf[..written]);
+        frame.data[written..total].copy_from_slice(trailer);
     });
 }
 
@@ -649,7 +690,7 @@ struct ConnectionHeartbeat {
 /// success and sends `Disconnected`; this function handles the decrement.
 fn process_control_events(
     control_rx: &mpsc::Receiver<ControlEvent>,
-    connections: &mut HashMap<u64, ConnectionHeartbeat>,
+    connections: &mut FxHashMap<u64, ConnectionHeartbeat>,
     active_connections: &AtomicU64,
     now: Instant,
 ) {
@@ -681,7 +722,7 @@ mod tests {
     fn active_connections_single_lifecycle() {
         let counter = AtomicU64::new(0);
         let (tx, rx) = mpsc::channel();
-        let mut connections = HashMap::new();
+        let mut connections = FxHashMap::default();
         let now = Instant::now();
 
         // Poll thread: auth succeeds → increment.
@@ -706,7 +747,7 @@ mod tests {
     fn disconnect_unknown_connection_no_decrement() {
         let counter = AtomicU64::new(0);
         let (tx, rx) = mpsc::channel();
-        let mut connections = HashMap::new();
+        let mut connections = FxHashMap::default();
         let now = Instant::now();
 
         tx.send(ControlEvent::Disconnected { connection_id: 999 })
@@ -721,7 +762,7 @@ mod tests {
     fn active_connections_multiple_lifecycle() {
         let counter = AtomicU64::new(0);
         let (tx, rx) = mpsc::channel();
-        let mut connections = HashMap::new();
+        let mut connections = FxHashMap::default();
         let now = Instant::now();
 
         // Three connections authenticate.
@@ -757,7 +798,7 @@ mod tests {
     fn duplicate_disconnect_single_decrement() {
         let counter = AtomicU64::new(0);
         let (tx, rx) = mpsc::channel();
-        let mut connections = HashMap::new();
+        let mut connections = FxHashMap::default();
         let now = Instant::now();
 
         counter.fetch_add(1, Ordering::Relaxed);
@@ -772,5 +813,90 @@ mod tests {
             .unwrap();
         process_control_events(&rx, &mut connections, &counter, now);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    mod push_frame {
+        use super::*;
+
+        const TRAILER: &[u8] = b"END";
+
+        /// Drive `push_frame` and return every frame the poll thread would
+        /// see, as `(connection_id, bytes)`.
+        fn pushed(
+            payload: Option<Result<usize, &'static str>>,
+            trailer: &[u8],
+        ) -> Vec<(u64, Vec<u8>)> {
+            let (mut tx, mut rx) = spsc::channel::<TxFrame>(8);
+            let encode_buf = b"response-body";
+            super::super::push_frame(payload, 42, &mut tx, encode_buf, trailer);
+            tx.flush();
+
+            let mut out = Vec::new();
+            while let Some((_, frame)) = rx.try_consume() {
+                out.push((frame.connection_id, frame.as_bytes().to_vec()));
+            }
+            out
+        }
+
+        #[test]
+        fn payload_and_trailer_ship_as_one_frame() {
+            let frames = pushed(Some(Ok(8)), TRAILER);
+
+            assert_eq!(frames.len(), 1, "two SPSC slots where one suffices");
+            assert_eq!(frames[0].0, 42);
+            assert_eq!(frames[0].1, b"responseEND".to_vec());
+        }
+
+        #[test]
+        fn payload_without_trailer_ships_alone() {
+            let frames = pushed(Some(Ok(8)), &[]);
+
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].1, b"response".to_vec());
+        }
+
+        #[test]
+        fn trailer_without_payload_ships_alone() {
+            // A `BatchEnd` slot: no body of its own, but it closes the
+            // request.
+            let frames = pushed(None, TRAILER);
+
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].1, TRAILER.to_vec());
+        }
+
+        #[test]
+        fn nothing_to_send_pushes_no_frame() {
+            assert!(pushed(None, &[]).is_empty());
+        }
+
+        #[test]
+        fn encode_failure_still_terminates_the_request() {
+            // The response is lost, but dropping the terminator too would
+            // leave the client waiting on a batch that never ends.
+            let frames = pushed(Some(Err("encode error")), TRAILER);
+
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].1, TRAILER.to_vec());
+        }
+
+        #[test]
+        fn encode_failure_without_trailer_pushes_no_frame() {
+            assert!(pushed(Some(Err("encode error")), &[]).is_empty());
+        }
+
+        #[test]
+        fn the_encoded_terminator_fits_its_reserved_room() {
+            let batch_end = {
+                let mut buf = [0u8; MAX_BATCH_END_FRAME];
+                let written = control_codec::encode_transport_response(
+                    &TransportResponse::BatchEnd,
+                    &mut buf,
+                )
+                .expect("BatchEnd encodes");
+                buf[..written].to_vec()
+            };
+            assert!(batch_end.len() <= MAX_BATCH_END_FRAME);
+        }
     }
 }
