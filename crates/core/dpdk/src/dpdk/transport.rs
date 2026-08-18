@@ -945,6 +945,13 @@ impl DpdkTransport {
         if let Some(socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) {
             socket.abort();
             self.sockets.remove(handle);
+            // The interface indexes established connections by 4-tuple for
+            // O(1) segment demultiplexing, and cannot see a `SocketSet`
+            // removal. Left in place, the entry holds its slot for the life of
+            // the process; once the index stops accepting inserts, every later
+            // connection is unindexed for its whole life and each of its
+            // segments costs a linear scan over all sockets.
+            self.iface.forget_tcp_socket(handle);
         } else {
             tracing::warn!(
                 handle = ?handle,
