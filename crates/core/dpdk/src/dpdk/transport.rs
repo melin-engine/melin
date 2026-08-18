@@ -306,6 +306,9 @@ impl DpdkShared {
         let eal = Eal::init(&eal_args)?;
 
         let port_count = eal.port_count();
+        if config.port_ids.is_empty() {
+            return Err("DPDK transport requires at least one port id".into());
+        }
         for &pid in &config.port_ids {
             if pid >= port_count {
                 return Err(
@@ -314,13 +317,34 @@ impl DpdkShared {
             }
         }
 
+        // Place the mempool on the NIC's own NUMA node. Every RX descriptor
+        // and every transmitted frame is DMA'd to or from these buffers, so a
+        // pool on the wrong node puts a cross-socket interconnect hop on the
+        // whole packet path. `rte_eth_dev_socket_id` returns -1 when the
+        // device's node is unknown, which is DPDK's `SOCKET_ID_ANY` and the
+        // right value to pass through unchanged.
+        //
+        // A single pool cannot straddle nodes, so with ports on different
+        // nodes the first port's node wins and the rest pay the hop.
+        let socket_id = unsafe { ffi::rte_eth_dev_socket_id(config.port_ids[0]) };
+        if let Some(&mismatched) = config.port_ids[1..]
+            .iter()
+            .find(|&&pid| unsafe { ffi::rte_eth_dev_socket_id(pid) } != socket_id)
+        {
+            tracing::warn!(
+                port = mismatched,
+                mempool_socket_id = socket_id,
+                "DPDK ports span NUMA nodes; mempool follows the first port"
+            );
+        }
+
         // Scale mempool for number of queues and ports.
         let num_mbufs: u32 =
             8192 * (config.port_ids.len() as u32).max(1) * (config.num_queues as u32).max(1);
         let mempool = if config.mtu > 1500 {
-            Mempool::create_for_mtu("pktmbuf_pool", num_mbufs, config.mtu as u16, 0)?
+            Mempool::create_for_mtu("pktmbuf_pool", num_mbufs, config.mtu as u16, socket_id)?
         } else {
-            Mempool::create_with_size("pktmbuf_pool", num_mbufs, 0)?
+            Mempool::create_with_size("pktmbuf_pool", num_mbufs, socket_id)?
         };
 
         // Configure and start all ports with N queue pairs.
