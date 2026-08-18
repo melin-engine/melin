@@ -12,9 +12,10 @@ reference, not a quantified regression. Price each with the
 `tick-to-trade` per-stage trace before landing it, and expect null
 results on some.
 
-Items landed are removed from this document as they ship; the numbering
-below is the original audit's, so the gaps are done work, not omissions.
-See "First pass" for what that was and what it bought.
+Items landed are removed from this document as they ship, and items
+struck as inapplicable are reduced to a note saying why; the numbering
+below is the original audit's, so the gaps are resolved work, not
+omissions. The pass notes say what each round did.
 
 ## Framing — where loaded latency actually is
 
@@ -47,18 +48,18 @@ unless marked DPDK. Ratings are judgement calls from code reading.
 | 5 | Sub-batch replication publish every K encoded slots; publish regardless of group-commit | up to tens of µs on heads of large batches | Low | M | Med–High |
 | 6 | Pad the gate's cursors — **tried, measured, reverted**; read the entry first | sub-µs per gate wake, and a measured throughput cost as implemented | Demonstrated | M | **Low** |
 | 7 | `DEFER_TASKRUN` on the reader ring (residue) | 5–25 % reader-core cycles at ~1 M msg/s, less jitter | Med (CQ-read sites) | S | Med |
-| 10 | Shard egress across K response consumers | divides per-flush xmit cost by K; only >32 dirty conns | Med | M–L | Low–Med |
-| 11 | DPDK: fastcp TCP 4-tuple index caps at 64 and leaks on close | 10×+ per-packet ingest cost after churn | Low | S+S | **Very high** (DPDK) |
-| 12 | DPDK: zero-copy RX cap of 32 segments/socket drops the excess | likely the DPDK throughput limiter; ≥1 RTT stalls | Med | M | **High** (DPDK) |
-| 13 | DPDK: `poll()` is O(sockets) and runs O(N) times per iteration | dominant at N ≥ 64 | Low / Med | S / M | High at scale (DPDK) |
-| 14 | DPDK: mempool sizing, TX-alloc `assert!`, neighbor cache 8, 528 B `TxFrame` copies | removes crash/drop cliffs, ~100–300 ns/frame | Low | S | Med (DPDK) |
+| 12 (residue) | DPDK: small segments can still exhaust the zero-copy descriptor array | sporadic ≥1 RTT stalls | Med | M | Med (DPDK) |
+| 14 (residue) | DPDK: per-mbuf FFI calls, `spsc` copy-out, iteration-based timers | ~10–30 ns/pkt, timer drift | Low | S–M | Low–Med (DPDK) |
+
+Struck as not applicable to the deployment profile — see "Third pass":
+10 (shard egress), 13. Item 11 landed, but for the leak rather than the
+capacity ceiling the entry led with.
 
 ### Suggested order
 
-Kernel-TCP: instrument and decide 4 / 5 / 7 on numbers; 10 only with a
-profile that has more than ~16 connections; 6 only after a microbenchmark
-justifies a second attempt. DPDK: 11 → 14 (neighbor cache, mempool) →
-12 → 13.
+Kernel-TCP: instrument and decide 4 / 5 / 7 on numbers; 6 only after a
+microbenchmark justifies a second attempt. DPDK: measure what the third
+pass landed before spending anything on the residue.
 
 ### First pass (landed, 2026-08-17)
 
@@ -108,6 +109,66 @@ a profile where that reader exists — the in-process replication bench
 runs no durability gate at all.
 
 Same caveat as the first pass for what did land: unmeasured per item.
+
+### Third pass — the DPDK items (2026-08-18)
+
+**Read this before using any rating in this document.** The DPDK items
+were rated per-mechanism, and that rating quietly assumed a scaling
+regime Melin does not target. Melin runs a handful of sockets: a few
+trading clients plus one or two replication sockets. Re-rated against
+that profile the items split along an axis the original audit did not
+draw:
+
+- **Per-connection mechanisms** — poll cost O(sockets), egress passes
+  over every socket, per-connection clock reads, index capacity, mempool
+  retention sized for hundreds of retained segments. Worth approximately
+  nothing at eight sockets.
+- **Per-socket burst depth** — everything driven by how much data hits
+  *one* socket between drains. Unaffected by connection count, and the
+  replication socket has by far the deepest bursts in the system: up to
+  512 KiB handed to a single `queue_send`.
+
+Only the second kind survives. That also strikes item 10 on the
+kernel-TCP side, which is explicitly gated on ">32 dirty connections".
+Generalise the lesson: before costing an item, state which axis it
+scales on and check that axis against the deployment, not against the
+largest number the code permits.
+
+**Landed.** Item 11 (index eviction on close, plus the fastcp API it
+needed); the burst-depth half of 13 (replication sockets get an egress
+burst limit covering a whole in-flight window; the trading port keeps
+the fan-in default); and from 14 — the replication per-tick byte cap,
+`BatchEnd` folded into the response's TX frame, both mbuf-exhaustion
+panics removed, the FxHash connection table and its double lookup, the
+mempool on the NIC's NUMA node, and the neighbour cache widened.
+
+Item 12's mechanism was addressed in fastcp rather than melin: the
+descriptor cap is a first-class config knob defaulting to a value that
+covers several full RX bursts to one socket, and the advertised window
+is now bounded by free descriptor slots so a bulk peer is flow-
+controlled instead of silently overrunning the array.
+
+**Right item, wrong reason.** Item 11's *capacity* was never the
+constraint — 64 concurrent is far above the target. What bit was the
+*leak*: entries were evicted only on a stale hit, so the cost scaled
+with connection *lifetimes*, not concurrency, and degraded monotonically
+with uptime. It landed for that, not for the per-packet number the entry
+led with, and the capacity ceiling was left alone.
+
+**Found while implementing, worth knowing.** fastcp's zero-copy ingest
+checked descriptor capacity *after* adding the segment to the
+reassembler, so an overflow drop left the reassembler holding bytes no
+descriptor backed — once the preceding gap filled, the stream advanced
+over data that was never stored and every later segment landed at the
+wrong offset. Silent corruption, not a clean drop. Anything touching
+that path should keep the capacity check ahead of every state mutation.
+
+**Caveat, stronger here than for the earlier passes.** None of this is
+exercised without a NIC. It is compile-verified and unit-tested where
+the logic is transport-independent, and that is all. Price it on
+hardware before believing any of it — and the descriptor cap is the one
+to watch first, since it remains the most plausible explanation for the
+DPDK-under-kernel-TCP throughput result in the AWS bench notes.
 
 ---
 
@@ -232,27 +293,18 @@ the ring — the same shape as July #9, ~10–30 ns/slot.
 
 ## Kernel-TCP: response egress
 
-### 10. `flush_sends` does all TCP transmit work inline on the gate thread
+### 10 (struck). Sharding `flush_sends` across response consumers
 
-**Where:** `response.rs` `flush_sends` — one SEND SQE per dirty
-connection, `submit_and_wait(pending)`; with `MSG_DONTWAIT` each SEND
-executes inline in the syscall (~1.5–5 µs each).
+Cut in the third pass. The mechanism is real — N dirty connections put N
+inline sends on the response thread, and it grows linearly with
+connection count — but it is a per-connection cost, and the entry's own
+advice was to measure it only with a >32-connection profile. Melin does
+not run one.
 
-N dirty connections → N × that on the response thread, during which no
-gate polling or encoding happens. It is the pre-gate flush, so it
-usually overlaps the wait, but once N × cost exceeds the fsync/ack
-interval the flush *is* the latency, and it grows linearly with
-connection count.
-
-Options: shard egress — the output ring supports multiple consumers; K
-response consumers each owning `conn_id % K`, each spinning the same gate
-cursors (M–L, K threads on the same cursors, `active_connections`
-accounting split, slot reads duplicated). Completion-driven sends were
-explicitly rejected in the August audit for buffer-ownership complexity.
-Measure with a > 32-connection profile before investing. Related, cheap:
-client fds are unregistered `types::Fd` on the response ring (fget/fput
-per SEND) — a sparse fixed table updated on connect/teardown saves
-~50–100 ns per SEND.
+One cheap piece survives independent of connection count: client fds are
+unregistered `types::Fd` on the response ring, costing an fget/fput per
+SEND. A sparse fixed table updated on connect and teardown removes it,
+~50–100 ns per SEND at any N.
 
 ## Kernel-TCP: client ingress
 
@@ -330,148 +382,90 @@ kernel only when it has SQEs to hand over or an empty CQ, via
 
 ## DPDK / smoltcp (fastcp)
 
-`melin-dpdk` depends on the published `fastcp` crate; fastcp-side fixes
-need a publish + bump. One poll thread (the EAL main lcore) does RX, TCP,
+`melin-dpdk` tracks a `fastcp` branch while the third pass's fixes are
+unpublished; fastcp-side work still needs a publish + bump before melin
+can be released. One poll thread (the EAL main lcore) does RX, TCP,
 decode, ring publish, TX and both replication slots; the outer loop
 visits every connection every iteration and calls `transport.poll()` at
 the top, every 4 connections, and at the end, plus `repl_driver.tick()`
 at the same cadence (which polls again whenever it queued data).
 
-### 11. fastcp TCP 4-tuple index caps at 64 live entries and leaks on close
+### 12 (residue). Small segments can still exhaust the descriptor array
 
-**Where:** `fastcp/src/iface/tcp_socket_index.rs` (`CAPACITY = 128`,
-refuses insert at 50 % load), `fastcp/src/iface/interface/tcp.rs`
-(miss → linear scan of all sockets with `accepts()`, then re-insert
-which fails again). Removal only happens lazily on a stale hit;
-`SocketSet::remove` never touches the index and melin's `close()` has no
-way to.
+The bulk half is fixed: the advertised window is now bounded by free
+zero-copy descriptor slots, so a peer sending MSS-sized segments is
+flow-controlled rather than overrunning the array and having the excess
+dropped without an ACK. The cap itself is a config knob with a default
+sized for several full RX bursts to one socket.
 
-Connection #65+ (concurrent) is never indexed; worse, closed connections
-keep their entries, so after 64 connection *lifetimes* (a few bench runs
-against one server process) every new connection is unindexed for its
-whole life, and each of its segments costs O(live sockets) `accepts()`
-checks (~10–20 ns each). ~200 ns/pkt at 16 sockets, tens of µs/pkt at
-1000 — enough on its own to saturate the poll core, and a plausible
-contributor to "DPDK throughput lower than TCP".
+What no window can fix: TCP windows are denominated in bytes, so nothing
+in the window bounds a segment *count*. A flow of small segments — which
+is exactly what order entry looks like with Nagle off — consumes one
+descriptor per packet while the byte window still reports plenty free.
+Sizing the array is the only lever, and it is a bound, not a guarantee.
 
-**Fix.** fastcp: raise `CAPACITY` to ≥ 2 × `MAX_CONNECTIONS` (~32 B/slot),
-add a public `Interface::forget_tcp_socket(handle)` that melin's `close()`
-calls, index at accept time rather than on the first data segment.
+**Fix.** Spill to the copy-path `rx_buffer` when the descriptor array is
+full instead of dropping. Non-trivial: the zero-copy path tracks its own
+contiguous-byte count as a virtual `rx_buffer.len()`, so a mixed socket
+needs the two to interleave in stream order on both the receive and the
+window-accounting sides. Worth doing only if the cap is observed to bind
+in practice; the counter to watch is whether the drop path logs at all.
 
-Gain: large at N > 64 or after churn; ~100–200 ns/pkt even at small N.
-Risk: low. Effort: S (fastcp) + S (melin). Confidence: high.
+Gain: removes a sporadic ≥1 RTT stall under small-segment bursts. Risk:
+medium (stream ordering). Effort: M (fastcp). Confidence: high on
+mechanism, unknown on frequency.
 
-### 12. Zero-copy RX holds ≤ 32 segments per socket; the excess in one burst is dropped
+### 13 (struck). `poll()` is O(all sockets) and runs O(N) times per iteration
 
-**Where:** `fastcp/build.rs` (`ZERO_COPY_RX_MAX_SEGMENTS = 32`, env-only),
-`fastcp/src/socket/tcp.rs` (`Dropped`: no ACK, no retain), consumer drain
-only in `recv_into_vec`, called once per connection per outer iteration
-(and once per `poll_recv` on the replica).
+Cut in the third pass — the O(N) modelling starts at N=64 and Melin runs
+an order of magnitude below that. The dirty-TX handle list, the
+needs-egress set, the adaptive mid-iteration polls and the
+touched-handle drain are all per-connection work with nothing to save at
+this scale.
 
-`poll()` ingests up to 64 frames per port before any drain; any burst
-> 32 data segments to one socket between drains drops the rest.
-Replication is the worst case: the primary flushes up to 512 KiB (~350
-MSS segments) in one `flush_tx`, the replica's `rx_burst(64)` delivers 64
-for the same socket → 32 stored, 32 dropped, every poll. Recovery is via
-dup-ACK fast retransmit or the 1 ms RTO, and smoltcp's retransmit rewinds
-to `local_seq_no` and resends the whole outstanding window, re-triggering
-the drop. Pipelined clients (64 KiB advertised window) can hit it too. For
-bulk replication this caps effective throughput at ~46 KiB per drain plus
-retransmit churn; for clients it is a sporadic ≥ 1 RTT stall — a p99.9
-artefact. Strong candidate for the "smoltcp investigation" item in the
-AWS bench notes.
+The burst-depth half of the item landed instead: the egress pass repeats
+over every socket until one sends nothing, and the per-socket burst
+limit defaulted to 4, so a replication window cost a pass per few
+segments regardless of connection count. Replication sockets now carry a
+limit sized to a whole in-flight window.
 
-**Fix.** (a) advertise a window bounded by free ZC slots × MSS so the
-peer cannot exceed the cap; (b) raise the cap
-(`SMOLTCP_ZERO_COPY_RX_MAX_SEGMENTS=256`, ~40 B/segment) and/or spill to
-the copy-path `rx_buffer` when the array is full instead of dropping;
-(c) drain touched sockets after every poll (item 13). Do (a)+(b) first;
-a quick probe is the env var alone with replication throughput measured
-before/after.
+### 14 (residue). Copies and drift
 
-Gain: needs measurement; potentially the dominant DPDK replication
-throughput limiter. Risk: medium (window logic). Effort: M (fastcp).
-Confidence: high on mechanism, medium on magnitude.
+Landed from this item: the mempool now allocates on the NIC's own NUMA
+node; neither mbuf allocation site can panic the server (`Device`'s
+token allocation reports the shortage and the stack retries); the
+neighbour cache is widened past its 8-entry stall cliff; `BatchEnd`
+rides in the same `TxFrame` as the response it terminates, with the
+terminator pre-encoded once; and `dpdk_response.rs` uses an FxHash
+connection table with a single lookup per slot.
 
-### 13. `poll()` is O(all sockets), and runs O(N) times per outer iteration
+Struck as per-connection: the mempool *resize* (its arithmetic was
+driven by hundreds of retained segments at N=256); the per-connection
+clock reads (~1.75 N + 3 vDSO reads per iteration, which at eight
+sockets is noise); the `tx_queues` / `tx_queue_limits` / `connections`
+out-of-bounds past 1021 clients; and the RSS `mq_mode` gap, moot at
+`num_queues = 1`.
 
-**Where:** melin `dpdk_transport.rs` (poll at top, every 4 connections,
-end; `flush_tx_queues` iterates every socket), `replication/dpdk.rs`
-(extra polls per slot per tick); fastcp `iface/interface/mod.rs`
-(`Interface::poll` egress loop repeats `socket_egress` until a pass sends
-nothing, each pass visiting every socket at ~25 ns idle; default
-`dispatch_burst_limit = 4`, never raised by melin, so a 350-segment
-replication burst forces ~88 full passes).
+Still open, all independent of connection count:
 
-Rough model: N=64 → ~4 µs/poll × 20–50 polls/iteration → 100–200 µs
-iteration; N=256 → ~1 ms; N=1024 → ~15 ms. The iteration length is also
-the visitation latency for a request that just missed its connection's
-turn: ingest is scan-driven, not event-driven — data for an
-already-visited socket sits in ZC segments (holding mbufs) until the next
-lap.
-
-**Fix.** melin: dirty-TX handle list so `flush_tx_queues` is O(pending)
-(S); `set_dispatch_burst_limit(64..256)` on replication sockets (S);
-adaptive mid-iteration polls (only when the last `rx_burst` was full)
-(S). fastcp: return the handles that received payload from
-`poll_ingress_batch_zero_copy` and drain exactly those in arrival order
-right after each poll — melin then scans all connections only on the slow
-tick (M); a "needs-egress" set so `socket_egress` is O(active) (M).
-
-Gain: dominant at N ≥ 64; small at N ≤ 8. Risk: low for the melin parts,
-medium for the fastcp parts. Confidence: high on mechanism.
-
-### 14. Sizing cliffs and copies
-
-- **Mempool** (8192 mbufs × ports × queues, `socket_id` hard-coded 0) is
-  undersized for the zero-copy design: RX ring 1024 + up to 1024 TX in
-  flight + 256 lcore cache leave ~5.9 K for retained ZC segments, while
-  one outer iteration can retain 64 × polls (≈ 4 K at N=256). Exhaustion
-  = RX refill fails (NIC drops → client RTO) and any TX alloc **panics
-  the server** (`assert!` on null mbuf). Size ≥ RX_DESC + TX_DESC + cache
-  + `MAX_CONNECTIONS` × ZC cap, allocate on `rte_eth_dev_socket_id(port)`,
-  make TX alloc failure a retry-next-poll. Consider RX_DESC 4096 so a
-  100–200 µs poll-thread stall does not drop.
-- **Neighbor cache** is fastcp's default 8 entries (no
-  `iface-neighbor-cache-count-N` feature set in `crates/core/dpdk/Cargo.toml`);
-  eviction of oldest on full, a missing neighbor silences the socket for
-  `DISCOVERY_SILENT_TIME`, MAC-learning reseed throttled to 30 s — a
-  multi-second stall cliff when clients span > 8 hosts. Enable
-  `iface-neighbor-cache-count-64`. Trivial.
-- **`TxFrame`** is a fixed 528 B (`8+2+516`) struct copied whole out of
-  the SPSC per frame (`try_consume` returns `T` by value; 9 cache lines
-  on the poll thread, which is also ingress), two frames per request
-  (Report + `BatchEnd`, two `queue_send` calls), then `TxQueue::push`,
-  `send_slice`, mbuf — five copies of every response byte; the
-  replication path copies four times (~> 1 GB/s of memcpy on the poll
-  core at 3 M ev/s). Fold `BatchEnd` into the same `TxFrame` when
-  `is_last_in_request` (S); a borrow-based `spsc::Consumer::peek` copying
-  only `len` bytes (M); `queue_send` fast path straight to `send_slice`
-  when the `TxQueue` is empty and `can_send()` (S). Per-slot `flush()`
-  is July #8 (deliberate).
-- **Replication egress bursts** stall the poll thread ~100–200 µs (up to
-  512 KiB queued per tick, one `send_slice` memcpy, ~350 mbuf builds in
-  one `iface.poll`) — a bimodal DPDK tail shape. Cap bytes per tick
-  (64–128 KiB) with a raised `dispatch_burst_limit` so the cap costs no
-  extra passes; the structural fix is the roadmap's "split replication
-  off the DPDK poll thread".
-- **Clock reads** scale with connection count: `Instant::now()` per
-  active connection per iteration, per non-empty RX batch, and per
-  replication tick per slot (~1.75 N + 3 vDSO reads per iteration).
-  Stamp `last_activity` from a per-iteration cached `Instant`; gate the
-  MAC-learning reseed and repl `last_send` checks on poll count.
-- Small: `dpdk_response.rs` still uses std `HashMap` with a double lookup
-  per slot; 5–6 non-inline FFI calls per RX mbuf plus per-mbuf free (a
-  `(ptr,len)` accessor and `rte_pktmbuf_free_bulk` save ~10–20 ns/pkt);
-  `SLOW_CHECK_INTERVAL` / `TICK_CHECK_INTERVAL` are iteration-based, so at
-  100 µs iterations timeouts drift to 100 s / 400 ms — clock-gate them via
-  the cached time; `SocketSet` is growable but `tx_queues` /
-  `tx_queue_limits` / `connections` are fixed at `MAX_CONNECTIONS` and
-  indexed by `handle.index()` (with 2 listeners + 2 replica sockets,
-  1021+ clients index out of bounds); RSS config never sets
-  `mq_mode = RTE_ETH_MQ_RX_RSS` (moot with `num_queues = 1`, but likely
-  why RSS "was unworkable"); `set_initial_congestion_window` is a no-op
-  under fastcp's `NoControl` (comment misleads).
+- **Copies per response byte.** Folding the terminator removed one frame
+  per request, but each frame is still copied by value out of the SPSC
+  (`try_consume` returns `T`) on the poll thread, which is also ingress,
+  then again through `TxQueue::push`, `send_slice` and into the mbuf. A
+  borrow-based `spsc::Consumer::peek` copying only `len` bytes (M) and a
+  `queue_send` fast path straight to `send_slice` when the `TxQueue` is
+  empty and `can_send()` (S). Per-slot `flush()` is July #8 (deliberate).
+- **Per-mbuf FFI**: 5–6 non-inline calls per RX mbuf plus a per-mbuf
+  free; a `(ptr,len)` accessor and `rte_pktmbuf_free_bulk` save
+  ~10–20 ns/pkt (S).
+- **Iteration-based timers**: `SLOW_CHECK_INTERVAL` /
+  `TICK_CHECK_INTERVAL` count iterations, so their real period moves
+  with iteration length — clock-gate them off the cached time (S).
+- **RX descriptors**: consider RX_DESC 4096 so a poll-thread stall does
+  not drop. The per-tick replication cap shortens the worst stall, which
+  reduces but does not remove the exposure.
+- **Structural**: splitting replication off the DPDK poll thread (on the
+  roadmap) subsumes the per-tick cap and the stall it bounds.
 - ENA/AWS operational checks (not verifiable from code): confirm the PMD
   log does not report LLQ falling back to host mode (needs WC BAR
   mapping; historically unavailable under vfio-pci → lower TX
