@@ -62,6 +62,26 @@ struct DpdkReceiverTransport<'a> {
 
 const ACK_RETRY_CAP: u32 = 32;
 
+/// Data segments a replication socket may dispatch per egress pass.
+///
+/// The stack repeats its egress pass over every socket until one sends
+/// nothing, so with the fan-in default of 4 a full replication window costs
+/// roughly a pass per 4 segments — each pass visiting every socket on the
+/// interface. 256 covers a whole in-flight window (the peer's advertised
+/// window is itself bounded by its zero-copy descriptor slots, 256 of them) in
+/// a single pass. The fairness the low default buys does not apply here: the
+/// bulk flow and the latency-sensitive flows are on separate ports, and
+/// replication latency is itself on the client's critical path through the
+/// durability gate.
+pub(crate) const REPL_DISPATCH_BURST: usize = 256;
+
+/// Soft cap on the bytes one replication slot hands to the transport per tick.
+///
+/// Sized to roughly one in-flight window ([`REPL_DISPATCH_BURST`] segments at
+/// a 1500-byte MTU), so a tick queues about what one egress pass can ship
+/// rather than several passes' worth in one stall.
+const MAX_REPL_BYTES_PER_TICK: usize = 128 * 1024;
+
 impl ReceiverTransport for DpdkReceiverTransport<'_> {
     fn poll_recv(&mut self, recv_buf: &mut Vec<u8>) -> io::Result<bool> {
         self.transport.poll();
@@ -942,8 +962,23 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                     slot.send_buf.clear();
                     let mut batches_sent = 0;
+                    let mut bytes_this_tick = 0usize;
                     let mut tx_overflow = false;
                     while batches_sent < batch_size {
+                        // Bound the bytes handed to the transport in one tick.
+                        // The poll thread is also the ingress thread, so every
+                        // microsecond it spends copying a replication burst
+                        // into the socket and building mbufs is time no client
+                        // packet is being received; a full 512 KiB queue is a
+                        // single stall of that length. Spreading the same
+                        // bytes over more ticks costs nothing — the driver is
+                        // ticked several times per outer iteration.
+                        //
+                        // Never below one batch: a batch larger than the cap
+                        // must still make progress, or the stream wedges.
+                        if batches_sent > 0 && bytes_this_tick >= MAX_REPL_BYTES_PER_TICK {
+                            break;
+                        }
                         let Some((meta, data)) = slot.consumer.try_read() else {
                             break;
                         };
@@ -973,6 +1008,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         slot.consumer.commit();
                         slot.sent.advance(meta.end_sequence);
                         batches_sent += 1;
+                        bytes_this_tick += data_len;
                         available = available.saturating_sub(data_len);
                     }
 
@@ -1203,6 +1239,7 @@ where
             REPL_RX_BUF,
             REPL_TX_BUF,
             REPL_TX_QUEUE,
+            REPL_DISPATCH_BURST,
         );
         local_port = local_port.wrapping_add(1).max(40000);
 

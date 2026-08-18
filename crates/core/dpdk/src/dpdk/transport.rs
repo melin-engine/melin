@@ -180,6 +180,9 @@ struct ListenerEntry {
     tx_buf_size: usize,
     /// TX queue limit for sockets accepted on this port.
     tx_queue_limit: usize,
+    /// Data segments a socket accepted on this port may dispatch per egress
+    /// pass. See [`DpdkTransport::add_listener_with_buffers`].
+    dispatch_burst_limit: usize,
 }
 
 /// Shared DPDK resources created once and shared across all poll threads.
@@ -482,6 +485,9 @@ impl DpdkTransport {
                 rx_buf_size: SOCKET_RX_BUF_SIZE,
                 tx_buf_size: SOCKET_TX_BUF_SIZE,
                 tx_queue_limit: MAX_TX_QUEUE_SIZE,
+                // Trading port: keep the fan-in default so one client's burst
+                // cannot delay its peers within an egress pass.
+                dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
             }],
             accepted: Vec::new(),
             // Pre-allocate all MAX_CONNECTIONS slots so index lookup is
@@ -541,11 +547,14 @@ impl DpdkTransport {
             SOCKET_RX_BUF_SIZE,
             SOCKET_TX_BUF_SIZE,
             MAX_TX_QUEUE_SIZE,
+            tcp::DEFAULT_DISPATCH_BURST_LIMIT,
         )
     }
 
-    /// Like `connect_to` but with custom buffer sizes and TX queue limit.
-    /// Used for replication connections that need larger RX/TX buffers.
+    /// Like `connect_to` but with custom buffer sizes, TX queue limit and
+    /// egress burst limit. Used for replication connections that need larger
+    /// RX/TX buffers. See [`Self::add_listener_with_buffers`] for what
+    /// `dispatch_burst_limit` controls.
     pub fn connect_to_with_buffers(
         &mut self,
         remote_ip: std::net::Ipv4Addr,
@@ -554,6 +563,7 @@ impl DpdkTransport {
         rx_buf_size: usize,
         tx_buf_size: usize,
         tx_queue_limit: usize,
+        dispatch_burst_limit: usize,
     ) -> SocketHandle {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
@@ -561,6 +571,7 @@ impl DpdkTransport {
         tune_socket(&mut socket);
         socket.set_zero_copy_retain_fn(retain_mbuf);
         socket.set_zero_copy_release_fn(release_mbuf);
+        socket.set_dispatch_burst_limit(dispatch_burst_limit);
 
         let remote_addr = Ipv4Address::new(
             remote_ip.octets()[0],
@@ -744,6 +755,8 @@ impl DpdkTransport {
             // removed between the read above and now (shouldn't happen —
             // we don't yield in this function — but guard anyway), skip
             // the entry instead of crashing.
+            // Copied out before the socket borrow so both can be held.
+            let dispatch_burst_limit = self.listeners[i].dispatch_burst_limit;
             let Some(accepted_socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) else {
                 tracing::warn!(
                     handle = ?handle,
@@ -756,6 +769,7 @@ impl DpdkTransport {
             };
             accepted_socket.set_zero_copy_retain_fn(retain_mbuf);
             accepted_socket.set_zero_copy_release_fn(release_mbuf);
+            accepted_socket.set_dispatch_burst_limit(dispatch_burst_limit);
 
             // Replace the listener slot in-place so the port stays
             // receptive while the just-accepted handle is moved out
@@ -805,18 +819,27 @@ impl DpdkTransport {
             SOCKET_RX_BUF_SIZE,
             SOCKET_TX_BUF_SIZE,
             MAX_TX_QUEUE_SIZE,
+            tcp::DEFAULT_DISPATCH_BURST_LIMIT,
         )
     }
 
     /// Like `add_listener` but with custom buffer sizes for sockets
     /// accepted on this port. Used for replication, which needs larger
     /// TX buffers to keep up with journal batch throughput.
+    ///
+    /// `dispatch_burst_limit` caps how many data segments a socket accepted
+    /// here may dispatch in one egress pass. The stack repeats the pass over
+    /// every socket until one sends nothing, so the low default (tuned to keep
+    /// one client from delaying its peers under fan-in) makes a large
+    /// single-flow burst cost a pass per few segments. Bulk flows want a value
+    /// covering a whole in-flight window in one pass.
     pub fn add_listener_with_buffers(
         &mut self,
         port: u16,
         rx_buf_size: usize,
         tx_buf_size: usize,
         tx_queue_limit: usize,
+        dispatch_burst_limit: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
@@ -832,6 +855,7 @@ impl DpdkTransport {
             rx_buf_size,
             tx_buf_size,
             tx_queue_limit,
+            dispatch_burst_limit,
         });
         tracing::info!(port, "DPDK transport: added listener");
         Ok(())

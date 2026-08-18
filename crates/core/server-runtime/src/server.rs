@@ -2743,7 +2743,13 @@ where
         const REPL_TX_QUEUE: usize = 512 * 1024;
         const REPL_RX_BUF: usize = 64 * 1024;
         transports[0]
-            .add_listener_with_buffers(repl_port, REPL_RX_BUF, REPL_TX_BUF, REPL_TX_QUEUE)
+            .add_listener_with_buffers(
+                repl_port,
+                REPL_RX_BUF,
+                REPL_TX_BUF,
+                REPL_TX_QUEUE,
+                crate::replication::REPL_DISPATCH_BURST,
+            )
             .map_err(|e| format!("add replication listener: {e}"))?;
 
         let driver = crate::replication::DpdkReplicationDriver::new(
