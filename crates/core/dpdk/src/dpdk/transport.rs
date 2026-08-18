@@ -998,13 +998,21 @@ impl DpdkTransport {
         frame[32..38].copy_from_slice(&[0x00; 6]); // target hardware addr (zero)
         frame[38..42].copy_from_slice(&our_ip.octets()); // target protocol addr (= sender)
 
-        self.device.send_raw_frame(&frame);
-
-        tracing::info!(
-            mac = ?our_mac,
-            ip = %our_ip,
-            "sent gratuitous ARP (switch MAC learning)"
-        );
+        if self.device.send_raw_frame(&frame) {
+            tracing::info!(
+                mac = ?our_mac,
+                ip = %our_ip,
+                "sent gratuitous ARP (switch MAC learning)"
+            );
+        } else {
+            // Best effort: the switch also learns from our first outbound
+            // unicast, and `send_raw_frame` has already logged the shortage.
+            tracing::warn!(
+                mac = ?our_mac,
+                ip = %our_ip,
+                "gratuitous ARP not sent; switch MAC learning deferred to first outbound frame"
+            );
+        }
     }
 
     /// Seed smoltcp's neighbor cache by injecting a crafted ARP reply.
