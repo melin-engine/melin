@@ -27,6 +27,9 @@ use melin_pipeline::ring;
 #[cfg(not(feature = "no-persist"))]
 use crate::cursors::SlotAcked;
 use crate::cursors::{DurableWireSeqCursor, WireSeq};
+// Recovery replays a journal from disk, so every use sits in a test that
+// no-persist gates off — same reason as `JournalReader` above.
+#[cfg(not(feature = "no-persist"))]
 use crate::journaled_app::JournaledApp;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::build_replica_pipeline;

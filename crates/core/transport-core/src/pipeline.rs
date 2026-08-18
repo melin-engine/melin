@@ -2285,7 +2285,11 @@ impl<E: AppEvent> JournalStage<E> {
     }
 
     /// Test-only probe: whether `enable_preparer` armed the preparer.
-    #[cfg(test)]
+    ///
+    /// Gated to match its sole caller — `preparer_arms_for_size_and_replica_modes_only`
+    /// is itself `not(no-persist)`, so without the feature clause this is
+    /// dead code in that configuration.
+    #[cfg(all(test, not(feature = "no-persist")))]
     pub(crate) fn preparer_enabled(&self) -> bool {
         self.preparer.is_some()
     }
