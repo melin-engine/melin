@@ -35,10 +35,25 @@ env:
 jobs:
   miri:
     runs-on: ubuntu-latest
-    # Hosted jobs are capped at 6 hours. This baseline run has no seed sweep
-    # and should finish far inside 180 minutes; the limit is here to fail
-    # rather than burn the cap if Miri hits something pathological.
-    timeout-minutes: 180
+    # A shard runs two seeds against a measured 8-minute baseline, so it
+    # should land near 16 minutes. The limit is here to fail rather than
+    # hang if Miri hits something pathological under one interleaving.
+    timeout-minutes: 60
+
+    strategy:
+      # One shard finding a bug must not cancel the other: which
+      # interleaving breaks is the information being bought, and a
+      # cancelled sibling reports nothing.
+      fail-fast: false
+      matrix:
+        # Deliberately small to start. Sharding rather than one `0..4`
+        # sweep halves the wall clock and names the range a failure came
+        # from; widen the ranges or add shards once the cost of a real
+        # nightly run is known. Concurrency allows 20 jobs.
+        seeds: ["0..2", "2..4"]
+
+    env:
+      MIRI_SEEDS: ${{ matrix.seeds }}
 
     steps:
       - uses: actions/checkout@v7
@@ -53,10 +68,10 @@ jobs:
       # enough to evict the Pre-merge entries that people actually wait on.
       # Nobody is waiting on a nightly.
 
-      # Baseline run: no MIRI_SEEDS, so each test runs under a single
-      # scheduler interleaving. The point of this first run is to measure the
-      # wall clock, so the seed sweep (`MIRI_SEEDS=0..N`, which multiplies
-      # runtime by N against an interpreter already ~100x slower than native)
-      # can be sized against the 6-hour cap from evidence rather than a guess.
+      # MIRI_SEEDS comes from the matrix. Re-running each test under several
+      # scheduler seeds is the point of running Miri nightly rather than on
+      # every push: a single interleaving misses exactly the ordering bugs
+      # this lock-free code can hide, and the sweep is far too slow to gate a
+      # commit on. Baseline with no sweep measured 8 minutes on this runner.
       - name: Miri
         run: scripts/miri.sh
