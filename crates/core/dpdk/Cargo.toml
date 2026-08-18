@@ -22,13 +22,23 @@ dpdk-sys = ["dep:libc", "dep:bindgen", "dep:pkg-config", "dep:cc"]
 # Userspace TCP/IP stack — replaces the kernel TCP stack when using DPDK.
 # `std` feature needed for smoltcp to link against system time; `medium-ethernet`
 # for Ethernet frame processing; `proto-ipv4` + `socket-tcp` for TCP/IPv4.
-smoltcp = { package = "fastcp", version = "0.13", default-features = false, features = [
+#
+# Tracking a branch while the zero-copy RX window bound, the
+# descriptor-capacity ordering fix and `Interface::forget_tcp_socket` land
+# upstream. `version` is deliberately omitted so `cargo publish` fails loudly
+# rather than silently resolving to the registry copy, which lacks all three.
+# Restore `version = "0.14"` once fastcp is published.
+smoltcp = { package = "fastcp", git = "https://github.com/melin-engine/fastcp.git", branch = "feat/zc-rx-window-and-index-eviction", default-features = false, features = [
     "std",
     "medium-ethernet",
     "proto-ipv4",
     "socket-tcp",
     "socket-tcp-zero-copy-rx",
     "log",
+    # 8 entries by default; a missing neighbour silences the socket for the
+    # discovery timeout, so a deployment whose peers span more hosts than that
+    # stalls for seconds at a time.
+    "iface-neighbor-cache-count-64",
 ] }
 tracing = "0.1"
 libc = { version = "0.2", optional = true }
