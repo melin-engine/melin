@@ -325,9 +325,15 @@ impl DpdkDevice {
     ///
     /// Used for gratuitous ARP on startup (switch MAC learning) and other
     /// control frames that aren't part of a TCP connection.
-    pub fn send_raw_frame(&mut self, frame: &[u8]) {
+    /// Returns `false` if no mbuf was available, leaving the frame unsent.
+    /// Callers use this for best-effort control frames (gratuitous ARP), so
+    /// a miss is retried on the next occasion rather than propagated.
+    pub fn send_raw_frame(&mut self, frame: &[u8]) -> bool {
         let mbuf = unsafe { ffi::dpdk_pktmbuf_alloc(self.mempool) };
-        assert!(!mbuf.is_null(), "mbuf alloc failed for raw frame TX");
+        if mbuf.is_null() {
+            tracing::warn!("DPDK: mbuf alloc failed, dropping raw control frame");
+            return false;
+        }
         unsafe {
             let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf).cast::<u8>();
             let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
@@ -344,6 +350,7 @@ impl DpdkDevice {
         }
         self.tx_batch.push(mbuf);
         self.flush_tx();
+        true
     }
 
     /// Inject a raw Ethernet frame into smoltcp's RX path.
@@ -394,24 +401,47 @@ impl Device for DpdkDevice {
     type TxToken<'a> = DpdkTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Bail out before allocating when there is nothing to hand back, so
+        // the common empty poll stays allocation-free. In steady state
+        // `collect_rx_batch` has already drained the port, so this is the
+        // path taken on almost every call.
+        let has_injected = !self.inject_queue.is_empty();
+        if !has_injected {
+            let active = &self.rx_ports[self.active_rx];
+            if active.rx_cursor >= active.rx_count {
+                return None;
+            }
+        }
+
+        // The paired TX mbuf is allocated before any RX state is consumed: on
+        // a mempool shortage the frame stays queued for the next poll rather
+        // than being taken off the ring and lost.
+        let tx_mbuf = unsafe { ffi::dpdk_pktmbuf_alloc(self.mempool) };
+        if tx_mbuf.is_null() {
+            tracing::warn!("DPDK: mbuf alloc failed, deferring RX frame to the next poll");
+            return None;
+        }
+        let tx_ol_flags = self.tx_ol_flags;
+        let tx_vlan_id = self.tx_vlan_id;
+
         // Drain injected frames first (crafted ARP replies for neighbor
         // cache seeding). These are owned Vec<u8> buffers, not DPDK mbufs.
-        if let Some(frame) = self.inject_queue.pop() {
+        if has_injected {
+            let frame = self
+                .inject_queue
+                .pop()
+                .expect("inject_queue non-empty checked above");
             let rx_token = DpdkRxToken::Injected(frame);
             let tx_token = DpdkTxToken {
-                mempool: self.mempool,
-                tx_ol_flags: self.tx_ol_flags,
-                tx_vlan_id: self.tx_vlan_id,
+                mbuf: tx_mbuf,
+                tx_ol_flags,
+                tx_vlan_id,
                 tx_batch: &mut self.tx_batch,
             };
             return Some((rx_token, tx_token));
         }
 
         let active = &mut self.rx_ports[self.active_rx];
-        if active.rx_cursor >= active.rx_count {
-            return None;
-        }
-
         let mbuf = active.rx_buf[active.rx_cursor];
         active.rx_cursor += 1;
 
@@ -440,9 +470,9 @@ impl Device for DpdkDevice {
             data_len,
         };
         let tx_token = DpdkTxToken {
-            mempool: self.mempool,
-            tx_ol_flags: self.tx_ol_flags,
-            tx_vlan_id: self.tx_vlan_id,
+            mbuf: tx_mbuf,
+            tx_ol_flags,
+            tx_vlan_id,
             tx_batch: &mut self.tx_batch,
         };
 
@@ -450,8 +480,20 @@ impl Device for DpdkDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        // Allocate here rather than in `consume`, which has no way to report
+        // failure — its signature must return a value. Handing back `None`
+        // instead makes the stack keep the data queued and retry on the next
+        // poll, which is the correct response to a transient mempool
+        // shortage. Exhaustion is not otherwise recoverable: the pool is also
+        // what refills the RX ring, so the pressure clears only once in-flight
+        // mbufs are freed.
+        let mbuf = unsafe { ffi::dpdk_pktmbuf_alloc(self.mempool) };
+        if mbuf.is_null() {
+            tracing::warn!("DPDK: mbuf alloc failed, deferring TX to the next poll");
+            return None;
+        }
         Some(DpdkTxToken {
-            mempool: self.mempool,
+            mbuf,
             tx_ol_flags: self.tx_ol_flags,
             tx_vlan_id: self.tx_vlan_id,
             tx_batch: &mut self.tx_batch,
@@ -505,9 +547,16 @@ impl phy::RxToken for DpdkRxToken {
     }
 }
 
-/// TX token: allocates an mbuf and queues it for batched transmission.
+/// TX token: owns a pre-allocated mbuf and queues it for batched
+/// transmission.
+///
+/// The mbuf is allocated by [`Device::transmit`] rather than on consume, so
+/// that a mempool shortage surfaces as `None` — which the stack retries — and
+/// never as a panic on a path with no way to report failure.
 pub struct DpdkTxToken<'a> {
-    mempool: *mut ffi::rte_mempool,
+    /// Owned until consumed; freed by `Drop` if the stack discards the token
+    /// without emitting a frame. Null only after `consume` has taken it.
+    mbuf: *mut ffi::rte_mbuf,
     /// Pre-computed TX offload flags (IPv4 + TCP checksum + VLAN insert).
     tx_ol_flags: u64,
     /// VLAN ID for TX insert. 0 = no VLAN tagging.
@@ -516,13 +565,24 @@ pub struct DpdkTxToken<'a> {
     tx_batch: &'a mut Vec<*mut ffi::rte_mbuf>,
 }
 
+impl Drop for DpdkTxToken<'_> {
+    fn drop(&mut self) {
+        // The stack may take a token and then decide not to emit. Without
+        // this the mbuf would leak out of the pool on every such decision.
+        if !self.mbuf.is_null() {
+            unsafe { ffi::dpdk_pktmbuf_free(self.mbuf) };
+        }
+    }
+}
+
 impl<'a> phy::TxToken for DpdkTxToken<'a> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mbuf = unsafe { ffi::dpdk_pktmbuf_alloc(self.mempool) };
-        assert!(!mbuf.is_null(), "mbuf alloc failed — mempool exhausted");
+        // Take ownership away from `Drop`: from here the mbuf either reaches
+        // `tx_batch` or is freed by the TX burst.
+        let mbuf = std::mem::replace(&mut self.mbuf, std::ptr::null_mut());
 
         // Get mutable slice via C accessors. Cast from *mut c_void to
         // *mut u8 (dpdk_mbuf_buf_addr returns void*).
