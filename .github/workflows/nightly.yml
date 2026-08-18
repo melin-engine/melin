@@ -1,0 +1,62 @@
+name: Nightly
+
+# Checks that do not belong on every push — either because they are far
+# too slow, or because they go red without anyone committing anything
+# (upstream toolchain changes, newly published advisories).
+#
+# TRIGGER IS TEMPORARY. Scheduled runs only ever execute on the default
+# branch, and `workflow_dispatch` does not even appear in the UI until the
+# file is on the default branch — so neither can exercise this while it is
+# still on a branch. `push` scoped to the development branch is how it gets
+# tested; replace it with `schedule` + `workflow_dispatch` when merging.
+#
+# When the schedule goes in, avoid the top of the hour — `schedule` is
+# delayed under load and every naive cron says `0`. Note also that GitHub
+# disables scheduled workflows on a public repository after 60 days with no
+# repository activity, which is a realistic gap between releases here.
+
+on:
+  push:
+    branches: [ci/nightly-miri]
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same reasoning as the Pre-merge workflow: `.cargo/config.toml` asks for
+  # `-C target-cpu=native` and `-fuse-ld=lld`, neither of which suits a
+  # hosted runner. Miri interprets rather than links, but cargo still builds
+  # build scripts and proc macros natively, so the override is still needed.
+  RUSTFLAGS: -C target-cpu=x86-64-v2
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    # Hosted jobs are capped at 6 hours. This baseline run has no seed sweep
+    # and should finish far inside 180 minutes; the limit is here to fail
+    # rather than burn the cap if Miri hits something pathological.
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      # Deliberately no `Swatinem/rust-cache`. Cache storage is 10 GB per
+      # repository with LRU eviction, and this workspace builds dependencies
+      # at opt-level 2 even in dev, so a Miri cache entry would be large
+      # enough to evict the Pre-merge entries that people actually wait on.
+      # Nobody is waiting on a nightly.
+
+      # Baseline run: no MIRI_SEEDS, so each test runs under a single
+      # scheduler interleaving. The point of this first run is to measure the
+      # wall clock, so the seed sweep (`MIRI_SEEDS=0..N`, which multiplies
+      # runtime by N against an interpreter already ~100x slower than native)
+      # can be sized against the 6-hour cap from evidence rather than a guess.
+      - name: Miri
+        run: scripts/miri.sh
