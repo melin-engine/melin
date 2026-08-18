@@ -1,19 +1,24 @@
 # Nextest configuration.
 #
-# Failover integration tests each spawn one primary plus one or two
+# The cluster integration tests each spawn one primary plus one or two
 # replica server processes, each preallocating its own journal and
-# (optionally) mlocking memory. Run in parallel, the resulting
-# fan-out (≈20 tests × 3 processes × ~1 GB) exhausts host memory on
-# anything short of a workstation. The tests already use
-# `#[serial]` (serial_test) to document the intent, but `#[serial]`
-# only serialises *within* one test process — nextest forks per
-# test by default, so the annotation has no effect under nextest.
+# (optionally) mlocking memory. Run in parallel the fan-out is three
+# processes per test, which is why they carry `#[serial]` (serial_test)
+# — but `#[serial]` only serialises *within* one test process, and
+# nextest forks per test, so the annotation has no effect here. The
+# test-group below is what actually holds them apart.
 #
-# Route the failover binary into a one-at-a-time test-group; other
-# crates keep nextest's default parallelism.
+# Binaries are named exactly rather than matched by pattern. `binary()`
+# is an equality predicate: the previous `binary(failover)` matched
+# nothing at all (the binary is `raft_failover`), so the group sat empty
+# and these tests had been running fully parallel. Exact names are
+# self-policing — nextest treats a name that matches no binary as a hard
+# config error, so renaming or deleting one of these fails loudly
+# instead of silently emptying the group again. Adding a new
+# cluster-spawning test binary means adding it here.
 [[profile.default.overrides]]
-filter = 'binary(failover)'
-test-group = 'failover-serial'
+filter = 'binary(raft_failover) + binary(raft_smoke) + binary(empty_seed)'
+test-group = 'cluster-serial'
 
 [test-groups]
-failover-serial = { max-threads = 1 }
+cluster-serial = { max-threads = 1 }
