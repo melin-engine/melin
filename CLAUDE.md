@@ -6,6 +6,8 @@
 
 **Melin** — a deterministic, replicated sequencer for latency-critical applications, built on the **LMAX architecture** (single-threaded business logic, event sourcing, mechanical sympathy). Rust (edition 2024). Provides the event-sourced processing pipeline, durable journaling, synchronous replication, transport (kernel TCP and DPDK), the application-agnostic server runtime, and a raft control plane (`crates/core/raft`, on openraft) for leader election and automatic failover — the one place tokio/serde are allowed, confined to its dedicated thread, never on the hot path. Applications (e.g. the Melin Exchange Core, maintained separately) plug in via the `melin-app` traits; `crates/examples/counter` is the reference application.
 
+Outside `crates/`: `.githooks/` (pre-commit gate, opt-in), `.github/workflows/` (CI), `deny.toml` (dependency and licence policy), `scripts/` (Miri, publishing, DPDK host setup). `docs/` is operator-facing; `docs/internal/` is for contributors.
+
 **Commercial product** — Every feature decision should be evaluated through the lens of "does this make the product more appealing to an operator of latency-critical, durability-critical systems?"
 
 ## Conventions
@@ -14,7 +16,8 @@
 - Write unit tests for all non-trivial code. Skip only when genuinely unreasonable (e.g., trivial glue code).
 - **Correctness is critical** — the sequencer carries financial infrastructure. Correctness always comes first.
 - **Reasonably optimized from the start** — don't prematurely optimize, but make performance-conscious choices by default: minimize allocations, avoid locks on the hot path, favor cache-friendly data structures. Profile before micro-optimizing.
-- **Always `cargo check` before committing** — run `cargo check` with the correct feature flags for all affected crates before committing. For DPDK code, check `melin-server-runtime` with `--features dpdk`.
+- **Install the pre-commit hook** — `git config core.hooksPath .githooks`. It is opt-in: on a fresh clone nothing is enforced until you run it.
+- **Dependencies are constrained by `deny.toml`** — licence on the allow list, source crates.io (git dependencies denied), no `*` version requirements. Copyleft is absent by design: needing it is a commercial decision, not a config edit. A new published workspace crate needs a `BUSL-1.1` exception, so that a third-party BSL dependency cannot pass as one of ours.
 - **No `.unwrap()` in production code** — use proper error handling, or an `.expect()` if really necessary. `.unwrap()` is fine in tests.
 - **No `#[ignore]` on tests** — if a test fails, fix the bug. Never suppress a failing test with `#[ignore]`.
 - **No silently ignored results** — do not discard `Result` errors via `let _ =`, `.unwrap_or(...)`, `.unwrap_or_default()`, `.ok()`, or similar swallowing patterns unless there is a clear reason (e.g., best-effort diagnostic writes). Handle errors explicitly. When discarding is genuinely the right call, leave a comment on the line above explaining *why* the error is being dropped.
