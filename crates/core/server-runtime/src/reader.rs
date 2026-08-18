@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -111,7 +111,21 @@ pub struct ReaderRegistration<R> {
 /// Handle for the accept loop to register connections with the io_uring reader.
 pub struct UringReaderHandle<R> {
     tx: mpsc::Sender<ReaderRegistration<R>>,
-    event_fd: RawFd,
+    /// Wakeup eventfd, shared with the reader thread.
+    ///
+    /// `Arc<OwnedFd>` rather than a `RawFd` so the descriptor cannot be
+    /// closed while the other side still holds it: the close happens in
+    /// `OwnedFd`'s `Drop`, which runs when the last holder goes away, and
+    /// no code here is able to call `close` early because none of it owns
+    /// a raw descriptor to close.
+    ///
+    /// The reader thread used to close this itself while this handle was
+    /// still writing wakeups to it — a use-after-close whose real danger
+    /// was descriptor reuse, not `EBADF`: once the number is free, a
+    /// journal segment or an accepted connection can be assigned it, and
+    /// the next wakeup writes eight bytes into that instead. Found by
+    /// ThreadSanitizer.
+    event_fd: Arc<OwnedFd>,
     join_handle: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -126,7 +140,11 @@ impl<R> UringReaderHandle<R> {
             // Signal the eventfd to wake the reader from io_uring_enter.
             let val: u64 = 1;
             unsafe {
-                libc::write(self.event_fd, &val as *const u64 as *const libc::c_void, 8);
+                libc::write(
+                    self.event_fd.as_raw_fd(),
+                    &val as *const u64 as *const libc::c_void,
+                    8,
+                );
             }
         } else {
             error!("reader thread dead, cannot register connection");
@@ -139,7 +157,11 @@ impl<R> UringReaderHandle<R> {
         self.shutdown.store(true, Ordering::Relaxed);
         let val: u64 = 1;
         unsafe {
-            libc::write(self.event_fd, &val as *const u64 as *const libc::c_void, 8);
+            libc::write(
+                self.event_fd.as_raw_fd(),
+                &val as *const u64 as *const libc::c_void,
+                8,
+            );
         }
     }
 
@@ -187,10 +209,15 @@ where
 {
     let (tx, rx) = mpsc::channel();
 
-    let event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
-    assert!(event_fd >= 0, "eventfd creation failed");
+    let raw_event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+    assert!(raw_event_fd >= 0, "eventfd creation failed");
 
-    let wakeup_fd = event_fd;
+    // SAFETY: `eventfd` returned a fresh descriptor (asserted non-negative
+    // above) that nothing else owns, so transferring ownership to `OwnedFd`
+    // is sound. From here the raw number is never closed by hand — the
+    // descriptor lives exactly as long as the last `Arc` holder.
+    let event_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_event_fd) });
+    let wakeup_fd = Arc::clone(&event_fd);
     let shutdown_clone = Arc::clone(&shutdown);
 
     let handle = std::thread::Builder::new()
@@ -349,7 +376,10 @@ fn ring_entry(sq_pending: usize, cq_ready: bool) -> RingEntry {
 /// scheduler ticks — see [`spawn_reader`] for the rationale.
 fn reader_loop<A: Application, R: AsRawFd>(
     command_rx: mpsc::Receiver<ReaderRegistration<R>>,
-    wakeup_fd: RawFd,
+    // Shared with `UringReaderHandle`. Taken by value so this thread keeps
+    // the descriptor alive for as long as it is armed in the ring, and
+    // releases it by dropping the `Arc` rather than by closing the fd.
+    wakeup_fd: Arc<OwnedFd>,
     mut producer: ring::Producer<InputSlot<A::Event>>,
     decoder: &dyn RequestDecoder<Event = A::Event>,
     control_tx: &mpsc::Sender<ControlEvent>,
@@ -423,7 +453,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
     let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(RING_SIZE as usize * 2);
 
     // Submit the initial eventfd read so we wake on first connection.
-    push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
+    push_eventfd_read(&mut ring, wakeup_fd.as_raw_fd(), eventfd_buf.as_mut_ptr());
 
     // Stage histograms via the global registry. `publish` is the
     // narrow ring-publish call cost (lightweight, gated on
@@ -649,7 +679,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 }
 
                 // Re-submit eventfd read for the next wakeup.
-                push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
+                push_eventfd_read(&mut ring, wakeup_fd.as_raw_fd(), eventfd_buf.as_mut_ptr());
                 continue;
             }
 
@@ -920,9 +950,11 @@ fn reader_loop<A: Application, R: AsRawFd>(
         }
     }
 
-    unsafe {
-        libc::close(wakeup_fd);
-    }
+    // No `close` here. This thread shares the eventfd with
+    // `UringReaderHandle`, which writes wakeups to it, and closing it from
+    // this side left that write racing a reused descriptor number. Dropping
+    // the `Arc` at the end of this scope releases our share; the descriptor
+    // itself closes when the handle drops too.
 }
 
 /// What to do after processing a RECV CQE.
