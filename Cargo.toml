@@ -12,8 +12,21 @@ resolver = "3"
 # file. Keep the two in lockstep: a member's inherited version and the
 # version requirement its dependents resolve against must always match.
 version = "0.13.0"
+# SPDX identifier only. `license-file` is deliberately absent: setting both
+# makes cargo warn ("only one of `license` or `license-file` is necessary")
+# on every invocation, for every member.
+#
+# Dropping it means cargo no longer copies the root LICENSE into each
+# published crate, so every member carries its own copy instead — cargo
+# includes files under a package root automatically. BSL requires the
+# licence to be displayed on each copy of the Licensed Work, so a published
+# crate without the text (and without its Licensor / Change Date block)
+# would not satisfy our own terms.
+#
+# Those copies must stay identical to the root LICENSE. Stamping the Change
+# Date means rewriting all ten; that belongs in the release tooling, not in
+# a manual edit.
 license = "BUSL-1.1"
-license-file = "LICENSE"
 repository = "https://github.com/melin-engine/melin"
 homepage = "https://github.com/melin-engine/melin"
 authors = ["P.L.S.C."]
