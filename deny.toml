@@ -1,0 +1,108 @@
+# cargo-deny configuration.
+#
+# Four checks, run in CI: `advisories` (RUSTSEC vulnerabilities, unsound
+# and unmaintained crates), `licenses`, `bans` (duplicate and unwanted
+# crates), and `sources` (where code is fetched from).
+
+[graph]
+# Melin is Linux/x86-64 only — io_uring and DPDK see to that. Without this
+# the graph pulls in Windows, WASI, and UEFI dependencies that are resolved
+# but never compiled, and audits them: `r-efi` alone drags an
+# LGPL-2.1-or-later option into the licence set for a target that cannot
+# run this software. Auditing what actually ships keeps a real finding from
+# being buried under noise from platforms we do not support.
+targets = ["x86_64-unknown-linux-gnu"]
+# Feature-gated dependencies are part of the supply chain too: `dpdk-sys`
+# pulls bindgen, pkg-config, and cc, none of which appear in a default
+# resolve. cargo-deny resolves rather than builds, so enabling everything
+# costs nothing and no DPDK SDK is required.
+all-features = true
+
+[advisories]
+# Empty, and worth keeping that way. An entry here is a decision to ship a
+# known-vulnerable or unmaintained dependency; both advisories found on the
+# first run were fixed instead — one by a patch bump, one by dropping a
+# default feature that pulled an archived crate. Any addition should carry
+# a comment saying why the risk is accepted and what would remove it.
+ignore = []
+# A yank is the registry's strongest signal short of an advisory.
+yanked = "deny"
+
+[licenses]
+# Only what the tree actually uses. Kept tight on purpose: a new licence
+# appearing is a decision for a commercial product, and should surface as a
+# failure rather than being silently absorbed by a permissive list.
+#
+# Copyleft is absent by design. Several crates offer it as one option in an
+# OR expression (blake3, r-efi) and cargo-deny picks a licence that is
+# allowed, so omitting LGPL/GPL/MPL costs nothing today and catches a
+# genuinely copyleft-only dependency the day one appears.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    # Reached only through the DPDK build dependency (bindgen -> clang-sys
+    # -> libloading), so it appears only because `all-features` is on.
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+# BUSL-1.1 is deliberately NOT in `allow` above. It is our licence, and it
+# must stay a per-crate exception: a third-party BSL dependency would need
+# a commercial licence from its vendor before Melin could ship, so it has
+# to fail the build rather than pass because we happen to use BSL too.
+#
+# Listing every member by name is the point — a new workspace crate fails
+# this check until it is added here, which is a cheap reminder that a new
+# published crate is a licensing decision.
+exceptions = [
+    { allow = ["BUSL-1.1"], name = "melin-app" },
+    { allow = ["BUSL-1.1"], name = "melin-dpdk" },
+    { allow = ["BUSL-1.1"], name = "melin-example-counter" },
+    { allow = ["BUSL-1.1"], name = "melin-journal" },
+    { allow = ["BUSL-1.1"], name = "melin-pipeline" },
+    { allow = ["BUSL-1.1"], name = "melin-raft" },
+    { allow = ["BUSL-1.1"], name = "melin-server-runtime" },
+    { allow = ["BUSL-1.1"], name = "melin-transport-core" },
+    { allow = ["BUSL-1.1"], name = "melin-wire-protocol" },
+]
+
+[licenses.private]
+# The workspace members declare `license = "BUSL-1.1"` alongside
+# `license-file`, so they are identified like any other crate and this is
+# left off rather than blanket-ignoring our own code.
+ignore = false
+
+[bans]
+# Duplicates warn rather than fail. The tree carries several major-version
+# pairs (thiserror 1 and 2, rand 0.8 and 0.10, bitflags 1 and 2) that
+# transitive dependencies disagree about and we cannot unilaterally
+# resolve. Failing on them would mean either pinning other people's
+# dependencies or ignoring the check entirely.
+multiple-versions = "warn"
+# A `*` version requirement accepts whatever the registry serves,
+# including a future breaking release.
+wildcards = "deny"
+# ...except for path dependencies, which resolve locally and never consult
+# a registry. `melin-server-runtime` dev-depends on `melin-example-counter`
+# without a version because that crate is `publish = false` and must stay
+# version-less (see the note in the workspace manifest); that is a path
+# dependency, not an open-ended registry requirement.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+# Everything must come from crates.io. A git dependency is the easiest way
+# for unreviewed code to enter a build, and an unknown registry is worth
+# failing on outright rather than noticing later.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

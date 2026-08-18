@@ -12,6 +12,7 @@ resolver = "3"
 # file. Keep the two in lockstep: a member's inherited version and the
 # version requirement its dependents resolve against must always match.
 version = "0.13.0"
+license = "BUSL-1.1"
 license-file = "LICENSE"
 repository = "https://github.com/melin-engine/melin"
 homepage = "https://github.com/melin-engine/melin"

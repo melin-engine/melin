@@ -32,10 +32,10 @@ env:
   # gates; x86-64-v2 is a floor every hosted runner generation clears.
   RUSTFLAGS: -C target-cpu=x86-64-v2
 
-# Two jobs rather than one so a lint failure does not hide the test result:
-# jobs are independent by default, so both report even when the other fails.
-# They also run concurrently, so wall clock is the slower of the two rather
-# than their sum.
+# Separate jobs rather than one so a failure in one does not hide the
+# others: jobs are independent by default, so each reports its own verdict.
+# They also run concurrently, so wall clock is the slowest job rather than
+# the sum.
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -103,3 +103,20 @@ jobs:
       # the other 686. Costs nothing when the suite is green.
       - name: Tests
         run: cargo nextest run --no-fail-fast
+
+  # All four cargo-deny checks, configured in `deny.toml`. Advisories run
+  # here as well as in Nightly on purpose: here they catch a dependency that
+  # arrives already carrying a known problem, at the moment it is added
+  # rather than up to a day later. Nightly covers the other direction — an
+  # advisory published against a dependency that was clean when it landed.
+  #
+  # Needs no toolchain or cache: the action ships its own cargo-deny, and
+  # the check resolves the dependency graph rather than compiling it.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2

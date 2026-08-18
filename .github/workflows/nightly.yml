@@ -80,3 +80,19 @@ jobs:
       # commit on. Baseline with no sweep measured 8 minutes on this runner.
       - name: Miri
         run: scripts/miri.sh
+
+  # The reason this check belongs on a schedule at all: the RUSTSEC database
+  # is published continuously, so a dependency set that passed at merge time
+  # can become vulnerable with no commit involved. Pre-merge runs the full
+  # cargo-deny suite against the graph as it changes; this catches the graph
+  # standing still while the world moves.
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
