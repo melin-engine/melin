@@ -104,6 +104,49 @@ jobs:
       - name: Tests
         run: cargo nextest run --no-fail-fast
 
+  # The DPDK transport is the one configuration nothing else compiles. The
+  # pre-commit hook cannot cover it: `melin-dpdk`'s build script hard-fails
+  # when pkg-config cannot find libdpdk, so building it unconditionally
+  # would break every commit on a machine without the SDK. That left the
+  # feature compiled by nothing automatic, on any machine.
+  #
+  # Ubuntu ships the same 23.11 line the dev box runs, so a runner installs
+  # it from the archive in seconds — no `scripts/dpdk/dpdk-setup.sh`, which
+  # exists for hugepages and NIC binding rather than for building.
+  #
+  # `cargo check` rather than build or test: the value here is proving the
+  # bindgen run and the feature-gated code still compile. Actually running
+  # DPDK needs hugepages, a bound NIC, and root, none of which a hosted
+  # runner has.
+  dpdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Only the DPDK headers. bindgen needs libclang, but the runner image
+      # already ships Clang 16/17/18 — installing `libclang-dev` on top of
+      # that pulled a whole LLVM development tree and dominated the job.
+      # If bindgen ever fails to find it, set LIBCLANG_PATH rather than
+      # reinstalling the tree.
+      #
+      # This is not cached: rust-cache covers cargo's registry and target
+      # directory, not apt, and every run starts on a fresh VM. So this step
+      # pays full price every time — if it stays expensive, the job belongs
+      # in Nightly rather than on every push.
+      - name: Install DPDK headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdpdk-dev
+
+      - name: DPDK builds
+        run: cargo check -p melin-server-runtime --all-targets --features dpdk
+
   # All four cargo-deny checks, configured in `deny.toml`. Advisories run
   # here as well as in Nightly on purpose: here they catch a dependency that
   # arrives already carrying a known problem, at the moment it is added
