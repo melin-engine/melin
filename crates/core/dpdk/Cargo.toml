@@ -8,6 +8,9 @@ homepage.workspace = true
 authors.workspace = true
 description = "DPDK kernel-bypass transport using userspace poll-mode drivers and smoltcp TCP/IP"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 # Enable when libdpdk is installed. Without this feature the crate

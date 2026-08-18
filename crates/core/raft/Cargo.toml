@@ -8,6 +8,9 @@ homepage.workspace = true
 authors.workspace = true
 description = "Control-plane consensus: leader election, membership, and fencing epochs on openraft"
 
+[lints]
+workspace = true
+
 [lib]
 name = "melin_raft"
 path = "src/lib.rs"

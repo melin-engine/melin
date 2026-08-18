@@ -8,5 +8,8 @@ homepage.workspace = true
 authors.workspace = true
 description = "Length-prefixed wire framing and transport listener for TCP and Unix sockets"
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 tempfile = "3"

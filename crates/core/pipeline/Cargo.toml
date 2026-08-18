@@ -8,6 +8,9 @@ homepage.workspace = true
 authors.workspace = true
 description = "Lock-free ring buffers with dependency gating for low-latency inter-thread communication"
 
+[lints]
+workspace = true
+
 [dependencies]
 # No external dependencies — this is a generic, reusable ring buffer library.
 

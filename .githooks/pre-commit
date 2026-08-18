@@ -50,6 +50,13 @@ fi
 # compile rot is the whole point, and the extra minute of lint/test
 # time per commit is not.
 #
+# `check` is enough to catch dead code left behind by a feature gate
+# because `unused` is denied in `[workspace.lints.rust]`, so the
+# compiler itself errors rather than warning-and-exiting-0. Do not
+# "fix" a failure here by relaxing that — the warning is invisible in
+# the default configuration, which is exactly why it needs to be fatal
+# in this one.
+#
 # Enabled per package because a virtual workspace has no features of
 # its own. Deliberately WITHOUT `--no-default-features` — stripping
 # defaults across the workspace breaks the failover suite's binary

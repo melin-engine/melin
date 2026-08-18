@@ -8,6 +8,9 @@ homepage.workspace = true
 authors.workspace = true
 description = "Durable write-ahead journal with CRC32C checksums, BLAKE3 hash chain, and snapshot framing"
 
+[lints]
+workspace = true
+
 [lib]
 name = "melin_journal"
 path = "src/lib.rs"

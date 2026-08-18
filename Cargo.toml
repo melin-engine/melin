@@ -44,6 +44,25 @@ rand = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
+# Lints every member inherits via `[lints] workspace = true`.
+#
+# `unused` is denied rather than warned because the warnings it catches
+# are invisible in the configuration people actually build. An item whose
+# only users sit behind `#[cfg(not(feature = "no-persist"))]` becomes dead
+# code *only* in that configuration — the default build stays clean, the
+# pre-commit hook's `cargo clippy -D warnings` never sees it (it lints
+# default features), and the feature steps run `cargo check`, which warns
+# and exits 0. Denying here moves the failure into the compiler itself, so
+# every command in every configuration agrees without the hook and CI
+# having to be kept in lockstep about it.
+#
+# Deliberately narrower than `warnings = "deny"`: a blanket deny hands
+# every future rustc release the power to break this build on a new
+# deprecation. `unused` is a stable group that rarely gains surprising
+# members, and it covers the class that hides behind feature gates.
+[workspace.lints.rust]
+unused = "deny"
+
 [profile.release]
 # Full cross-crate LTO: allows LLVM to inline across crate boundaries
 # (e.g., disruptor ring ops into engine hot path). Major win for multi-crate

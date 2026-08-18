@@ -12,6 +12,9 @@ description = "Minimal example: a durable, replicated counter built on the Melin
 # does not make the crate publishable.
 publish = false
 
+[lints]
+workspace = true
+
 [lib]
 name = "counter_server"
 path = "src/lib.rs"

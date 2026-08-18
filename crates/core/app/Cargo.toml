@@ -8,6 +8,9 @@ homepage.workspace = true
 authors.workspace = true
 description = "Trait abstractions for pluggable applications on the Melin sequencer"
 
+[lints]
+workspace = true
+
 [lib]
 name = "melin_app"
 path = "src/lib.rs"
