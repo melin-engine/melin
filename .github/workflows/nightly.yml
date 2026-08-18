@@ -81,6 +81,51 @@ jobs:
       - name: Miri
         run: scripts/miri.sh
 
+  # ThreadSanitizer over the whole suite — the broader of the two race
+  # detectors here, despite being the cheaper one. Miri explores scheduler
+  # interleavings systematically but can only run the two crates that touch
+  # no FFI and no I/O; TSan instruments real compiled code at native speed,
+  # so it covers the journal's file I/O, the replication paths, and the
+  # three-process cluster tests that Miri structurally cannot reach.
+  #
+  # It earned the slot immediately: the first full-suite run found the
+  # reader thread closing a wakeup eventfd that the accept side was still
+  # writing to, a use-after-close whose real danger was descriptor reuse.
+  #
+  # Two mechanical requirements, both non-obvious:
+  #   * `-Zbuild-std` (hence the `rust-src` component) is mandatory, not an
+  #     optimisation — rustc refuses to link sanitized code against the
+  #     uninstrumented precompiled std, with an ABI mismatch error.
+  #   * `--tests` skips doctests, which `rustdoc` builds without inheriting
+  #     RUSTFLAGS, producing that same ABI mismatch. `RUSTDOCFLAGS` would
+  #     also work; doctests add nothing under a race detector.
+  #
+  # `--target` is required too: without it, build scripts and proc macros
+  # are instrumented along with everything else.
+  tsan:
+    runs-on: ubuntu-latest
+    # About a minute warm on a 16-core box, dominated by the instrumented
+    # std rebuild on a cold runner.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      # No cache, for the same reason as the Miri job: cache storage is 10 GB
+      # per repository, and a sanitized build tree would evict the Pre-merge
+      # entries that people actually wait on.
+
+      - name: ThreadSanitizer
+        # Step-level RUSTFLAGS replaces the workflow-level value entirely,
+        # which is what we want — target-cpu tuning is irrelevant here.
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+        run: cargo test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --tests
+
   # The reason this check belongs on a schedule at all: the RUSTSEC database
   # is published continuously, so a dependency set that passed at merge time
   # can become vulnerable with no commit involved. Pre-merge runs the full
