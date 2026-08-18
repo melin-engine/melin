@@ -4,20 +4,25 @@ name: Nightly
 # too slow, or because they go red without anyone committing anything
 # (upstream toolchain changes, newly published advisories).
 #
-# TRIGGER IS TEMPORARY. Scheduled runs only ever execute on the default
-# branch, and `workflow_dispatch` does not even appear in the UI until the
-# file is on the default branch — so neither can exercise this while it is
-# still on a branch. `push` scoped to the development branch is how it gets
-# tested; replace it with `schedule` + `workflow_dispatch` when merging.
+# Scheduled runs only ever execute on the default branch, and
+# `workflow_dispatch` does not appear in the UI until the file is on the
+# default branch — so changes here cannot be exercised on a branch. To test
+# a change, add `push:` scoped to your branch temporarily, then take it out
+# before merging.
 #
-# When the schedule goes in, avoid the top of the hour — `schedule` is
-# delayed under load and every naive cron says `0`. Note also that GitHub
-# disables scheduled workflows on a public repository after 60 days with no
-# repository activity, which is a realistic gap between releases here.
+# The cron is deliberately not on the hour: `schedule` is delayed under
+# load, and load peaks at :00 because every naive cron says `0`. Times are
+# UTC, so 03:17 UTC is early morning in Europe — a failure is waiting when
+# the day starts rather than landing mid-afternoon.
+#
+# Watch out: GitHub disables scheduled workflows on a public repository
+# after 60 days with no repository activity, and a quiet stretch between
+# releases is realistic here. It re-enables with one click, but the failure
+# mode is silence, not an error.
 
 on:
-  push:
-    branches: [ci/nightly-miri]
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 concurrency:
