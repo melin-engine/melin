@@ -688,8 +688,7 @@ dependencies = [
 [[package]]
 name = "fastcp"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d19e9b63761f5e09e8836bcc1480569e05f4c75f688f35ebc5e9de142a774d"
+source = "git+https://github.com/melin-engine/fastcp.git?branch=feat%2Fzc-rx-window-and-index-eviction#d105f1fca98b623126457b4f5255e35b0a6a0502"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
