@@ -1,0 +1,105 @@
+name: Pre-merge
+
+# The gate every change passes. Named for when it runs rather than what it
+# contains, so it stays accurate as checks are added; longer-running work
+# belongs in a Nightly workflow and release verification in a Release one.
+#
+# The checks here are the same ones `.githooks/pre-commit` runs locally.
+# The hook is still the faster gate — it catches these before a commit
+# exists — but it is opt-in (`git config core.hooksPath .githooks`) and
+# invisible to anyone reading the repository, which is what this is for.
+#
+# Public repositories get standard hosted runners free and unmetered, so
+# this costs nothing to run on every push.
+
+on:
+  push:
+  workflow_dispatch:
+
+# A new push to the same branch makes the in-flight run irrelevant.
+concurrency:
+  group: pre-merge-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # `.cargo/config.toml` is tuned for the dev box: `-C target-cpu=native`
+  # and `-fuse-ld=lld`. A `RUSTFLAGS` value in the environment *replaces*
+  # `build.rustflags` wholesale rather than appending, which is exactly what
+  # is wanted here — the runner image may not carry lld, and native codegen
+  # buys nothing on a shared runner we do not benchmark on. Safe because no
+  # code in the workspace uses target-specific intrinsics or `target_feature`
+  # gates; x86-64-v2 is a floor every hosted runner generation clears.
+  RUSTFLAGS: -C target-cpu=x86-64-v2
+
+# Two jobs rather than one so a lint failure does not hide the test result:
+# jobs are independent by default, so both report even when the other fails.
+# They also run concurrently, so wall clock is the slower of the two rather
+# than their sum.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The hook's Cargo.lock check guards against committing a manifest
+      # change without its lockfile. The CI equivalent is whether the
+      # committed lockfile still resolves the workspace unchanged.
+      - name: Cargo.lock is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    # The cluster tests are serialized to one at a time
+    # (`.config/nextest.toml`), so the tail is long on 4 vCPUs. Generous
+    # enough to finish, tight enough to fail rather than hang for six hours.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Official prebuilt binary — avoids a ~2 minute source build of
+      # cargo-nextest on every run.
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      # Off-by-default features that no other step builds. `hash-chain` is a
+      # production durability feature (the tamper-evident audit chain) and
+      # sat broken for a full release once because nothing enabled it.
+      - name: hash-chain builds
+        run: |
+          for pkg in melin-journal melin-transport-core melin-server-runtime melin-example-counter; do
+            cargo check -p "$pkg" --all-targets --features hash-chain
+          done
+
+      # no-persist needs a real test run, not a build check: its last
+      # regression was a recovery test recovering from a journal the mode
+      # never writes. It compiled fine.
+      - name: no-persist tests (transport-core)
+        run: cargo test -q -p melin-transport-core --features no-persist
+
+      - name: no-persist builds (server-runtime)
+        run: cargo check -p melin-server-runtime --all-targets --features no-persist
+
+      # `--no-fail-fast` so one flaky cluster test cannot hide the verdict on
+      # the other 686. Costs nothing when the suite is green.
+      - name: Tests
+        run: cargo nextest run --no-fail-fast
