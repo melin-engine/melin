@@ -671,16 +671,15 @@ fn handle_replica_connection<A: Application>(
     )
 }
 
-/// io_uring live streaming loop for the primary replication handler.
-///
-/// io_uring ownership for the live-stream loop: the ring, the RECV
-/// landing buffer the kernel writes ack bytes into, and the number of
-/// operations the kernel still owes CQEs for.
+/// Quiescing owner of the live-stream ring: the ring itself, the RECV
+/// landing buffer the kernel writes ack bytes into, the SEND source
+/// buffer the kernel reads out of, and the number of operations the
+/// kernel still owes CQEs for.
 ///
 /// Exists for its `Drop`. Returning from the loop — shutdown, eviction,
 /// an I/O error, or a panic's unwind — while a RECV or SEND is still in
-/// flight would free `recv_buf` (and drop the ring) with the kernel
-/// holding a pointer into it. Ring teardown on fd close is
+/// flight would release those buffers (and drop the ring) with the
+/// kernel holding pointers into them. Ring teardown on fd close is
 /// *asynchronous*: the kernel can complete a pending RECV after the
 /// allocation has been returned to the allocator, writing replica-ack
 /// bytes into freed heap. That corruption surfaced as malloc-metadata
@@ -688,17 +687,26 @@ fn handle_replica_connection<A: Application>(
 /// kernel-side store it is invisible to AddressSanitizer. The guard
 /// closes every exit path: wake pending operations by shutting the
 /// socket down, then reap CQEs until the kernel owes none, and only
-/// then let the buffer drop.
-struct InflightUring {
+/// then let the buffers go.
+struct InflightUring<'a> {
     ring: io_uring::IoUring,
     /// RECV landing buffer for ack frames. `Vec` so the heap pointer
     /// handed to the kernel stays stable however the guard itself
     /// moves; sized 4 KiB (acks are 13 bytes, the kernel may coalesce
     /// many).
     recv_buf: Vec<u8>,
-    /// SQEs pushed minus CQEs reaped — exactly what the kernel owes.
-    /// `u32` matches the ring-depth scale (at most a RECV and a SEND
-    /// are ever outstanding here).
+    /// SEND source buffer, borrowed from `handle_replica_connection`
+    /// (it outlives the live-stream loop so it can be reused across
+    /// reconnects). Held by the guard purely so the drain covers it:
+    /// the kernel *reads* it for an in-flight SEND, so releasing it
+    /// early would splice freed heap into the replication stream.
+    send_buf: &'a mut Vec<u8>,
+    /// SQEs pushed minus CQEs reaped. Between a push and the following
+    /// `submit` the kernel does not yet owe those CQEs, so this is an
+    /// upper bound rather than an exact debt; [`Self::drain`] submits
+    /// before waiting, which makes the two converge. `u32` matches the
+    /// ring-depth scale (at most a RECV and a SEND are ever
+    /// outstanding here).
     in_flight: u32,
     /// Raw socket fd, for the `shutdown(2)` wake in `Drop`. Always
     /// outlives the guard: the owning `TcpStream` is a parameter of
@@ -706,7 +714,14 @@ struct InflightUring {
     tcp_fd: std::os::unix::io::RawFd,
 }
 
-impl Drop for InflightUring {
+/// Upper bound on the teardown drain. The wake is a `shutdown(2)` on
+/// the very socket the pending operations are bound to, so they are
+/// expected to complete within microseconds; this bounds only the
+/// pathological case (a wedged io-wq worker), where waiting forever
+/// would hang the sender thread and everything that joins it.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Drop for InflightUring<'_> {
     fn drop(&mut self) {
         // Wake everything the kernel holds: a shutdown socket completes
         // a pending RECV with EOF and a pending SEND with an error,
@@ -716,32 +731,76 @@ impl Drop for InflightUring {
         // (see `tcp_fd`) and a socket already reset by the peer just
         // returns ENOTCONN, which changes nothing about the drain.
         unsafe { libc::shutdown(self.tcp_fd, libc::SHUT_RDWR) };
-        while self.in_flight > 0 {
-            match self.ring.submit_and_wait(1) {
-                Ok(_) => {}
+        if !self.drain() {
+            // The drain could not be proven complete, so the kernel may
+            // still write into `recv_buf` or read out of `send_buf`.
+            // Leak both: a few KiB lost on a dying connection is safe,
+            // returning memory the kernel still touches to the
+            // allocator is not. `take` leaves each `Vec` empty, so the
+            // caller's `send_buf` stays a valid (if reallocating) Vec.
+            std::mem::forget(std::mem::take(&mut self.recv_buf));
+            std::mem::forget(std::mem::take(self.send_buf));
+            warn!(
+                in_flight = self.in_flight,
+                "io_uring teardown drain did not complete; leaking replication buffers"
+            );
+        }
+    }
+}
+
+impl InflightUring<'_> {
+    /// Reap CQEs until the kernel owes none, bounded by
+    /// [`DRAIN_TIMEOUT`]. `true` means `in_flight` reached zero and the
+    /// buffers are provably free of kernel references; `false` means
+    /// the caller must not release them.
+    ///
+    /// Polls the memory-mapped CQ instead of blocking in
+    /// `submit_and_wait`: that wait takes no timeout, so an operation
+    /// the shutdown failed to wake would hang the sender thread — and
+    /// whatever joins it — forever. Trading a use-after-free for a
+    /// deadlock is not a trade worth making.
+    fn drain(&mut self) -> bool {
+        // Flush SQEs that were pushed but never submitted: until they
+        // reach the kernel, no CQE is ever coming for them.
+        loop {
+            match self.ring.submit() {
+                Ok(_) => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    // The wait itself failed, so it cannot be proven
-                    // that the kernel is done with the buffer. Leak it:
-                    // a one-off 4 KiB loss on a dying thread is safe,
-                    // freeing memory the kernel may still write is not.
-                    std::mem::forget(std::mem::take(&mut self.recv_buf));
-                    return;
-                }
+                Err(_) => return false,
             }
+        }
+        let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+        let mut spins: u32 = 0;
+        while self.in_flight > 0 {
             for _ in self.ring.completion() {
                 self.in_flight = self.in_flight.saturating_sub(1);
             }
+            if self.in_flight == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            // The expected wait is a few microseconds, so spin first;
+            // back off afterwards so a pathological drain does not burn
+            // a core for the whole timeout.
+            if spins < 1024 {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
         }
+        true
     }
 }
 
 /// Live streaming loop using async RECV/SEND via io_uring. A single RECV is always
 /// in-flight for ack frames; SEND is submitted when the replication ring
 /// has data. Both complete via the memory-mapped CQ with zero syscalls
-/// in the hot path. In-flight operations and the RECV buffer are owned
-/// by an [`InflightUring`] guard so no exit path can free memory the
-/// kernel still writes to.
+/// in the hot path. In-flight operations and both kernel-visible
+/// buffers are owned by an [`InflightUring`] guard, so no exit path can
+/// release memory the kernel is still reading or writing.
 fn live_stream_uring(
     writer: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
@@ -798,16 +857,19 @@ fn live_stream_uring(
         let _ = ring.submitter().register_iowq_aff(&cpuset);
     }
 
-    // Ring + RECV buffer + in-flight count live in the quiescing guard
-    // from here on: every exit below (shutdown, eviction, `?`, unwind)
-    // must drain the kernel before these allocations are freed.
+    // Ring, both kernel-visible buffers, and the in-flight count live
+    // in the quiescing guard from here on: every exit below (shutdown,
+    // eviction, `?`, unwind) must drain the kernel before any of these
+    // allocations can be released. The loop keeps using them through
+    // disjoint field borrows.
     let mut uring = InflightUring {
         ring,
         recv_buf: vec![0u8; 4096],
+        send_buf,
         in_flight: 0,
         tcp_fd,
     };
-    let (ring, recv_buf) = (&mut uring.ring, &mut uring.recv_buf);
+    let (ring, recv_buf, send_buf) = (&mut uring.ring, &mut uring.recv_buf, &mut *uring.send_buf);
     // Accumulation buffer for partial ack frame parsing.
     let mut parse_buf: Vec<u8> = Vec::with_capacity(MAX_CONTROL_FRAME + 4);
     // RECV is always resubmitted after CQE processing — no explicit
@@ -957,6 +1019,13 @@ fn live_stream_uring(
             // Every reaped CQE settles one operation the kernel owed —
             // counted even if it overflows the recording array (it
             // cannot: at most a RECV and a SEND are ever in flight).
+            // `saturating_sub` keeps a miscount from wrapping into a
+            // drain that never terminates; the assert catches the
+            // miscount itself rather than letting it hide in release.
+            debug_assert!(
+                uring.in_flight > 0,
+                "CQE reaped with no operation recorded in flight"
+            );
             uring.in_flight = uring.in_flight.saturating_sub(1);
             if cqe_count < cqes.len() {
                 cqes[cqe_count] = (cqe.user_data(), cqe.result());
@@ -1088,5 +1157,115 @@ fn live_stream_uring(
                 std::thread::yield_now();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use io_uring::{IoUring, opcode, types};
+
+    /// Connected AF_UNIX stream pair standing in for the replication
+    /// socket. Raw fds rather than `UnixStream` because the guard takes
+    /// a `RawFd` and the test needs to outlive it.
+    fn socketpair() -> (libc::c_int, libc::c_int) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid two-element array for the kernel to
+        // fill in; the fds are owned by the caller from here.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
+        (fds[0], fds[1])
+    }
+
+    /// SAFETY: both fds are owned by the caller and not used again.
+    fn close_pair(a: libc::c_int, b: libc::c_int) {
+        // Return value dropped deliberately: nothing can be done about
+        // a failing close on a test teardown path.
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    /// Guard over `fd` with a RECV already submitted, or `None` when
+    /// the host denies io_uring — some dev hosts filter opcodes, and
+    /// the production path falls back to blocking I/O there, so there
+    /// is nothing for these tests to assert.
+    fn guard_with_pending_recv(
+        fd: libc::c_int,
+        send_buf: &mut Vec<u8>,
+    ) -> Option<InflightUring<'_>> {
+        let ring = IoUring::builder().setup_single_issuer().build(8).ok()?;
+        ring.submitter().register_files(&[fd]).ok()?;
+        let mut uring = InflightUring {
+            ring,
+            recv_buf: vec![0u8; 4096],
+            send_buf,
+            in_flight: 0,
+            tcp_fd: fd,
+        };
+        let sqe = opcode::Recv::new(
+            types::Fixed(0),
+            uring.recv_buf.as_mut_ptr(),
+            uring.recv_buf.len() as u32,
+        )
+        .build()
+        .user_data(0);
+        // SAFETY: `recv_buf` belongs to the guard being built here, and
+        // the guard drains this operation before releasing it. The ring
+        // is only ever touched from this thread.
+        unsafe { uring.ring.submission().push(&sqe).ok()? };
+        uring.in_flight = 1;
+        uring.ring.submit().ok()?;
+        Some(uring)
+    }
+
+    /// The assumption the whole teardown design rests on: a
+    /// `shutdown(2)` — not an AsyncCancel, which some hosts filter —
+    /// is enough to make the kernel hand back a RECV that nobody is
+    /// ever going to write to.
+    #[test]
+    fn drain_reaps_a_pending_recv_after_shutdown() {
+        let (a, b) = socketpair();
+        let mut send_buf = Vec::new();
+        let Some(mut uring) = guard_with_pending_recv(a, &mut send_buf) else {
+            close_pair(a, b);
+            return;
+        };
+        // The peer never writes, so the only thing that can complete
+        // this RECV is the shutdown.
+        unsafe { libc::shutdown(a, libc::SHUT_RDWR) };
+        assert!(
+            uring.drain(),
+            "drain hit the deadline with a RECV in flight"
+        );
+        assert_eq!(uring.in_flight, 0, "kernel still owes a CQE");
+        drop(uring);
+        close_pair(a, b);
+    }
+
+    /// `Drop` must quiesce the ring on its own — including issuing the
+    /// wake — and must return promptly rather than burning the whole
+    /// [`DRAIN_TIMEOUT`], which is what a teardown that silently failed
+    /// to wake the operation would look like.
+    #[test]
+    fn drop_quiesces_a_pending_recv_without_hanging() {
+        let (a, b) = socketpair();
+        let mut send_buf = vec![0u8; 64];
+        let Some(uring) = guard_with_pending_recv(a, &mut send_buf) else {
+            close_pair(a, b);
+            return;
+        };
+        let started = std::time::Instant::now();
+        drop(uring);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < DRAIN_TIMEOUT / 4,
+            "teardown took {elapsed:?}, close to the {DRAIN_TIMEOUT:?} deadline"
+        );
+        // A clean drain releases the buffers; only a drain that cannot
+        // prove the kernel is done leaks them.
+        assert_eq!(send_buf.len(), 64, "send_buf leaked despite a clean drain");
+        close_pair(a, b);
     }
 }
