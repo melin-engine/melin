@@ -9,17 +9,19 @@ warm for failover.
 Every client response is gated on a configurable **durability mode**
 that decides what "the cluster has acknowledged this event" means
 before the primary tells the client it's done. Modes range from
-single-node durability (dev/test) to two-disk durability (compliance).
+single-node durability (dev/test) through RAM-quorum replication
+(lowest latency, bounded RPO) to two-disk durability (compliance).
 
 ## Durability modes
 
-The operator picks one of three named modes via
+The operator picks one of four named modes via
 `--durability-mode <mode>` on the primary. Each carries a different
 guarantee about what's confirmed before the client gets a reply:
 
 | Mode | Guarantee at client ack | Vulnerable to | When to use |
 |---|---|---|---|
 | `local` | One node has the event on PLP-backed NVMe (the primary's own disk). | Primary disk hardware failure. | Dev, staging, single-node deployments. |
+| `replicated` | Two nodes hold the event in RAM. Disk writes trail asynchronously — the journal still syncs every batch, just off the ack path. | Simultaneous failure of every node holding the event within the fsync window (typically milliseconds) — the un-synced tail is lost. Any single node failure is fully covered by failover. | Storage where fsync is slow (cloud block volumes) or latency-critical applications that accept a small, bounded RPO. Lowest ack latency of the four modes. |
 | `hybrid` *(default)* | One node has the event on PLP-backed NVMe **and** a second node has confirmed receipt in RAM. | Primary disk hardware failure within ~80 µs of the ack — the window before the secondary completes its own fsync. PLP-protected power loss is fully handled. | Typical live-trading deployments. Saves ~50–80 µs per fill vs `durably-replicated`. |
 | `durably-replicated` | Two nodes have the event on PLP-backed NVMe. | Simultaneous disk failure on two nodes. | Compliance-driven venues that require two durable copies before client ack. |
 
@@ -41,6 +43,30 @@ Under `durably-replicated` the replica's disk is on the critical path by
 definition — that is the guarantee the mode buys. A replica running
 behind its own device is visible on that node's
 `melin_journal_disk_lag_batches`.
+
+### No disk on the `replicated` critical path
+
+`replicated` takes the `hybrid` idea one step further: *no* disk gates
+the ack, not even the primary's. A response goes out once a second node
+has confirmed receipt in RAM. Every node's journal keeps writing and
+syncing every batch exactly as in the other modes — durability is not
+disabled, it is moved off the ack path — so the on-disk copies trail
+the acked frontier by roughly one disk-sync interval.
+
+The resulting contract:
+
+- **Any single node failure loses nothing.** Every acked event is held
+  by at least two nodes; failover promotes a replica that has it.
+- **A whole-cluster power loss loses the un-synced tail** — the acked
+  events that no journal had synced yet, typically the final few
+  milliseconds. This is the mode's recovery point objective (RPO), and
+  it is the price of taking fsync out of the ack path.
+
+Pick `replicated` when that trade is right: deployments whose storage
+makes fsync expensive (cloud block volumes, network-attached disks) —
+where the other modes would put milliseconds of disk latency inside
+every ack — or applications that value the lowest possible ack latency
+over a guarantee against simultaneous multi-node loss.
 
 ### Strict fail-closed semantics
 
@@ -78,6 +104,7 @@ the node via a signed admin command:
 
 ```
 DURABILITY local
+DURABILITY replicated
 DURABILITY hybrid
 DURABILITY durably-replicated
 ```
@@ -421,7 +448,7 @@ requiring the full journal history.
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary. |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `DURABILITY <mode>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
-| `--durability-mode <mode>` | Primary | `hybrid` | Active durability mode at startup. `local`, `hybrid`, or `durably-replicated`. Can be swapped at runtime via admin `DURABILITY`. |
+| `--durability-mode <mode>` | Primary | `hybrid` | Active durability mode at startup. `local`, `replicated`, `hybrid`, or `durably-replicated`. Can be swapped at runtime via admin `DURABILITY`. |
 
 `--standalone` is mutually exclusive with both `--replication-bind`
 and `--replica-of`. `--replica-of` **combines** with
@@ -468,8 +495,11 @@ Most failures resolve without operator action:
   surviving replica via `PROMOTE`. Under `hybrid` or
   `durably-replicated`, all surviving replicas hold the same set of
   acked events (the contract guaranteed that before the client was
-  told). Send `DURABILITY local` after promotion if the new primary
-  is standalone; restore the target mode once new replicas attach.
+  told). Under `replicated`, at least one surviving replica holds
+  every acked event — promote the most caught-up one (a raft-driven
+  failover already elects it). Send `DURABILITY local` after promotion
+  if the new primary is standalone; restore the target mode once new
+  replicas attach.
 - **One replica crashes, primary and other replica alive** — the
   cluster continues at the configured mode. Under `hybrid` the gate
   is satisfied by the primary plus the surviving replica's in-memory
@@ -480,11 +510,15 @@ Most failures resolve without operator action:
 ### Cluster-wide outage
 
 When all nodes restart with their own journals they may differ in
-length. Under every mode the contract is that every event the client
-was told about is on at least one PLP-backed disk, so the node with
-the longest journal holds the acked frontier (and possibly some
-events past it that were locally durable but never confirmed to a
-client). The recovery procedure:
+length. Under every mode except `replicated` the contract is that
+every event the client was told about is on at least one PLP-backed
+disk, so the node with the longest journal holds the acked frontier
+(and possibly some events past it that were locally durable but never
+confirmed to a client). Under `replicated` the longest journal holds
+the acked frontier *minus the un-synced tail* — a whole-cluster
+outage may lose the final few milliseconds of acked events, which is
+that mode's documented RPO ("No disk on the `replicated` critical
+path" above). The recovery procedure is the same in every mode:
 
 1. Stop all nodes if not already stopped.
 2. Determine each node's journal end sequence. Today this means

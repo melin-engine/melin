@@ -167,7 +167,14 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
             );
         }
         None => return Err("acking durability mode is unrecognised"),
-        Some(DurabilityMode::Hybrid | DurabilityMode::DurablyReplicated) => {}
+        // Every mode whose policy requires a second node before the ack
+        // (`in_memory>=2` or `persisted>=2`) qualifies: the election's
+        // recency filter can then prove the winner holds every acked
+        // order. `replicated` qualifies on the same grounds as `hybrid`
+        // — its acks waited for a second node's in-memory receipt.
+        Some(
+            DurabilityMode::Hybrid | DurabilityMode::DurablyReplicated | DurabilityMode::Replicated,
+        ) => {}
     }
     if inputs.term <= inputs.fence_epoch {
         return Err(

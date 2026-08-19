@@ -2064,7 +2064,7 @@ mod tests {
         Blocker, DegradationLogger, OutputSlot, WireSeq, evaluate_durability, evaluate_gate,
         slot_needs_gate,
     };
-    use crate::durability_policy::{Clause, Level, Policy};
+    use crate::durability_policy::{Clause, DurabilityMode, Level, Policy};
     use crate::replication::ReplicationMetrics;
 
     /// Queued end-to-end samples survive a flush that dropped nothing,
@@ -2255,6 +2255,31 @@ mod tests {
             evaluate_durability(&p, WireSeq::new(150), Some(&m), Some(&a)).durable_pos,
             150
         );
+    }
+
+    #[test]
+    fn ram_quorum_gates_on_replica_memory_not_on_any_disk() {
+        // `replicated` (`in_memory>=2`): the journal position must not
+        // bind. Journal at 0 — nothing persisted anywhere on the
+        // primary — while the replicas hold 100/120 in memory. The
+        // 2nd-largest in-memory across {primary=MAX, 100, 120} is 120:
+        // the gate is exactly the fastest replica's RAM receipt.
+        let p = DurabilityMode::Replicated.to_policy();
+        let m = metrics((100, 0), (120, 0));
+        let a = both_active();
+        let r = evaluate_durability(&p, WireSeq::new(0), Some(&m), Some(&a));
+        assert_eq!(r.durable_pos, 120);
+        assert!(!r.degraded);
+    }
+
+    #[test]
+    fn ram_quorum_stalls_with_no_replica_connected() {
+        // Fail-closed: with only the primary in the view, `in_memory>=2`
+        // is structurally unsatisfiable however far the journal is.
+        let p = DurabilityMode::Replicated.to_policy();
+        let r = evaluate_durability(&p, WireSeq::new(500), None, None);
+        assert_eq!(r.durable_pos, 0);
+        assert!(r.degraded);
     }
 
     // --- Single replica connected ---

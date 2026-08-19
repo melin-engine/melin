@@ -13,7 +13,7 @@
 //!   boundary and start a fresh one. Available only when the spawn
 //!   caller wired a rotation flag (any node with `--max-journal-mib >
 //!   0` or runtime rotation enabled).
-//! - `DURABILITY <local|hybrid|durably-replicated>` — atomically swap
+//! - `DURABILITY <local|replicated|hybrid|durably-replicated>` — atomically swap
 //!   the active durability mode on a node running a response stage
 //!   (primary, or post-promotion replica). Lets an operator resume
 //!   trading at reduced durability immediately after a promotion (no
@@ -362,7 +362,7 @@ fn handle_durability(stream: &mut TcpStream, durability_mode: Option<&AtomicU8>,
     if arg.is_empty() {
         send_best_effort(
             stream,
-            b"ERR DURABILITY requires a mode (local|hybrid|durably-replicated)\n",
+            b"ERR DURABILITY requires a mode (local|replicated|hybrid|durably-replicated)\n",
         );
         debug!("rejected DURABILITY — missing argument");
         return;
@@ -406,7 +406,7 @@ fn format_unknown_mode<'a>(buf: &'a mut [u8], arg: &str) -> &'a [u8] {
     // strictly better than allocating on the admin hot path.
     let _ = writeln!(
         cursor,
-        "ERR DURABILITY unknown mode `{arg}` (expected local|hybrid|durably-replicated)"
+        "ERR DURABILITY unknown mode `{arg}` (expected local|replicated|hybrid|durably-replicated)"
     );
     let n = cursor.position() as usize;
     &cursor.into_inner()[..n]
@@ -730,6 +730,7 @@ mod tests {
     fn durability_command_accepts_each_mode() {
         for target in [
             DurabilityMode::Local,
+            DurabilityMode::Replicated,
             DurabilityMode::Hybrid,
             DurabilityMode::DurablyReplicated,
         ] {

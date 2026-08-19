@@ -7,10 +7,11 @@
 //! keep working, and the response stage's ack gate is built on them.
 //!
 //! What this module owns is the *operator surface*: a small enum that
-//! exposes three named modes (`local`, `hybrid`, `durably-replicated`)
-//! via `--durability-mode`, plus the mapping from each mode to the
-//! underlying clause list. The set of modes is exchange-server policy,
-//! not a transport-core concern, so it lives here.
+//! exposes four named modes (`local`, `replicated`, `hybrid`,
+//! `durably-replicated`) via `--durability-mode`, plus the mapping from
+//! each mode to the underlying clause list. The set of modes is
+//! exchange-server policy, not a transport-core concern, so it lives
+//! here.
 
 use std::fmt;
 
@@ -18,7 +19,7 @@ pub use melin_transport_core::durability_policy::{
     Blocker, Clause, CursorView, EvalStatus, Level, MAX_CLUSTER_SIZE, Policy, PolicyError,
 };
 
-/// Operator-facing durability mode. Each variant maps to one of three
+/// Operator-facing durability mode. Each variant maps to one of four
 /// named policies that compose the underlying [`Clause`] list directly
 /// in code, replacing the legacy `--durability-policy <STRING>` DSL.
 /// See `docs/replication.md` for the three-tier menu in operational
@@ -31,7 +32,7 @@ pub use melin_transport_core::durability_policy::{
 /// the low values free for future modes.
 pub const ACKING_MODE_UNKNOWN: u8 = u8::MAX;
 
-/// `clap::ValueEnum` derives `--durability-mode <local|hybrid|durably-replicated>`.
+/// `clap::ValueEnum` derives `--durability-mode <local|replicated|hybrid|durably-replicated>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum DurabilityMode {
     /// `persisted>=1`. Single-node durability — the primary's
@@ -39,6 +40,17 @@ pub enum DurabilityMode {
     /// Required when running with `--standalone`; appropriate for
     /// dev/staging deployments without a replica.
     Local,
+
+    /// `in_memory>=2`. RAM-quorum durability — a second node holds the
+    /// event in memory before the client ack; every disk write trails
+    /// asynchronously off the ack path (the journal still fsyncs every
+    /// batch, it just no longer gates responses). Survives any single
+    /// node failure via failover; loses only the un-fsynced tail on a
+    /// simultaneous whole-cluster power loss. For deployments where
+    /// fsync is slow (cloud block storage) or where that bounded RPO
+    /// is an acceptable trade for the lowest ack latency. Fails closed
+    /// when no replica is connected.
+    Replicated,
 
     /// `persisted>=1 && in_memory>=2`. One durable copy on the
     /// primary's disk plus an in-memory ack from a second node.
@@ -66,6 +78,10 @@ impl DurabilityMode {
                 count: 1,
                 level: Level::Persisted,
             }],
+            DurabilityMode::Replicated => vec![Clause {
+                count: 2,
+                level: Level::InMemory,
+            }],
             DurabilityMode::Hybrid => vec![
                 Clause {
                     count: 1,
@@ -90,6 +106,7 @@ impl DurabilityMode {
     pub fn as_str(self) -> &'static str {
         match self {
             DurabilityMode::Local => "local",
+            DurabilityMode::Replicated => "replicated",
             DurabilityMode::Hybrid => "hybrid",
             DurabilityMode::DurablyReplicated => "durably-replicated",
         }
@@ -102,6 +119,7 @@ impl DurabilityMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "local" => Some(DurabilityMode::Local),
+            "replicated" => Some(DurabilityMode::Replicated),
             "hybrid" => Some(DurabilityMode::Hybrid),
             "durably-replicated" => Some(DurabilityMode::DurablyReplicated),
             _ => None,
@@ -121,6 +139,10 @@ impl DurabilityMode {
             DurabilityMode::Local => 0,
             DurabilityMode::Hybrid => 1,
             DurabilityMode::DurablyReplicated => 2,
+            // 3, not a re-sort: the values are a stable ABI (see doc
+            // comment), so a later variant takes the next free byte
+            // regardless of where it sits in the operator-facing menu.
+            DurabilityMode::Replicated => 3,
         }
     }
 
@@ -135,6 +157,7 @@ impl DurabilityMode {
             0 => Some(DurabilityMode::Local),
             1 => Some(DurabilityMode::Hybrid),
             2 => Some(DurabilityMode::DurablyReplicated),
+            3 => Some(DurabilityMode::Replicated),
             _ => None,
         }
     }
@@ -156,12 +179,13 @@ mod tests {
             DurabilityMode::Local,
             DurabilityMode::Hybrid,
             DurabilityMode::DurablyReplicated,
+            DurabilityMode::Replicated,
         ] {
             assert_eq!(DurabilityMode::from_u8(m.as_u8()), Some(m));
         }
         // Unknown bytes surface as None — the response stage relies on
         // this to detect a corrupted atomic and retain the prior mode.
-        for b in [3, 4, 255] {
+        for b in [4, 5, 255] {
             assert_eq!(DurabilityMode::from_u8(b), None);
         }
     }
@@ -172,10 +196,11 @@ mod tests {
             DurabilityMode::Local,
             DurabilityMode::Hybrid,
             DurabilityMode::DurablyReplicated,
+            DurabilityMode::Replicated,
         ] {
             assert_eq!(DurabilityMode::parse(m.as_str()), Some(m));
         }
-        for bad in ["", "LOCAL", "hyb", "fast", "durably_replicated"] {
+        for bad in ["", "LOCAL", "hyb", "fast", "durably_replicated", "repl"] {
             assert_eq!(DurabilityMode::parse(bad), None, "{bad:?} should not parse");
         }
     }
@@ -208,12 +233,70 @@ mod tests {
     }
 
     #[test]
+    fn mode_replicated_builds_in_memory_ge_2() {
+        let p = DurabilityMode::Replicated.to_policy();
+        assert_eq!(p.clauses().len(), 1);
+        let c = p.clauses()[0];
+        assert_eq!(c.level, Level::InMemory);
+        assert_eq!(c.count, 2);
+    }
+
+    #[test]
+    fn mode_replicated_fails_closed_on_single_node() {
+        // Same fail-closed semantic as hybrid: `in_memory>=2` cannot be
+        // satisfied by the primary alone, so the gate must stall rather
+        // than silently weaken to local durability.
+        let p = DurabilityMode::Replicated.to_policy();
+        let nodes = [[100u64, 100u64]];
+        let v = CursorView::new(&nodes);
+        assert_eq!(p.evaluate(&v), 0, "replicated stalls on single-node view");
+    }
+
+    #[test]
+    fn mode_replicated_ignores_every_persisted_cursor() {
+        // The mode's whole point: no disk gates the ack. Primary at
+        // in_memory=100 with fsync trailing at 10; replica at
+        // in_memory=80 with nothing persisted at all.
+        // in_memory>=2: 2nd largest in_memory = 80. Gate = 80 — the
+        // trailing fsyncs on both nodes must not bind.
+        let p = DurabilityMode::Replicated.to_policy();
+        let nodes = [[100u64, 10u64], [80u64, 0u64]];
+        let v = CursorView::new(&nodes);
+        assert_eq!(p.evaluate(&v), 80);
+    }
+
+    #[test]
     fn mode_durably_replicated_builds_persisted_ge_2() {
         let p = DurabilityMode::DurablyReplicated.to_policy();
         assert_eq!(p.clauses().len(), 1);
         let c = p.clauses()[0];
         assert_eq!(c.level, Level::Persisted);
         assert_eq!(c.count, 2);
+    }
+
+    #[test]
+    fn no_mode_gates_on_the_primary_in_memory_sentinel() {
+        // The response stage models the primary's in-memory cursor as
+        // `u64::MAX` (events it gates are trivially in-memory on the
+        // primary). A mode whose policy contained `in_memory>=1` would
+        // therefore ack instantly and unconditionally — and would also
+        // break the transport-core evaluation's u64::MAX-sentinel
+        // reasoning. Pin the invariant: every clause of every mode is
+        // either persisted-level or requires a second node.
+        for m in [
+            DurabilityMode::Local,
+            DurabilityMode::Replicated,
+            DurabilityMode::Hybrid,
+            DurabilityMode::DurablyReplicated,
+        ] {
+            for c in m.to_policy().clauses() {
+                assert!(
+                    c.level == Level::Persisted || c.count >= 2,
+                    "mode {m}: clause `{c}` would be satisfied by the primary's \
+                     in-memory sentinel alone"
+                );
+            }
+        }
     }
 
     #[test]

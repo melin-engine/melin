@@ -15,7 +15,7 @@ It is a deterministic, replicated sequencer: your single-threaded application lo
 
 **Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application inherits it as long as its logic stays pure.
 
-**Durable and replicated.** Every event is journaled and synchronously replicated before the client sees a response, with CRC32C integrity checks and a BLAKE3 hash chain for tamper evidence. By default an ack requires one node to have persisted and two to hold the event in memory, so a single slow disk or a single node failure costs neither latency nor data; a stricter two-disks-before-ack mode is available. Journal catch-up, snapshot transfer, and automatic failover are built in. See [replication](docs/replication.md).
+**Durable and replicated.** Every event is journaled and synchronously replicated before the client sees a response, with CRC32C integrity checks and a BLAKE3 hash chain for tamper evidence. By default an ack requires one node to have persisted and two to hold the event in memory, so a single slow disk or a single node failure costs neither latency nor data; a stricter two-disks-before-ack mode and a faster replication-only mode (no fsync on the ack path) are available. Journal catch-up, snapshot transfer, and automatic failover are built in. See [replication](docs/replication.md).
 
 **Fast.** p99 of 404 µs at 1.00M events/sec, full round trip including persistence and replication, on kernel TCP and commodity datacenter hardware. Single-event floor: 66 µs p99. See [Benchmarks](#benchmarks).
 

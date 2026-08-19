@@ -766,8 +766,10 @@ mod tests {
             // "nothing seen yet" sentinel and maps a surviving sentinel
             // back to 0, so a policy whose clauses genuinely resolve to
             // u64::MAX is indistinguishable from an empty view. Not
-            // reachable in production — every `DurabilityMode` carries a
-            // `persisted` clause, and the primary's persisted term is a
+            // reachable in production — the only `u64::MAX` cursor in a
+            // real view is the primary's in-memory sentinel, and every
+            // `DurabilityMode` clause is either persisted-level or
+            // requires a second node, so the binding value is always a
             // real journal position — so the fold is left alone and the
             // case is excluded here rather than papered over.
             prop_assume!(expected != u64::MAX);

@@ -233,6 +233,12 @@ pub struct ServerConfig {
     ///
     /// - `local`              `persisted>=1`. Single-node durability;
     ///   required with `--standalone`. Dev/staging deployments.
+    /// - `replicated`         `in_memory>=2`. A second node holds the
+    ///   event in memory before the ack; every fsync trails off the
+    ///   ack path (the journal still syncs every batch). Lowest ack
+    ///   latency; survives any single node failure via failover; loses
+    ///   only the un-fsynced tail on a whole-cluster power loss. For
+    ///   slow-fsync storage (cloud volumes) or RPO-tolerant apps.
     /// - `hybrid` (default)   `persisted>=1 && in_memory>=2`. Primary's
     ///   disk plus an in-memory ack from a second node. Single-failure-
     ///   safe with a brief RAM-only window on the secondary copy. The
@@ -242,11 +248,10 @@ pub struct ServerConfig {
     ///   client ack. Zero RAM-only window; the gate stalls when no
     ///   replica is connected. Compliance-driven venues.
     ///
-    /// `--standalone` requires `local`. With `hybrid` or
-    /// `durably-replicated` and no connected replica the gate stalls —
-    /// the correct behaviour for a serious deployment that has lost
-    /// its replicas. See `docs/replication.md` for the operational
-    /// menu.
+    /// `--standalone` requires `local`. In every other mode the gate
+    /// stalls while no replica is connected — the correct behaviour
+    /// for a serious deployment that has lost its replicas. See
+    /// `docs/replication.md` for the operational menu.
     #[arg(long, value_enum, default_value_t = crate::durability_policy::DurabilityMode::Hybrid)]
     pub durability_mode: crate::durability_policy::DurabilityMode,
 
@@ -1314,8 +1319,9 @@ where
         return Err("--replication-bind and --standalone are mutually exclusive".into());
     }
     // `--standalone` declares "no replicas ever" — only `local` can be
-    // satisfied. `hybrid` and `durably-replicated` would stall the gate
-    // forever; reject loudly at startup with the fix in the message.
+    // satisfied. Every other mode requires a second node and would
+    // stall the gate forever; reject loudly at startup with the fix in
+    // the message.
     if config.standalone
         && config.durability_mode != crate::durability_policy::DurabilityMode::Local
     {
@@ -2476,8 +2482,9 @@ where
         return Err("--replication-bind and --standalone are mutually exclusive".into());
     }
     // `--standalone` declares "no replicas ever" — only `local` can be
-    // satisfied. `hybrid` and `durably-replicated` would stall the gate
-    // forever; reject loudly at startup with the fix in the message.
+    // satisfied. Every other mode requires a second node and would
+    // stall the gate forever; reject loudly at startup with the fix in
+    // the message.
     if config.standalone
         && config.durability_mode != crate::durability_policy::DurabilityMode::Local
     {
