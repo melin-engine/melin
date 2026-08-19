@@ -176,11 +176,14 @@ impl Drop for BufRing {
     fn drop(&mut self) {
         // SAFETY: allocated in `new` with this exact layout. The
         // `IoUring` this was registered with is already gone (the
-        // declaration-order rule). Ring-fd close makes the kernel's
-        // teardown *eventually* release its reference; the reader's
-        // shutdown path additionally cancels all armed ops and drains
-        // the CQ to quiescence before this runs, closing the async
-        // exit-work window on every non-panic path.
+        // declaration-order rule), and the reader's teardown quiesce
+        // (see `reader_loop`, and `crate::uring_teardown` for the
+        // shared policy) has *proven* no armed operation can still
+        // select from this ring before letting it drop — when that
+        // proof fails, the whole `BufRing` is `mem::forget`-leaked and
+        // this dealloc never runs. Panic unwind skips the quiesce and
+        // accepts the tiny process-is-dying exit-work window;
+        // declaration order still closes the ring fd before this free.
         unsafe { std::alloc::dealloc(self.ring as *mut u8, Self::layout(self.entries)) }
     }
 }

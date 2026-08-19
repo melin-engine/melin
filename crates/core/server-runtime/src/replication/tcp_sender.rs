@@ -14,8 +14,8 @@ use tracing::{debug, error, info, warn};
 use melin_journal::replication::ReplicationConsumer;
 
 use super::auth::authenticate_replica;
-use super::uring_teardown::{DrainBackoff, wake_pending_ops};
 use super::{ReplicaCursors, ReplicaGate, ReplicationMetrics, SentHighWater};
+use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{
     CatchUpResult, bridge_catchup_to_live, can_catch_up_from_journal, catch_up_from_journal,
@@ -737,10 +737,10 @@ impl Drop for InflightUring<'_> {
 
 impl InflightUring<'_> {
     /// Reap CQEs until the kernel owes none, bounded by
-    /// [`super::uring_teardown::DRAIN_TIMEOUT`]. `true` means
+    /// [`crate::uring_teardown::DRAIN_TIMEOUT`]. `true` means
     /// `in_flight` reached zero and the
     /// buffers are provably free of kernel references; `false` means
-    /// the caller must not release them. See [`super::uring_teardown`]
+    /// the caller must not release them. See [`crate::uring_teardown`]
     /// for why this polls rather than blocking in `submit_and_wait`.
     fn drain(&mut self) -> bool {
         // Flush SQEs that were pushed but never submitted: until they
@@ -1132,8 +1132,8 @@ fn live_stream_uring(
 
 #[cfg(test)]
 mod tests {
-    use super::super::uring_teardown::DRAIN_TIMEOUT;
     use super::*;
+    use crate::uring_teardown::DRAIN_TIMEOUT;
     use io_uring::{IoUring, opcode, types};
 
     /// Connected AF_UNIX stream pair standing in for the replication

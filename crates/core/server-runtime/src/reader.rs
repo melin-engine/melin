@@ -453,7 +453,12 @@ fn reader_loop<A: Application, R: AsRawFd>(
     let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(RING_SIZE as usize * 2);
 
     // Submit the initial eventfd read so we wake on first connection.
+    // `eventfd_armed` mirrors whether that READ is pushed/armed — the
+    // kernel owes its CQE and writes `eventfd_buf` when it lands — and
+    // is maintained at every push/consume site so the teardown quiesce
+    // below can prove when the buffer is free of kernel references.
     push_eventfd_read(&mut ring, wakeup_fd.as_raw_fd(), eventfd_buf.as_mut_ptr());
+    let mut eventfd_armed = true;
 
     // Stage histograms via the global registry. `publish` is the
     // narrow ring-publish call cost (lightweight, gated on
@@ -652,6 +657,12 @@ fn reader_loop<A: Application, R: AsRawFd>(
 
             // ── Eventfd wakeup ──
             if token == EVENTFD_TOKEN {
+                // This CQE is the armed READ completing; the re-arm at
+                // the end of the branch replaces it before anything can
+                // observe the gap, so `eventfd_armed` stays `true`
+                // through the pair. The teardown drain clears it for
+                // the one case where a completion is never processed
+                // here (a CQE still queued when the loop breaks).
                 if result >= 0 {
                     // Process all pending registrations.
                     while let Ok(reg) = command_rx.try_recv() {
@@ -678,7 +689,8 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     error!(error = result, "eventfd read error");
                 }
 
-                // Re-submit eventfd read for the next wakeup.
+                // Re-submit eventfd read for the next wakeup
+                // (`eventfd_armed` stays `true` — see above).
                 push_eventfd_read(&mut ring, wakeup_fd.as_raw_fd(), eventfd_buf.as_mut_ptr());
                 continue;
             }
@@ -914,40 +926,114 @@ fn reader_loop<A: Application, R: AsRawFd>(
         }
     }
 
-    // Quiesce armed operations before the kernel-referenced allocations
-    // (buffer pool, buf_ring, eventfd buffer) leave scope. Closing the
-    // ring fd alone triggers ASYNCHRONOUS cancellation (the kernel's
-    // ring-exit work) which can still be touching those allocations
-    // after this function returns and frees them. Cancel everything
-    // (CANCEL_ANY matches all armed ops), then drain until the CQ stays
-    // quiet — bounded by a deadline so a wedged kernel cannot hang
-    // shutdown. Panic unwind skips this and accepts the (tiny,
-    // process-is-dying) exit-work window; declaration order still
-    // guarantees the ring fd closes before the frees.
-    {
+    // ── Teardown quiesce ────────────────────────────────────────────
+    // Armed operations hold kernel pointers into the buffer pool, the
+    // buf_ring memory, and the eventfd buffer. Closing the ring fd only
+    // triggers ASYNCHRONOUS cancellation (the kernel's ring-exit work),
+    // which can still be touching those allocations after this function
+    // returns and frees them — the same corruption class fixed on both
+    // replication transports (see `crate::uring_teardown`). Quiesce
+    // *provably*: wake every armed operation, then reap CQEs until none
+    // is owed, and leak the buffers if that cannot be shown within the
+    // deadline. "CQ went quiet" is not proof — a wake that silently
+    // failed leaves armed ops and a quiet CQ.
+    //
+    // The wake cannot rely on the cancel opcode alone: some hosts
+    // filter io_uring opcodes (the reason the buf_ring path has a
+    // legacy fallback), and a filtered cancel completes with EINVAL
+    // while the armed operations live on. So each wake is one the
+    // operation itself must answer: `shutdown(2)` on every connection
+    // socket completes its multishot RECV with EOF, a wakeup write
+    // completes the armed eventfd READ, and the tick timeout fires by
+    // itself at its (sub-second) cadence. The cancel is still pushed as
+    // an accelerator where the host honours it. Panic unwind skips all
+    // of this and accepts the (tiny, process-is-dying) exit-work
+    // window; declaration order still closes the ring fd before the
+    // frees.
+    let proven = {
         let cancel_all = opcode::AsyncCancel2::new(types::CancelBuilder::any())
             .build()
             .user_data(CANCEL_TOKEN);
         unsafe {
-            // Ignore a full SQ: the drain below still reaps whatever
-            // completes on its own within the deadline.
+            // Ignore a full SQ: the wakes below do not depend on it.
             let _ = ring.submission().push(&cancel_all);
         }
-        // Best-effort by design — on failure the bounded drain below
-        // still runs and the deadline caps the exposure.
-        let _ = ring.submit();
-        let deadline = Instant::now() + Duration::from_millis(250);
-        let mut quiet_polls = 0u32;
-        while quiet_polls < 10 && Instant::now() < deadline {
-            if ring.completion().next().is_some() {
-                quiet_polls = 0;
-                // Drain the rest of this batch without sleeping.
-                while ring.completion().next().is_some() {}
-            } else {
-                quiet_polls += 1;
-                std::thread::sleep(Duration::from_millis(1));
+        for entry in slab.entries.iter().flatten() {
+            crate::uring_teardown::wake_pending_ops(entry.fd);
+        }
+        // Completes the armed eventfd READ into `eventfd_buf` (still
+        // alive). Best-effort: on failure the cancel is the fallback.
+        let wake: u64 = 1;
+        unsafe {
+            libc::write(
+                wakeup_fd.as_raw_fd(),
+                &wake as *const u64 as *const libc::c_void,
+                8,
+            );
+        }
+        // Flush SQEs pushed but never submitted (re-arms from the last
+        // batch, the cancel above): until they reach the kernel no CQE
+        // is coming for them, but their armed-state flags are already
+        // set, so abandoning them in the SQ would stall the proof
+        // below. On a submit error the flags stay set and the deadline
+        // routes to the leak path — the conservative outcome.
+        loop {
+            match ring.submit() {
+                Ok(_) => break,
+                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(_) => break,
             }
         }
+        let mut backoff = crate::uring_teardown::DrainBackoff::new();
+        loop {
+            for cqe in ring.completion() {
+                match cqe.user_data() {
+                    EVENTFD_TOKEN => eventfd_armed = false,
+                    TICK_TIMEOUT_TOKEN => tick_armed = false,
+                    // Cancel results carry no information; legacy
+                    // ProvideBuffers completions only registered
+                    // addresses — neither reads nor writes the pool.
+                    PROVIDE_BUFS_TOKEN | CANCEL_TOKEN => {}
+                    idx => {
+                        // A terminal CQE retires that connection's arm.
+                        // Data CQEs landing mid-teardown are discarded
+                        // and their buffers deliberately not recycled —
+                        // nothing re-arms, so the pool cannot be
+                        // selected from again once every arm is down.
+                        if (cqe.flags() & IORING_CQE_F_MORE) == 0
+                            && let Some(entry) = slab.get_mut(idx as usize)
+                        {
+                            entry.multishot_active = false;
+                        }
+                    }
+                }
+            }
+            let owed = eventfd_armed
+                || tick_armed
+                || slab.entries.iter().flatten().any(|e| e.multishot_active);
+            if !owed {
+                break true;
+            }
+            if !backoff.wait() {
+                break false;
+            }
+        }
+    };
+    if !proven {
+        // The kernel may still write the pool or the eventfd buffer, or
+        // read buf_ring entries. Leak all three rather than hand the
+        // allocator memory the kernel still touches — a bounded one-off
+        // cost on a thread that is exiting anyway. `mem::forget` on the
+        // `BufRing` also skips its ring-memory dealloc, which is the
+        // point.
+        tracing::warn!(
+            eventfd_armed,
+            tick_armed,
+            "io_uring teardown drain did not complete; leaking reader buffers"
+        );
+        std::mem::forget(buffer_pool);
+        std::mem::forget(buf_ring);
+        std::mem::forget(eventfd_buf);
     }
 
     // No `close` here. This thread shares the eventfd with
@@ -2010,6 +2096,80 @@ mod tests {
             .collect();
         handle.shutdown();
         handle.join();
+    }
+
+    /// Shutdown with live, armed connections must quiesce the ring
+    /// provably and promptly. The armed multishot RECVs sit on sockets
+    /// whose peers never disconnect, so nothing completes them on its
+    /// own — the teardown's wakes (per-connection `shutdown(2)`, the
+    /// eventfd write) are what retire them, including on hosts that
+    /// filter the AsyncCancel opcode, where the old cancel-then-quiet
+    /// teardown could conclude "done" with arms still live against the
+    /// soon-freed pool. A drain that cannot prove quiescence only
+    /// returns at the full deadline (and leaks the buffers), so
+    /// returning well inside it is the proof this test can observe.
+    #[test]
+    fn shutdown_quiesces_armed_connections_promptly() {
+        use std::io::Write as _;
+
+        const CONNS: u64 = 3;
+        let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(1024)
+            .add_consumer()
+            .build();
+        let mut consumer = consumers.pop().expect("consumer");
+        let (control_tx, _control_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut handle = spawn_reader::<TestApp, UnixStream>(
+            producer,
+            Arc::new(TagDecoder),
+            control_tx,
+            0,    // "do not pin" sentinel
+            None, // no idle timeout
+            None, // no tick generator
+            Arc::clone(&shutdown),
+        );
+
+        let mut clients = Vec::new();
+        for id in 0..CONNS {
+            let (mut client, server_side) = UnixStream::pair().expect("socketpair");
+            handle.register(ReaderRegistration {
+                connection_id: ConnectionId(id),
+                reader: server_side,
+                addr: "127.0.0.1:1".parse().expect("addr"),
+                permission: Permission::Trader,
+                key_hash: id,
+            });
+            // One delivered frame per connection proves its multishot
+            // is armed and active before the shutdown fires.
+            client.write_all(&frame(7)).expect("client write");
+            clients.push(client);
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen = 0u64;
+        while seen < CONNS {
+            assert!(
+                Instant::now() < deadline,
+                "frames never arrived ({seen}/{CONNS})"
+            );
+            while consumer.try_consume().is_some() {
+                seen += 1;
+            }
+            std::hint::spin_loop();
+        }
+
+        // The clients stay alive across the shutdown: no peer
+        // disconnect can complete the armed RECVs — only the teardown's
+        // own wakes can.
+        let started = Instant::now();
+        handle.shutdown();
+        handle.join();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < crate::uring_teardown::DRAIN_TIMEOUT / 4,
+            "reader teardown took {elapsed:?}, close to the drain deadline — \
+             armed operations were not woken"
+        );
+        drop(clients);
     }
 
     /// Regression for audit review F1

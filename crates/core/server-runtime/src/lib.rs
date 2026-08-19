@@ -24,6 +24,7 @@ pub mod reader;
 pub mod replication;
 pub mod response;
 pub mod server;
+mod uring_teardown;
 
 #[cfg(feature = "dpdk")]
 pub mod dpdk_response;

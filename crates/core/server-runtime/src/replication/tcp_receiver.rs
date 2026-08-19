@@ -21,12 +21,12 @@ use super::auth::authenticate_with_primary;
 use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
-use super::uring_teardown::{DrainBackoff, wake_pending_ops};
 use super::{
     AfterSession, ReplicaPipelineHandles, ResyncDecision, build_replica_pipeline_with_threads,
     handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_then_double_backoff,
     take_pipeline_for_promotion, teardown_replica_pipeline,
 };
+use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
     encode_ack, encode_handshake, read_frame,
@@ -249,7 +249,7 @@ impl UringTransport {
     }
 
     /// Reap completions until the kernel holds neither buffer, bounded
-    /// by [`super::uring_teardown::DRAIN_TIMEOUT`]. `true` means the
+    /// by [`crate::uring_teardown::DRAIN_TIMEOUT`]. `true` means the
     /// multishot RECV has terminated and any SEND has settled, so both
     /// buffers are provably free of kernel references.
     ///
@@ -935,8 +935,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::uring_teardown::DRAIN_TIMEOUT;
     use super::*;
+    use crate::uring_teardown::DRAIN_TIMEOUT;
     use std::io::Read;
     use std::net::TcpListener;
     use std::time::{Duration, Instant};

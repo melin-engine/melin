@@ -1,17 +1,20 @@
-//! Shared io_uring teardown policy for the replication transports.
+//! Shared io_uring teardown policy for every ring-owning thread: the
+//! replication sender's live-stream ring, the replication receiver's
+//! session ring, and the client-facing reader.
 //!
-//! Both the sender's live-stream ring and the receiver's session ring
-//! hand the kernel pointers into heap buffers — a landing area a RECV
-//! writes into, a source buffer a SEND reads out of. Closing the ring
+//! All of them hand the kernel pointers into heap buffers — a landing
+//! area a RECV writes into, a source buffer a SEND reads out of, a
+//! provided-buffer pool a multishot RECV selects from. Closing the ring
 //! fd does not retract those pointers: ring teardown is *asynchronous*,
 //! so an operation still in flight can complete after the allocation
-//! has been returned to the allocator. On the sender that surfaced as
-//! malloc-metadata corruption and a SIGSEGV at thread exit; being a
-//! kernel-side store, it is invisible to AddressSanitizer.
+//! has been returned to the allocator. On the replication sender that
+//! surfaced as malloc-metadata corruption and a SIGSEGV at thread exit;
+//! being a kernel-side store, it is invisible to AddressSanitizer.
 //!
-//! Both sides therefore tear down the same way, and share the policy
+//! Every side therefore tears down the same way, and shares the policy
 //! here so it cannot drift apart: wake whatever the kernel holds with a
-//! `shutdown(2)`, reap completions until it holds nothing, and only
+//! `shutdown(2)` (never an AsyncCancel alone — some hosts filter
+//! io_uring opcodes), reap completions until it holds nothing, and only
 //! then release the buffers — leaking them if the drain cannot be
 //! proven complete.
 
@@ -23,7 +26,7 @@ use std::time::{Duration, Instant};
 /// expected to complete within microseconds; this bounds only the
 /// pathological case (a wedged io-wq worker), where waiting forever
 /// would hang the transport thread and everything that joins it.
-pub(super) const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Poll iterations spent spinning before backing off to a sleep.
 const SPIN_LIMIT: u32 = 1024;
@@ -43,9 +46,9 @@ const BACKOFF_SLEEP: Duration = Duration::from_micros(200);
 /// fd that outlives the ring being torn down, and a socket the peer
 /// already reset simply answers `ENOTCONN`, which changes nothing about
 /// the drain that follows.
-pub(super) fn wake_pending_ops(fd: RawFd) {
-    // SAFETY: `fd` belongs to a `TcpStream` that outlives the ring
-    // being torn down — see the `tcp_fd` field docs on each caller.
+pub(crate) fn wake_pending_ops(fd: RawFd) {
+    // SAFETY: `fd` belongs to a socket that outlives the ring being
+    // torn down — see the fd-holding field docs on each caller.
     unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
 }
 
@@ -56,13 +59,13 @@ pub(super) fn wake_pending_ops(fd: RawFd) {
 /// failed to rouse would hang the thread — and everything that joins it
 /// — forever, and trading a use-after-free for a deadlock is not a
 /// trade worth making.
-pub(super) struct DrainBackoff {
+pub(crate) struct DrainBackoff {
     deadline: Instant,
     spins: u32,
 }
 
 impl DrainBackoff {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             deadline: Instant::now() + DRAIN_TIMEOUT,
             spins: 0,
@@ -72,7 +75,7 @@ impl DrainBackoff {
     /// Pause before the next completion-queue poll. Returns `false` once
     /// the deadline has passed, at which point the caller must keep
     /// treating its buffers as kernel-visible.
-    pub(super) fn wait(&mut self) -> bool {
+    pub(crate) fn wait(&mut self) -> bool {
         if Instant::now() >= self.deadline {
             return false;
         }
