@@ -941,15 +941,15 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // The wake cannot rely on the cancel opcode alone: some hosts
     // filter io_uring opcodes (the reason the buf_ring path has a
     // legacy fallback), and a filtered cancel completes with EINVAL
-    // while the armed operations live on. So each wake is one the
-    // operation itself must answer: `shutdown(2)` on every connection
-    // socket completes its multishot RECV with EOF, a wakeup write
-    // completes the armed eventfd READ, and the tick timeout fires by
-    // itself at its (sub-second) cadence. The cancel is still pushed as
-    // an accelerator where the host honours it. Panic unwind skips all
-    // of this and accepts the (tiny, process-is-dying) exit-work
-    // window; declaration order still closes the ring fd before the
-    // frees.
+    // while the armed operations live on. So every operation that has
+    // to be proven down gets a wake it must answer: `shutdown(2)` on
+    // each connection socket completes its multishot RECV with EOF,
+    // and a wakeup write completes the armed eventfd READ. The cancel
+    // is still pushed as an accelerator where the host honours it. The
+    // tick timeout is not in the proof at all — see `owed` below.
+    // Panic unwind skips all of this and accepts the (tiny,
+    // process-is-dying) exit-work window; declaration order still
+    // closes the ring fd before the frees.
     let proven = {
         let cancel_all = opcode::AsyncCancel2::new(types::CancelBuilder::any())
             .build()
@@ -989,11 +989,14 @@ fn reader_loop<A: Application, R: AsRawFd>(
             for cqe in ring.completion() {
                 match cqe.user_data() {
                     EVENTFD_TOKEN => eventfd_armed = false,
-                    TICK_TIMEOUT_TOKEN => tick_armed = false,
-                    // Cancel results carry no information; legacy
-                    // ProvideBuffers completions only registered
-                    // addresses — neither reads nor writes the pool.
-                    PROVIDE_BUFS_TOKEN | CANCEL_TOKEN => {}
+                    // None of these touch the allocations freed below,
+                    // so reaping them settles nothing: cancel results
+                    // carry no information, legacy ProvideBuffers
+                    // completions only registered addresses, and the
+                    // tick timeout reads nothing after submit (see
+                    // `owed`).
+                    PROVIDE_BUFS_TOKEN | CANCEL_TOKEN | TICK_TIMEOUT_TOKEN => {}
+                    // Connection tokens are slab indices.
                     idx => {
                         // A terminal CQE retires that connection's arm.
                         // Data CQEs landing mid-teardown are discarded
@@ -1008,9 +1011,21 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     }
                 }
             }
-            let owed = eventfd_armed
-                || tick_armed
-                || slab.entries.iter().flatten().any(|e| e.multishot_active);
+            // `tick_armed` is deliberately absent: an armed
+            // `IORING_OP_TIMEOUT` holds no pointer into any of the
+            // allocations below. The kernel copies its `Timespec` out
+            // of `tick_ts` when the SQE is *submitted* (which is why
+            // that binding only has to outlive the submit — see its
+            // declaration), and the ring's own exit work retires the
+            // timer. Waiting for it would prove nothing and cost
+            // plenty: nothing here can wake a timeout, so the only
+            // things that retire one are it firing at its own cadence
+            // — `--tick-interval-ms`, operator-set and unbounded — or
+            // the cancel above, which is exactly what a host that
+            // filters opcodes refuses. Gating the proof on it would
+            // hand those hosts a full-deadline stall and a spurious
+            // "leaking" warning on every clean shutdown.
+            let owed = eventfd_armed || slab.entries.iter().flatten().any(|e| e.multishot_active);
             if !owed {
                 break true;
             }
@@ -1026,9 +1041,17 @@ fn reader_loop<A: Application, R: AsRawFd>(
         // cost on a thread that is exiting anyway. `mem::forget` on the
         // `BufRing` also skips its ring-memory dealloc, which is the
         // point.
+        // Report what was still owed, not `tick_armed` — naming a
+        // timer that was never part of the proof would point the next
+        // reader at the wrong operation.
         tracing::warn!(
             eventfd_armed,
-            tick_armed,
+            armed_connections = slab
+                .entries
+                .iter()
+                .flatten()
+                .filter(|e| e.multishot_active)
+                .count(),
             "io_uring teardown drain did not complete; leaking reader buffers"
         );
         std::mem::forget(buffer_pool);
