@@ -22,8 +22,7 @@ pub use melin_transport_core::durability_policy::{
 /// Operator-facing durability mode. Each variant maps to one of four
 /// named policies that compose the underlying [`Clause`] list directly
 /// in code, replacing the legacy `--durability-policy <STRING>` DSL.
-/// See `docs/replication.md` for the three-tier menu in operational
-/// terms.
+/// See `docs/replication.md` for the mode menu in operational terms.
 ///
 /// Sentinel for "no primary acking mode observed yet" in the
 /// replica-side gauge the replication stream feeds (see
@@ -131,16 +130,27 @@ impl DurabilityMode {
     /// a runtime swap (via the admin `DURABILITY` command) with a
     /// relaxed load on every gate iteration — cheaper than crossing a
     /// `Mutex` or carrying a refcounted `Arc<Policy>` snapshot.
-    /// Values are part of the in-process ABI between admin and
-    /// response, not a wire format; they must remain stable so the
-    /// round-trip `from_u8(as_u8(x)) == Some(x)` always holds.
+    ///
+    /// **These values are a wire format**, not just an in-process ABI:
+    /// the primary stamps this byte onto every `StreamStart` and
+    /// `Heartbeat`, and the replica decodes it with [`from_u8`] to
+    /// judge auto-promotion (see `raft_promotion`). So they must stay
+    /// stable across releases in two directions — the round-trip
+    /// `from_u8(as_u8(x)) == Some(x)` has to hold, *and* a value once
+    /// released can never be reassigned to a different mode, or a peer
+    /// on an older build would silently read the new mode as the old
+    /// one. Add new modes on the next free byte; never renumber.
+    ///
+    /// A peer that does not know a byte gets `None` and refuses to
+    /// auto-promote on it — fail-closed, and the reason replicas must
+    /// be upgraded before a primary starts advertising a new mode.
     pub fn as_u8(self) -> u8 {
         match self {
             DurabilityMode::Local => 0,
             DurabilityMode::Hybrid => 1,
             DurabilityMode::DurablyReplicated => 2,
-            // 3, not a re-sort: the values are a stable ABI (see doc
-            // comment), so a later variant takes the next free byte
+            // 3, not a re-sort: these bytes are on the wire (see doc
+            // comment), so a later variant takes the next free one
             // regardless of where it sits in the operator-facing menu.
             DurabilityMode::Replicated => 3,
         }

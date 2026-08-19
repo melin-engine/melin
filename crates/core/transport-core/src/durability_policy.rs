@@ -769,9 +769,11 @@ mod tests {
             // reachable in production — the only `u64::MAX` cursor in a
             // real view is the primary's in-memory sentinel, and every
             // `DurabilityMode` clause is either persisted-level or
-            // requires a second node, so the binding value is always a
-            // real journal position — so the fold is left alone and the
-            // case is excluded here rather than papered over.
+            // requires a second node, so the binding value always comes
+            // from some other node's real cursor (a replica's in-memory
+            // receipt under `replicated`, a journal position otherwise)
+            // — so the fold is left alone and the case is excluded here
+            // rather than papered over.
             prop_assume!(expected != u64::MAX);
             prop_assert_eq!(policy.evaluate(&CursorView::new(&nodes)), expected);
         }
