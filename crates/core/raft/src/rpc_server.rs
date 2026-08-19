@@ -122,6 +122,12 @@ pub struct RpcServerConfig {
     /// Local journal tip: stamped on every response envelope, and the
     /// voter side of the recency filter below.
     pub tip: Arc<TipSource>,
+    /// Sink for peers' advertised tips, recorded off every inbound
+    /// frame under the connection's authenticated peer id — this is how
+    /// a follower learns its leader's tip (every append carries it).
+    /// Feeds the promotion-time journal-safety check; see
+    /// [`crate::recency::PeerTips`].
+    pub peer_tips: Arc<crate::recency::PeerTips>,
     /// Fence-on-supersession (see [`SupersessionPolicy`]); `None` when
     /// auto-promotion is off — without automation, fencing stays a
     /// data-plane-contact concern exactly as documented today.
@@ -292,6 +298,16 @@ async fn handle_connection<A: RaftApi>(
         // Fence-on-supersession: every peer envelope advertises the
         // sender's fencing epoch (see `SupersessionPolicy`).
         cfg.observe_peer_epoch(frame.tip_epoch);
+
+        // Record the sender's advertised tip under its authenticated
+        // peer id for the promotion-time journal-safety check.
+        cfg.peer_tips.record(
+            peer_id,
+            JournalTip {
+                epoch: frame.tip_epoch,
+                last_sequence: frame.tip_seq,
+            },
+        );
 
         // Journal-tip recency filter (see `crate::recency`): a vote
         // request from a candidate behind our own tip is dropped before

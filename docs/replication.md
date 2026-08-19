@@ -331,6 +331,21 @@ Auto-promotion is deliberately conservative. The elected replica
 - the primary was acking under `local` durability — acks never waited
   for any replica, so no election can prove the winner holds every
   acked order; failover stays a manual, eyes-on decision under `local`;
+- **a reachable peer holds more data than it does.** Election steering
+  is best-effort, so a behind replica can end up holding leadership —
+  and under `hybrid`/`replicated` an ack only requires the *fastest*
+  replica, so at the moment of a crash the slower replica legitimately
+  lacks the newest acked events. Every raft message carries the
+  sender's journal position; the winner refuses to promote while any
+  peer it can still hear advertises a position ahead of its own. The
+  caught-up peer recognizes the standoff (it sees the leader's
+  position on every heartbeat) and takes over leadership itself, so
+  promotion lands on the node that holds every acked event. A peer
+  that has genuinely stopped responding cannot hold this up: after a
+  short grace it is treated as dead — nothing better is reachable —
+  and promotion proceeds, with a loud log if that peer's last known
+  position was ahead (its journal is then the reconciliation source
+  when it returns);
 - manual promotions have outrun election terms (the term must be
   strictly above the epoch in force; the alignment heals as terms
   advance — promote manually in the interim).
@@ -537,13 +552,18 @@ connection separate from the client protocol.
 
 Most failures resolve without operator action:
 
-- **Primary crashes, one or both replicas alive** — promote any
-  surviving replica via `PROMOTE`. Under `hybrid` or
-  `durably-replicated`, all surviving replicas hold the same set of
-  acked events (the contract guaranteed that before the client was
-  told). Under `replicated`, at least one surviving replica holds
-  every acked event — promote the most caught-up one (a raft-driven
-  failover already elects it), and **do not restart the old primary as
+- **Primary crashes, one or both replicas alive** — promote the most
+  caught-up surviving replica. With a single replica, the durability
+  contract guarantees it holds every acked event (`replicated`,
+  `hybrid`, and `durably-replicated` all required its confirmation
+  before each ack). With two replicas, an ack only ever required the
+  *faster* one, so the two may differ by the final instants of
+  traffic: a raft-driven failover handles this — it steers the
+  election toward the most caught-up node, and a winner refuses to
+  promote while a reachable peer holds more (see "Automatic
+  failover"). For a manual `PROMOTE`, compare `journal_sequence` on
+  each replica's `/healthz` first and promote the higher one. Under
+  `replicated`, additionally **do not restart the old primary as
   primary**: its journal may be short of events it already acked, and
   bringing it back in that role discards them (see "Failover is
   mandatory" above). Bring it back as a replica instead. Send

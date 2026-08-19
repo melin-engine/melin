@@ -940,13 +940,16 @@ where
         // primaries have nothing to promote — replica paths only. The
         // guard joins the thread on every exit path.
         if config.raft_auto_promote
-            && let Some(status) = raft.status()
+            && let Some(wiring) = raft.promotion_wiring()
         {
             raft.arm_promotion(crate::raft_promotion::spawn_auto_promotion(
-                status,
+                wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
                 Arc::clone(&durability_mode_atomic),
+                wiring.peer_tips,
+                wiring.peer_ids,
+                wiring.elect_requested,
                 Arc::clone(&shutdown),
             ));
         }
@@ -2289,13 +2292,16 @@ where
         // primaries have nothing to promote — replica paths only. The
         // guard joins the thread on every exit path.
         if config.raft_auto_promote
-            && let Some(status) = raft.status()
+            && let Some(wiring) = raft.promotion_wiring()
         {
             raft.arm_promotion(crate::raft_promotion::spawn_auto_promotion(
-                status,
+                wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
                 Arc::clone(&durability_mode_atomic),
+                wiring.peer_tips,
+                wiring.peer_ids,
+                wiring.elect_requested,
                 Arc::clone(&shutdown),
             ));
         }

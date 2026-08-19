@@ -28,8 +28,13 @@
 //! leader observed, it stops filtering until a leader is next seen,
 //! letting Raft's own rules elect whoever they can. The filter is
 //! therefore best-effort steering, not a guarantee: the authoritative
-//! journal-safety check belongs at *promotion* time (the auto-promotion
-//! policy refuses independently), never at the ballot box.
+//! journal-safety check belongs at *promotion* time, never at the
+//! ballot box. That check exists — the auto-promotion policy in
+//! `melin-server-runtime` refuses to promote while a recently-heard
+//! peer advertises a higher tip, fed by [`PeerTips`] below — so a
+//! behind node that wins here (via the escape, or by holding
+//! leadership from before the failure) stalls loudly instead of
+//! promoting, and nudges the caught-up peer to campaign.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -59,6 +64,12 @@ impl JournalTip {
     fn key(self) -> (u64, u64) {
         (self.epoch, self.last_sequence)
     }
+
+    /// Strictly ahead of `other` in the (epoch, sequence) tip order —
+    /// the comparison the promotion-time journal-safety veto uses.
+    pub fn is_ahead_of(self, other: JournalTip) -> bool {
+        self.key() > other.key()
+    }
 }
 
 /// Live source of this node's advertised journal tip, read by the RPC
@@ -87,6 +98,72 @@ impl TipSource {
         // Acquire pairs with the recovery path's Release store, which
         // happens after both halves are seeded.
         self.ready.load(Ordering::Acquire)
+    }
+}
+
+/// Last journal tip heard from each configured peer, with when it was
+/// heard. Every control-plane RPC envelope — request and response —
+/// carries the sender's tip, so this fills from both directions: the
+/// RPC server records inbound frames per authenticated peer, and the
+/// RPC client records every reply from its target. A leader therefore
+/// learns its followers' tips within one heartbeat round, and a
+/// follower learns its leader's tip from every append.
+///
+/// Read by the auto-promotion policy in `melin-server-runtime`: the
+/// promotion-time journal-safety check the vote filter above defers to.
+pub struct PeerTips {
+    /// `Mutex<HashMap>` rather than anything lock-free: written a few
+    /// times per heartbeat interval per peer and read once per 100 ms
+    /// promotion poll, so contention is irrelevant; and the map holds
+    /// 2–4 entries (the configured voter set), so `HashMap` vs anything
+    /// smarter is noise. Never touched by the data plane.
+    inner: std::sync::Mutex<std::collections::HashMap<crate::types::NodeId, TipSample>>,
+}
+
+/// One recorded observation: the advertised tip and when it arrived.
+#[derive(Debug, Clone, Copy)]
+struct TipSample {
+    tip: JournalTip,
+    at: std::time::Instant,
+}
+
+impl PeerTips {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Record a tip heard from `peer` now.
+    pub fn record(&self, peer: crate::types::NodeId, tip: JournalTip) {
+        self.record_at(peer, tip, std::time::Instant::now());
+    }
+
+    /// Deterministic-time seam for `record` — tests inject the arrival
+    /// instant so aging is assertable without sleeping.
+    pub fn record_at(&self, peer: crate::types::NodeId, tip: JournalTip, at: std::time::Instant) {
+        // Poisoning unreachable under panic=abort (no unwinding).
+        let mut map = self.inner.lock().expect("peer tips mutex poisoned");
+        map.insert(peer, TipSample { tip, at });
+    }
+
+    /// The last tip heard from `peer` and how long ago it arrived
+    /// (relative to `now`), or `None` if the peer has never been heard.
+    pub fn sample(
+        &self,
+        peer: crate::types::NodeId,
+        now: std::time::Instant,
+    ) -> Option<(JournalTip, std::time::Duration)> {
+        // Poisoning unreachable under panic=abort (no unwinding).
+        let map = self.inner.lock().expect("peer tips mutex poisoned");
+        map.get(&peer)
+            .map(|s| (s.tip, now.saturating_duration_since(s.at)))
+    }
+}
+
+impl Default for PeerTips {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -168,6 +245,37 @@ mod tests {
     #[test]
     fn equal_tips_pass() {
         assert!(candidate_is_current(tip(3, 100), tip(3, 100)));
+    }
+
+    #[test]
+    fn peer_tips_sample_returns_latest_with_age() {
+        use std::time::{Duration, Instant};
+        let tips = PeerTips::new();
+        let t0 = Instant::now();
+        assert!(tips.sample(2, t0).is_none(), "never-heard peer is None");
+
+        tips.record_at(2, tip(1, 10), t0);
+        // A later observation replaces the earlier one entirely.
+        tips.record_at(2, tip(1, 42), t0 + Duration::from_millis(500));
+
+        let (t, age) = tips.sample(2, t0 + Duration::from_secs(2)).expect("sample");
+        assert_eq!(t, tip(1, 42));
+        assert_eq!(age, Duration::from_millis(1500));
+
+        // Peers are independent.
+        assert!(tips.sample(3, t0 + Duration::from_secs(2)).is_none());
+    }
+
+    #[test]
+    fn peer_tips_age_saturates_for_out_of_order_clock_reads() {
+        use std::time::{Duration, Instant};
+        let tips = PeerTips::new();
+        let t0 = Instant::now();
+        tips.record_at(2, tip(1, 10), t0 + Duration::from_secs(1));
+        // `now` earlier than the record instant (racing clock reads
+        // between threads) must yield age zero, not a panic.
+        let (_, age) = tips.sample(2, t0).expect("sample");
+        assert_eq!(age, Duration::ZERO);
     }
 
     #[test]

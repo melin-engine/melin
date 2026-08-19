@@ -121,6 +121,10 @@ pub(crate) fn build_raft_config(config: &ServerConfig) -> Result<Option<RaftConf
 pub(crate) struct RaftDriverGuard {
     /// `None` when raft is not configured — the guard is then inert.
     handles: Option<RaftHandles>,
+    /// Configured voter ids excluding this node — what the promotion
+    /// policy's journal-safety veto must account for. Empty when raft
+    /// is off.
+    peer_ids: Vec<u64>,
     /// Auto-promotion poll thread (replica paths under
     /// `--raft-auto-promote`), adopted via [`Self::arm_promotion`]. Exits
     /// within one 100 ms poll of the shutdown flag, or the moment a
@@ -129,12 +133,22 @@ pub(crate) struct RaftDriverGuard {
     shutdown: Arc<AtomicBool>,
 }
 
+/// Everything [`crate::raft_promotion::spawn_auto_promotion`] needs from
+/// the driver, returned by [`RaftDriverGuard::promotion_wiring`].
+pub(crate) struct PromotionWiring {
+    pub(crate) status: Arc<melin_transport_core::health::RaftStatus>,
+    pub(crate) peer_tips: Arc<melin_raft::recency::PeerTips>,
+    pub(crate) peer_ids: Vec<u64>,
+    pub(crate) elect_requested: Arc<AtomicBool>,
+}
+
 impl RaftDriverGuard {
     /// Guard for a node without a control plane (raft off). Dropping it
     /// does nothing.
     pub(crate) fn disabled(shutdown: &Arc<AtomicBool>) -> Self {
         Self {
             handles: None,
+            peer_ids: Vec::new(),
             promotion: None,
             shutdown: Arc::clone(shutdown),
         }
@@ -143,6 +157,16 @@ impl RaftDriverGuard {
     /// Election state for the health gauges; `None` when raft is off.
     pub(crate) fn status(&self) -> Option<Arc<melin_transport_core::health::RaftStatus>> {
         self.handles.as_ref().map(|h| Arc::clone(&h.status))
+    }
+
+    /// The promotion thread's inputs; `None` when raft is off.
+    pub(crate) fn promotion_wiring(&self) -> Option<PromotionWiring> {
+        self.handles.as_ref().map(|h| PromotionWiring {
+            status: Arc::clone(&h.status),
+            peer_tips: Arc::clone(&h.peer_tips),
+            peer_ids: self.peer_ids.clone(),
+            elect_requested: Arc::clone(&h.elect_requested),
+        })
     }
 
     /// Adopt the auto-promotion thread so it is joined on every exit
@@ -225,6 +249,13 @@ pub(crate) fn spawn_raft_driver(
         shutdown: Arc::clone(shutdown),
         serving: serving_claim,
     });
+    // The voter set the promotion veto must account for: everyone but us.
+    let peer_ids: Vec<u64> = raft_config
+        .peers
+        .iter()
+        .map(|p| p.id)
+        .filter(|&id| id != raft_config.node_id)
+        .collect();
     let handles = melin_raft::driver::spawn(
         raft_config,
         Arc::new(signing_key.clone()),
@@ -235,6 +266,7 @@ pub(crate) fn spawn_raft_driver(
     )?;
     Ok(RaftDriverGuard {
         handles: Some(handles),
+        peer_ids,
         promotion: None,
         shutdown: Arc::clone(shutdown),
     })

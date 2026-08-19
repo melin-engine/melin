@@ -93,6 +93,7 @@ async fn start_server() -> Harness {
         authorized_keys,
         peer_ids,
         tip: tip_at(0, 0),
+        peer_tips: Arc::new(melin_raft::recency::PeerTips::new()),
         supersession: None,
         vote_filter: std::sync::Mutex::new(Default::default()),
     });
@@ -108,7 +109,11 @@ async fn start_server() -> Harness {
 }
 
 async fn client_for(h: &Harness, key: &SigningKey) -> impl RaftNetwork<TypeConfig> {
-    let mut factory = RaftClientFactory::new(Arc::new(key.clone()), tip_at(0, 0));
+    let mut factory = RaftClientFactory::new(
+        Arc::new(key.clone()),
+        tip_at(0, 0),
+        Arc::new(melin_raft::recency::PeerTips::new()),
+    );
     factory
         .new_client(
             1,
@@ -269,12 +274,17 @@ async fn votes_are_dropped_until_the_tip_is_ready() {
             seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0)),
             ready: Arc::clone(&ready),
         }),
+        peer_tips: Arc::new(melin_raft::recency::PeerTips::new()),
         supersession: None,
         vote_filter: std::sync::Mutex::new(Default::default()),
     });
     tokio::spawn(serve(listener, MockApi, cfg, Arc::clone(&shutdown)));
 
-    let mut factory = RaftClientFactory::new(Arc::new(client_key.clone()), tip_at(0, 0));
+    let mut factory = RaftClientFactory::new(
+        Arc::new(client_key.clone()),
+        tip_at(0, 0),
+        Arc::new(melin_raft::recency::PeerTips::new()),
+    );
     let node = BasicNode { addr };
 
     let mut client = factory.new_client(1, &node).await;
@@ -334,6 +344,7 @@ async fn serving_node_fences_on_higher_peer_epoch() {
             seq: AdvertisedJournalTip::new(melin_transport_core::WireSeq::new(0)),
             ready: Arc::new(AtomicBool::new(true)),
         }),
+        peer_tips: Arc::new(melin_raft::recency::PeerTips::new()),
         supersession: Some(SupersessionPolicy {
             fence: Arc::clone(&fence),
             shutdown: Arc::clone(&process_shutdown),
@@ -344,7 +355,11 @@ async fn serving_node_fences_on_higher_peer_epoch() {
     tokio::spawn(serve(listener, MockApi, cfg, Arc::clone(&shutdown)));
 
     // A peer whose envelopes advertise epoch 7 — a newer tenure exists.
-    let mut factory = RaftClientFactory::new(Arc::new(client_key.clone()), tip_at(7, 100));
+    let mut factory = RaftClientFactory::new(
+        Arc::new(client_key.clone()),
+        tip_at(7, 100),
+        Arc::new(melin_raft::recency::PeerTips::new()),
+    );
     let mut client = factory.new_client(1, &BasicNode { addr }).await;
     // The RPC itself may succeed or fail (the server may begin shutting
     // down mid-exchange) — the assertion is the fencing side effect.

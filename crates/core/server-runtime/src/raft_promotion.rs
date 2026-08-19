@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+use melin_raft::recency::{JournalTip, PeerTips};
 use melin_transport_core::health::RaftStatus;
 use tracing::{info, warn};
 
@@ -52,6 +53,59 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// the cluster up primary-first — see `docs/replication.md`.
 const PRIMARY_DOWN_GRACE: Duration = Duration::from_secs(3);
 
+/// How long a configured peer may go unheard before the journal-safety
+/// veto treats it as dead rather than merely not-yet-sampled.
+///
+/// The clock this grace runs against is *leadership tenure*: only
+/// leaders and candidates emit control-plane RPCs, so a node that just
+/// won an election starts with an empty peer-tip table and fills it
+/// from the heartbeat responses that begin immediately (200–350 ms
+/// interval — a live peer produces its first sample within one round).
+/// A peer still unheard after several rounds is down — typically the
+/// dead primary the failover is *for* — and must not hold up promotion
+/// forever. 1.5 s covers four-plus heartbeat rounds with margin while
+/// bounding the extra failover delay it can add.
+///
+/// The same window ages recorded samples: a peer whose last tip is
+/// older than this has stopped answering heartbeats and is treated as
+/// dead too — its data is unreachable, so nothing better is available
+/// and promotion may proceed (loudly, if its last tip was ahead).
+const PEER_TIP_GRACE: Duration = Duration::from_millis(1500);
+
+/// One configured peer's journal-tip observation, digested from
+/// [`PeerTips`] by the poll loop so [`auto_promotion_decision`] stays a
+/// pure function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerTipObservation {
+    /// Heard within [`PEER_TIP_GRACE`] — the tip is current.
+    Fresh(JournalTip),
+    /// Dead as far as this node can tell: last heard longer than the
+    /// grace ago (with its final tip), or never heard although we have
+    /// been leader — i.e. heartbeating it — for longer than the grace.
+    Silent { last: Option<JournalTip> },
+    /// Never heard, and we have not been leader long enough to conclude
+    /// anything. The veto waits.
+    Unknown,
+}
+
+/// Digest one peer's [`PeerTips`] sample into an observation.
+/// `leader_for` is how long this node has continuously been leader in
+/// the current term — the only sound baseline for "we have been trying
+/// to reach it", since only leaders emit RPCs.
+fn observe_peer(
+    peer_tips: &PeerTips,
+    peer: u64,
+    leader_for: Duration,
+    now: Instant,
+) -> PeerTipObservation {
+    match peer_tips.sample(peer, now) {
+        Some((tip, age)) if age <= PEER_TIP_GRACE => PeerTipObservation::Fresh(tip),
+        Some((tip, _)) => PeerTipObservation::Silent { last: Some(tip) },
+        None if leader_for > PEER_TIP_GRACE => PeerTipObservation::Silent { last: None },
+        None => PeerTipObservation::Unknown,
+    }
+}
+
 /// The durability mode the auto-promotion refusal judges: the mode
 /// the *primary* last advertised on the replication stream — that is
 /// the gate acked orders actually passed through — falling back to
@@ -90,9 +144,13 @@ struct AutoPromotionInputs {
     /// booted (streaming started, i.e. the acking-mode gauge left
     /// `ACKING_MODE_UNKNOWN`). Process-lifetime, not per-session.
     primary_observed: bool,
-    /// This node's advertised journal tip is still at sequence 0 — it
-    /// holds no journal data at all.
-    journal_empty: bool,
+    /// This node's own journal tip (fencing epoch + advertised
+    /// sequence) — the local side of the peer-tip veto, and
+    /// `last_sequence == 0` is the blank-genesis-node signal.
+    local_tip: JournalTip,
+    /// Journal-tip observation for every *other* configured voter,
+    /// digested by the poll loop (see [`observe_peer`]).
+    peers: Vec<(u64, PeerTipObservation)>,
     /// The term this node was elected at.
     term: u64,
     /// The fencing epoch currently in force.
@@ -129,6 +187,17 @@ struct AutoPromotionInputs {
 /// - `local` durability — acks in `local` mode never waited for this
 ///   replica, so no election can prove it holds every acked order.
 ///   Failover stays a manual, eyes-on decision.
+/// - `peers` — the authoritative journal-safety check the vote filter
+///   defers to (see `melin_raft::recency`). The election is only
+///   best-effort steering: a behind node can win via the filter's
+///   liveness escape, or hold leadership from before the failure. So
+///   the decision independently refuses while any reachable peer
+///   advertises a tip ahead of ours — under `hybrid`/`replicated` the
+///   ack quorum is the primary plus the *fastest* replica, so the
+///   slower replica legitimately lacks the newest acked events and
+///   must not serve. A peer still `Unknown` (heartbeat responses not
+///   yet arrived) also blocks, briefly; a `Silent` peer does not — its
+///   data is unreachable, so nothing better is available.
 /// - `term > fence_epoch` — the promotion journals `epoch = term`, so
 ///   the term must be strictly newer than every epoch already in
 ///   force; two auto-promotions from different elections then always
@@ -152,12 +221,30 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
              a transient blip from a real failure before failover",
         );
     }
-    if !inputs.primary_observed && inputs.journal_empty {
+    if !inputs.primary_observed && inputs.local_tip.last_sequence == 0 {
         return Err(
             "no primary has been observed since boot and the local journal is empty — a blank \
              genesis node must not depose a primary that may still be starting; bring the \
              primary up first, or promote manually",
         );
+    }
+    for (_peer, obs) in &inputs.peers {
+        match obs {
+            PeerTipObservation::Fresh(tip) if tip.is_ahead_of(inputs.local_tip) => {
+                return Err(
+                    "a live peer advertises a journal tip ahead of ours — it holds acked events \
+                     this node lacks; refusing to promote so the caught-up peer can take over \
+                     (it campaigns on its own once it sees this leadership)",
+                );
+            }
+            PeerTipObservation::Fresh(_) | PeerTipObservation::Silent { .. } => {}
+            PeerTipObservation::Unknown => {
+                return Err(
+                    "a configured peer's journal tip is still unknown — waiting up to one \
+                     peer-tip grace to learn whether it holds acked events this node lacks",
+                );
+            }
+        }
     }
     match inputs.durability_mode {
         Some(DurabilityMode::Local) => {
@@ -188,15 +275,22 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
 /// One poll: if this node currently leads the control plane and the
 /// policy allows it, file a promotion request carrying the election
 /// term. Standing refusals are logged once per term, not once per poll.
+#[allow(clippy::too_many_arguments)] // poll-loop assembly point; a struct would just restate it
 fn consider_auto_promotion(
     status: &RaftStatus,
     control: &ReplicaControlPlane,
     fence_state: &melin_transport_core::fence::FenceState,
     durability_mode: &AtomicU8,
+    peer_tips: &PeerTips,
+    // Configured voter ids excluding this node.
+    peer_ids: &[u64],
     // How long the primary link has been continuously down — tracked by
     // the poll loop so the decision stays a pure function (see
     // [`PRIMARY_DOWN_GRACE`]). `ZERO` while the link is up.
     primary_link_down_for: Duration,
+    // How long this node has continuously been leader in the current
+    // term — the baseline for the peer-tip veto's `Unknown` grace.
+    leader_for: Duration,
     last_refused_term: &mut u64,
 ) {
     if !status.running.load(Ordering::Relaxed)
@@ -209,6 +303,11 @@ fn consider_auto_promotion(
     // Loaded once: both the effective mode and the observed-a-primary
     // fact must come from the same snapshot of the gauge.
     let observed_mode = control.primary_acking_mode.load(Ordering::Acquire);
+    // Loaded once for the same reason: `local_tip.epoch` and the
+    // `fence_epoch` input must not tear if a fencing event lands
+    // mid-poll.
+    let fence_epoch = fence_state.epoch();
+    let now = Instant::now();
     let inputs = AutoPromotionInputs {
         tip_ready: control.tip_ready.load(Ordering::Acquire),
         fenced: fence_state.is_fenced(),
@@ -219,12 +318,38 @@ fn consider_auto_promotion(
         primary_link_up: control.primary_link_up.load(Ordering::Acquire),
         primary_link_down_for,
         primary_observed: observed_mode != crate::durability_policy::ACKING_MODE_UNKNOWN,
-        journal_empty: control.journal_tip.load().get() == 0,
+        local_tip: JournalTip {
+            epoch: fence_epoch,
+            last_sequence: control.journal_tip.load().get(),
+        },
+        peers: peer_ids
+            .iter()
+            .map(|&p| (p, observe_peer(peer_tips, p, leader_for, now)))
+            .collect(),
         term,
-        fence_epoch: fence_state.epoch(),
+        fence_epoch,
     };
     match auto_promotion_decision(&inputs) {
         Ok(()) => {
+            // A silent peer whose *last known* tip was ahead cannot block
+            // promotion — its data is unreachable, so nothing better is
+            // available — but the operator must know acked events may be
+            // recoverable only from that node's disk when it returns.
+            for (peer, obs) in &inputs.peers {
+                if let PeerTipObservation::Silent { last: Some(tip) } = obs
+                    && tip.is_ahead_of(inputs.local_tip)
+                {
+                    warn!(
+                        node_id = status.node_id,
+                        peer,
+                        peer_tip = ?tip,
+                        local_tip = ?inputs.local_tip,
+                        "promoting although an unreachable peer last advertised a journal tip \
+                         ahead of ours — events acked past our tip exist only on that node; \
+                         reconcile from its journal when it returns"
+                    );
+                }
+            }
             // `request` can only lose to a racing manual PROMOTE; either
             // way a promotion is now in flight.
             if control.promote.request(term) {
@@ -239,10 +364,101 @@ fn consider_auto_promotion(
                 *last_refused_term = term;
                 warn!(
                     node_id = status.node_id,
-                    term, reason, "elected leader but refusing auto-promotion"
+                    term,
+                    reason,
+                    peers = ?inputs.peers,
+                    local_tip = ?inputs.local_tip,
+                    "elected leader but refusing auto-promotion"
                 );
             }
         }
+    }
+}
+
+/// Voter-side of the takeover handshake: should this *follower* nudge
+/// an election because the standing control-plane leader is behind its
+/// journal tip during a failover window?
+///
+/// The peer-tip veto above makes a behind leader refuse to promote —
+/// which prevents data loss but leaves the cluster primary-less, since
+/// the caught-up node holds the data and not the leadership. This is
+/// the other half: the caught-up node sees the leader's tip on every
+/// inbound append envelope, recognizes the standoff, and campaigns.
+/// The vote filter then steers the election its way (its tip is
+/// higher), and its own promotion passes the veto.
+///
+/// Gated on the same failover conditions as promotion itself
+/// (tip ready, not fenced, primary continuously down past the grace)
+/// so a healthy cluster — where the control-plane leader's tip
+/// routinely trails the data-plane primary's — never churns leadership.
+fn challenger_should_campaign(
+    tip_ready: bool,
+    fenced: bool,
+    primary_link_up: bool,
+    primary_link_down_for: Duration,
+    local_tip: JournalTip,
+    // The current leader's tip, if heard within [`PEER_TIP_GRACE`].
+    leader_tip: Option<JournalTip>,
+) -> bool {
+    if !tip_ready || fenced || primary_link_up || primary_link_down_for < PRIMARY_DOWN_GRACE {
+        return false;
+    }
+    matches!(leader_tip, Some(tip) if local_tip.is_ahead_of(tip))
+}
+
+/// One poll of the challenger rule: if it fires, request an election
+/// via the driver's nudge flag, at most once per observed term (a
+/// campaign bumps the term, so a failed takeover re-arms on its own).
+fn consider_challenger_nudge(
+    status: &RaftStatus,
+    control: &ReplicaControlPlane,
+    fence_state: &melin_transport_core::fence::FenceState,
+    peer_tips: &PeerTips,
+    elect_requested: &AtomicBool,
+    primary_link_down_for: Duration,
+    last_nudged_term: &mut u64,
+) {
+    if !status.running.load(Ordering::Relaxed)
+        || status.role.load(Ordering::Relaxed) == RaftStatus::ROLE_LEADER
+        || control.promote.is_requested()
+    {
+        return;
+    }
+    let leader_id = status.leader_id.load(Ordering::Relaxed);
+    if leader_id == 0 || leader_id == status.node_id {
+        return;
+    }
+    let term = status.term.load(Ordering::Relaxed);
+    if *last_nudged_term == term {
+        return;
+    }
+    let local_tip = JournalTip {
+        epoch: fence_state.epoch(),
+        last_sequence: control.journal_tip.load().get(),
+    };
+    let leader_tip = peer_tips
+        .sample(leader_id, Instant::now())
+        .filter(|(_, age)| *age <= PEER_TIP_GRACE)
+        .map(|(tip, _)| tip);
+    if challenger_should_campaign(
+        control.tip_ready.load(Ordering::Acquire),
+        fence_state.is_fenced(),
+        control.primary_link_up.load(Ordering::Acquire),
+        primary_link_down_for,
+        local_tip,
+        leader_tip,
+    ) {
+        *last_nudged_term = term;
+        elect_requested.store(true, Ordering::Release);
+        info!(
+            node_id = status.node_id,
+            leader_id,
+            term,
+            ?local_tip,
+            ?leader_tip,
+            "control-plane leader is behind this node's journal tip during failover — \
+             campaigning so promotion lands on the caught-up node"
+        );
     }
 }
 
@@ -251,23 +467,35 @@ fn consider_auto_promotion(
 /// genesis primary has nothing to promote). Exits on the process
 /// shutdown flag or once a promotion has been filed (by anyone — its
 /// job is done either way).
+#[allow(clippy::too_many_arguments)] // thread assembly point; a struct would just restate it
 pub(crate) fn spawn_auto_promotion(
     status: Arc<RaftStatus>,
     control: ReplicaControlPlane,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     durability_mode: Arc<AtomicU8>,
+    peer_tips: Arc<PeerTips>,
+    // Configured voter ids excluding this node — the peers the
+    // journal-safety veto must account for.
+    peer_ids: Vec<u64>,
+    elect_requested: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("raft-promotion".into())
         .spawn(move || {
             let mut last_refused_term = 0u64;
+            let mut last_nudged_term = 0u64;
             // When the primary link last went (and has since stayed) down
             // — `None` while it is up. Tracked here, independent of raft
             // leadership, so the grace clock reflects the true unreachable
             // duration by the time an election win arrives. See
             // [`PRIMARY_DOWN_GRACE`].
             let mut primary_link_down_since: Option<Instant> = None;
+            // When this node became leader of the current term — `None`
+            // while a follower. The peer-tip veto's `Unknown` grace runs
+            // against this: heartbeats (and thus peer samples) only flow
+            // once we lead. A term change restarts the clock.
+            let mut leader_since: Option<(u64, Instant)> = None;
             while !shutdown.load(Ordering::Relaxed) {
                 if control.primary_link_up.load(Ordering::Acquire) {
                     primary_link_down_since = None;
@@ -277,13 +505,35 @@ pub(crate) fn spawn_auto_promotion(
                 let primary_link_down_for = primary_link_down_since
                     .map(|since| since.elapsed())
                     .unwrap_or(Duration::ZERO);
+                let term = status.term.load(Ordering::Relaxed);
+                let is_leader = status.role.load(Ordering::Relaxed) == RaftStatus::ROLE_LEADER;
+                if !is_leader {
+                    leader_since = None;
+                } else if leader_since.is_none_or(|(t, _)| t != term) {
+                    leader_since = Some((term, Instant::now()));
+                }
+                let leader_for = leader_since
+                    .map(|(_, since)| since.elapsed())
+                    .unwrap_or(Duration::ZERO);
                 consider_auto_promotion(
                     &status,
                     &control,
                     &fence_state,
                     &durability_mode,
+                    &peer_tips,
+                    &peer_ids,
                     primary_link_down_for,
+                    leader_for,
                     &mut last_refused_term,
+                );
+                consider_challenger_nudge(
+                    &status,
+                    &control,
+                    &fence_state,
+                    &peer_tips,
+                    &elect_requested,
+                    primary_link_down_for,
+                    &mut last_nudged_term,
                 );
                 if control.promote.is_requested() {
                     // A promotion is in flight (ours or a manual one) —
@@ -301,6 +551,13 @@ mod tests {
     use super::*;
     use crate::durability_policy::ACKING_MODE_UNKNOWN;
 
+    fn tip(epoch: u64, seq: u64) -> JournalTip {
+        JournalTip {
+            epoch,
+            last_sequence: seq,
+        }
+    }
+
     fn ok_inputs() -> AutoPromotionInputs {
         AutoPromotionInputs {
             tip_ready: true,
@@ -312,7 +569,13 @@ mod tests {
             // A normal failover: the primary streamed to this node
             // before dying, and the journal carries its data.
             primary_observed: true,
-            journal_empty: false,
+            local_tip: tip(3, 100),
+            // The dead primary is silent, the other replica is live and
+            // equal — the common healthy-failover shape.
+            peers: vec![
+                (1, PeerTipObservation::Silent { last: None }),
+                (3, PeerTipObservation::Fresh(tip(3, 100))),
+            ],
             term: 5,
             fence_epoch: 3,
         }
@@ -398,7 +661,12 @@ mod tests {
         // failover — it must not depose a slow-starting primary.
         let inputs = AutoPromotionInputs {
             primary_observed: false,
-            journal_empty: true,
+            local_tip: tip(3, 0),
+            // A blank node has heard nobody either.
+            peers: vec![
+                (1, PeerTipObservation::Silent { last: None }),
+                (3, PeerTipObservation::Silent { last: None }),
+            ],
             ..ok_inputs()
         };
         assert!(
@@ -412,7 +680,6 @@ mod tests {
         // or a full-cluster outage could never auto-fail-over.
         let inputs = AutoPromotionInputs {
             primary_observed: false,
-            journal_empty: false,
             ..ok_inputs()
         };
         assert!(auto_promotion_decision(&inputs).is_ok());
@@ -422,7 +689,11 @@ mod tests {
         // promoting, and the outage is real.
         let inputs = AutoPromotionInputs {
             primary_observed: true,
-            journal_empty: true,
+            local_tip: tip(3, 0),
+            peers: vec![
+                (1, PeerTipObservation::Silent { last: None }),
+                (3, PeerTipObservation::Fresh(tip(3, 0))),
+            ],
             ..ok_inputs()
         };
         assert!(auto_promotion_decision(&inputs).is_ok());
@@ -505,6 +776,200 @@ mod tests {
             ..ok_inputs()
         };
         assert!(auto_promotion_decision(&inputs).is_ok());
+    }
+
+    // --- Peer-tip veto (the promotion-time journal-safety check) ---
+
+    #[test]
+    fn refuses_while_a_live_peer_is_ahead() {
+        // The failover data-loss scenario: this node won the election
+        // (or held leadership) while the other replica holds an acked
+        // event it lacks. Its fresh higher tip must veto promotion.
+        let inputs = AutoPromotionInputs {
+            local_tip: tip(3, 100),
+            peers: vec![
+                (1, PeerTipObservation::Silent { last: None }),
+                (3, PeerTipObservation::Fresh(tip(3, 101))),
+            ],
+            ..ok_inputs()
+        };
+        assert!(
+            auto_promotion_decision(&inputs)
+                .unwrap_err()
+                .contains("ahead of ours")
+        );
+    }
+
+    #[test]
+    fn epoch_dominates_sequence_in_the_veto() {
+        // A peer with a *longer* journal on an older epoch holds a
+        // divergent, never-acked suffix from a deposed primary — it is
+        // NOT ahead and must not veto (same order as the vote filter).
+        let inputs = AutoPromotionInputs {
+            local_tip: tip(3, 100),
+            peers: vec![(3, PeerTipObservation::Fresh(tip(2, 900)))],
+            ..ok_inputs()
+        };
+        assert!(auto_promotion_decision(&inputs).is_ok());
+
+        // A peer on a newer epoch is ahead regardless of sequence.
+        let inputs = AutoPromotionInputs {
+            local_tip: tip(3, 100),
+            peers: vec![(3, PeerTipObservation::Fresh(tip(4, 1)))],
+            ..ok_inputs()
+        };
+        assert!(auto_promotion_decision(&inputs).is_err());
+    }
+
+    #[test]
+    fn refuses_while_a_peer_tip_is_still_unknown() {
+        // Just became leader; heartbeat responses not in yet. The veto
+        // must wait rather than promote blind — the unknown peer may be
+        // the one holding the newest acked events.
+        let inputs = AutoPromotionInputs {
+            peers: vec![
+                (1, PeerTipObservation::Silent { last: None }),
+                (3, PeerTipObservation::Unknown),
+            ],
+            ..ok_inputs()
+        };
+        assert!(
+            auto_promotion_decision(&inputs)
+                .unwrap_err()
+                .contains("unknown")
+        );
+    }
+
+    #[test]
+    fn silent_peers_do_not_block_promotion() {
+        // Both peers dead — even one whose last-known tip was ahead.
+        // Its data is unreachable; nothing better is available, so
+        // promotion proceeds (the caller warns about the higher tip).
+        let inputs = AutoPromotionInputs {
+            local_tip: tip(3, 100),
+            peers: vec![
+                (1, PeerTipObservation::Silent { last: None }),
+                (
+                    3,
+                    PeerTipObservation::Silent {
+                        last: Some(tip(3, 101)),
+                    },
+                ),
+            ],
+            ..ok_inputs()
+        };
+        assert!(auto_promotion_decision(&inputs).is_ok());
+    }
+
+    #[test]
+    fn observe_peer_digests_freshness_correctly() {
+        let tips = PeerTips::new();
+        let t0 = Instant::now();
+
+        // Never heard, short leadership: Unknown (the veto waits).
+        assert_eq!(
+            observe_peer(&tips, 2, Duration::ZERO, t0),
+            PeerTipObservation::Unknown
+        );
+        // Never heard, but we have been heartbeating past the grace:
+        // the peer is dead.
+        assert_eq!(
+            observe_peer(&tips, 2, PEER_TIP_GRACE * 2, t0),
+            PeerTipObservation::Silent { last: None }
+        );
+
+        tips.record_at(2, tip(3, 7), t0);
+        // Within the grace: fresh.
+        assert_eq!(
+            observe_peer(&tips, 2, Duration::ZERO, t0 + PEER_TIP_GRACE),
+            PeerTipObservation::Fresh(tip(3, 7))
+        );
+        // Past the grace: silent, last tip retained for the loss warning.
+        assert_eq!(
+            observe_peer(&tips, 2, Duration::ZERO, t0 + PEER_TIP_GRACE * 2),
+            PeerTipObservation::Silent {
+                last: Some(tip(3, 7))
+            }
+        );
+    }
+
+    // --- Challenger nudge (the takeover half of the veto) ---
+
+    #[test]
+    fn challenger_campaigns_only_against_a_fresh_behind_leader() {
+        let ahead = tip(3, 101);
+        let behind = tip(3, 100);
+        // The standoff: failover conditions hold and the leader is
+        // behind us — campaign.
+        assert!(challenger_should_campaign(
+            true,
+            false,
+            false,
+            PRIMARY_DOWN_GRACE,
+            ahead,
+            Some(behind)
+        ));
+        // Leader equal or ahead: its promotion is safe — stay put.
+        assert!(!challenger_should_campaign(
+            true,
+            false,
+            false,
+            PRIMARY_DOWN_GRACE,
+            ahead,
+            Some(ahead)
+        ));
+        // No fresh leader tip: nothing to conclude.
+        assert!(!challenger_should_campaign(
+            true,
+            false,
+            false,
+            PRIMARY_DOWN_GRACE,
+            ahead,
+            None
+        ));
+    }
+
+    #[test]
+    fn challenger_never_fires_outside_a_failover_window() {
+        let ahead = tip(3, 101);
+        let behind = tip(3, 100);
+        // Healthy cluster: primary link up. The control-plane leader's
+        // tip routinely trails the data-plane primary's — deposing it
+        // would churn leadership for nothing.
+        assert!(!challenger_should_campaign(
+            true,
+            false,
+            true,
+            Duration::ZERO,
+            ahead,
+            Some(behind)
+        ));
+        // Link down but inside the blip grace.
+        assert!(!challenger_should_campaign(
+            true,
+            false,
+            false,
+            PRIMARY_DOWN_GRACE - Duration::from_millis(1),
+            ahead,
+            Some(behind)
+        ));
+        // Not tip-ready / fenced nodes must never campaign.
+        assert!(!challenger_should_campaign(
+            false,
+            false,
+            false,
+            PRIMARY_DOWN_GRACE,
+            ahead,
+            Some(behind)
+        ));
+        assert!(!challenger_should_campaign(
+            true,
+            true,
+            false,
+            PRIMARY_DOWN_GRACE,
+            ahead,
+            Some(behind)
+        ));
     }
 
     #[test]

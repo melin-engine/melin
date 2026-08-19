@@ -32,7 +32,7 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::auth::authenticate_outbound;
-use crate::recency::TipSource;
+use crate::recency::{JournalTip, PeerTips, TipSource};
 use crate::types::Node;
 use crate::types::NodeId;
 use crate::types::TypeConfig;
@@ -48,11 +48,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct RaftClientFactory {
     signing_key: Arc<SigningKey>,
     tip: Arc<TipSource>,
+    peer_tips: Arc<PeerTips>,
 }
 
 impl RaftClientFactory {
-    pub fn new(signing_key: Arc<SigningKey>, tip: Arc<TipSource>) -> Self {
-        Self { signing_key, tip }
+    pub fn new(
+        signing_key: Arc<SigningKey>,
+        tip: Arc<TipSource>,
+        peer_tips: Arc<PeerTips>,
+    ) -> Self {
+        Self {
+            signing_key,
+            tip,
+            peer_tips,
+        }
     }
 }
 
@@ -65,6 +74,7 @@ impl RaftNetworkFactory<TypeConfig> for RaftClientFactory {
             addr: node.addr.clone(),
             signing_key: Arc::clone(&self.signing_key),
             tip: Arc::clone(&self.tip),
+            peer_tips: Arc::clone(&self.peer_tips),
             stream: None,
         }
     }
@@ -75,6 +85,10 @@ pub struct RaftClient {
     addr: String,
     signing_key: Arc<SigningKey>,
     tip: Arc<TipSource>,
+    /// Sink for the target's tip, read off every reply envelope — this
+    /// is how a leader learns its followers' tips (followers make no
+    /// outbound RPCs, so the server-side sampling never fires on them).
+    peer_tips: Arc<PeerTips>,
     /// Live authenticated connection, established on first use and dropped
     /// on any I/O error.
     stream: Option<TcpStream>,
@@ -140,7 +154,18 @@ impl RaftClient {
         .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "rpc timed out")));
 
         match result {
-            Ok(frame) => Ok(frame.body),
+            Ok(frame) => {
+                // Every reply envelope carries the target's journal tip —
+                // feed the promotion-time safety check (see `PeerTips`).
+                self.peer_tips.record(
+                    self.target,
+                    JournalTip {
+                        epoch: frame.tip_epoch,
+                        last_sequence: frame.tip_seq,
+                    },
+                );
+                Ok(frame.body)
+            }
             Err(e) => {
                 // Tear down so the next attempt reconnects from scratch.
                 self.stream = None;

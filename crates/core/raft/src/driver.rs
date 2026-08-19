@@ -96,6 +96,15 @@ pub struct RaftConfig {
 pub struct RaftHandles {
     /// Election state for the health gauges (and, later, auto-promotion).
     pub status: Arc<RaftStatus>,
+    /// Last tip heard from each peer, fed from every RPC envelope in
+    /// both directions. Read by the auto-promotion policy's
+    /// journal-safety check.
+    pub peer_tips: Arc<crate::recency::PeerTips>,
+    /// One-shot election nudge: set by the promotion policy when this
+    /// node holds a higher journal tip than the current control-plane
+    /// leader during a failover window; the driver observes it within
+    /// one poll and calls `Raft::trigger().elect()`.
+    pub elect_requested: Arc<AtomicBool>,
     /// The driver thread. Join on shutdown so storage I/O finishes cleanly.
     pub join: std::thread::JoinHandle<()>,
 }
@@ -161,9 +170,13 @@ pub fn spawn(
         .map_err(|e| io::Error::other(format!("raft storage open failed: {e}")))?;
 
     let status = Arc::new(RaftStatus::new(config.node_id));
+    let peer_tips = Arc::new(crate::recency::PeerTips::new());
+    let elect_requested = Arc::new(AtomicBool::new(false));
 
     let thread_status = Arc::clone(&status);
     let thread_tip = Arc::clone(&tip);
+    let thread_peer_tips = Arc::clone(&peer_tips);
+    let thread_elect = Arc::clone(&elect_requested);
     let join = std::thread::Builder::new()
         .name("raft-driver".into())
         .spawn(move || {
@@ -194,13 +207,20 @@ pub fn spawn(
                 authorized_keys,
                 thread_status,
                 thread_tip,
+                thread_peer_tips,
+                thread_elect,
                 supersession,
                 shutdown,
             ));
         })
         .map_err(|e| io::Error::other(format!("failed to spawn raft-driver thread: {e}")))?;
 
-    Ok(RaftHandles { status, join })
+    Ok(RaftHandles {
+        status,
+        peer_tips,
+        elect_requested,
+        join,
+    })
 }
 
 /// Map openraft's server state onto the gauge encoding.
@@ -225,6 +245,8 @@ async fn driver_main(
     authorized_keys: Arc<AuthorizedKeys>,
     status: Arc<RaftStatus>,
     tip: Arc<TipSource>,
+    peer_tips: Arc<crate::recency::PeerTips>,
+    elect_requested: Arc<AtomicBool>,
     supersession: Option<crate::rpc_server::SupersessionPolicy>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -258,7 +280,11 @@ async fn driver_main(
         }
     };
 
-    let network = RaftClientFactory::new(Arc::clone(&signing_key), Arc::clone(&tip));
+    let network = RaftClientFactory::new(
+        Arc::clone(&signing_key),
+        Arc::clone(&tip),
+        Arc::clone(&peer_tips),
+    );
     let raft: Raft<TypeConfig> = match Raft::new(
         config.node_id,
         raft_config,
@@ -291,6 +317,7 @@ async fn driver_main(
         authorized_keys,
         peer_ids: Arc::new(peer_ids),
         tip: Arc::clone(&tip),
+        peer_tips: Arc::clone(&peer_tips),
         supersession,
         vote_filter: std::sync::Mutex::new(Default::default()),
     });
@@ -369,6 +396,18 @@ async fn driver_main(
         // Wait for a metrics change, capped so the shutdown flag is polled
         // at the codebase's usual 100 ms listener cadence.
         let _ = tokio::time::timeout(SHUTDOWN_POLL, metrics_rx.changed()).await;
+        // Election nudge from the promotion policy: this node holds a
+        // higher journal tip than the current leader during a failover
+        // window, so campaign now instead of waiting for a timeout that
+        // will never fire (the lesser leader heartbeats happily). Swap,
+        // not load+store: a request landing between the two must not be
+        // lost. Best-effort — a failed trigger just leaves the standing
+        // leader in place and the policy re-nudges on a later term.
+        if elect_requested.swap(false, Ordering::Relaxed)
+            && let Err(e) = raft.trigger().elect().await
+        {
+            warn!(error = %e, "requested election trigger failed");
+        }
         let m = metrics_rx.borrow().clone();
         status.term.store(m.current_term, Ordering::Relaxed);
         status
