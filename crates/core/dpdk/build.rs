@@ -15,6 +15,16 @@ fn main() {
 
 #[cfg(feature = "dpdk-sys")]
 fn generate_bindings() {
+    // Cargo re-runs a build script whenever any file in the package changes —
+    // but ONLY until the script emits its first `cargo:rerun-if-*` directive,
+    // after which the listed conditions become the complete set. `pkg_config`
+    // below emits a long list of `rerun-if-env-changed` lines, so without
+    // these two the C wrapper is never recompiled when its source changes:
+    // editing `inline_wrappers.c` silently does nothing until `cargo clean`,
+    // and a binary can be built against a stale object.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/dpdk/inline_wrappers.c");
+
     // Locate DPDK via pkg-config.
     let dpdk = pkg_config::Config::new()
         .atleast_version("22.11")
@@ -45,7 +55,21 @@ fn generate_bindings() {
     for path in &dpdk.include_paths {
         cc.include(path);
     }
-    // DPDK headers require these on some platforms.
+    // DPDK's inline headers use SSSE3 and SSE4.2 intrinsics unconditionally
+    // (`rte_memcpy.h` reaches `_mm_alignr_epi8`), so an ISA baseline is a hard
+    // requirement rather than a tuning choice. x86-64-v2 — SSE3, SSSE3,
+    // SSE4.1, SSE4.2, POPCNT — is DPDK's own x86 minimum.
+    //
+    // This used to be `flag_if_supported("-march=native")` alone, which turned
+    // that requirement into a best-effort: clang cannot always probe the host
+    // CPU (hosted CI runners are the case that caught us), the flag was then
+    // dropped without comment, and the build failed deep inside DPDK's headers
+    // with "needs target feature ssse3" — on some machines and not others.
+    cc.flag("-march=x86-64-v2");
+    // Prefer the build machine's own ISA when clang can detect it, matching
+    // `.cargo/config.toml`'s `target-cpu=native`. A later `-march` wins, so
+    // this raises the baseline; losing it now costs codegen quality instead of
+    // breaking the build.
     cc.flag_if_supported("-march=native");
     cc.compile("dpdk_wrappers");
 
