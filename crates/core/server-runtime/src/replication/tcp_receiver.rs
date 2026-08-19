@@ -21,6 +21,7 @@ use super::auth::authenticate_with_primary;
 use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
+use super::uring_teardown::{DrainBackoff, wake_pending_ops};
 use super::{
     AfterSession, ReplicaPipelineHandles, ResyncDecision, build_replica_pipeline_with_threads,
     handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_then_double_backoff,
@@ -93,11 +94,17 @@ const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 /// ring, buffer pool, and ack send state.
 struct UringTransport {
     ring: io_uring::IoUring,
+    /// Raw socket fd, also used for the `shutdown(2)` wake in `Drop`.
+    /// Always outlives the transport: the owning `TcpStream` lives in
+    /// the reconnect loop, while the transport is a local of the scoped
+    /// receiver thread that borrows it.
     tcp_fd: RawFd,
     // Backing storage for the io_uring provided-buffer pool. Never read
-    // directly — the kernel accesses it via raw pointers registered in
-    // ProvideBuffers. Must stay alive for the lifetime of the ring.
-    _recv_pool: Vec<u8>,
+    // through this handle — the kernel accesses it via raw pointers
+    // registered in ProvideBuffers, and reads go through `pool_ptr`.
+    // Owned here so it outlives every RECV the kernel may land in it;
+    // `Drop` quiesces the ring before letting it go.
+    recv_pool: Vec<u8>,
     pool_ptr: *mut u8,
     multishot_active: bool,
     connected: bool,
@@ -183,7 +190,7 @@ impl UringTransport {
         Ok(UringTransport {
             ring,
             tcp_fd,
-            _recv_pool: recv_pool,
+            recv_pool,
             pool_ptr,
             multishot_active: true,
             connected: true,
@@ -220,6 +227,99 @@ impl UringTransport {
         self.ack_in_flight = true;
         self.ack_offset = 0;
         self.acked_since_recv = true;
+    }
+
+    /// Settle the kernel-ownership flags from CQEs that were reaped out
+    /// of the completion queue but will not be processed, because
+    /// [`Self::poll_recv`] is bailing out on a failed session.
+    ///
+    /// Only the flags — the payloads are deliberately discarded, and
+    /// nothing is resubmitted, since the session is over. Skipping this
+    /// would leave `ack_in_flight` set for a SEND the kernel has
+    /// already returned, and [`Self::drain`] would then wait out its
+    /// whole deadline on a completion that can never arrive again.
+    fn settle_unprocessed(&mut self, rest: &[(u64, i32, u32)]) {
+        for &(token, _result, flags) in rest {
+            match token {
+                TOKEN_RECV if (flags & IORING_CQE_F_MORE) == 0 => self.multishot_active = false,
+                TOKEN_SEND => self.ack_in_flight = false,
+                _ => {}
+            }
+        }
+    }
+
+    /// Reap completions until the kernel holds neither buffer, bounded
+    /// by [`super::uring_teardown::DRAIN_TIMEOUT`]. `true` means the
+    /// multishot RECV has terminated and any SEND has settled, so both
+    /// buffers are provably free of kernel references.
+    ///
+    /// Unlike the sender's ring there is no in-flight *count* to drive
+    /// this: multishot RECV is a single SQE that yields many CQEs and
+    /// only settles on the one without `IORING_CQE_F_MORE`. So the two
+    /// existing flags are the drain condition, and CQEs are classified
+    /// here rather than reusing `poll_recv` — during teardown the
+    /// payloads are discarded, consumed buffers are not re-provided,
+    /// and neither the multishot nor a partial send is resubmitted.
+    fn drain(&mut self) -> bool {
+        // Flush SQEs pushed but never submitted — notably the initial
+        // multishot RECV and any resubmission queued by the last
+        // `poll_recv`. Until they reach the kernel no CQE is coming,
+        // but the kernel takes the buffer pointers the moment it sees
+        // them, so they cannot simply be abandoned in the SQ either.
+        loop {
+            match self.ring.submit() {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
+        let mut backoff = DrainBackoff::new();
+        while self.multishot_active || self.ack_in_flight {
+            for cqe in self.ring.completion() {
+                match cqe.user_data() {
+                    // The kernel stops writing into the pool only once
+                    // the multishot arm is retired, which it signals by
+                    // clearing F_MORE. A CQE that still carries F_MORE
+                    // is data landing mid-teardown: discard it and keep
+                    // waiting for the terminal one.
+                    TOKEN_RECV if (cqe.flags() & IORING_CQE_F_MORE) == 0 => {
+                        self.multishot_active = false;
+                    }
+                    // Settles whether the send completed, errored, or
+                    // went partial: either way the kernel is done
+                    // reading `ack_buf` for this operation.
+                    TOKEN_SEND => self.ack_in_flight = false,
+                    // ProvideBuffers only hands the kernel addresses;
+                    // it never touches pool contents, so a pending one
+                    // is not a reason to keep waiting.
+                    _ => {}
+                }
+            }
+            if (self.multishot_active || self.ack_in_flight) && !backoff.wait() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Drop for UringTransport {
+    fn drop(&mut self) {
+        wake_pending_ops(self.tcp_fd);
+        if !self.drain() {
+            // The drain could not be proven complete, so the kernel may
+            // still land a RECV in the buffer pool or read `ack_buf`
+            // for an in-flight SEND. Leak both rather than hand the
+            // allocator memory the kernel still touches — a session
+            // that is tearing down anyway pays a bounded one-off cost.
+            std::mem::forget(std::mem::take(&mut self.recv_pool));
+            std::mem::forget(std::mem::take(&mut self.ack_buf));
+            tracing::warn!(
+                multishot_active = self.multishot_active,
+                ack_in_flight = self.ack_in_flight,
+                "io_uring teardown drain did not complete; leaking receiver buffers"
+            );
+        }
     }
 }
 
@@ -260,7 +360,11 @@ impl ReceiverTransport for UringTransport {
         // poll_recv's top-of-call submit one loop iteration later.
         let mut submit_chained_ack = false;
 
-        for &(token, result, flags) in &cqes[..cqe_count] {
+        for (idx, &(token, result, flags)) in cqes[..cqe_count].iter().enumerate() {
+            // Every early return below abandons the CQEs after `idx`,
+            // which have already been reaped out of the CQ — hence the
+            // `settle_unprocessed` calls: without them teardown would
+            // wait on a completion that has come and gone.
             match token {
                 TOKEN_RECV => {
                     if (flags & IORING_CQE_F_MORE) == 0 {
@@ -272,16 +376,19 @@ impl ReceiverTransport for UringTransport {
                             continue;
                         }
                         self.connected = false;
+                        self.settle_unprocessed(&cqes[idx + 1..cqe_count]);
                         return Err(io::Error::other(format!(
                             "primary disconnected (recv returned {result})"
                         )));
                     }
                     if result == 0 {
                         self.connected = false;
+                        self.settle_unprocessed(&cqes[idx + 1..cqe_count]);
                         return Err(io::Error::other("primary disconnected (recv returned 0)"));
                     }
                     if (flags & IORING_CQE_F_BUFFER) == 0 {
                         self.connected = false;
+                        self.settle_unprocessed(&cqes[idx + 1..cqe_count]);
                         return Err(io::Error::other("recv cqe missing F_BUFFER flag"));
                     }
 
@@ -314,6 +421,10 @@ impl ReceiverTransport for UringTransport {
                 TOKEN_SEND => {
                     if result < 0 {
                         self.connected = false;
+                        // This CQE is the kernel handing `ack_buf` back,
+                        // failure or not — record that before bailing.
+                        self.ack_in_flight = false;
+                        self.settle_unprocessed(&cqes[idx + 1..cqe_count]);
                         return Err(io::Error::other(format!(
                             "ack send error (returned {result})"
                         )));
@@ -824,6 +935,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::uring_teardown::DRAIN_TIMEOUT;
     use super::*;
     use std::io::Read;
     use std::net::TcpListener;
@@ -923,6 +1035,90 @@ mod tests {
         let acks = read_acks(&mut peer, 3);
         let seqs: Vec<u64> = acks.iter().map(|a| a.acked_sequence).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    /// The multishot RECV armed at construction stays armed for the
+    /// whole session, so every ordinary session exit drops the
+    /// transport with the kernel still holding pointers into the buffer
+    /// pool. `Drop` has to quiesce it — and promptly: a drain that
+    /// cannot settle only gives up on the deadline, so finishing well
+    /// inside it is what proves the buffers were released rather than
+    /// leaked.
+    #[test]
+    fn drop_quiesces_the_multishot_recv() {
+        let (client, _peer) = socket_pair();
+        let mut transport = UringTransport::new(&client).unwrap();
+        // `new` only pushes the multishot RECV; the first poll submits
+        // it. Teardown from that state is what a real session does.
+        let mut recv_buf = Vec::new();
+        transport.poll_recv(&mut recv_buf).unwrap();
+        assert!(transport.multishot_active);
+
+        let started = Instant::now();
+        drop(transport);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < DRAIN_TIMEOUT / 4,
+            "teardown took {elapsed:?}, close to the {DRAIN_TIMEOUT:?} deadline"
+        );
+    }
+
+    /// A failing session bails out of `poll_recv` part-way through a
+    /// batch, abandoning CQEs that were already reaped out of the
+    /// completion queue. Their kernel-ownership flags still have to be
+    /// recorded: otherwise teardown waits out its whole deadline for a
+    /// SEND completion that was consumed here and can never arrive
+    /// again, and then leaks the buffer pool.
+    #[test]
+    fn abandoned_cqes_still_settle_kernel_ownership() {
+        let (client, _peer) = socket_pair();
+        let mut transport = UringTransport::new(&client).unwrap();
+        let mut recv_buf = Vec::new();
+        transport.poll_recv(&mut recv_buf).unwrap();
+
+        // Stands in for a SEND whose CQE landed in the batch behind a
+        // RECV CQE that failed the session.
+        transport.ack_in_flight = true;
+        transport.settle_unprocessed(&[(TOKEN_SEND, 13, 0)]);
+        assert!(
+            !transport.ack_in_flight,
+            "an abandoned SEND completion must release `ack_buf`"
+        );
+
+        // A RECV that still carries F_MORE leaves the arm live — the
+        // kernel may write into the pool again, so teardown must wait.
+        transport.settle_unprocessed(&[(TOKEN_RECV, 128, IORING_CQE_F_MORE)]);
+        assert!(
+            transport.multishot_active,
+            "F_MORE must leave the multishot armed"
+        );
+        // Only the terminal completion retires it.
+        transport.settle_unprocessed(&[(TOKEN_RECV, 0, 0)]);
+        assert!(!transport.multishot_active);
+
+        // The real arm submitted by `poll_recv` above is still live in
+        // the kernel; restore the flag the assertion just cleared so
+        // `Drop` drains it instead of freeing the pool underneath it.
+        transport.multishot_active = true;
+    }
+
+    /// Same, for the other kernel-visible buffer: an ack SEND pushed
+    /// but never submitted, so the drain has to flush the SQ before it
+    /// can wait for anything.
+    #[test]
+    fn drop_quiesces_a_pending_ack_send() {
+        let (client, _peer) = socket_pair();
+        let mut transport = UringTransport::new(&client).unwrap();
+        assert!(transport.send_ack(&ack(7)).unwrap());
+        assert!(transport.ack_in_flight());
+
+        let started = Instant::now();
+        drop(transport);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < DRAIN_TIMEOUT / 4,
+            "teardown took {elapsed:?}, close to the {DRAIN_TIMEOUT:?} deadline"
+        );
     }
 
     /// Scripted-primary scaffolding shared by the end-to-end receiver
