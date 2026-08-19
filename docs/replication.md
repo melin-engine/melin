@@ -55,18 +55,64 @@ the acked frontier by roughly one disk-sync interval.
 
 The resulting contract:
 
-- **Any single node failure loses nothing.** Every acked event is held
-  by at least two nodes; failover promotes a replica that has it.
-- **A whole-cluster power loss loses the un-synced tail** — the acked
-  events that no journal had synced yet, typically the final few
-  milliseconds. This is the mode's recovery point objective (RPO), and
-  it is the price of taking fsync out of the ack path.
+- **Any single node failure loses nothing — provided you fail over.**
+  Every acked event is held by at least two nodes, so a surviving
+  replica always has it. See the warning below: this is the one mode
+  where recovering a crashed primary by restarting it *in place* is
+  not equivalent.
+- **Losing every node that held an event loses it.** The gate requires
+  two holders, not all three, so an event can be acked while only the
+  primary and one replica have it — losing that pair loses the event
+  even with a third node still running. In the common case that means
+  a simultaneous outage across the cluster, but it does not take a
+  full cluster outage.
+- **What is lost is the un-synced tail** — the acked events no journal
+  had synced yet, typically the final few milliseconds. That window is
+  the mode's recovery point objective (RPO), and it is the price of
+  taking fsync out of the ack path.
 
 Pick `replicated` when that trade is right: deployments whose storage
 makes fsync expensive (cloud block volumes, network-attached disks) —
 where the other modes would put milliseconds of disk latency inside
 every ack — or applications that value the lowest possible ack latency
 over a guarantee against simultaneous multi-node loss.
+
+#### Failover is mandatory — never restart a crashed primary in place
+
+Under every other mode, an acked event is on the primary's own disk
+before the client hears about it, so restarting a crashed primary in
+place brings back a node that still holds the acked frontier. That is
+not true here: under `replicated` the primary acks events it has not
+yet written, so a crash can leave its journal **short of the events
+its clients were told were durable**.
+
+Restarting that primary in place discards them. The surviving replica
+does hold them, and on reconnect it advertises a sequence beyond the
+restarted primary's tip — which the primary correctly reads as
+divergent history and resolves by rebasing the replica onto its own
+shorter journal (the replica archives its lineage first, so the events
+are recoverable from the archive, but they leave the live cluster and
+any client that read them is now ahead of the system of record).
+
+So after a primary crash under `replicated`:
+
+- **Promote a surviving replica.** Raft-driven failover already does
+  this automatically and elects the most caught-up node.
+- **Do not restart the old primary as primary.** Bring it back as a
+  replica of the newly promoted node; it will catch up from the
+  authoritative journal.
+
+The other modes tolerate either recovery order. This one does not.
+
+#### Version requirement for automatic failover
+
+The acking mode is advertised to replicas on the replication stream,
+and a node refuses to auto-promote on a mode it does not recognise —
+the correct fail-closed behaviour, but it means a replica running a
+build that predates `replicated` will decline to take over from a
+primary using it. Upgrade every replica before switching a primary to
+`replicated`, or automatic failover is silently unavailable until you
+do. Manual `PROMOTE` is unaffected.
 
 ### Strict fail-closed semantics
 
@@ -497,9 +543,12 @@ Most failures resolve without operator action:
   acked events (the contract guaranteed that before the client was
   told). Under `replicated`, at least one surviving replica holds
   every acked event — promote the most caught-up one (a raft-driven
-  failover already elects it). Send `DURABILITY local` after promotion
-  if the new primary is standalone; restore the target mode once new
-  replicas attach.
+  failover already elects it), and **do not restart the old primary as
+  primary**: its journal may be short of events it already acked, and
+  bringing it back in that role discards them (see "Failover is
+  mandatory" above). Bring it back as a replica instead. Send
+  `DURABILITY local` after promotion if the new primary is standalone;
+  restore the target mode once new replicas attach.
 - **One replica crashes, primary and other replica alive** — the
   cluster continues at the configured mode. Under `hybrid` the gate
   is satisfied by the primary plus the surviving replica's in-memory
