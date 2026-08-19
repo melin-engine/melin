@@ -451,6 +451,36 @@ mod tests {
         );
     }
 
+    /// Auto-promotion qualifies on exactly the modes whose acks waited
+    /// for a second node — the property the match arm in
+    /// [`auto_promotion_decision`] encodes.
+    ///
+    /// Checked against the policies themselves rather than a hand-kept
+    /// list of variants, and driven by `value_variants` (exhaustive by
+    /// construction), so a mode added later is covered without anyone
+    /// remembering to extend this test. Listing variants by hand is
+    /// what would let a new mode drop out of the qualifying arm with
+    /// the suite still green — auto-failover silently off under it.
+    #[test]
+    fn promotion_qualifies_exactly_on_modes_that_acked_on_a_second_node() {
+        use clap::ValueEnum as _;
+
+        for &mode in DurabilityMode::value_variants() {
+            let waits_for_a_second_node = mode.to_policy().clauses().iter().any(|c| c.count >= 2);
+            let inputs = AutoPromotionInputs {
+                durability_mode: Some(mode),
+                ..ok_inputs()
+            };
+            let decision = auto_promotion_decision(&inputs);
+            assert_eq!(
+                decision.is_ok(),
+                waits_for_a_second_node,
+                "mode `{mode}` requires a second node: {waits_for_a_second_node}, \
+                 but the promotion decision was {decision:?}"
+            );
+        }
+    }
+
     #[test]
     fn refuses_when_epochs_outran_terms() {
         // Equal is refused too: the promotion journals epoch = term, so
