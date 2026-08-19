@@ -9,6 +9,8 @@ Melin is the runtime under a matching engine, a ledger, or any system whose busi
 
 It is a deterministic, replicated sequencer: your single-threaded application logic plugs in, and Melin provides the event-sourced pipeline around it — durable journaling, synchronous replication, snapshots, transport, failover. Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: lock-free disruptor rings, io_uring I/O, and mechanical sympathy throughout.
 
+**Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity (internal crossing, a new instrument, a parallel run alongside an existing engine) in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
+
 ## Features
 
 **Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application inherits it as long as its logic stays pure.
@@ -91,10 +93,6 @@ A node runs a fixed set of pinned threads connected by lock-free disruptor rings
 ## Melin Exchange Core
 
 A production exchange core is built on this sequencer and distributed separately: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [melin-exchange-core](https://github.com/melin-engine/exchange-core).
-
-## Design partners wanted
-
-We are looking for one or two design partners willing to run Melin in a non-critical capacity (internal crossing, a new instrument, a parallel run alongside an existing engine) in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
 ## Contributing
 
