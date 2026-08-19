@@ -64,15 +64,29 @@ See [`crates/examples/counter`](crates/examples/counter) for a complete working 
 
 ## Architecture
 
-Melin runs a fixed set of pinned threads connected by lock-free disruptor rings:
+A node runs a fixed set of pinned threads connected by lock-free disruptor rings. No async runtime, no locks on the hot path.
 
-- **Reader**: single thread multiplexing all client connections. Sole producer into the input ring.
-- **Journal**: consumes from the input ring, batch-encodes events, and writes them durably. Pushes encoded batches to replicas. Advances its cursor only after the write completes.
-- **Application**: consumes from the same input ring *in parallel with the journal* (not chained). Executes your single-threaded business logic and publishes results to an output ring. Never waits on disk.
-- **Replication senders**: stream journal batches to replicas over TCP.
+```
+ clients ──> Reader ──┬──> Journal ──┬──> Journal Disk ┄┄┄┄┐
+ (TCP or DPDK)        │              └──> Replication ┄┄┄┄┄┤ durability
+                      │                                    v cursors
+                      ├──> Application ───────────┬──> Response ──> clients
+                      │                           └──> Event publisher ──> subscribers
+                      └──> Shadow ──> snapshots
+```
+
+- **Reader**: one thread multiplexing every client connection, over kernel TCP with io_uring or over DPDK in userspace. Sole producer into the input ring.
+- **Journal**: sequences, encodes, and hash-chains events and feeds encoded batches to the replication senders — all in memory. A separate **Journal Disk** thread writes and syncs the batches and publishes the durability cursors. Because the two are split, a slow disk stalls neither ordering nor the replica feed.
+- **Application**: consumes the input ring in parallel with the journal. Runs your single-threaded logic and publishes results to the output ring. Never waits on disk.
+- **Response**: drains the output ring but gates each response on the journal and replication cursors before sending it, so persist-before-ack is enforced without stalling the application.
 - **Event publisher**: broadcasts application output to subscribers (market data, audit, analytics).
-- **Response**: drains the output ring but gates on the journal and replication cursors before sending to clients, enforcing persist-before-ack without stalling the application.
-- **Shadow**: third consumer on the input ring, gated on the journal cursor. Takes periodic snapshots without pausing the application.
+- **Shadow**: a third consumer on the input ring, gated on the journal cursor, that takes periodic snapshots without pausing the application.
+
+**Replicas** run the same pipeline, fed by the primary's journal batches over TCP: they journal, apply, and snapshot exactly as the primary does, with application state kept warm and outputs discarded.
+
+**Recovery** on any node is snapshot plus journal replay: the newest snapshot is loaded and every journaled event after it is re-applied. Determinism guarantees the result is the state clients were told about.
+
+**Control plane.** An optional Raft service handles leader election, fencing epochs, and automatic failover, and nothing else. It runs on its own thread, isolated from the data plane. Elections steer toward the most-caught-up replica, and an elected replica refuses to promote while it can still see a live primary.
 
 ## Melin Exchange Core
 
