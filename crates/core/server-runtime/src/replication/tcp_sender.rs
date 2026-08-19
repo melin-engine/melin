@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 use melin_journal::replication::ReplicationConsumer;
 
 use super::auth::authenticate_replica;
+use super::uring_teardown::{DrainBackoff, wake_pending_ops};
 use super::{ReplicaCursors, ReplicaGate, ReplicationMetrics, SentHighWater};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{
@@ -714,23 +715,9 @@ struct InflightUring<'a> {
     tcp_fd: std::os::unix::io::RawFd,
 }
 
-/// Upper bound on the teardown drain. The wake is a `shutdown(2)` on
-/// the very socket the pending operations are bound to, so they are
-/// expected to complete within microseconds; this bounds only the
-/// pathological case (a wedged io-wq worker), where waiting forever
-/// would hang the sender thread and everything that joins it.
-const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
 impl Drop for InflightUring<'_> {
     fn drop(&mut self) {
-        // Wake everything the kernel holds: a shutdown socket completes
-        // a pending RECV with EOF and a pending SEND with an error,
-        // immediately and without relying on AsyncCancel opcode
-        // availability (this must also work on hosts that filter
-        // io_uring opcodes). Best-effort by design — the fd is valid
-        // (see `tcp_fd`) and a socket already reset by the peer just
-        // returns ENOTCONN, which changes nothing about the drain.
-        unsafe { libc::shutdown(self.tcp_fd, libc::SHUT_RDWR) };
+        wake_pending_ops(self.tcp_fd);
         if !self.drain() {
             // The drain could not be proven complete, so the kernel may
             // still write into `recv_buf` or read out of `send_buf`.
@@ -750,15 +737,11 @@ impl Drop for InflightUring<'_> {
 
 impl InflightUring<'_> {
     /// Reap CQEs until the kernel owes none, bounded by
-    /// [`DRAIN_TIMEOUT`]. `true` means `in_flight` reached zero and the
+    /// [`super::uring_teardown::DRAIN_TIMEOUT`]. `true` means
+    /// `in_flight` reached zero and the
     /// buffers are provably free of kernel references; `false` means
-    /// the caller must not release them.
-    ///
-    /// Polls the memory-mapped CQ instead of blocking in
-    /// `submit_and_wait`: that wait takes no timeout, so an operation
-    /// the shutdown failed to wake would hang the sender thread — and
-    /// whatever joins it — forever. Trading a use-after-free for a
-    /// deadlock is not a trade worth making.
+    /// the caller must not release them. See [`super::uring_teardown`]
+    /// for why this polls rather than blocking in `submit_and_wait`.
     fn drain(&mut self) -> bool {
         // Flush SQEs that were pushed but never submitted: until they
         // reach the kernel, no CQE is ever coming for them.
@@ -769,26 +752,13 @@ impl InflightUring<'_> {
                 Err(_) => return false,
             }
         }
-        let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
-        let mut spins: u32 = 0;
+        let mut backoff = DrainBackoff::new();
         while self.in_flight > 0 {
             for _ in self.ring.completion() {
                 self.in_flight = self.in_flight.saturating_sub(1);
             }
-            if self.in_flight == 0 {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
+            if self.in_flight > 0 && !backoff.wait() {
                 return false;
-            }
-            // The expected wait is a few microseconds, so spin first;
-            // back off afterwards so a pathological drain does not burn
-            // a core for the whole timeout.
-            if spins < 1024 {
-                spins += 1;
-                std::hint::spin_loop();
-            } else {
-                std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
         true
@@ -1162,6 +1132,7 @@ fn live_stream_uring(
 
 #[cfg(test)]
 mod tests {
+    use super::super::uring_teardown::DRAIN_TIMEOUT;
     use super::*;
     use io_uring::{IoUring, opcode, types};
 

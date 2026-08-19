@@ -73,6 +73,7 @@ mod dpdk;
 mod receiver_transport;
 mod tcp_receiver;
 mod tcp_sender;
+mod uring_teardown;
 
 use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
 
