@@ -2,21 +2,65 @@
 
 [![Crates.io](https://img.shields.io/crates/v/melin-app)](https://crates.io/crates/melin-app)
 [![docs.rs](https://img.shields.io/docsrs/melin-app)](https://docs.rs/melin-app)
+[![CI](https://img.shields.io/github/actions/workflow/status/melin-engine/melin/pre-merge.yml?label=CI)](https://github.com/melin-engine/melin/actions/workflows/pre-merge.yml)
 [![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
 
-Melin is a deterministic, replicated sequencer for latency-critical applications. It provides a multi-threaded, event-sourced processing pipeline with durable journaling, synchronous replication, and sub-millisecond tail latency under load. The infrastructure layer for systems where every event must be persisted, ordered, and replayed exactly.
+Melin is the runtime under a matching engine, a ledger, or any system whose business logic must process every event in a total order, survive a crash without losing one, and replay identically for audit — while keeping tail latency inside a budget measured in microseconds.
 
-Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: a lock-free disruptor pipeline, io_uring I/O, and mechanical sympathy throughout.
+It is a deterministic, replicated sequencer: your single-threaded application logic plugs in, and Melin provides the event-sourced pipeline around it — durable journaling, synchronous replication, snapshots, transport, failover. Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: lock-free disruptor rings, io_uring I/O, and mechanical sympathy throughout.
 
 ## Features
 
-**Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application logic inherits it as long as it stays pure (no I/O, no non-deterministic state).
+**Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application inherits it as long as its logic stays pure.
 
-**Durable and replicated.** Every event is persisted to the journal and synchronously replicated via lock-free ring buffer before the client sees a response. CRC32C integrity checks and BLAKE3 hash chain for tamper evidence. Journal catch-up, snapshot transfer, and sub-second switchover upon promotion. Configurable durability modes let you trade latency for stronger guarantees:
-- **Hybrid** (default): ack once one node has persisted and two have confirmed receipt in memory. Any single node's slow disk is masked by the others, and single-node failures cause no data-loss.
-- **Durably replicated**: two on-disk copies on separate nodes before ack, for stricter compliance regimes.
+**Durable and replicated.** Every event is journaled and synchronously replicated before the client sees a response, with CRC32C integrity checks and a BLAKE3 hash chain for tamper evidence. By default an ack requires one node to have persisted and two to hold the event in memory, so a single slow disk or a single node failure costs neither latency nor data; a stricter two-disks-before-ack mode is available. Journal catch-up, snapshot transfer, and automatic failover are built in. See [replication](docs/replication.md).
 
-**Fast.** p99 ~ 404 µs at 1.00M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 66 µs p99.
+**Fast.** p99 of 404 µs at 1.00M events/sec, full round trip including persistence and replication, on kernel TCP and commodity datacenter hardware. Single-event floor: 66 µs p99. See [Benchmarks](#benchmarks).
+
+**Tested for the failures that matter.** Every commit runs the full suite, including crash-recovery and three-node failover tests. Nightly, the suite runs again under ThreadSanitizer, the lock-free core runs under Miri across multiple scheduler seeds, and dependencies are checked against the RUSTSEC advisory database.
+
+## Benchmarks
+
+All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas). Default durability mode: one node persisted, two in memory.
+
+### Latency under load (closed-loop)
+
+Four connections, 56 requests in flight each.
+
+| Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 |
+|-----------|-----|-----|-------|--------|---------|
+| 1.00M/s | 207 µs | 404 µs | 511 µs | 595 µs | 691 µs |
+
+### Single-event latency (1 client, window 1)
+
+| Throughput | p50 | p99 | p99.9 | p99.99 |
+|-----------|-----|-----|-------|--------|
+| 20K/s | 49 µs | 66 µs | 113 µs | 138 µs |
+
+The benchmark harness and tuning guidance ship with the Melin Exchange Core.
+
+## Building an application on Melin
+
+Melin's core crates form a generic sequencer. Your application plugs in via four traits:
+
+| Trait | Role |
+|-------|------|
+| `Application` | Your business logic: receives events, produces output |
+| `AppFactory` | Constructs your application, deserializes snapshots, seeds initial state |
+| `RequestDecoder` | Deserializes wire bytes into your domain request type |
+| `ResponseEncoder` | Serializes your domain response type into wire bytes |
+
+The one rule: `Application` must be deterministic — no I/O, no clocks, no randomness. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and your binary becomes pure composition:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig::parse();
+    let factory = MyAppFactory::new(/* ... */);
+    server::run(config, factory, MyDecoder, MyEncoder, None)
+}
+```
+
+See [`crates/examples/counter`](crates/examples/counter) for a complete working example.
 
 ## Architecture
 
@@ -30,63 +74,22 @@ Melin runs a fixed set of pinned threads connected by lock-free disruptor rings:
 - **Response**: drains the output ring but gates on the journal and replication cursors before sending to clients, enforcing persist-before-ack without stalling the application.
 - **Shadow**: third consumer on the input ring, gated on the journal cursor. Takes periodic snapshots without pausing the application.
 
-## Building an application on Melin
-
-Melin's core crates form a generic sequencer. Your application plugs in via four traits:
-
-| Trait | Role |
-|-------|------|
-| `Application` | Your business logic: receives events, produces output. No I/O, no syscalls. Determinism is required for replay. |
-| `AppFactory` | Constructs your application, deserializes snapshots, seeds initial state |
-| `RequestDecoder` | Deserializes wire bytes into your domain request type |
-| `ResponseEncoder` | Serializes your domain response type into wire bytes |
-
-The runtime handles transport, journaling, replication, signal handling, memory locking, and CPU pinning. Your binary becomes pure composition:
-
-```rust
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ServerConfig::parse();
-    let factory = MyAppFactory::new(/* ... */);
-    server::run(config, factory, MyDecoder, MyEncoder, None)
-}
-```
-
-See [`crates/examples/counter`](crates/examples/counter) for a complete working example.
-
-## Benchmarks
-
-All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas).
-
-### Latency under load (closed-loop)
-
-Four connections, 56 requests in flight each.
-
-| Ack gate | Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 |
-|----------|-----------|-----|-----|-------|--------|---------|
-| Hybrid (1 persisted + 2 in-memory) | 1.00M/s | 207 µs | 404 µs | 511 µs | 595 µs | 691 µs |
-
-### Single-event latency (1 client, window 1)
-
-| Ack gate | Throughput | p50 | p99 | p99.9 | p99.99 |
-|----------|-----------|-----|-----|-------|--------|
-| Hybrid (1 persisted + 2 in-memory) | 20K/s | 49 µs | 66 µs | 113 µs | 138 µs |
-
-See [replication](docs/replication.md) for the full durability-mode menu. The benchmark harness and tuning guidance ship with the Melin Exchange Core.
-
 ## Melin Exchange Core
 
 A production exchange core is built on this sequencer and distributed separately: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [melin-exchange-core](https://github.com/melin-engine/exchange-core).
 
+## Design partners wanted
+
+We are looking for one or two design partners willing to run Melin in a non-critical capacity (internal crossing, a new instrument, a parallel run alongside an existing engine) in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
+
 ## Contributing
 
-Bug fixes and correctness improvements are welcome. Feature PRs will likely be closed.
+Bug fixes and correctness improvements are welcome. Feature PRs will likely be closed: the roadmap is driven by the needs of the product and its design partners.
 
 By submitting a pull request, you agree to the terms of our [Contributor License Agreement](CLA.md).
 
 ## License
 
 Licensed under the [Business Source License 1.1](LICENSE). Production use requires a commercial license from P.L.S.C. Contact [contact@melin-engine.com](mailto:contact@melin-engine.com).
-
-**Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity (internal crossing, a new instrument, a parallel-run alongside an existing engine) in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
 Each version of the Licensed Work converts to Apache License, Version 2.0 on the fourth anniversary of its first public distribution.
