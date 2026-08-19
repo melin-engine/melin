@@ -1158,16 +1158,21 @@ mod tests {
         }
     }
 
-    /// Guard over `fd` with a RECV already submitted, or `None` when
-    /// the host denies io_uring — some dev hosts filter opcodes, and
-    /// the production path falls back to blocking I/O there, so there
-    /// is nothing for these tests to assert.
-    fn guard_with_pending_recv(
-        fd: libc::c_int,
-        send_buf: &mut Vec<u8>,
-    ) -> Option<InflightUring<'_>> {
-        let ring = IoUring::builder().setup_single_issuer().build(8).ok()?;
-        ring.submitter().register_files(&[fd]).ok()?;
+    /// Guard over `fd` with a RECV already submitted.
+    ///
+    /// Panics rather than skipping if the host denies io_uring:
+    /// [`live_stream_uring`] is the only live-stream path there is, so
+    /// a host that cannot build this ring cannot replicate at all. A
+    /// test that quietly passed there would report coverage for a
+    /// teardown it never ran.
+    fn guard_with_pending_recv(fd: libc::c_int, send_buf: &mut Vec<u8>) -> InflightUring<'_> {
+        let ring = IoUring::builder()
+            .setup_single_issuer()
+            .build(8)
+            .expect("io_uring is a hard requirement for replication");
+        ring.submitter()
+            .register_files(&[fd])
+            .expect("register_files");
         let mut uring = InflightUring {
             ring,
             recv_buf: vec![0u8; 4096],
@@ -1185,10 +1190,10 @@ mod tests {
         // SAFETY: `recv_buf` belongs to the guard being built here, and
         // the guard drains this operation before releasing it. The ring
         // is only ever touched from this thread.
-        unsafe { uring.ring.submission().push(&sqe).ok()? };
+        unsafe { uring.ring.submission().push(&sqe).expect("SQ full") };
         uring.in_flight = 1;
-        uring.ring.submit().ok()?;
-        Some(uring)
+        uring.ring.submit().expect("submit initial RECV");
+        uring
     }
 
     /// The assumption the whole teardown design rests on: a
@@ -1199,10 +1204,7 @@ mod tests {
     fn drain_reaps_a_pending_recv_after_shutdown() {
         let (a, b) = socketpair();
         let mut send_buf = Vec::new();
-        let Some(mut uring) = guard_with_pending_recv(a, &mut send_buf) else {
-            close_pair(a, b);
-            return;
-        };
+        let mut uring = guard_with_pending_recv(a, &mut send_buf);
         // The peer never writes, so the only thing that can complete
         // this RECV is the shutdown.
         unsafe { libc::shutdown(a, libc::SHUT_RDWR) };
@@ -1223,10 +1225,7 @@ mod tests {
     fn drop_quiesces_a_pending_recv_without_hanging() {
         let (a, b) = socketpair();
         let mut send_buf = vec![0u8; 64];
-        let Some(uring) = guard_with_pending_recv(a, &mut send_buf) else {
-            close_pair(a, b);
-            return;
-        };
+        let uring = guard_with_pending_recv(a, &mut send_buf);
         let started = std::time::Instant::now();
         drop(uring);
         let elapsed = started.elapsed();
