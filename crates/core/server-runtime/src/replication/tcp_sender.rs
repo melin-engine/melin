@@ -673,10 +673,75 @@ fn handle_replica_connection<A: Application>(
 
 /// io_uring live streaming loop for the primary replication handler.
 ///
+/// io_uring ownership for the live-stream loop: the ring, the RECV
+/// landing buffer the kernel writes ack bytes into, and the number of
+/// operations the kernel still owes CQEs for.
+///
+/// Exists for its `Drop`. Returning from the loop — shutdown, eviction,
+/// an I/O error, or a panic's unwind — while a RECV or SEND is still in
+/// flight would free `recv_buf` (and drop the ring) with the kernel
+/// holding a pointer into it. Ring teardown on fd close is
+/// *asynchronous*: the kernel can complete a pending RECV after the
+/// allocation has been returned to the allocator, writing replica-ack
+/// bytes into freed heap. That corruption surfaced as malloc-metadata
+/// segfaults at sender-thread exit in the failover tests, and being a
+/// kernel-side store it is invisible to AddressSanitizer. The guard
+/// closes every exit path: wake pending operations by shutting the
+/// socket down, then reap CQEs until the kernel owes none, and only
+/// then let the buffer drop.
+struct InflightUring {
+    ring: io_uring::IoUring,
+    /// RECV landing buffer for ack frames. `Vec` so the heap pointer
+    /// handed to the kernel stays stable however the guard itself
+    /// moves; sized 4 KiB (acks are 13 bytes, the kernel may coalesce
+    /// many).
+    recv_buf: Vec<u8>,
+    /// SQEs pushed minus CQEs reaped — exactly what the kernel owes.
+    /// `u32` matches the ring-depth scale (at most a RECV and a SEND
+    /// are ever outstanding here).
+    in_flight: u32,
+    /// Raw socket fd, for the `shutdown(2)` wake in `Drop`. Always
+    /// outlives the guard: the owning `TcpStream` is a parameter of
+    /// [`live_stream_uring`] and parameters drop after locals.
+    tcp_fd: std::os::unix::io::RawFd,
+}
+
+impl Drop for InflightUring {
+    fn drop(&mut self) {
+        // Wake everything the kernel holds: a shutdown socket completes
+        // a pending RECV with EOF and a pending SEND with an error,
+        // immediately and without relying on AsyncCancel opcode
+        // availability (this must also work on hosts that filter
+        // io_uring opcodes). Best-effort by design — the fd is valid
+        // (see `tcp_fd`) and a socket already reset by the peer just
+        // returns ENOTCONN, which changes nothing about the drain.
+        unsafe { libc::shutdown(self.tcp_fd, libc::SHUT_RDWR) };
+        while self.in_flight > 0 {
+            match self.ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    // The wait itself failed, so it cannot be proven
+                    // that the kernel is done with the buffer. Leak it:
+                    // a one-off 4 KiB loss on a dying thread is safe,
+                    // freeing memory the kernel may still write is not.
+                    std::mem::forget(std::mem::take(&mut self.recv_buf));
+                    return;
+                }
+            }
+            for _ in self.ring.completion() {
+                self.in_flight = self.in_flight.saturating_sub(1);
+            }
+        }
+    }
+}
+
 /// Live streaming loop using async RECV/SEND via io_uring. A single RECV is always
 /// in-flight for ack frames; SEND is submitted when the replication ring
 /// has data. Both complete via the memory-mapped CQ with zero syscalls
-/// in the hot path.
+/// in the hot path. In-flight operations and the RECV buffer are owned
+/// by an [`InflightUring`] guard so no exit path can free memory the
+/// kernel still writes to.
 fn live_stream_uring(
     writer: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
@@ -717,7 +782,7 @@ fn live_stream_uring(
 
     let tcp_fd = writer.as_raw_fd();
 
-    let mut ring: IoUring = IoUring::builder()
+    let ring: IoUring = IoUring::builder()
         .setup_single_issuer()
         .build(8)
         .map_err(|e| io::Error::other(format!("io_uring init failed: {e}")))?;
@@ -733,9 +798,16 @@ fn live_stream_uring(
         let _ = ring.submitter().register_iowq_aff(&cpuset);
     }
 
-    // RECV buffer for ack frames (13 bytes each, but kernel may
-    // coalesce multiple). 4 KiB is plenty.
-    let mut recv_buf = vec![0u8; 4096];
+    // Ring + RECV buffer + in-flight count live in the quiescing guard
+    // from here on: every exit below (shutdown, eviction, `?`, unwind)
+    // must drain the kernel before these allocations are freed.
+    let mut uring = InflightUring {
+        ring,
+        recv_buf: vec![0u8; 4096],
+        in_flight: 0,
+        tcp_fd,
+    };
+    let (ring, recv_buf) = (&mut uring.ring, &mut uring.recv_buf);
     // Accumulation buffer for partial ack frame parsing.
     let mut parse_buf: Vec<u8> = Vec::with_capacity(MAX_CONTROL_FRAME + 4);
     // RECV is always resubmitted after CQE processing — no explicit
@@ -761,10 +833,12 @@ fn live_stream_uring(
     )
     .build()
     .user_data(TOKEN_RECV);
-    // SAFETY: `recv_buf` is owned by this task and lives across the
-    // event loop until the corresponding CQE is drained. The ring is
-    // single-threaded — only this task pushes/reaps on it.
+    // SAFETY: `recv_buf` is owned by the `InflightUring` guard, which
+    // drains this operation's CQE before the buffer can be freed on any
+    // exit path. The ring is single-threaded — only this task
+    // pushes/reaps on it.
     unsafe { ring.submission().push(&sqe).expect("SQ full") };
+    uring.in_flight += 1;
 
     loop {
         // --- Check flags ---
@@ -807,9 +881,12 @@ fn live_stream_uring(
                         .user_data(TOKEN_SEND);
                 // SAFETY: `send_buf` is owned by this task and pinned
                 // by `send_in_flight = true` below — it isn't mutated
-                // until the matching TOKEN_SEND CQE clears the flag.
-                // The ring is single-threaded.
+                // until the matching TOKEN_SEND CQE clears the flag,
+                // and the `InflightUring` guard drains the CQE before
+                // any exit path can release it. The ring is
+                // single-threaded.
                 unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                uring.in_flight += 1;
                 send_in_flight = true;
                 send_offset = 0;
                 *last_send = std::time::Instant::now();
@@ -837,8 +914,10 @@ fn live_stream_uring(
                     .user_data(TOKEN_SEND);
                     // SAFETY: same as the coalesced send above —
                     // `send_buf` is owned and pinned by `send_in_flight`
-                    // until the TOKEN_SEND CQE clears it.
+                    // until the TOKEN_SEND CQE clears it, and the guard
+                    // drains the CQE on every exit path.
                     unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                    uring.in_flight += 1;
                     send_in_flight = true;
                     send_offset = 0;
                     *last_send = std::time::Instant::now();
@@ -875,6 +954,10 @@ fn live_stream_uring(
         let mut cqes: [(u64, i32); 4] = [(0, 0); 4];
         let mut cqe_count = 0;
         for cqe in ring.completion() {
+            // Every reaped CQE settles one operation the kernel owed —
+            // counted even if it overflows the recording array (it
+            // cannot: at most a RECV and a SEND are ever in flight).
+            uring.in_flight = uring.in_flight.saturating_sub(1);
             if cqe_count < cqes.len() {
                 cqes[cqe_count] = (cqe.user_data(), cqe.result());
                 cqe_count += 1;
@@ -938,10 +1021,12 @@ fn live_stream_uring(
                     )
                     .build()
                     .user_data(TOKEN_RECV);
-                    // SAFETY: `recv_buf` is owned by this task; only
+                    // SAFETY: `recv_buf` is owned by the guard; only
                     // one RECV is ever in flight (we just consumed the
-                    // previous CQE). Ring is single-threaded.
+                    // previous CQE), and the guard drains this one on
+                    // every exit path. Ring is single-threaded.
                     unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                    uring.in_flight += 1;
                 }
 
                 TOKEN_SEND => {
@@ -983,8 +1068,10 @@ fn live_stream_uring(
                         .user_data(TOKEN_SEND);
                         // SAFETY: `send_buf` is owned and still pinned
                         // (`send_in_flight` stays true across partial
-                        // sends); ring is single-threaded.
+                        // sends), and the guard drains the CQE on every
+                        // exit path; ring is single-threaded.
                         unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                        uring.in_flight += 1;
                     }
                 }
 
