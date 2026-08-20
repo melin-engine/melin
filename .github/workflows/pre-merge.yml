@@ -77,14 +77,19 @@ jobs:
       # The hook's Cargo.lock check guards against committing a manifest
       # change without its lockfile. The CI equivalent is whether the
       # committed lockfile still resolves the workspace unchanged.
+      #
+      # Every cargo step below also passes `--locked`, so this one is not the
+      # only thing asserting it — but it is the fastest and the one that says
+      # so by name, which beats a ten-minute build failing on a flag.
       - name: Cargo.lock is up to date
         run: cargo metadata --locked --format-version 1 > /dev/null
 
+      # `cargo fmt` neither builds nor resolves, so `--locked` does not apply.
       - name: Formatting
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -111,22 +116,22 @@ jobs:
       - name: hash-chain builds
         run: |
           for pkg in melin-journal melin-transport-core melin-server-runtime melin-example-counter; do
-            cargo check -p "$pkg" --all-targets --features hash-chain
+            cargo check -p "$pkg" --all-targets --features hash-chain --locked
           done
 
       # no-persist needs a real test run, not a build check: its last
       # regression was a recovery test recovering from a journal the mode
       # never writes. It compiled fine.
       - name: no-persist tests (transport-core)
-        run: cargo test -q -p melin-transport-core --features no-persist
+        run: cargo test -q -p melin-transport-core --features no-persist --locked
 
       - name: no-persist builds (server-runtime)
-        run: cargo check -p melin-server-runtime --all-targets --features no-persist
+        run: cargo check -p melin-server-runtime --all-targets --features no-persist --locked
 
       # `--no-fail-fast` so one flaky cluster test cannot hide the verdict on
       # the other 686. Costs nothing when the suite is green.
       - name: Tests
-        run: cargo nextest run --no-fail-fast
+        run: cargo nextest run --no-fail-fast --locked
 
   # The DPDK transport is the one configuration nothing else compiles. The
   # pre-commit hook cannot cover it: `melin-dpdk`'s build script hard-fails
@@ -169,7 +174,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libdpdk-dev
 
       - name: DPDK builds
-        run: cargo check -p melin-server-runtime --all-targets --features dpdk
+        run: cargo check -p melin-server-runtime --all-targets --features dpdk --locked
 
   # All four cargo-deny checks, configured in `deny.toml`. Advisories run
   # here as well as in Nightly on purpose: here they catch a dependency that
