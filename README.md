@@ -3,6 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/melin-app)](https://crates.io/crates/melin-app)
 [![docs.rs](https://img.shields.io/docsrs/melin-app)](https://docs.rs/melin-app)
 [![CI](https://img.shields.io/github/actions/workflow/status/melin-engine/melin/pre-merge.yml?label=CI)](https://github.com/melin-engine/melin/actions/workflows/pre-merge.yml)
+[![MSRV](https://img.shields.io/crates/msrv/melin-app)](Cargo.toml)
 [![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
 
 Melin is the runtime under a matching engine, a ledger, or any system whose business logic must process every event in a total order, survive a crash without losing one, and replay identically for audit — while keeping tail latency inside a budget measured in microseconds.

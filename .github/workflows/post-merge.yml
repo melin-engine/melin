@@ -1,0 +1,82 @@
+name: Post-merge
+
+# Checks that run when a change lands on main rather than on every push.
+# The MSRV can only break via a commit (a new std API in our code, or a
+# dependency bump in Cargo.lock), so checking at the fast-forward push
+# that lands a branch catches the breakage at zero lag on main's history
+# without doubling the per-push job count — and without a second
+# toolchain's dependency cache competing in the repository's 10 GB LRU
+# cache against the Pre-merge entries people actually wait on. Not in
+# Nightly for the same reason inverted: nothing here can go red while the
+# tree stands still, which is Nightly's admission criterion.
+#
+# Same caveat as Nightly: `workflow_dispatch` does not appear in the UI
+# until the file is on the default branch, and once it is, a dispatch runs
+# whatever ref it is pointed at — that is the escape hatch for exercising
+# a branch that touches Cargo.lock or this file before it lands.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: post-merge-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same reasoning as the Pre-merge workflow: `.cargo/config.toml` asks for
+  # `-C target-cpu=native` and `-fuse-ld=lld`, neither of which suits a
+  # hosted runner.
+  RUSTFLAGS: -C target-cpu=x86-64-v2
+
+jobs:
+  # Compile every shipped configuration on the declared MSRV (`rust-version`
+  # in the root Cargo.toml) so the number stays true instead of rotting:
+  # without this job, the first use of a newer std API breaks downstream
+  # builds silently while our own stable-toolchain checks stay green. When
+  # this job fails after a dependency upgrade, that is a decision point, not
+  # a fix-up — either pin the dependency back or bump the MSRV per the
+  # policy comment in the root Cargo.toml.
+  #
+  # `cargo check` on the committed lockfile, across the same off-default
+  # feature configurations the Pre-merge jobs build — including dpdk, which
+  # is why the headers are installed here too (they feed the bindgen run
+  # that `melin-dpdk`'s `dpdk-sys` feature turns on; `fastcp`, our smoltcp
+  # fork and the crate that currently *sets* the MSRV, compiles in the
+  # plain workspace check regardless). Clippy and rustfmt stay on stable
+  # only: lint output is toolchain-dependent, and enforcing it twice would
+  # demand a tree that satisfies two versions of every lint.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install DPDK headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdpdk-dev
+
+      - name: Workspace builds on the MSRV
+        run: cargo check --workspace --all-targets --locked
+
+      - name: hash-chain builds on the MSRV
+        run: |
+          for pkg in melin-journal melin-transport-core melin-server-runtime melin-example-counter; do
+            cargo check -p "$pkg" --all-targets --features hash-chain --locked
+          done
+
+      - name: no-persist builds on the MSRV
+        run: |
+          cargo check -p melin-transport-core --all-targets --features no-persist --locked
+          cargo check -p melin-server-runtime --all-targets --features no-persist --locked
+
+      - name: dpdk builds on the MSRV
+        run: cargo check -p melin-server-runtime --all-targets --features dpdk --locked

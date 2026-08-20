@@ -2,6 +2,7 @@
 name = "melin-example-counter"
 version.workspace = true
 edition = "2024"
+rust-version.workspace = true
 license.workspace = true
 description = "Minimal example: a durable, replicated counter built on the Melin core runtime."
 # Not publishable, and not just by policy: this crate and

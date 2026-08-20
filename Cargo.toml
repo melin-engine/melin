@@ -12,6 +12,16 @@ resolver = "3"
 # file. Keep the two in lockstep: a member's inherited version and the
 # version requirement its dependents resolve against must always match.
 version = "0.13.0"
+# Minimum supported Rust version, inherited by every member via
+# `rust-version.workspace = true` and enforced by the post-merge `msrv`
+# CI job on every push to main — a declared-but-untested MSRV silently rots
+# the first time a new std API lands. 1.91 is the floor `fastcp` (our
+# smoltcp fork, via `melin-dpdk`) already declares on crates.io; the
+# next-highest floor in the graph is 1.88 (`validit`, via openraft).
+# Policy: bumping this is a breaking-ish change — minor release only,
+# called out in the changelog, and the version chosen must be at least
+# ~6 months old at the time.
+rust-version = "1.91"
 # SPDX identifier only. `license-file` is deliberately absent: setting both
 # makes cargo warn ("only one of `license` or `license-file` is necessary")
 # on every invocation, for every member.
