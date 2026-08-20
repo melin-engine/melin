@@ -72,6 +72,15 @@ const PRIMARY_DOWN_GRACE: Duration = Duration::from_secs(3);
 /// and promotion may proceed (loudly, if its last tip was ahead).
 const PEER_TIP_GRACE: Duration = Duration::from_millis(1500);
 
+/// The two conditions that disqualify this node from *both* promoting
+/// and campaigning, so both rules report them in the same words. Named
+/// rather than repeated: the pair are one fact about this node with two
+/// readers, and an operator correlating a refusal with a stand-down
+/// should not have to decide whether two near-identical sentences mean
+/// the same thing.
+const TIP_NOT_READY: &str = "journal recovery has not seeded this node's tip yet";
+const FENCED: &str = "node is fenced (superseded by a newer primary)";
+
 /// One configured peer's journal-tip observation, digested from
 /// [`PeerTips`] by the poll loop so [`auto_promotion_decision`] stays a
 /// pure function.
@@ -207,10 +216,10 @@ struct AutoPromotionInputs {
 ///   an epoch collision.
 fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static str> {
     if !inputs.tip_ready {
-        return Err("journal recovery has not seeded this node's tip yet");
+        return Err(TIP_NOT_READY);
     }
     if inputs.fenced {
-        return Err("node is fenced (superseded by a newer primary)");
+        return Err(FENCED);
     }
     if inputs.primary_link_up {
         return Err("replication link to the primary is up — refusing to depose a live primary");
@@ -571,10 +580,10 @@ fn election_should_stand_down(
     peer_samples: &[(JournalTip, Duration)],
 ) -> Option<&'static str> {
     if !tip_ready {
-        return Some("journal recovery has not seeded this node's tip yet");
+        return Some(TIP_NOT_READY);
     }
     if fenced {
-        return Some("node is fenced (superseded by a newer primary)");
+        return Some(FENCED);
     }
     peer_samples
         .iter()
