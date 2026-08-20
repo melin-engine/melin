@@ -7,6 +7,7 @@ set -euo pipefail
 # Usage:
 #   scripts/release.sh 0.14.0                    # rehearsal (see below)
 #   scripts/release.sh 0.14.0 --execute          # for real: pushes and publishes
+#   scripts/release.sh 0.13.1 --from release/0.13.x   # patch a maintenance line
 #   scripts/release.sh 0.14.0 --change-date 2030-01-01
 #   scripts/release.sh 0.14.0 --execute --yes    # skip the confirmation prompt
 #   scripts/release.sh 0.14.0 --keep             # rehearsal, keep what it built
@@ -18,13 +19,15 @@ set -euo pipefail
 # as it found it. Nothing leaves the machine. `--keep` skips the restore when
 # you want to inspect the result; a rehearsal that *fails* also keeps
 # everything, so there is something left to debug, and prints how to clean up.
+# The branch and up-to-date checks are warnings there rather than errors, since
+# a rehearsal has no remote or registry to protect.
 #
 # What it deliberately does not do:
 #
-#   * Merge to main. The tag is cut on `release/vX.Y.Z` and the human merges
-#     it — this repository fast-forwards, so the tagged commit becomes main's
-#     tip unchanged. Do it promptly: the up-to-date check below only proves
-#     main was current when the release started.
+#   * Merge. The tag is cut on `release/vX.Y.Z` and the human merges it — this
+#     repository fast-forwards, so the tagged commit becomes the integration
+#     branch's tip unchanged. Do it promptly: the up-to-date check below only
+#     proves that branch was current when the release started.
 #   * Verify a CHANGELOG entry exists for the version. That check belongs to
 #     `publish.sh` per the roadmap, so that it also guards a publish run
 #     started by hand or from CI, not just one driven from here.
@@ -36,9 +39,11 @@ EXECUTE=0
 KEEP=0
 ASSUME_YES=0
 CHANGE_DATE=""
+FROM_BRANCH="main"
 
 usage() {
-    echo "usage: scripts/release.sh <version> [--execute] [--change-date YYYY-MM-DD] [--yes] [--keep]" >&2
+    echo "usage: scripts/release.sh <version> [--execute] [--from BRANCH]" >&2
+    echo "                          [--change-date YYYY-MM-DD] [--yes] [--keep]" >&2
     exit 2
 }
 
@@ -47,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --execute) EXECUTE=1; shift ;;
         --keep) KEEP=1; shift ;;
         --yes|-y) ASSUME_YES=1; shift ;;
+        --from) FROM_BRANCH="${2:-}"; [[ -n "$FROM_BRANCH" ]] || usage; shift 2 ;;
         --change-date) CHANGE_DATE="${2:-}"; [[ -n "$CHANGE_DATE" ]] || usage; shift 2 ;;
         -h|--help) usage ;;
         -*) echo "error: unknown option '$1'" >&2; usage ;;
@@ -130,6 +136,18 @@ step() { echo; echo "==> $*"; }
 # "zero matches" is an answer these checks need, not a failure.
 count() { grep -c -- "$1" "$2" || true; }
 
+# The checks that exist to protect the remote and the registry. A rehearsal
+# pushes nothing and publishes nothing, so there they have nothing to protect
+# and become warnings — which is also what lets this script rehearse a change
+# to itself, from the branch carrying that change.
+guard() {
+    if (( EXECUTE )); then
+        echo "error: $*" >&2
+        exit 1
+    fi
+    echo "warning: $* — ignored in rehearsal" >&2
+}
+
 # --- Preconditions -----------------------------------------------------------
 
 cd "$(git rev-parse --show-toplevel)"
@@ -149,17 +167,29 @@ if [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
     echo "warning: untracked files present; they will not be part of the release" >&2
 fi
 
+# A release is cut from an integration branch that is already on origin, at
+# exactly its remote tip. Both halves matter and for different reasons: the
+# tag has to stay reachable from the line it claims to belong to, the
+# `--ff-only` merge printed at the end has to be able to succeed, and what
+# gets published has to be code that branch actually carries — crates.io is
+# immutable, so a version cut from somewhere else cannot be taken back.
+#
+# `main` by default, `--from` for a maintenance line (the shape a patch
+# release off an older version takes). Requiring it to be *named* rather than
+# merely allowed is the point: it makes releasing from a feature branch
+# something you do on purpose, not by forgetting to check out main.
 ORIGINAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [[ "$ORIGINAL_BRANCH" != "main" ]]; then
-    echo "error: releases are cut from main, currently on '$ORIGINAL_BRANCH'" >&2
-    exit 1
+if [[ "$ORIGINAL_BRANCH" != "$FROM_BRANCH" ]]; then
+    guard "on '$ORIGINAL_BRANCH' but releasing from '$FROM_BRANCH'; check it out, or name it with --from"
 fi
 
-step "Checking main is current"
-git fetch --quiet origin main
-if [[ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]]; then
-    echo "error: local main differs from origin/main; pull (or push) first" >&2
-    exit 1
+step "Checking $ORIGINAL_BRANCH is current"
+if git fetch --quiet origin "$ORIGINAL_BRANCH" 2>/dev/null; then
+    if [[ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]]; then
+        guard "local $ORIGINAL_BRANCH differs from origin/$ORIGINAL_BRANCH; pull (or push) first"
+    fi
+else
+    guard "$ORIGINAL_BRANCH is not on origin; push it first"
 fi
 
 step "Checking $BRANCH and $TAG are free"
@@ -416,8 +446,8 @@ fi
 echo
 if (( EXECUTE )); then
     echo "==> Released v$NEW_VERSION."
-    echo "    Merge it — the tag is on $BRANCH, not yet on main:"
-    echo "      git checkout main && git merge --ff-only $BRANCH && git push origin main"
+    echo "    Merge it — the tag is on $BRANCH, not yet on $ORIGINAL_BRANCH:"
+    echo "      git checkout $ORIGINAL_BRANCH && git merge --ff-only $BRANCH && git push origin $ORIGINAL_BRANCH"
 elif (( KEEP )); then
     echo "==> Rehearsal complete; $BRANCH and $TAG kept as asked."
     cleanup_hint
