@@ -274,7 +274,15 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
 
 /// One poll: if this node currently leads the control plane and the
 /// policy allows it, file a promotion request carrying the election
-/// term. Standing refusals are logged once per term, not once per poll.
+/// term. A standing refusal is logged once, not once per poll — but
+/// keyed on the *reason* as well as the term, because the reason
+/// changes under a leader that keeps its term across the failure it is
+/// reacting to. A replica holding control-plane leadership while the
+/// primary is healthy refuses with "the link is up", and when the
+/// primary then dies it refuses again — same term — with the
+/// journal-safety veto. Deduplicating on the term alone would print the
+/// first and swallow the second, leaving a stalled failover explained
+/// by a reason that stopped being true when the primary died.
 #[allow(clippy::too_many_arguments)] // poll-loop assembly point; a struct would just restate it
 fn consider_auto_promotion(
     status: &RaftStatus,
@@ -291,7 +299,9 @@ fn consider_auto_promotion(
     // How long this node has continuously been leader in the current
     // term — the baseline for the peer-tip veto's `Unknown` grace.
     leader_for: Duration,
-    last_refused_term: &mut u64,
+    // The `(term, reason)` last logged, so a standing refusal stays
+    // quiet while a *changed* one is reported. `None` before the first.
+    last_refused: &mut Option<(u64, &'static str)>,
 ) {
     if !status.running.load(Ordering::Relaxed)
         || status.role.load(Ordering::Relaxed) != RaftStatus::ROLE_LEADER
@@ -360,8 +370,12 @@ fn consider_auto_promotion(
             }
         }
         Err(reason) => {
-            if *last_refused_term != term {
-                *last_refused_term = term;
+            // Compare the reason by value, not by pointer: the arms
+            // return distinct string literals, but nothing stops two
+            // from being merged by the compiler or a future edit from
+            // reusing one.
+            if *last_refused != Some((term, reason)) {
+                *last_refused = Some((term, reason));
                 warn!(
                     node_id = status.node_id,
                     term,
@@ -520,7 +534,11 @@ fn consider_challenger_nudge(
 const STAND_DOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Election stand-down rule (pure): may this replica start
-/// timeout-driven control-plane elections right now?
+/// timeout-driven control-plane elections right now? `None` to compete
+/// normally, `Some(reason)` to stand down — the reason is carried out
+/// rather than collapsed into a bool because the three grounds below
+/// are not interchangeable to whoever reads the log, and the driver
+/// that applies the verdict sees only the flag.
 ///
 /// It may not while a recently-heard peer journal tip is strictly ahead
 /// of its own: an election it could win would only seat a leader whose
@@ -551,24 +569,37 @@ fn election_should_stand_down(
     fenced: bool,
     local_tip: JournalTip,
     peer_samples: &[(JournalTip, Duration)],
-) -> bool {
-    if !tip_ready || fenced {
-        return true;
+) -> Option<&'static str> {
+    if !tip_ready {
+        return Some("journal recovery has not seeded this node's tip yet");
+    }
+    if fenced {
+        return Some("node is fenced (superseded by a newer primary)");
     }
     peer_samples
         .iter()
         .any(|(tip, age)| *age <= STAND_DOWN_GRACE && tip.is_ahead_of(local_tip))
+        .then_some("a recently heard peer advertises a journal tip ahead of ours")
 }
 
 /// One poll of the stand-down rule: sample the peer-tip table and
 /// publish the verdict to the driver's `elect_enabled` flag. The
 /// driver applies changes on its own 100 ms bridge loop.
+///
+/// The reason is logged here, not there: the driver receives a bare
+/// flag and cannot tell an unrecovered tip from a fencing from a peer
+/// that is genuinely ahead — three states an operator reading "this
+/// node stopped holding elections" needs told apart.
 fn consider_election_stand_down(
+    status: &RaftStatus,
     control: &ReplicaControlPlane,
     fence_state: &melin_transport_core::fence::FenceState,
     peer_tips: &PeerTips,
     peer_ids: &[u64],
     elect_enabled: &AtomicBool,
+    // The reason last logged, so a standing verdict is quiet and a
+    // changed one is reported. `None` while elections are enabled.
+    last_reason: &mut Option<&'static str>,
 ) {
     let now = Instant::now();
     let local_tip = JournalTip {
@@ -585,7 +616,25 @@ fn consider_election_stand_down(
         local_tip,
         &peer_samples,
     );
-    elect_enabled.store(!stand_down, Ordering::Release);
+    elect_enabled.store(stand_down.is_none(), Ordering::Release);
+    // Compare by value, not by pointer — see `consider_auto_promotion`.
+    if *last_reason != stand_down {
+        match stand_down {
+            Some(reason) => info!(
+                node_id = status.node_id,
+                reason,
+                ?local_tip,
+                "standing down from control-plane elections — this node will not campaign \
+                 on a timeout while the condition holds"
+            ),
+            None => info!(
+                node_id = status.node_id,
+                ?local_tip,
+                "resuming control-plane elections — the stand-down condition no longer holds"
+            ),
+        }
+        *last_reason = stand_down;
+    }
 }
 
 /// Spawn the auto-promotion thread for a replica node. Only called when
@@ -610,8 +659,14 @@ pub(crate) fn spawn_auto_promotion(
     std::thread::Builder::new()
         .name("raft-promotion".into())
         .spawn(move || {
-            let mut last_refused_term = 0u64;
+            // The `(term, reason)` of the last logged refusal — see
+            // [`consider_auto_promotion`] for why the reason is part of
+            // the key.
+            let mut last_refused: Option<(u64, &'static str)> = None;
             let mut last_nudged_term = 0u64;
+            // The stand-down reason last logged — see
+            // [`consider_election_stand_down`].
+            let mut stand_down_reason: Option<&'static str> = None;
             // Hold-down clock for the challenger nudge — see
             // [`CHALLENGER_HOLD_DOWN`].
             let mut behind_since: Option<(u64, u64, Instant)> = None;
@@ -654,7 +709,7 @@ pub(crate) fn spawn_auto_promotion(
                     &peer_ids,
                     primary_link_down_for,
                     leader_for,
-                    &mut last_refused_term,
+                    &mut last_refused,
                 );
                 consider_challenger_nudge(
                     &status,
@@ -667,11 +722,13 @@ pub(crate) fn spawn_auto_promotion(
                     &mut last_nudged_term,
                 );
                 consider_election_stand_down(
+                    &status,
                     &control,
                     &fence_state,
                     &peer_tips,
                     &peer_ids,
                     &elect_enabled,
+                    &mut stand_down_reason,
                 );
                 if control.promote.is_requested() {
                     // A promotion is in flight (ours or a manual one) —
@@ -1005,6 +1062,66 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_refusal_reason_is_reported_within_the_same_term() {
+        // The failover shape this dedup key exists for: a replica holds
+        // control-plane leadership *through* the primary's death, so the
+        // term never changes, but the reason it refuses does — from "the
+        // link is up" (correct before the crash, misleading after) to
+        // the journal-safety veto. Keying only on the term would log the
+        // first and swallow the second, leaving the stalled failover
+        // explained by a condition that stopped holding at the crash.
+        let status = RaftStatus::new(2);
+        status
+            .role
+            .store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        status.term.store(7, Ordering::Relaxed);
+        let control = crate::replication::ReplicaControlPlane::new();
+        control.tip_ready.store(true, Ordering::Release);
+        control
+            .journal_tip
+            .advance(melin_transport_core::WireSeq::new(100));
+        control
+            .primary_acking_mode
+            .store(DurabilityMode::Replicated.as_u8(), Ordering::Release);
+        // Epoch 0 so the peer comparison turns on the sequence, and the
+        // term (7) clears the fence-epoch check.
+        let fence = melin_transport_core::fence::FenceState::new(0);
+        let mode = AtomicU8::new(DurabilityMode::Replicated.as_u8());
+        let peer_tips = PeerTips::new();
+        // Peer 3 is a caught-up replica; peer 1 is the primary, unheard
+        // — which digests to `Silent` rather than `Unknown` because this
+        // node has led (and so heartbeated it) well past the grace.
+        peer_tips.record(3, tip(0, 101));
+        let peer_ids = [1u64, 3];
+        let leader_for = PEER_TIP_GRACE * 2;
+        let mut last_refused = None;
+
+        // Before the crash: the link is up, and that is what gets logged.
+        control.primary_link_up.store(true, Ordering::Release);
+        let refuse = |last: &mut Option<(u64, &'static str)>, down_for| {
+            consider_auto_promotion(
+                &status, &control, &fence, &mode, &peer_tips, &peer_ids, down_for, leader_for, last,
+            );
+        };
+        refuse(&mut last_refused, Duration::ZERO);
+        let (term, first) = last_refused.expect("a refusal was recorded");
+        assert_eq!(term, 7);
+        assert!(first.contains("link to the primary is up"), "{first}");
+
+        // The primary dies; this node keeps leadership, so the term is
+        // unchanged. The peer-tip veto now refuses — and must be seen.
+        control.primary_link_up.store(false, Ordering::Release);
+        refuse(&mut last_refused, PRIMARY_DOWN_GRACE);
+        let (term, second) = last_refused.expect("a refusal was recorded");
+        assert_eq!(term, 7, "same leadership, same term");
+        assert!(second.contains("ahead of ours"), "{second}");
+
+        // A standing refusal still logs once, not once per poll.
+        refuse(&mut last_refused, PRIMARY_DOWN_GRACE);
+        assert_eq!(last_refused, Some((7, second)));
+    }
+
+    #[test]
     fn observe_peer_digests_freshness_correctly() {
         let tips = PeerTips::new();
         let t0 = Instant::now();
@@ -1118,47 +1235,59 @@ mod tests {
     #[test]
     fn stand_down_only_while_a_recent_peer_tip_is_ahead() {
         let local = tip(3, 100);
-        // A recently heard peer strictly ahead: stand down.
-        assert!(election_should_stand_down(
-            true,
-            false,
-            local,
-            &[(tip(3, 101), Duration::ZERO)],
-        ));
+        // A recently heard peer strictly ahead: stand down, and say so.
+        let reason =
+            election_should_stand_down(true, false, local, &[(tip(3, 101), Duration::ZERO)])
+                .expect("stands down");
+        assert!(reason.contains("ahead of ours"), "{reason}");
         // Heard right at the window edge still counts.
-        assert!(election_should_stand_down(
-            true,
-            false,
-            local,
-            &[(tip(3, 101), STAND_DOWN_GRACE)],
-        ));
+        assert!(
+            election_should_stand_down(true, false, local, &[(tip(3, 101), STAND_DOWN_GRACE)])
+                .is_some()
+        );
         // Recent but equal or behind: compete normally — strictness is
         // what lets tied replicas elect each other.
-        assert!(!election_should_stand_down(
-            true,
-            false,
-            local,
-            &[(tip(3, 100), Duration::ZERO), (tip(3, 99), Duration::ZERO),],
-        ));
+        assert!(
+            election_should_stand_down(
+                true,
+                false,
+                local,
+                &[(tip(3, 100), Duration::ZERO), (tip(3, 99), Duration::ZERO)],
+            )
+            .is_none()
+        );
         // An ahead peer gone quiet past the window must not hold
         // elections down: its data is unreachable, someone must lead.
-        assert!(!election_should_stand_down(
-            true,
-            false,
-            local,
-            &[(tip(3, 200), STAND_DOWN_GRACE + Duration::from_millis(1))],
-        ));
+        assert!(
+            election_should_stand_down(
+                true,
+                false,
+                local,
+                &[(tip(3, 200), STAND_DOWN_GRACE + Duration::from_millis(1))],
+            )
+            .is_none()
+        );
         // No peers heard at all: compete.
-        assert!(!election_should_stand_down(true, false, local, &[]));
+        assert!(election_should_stand_down(true, false, local, &[]).is_none());
     }
 
     #[test]
     fn stand_down_is_unconditional_when_fenced_or_tip_unready() {
         let local = tip(3, 100);
-        // Fenced: must not lead, whatever the peers look like.
-        assert!(election_should_stand_down(true, true, local, &[]));
-        // Tip not recovered: cannot know where we stand.
-        assert!(election_should_stand_down(false, false, local, &[]));
+        // Each ground reports itself: a node that stood down at boot
+        // because its tip was not recovered must not be logged as one
+        // that saw a peer ahead — at boot it has heard no peer at all.
+        let fenced = election_should_stand_down(true, true, local, &[]).expect("stands down");
+        assert!(fenced.contains("fenced"), "{fenced}");
+        let unready = election_should_stand_down(false, false, local, &[]).expect("stands down");
+        assert!(unready.contains("recovery"), "{unready}");
+        // Not-tip-ready is judged before the peers, so a node with no
+        // samples still reports the recovery ground rather than falling
+        // through to a peer comparison it cannot make.
+        let unready =
+            election_should_stand_down(false, false, local, &[(tip(3, 999), Duration::ZERO)])
+                .expect("stands down");
+        assert!(unready.contains("recovery"), "{unready}");
     }
 
     #[test]

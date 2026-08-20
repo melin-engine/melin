@@ -26,6 +26,7 @@ use openraft::Raft;
 use openraft::ServerState;
 use openraft::error::InitializeError;
 use openraft::error::RaftError;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -423,8 +424,12 @@ async fn driver_main(
         // window, so campaign now instead of waiting for a timeout that
         // will never fire (the lesser leader heartbeats happily). Swap,
         // not load+store: a request landing between the two must not be
-        // lost. Best-effort — a failed trigger just leaves the standing
-        // leader in place and the policy re-nudges on a later term.
+        // lost. A failed trigger is not retried and the policy will not
+        // re-nudge (it fires at most once per observed term, and a
+        // trigger that never ran leaves the term where it was) — which
+        // costs nothing, because `elect` only fails with `Fatal`: the
+        // raft core has already stopped, so no election was going to
+        // happen on this node regardless.
         if elect_requested.swap(false, Ordering::Relaxed)
             && let Err(e) = raft.trigger().elect().await
         {
@@ -432,21 +437,19 @@ async fn driver_main(
         }
         // Election stand-down (see `RaftHandles::elect_enabled`): apply
         // the flag on change only — the toggle is a plain atomic store
-        // inside openraft, but logging every poll would be noise.
+        // inside openraft, but calling it every poll would be noise.
+        // Logged at debug and stated as the mechanical fact it is: the
+        // flag arrives here as a bare bool, so this side cannot know
+        // *why* the policy asked, and the policy logs the reason itself
+        // at info (see `raft_promotion::consider_election_stand_down`).
         let elect_wanted = elect_enabled.load(Ordering::Relaxed);
         if elect_wanted != elect_applied {
             raft.runtime_config().elect(elect_wanted);
             elect_applied = elect_wanted;
-            info!(
+            debug!(
                 node_id = config.node_id,
                 enabled = elect_wanted,
-                "election stand-down toggled — a fresh peer journal tip is \
-                 {} this node's",
-                if elect_wanted {
-                    "no longer ahead of"
-                } else {
-                    "ahead of"
-                }
+                "applied the election stand-down flag to the raft runtime config"
             );
         }
         let m = metrics_rx.borrow().clone();
