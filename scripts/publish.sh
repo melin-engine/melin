@@ -37,6 +37,35 @@ esac
 
 cd "$(git rev-parse --show-toplevel)"
 
+# The single source of truth for the release version; every member inherits it.
+# Read with grep rather than `cargo metadata | jq` so the dry-run path, which
+# CI runs, needs neither jq nor a metadata pass.
+WORKSPACE_VERSION=$(grep -m1 '^version = "' Cargo.toml || true)
+WORKSPACE_VERSION=${WORKSPACE_VERSION#version = \"}
+WORKSPACE_VERSION=${WORKSPACE_VERSION%\"}
+if [[ -z "$WORKSPACE_VERSION" ]]; then
+    echo "error: could not read the workspace version from Cargo.toml" >&2
+    exit 1
+fi
+
+# A published version that will not say what changed in it is one nobody can
+# plan an upgrade around, and the entry cannot be added afterwards — crates.io
+# is immutable. Checked in both modes, so CI's dry run catches a missing entry
+# days before the release rather than during it, and checked here rather than
+# in release.sh so a publish started by hand or from CI is guarded too.
+if [[ ! -f CHANGELOG.md ]]; then
+    echo "error: CHANGELOG.md is missing; every published version needs an entry" >&2
+    exit 1
+fi
+# Keep a Changelog headings, e.g. `## [0.14.0] - 2026-08-20`. Only `.` is a
+# metacharacter in a version made of digits and dots.
+if ! grep -q "^## \[${WORKSPACE_VERSION//./\\.}\]" CHANGELOG.md; then
+    echo "error: CHANGELOG.md has no '## [$WORKSPACE_VERSION]' entry" >&2
+    echo "       add one before publishing; see https://keepachangelog.com" >&2
+    exit 1
+fi
+echo "==> CHANGELOG.md has an entry for $WORKSPACE_VERSION"
+
 # The dry run deliberately skips the already-published filter. It never
 # uploads, so what is on crates.io is irrelevant to it, and CI runs it on main
 # — where every crate *is* already published at the current version, so
@@ -48,7 +77,7 @@ cd "$(git rev-parse --show-toplevel)"
 # build", not "is the tree clean"; `release.sh` enforces a clean tree itself.
 if (( ! EXECUTE )); then
     echo "==> Dry-run mode (pass --execute to publish for real)"
-    cargo publish --workspace --dry-run --allow-dirty
+    cargo publish --workspace --dry-run --allow-dirty --locked
     echo
     echo "==> Done (nothing was uploaded)."
     exit 0
@@ -131,8 +160,11 @@ echo "    publishing $(( TOTAL - ALREADY )) of $TOTAL crates"
 
 echo
 echo "==> Publishing"
-# `${EXCLUDES[@]+...}` so an empty array does not trip `set -u` on bash < 4.4.
-cargo publish --workspace ${EXCLUDES[@]+"${EXCLUDES[@]}"}
+# `--locked` so the release is built against the dependency versions CI tested
+# rather than whatever re-resolves at publish time; the lockfile is the record
+# of what was actually verified. `${EXCLUDES[@]+...}` so an empty array does
+# not trip `set -u` on bash < 4.4.
+cargo publish --workspace --locked ${EXCLUDES[@]+"${EXCLUDES[@]}"}
 
 echo
 echo "==> Done."

@@ -233,6 +233,23 @@ if ! printf '%s\n%s\n' "$OLD_VERSION" "$NEW_VERSION" | sort -V -C; then
     exit 1
 fi
 
+# `publish.sh` enforces this too — it has to, since it also runs from CI and by
+# hand. Repeating it here is not redundancy but placement: there the check
+# lands *after* the branch and tag have been pushed, and a tag on origin for a
+# version that cannot be published is not something to discover at that point.
+step "Checking CHANGELOG.md covers $NEW_VERSION"
+if [[ ! -f CHANGELOG.md ]]; then
+    echo "error: CHANGELOG.md is missing; every released version needs an entry" >&2
+    exit 1
+fi
+if ! grep -q "^## \[${NEW_VERSION//./\\.}\]" CHANGELOG.md; then
+    echo "error: CHANGELOG.md has no '## [$NEW_VERSION]' entry" >&2
+    echo "       Rename the '## [Unreleased]' heading to" >&2
+    echo "         ## [$NEW_VERSION] - $(date -u +%F)" >&2
+    echo "       add a fresh empty '## [Unreleased]' above it, and land that first." >&2
+    exit 1
+fi
+
 echo
 echo "    version:     $OLD_VERSION -> $NEW_VERSION"
 echo "    branch:      $BRANCH"
