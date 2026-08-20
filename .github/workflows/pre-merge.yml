@@ -14,6 +14,30 @@ name: Pre-merge
 
 on:
   push:
+    # Skip pushes that only touch content no job reads: documentation, the
+    # opt-in local hook, and repo housekeeping. Nothing in the workspace
+    # `include_str!`s a markdown file and no crate directory holds a README
+    # for cargo to package, so the prose here cannot affect a build.
+    #
+    # Files are named rather than globbed (no `**.md`, no `**/LICENSE`) so
+    # that a file CI *does* read cannot silently fall into this list later.
+    # The roadmap already commits to two such files: `publish.sh --dry-run`
+    # from CI is to verify the BSL `Change Date` across the root `LICENSE`
+    # and its byte-identical per-crate copies, and that the version being
+    # published has a `CHANGELOG.md` entry. A glob would skip that job on
+    # exactly the pushes that change its inputs.
+    #
+    # Anything a job *does* read stays in scope — `.cargo/` (rustflags),
+    # `.config/` (nextest), `clippy.toml`, `deny.toml`, and `scripts/`
+    # (inert today, exercised once the item above lands).
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - "CLA.md"
+      - "CLAUDE.md"
+      - ".githooks/**"
+      - ".gitignore"
+      - "signatures/**"
   workflow_dispatch:
 
 # A new push to the same branch makes the in-flight run irrelevant.

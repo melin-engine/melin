@@ -18,6 +18,17 @@ name: Post-merge
 on:
   push:
     branches: [main]
+    # Same filter as Pre-merge, for the same reason: a docs-only landing
+    # cannot change what any toolchain compiles. Keep the two lists
+    # identical — see Pre-merge for why they name files instead of globbing.
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - "CLA.md"
+      - "CLAUDE.md"
+      - ".githooks/**"
+      - ".gitignore"
+      - "signatures/**"
   workflow_dispatch:
 
 concurrency:
