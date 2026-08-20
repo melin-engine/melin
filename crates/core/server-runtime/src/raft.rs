@@ -140,6 +140,7 @@ pub(crate) struct PromotionWiring {
     pub(crate) peer_tips: Arc<melin_raft::recency::PeerTips>,
     pub(crate) peer_ids: Vec<u64>,
     pub(crate) elect_requested: Arc<AtomicBool>,
+    pub(crate) elect_enabled: Arc<AtomicBool>,
 }
 
 impl RaftDriverGuard {
@@ -166,6 +167,7 @@ impl RaftDriverGuard {
             peer_tips: Arc::clone(&h.peer_tips),
             peer_ids: self.peer_ids.clone(),
             elect_requested: Arc::clone(&h.elect_requested),
+            elect_enabled: Arc::clone(&h.elect_enabled),
         })
     }
 

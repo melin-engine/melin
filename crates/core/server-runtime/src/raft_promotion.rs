@@ -406,9 +406,30 @@ fn challenger_should_campaign(
     matches!(leader_tip, Some(tip) if local_tip.is_ahead_of(tip))
 }
 
-/// One poll of the challenger rule: if it fires, request an election
-/// via the driver's nudge flag, at most once per observed term (a
-/// campaign bumps the term, so a failed takeover re-arms on its own).
+/// How long the challenger rule must hold *continuously* — same
+/// leader, same term — before the nudge fires.
+///
+/// Nudging on the first sighting of a behind leader loses a race that
+/// can livelock the control plane: openraft appends a blank entry on
+/// every leadership win, so at the moment the new leader's first
+/// heartbeat delivers its (behind) tip, this node's raft *log* is one
+/// entry behind — and the election the nudge triggers is one this node
+/// cannot win (log-recency refusal). The deposed behind node then
+/// re-wins via the vote filter's liveness escape, appends another
+/// blank entry, and the cycle repeats: elections churn, nobody leads
+/// long enough to promote, and failover stalls — fail-safe, but
+/// unbounded. The repair is the leader's own log replication, which
+/// lands within a heartbeat round or two; the hold-down simply lets it
+/// win the race, so the election we then trigger is one we win.
+/// Several heartbeat intervals with margin; costs at most this much
+/// extra failover latency.
+const CHALLENGER_HOLD_DOWN: Duration = Duration::from_millis(1500);
+
+/// One poll of the challenger rule: if it has held continuously for
+/// [`CHALLENGER_HOLD_DOWN`] (see there for why not immediately),
+/// request an election via the driver's nudge flag, at most once per
+/// observed term (a campaign bumps the term, so a failed takeover
+/// re-arms on its own).
 fn consider_challenger_nudge(
     status: &RaftStatus,
     control: &ReplicaControlPlane,
@@ -416,22 +437,25 @@ fn consider_challenger_nudge(
     peer_tips: &PeerTips,
     elect_requested: &AtomicBool,
     primary_link_down_for: Duration,
+    // Since when the challenger rule has held against the current
+    // `(leader, term)` — the hold-down clock, owned by the poll loop
+    // like the other grace timers. `None` while the rule does not hold.
+    behind_since: &mut Option<(u64, u64, Instant)>,
     last_nudged_term: &mut u64,
 ) {
     if !status.running.load(Ordering::Relaxed)
         || status.role.load(Ordering::Relaxed) == RaftStatus::ROLE_LEADER
         || control.promote.is_requested()
     {
+        *behind_since = None;
         return;
     }
     let leader_id = status.leader_id.load(Ordering::Relaxed);
     if leader_id == 0 || leader_id == status.node_id {
+        *behind_since = None;
         return;
     }
     let term = status.term.load(Ordering::Relaxed);
-    if *last_nudged_term == term {
-        return;
-    }
     let local_tip = JournalTip {
         epoch: fence_state.epoch(),
         last_sequence: control.journal_tip.load().get(),
@@ -440,7 +464,7 @@ fn consider_challenger_nudge(
         .sample(leader_id, Instant::now())
         .filter(|(_, age)| *age <= PEER_TIP_GRACE)
         .map(|(tip, _)| tip);
-    if challenger_should_campaign(
+    if !challenger_should_campaign(
         control.tip_ready.load(Ordering::Acquire),
         fence_state.is_fenced(),
         control.primary_link_up.load(Ordering::Acquire),
@@ -448,18 +472,120 @@ fn consider_challenger_nudge(
         local_tip,
         leader_tip,
     ) {
-        *last_nudged_term = term;
-        elect_requested.store(true, Ordering::Release);
-        info!(
-            node_id = status.node_id,
-            leader_id,
-            term,
-            ?local_tip,
-            ?leader_tip,
-            "control-plane leader is behind this node's journal tip during failover — \
-             campaigning so promotion lands on the caught-up node"
-        );
+        *behind_since = None;
+        return;
     }
+    // The rule holds. Run the hold-down clock against this exact
+    // (leader, term); any change restarts it, so the appends of a
+    // *new* leadership get their own window to repair our log.
+    let since = match *behind_since {
+        Some((l, t, s)) if l == leader_id && t == term => s,
+        _ => {
+            *behind_since = Some((leader_id, term, Instant::now()));
+            return;
+        }
+    };
+    if since.elapsed() < CHALLENGER_HOLD_DOWN || *last_nudged_term == term {
+        return;
+    }
+    *last_nudged_term = term;
+    elect_requested.store(true, Ordering::Release);
+    info!(
+        node_id = status.node_id,
+        leader_id,
+        term,
+        ?local_tip,
+        ?leader_tip,
+        "control-plane leader has been behind this node's journal tip through the hold-down — \
+         campaigning so promotion lands on the caught-up node"
+    );
+}
+
+/// Freshness window for the election stand-down rule, deliberately
+/// wider than [`PEER_TIP_GRACE`] because its evidence arrives more
+/// slowly. The veto samples peers it is actively heartbeating as
+/// leader (a live peer answers within 200–350 ms), so 1.5 s of silence
+/// there means death. The stand-down instead watches a peer it is
+/// *losing elections to*: during a leaderless standoff that peer's tip
+/// arrives only via its own vote requests — at most once per its
+/// election timeout, up to ~2.3 s with the driver's tick quantization.
+/// A window shorter than that period lets the rule flap: the behind
+/// node re-arms mid-period, campaigns first (openraft 0.9 draws each
+/// timeout once per boot, so the shorter draw wins that race every
+/// round), self-votes, and the refusal cycle the rule exists to break
+/// resumes. Two full worst-case periods of margin; the cost is bounded
+/// liveness delay — if the ahead peer dies mid-standoff, this node
+/// waits out the window before campaigning, comparable to
+/// [`PRIMARY_DOWN_GRACE`] and far cheaper than the livelock.
+const STAND_DOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Election stand-down rule (pure): may this replica start
+/// timeout-driven control-plane elections right now?
+///
+/// It may not while a recently-heard peer journal tip is strictly ahead
+/// of its own: an election it could win would only seat a leader whose
+/// promotion the journal-safety veto must refuse, and under openraft
+/// 0.9 such a doomed leadership is worse than useless — election
+/// timeouts are drawn once per boot, so the race between the deposed
+/// behind winner and the caught-up challenger has a fixed winner, and
+/// the depose/re-elect cycle self-sustains (observed livelocking
+/// failover past a 60 s deadline). Standing down is the electoral dual
+/// of the vote filter in `melin_raft::recency`: the filter refuses to
+/// *vote for* a behind candidate, this refuses to *be* one. The behind
+/// node learns where it stands from the ahead node's own vote requests
+/// (tips are recorded from every envelope before the filter judges
+/// it), so it stops competing after losing at most one round.
+///
+/// Liveness: freshness bounds the rule — if the ahead peer dies, its
+/// tip ages past [`STAND_DOWN_GRACE`] and elections re-enable within
+/// one poll. Stale or never-heard peers never stand us down (their
+/// data is unreachable; someone must lead). A fenced node stands down
+/// unconditionally (it must not lead), as does one whose own tip is
+/// not yet recovered (it cannot know where it stands — the vote
+/// filter's tip-readiness gate refuses inbound votes in that state for
+/// the same reason).
+///
+/// `peer_samples` holds each heard peer's last tip and its age.
+fn election_should_stand_down(
+    tip_ready: bool,
+    fenced: bool,
+    local_tip: JournalTip,
+    peer_samples: &[(JournalTip, Duration)],
+) -> bool {
+    if !tip_ready || fenced {
+        return true;
+    }
+    peer_samples
+        .iter()
+        .any(|(tip, age)| *age <= STAND_DOWN_GRACE && tip.is_ahead_of(local_tip))
+}
+
+/// One poll of the stand-down rule: sample the peer-tip table and
+/// publish the verdict to the driver's `elect_enabled` flag. The
+/// driver applies changes on its own 100 ms bridge loop.
+fn consider_election_stand_down(
+    control: &ReplicaControlPlane,
+    fence_state: &melin_transport_core::fence::FenceState,
+    peer_tips: &PeerTips,
+    peer_ids: &[u64],
+    elect_enabled: &AtomicBool,
+) {
+    let now = Instant::now();
+    let local_tip = JournalTip {
+        epoch: fence_state.epoch(),
+        last_sequence: control.journal_tip.load().get(),
+    };
+    let peer_samples: Vec<(JournalTip, Duration)> = peer_ids
+        .iter()
+        .filter_map(|&p| peer_tips.sample(p, now))
+        .collect();
+    let stand_down = election_should_stand_down(
+        control.tip_ready.load(Ordering::Acquire),
+        fence_state.is_fenced(),
+        local_tip,
+        &peer_samples,
+    );
+    elect_enabled.store(!stand_down, Ordering::Release);
 }
 
 /// Spawn the auto-promotion thread for a replica node. Only called when
@@ -478,6 +604,7 @@ pub(crate) fn spawn_auto_promotion(
     // journal-safety veto must account for.
     peer_ids: Vec<u64>,
     elect_requested: Arc<AtomicBool>,
+    elect_enabled: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -485,6 +612,9 @@ pub(crate) fn spawn_auto_promotion(
         .spawn(move || {
             let mut last_refused_term = 0u64;
             let mut last_nudged_term = 0u64;
+            // Hold-down clock for the challenger nudge — see
+            // [`CHALLENGER_HOLD_DOWN`].
+            let mut behind_since: Option<(u64, u64, Instant)> = None;
             // When the primary link last went (and has since stayed) down
             // — `None` while it is up. Tracked here, independent of raft
             // leadership, so the grace clock reflects the true unreachable
@@ -533,15 +663,28 @@ pub(crate) fn spawn_auto_promotion(
                     &peer_tips,
                     &elect_requested,
                     primary_link_down_for,
+                    &mut behind_since,
                     &mut last_nudged_term,
+                );
+                consider_election_stand_down(
+                    &control,
+                    &fence_state,
+                    &peer_tips,
+                    &peer_ids,
+                    &elect_enabled,
                 );
                 if control.promote.is_requested() {
                     // A promotion is in flight (ours or a manual one) —
                     // this node's replica phase is ending.
-                    return;
+                    break;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
+            // This thread owns the stand-down verdict; with the replica
+            // phase over (promotion or shutdown), nobody is left to
+            // clear it, and the node — possibly the new primary — must
+            // hold normal elections again.
+            elect_enabled.store(true, Ordering::Release);
         })
         .expect("failed to spawn raft-promotion thread")
 }
@@ -970,6 +1113,52 @@ mod tests {
             ahead,
             Some(behind)
         ));
+    }
+
+    #[test]
+    fn stand_down_only_while_a_recent_peer_tip_is_ahead() {
+        let local = tip(3, 100);
+        // A recently heard peer strictly ahead: stand down.
+        assert!(election_should_stand_down(
+            true,
+            false,
+            local,
+            &[(tip(3, 101), Duration::ZERO)],
+        ));
+        // Heard right at the window edge still counts.
+        assert!(election_should_stand_down(
+            true,
+            false,
+            local,
+            &[(tip(3, 101), STAND_DOWN_GRACE)],
+        ));
+        // Recent but equal or behind: compete normally — strictness is
+        // what lets tied replicas elect each other.
+        assert!(!election_should_stand_down(
+            true,
+            false,
+            local,
+            &[(tip(3, 100), Duration::ZERO), (tip(3, 99), Duration::ZERO),],
+        ));
+        // An ahead peer gone quiet past the window must not hold
+        // elections down: its data is unreachable, someone must lead.
+        assert!(!election_should_stand_down(
+            true,
+            false,
+            local,
+            &[(tip(3, 200), STAND_DOWN_GRACE + Duration::from_millis(1))],
+        ));
+        // No peers heard at all: compete.
+        assert!(!election_should_stand_down(true, false, local, &[]));
+    }
+
+    #[test]
+    fn stand_down_is_unconditional_when_fenced_or_tip_unready() {
+        let local = tip(3, 100);
+        // Fenced: must not lead, whatever the peers look like.
+        assert!(election_should_stand_down(true, true, local, &[]));
+        // Tip not recovered: cannot know where we stand.
+        assert!(election_should_stand_down(false, false, local, &[]));
     }
 
     #[test]

@@ -1196,6 +1196,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
  "zerocopy",
 ]
 

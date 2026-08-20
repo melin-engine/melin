@@ -74,4 +74,8 @@ tempfile = "3"
 serial_test = "3"
 proptest = "1"
 melin-journal = { workspace = true, features = ["test-utils"] }
+# Opt-in (RUST_LOG-gated) diagnostics for the multi-node failover tests:
+# election livelocks only reproduce statistically, and the panic-time
+# metrics snapshot alone cannot show the vote traffic that led there.
+tracing-subscriber = { workspace = true }
 melin-transport-core = { workspace = true, features = ["test-utils"] }

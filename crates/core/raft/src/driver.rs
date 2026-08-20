@@ -105,6 +105,16 @@ pub struct RaftHandles {
     /// leader during a failover window; the driver observes it within
     /// one poll and calls `Raft::trigger().elect()`.
     pub elect_requested: Arc<AtomicBool>,
+    /// Election stand-down: while `false`, this node starts no
+    /// timeout-driven elections (openraft's `enable_elect` runtime
+    /// toggle). Cleared by the promotion policy on a replica that can
+    /// see a fresh peer journal tip ahead of its own — the electoral
+    /// dual of the vote filter in [`crate::recency`]: that filter says
+    /// "don't vote for someone less caught up", this says "don't stand
+    /// while someone more caught up is alive" — and restored the moment
+    /// the condition no longer holds. The explicit nudge
+    /// (`elect_requested`) bypasses it by design.
+    pub elect_enabled: Arc<AtomicBool>,
     /// The driver thread. Join on shutdown so storage I/O finishes cleanly.
     pub join: std::thread::JoinHandle<()>,
 }
@@ -172,11 +182,13 @@ pub fn spawn(
     let status = Arc::new(RaftStatus::new(config.node_id));
     let peer_tips = Arc::new(crate::recency::PeerTips::new());
     let elect_requested = Arc::new(AtomicBool::new(false));
+    let elect_enabled = Arc::new(AtomicBool::new(true));
 
     let thread_status = Arc::clone(&status);
     let thread_tip = Arc::clone(&tip);
     let thread_peer_tips = Arc::clone(&peer_tips);
     let thread_elect = Arc::clone(&elect_requested);
+    let thread_elect_enabled = Arc::clone(&elect_enabled);
     let join = std::thread::Builder::new()
         .name("raft-driver".into())
         .spawn(move || {
@@ -209,6 +221,7 @@ pub fn spawn(
                 thread_tip,
                 thread_peer_tips,
                 thread_elect,
+                thread_elect_enabled,
                 supersession,
                 shutdown,
             ));
@@ -219,6 +232,7 @@ pub fn spawn(
         status,
         peer_tips,
         elect_requested,
+        elect_enabled,
         join,
     })
 }
@@ -247,6 +261,7 @@ async fn driver_main(
     tip: Arc<TipSource>,
     peer_tips: Arc<crate::recency::PeerTips>,
     elect_requested: Arc<AtomicBool>,
+    elect_enabled: Arc<AtomicBool>,
     supersession: Option<crate::rpc_server::SupersessionPolicy>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -392,6 +407,9 @@ async fn driver_main(
 
     // Bridge raft metrics into the lock-free gauge atomics until shutdown.
     let mut metrics_rx = raft.metrics();
+    // Last value handed to `runtime_config().elect()`; openraft starts
+    // with elections enabled.
+    let mut elect_applied = true;
     while !shutdown.load(Ordering::Relaxed) {
         // Wait for a metrics change, capped so the shutdown flag is polled
         // at the codebase's usual 100 ms listener cadence.
@@ -407,6 +425,25 @@ async fn driver_main(
             && let Err(e) = raft.trigger().elect().await
         {
             warn!(error = %e, "requested election trigger failed");
+        }
+        // Election stand-down (see `RaftHandles::elect_enabled`): apply
+        // the flag on change only — the toggle is a plain atomic store
+        // inside openraft, but logging every poll would be noise.
+        let elect_wanted = elect_enabled.load(Ordering::Relaxed);
+        if elect_wanted != elect_applied {
+            raft.runtime_config().elect(elect_wanted);
+            elect_applied = elect_wanted;
+            info!(
+                node_id = config.node_id,
+                enabled = elect_wanted,
+                "election stand-down toggled — a fresh peer journal tip is \
+                 {} this node's",
+                if elect_wanted {
+                    "no longer ahead of"
+                } else {
+                    "ahead of"
+                }
+            );
         }
         let m = metrics_rx.borrow().clone();
         status.term.store(m.current_term, Ordering::Relaxed);

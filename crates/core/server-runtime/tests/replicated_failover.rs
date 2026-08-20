@@ -222,6 +222,19 @@ fn cluster_summary(nodes: &[NodeSetup]) -> String {
 #[test]
 #[serial]
 fn acked_events_survive_primary_death_under_replicated_mode() {
+    // Opt-in diagnostics: with RUST_LOG set, capture the nodes' tracing
+    // output (all three run in this process) so a failing run records
+    // the control-plane election dialogue, not just the panic-time
+    // metrics snapshot. No-op when RUST_LOG is unset.
+    if std::env::var_os("RUST_LOG").is_some() {
+        // Error dropped deliberately: try_init fails only when a
+        // subscriber is already installed (an earlier #[serial] test),
+        // which is exactly the state we want.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    }
     let tmp = tempfile::tempdir().expect("tempdir");
     let replication_addr = free_addr(PORT_BASE);
 

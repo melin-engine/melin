@@ -950,6 +950,7 @@ where
                 wiring.peer_tips,
                 wiring.peer_ids,
                 wiring.elect_requested,
+                wiring.elect_enabled,
                 Arc::clone(&shutdown),
             ));
         }
@@ -2302,6 +2303,7 @@ where
                 wiring.peer_tips,
                 wiring.peer_ids,
                 wiring.elect_requested,
+                wiring.elect_enabled,
                 Arc::clone(&shutdown),
             ));
         }
