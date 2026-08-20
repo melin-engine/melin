@@ -28,9 +28,11 @@ set -euo pipefail
 #     repository fast-forwards, so the tagged commit becomes the integration
 #     branch's tip unchanged. Do it promptly: the up-to-date check below only
 #     proves that branch was current when the release started.
-#   * Verify a CHANGELOG entry exists for the version. That check belongs to
-#     `publish.sh` per the roadmap, so that it also guards a publish run
-#     started by hand or from CI, not just one driven from here.
+#   * Write the changelog for you. It promotes what is already under
+#     `## [Unreleased]` into the new version's entry and opens a fresh empty
+#     one; it refuses to release if that section is empty. Verifying that a
+#     published version *has* an entry stays in `publish.sh`, so a publish run
+#     started by hand or from CI is guarded too.
 
 # --- Arguments ---------------------------------------------------------------
 
@@ -233,20 +235,31 @@ if ! printf '%s\n%s\n' "$OLD_VERSION" "$NEW_VERSION" | sort -V -C; then
     exit 1
 fi
 
-# `publish.sh` enforces this too — it has to, since it also runs from CI and by
-# hand. Repeating it here is not redundancy but placement: there the check
-# lands *after* the branch and tag have been pushed, and a tag on origin for a
-# version that cannot be published is not something to discover at that point.
-step "Checking CHANGELOG.md covers $NEW_VERSION"
+# `publish.sh` enforces that the version being published has an entry — it has
+# to, since it also runs from CI and by hand. Checked here as well, because
+# there it lands *after* the branch and tag have been pushed, and a tag on
+# origin for a version that cannot be published is not something to discover at
+# that point. What is checked differs: the entry does not exist yet at this
+# stage, so what must hold is that there is something to promote into it.
+step "Checking CHANGELOG.md is ready for $NEW_VERSION"
 if [[ ! -f CHANGELOG.md ]]; then
     echo "error: CHANGELOG.md is missing; every released version needs an entry" >&2
     exit 1
 fi
-if ! grep -q "^## \[${NEW_VERSION//./\\.}\]" CHANGELOG.md; then
-    echo "error: CHANGELOG.md has no '## [$NEW_VERSION]' entry" >&2
-    echo "       Rename the '## [Unreleased]' heading to" >&2
-    echo "         ## [$NEW_VERSION] - $(date -u +%F)" >&2
-    echo "       add a fresh empty '## [Unreleased]' above it, and land that first." >&2
+if (( $(count '^## \[Unreleased\]$' CHANGELOG.md) != 1 )); then
+    echo "error: CHANGELOG.md needs exactly one '## [Unreleased]' heading to promote" >&2
+    exit 1
+fi
+if (( $(count "^## \[${NEW_VERSION//./\\.}\]" CHANGELOG.md) != 0 )); then
+    echo "error: CHANGELOG.md already has a '## [$NEW_VERSION]' entry" >&2
+    exit 1
+fi
+# A release whose changelog entry says nothing is worse than no changelog: it
+# looks maintained. `### ` rather than any text, because the link definitions
+# at the foot of the file would otherwise read as content when Unreleased is
+# the only section.
+if ! sed -n '/^## \[Unreleased\]$/,/^## \[/p' CHANGELOG.md | grep -q '^### '; then
+    echo "error: the '## [Unreleased]' section is empty; nothing to release" >&2
     exit 1
 fi
 
@@ -340,6 +353,44 @@ if (( WS_AFTER != WS_BEFORE || DEP_AFTER != DEP_BEFORE )); then
 fi
 echo "    rewrote $(( WS_AFTER + DEP_AFTER )) version strings in Cargo.toml"
 
+# --- Changelog ---------------------------------------------------------------
+
+# What accumulated under `## [Unreleased]` becomes this version's entry, and a
+# fresh empty `## [Unreleased]` takes its place. Done here rather than by hand
+# beforehand because it belongs in the release commit, next to the version bump
+# and the Change Date — and because a script that refuses to run on a dirty
+# tree cannot ask you to edit a tracked file first.
+step "Promoting the changelog's Unreleased section"
+
+RELEASE_DATE=$(date -u +%F)
+
+# Renaming and inserting are one substitution: the old heading becomes the new
+# pair. GNU sed only, for `\n` in the replacement — as with `date -d` above.
+sed -i "s|^## \[Unreleased\]\$|## [Unreleased]\n\n## [$NEW_VERSION] - $RELEASE_DATE|" CHANGELOG.md
+
+# Keep a Changelog defines its versions as link references at the foot of the
+# file. The base URL is taken from the line already there rather than written
+# into this script, so a repository move needs no edit here.
+UNRELEASED_LINK=$(grep -m1 '^\[Unreleased\]: ' CHANGELOG.md || true)
+if [[ -n "$UNRELEASED_LINK" ]]; then
+    LINK_BASE=${UNRELEASED_LINK#\[Unreleased\]: }
+    LINK_BASE=${LINK_BASE%/compare/*}
+    sed -i \
+        -e "s|^\[Unreleased\]: .*\$|[Unreleased]: $LINK_BASE/compare/v$NEW_VERSION...HEAD|" \
+        -e "/^\[Unreleased\]: /a [$NEW_VERSION]: $LINK_BASE/releases/tag/v$NEW_VERSION" \
+        CHANGELOG.md
+fi
+
+if (( $(count '^## \[Unreleased\]$' CHANGELOG.md) != 1 )); then
+    echo "error: promotion left $(count '^## \[Unreleased\]$' CHANGELOG.md) Unreleased headings" >&2
+    exit 1
+fi
+if (( $(count "^## \[$NEW_RE\] - $RELEASE_DATE\$" CHANGELOG.md) != 1 )); then
+    echo "error: promotion did not produce a '## [$NEW_VERSION] - $RELEASE_DATE' heading" >&2
+    exit 1
+fi
+echo "    promoted Unreleased to $NEW_VERSION ($RELEASE_DATE)"
+
 # `--workspace` restricts the update to workspace members, so a release cannot
 # quietly drag in new third-party versions along with the bump.
 step "Refreshing Cargo.lock"
@@ -424,10 +475,11 @@ echo "    stamped $CHANGE_DATE into ${#LICENSES[@]} LICENSE files"
 # the off-by-default feature builds, and the suite, and a release is exactly
 # the commit that must not skip them.
 step "Committing"
-git add Cargo.toml Cargo.lock "${LICENSES[@]}"
+git add Cargo.toml Cargo.lock CHANGELOG.md "${LICENSES[@]}"
 git commit -q -m "chore(release): v$NEW_VERSION
 
-Bump the workspace to $NEW_VERSION and set the BSL Change Date to
+Bump the workspace to $NEW_VERSION, promote the changelog's Unreleased
+section to $NEW_VERSION ($RELEASE_DATE), and set the BSL Change Date to
 $CHANGE_DATE across the root LICENSE and its per-crate copies."
 DID_COMMIT=1
 
