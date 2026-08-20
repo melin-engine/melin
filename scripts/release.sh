@@ -126,6 +126,10 @@ trap on_exit EXIT
 
 step() { echo; echo "==> $*"; }
 
+# `grep -c` exits 1 on no match, which `set -e` would turn into an abort — but
+# "zero matches" is an answer these checks need, not a failure.
+count() { grep -c -- "$1" "$2" || true; }
+
 # --- Preconditions -----------------------------------------------------------
 
 cd "$(git rev-parse --show-toplevel)"
@@ -182,11 +186,9 @@ cargo metadata --locked --format-version 1 >/dev/null
 # The single source of truth is `[workspace.package] version` in the root
 # manifest; every member inherits it. Read it from there rather than from
 # cargo metadata, because that is the line the bump has to rewrite.
-OLD_VERSION=$(python3 -c '
-import re
-m = re.search(r"^version = \"([^\"]+)\"$", open("Cargo.toml", encoding="utf-8").read(), re.M)
-print(m.group(1) if m else "")
-')
+OLD_VERSION=$(grep -m1 '^version = "' Cargo.toml || true)
+OLD_VERSION=${OLD_VERSION#version = \"}
+OLD_VERSION=${OLD_VERSION%\"}
 if [[ -z "$OLD_VERSION" ]]; then
     echo "error: could not read the current version from Cargo.toml" >&2
     exit 1
@@ -228,64 +230,68 @@ DID_BRANCH=1
 
 # --- Version bump ------------------------------------------------------------
 
-# Rewritten with an exact, counted substitution rather than a bare sed: the
-# root manifest carries the version in nine places (the inherited
-# `[workspace.package]` one plus a pin per intra-workspace dependency) and
-# those must move in lockstep — a dependent resolving against a version its
+# The root manifest carries the version in nine places — the inherited
+# `[workspace.package]` one plus a pin per intra-workspace dependency — and
+# they must move in lockstep: a dependent resolving against a version its
 # provider no longer has is a broken publish, discovered halfway through.
-# Anything unexpected aborts instead of being silently half-applied.
+#
+# So the substitution is counted at every step rather than trusted. Anything
+# unexpected aborts instead of being silently half-applied, which is the whole
+# risk of rewriting a manifest with a regex.
 step "Bumping the workspace version"
-python3 - "$OLD_VERSION" "$NEW_VERSION" Cargo.toml <<'PY'
-import re, sys
 
-old, new, path = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(path, encoding="utf-8") as f:
-    text = f.read()
+# Only `.` is a regex metacharacter in a version string the X.Y.Z check above
+# has already proven to be digits and dots.
+OLD_RE=${OLD_VERSION//./\\.}
+NEW_RE=${NEW_VERSION//./\\.}
 
-# Every `melin-* = { ... version = "..." }` line, matched loosely so that one
-# written in a shape the strict substitution below misses is caught rather
-# than skipped.
-loose = [
-    line for line in text.splitlines()
-    if re.match(r"^melin-[A-Za-z0-9_-]+\s*=", line) and 'version = "' in line
-]
-stale = [line for line in loose if f'version = "{old}"' not in line]
-if stale:
-    sys.exit(
-        f"error: intra-workspace pins are not all at {old}; fix them first:\n  "
-        + "\n  ".join(stale)
-    )
+WS_AT_OLD='^version = "'"$OLD_RE"'"$'
+DEP_AT_OLD='^melin-[A-Za-z0-9_-]* = { path = "[^"]*", version = "'"$OLD_RE"'"'
+# Deliberately looser than the substitution shape, so a pin written differently
+# is caught here rather than quietly skipped by the sed below.
+DEP_ANY='^melin-[A-Za-z0-9_-]* = .*version = "'
 
-text, workspace_hits = re.subn(
-    rf'^version = "{re.escape(old)}"$', f'version = "{new}"', text, flags=re.M
-)
-if workspace_hits != 1:
-    sys.exit(f"error: expected 1 [workspace.package] version line at {old}, found {workspace_hits}")
+STALE=$(grep -n -- "$DEP_ANY" Cargo.toml | grep -v -- "version = \"$OLD_RE\"" || true)
+if [[ -n "$STALE" ]]; then
+    echo "error: intra-workspace pins are not all at $OLD_VERSION; fix them first:" >&2
+    echo "$STALE" >&2
+    exit 1
+fi
 
-text, dep_hits = re.subn(
-    rf'^(melin-[A-Za-z0-9_-]+ = \{{ path = "[^"]*", version = )"{re.escape(old)}"',
-    r'\g<1>"' + new + '"',
-    text,
-    flags=re.M,
-)
-if dep_hits != len(loose):
-    sys.exit(f"error: rewrote {dep_hits} of {len(loose)} intra-workspace pins; aborting")
+WS_BEFORE=$(count "$WS_AT_OLD" Cargo.toml)
+DEP_BEFORE=$(count "$DEP_AT_OLD" Cargo.toml)
+DEP_TOTAL=$(count "$DEP_ANY" Cargo.toml)
 
-# Nothing may still claim the old version in a position that matters. Scoped to
-# those two shapes on purpose: a third-party dependency that happens to sit at
-# the same version number is not our problem and must not block a release.
-leftover = re.findall(
-    rf'^(?:version|melin-[A-Za-z0-9_-]+ = \{{ path = "[^"]*", version) = "{re.escape(old)}"',
-    text,
-    flags=re.M,
-)
-if leftover:
-    sys.exit(f"error: {len(leftover)} version string(s) still at {old} after the bump")
+if (( WS_BEFORE != 1 )); then
+    echo "error: expected 1 [workspace.package] version line at $OLD_VERSION, found $WS_BEFORE" >&2
+    exit 1
+fi
+if (( DEP_BEFORE != DEP_TOTAL )); then
+    echo "error: only $DEP_BEFORE of $DEP_TOTAL intra-workspace pins match the rewrite shape" >&2
+    exit 1
+fi
 
-with open(path, "w", encoding="utf-8") as f:
-    f.write(text)
-print(f"    rewrote {workspace_hits + dep_hits} version strings in {path}")
-PY
+sed -i \
+    -e "s/^version = \"$OLD_RE\"\$/version = \"$NEW_VERSION\"/" \
+    -e "s/^\\(melin-[A-Za-z0-9_-]* = { path = \"[^\"]*\", version = \\)\"$OLD_RE\"/\\1\"$NEW_VERSION\"/" \
+    Cargo.toml
+
+# Scoped to those two shapes on purpose: a third-party dependency that happens
+# to sit at the same version number is not our problem and must not block a
+# release.
+LEFT=$(( $(count "$WS_AT_OLD" Cargo.toml) + $(count "$DEP_AT_OLD" Cargo.toml) ))
+if (( LEFT != 0 )); then
+    echo "error: $LEFT version string(s) still at $OLD_VERSION after the bump" >&2
+    exit 1
+fi
+
+WS_AFTER=$(count '^version = "'"$NEW_RE"'"$' Cargo.toml)
+DEP_AFTER=$(count '^melin-[A-Za-z0-9_-]* = { path = "[^"]*", version = "'"$NEW_RE"'"' Cargo.toml)
+if (( WS_AFTER != WS_BEFORE || DEP_AFTER != DEP_BEFORE )); then
+    echo "error: rewrote $WS_AFTER+$DEP_AFTER version strings, expected $WS_BEFORE+$DEP_BEFORE" >&2
+    exit 1
+fi
+echo "    rewrote $(( WS_AFTER + DEP_AFTER )) version strings in Cargo.toml"
 
 # `--workspace` restricts the update to workspace members, so a release cannot
 # quietly drag in new third-party versions along with the bump.
@@ -306,16 +312,15 @@ step "Stamping the BSL Change Date"
 # `mapfile` from a process substitution cannot fail the script under `set -e`,
 # so an empty result is checked for explicitly below — silently falling back to
 # stamping the root LICENSE alone would ship crates carrying a stale date.
+# `.publish` is absent (null) on a publishable crate and `[]` on one marked
+# `publish = false`, so the comparison sorts them without a special case.
 mapfile -t CRATE_DIRS < <(
-    cargo metadata --no-deps --format-version 1 | python3 -c '
-import json, os, sys
-meta = json.load(sys.stdin)
-root = meta["workspace_root"]
-for pkg in sorted(meta["packages"], key=lambda p: p["name"]):
-    directory = os.path.dirname(pkg["manifest_path"])
-    publishable = pkg.get("publish") != []
-    print(f"{int(publishable)}\t{os.path.relpath(directory, root)}")
-'
+    cargo metadata --no-deps --format-version 1 | jq -r '
+        .workspace_root as $root
+        | .packages[]
+        | [(.publish != []),
+           (.manifest_path | ltrimstr($root + "/") | rtrimstr("/Cargo.toml"))]
+        | @tsv'
 )
 
 if (( ${#CRATE_DIRS[@]} == 0 )); then
@@ -329,7 +334,7 @@ for entry in "${CRATE_DIRS[@]}"; do
     dir="${entry#*$'\t'}"
     if [[ -f "$dir/LICENSE" ]]; then
         LICENSES+=("$dir/LICENSE")
-    elif [[ "$publishable" == "1" ]]; then
+    elif [[ "$publishable" == "true" ]]; then
         echo "error: $dir has no LICENSE; every published crate must carry one" >&2
         exit 1
     fi
@@ -345,21 +350,21 @@ for license in "${LICENSES[@]:1}"; do
     fi
 done
 
-python3 - "$CHANGE_DATE" LICENSE <<'PY'
-import re, sys
-
-date, path = sys.argv[1], sys.argv[2]
-with open(path, encoding="utf-8") as f:
-    text = f.read()
+# Anchored to the start of the line so the two places the licence *prose*
+# mentions the Change Date are left alone.
+DATE_BEFORE=$(count '^Change Date:[[:space:]]' LICENSE)
+if (( DATE_BEFORE != 1 )); then
+    echo "error: expected exactly 1 'Change Date:' line in LICENSE, found $DATE_BEFORE" >&2
+    exit 1
+fi
 
 # The parameter block aligns its values at column 23; keep that.
-text, hits = re.subn(r"^Change Date:\s+\S.*$", f"Change Date:          {date}", text, flags=re.M)
-if hits != 1:
-    sys.exit(f"error: expected exactly 1 'Change Date:' line in {path}, found {hits}")
+sed -i "s/^Change Date:[[:space:]].*\$/Change Date:          $CHANGE_DATE/" LICENSE
 
-with open(path, "w", encoding="utf-8") as f:
-    f.write(text)
-PY
+if (( $(count "^Change Date:          $CHANGE_DATE\$" LICENSE) != 1 )); then
+    echo "error: Change Date was not stamped into LICENSE" >&2
+    exit 1
+fi
 
 for license in "${LICENSES[@]:1}"; do
     cp LICENSE "$license"
