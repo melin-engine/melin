@@ -108,6 +108,9 @@ ORIGINAL_BRANCH=""
 cleanup_hint() {
     echo "    Undo the local work with:"
     (( DID_TAG )) && echo "      git tag -d $TAG"
+    # Before the commit, the bump and the stamped licences are uncommitted
+    # edits; a plain checkout would carry them back onto the original branch.
+    (( DID_BRANCH && ! DID_COMMIT )) && echo "      git checkout -- ."
     echo "      git checkout ${ORIGINAL_BRANCH:-main}"
     (( DID_BRANCH )) && echo "      git branch -D $BRANCH"
     return 0
@@ -209,6 +212,17 @@ if git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null 2>&1
 fi
 if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
     echo "error: tag $TAG already exists on origin — $NEW_VERSION is already released" >&2
+    exit 1
+fi
+
+# The commit below runs the pre-commit hook as the release gate — but the hook
+# is opt-in (`git config core.hooksPath .githooks`), and on a machine that
+# never ran that, `git commit` checks nothing. In live mode what follows is a
+# push and a publish with no CI in between, so this is a hard error in both
+# modes: a rehearsal that skips the gate proves nothing.
+step "Checking the pre-commit hook is installed"
+if [[ "$(git config --get core.hooksPath || true)" != ".githooks" ]]; then
+    echo "error: the pre-commit hook is not installed; run 'git config core.hooksPath .githooks'" >&2
     exit 1
 fi
 
