@@ -282,22 +282,24 @@ Defined in `crates/core/server-runtime/src/response.rs` (io_uring-based SEND).
 
 The response stage runs on a dedicated OS thread and is the final stage in the pipeline. It consumes from the output SPSC and writes encoded responses to client sockets.
 
-### Durability gating (persist-before-ack)
+### Ack gating (persist-before-ack)
 
-Before sending any response, the response stage verifies that the corresponding event is durable:
+Before sending any response, the response stage verifies that the corresponding event satisfies the configured ack policy:
 
 1. Each response carries the sequence number the event was assigned in the journal, which is the same number replicas report progress against.
-2. The durable position is derived from the configured mode:
-   - **Quorum mode** (default, 2 replicas connected): every connected replica has acknowledged the event — NVMe fsync is off the critical path.
-   - **Degraded/standalone mode** (0-1 replicas): the event is fsynced to the local journal, and acknowledged by the surviving replica if one is connected.
-3. If the durable position has not reached that response's own sequence number, spin-wait until it does.
+2. The acked position is derived from the configured ack policy (`--ack-policy`), which says which *copies* of the event must exist — not which nodes must hold them:
+   - **`disk`**: one fsynced copy, on whichever node's disk confirms first. The only policy allowed with `--standalone`.
+   - **`ram`**: two copies in memory (the primary's plus one replica's). Every fsync trails off the ack path.
+   - **`disk+ram`** (default): one fsynced copy plus a second copy in another node's memory. A disk spike on the primary lets the replica's fsync satisfy the disk clause.
+   - **`two-disks`**: two fsynced copies.
+3. If the acked position has not reached that response's own sequence number, spin-wait until it does.
 4. Once confirmed, the response is encoded and sent.
 
-The check is made **per response**, not once per batch. A response is released as soon as its own event is durable, so a request does not wait on the durability of unrelated requests that happened to be processed alongside it. Since the durable position is a high-water mark, a client that receives a response knows that event and every event before it is durable under the configured mode.
+The check is made **per response**, not once per batch. A response is released as soon as its own event satisfies the policy, so a request does not wait on unrelated requests that happened to be processed alongside it. Since the acked position is a high-water mark, a client that receives a response knows that event and every event before it satisfies the configured policy.
 
-Responses whose delivery does not depend on durability are exempt from the wait entirely. The halt rejection sent when the matching engine has stopped is the case that matters in practice: it reports no engine state, so it is delivered immediately rather than blocking on a mode that a degraded cluster may not be able to satisfy.
+Responses whose delivery does not depend on the policy are exempt from the wait entirely. The halt rejection sent when the matching engine has stopped is the case that matters in practice: it reports no engine state, so it is delivered immediately rather than blocking on a policy that a degraded cluster may not be able to satisfy.
 
-The durable position is cached across batches to avoid redundant atomic loads when durability is running ahead of the response stage.
+The acked position is cached across batches to avoid redundant atomic loads when the policy's cursors are running ahead of the response stage.
 
 ### Per-connection send buffers
 
@@ -313,7 +315,7 @@ The response stage uses an adaptive flush strategy:
 
 - Under high load, it processes many SPSC batches before the queue empties, accumulating buffered writes and amortizing syscall overhead across thousands of entries.
 - Under low load, the SPSC empties quickly, and the flush happens promptly.
-- Buffered writes are also flushed immediately before the stage blocks on a durability wait. Without this, a response that is already durable would sit in the buffer for the length of an unrelated event's fsync and replica round-trip. The flush costs nothing in latency terms because it only happens when the stage is about to wait anyway.
+- Buffered writes are also flushed immediately before the stage blocks on an ack-gate wait. Without this, a response whose own gate has already opened would sit in the buffer for the length of an unrelated event's fsync and replica round-trip. The flush costs nothing in latency terms because it only happens when the stage is about to wait anyway.
 
 **Operational note.** Both triggers — the lull and the pre-wait flush — fall silent while the output ring stays non-empty *and* durability keeps running ahead: no wait, no lull, no flush. A client that saturates the pipeline in that regime can accumulate 64 KiB of buffered responses, at which point the connection is dropped to bound memory. A size-based flush trigger on the consumed path would close this; it is not implemented yet.
 
@@ -376,7 +378,7 @@ The journal stage runs on two threads, and the division decides what a disk stal
 
 Publication happens on the disk thread because only it knows when a batch became durable. Publishing at hand-off time would let a replica acknowledge entries its disk had not taken.
 
-The practical consequence: while the device is slow, the sequencer keeps ordering, encoding, and **feeding replicas**. Under a durability policy that can be satisfied by a replica (`hybrid`), acknowledgements continue through the replica leg during a local stall. Under `local` they wait, correctly — but the stall now shows up as journal disk lag rather than a frozen pipeline.
+The practical consequence: while the device is slow, the sequencer keeps ordering, encoding, and **feeding replicas**. Because every ack policy counts copies rather than nodes, a replica's fsync can satisfy the disk clause of `disk` or `disk+ram` while the primary's device stalls, so acknowledgements continue through the replica leg. Only when no other copy can be supplied — `disk` with no replica attached — do acks wait, correctly; the stall then shows up as journal disk lag rather than a frozen pipeline.
 
 Absorption is bounded by the hand-off ring (64 batches). Past that the sequencer stalls at its next batch, the input ring fills, and producers backpressure — the same chain as before, with a deeper buffer in front of it. Watch `melin_journal_disk_lag_batches`.
 
@@ -396,7 +398,7 @@ The server is fully synchronous -- no async runtime. Eliminating tokio removes a
 
 ## Persist-Before-Ack Invariant
 
-The persist-before-ack invariant guarantees that **no client ever receives a response for an event that is not yet durable on disk**. This is the foundation of the event sourcing model: on crash recovery, the journal contains every event that any client was told succeeded.
+The persist-before-ack invariant guarantees that **no client ever receives a response for an event that does not yet hold the copies the ack policy demands** — under every policy except `ram`, that includes at least one fsynced copy. This is the foundation of the event sourcing model: on crash recovery, the journal contains every event that any client was told succeeded.
 
 ### Why it matters
 
@@ -409,7 +411,7 @@ Without this invariant, a crash between matching and journal sync could cause:
 
 1. The journal stage reads events from the input disruptor, encodes them, and hands each batch to the disk thread, which writes and syncs it. The consumer progress cursor advances **only after** that sync completes (durable write confirmed by the kernel/NVMe controller), and it is the disk thread that advances it.
 2. The matching stage stamps each response with the journal sequence number of the event that produced it. Query responses are stamped with the last event applied before the query, since that is the state they report.
-3. The response stage spin-waits until the durable position reaches that number — for each response individually, not once per batch.
+3. The response stage spin-waits until the acked position (the policy's evaluation of the journal and replica cursors) reaches that number — for each response individually, not once per batch.
 4. Only then is that response encoded and written to its client socket.
 
 Because the journal and matching consumers run in parallel (not chained), the matching stage often finishes before the journal. The response stage absorbs this difference by waiting on the journal cursor, achieving maximum pipeline parallelism while preserving the durability guarantee.

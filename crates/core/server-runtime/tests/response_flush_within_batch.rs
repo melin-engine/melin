@@ -25,7 +25,7 @@ use melin_app::encoder::ResponseEncoder;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_server_runtime::ControlEvent;
-use melin_server_runtime::durability_policy::DurabilityMode;
+use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::response::{self, Response};
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
@@ -168,7 +168,7 @@ fn large_frame_batch_is_delivered_not_disconnected() {
     let (control_tx, control_rx) = mpsc::channel();
     let config = Response::<PadApp> {
         journal_persisted_wire_seq: journal_cursor.clone(),
-        durability_mode: Arc::new(AtomicU8::new(DurabilityMode::Local.as_u8())),
+        ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
         replication_metrics: None,
         replica_active: None,
         heartbeat_interval: None,

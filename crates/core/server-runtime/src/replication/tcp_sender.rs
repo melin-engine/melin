@@ -54,7 +54,7 @@ pub struct Sender {
     /// `--replication-bind` port fails the boot with a clear error.
     /// Binding on this thread meant a failure only killed the sender
     /// silently, leaving a primary that looked healthy but could never
-    /// satisfy hybrid/durably-replicated acks.
+    /// satisfy `disk+ram`/`two-disks` acks.
     pub listener: ReplicationListener,
     pub repl_consumer_1: ReplicationConsumer,
     pub repl_consumer_2: ReplicationConsumer,
@@ -72,11 +72,11 @@ pub struct Sender {
     /// `StreamStart`, and to self-demote when a replica handshakes with a
     /// higher epoch (this primary has been superseded). See `crate::fence`.
     pub fence_state: Arc<melin_transport_core::fence::FenceState>,
-    /// The active durability (acking) mode, shared with the response
-    /// gate and the admin `DURABILITY` command. Stamped on every
-    /// `StreamStart` and `Heartbeat` so replicas judge auto-promotion
-    /// against the mode this primary actually acks under.
-    pub durability_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// The active ack policy, shared with the response gate and the
+    /// admin `ACK-POLICY` command. Stamped on every `StreamStart` and
+    /// `Heartbeat` so replicas judge auto-promotion against the policy
+    /// this primary actually acks under.
+    pub ack_policy: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Run the replication sender. Listens for replica connections,
@@ -105,7 +105,7 @@ pub fn run_sender<A: Application>(
         heartbeat_secs,
         busy_spin,
         fence_state,
-        durability_mode,
+        ack_policy,
     } = config;
     // Unwrap the invariant-carrying newtype — from here `listener` is a
     // plain TcpListener, known non-blocking.
@@ -303,7 +303,7 @@ pub fn run_sender<A: Application>(
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
                     let slot_evict = Arc::clone(&evict_flags[slot_idx]);
                     let slot_fence = Arc::clone(&fence_state);
-                    let slot_durability = Arc::clone(&durability_mode);
+                    let slot_ack_policy = Arc::clone(&ack_policy);
                     let slot_authenticated = Arc::clone(&authenticated_flags[slot_idx]);
                     let handler_core = handler_cores[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
@@ -350,7 +350,7 @@ pub fn run_sender<A: Application>(
                                 evict_flag: &slot_evict,
                                 metrics: &slot_metrics,
                                 fence_state: &slot_fence,
-                                durability_mode: &slot_durability,
+                                ack_policy: &slot_ack_policy,
                                 slot_idx,
                                 batch_size,
                                 heartbeat_secs,
@@ -392,9 +392,9 @@ struct SlotContext<'a> {
     evict_flag: &'a AtomicBool,
     metrics: &'a ReplicationMetrics,
     fence_state: &'a melin_transport_core::fence::FenceState,
-    /// The primary's active acking mode — stamped on `StreamStart` and
-    /// `Heartbeat` (see `Sender::durability_mode`).
-    durability_mode: &'a std::sync::atomic::AtomicU8,
+    /// The primary's active ack policy — stamped on `StreamStart` and
+    /// `Heartbeat` (see `Sender::ack_policy`).
+    ack_policy: &'a std::sync::atomic::AtomicU8,
     slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
@@ -436,7 +436,7 @@ fn handle_replica_connection<A: Application>(
         evict_flag: _,
         metrics,
         fence_state,
-        durability_mode,
+        ack_policy,
         slot_idx,
         batch_size: _,
         heartbeat_secs,
@@ -564,7 +564,7 @@ fn handle_replica_connection<A: Application>(
             lineage_start,
             lineage_anchor,
             fence_state.epoch(),
-            durability_mode.load(Ordering::Relaxed),
+            ack_policy.load(Ordering::Relaxed),
             &mut send_buf,
         );
         publish(&send_buf)?;
@@ -606,7 +606,7 @@ fn handle_replica_connection<A: Application>(
             journal_path,
             &mut publish,
             shutdown,
-            durability_mode.load(Ordering::Relaxed),
+            ack_policy.load(Ordering::Relaxed),
         )? {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
@@ -788,7 +788,7 @@ fn live_stream_uring(
         slot_idx,
         batch_size,
         busy_spin,
-        durability_mode,
+        ack_policy,
         // Only used during handshake/catch-up (handle_replica_connection).
         journal_path: _,
         authorized_keys: _,
@@ -932,11 +932,7 @@ fn live_stream_uring(
                 // free and must not be skipped — see AmortizedTimer docs.
                 let spinning = busy_spin || idle_spins < 1000;
                 if heartbeat_timer.tick(heartbeat_interval, spinning).is_some() {
-                    encode_heartbeat(
-                        sent.get(),
-                        durability_mode.load(Ordering::Relaxed),
-                        send_buf,
-                    );
+                    encode_heartbeat(sent.get(), ack_policy.load(Ordering::Relaxed), send_buf);
                     let sqe = opcode::Send::new(
                         types::Fixed(0),
                         send_buf.as_ptr(),

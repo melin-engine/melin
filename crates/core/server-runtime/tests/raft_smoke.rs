@@ -54,7 +54,7 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
         journal: tmp.path().join("smoke.journal"),
         authorized_keys: auth_path,
         standalone: true,
-        durability_mode: melin_server_runtime::durability_policy::DurabilityMode::Local,
+        ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         no_mlock: true,
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,

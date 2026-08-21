@@ -572,7 +572,7 @@ where
         tip_ready,
         journal_tip,
         primary_link_up,
-        primary_acking_mode,
+        primary_ack_policy,
         pipeline_healthy,
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
@@ -743,7 +743,7 @@ where
                 segment_start_sequence,
                 anchor_hash,
                 epoch,
-                durability_mode,
+                ack_policy,
             } => {
                 // Fence: refuse to follow a primary whose epoch is behind
                 // ours — following its (divergent) lineage on top of our
@@ -767,11 +767,11 @@ where
                     continue;
                 }
                 // Adopt the primary's epoch immediately; streamed `EpochBump`s
-                // keep it current thereafter. Likewise the acking mode
+                // keep it current thereafter. Likewise the ack policy
                 // (heartbeats keep it current mid-session).
                 fence_state.observe_epoch(epoch);
-                primary_acking_mode.store(durability_mode, Ordering::Release);
-                info!(start_sequence, epoch, durability_mode, "streaming started");
+                primary_ack_policy.store(ack_policy, Ordering::Release);
+                info!(start_sequence, epoch, ack_policy, "streaming started");
                 ((segment_start_sequence, anchor_hash), last_sequence)
             }
             ref resync @ (PrimaryMessage::NeedSnapshot | PrimaryMessage::HashMismatch) => {

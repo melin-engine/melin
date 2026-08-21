@@ -20,9 +20,7 @@ use tracing::{debug, error};
 
 use melin_pipeline::ring;
 
-use crate::durability_policy::{
-    Blocker, CursorView, DurabilityMode, EvalStatus, MAX_CLUSTER_SIZE, Policy,
-};
+use crate::ack_policy::{AckPolicy, Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -158,7 +156,7 @@ pub type ResponseEncoderArc<A> = Arc<
 
 /// Configuration and shared state for the response stage.
 pub struct Response<A: Application> {
-    /// Highest wire seq durably persisted on the primary's journal.
+    /// Highest wire seq durably persisted on this node's journal.
     /// In the same sequence space as `OutputSlot.wire_seq` and the
     /// replica metrics (`metrics.in_memory_sequence` /
     /// `metrics.acked_sequence`), so the durability gate can compare
@@ -168,15 +166,14 @@ pub struct Response<A: Application> {
     /// ring-space counter — the pre-v14 bug class. Updated by the
     /// journal stage after every fsync batch via `set_last_seq_publisher`.
     pub journal_persisted_wire_seq: DurableWireSeqCursor,
-    /// Operator-selected durability mode, published through a shared
-    /// [`AtomicU8`] so the admin `DURABILITY` command can swap it at
+    /// Operator-selected ack policy, published through a shared
+    /// [`AtomicU8`] so the admin `ACK-POLICY` command can swap it at
     /// runtime without restarting the node. The response stage reads
     /// this once per gate iteration with a relaxed load (cheaper than a
     /// `Mutex` or refcounted `Arc<Policy>` snapshot) and rebuilds its
     /// local [`Policy`] when the byte changes. See
-    /// [`crate::durability_policy::DurabilityMode::as_u8`] for the
-    /// encoding.
-    pub durability_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// [`crate::ack_policy::AckPolicy::as_u8`] for the encoding.
+    pub ack_policy: Arc<std::sync::atomic::AtomicU8>,
     /// Per-slot replica cursors. `None` for standalone deployments
     /// (no replication wiring) — the policy then evaluates against the
     /// primary alone.
@@ -248,8 +245,8 @@ struct ConnectionEntry {
 /// Consumes from the output SPSC, waits for durability confirmation, and
 /// sends responses via io_uring SEND.
 ///
-/// Durability gating: every gate iteration reads the journal cursor
-/// (primary persisted) plus per-slot replica cursors (in-memory and
+/// Ack gating: every gate iteration reads the journal cursor (this
+/// node's persisted) plus per-slot replica cursors (in-memory and
 /// persisted) from `replication_metrics` and feeds them through the
 /// configured [`Policy`]. See [`evaluate_durability`].
 pub fn run<A: Application>(
@@ -260,7 +257,7 @@ pub fn run<A: Application>(
 ) {
     let Response {
         journal_persisted_wire_seq,
-        durability_mode,
+        ack_policy,
         replication_metrics,
         replica_active,
         heartbeat_interval,
@@ -270,23 +267,24 @@ pub fn run<A: Application>(
         fence_state,
         active_connections,
     } = config;
-    // Resolve the starting mode from the shared atomic and derive the
+    // Resolve the starting policy from the shared atomic and derive the
     // local Policy. The atomic is the single source of truth across the
     // process lifetime; the response thread keeps a thread-local copy
     // for cheap per-iteration use and rebuilds it when an admin
-    // `DURABILITY` command swaps the atomic. Initialise as Hybrid (the
-    // default mode) if the atomic ever holds a corrupted byte — better
-    // than panicking on a degraded process and matches the default
-    // operators see at boot.
-    let mut active_mode =
-        DurabilityMode::from_u8(durability_mode.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or_else(|| {
-                tracing::error!(
-                    "durability_mode atomic held a corrupted byte at startup; defaulting to hybrid"
-                );
-                DurabilityMode::Hybrid
-            });
-    let mut policy = active_mode.to_policy();
+    // `ACK-POLICY` command swaps the atomic. Initialise as DiskAndRam
+    // (the default policy) if the atomic ever holds a corrupted byte —
+    // better than panicking on a degraded process and matches the
+    // default operators see at boot.
+    let mut active_policy = AckPolicy::from_u8(
+        ack_policy.load(std::sync::atomic::Ordering::Relaxed),
+    )
+    .unwrap_or_else(|| {
+        tracing::error!(
+            "ack_policy atomic held a corrupted byte at startup; defaulting to disk+ram"
+        );
+        AckPolicy::DiskAndRam
+    });
+    let mut policy = active_policy.to_policy();
     // SINGLE_ISSUER: created and submitted from this thread only — the
     // kernel skips SQ locking and rejects cross-thread submission with
     // EEXIST instead of racing. Matches the journal/replication rings.
@@ -318,7 +316,7 @@ pub fn run<A: Application>(
     // See `DegradationLogger` for the full state machine. Initialised
     // below from the policy's startup evaluation so an unsatisfiable
     // policy (e.g. a primary that just lost both replicas while
-    // running `hybrid` or `durably-replicated`) is visible immediately
+    // running `disk+ram` or `two-disks`) is visible immediately
     // on `/healthz` and in the journal.
     let startup_now = Instant::now();
     let mut last_policy_check = startup_now;
@@ -526,25 +524,25 @@ pub fn run<A: Application>(
     let mut gate_accrual_timer = AmortizedTimer::new();
 
     loop {
-        // Observe runtime mode swaps from the admin `DURABILITY`
+        // Observe runtime policy swaps from the admin `ACK-POLICY`
         // command. Relaxed load (single writer is the admin handler,
         // single reader is this thread). When the byte changes,
         // rebuild the local Policy and reset the cached durable
         // position so the next gate evaluation starts from a clean
         // slate under the new shape; log the transition for the audit
         // trail. An unknown byte is treated as memory corruption: we
-        // log and keep the prior mode rather than silently downgrading.
-        let observed_byte = durability_mode.load(Ordering::Relaxed);
-        if observed_byte != active_mode.as_u8() {
-            match DurabilityMode::from_u8(observed_byte) {
+        // log and keep the prior policy rather than silently downgrading.
+        let observed_byte = ack_policy.load(Ordering::Relaxed);
+        if observed_byte != active_policy.as_u8() {
+            match AckPolicy::from_u8(observed_byte) {
                 Some(next) => {
                     tracing::info!(
-                        prev = active_mode.as_str(),
+                        prev = active_policy.as_str(),
                         next = next.as_str(),
-                        "durability mode swapped at runtime"
+                        "ack policy swapped at runtime"
                     );
-                    active_mode = next;
-                    policy = active_mode.to_policy();
+                    active_policy = next;
+                    policy = active_policy.to_policy();
                     // The fresh policy may evaluate degraded/undegraded
                     // differently against the same cluster shape; let
                     // the next gate evaluation re-derive.
@@ -559,7 +557,7 @@ pub fn run<A: Application>(
                 None => {
                     tracing::error!(
                         byte = observed_byte,
-                        "durability_mode atomic held a corrupted byte; retaining prior mode"
+                        "ack_policy atomic held a corrupted byte; retaining prior policy"
                     );
                 }
             }
@@ -761,7 +759,7 @@ pub fn run<A: Application>(
                     }
                 }
 
-                // Re-evaluate the durability policy on a slow timer so
+                // Re-evaluate the ack policy on a slow timer so
                 // the `policy_degraded` flag and the periodic warn track
                 // the cluster's real state even on idle / quiet venues.
                 // The gate-open block also calls `update_degraded_state`
@@ -952,26 +950,26 @@ pub fn run<A: Application>(
 
                 loop {
                     // Inside the gate-wait spin loop, also observe a
-                    // mode swap. Without this, a batch whose gate
+                    // policy swap. Without this, a batch whose gate
                     // becomes structurally unsatisfiable (e.g. all
                     // replicas die while a non-bypass slot is in
-                    // flight under `Hybrid`) would wedge the response
+                    // flight under `DiskAndRam`) would wedge the response
                     // stage forever, even if an operator sends the
-                    // remediating `DURABILITY local` — the outer loop
+                    // remediating `ACK-POLICY disk` — the outer loop
                     // observation never gets a chance to run. The
                     // relaxed load is ~1 cycle on x86; cheaper than
                     // the `spin_loop` hint below.
-                    let observed_byte = durability_mode.load(Ordering::Relaxed);
-                    if observed_byte != active_mode.as_u8()
-                        && let Some(next) = DurabilityMode::from_u8(observed_byte)
+                    let observed_byte = ack_policy.load(Ordering::Relaxed);
+                    if observed_byte != active_policy.as_u8()
+                        && let Some(next) = AckPolicy::from_u8(observed_byte)
                     {
                         tracing::info!(
-                            prev = active_mode.as_str(),
+                            prev = active_policy.as_str(),
                             next = next.as_str(),
-                            "durability mode swapped during gate wait"
+                            "ack policy swapped during gate wait"
                         );
-                        active_mode = next;
-                        policy = active_mode.to_policy();
+                        active_policy = next;
+                        policy = active_policy.to_policy();
                         // Flush accrual before re-seeding so the wedged-
                         // degraded interval up to the swap isn't dropped.
                         degraded_logger.reseed(&utilization, Instant::now());
@@ -995,9 +993,9 @@ pub fn run<A: Application>(
                     gate_tracker.observe(
                         journal_pos.get(),
                         // The level the *active policy* gates replicas
-                        // on — in-memory under `hybrid`, persisted under
-                        // `durably-replicated`. `None` when no clause is
-                        // replica-supplied (`local`) and, transiently,
+                        // on — in-memory under `disk+ram`, persisted under
+                        // `two-disks`. `None` when no clause is
+                        // replica-supplied (`disk`) and, transiently,
                         // when the binding replica drops out of the
                         // cursor view mid-wait. Passed through as-is so
                         // the tracker can tell "no replica wait to
@@ -1310,7 +1308,7 @@ fn discard_e2e_samples(pending: &mut Vec<(u64, trace::MonoTraceInstant)>, droppe
 /// emission carry no engine state worth replicating before delivery —
 /// see [`OutputSlot::durability_bypass`] for the correctness argument —
 /// so clients receive the halt reason immediately rather than blocking
-/// on a structurally unsatisfiable policy (e.g. `Hybrid` with all
+/// on a structurally unsatisfiable policy (e.g. `DiskAndRam` with all
 /// replicas disconnected, which would otherwise stall the gate until
 /// peers return). Second, the slot's own event is already durable.
 ///
@@ -1735,9 +1733,9 @@ pub(crate) fn evaluate_durability(
 ///
 /// The attribution itself replaces the old "compare the journal cursor
 /// against the minimum replica *persisted* cursor" heuristic, which
-/// reported replication as the blocker under `local` — where replicas
+/// reported replication as the blocker under `disk` — where replicas
 /// cannot bind the gate at all — and read the persisted level under
-/// `hybrid`, which gates on in-memory.
+/// `disk+ram`, which gates on in-memory.
 #[inline]
 pub(crate) fn evaluate_gate(
     policy: &Policy,
@@ -1830,13 +1828,13 @@ impl DegradationLogger {
     }
 
     /// Use when the policy is known to start in a degraded state
-    /// (e.g. a primary in `hybrid` mode with no replica yet
+    /// (e.g. a primary under `disk+ram` with no replica yet
     /// connected). Logs a startup warn immediately and treats the
     /// state as already-logged so the next tick doesn't re-emit.
     pub(crate) fn new_starting_degraded(now: Instant, policy: &Policy) -> Self {
         tracing::warn!(
             policy = %policy,
-            "durability policy starts in degraded mode — fewer connected nodes than the target count"
+            "ack policy starts degraded — fewer connected nodes than the target count"
         );
         Self {
             pending_state: true,
@@ -1874,7 +1872,7 @@ impl DegradationLogger {
     }
 
     /// Flush in-flight degraded accrual up to `now`, then reset to a
-    /// fresh healthy-start logger. Called on a runtime durability-mode
+    /// fresh healthy-start logger. Called on a runtime ack-policy
     /// swap, which is a logger lifecycle boundary: without flushing
     /// first, the pre-swap degraded interval — on the gate-wait path the
     /// entire wedge — would be silently dropped. The new policy's actual
@@ -1925,12 +1923,12 @@ impl DegradationLogger {
             if degraded_now {
                 tracing::warn!(
                     policy = %policy,
-                    "durability policy operating in degraded mode — fewer connected nodes than the target count, response gate stalled until the cluster recovers or the mode is swapped"
+                    "ack policy operating degraded — fewer connected nodes than the target count, response gate stalled until the cluster recovers or the policy is swapped"
                 );
             } else {
                 tracing::info!(
                     policy = %policy,
-                    "durability policy returned to target shape"
+                    "ack policy returned to target shape"
                 );
             }
             self.pending_logged = true;
@@ -1947,7 +1945,7 @@ impl DegradationLogger {
         {
             tracing::warn!(
                 policy = %policy,
-                "durability policy still degraded — fewer connected nodes than the target count"
+                "ack policy still degraded — fewer connected nodes than the target count"
             );
             self.last_log = Some(now);
         }
@@ -2064,7 +2062,7 @@ mod tests {
         Blocker, DegradationLogger, OutputSlot, WireSeq, evaluate_durability, evaluate_gate,
         slot_needs_gate,
     };
-    use crate::durability_policy::{Clause, DurabilityMode, Level, Policy};
+    use crate::ack_policy::{AckPolicy, Clause, Level, Policy};
     use crate::replication::ReplicationMetrics;
 
     /// Queued end-to-end samples survive a flush that dropped nothing,
@@ -2141,7 +2139,7 @@ mod tests {
     /// Build a [`Policy`] from a mini DSL: one or more
     /// `"<level>>=<count>"` clauses joined with `&&`. Test-only
     /// ergonomics — production builds policies via
-    /// [`DurabilityMode::to_policy`].
+    /// [`AckPolicy::to_policy`].
     fn parse(s: &str) -> Result<Policy, String> {
         let mut clauses = Vec::new();
         for raw in s.split("&&") {
@@ -2259,12 +2257,12 @@ mod tests {
 
     #[test]
     fn ram_quorum_gates_on_replica_memory_not_on_any_disk() {
-        // `replicated` (`in_memory>=2`): the journal position must not
+        // `ram` (`in_memory>=2`): the journal position must not
         // bind. Journal at 0 — nothing persisted anywhere on the
         // primary — while the replicas hold 100/120 in memory. The
         // 2nd-largest in-memory across {primary=MAX, 100, 120} is 120:
         // the gate is exactly the fastest replica's RAM receipt.
-        let p = DurabilityMode::Replicated.to_policy();
+        let p = AckPolicy::Ram.to_policy();
         let m = metrics((100, 0), (120, 0));
         let a = both_active();
         let r = evaluate_durability(&p, WireSeq::new(0), Some(&m), Some(&a));
@@ -2276,7 +2274,7 @@ mod tests {
     fn ram_quorum_stalls_with_no_replica_connected() {
         // Fail-closed: with only the primary in the view, `in_memory>=2`
         // is structurally unsatisfiable however far the journal is.
-        let p = DurabilityMode::Replicated.to_policy();
+        let p = AckPolicy::Ram.to_policy();
         let r = evaluate_durability(&p, WireSeq::new(500), None, None);
         assert_eq!(r.durable_pos, 0);
         assert!(r.degraded);
@@ -2386,9 +2384,9 @@ mod tests {
     // The attribution must follow the policy actually in force. The
     // previous heuristic compared the journal cursor against the
     // minimum replica *persisted* cursor unconditionally, which
-    // reported replication as the blocker under `local` (where
+    // reported replication as the blocker under `disk` (where
     // replicas cannot bind the gate) and read the wrong level under
-    // `hybrid` (which gates replicas on in-memory).
+    // `disk+ram` (which gates replicas on in-memory).
     //
     // Attribution comes out of `evaluate_gate` alongside the durable
     // position, computed from the same cursor snapshot, and is `None`
@@ -2397,9 +2395,9 @@ mod tests {
     // on which the gate opens.
 
     #[test]
-    fn local_mode_never_blames_replication() {
+    fn disk_policy_never_blames_replication() {
         // `persisted>=1` is satisfied by the highest persisted cursor
-        // in the cluster — the primary's. A connected replica lagging
+        // in the cluster — here the primary's. A connected replica lagging
         // far behind is irrelevant to the gate, so it must not be
         // credited as the blocker. This is the case the old heuristic
         // got flatly wrong: journal_pos (500) > repl_min (10) sent it
@@ -2414,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_reads_replica_in_memory_not_persisted() {
+    fn disk_and_ram_reads_replica_in_memory_not_persisted() {
         // `persisted>=1 && in_memory>=2`. The replica has the event in
         // memory (400) well ahead of its own fsync (100), and the
         // primary's journal is behind that in-memory cursor (300).
@@ -2439,7 +2437,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_is_satisfied_by_the_faster_replica() {
+    fn disk_and_ram_is_satisfied_by_the_faster_replica() {
         // `in_memory>=2` needs the primary plus *one* replica, so the
         // best replica binds, not the worst. Replica 0 holds the event
         // in memory at 400 with its own fsync trailing at 250 (behind
@@ -2458,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn durably_replicated_uses_second_largest_persisted() {
+    fn two_disks_uses_second_largest_persisted() {
         // `persisted>=2` is met by the primary plus the *best* replica's
         // persisted cursor. With the primary ahead at 900 and replicas
         // at 400 and 10, the clause resolves at 400 — the fast replica —
@@ -2471,7 +2469,7 @@ mod tests {
             400,
             "clause takes the second-largest persisted cursor, not the minimum"
         );
-        // Replication binds, which is the norm for this mode: the
+        // Replication binds, which is the norm for this policy: the
         // primary persists before it ships, so it is normally ahead of
         // every replica.
         assert_eq!(
@@ -2805,7 +2803,7 @@ mod tests {
     // gauge, which the logger updates on every tick regardless of
     // log emission.
 
-    fn logger_test_policy() -> crate::durability_policy::Policy {
+    fn logger_test_policy() -> crate::ack_policy::Policy {
         parse("persisted>=2").unwrap()
     }
 
@@ -2816,7 +2814,7 @@ mod tests {
     fn drive_logger(
         logger: &mut DegradationLogger,
         utilization: &StageUtilization,
-        policy: &crate::durability_policy::Policy,
+        policy: &crate::ack_policy::Policy,
         start: Instant,
         states: &[bool],
         step: Duration,
@@ -2922,7 +2920,7 @@ mod tests {
 
     #[test]
     fn logger_starting_degraded_accrues_from_construction() {
-        // A primary that boots already-degraded (e.g. `hybrid` with no
+        // A primary that boots already-degraded (e.g. `disk+ram` with no
         // replica yet) must accrue from construction, not from the first
         // observed transition — `new_starting_degraded` seeds the
         // degraded state so the first tick's interval counts.
@@ -2946,7 +2944,7 @@ mod tests {
 
     #[test]
     fn logger_reseed_flushes_in_flight_degraded_accrual() {
-        // A runtime mode swap re-seeds the logger. On the gate-wait path
+        // A runtime policy swap re-seeds the logger. On the gate-wait path
         // the swap can land after many seconds of wedged-degraded time
         // with no intervening tick, so `reseed` must flush that interval
         // before resetting — otherwise the whole wedge is silently lost,

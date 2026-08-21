@@ -162,16 +162,16 @@ pub struct ReplicaControlPlane {
     /// because a *different* node's raft died) must not depose a
     /// healthy primary.
     pub primary_link_up: std::sync::Arc<AtomicBool>,
-    /// The durability (acking) mode last advertised by the primary
-    /// (`DurabilityMode::as_u8`; `ACKING_MODE_UNKNOWN` until first
+    /// The ack policy last advertised by the primary
+    /// (`AckPolicy::as_u8`; `ACK_POLICY_UNKNOWN` until first
     /// contact), refreshed by `StreamStart` and every `Heartbeat`. The
-    /// raft driver's auto-promotion refusal reads this — the mode the
+    /// raft driver's auto-promotion refusal reads this — the policy the
     /// *primary* acked under decides whether an election win proves
     /// this replica holds every acked order, not this node's own
-    /// (possibly pre-staged) configuration. Falls back to the local
-    /// mode while unknown, which is exactly the pre-propagation
+    /// (possibly pre-staged) configuration. Falls back to this node's
+    /// own policy while unknown, which is exactly the pre-propagation
     /// behavior.
-    pub primary_acking_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    pub primary_ack_policy: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Whether the replica's pipeline is healthy — fed to the replica's
     /// minimal health endpoint (`/health` OK/ERR and the
     /// `melin_pipeline_healthy` gauge). Process-lifetime (the per-session
@@ -194,8 +194,8 @@ impl ReplicaControlPlane {
                 melin_transport_core::WireSeq::new(0),
             ),
             primary_link_up: std::sync::Arc::new(AtomicBool::new(false)),
-            primary_acking_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
-                crate::durability_policy::ACKING_MODE_UNKNOWN,
+            primary_ack_policy: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                crate::ack_policy::ACK_POLICY_UNKNOWN,
             )),
             pipeline_healthy: std::sync::Arc::new(AtomicBool::new(true)),
         }
@@ -1124,7 +1124,7 @@ where
             segment_start_sequence,
             anchor_hash,
             epoch,
-            durability_mode,
+            ack_policy,
         } => {
             if segment_start_sequence != seeded_info.starting_sequence
                 || anchor_hash != seeded_info.anchor_hash
@@ -1142,12 +1142,12 @@ where
             // was discarded).
             fence_state.observe_epoch(epoch);
             control
-                .primary_acking_mode
-                .store(durability_mode, Ordering::Release);
+                .primary_ack_policy
+                .store(ack_policy, Ordering::Release);
             tracing::info!(
                 start_sequence,
                 epoch,
-                durability_mode,
+                ack_policy,
                 "streaming resumed after snapshot transfer"
             );
             // The transfer is installed and validated: the node's holdings
@@ -1280,8 +1280,7 @@ mod tests {
     #[test]
     fn stream_start_encode_decode_round_trip() {
         let mut buf = Vec::new();
-        // Non-zero epoch so a dropped/zeroed field is caught.
-        // Non-zero epoch/mode so a dropped/zeroed field is caught.
+        // Non-zero epoch/policy so a dropped/zeroed field is caught.
         encode_stream_start(99, 42, [0xAA; 32], 5, 2, &mut buf);
 
         let payload = &buf[4..];
@@ -1292,12 +1291,12 @@ mod tests {
                 segment_start_sequence,
                 anchor_hash,
                 epoch,
-                durability_mode,
+                ack_policy,
             } => {
                 assert_eq!(start_sequence, 99);
                 assert_eq!(segment_start_sequence, 42);
                 assert_eq!(anchor_hash, [0xAA; 32]);
-                assert_eq!(durability_mode, 2);
+                assert_eq!(ack_policy, 2);
                 assert_eq!(epoch, 5);
             }
             _ => panic!("expected StreamStart"),
@@ -1314,10 +1313,10 @@ mod tests {
         match msg {
             PrimaryMessage::Heartbeat {
                 sequence,
-                durability_mode,
+                ack_policy,
             } => {
                 assert_eq!(sequence, 123);
-                assert_eq!(durability_mode, 2);
+                assert_eq!(ack_policy, 2);
             }
             _ => panic!("expected Heartbeat"),
         }

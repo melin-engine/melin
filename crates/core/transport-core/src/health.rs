@@ -293,14 +293,14 @@ struct HealthSnapshot {
     response_gate_journal: u64,
     /// Response gate-wait events where the replication cursor was the bottleneck.
     response_gate_replication: u64,
-    /// Whether the durability policy was last evaluated as degraded —
+    /// Whether the ack policy was last evaluated as degraded —
     /// at least one clause requires more nodes than are currently
     /// connected, so the response gate stalls until the cluster shape
-    /// recovers (or an operator swaps the mode). Trips when a replica
+    /// recovers (or an operator swaps the policy). Trips when a replica
     /// disconnects from a two-node cluster running `persisted>=2`, etc.
     /// Operator alerting should fire on this transitioning to `true`.
     response_policy_degraded: bool,
-    /// Cumulative nanoseconds the durability policy has spent degraded.
+    /// Cumulative nanoseconds the ack policy has spent degraded.
     /// Emitted as a `_seconds_total` counter (nanos / 1e9) so operators
     /// can `rate()` time-in-degraded over a window — see
     /// `StageUtilization::policy_degraded_nanos`.
@@ -675,7 +675,7 @@ impl HealthSnapshot {
              melin_stage_idle_total{{stage=\"journal\"}} {}\n\
              melin_stage_idle_total{{stage=\"matching\"}} {}\n\
              melin_stage_idle_total{{stage=\"response\"}} {}\n\
-             # HELP melin_response_gate_total Gate opens by which node supplied the binding cursor of the configured durability policy (journal = the local primary, replication = a replica). While the cluster shape cannot satisfy the policy the gate does not open and neither label moves (see melin_durability_policy_degraded).\n\
+             # HELP melin_response_gate_total Gate opens by which node supplied the binding cursor of the configured ack policy (journal = the local primary, replication = a replica). While the cluster shape cannot satisfy the policy the gate does not open and neither label moves (see melin_ack_policy_degraded).\n\
              # TYPE melin_response_gate_total counter\n\
              melin_response_gate_total{{blocker=\"journal\"}} {}\n\
              melin_response_gate_total{{blocker=\"replication\"}} {}\n\
@@ -687,12 +687,12 @@ impl HealthSnapshot {
              # HELP melin_journal_disk_lag_batches Journal batches handed to the disk thread that are not yet durable. Zero in steady state; a sustained non-zero value is the disk falling behind the sequencer, which the pipeline absorbs up to the hand-off ring depth before backpressuring producers.\n\
              # TYPE melin_journal_disk_lag_batches gauge\n\
              melin_journal_disk_lag_batches {}\n\
-             # HELP melin_durability_policy_degraded Durability policy currently unsatisfiable by the connected cluster shape; the response gate stalls while set (1 = degraded, 0 = healthy).\n\
-             # TYPE melin_durability_policy_degraded gauge\n\
-             melin_durability_policy_degraded {}\n\
-             # HELP melin_durability_policy_degraded_seconds_total Cumulative seconds the durability policy has spent unsatisfiable by the connected cluster shape.\n\
-             # TYPE melin_durability_policy_degraded_seconds_total counter\n\
-             melin_durability_policy_degraded_seconds_total {:.6}\n",
+             # HELP melin_ack_policy_degraded Ack policy currently unsatisfiable by the connected cluster shape; the response gate stalls while set (1 = degraded, 0 = healthy).\n\
+             # TYPE melin_ack_policy_degraded gauge\n\
+             melin_ack_policy_degraded {}\n\
+             # HELP melin_ack_policy_degraded_seconds_total Cumulative seconds the ack policy has spent unsatisfiable by the connected cluster shape.\n\
+             # TYPE melin_ack_policy_degraded_seconds_total counter\n\
+             melin_ack_policy_degraded_seconds_total {:.6}\n",
             self.active_connections,
             self.events_processed,
             self.journal_seq,
@@ -2477,11 +2477,11 @@ mod tests {
             "gate_replication: {response}"
         );
         assert!(
-            response.contains("melin_durability_policy_degraded 1\n"),
+            response.contains("melin_ack_policy_degraded 1\n"),
             "policy_degraded: {response}"
         );
         assert!(
-            response.contains("melin_durability_policy_degraded_seconds_total 2.500000\n"),
+            response.contains("melin_ack_policy_degraded_seconds_total 2.500000\n"),
             "policy_degraded_seconds_total: {response}"
         );
 

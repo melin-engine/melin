@@ -393,7 +393,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
 /// genesis) consumed allocator sequences without ever crossing the
 /// input ring, so wire space fell permanently behind allocator space —
 /// one sequence per checkpoint/rotation — and the replica clauses of
-/// `hybrid` / `durably-replicated` became vacuous within seconds of
+/// `disk+ram` / `two-disks` became vacuous within seconds of
 /// uptime: the gate released client acks before any replica held the
 /// order. v14 made the two spaces identical by removing every
 /// writer-internal sequence consumer; this test fails if one

@@ -15,15 +15,15 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+/// Cluster-wide ack policy: the `Level`/`Clause`/`Policy`
+/// cursor-evaluation core used by the response stage's ack gate.
+/// Application-agnostic — the operator-facing CLI enum that picks
+/// between named policies lives with the consuming application.
+pub mod ack_policy;
 /// Named sequence-space cursors (`WireSeq` / `RingPos` / `PipelineCursors`).
 /// Bundles the journal-progress atomics behind space-typed accessors so the
 /// compiler rejects mixing wire-seq and ring-index values.
 pub mod cursors;
-/// Cluster-wide durability ack policy: the `Level`/`Clause`/`Policy`
-/// cursor-evaluation core used by the response stage's ack gate.
-/// Application-agnostic — the operator-facing CLI mode that picks
-/// between named policies lives with the consuming application.
-pub mod durability_policy;
 /// Replication fencing: the node's observed epoch and the one-way fenced
 /// latch that closes the split-brain window after a promotion.
 pub mod fence;

@@ -3,7 +3,7 @@
 //!
 //! A plain `std` thread polling the [`RaftStatus`] atomics the driver
 //! publishes — NOT async code inside the driver. The policy's inputs
-//! (acking mode, primary link state, tip readiness, fence state) are all
+//! (ack policy, primary link state, tip readiness, fence state) are all
 //! data-plane concepts owned by this crate, and a synchronous poll keeps
 //! the decision unit-testable without tokio. The 100 ms cadence is far
 //! inside the 1–2 s election timeout, so a leadership win is acted on
@@ -17,7 +17,7 @@ use melin_raft::recency::{JournalTip, PeerTips};
 use melin_transport_core::health::RaftStatus;
 use tracing::{info, warn};
 
-use crate::durability_policy::DurabilityMode;
+use crate::ack_policy::AckPolicy;
 use crate::replication::ReplicaControlPlane;
 
 /// Poll cadence for the promotion thread. Matches the codebase's
@@ -115,20 +115,20 @@ fn observe_peer(
     }
 }
 
-/// The durability mode the auto-promotion refusal judges: the mode
+/// The ack policy the auto-promotion refusal judges: the policy
 /// the *primary* last advertised on the replication stream — that is
 /// the gate acked orders actually passed through — falling back to
-/// this node's own configured mode while no primary has ever been
-/// observed (`ACKING_MODE_UNKNOWN`), which is exactly the
+/// this node's own configured policy while no primary has ever been
+/// observed (`ACK_POLICY_UNKNOWN`), which is exactly the
 /// pre-propagation behavior. `None` for an unrecognised byte (e.g. a
-/// newer node's mode) — the caller refuses on it.
-fn effective_acking_mode(observed: u8, local_fallback: u8) -> Option<DurabilityMode> {
-    let byte = if observed == crate::durability_policy::ACKING_MODE_UNKNOWN {
+/// newer node's policy) — the caller refuses on it.
+fn effective_ack_policy(observed: u8, local_fallback: u8) -> Option<AckPolicy> {
+    let byte = if observed == crate::ack_policy::ACK_POLICY_UNKNOWN {
         local_fallback
     } else {
         observed
     };
-    DurabilityMode::from_u8(byte)
+    AckPolicy::from_u8(byte)
 }
 
 /// Everything the auto-promotion rule looks at, snapshotted from the
@@ -139,9 +139,9 @@ struct AutoPromotionInputs {
     tip_ready: bool,
     /// This node has been fenced (superseded) — it must never lead.
     fenced: bool,
-    /// The acking durability mode ([`effective_acking_mode`]), `None`
-    /// for an unrecognised byte.
-    durability_mode: Option<DurabilityMode>,
+    /// The ack policy ([`effective_ack_policy`]), `None` for an
+    /// unrecognised byte.
+    ack_policy: Option<AckPolicy>,
     /// The replication link to the primary is authenticated and live.
     primary_link_up: bool,
     /// How long that link has been *continuously* down (`ZERO` while it
@@ -150,8 +150,8 @@ struct AutoPromotionInputs {
     /// failover; the link state is one-sided (this node's socket only).
     primary_link_down_for: Duration,
     /// A primary has been observed at least once since this process
-    /// booted (streaming started, i.e. the acking-mode gauge left
-    /// `ACKING_MODE_UNKNOWN`). Process-lifetime, not per-session.
+    /// booted (streaming started, i.e. the ack-policy gauge left
+    /// `ACK_POLICY_UNKNOWN`). Process-lifetime, not per-session.
     primary_observed: bool,
     /// This node's own journal tip (fencing epoch + advertised
     /// sequence) — the local side of the peer-tip veto, and
@@ -193,7 +193,7 @@ struct AutoPromotionInputs {
 ///   slow to start (journal recovery outlasting the link grace). A
 ///   restarted data-bearing replica (journal non-empty) is unaffected
 ///   and may still win a real failover.
-/// - `local` durability — acks in `local` mode never waited for this
+/// - `disk` ack policy — acks under `disk` never waited for this
 ///   replica, so no election can prove it holds every acked order.
 ///   Failover stays a manual, eyes-on decision.
 /// - `peers` — the authoritative journal-safety check the vote filter
@@ -201,7 +201,7 @@ struct AutoPromotionInputs {
 ///   best-effort steering: a behind node can win via the filter's
 ///   liveness escape, or hold leadership from before the failure. So
 ///   the decision independently refuses while any reachable peer
-///   advertises a tip ahead of ours — under `hybrid`/`replicated` the
+///   advertises a tip ahead of ours — under `disk+ram`/`ram` the
 ///   ack quorum is the primary plus the *fastest* replica, so the
 ///   slower replica legitimately lacks the newest acked events and
 ///   must not serve. A peer still `Unknown` (heartbeat responses not
@@ -255,22 +255,20 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
             }
         }
     }
-    match inputs.durability_mode {
-        Some(DurabilityMode::Local) => {
+    match inputs.ack_policy {
+        Some(AckPolicy::Disk) => {
             return Err(
-                "the primary acks under `local` durability — an election win cannot prove \
+                "the primary acks under the `disk` policy — an election win cannot prove \
                  this node holds every acked order; promote manually if the lag is acceptable",
             );
         }
-        None => return Err("acking durability mode is unrecognised"),
-        // Every mode whose policy requires a second node before the ack
+        None => return Err("ack policy is unrecognised"),
+        // Every policy that requires a second node before the ack
         // (`in_memory>=2` or `persisted>=2`) qualifies: the election's
         // recency filter can then prove the winner holds every acked
-        // order. `replicated` qualifies on the same grounds as `hybrid`
+        // order. `ram` qualifies on the same grounds as `disk+ram`
         // — its acks waited for a second node's in-memory receipt.
-        Some(
-            DurabilityMode::Hybrid | DurabilityMode::DurablyReplicated | DurabilityMode::Replicated,
-        ) => {}
+        Some(AckPolicy::DiskAndRam | AckPolicy::TwoDisks | AckPolicy::Ram) => {}
     }
     if inputs.term <= inputs.fence_epoch {
         return Err(
@@ -297,7 +295,7 @@ fn consider_auto_promotion(
     status: &RaftStatus,
     control: &ReplicaControlPlane,
     fence_state: &melin_transport_core::fence::FenceState,
-    durability_mode: &AtomicU8,
+    ack_policy: &AtomicU8,
     peer_tips: &PeerTips,
     // Configured voter ids excluding this node.
     peer_ids: &[u64],
@@ -319,9 +317,9 @@ fn consider_auto_promotion(
         return;
     }
     let term = status.term.load(Ordering::Relaxed);
-    // Loaded once: both the effective mode and the observed-a-primary
+    // Loaded once: both the effective policy and the observed-a-primary
     // fact must come from the same snapshot of the gauge.
-    let observed_mode = control.primary_acking_mode.load(Ordering::Acquire);
+    let observed_policy = control.primary_ack_policy.load(Ordering::Acquire);
     // Loaded once for the same reason: `local_tip.epoch` and the
     // `fence_epoch` input must not tear if a fencing event lands
     // mid-poll.
@@ -330,13 +328,10 @@ fn consider_auto_promotion(
     let inputs = AutoPromotionInputs {
         tip_ready: control.tip_ready.load(Ordering::Acquire),
         fenced: fence_state.is_fenced(),
-        durability_mode: effective_acking_mode(
-            observed_mode,
-            durability_mode.load(Ordering::Relaxed),
-        ),
+        ack_policy: effective_ack_policy(observed_policy, ack_policy.load(Ordering::Relaxed)),
         primary_link_up: control.primary_link_up.load(Ordering::Acquire),
         primary_link_down_for,
-        primary_observed: observed_mode != crate::durability_policy::ACKING_MODE_UNKNOWN,
+        primary_observed: observed_policy != crate::ack_policy::ACK_POLICY_UNKNOWN,
         local_tip: JournalTip {
             epoch: fence_epoch,
             last_sequence: control.journal_tip.load().get(),
@@ -656,7 +651,7 @@ pub(crate) fn spawn_auto_promotion(
     status: Arc<RaftStatus>,
     control: ReplicaControlPlane,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    durability_mode: Arc<AtomicU8>,
+    ack_policy: Arc<AtomicU8>,
     peer_tips: Arc<PeerTips>,
     // Configured voter ids excluding this node — the peers the
     // journal-safety veto must account for.
@@ -713,7 +708,7 @@ pub(crate) fn spawn_auto_promotion(
                     &status,
                     &control,
                     &fence_state,
-                    &durability_mode,
+                    &ack_policy,
                     &peer_tips,
                     &peer_ids,
                     primary_link_down_for,
@@ -758,7 +753,7 @@ pub(crate) fn spawn_auto_promotion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durability_policy::ACKING_MODE_UNKNOWN;
+    use crate::ack_policy::ACK_POLICY_UNKNOWN;
 
     fn tip(epoch: u64, seq: u64) -> JournalTip {
         JournalTip {
@@ -771,7 +766,7 @@ mod tests {
         AutoPromotionInputs {
             tip_ready: true,
             fenced: false,
-            durability_mode: Some(DurabilityMode::Hybrid),
+            ack_policy: Some(AckPolicy::DiskAndRam),
             primary_link_up: false,
             // Well past the grace: a sustained outage, not a blip.
             primary_link_down_for: PRIMARY_DOWN_GRACE * 10,
@@ -909,19 +904,19 @@ mod tests {
     }
 
     #[test]
-    fn refuses_local_durability_and_unknown_modes() {
+    fn refuses_disk_policy_and_unknown_policies() {
         let inputs = AutoPromotionInputs {
-            durability_mode: Some(DurabilityMode::Local),
+            ack_policy: Some(AckPolicy::Disk),
             ..ok_inputs()
         };
         assert!(
             auto_promotion_decision(&inputs)
                 .unwrap_err()
-                .contains("local")
+                .contains("`disk`")
         );
 
         let inputs = AutoPromotionInputs {
-            durability_mode: None,
+            ack_policy: None,
             ..ok_inputs()
         };
         assert!(
@@ -931,31 +926,32 @@ mod tests {
         );
     }
 
-    /// Auto-promotion qualifies on exactly the modes whose acks waited
-    /// for a second node — the property the match arm in
+    /// Auto-promotion qualifies on exactly the policies whose acks
+    /// waited for a second node — the property the match arm in
     /// [`auto_promotion_decision`] encodes.
     ///
-    /// Checked against the policies themselves rather than a hand-kept
-    /// list of variants, and driven by `value_variants` (exhaustive by
-    /// construction), so a mode added later is covered without anyone
-    /// remembering to extend this test. Listing variants by hand is
-    /// what would let a new mode drop out of the qualifying arm with
-    /// the suite still green — auto-failover silently off under it.
+    /// Checked against the clause lists themselves rather than a
+    /// hand-kept list of variants, and driven by `value_variants`
+    /// (exhaustive by construction), so a policy added later is covered
+    /// without anyone remembering to extend this test. Listing variants
+    /// by hand is what would let a new policy drop out of the qualifying
+    /// arm with the suite still green — auto-failover silently off
+    /// under it.
     #[test]
-    fn promotion_qualifies_exactly_on_modes_that_acked_on_a_second_node() {
+    fn promotion_qualifies_exactly_on_policies_that_acked_on_a_second_node() {
         use clap::ValueEnum as _;
 
-        for &mode in DurabilityMode::value_variants() {
-            let waits_for_a_second_node = mode.to_policy().clauses().iter().any(|c| c.count >= 2);
+        for &policy in AckPolicy::value_variants() {
+            let waits_for_a_second_node = policy.to_policy().clauses().iter().any(|c| c.count >= 2);
             let inputs = AutoPromotionInputs {
-                durability_mode: Some(mode),
+                ack_policy: Some(policy),
                 ..ok_inputs()
             };
             let decision = auto_promotion_decision(&inputs);
             assert_eq!(
                 decision.is_ok(),
                 waits_for_a_second_node,
-                "mode `{mode}` requires a second node: {waits_for_a_second_node}, \
+                "policy `{policy}` requires a second node: {waits_for_a_second_node}, \
                  but the promotion decision was {decision:?}"
             );
         }
@@ -1090,12 +1086,12 @@ mod tests {
             .journal_tip
             .advance(melin_transport_core::WireSeq::new(100));
         control
-            .primary_acking_mode
-            .store(DurabilityMode::Replicated.as_u8(), Ordering::Release);
+            .primary_ack_policy
+            .store(AckPolicy::Ram.as_u8(), Ordering::Release);
         // Epoch 0 so the peer comparison turns on the sequence, and the
         // term (7) clears the fence-epoch check.
         let fence = melin_transport_core::fence::FenceState::new(0);
-        let mode = AtomicU8::new(DurabilityMode::Replicated.as_u8());
+        let policy = AtomicU8::new(AckPolicy::Ram.as_u8());
         let peer_tips = PeerTips::new();
         // Peer 3 is a caught-up replica; peer 1 is the primary, unheard
         // — which digests to `Silent` rather than `Unknown` because this
@@ -1109,7 +1105,8 @@ mod tests {
         control.primary_link_up.store(true, Ordering::Release);
         let refuse = |last: &mut Option<(u64, &'static str)>, down_for| {
             consider_auto_promotion(
-                &status, &control, &fence, &mode, &peer_tips, &peer_ids, down_for, leader_for, last,
+                &status, &control, &fence, &policy, &peer_tips, &peer_ids, down_for, leader_for,
+                last,
             );
         };
         refuse(&mut last_refused, Duration::ZERO);
@@ -1300,23 +1297,20 @@ mod tests {
     }
 
     #[test]
-    fn effective_acking_mode_prefers_the_observed_primary_mode() {
-        // Observed mode wins over the local fallback.
+    fn effective_ack_policy_prefers_the_observed_primary_policy() {
+        // Observed policy wins over the local fallback.
         assert_eq!(
-            effective_acking_mode(
-                DurabilityMode::Local.as_u8(),
-                DurabilityMode::Hybrid.as_u8()
-            ),
-            Some(DurabilityMode::Local)
+            effective_ack_policy(AckPolicy::Disk.as_u8(), AckPolicy::DiskAndRam.as_u8()),
+            Some(AckPolicy::Disk)
         );
-        // Unknown observed falls back to the local mode.
+        // Unknown observed falls back to this node's own policy.
         assert_eq!(
-            effective_acking_mode(ACKING_MODE_UNKNOWN, DurabilityMode::Hybrid.as_u8()),
-            Some(DurabilityMode::Hybrid)
+            effective_ack_policy(ACK_POLICY_UNKNOWN, AckPolicy::DiskAndRam.as_u8()),
+            Some(AckPolicy::DiskAndRam)
         );
         // Garbage bytes are None (caller refuses).
         assert_eq!(
-            effective_acking_mode(0x7F, DurabilityMode::Hybrid.as_u8()),
+            effective_ack_policy(0x7F, AckPolicy::DiskAndRam.as_u8()),
             None
         );
     }

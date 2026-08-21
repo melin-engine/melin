@@ -2,7 +2,7 @@
 //!
 //! When a replica is re-seeded from a snapshot, its existing journal is
 //! moved aside — never deleted. A *divergent* journal (chain mismatch
-//! with the primary) is audit-trail material: under `local` durability
+//! with the primary) is audit-trail material: under the `disk` ack policy
 //! it may hold acked orders that did not survive a failover, exactly
 //! the data an operator or regulator will want to reconcile. A merely
 //! *stale* journal (history pruned on the primary) is kept for the same
