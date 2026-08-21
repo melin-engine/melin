@@ -27,17 +27,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   hand-off ring. The new thread inherits its scheduling context from the
   parent, can be pinned like the others, and reports its lag as a gauge so a
   disk falling behind the pipeline is visible before it becomes a stall.
-- **A declared minimum supported Rust version** (1.91), enforced on every push
-  rather than documented and left to rot.
+- **A declared minimum supported Rust version** (1.91), enforced in CI rather
+  than documented and left to rot.
 
 ### Changed
 
-- Every published crate now ships its own copy of the licence instead of
-  relying on cargo's `license-file`, so each crate on crates.io carries the
-  full BSL text and its parameter block.
 - Crate versions are inherited from the workspace, so the whole set moves
   together and a dependent can never resolve against a sibling version that
   was never published.
+
+### Removed
+
+- **The `O_DIRECT` sector writer, and the `SectorSizeMismatch` error it
+  raised.** Durability is `fdatasync`-based; the sector-aligned path it
+  replaced is gone. Source-breaking for anything matching on that error.
 
 ### Fixed
 
@@ -55,12 +58,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   waiting out a timeout and hoping.
 - A replica that sees a gap in the replication stream reconnects instead of
   exiting.
-
-### Removed
-
-- **The `O_DIRECT` sector writer, and the `SectorSizeMismatch` error it
-  raised.** Durability is `fdatasync`-based; the sector-aligned path it
-  replaced is gone. Source-breaking for anything matching on that error.
+- **`hybrid` mode no longer puts the replica's disk on the client's ack
+  path.** Once enough batches were awaiting the replica's fsync, its receiver
+  stalled — and with it the in-memory acknowledgement the mode gates on, so a
+  slow replica disk delayed client responses in the one mode designed not to
+  wait for it. Pending acks now coalesce instead of blocking; an ack can only
+  arrive later than before, never earlier.
 
 ## [0.13.0] - 2026-08-13
 
