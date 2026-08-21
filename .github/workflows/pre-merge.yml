@@ -21,15 +21,14 @@ on:
     #
     # Files are named rather than globbed (no `**.md`, no `**/LICENSE`) so
     # that a file CI *does* read cannot silently fall into this list later.
-    # The roadmap already commits to two such files: `publish.sh --dry-run`
-    # from CI is to verify the BSL `Change Date` across the root `LICENSE`
-    # and its byte-identical per-crate copies, and that the version being
-    # published has a `CHANGELOG.md` entry. A glob would skip that job on
-    # exactly the pushes that change its inputs.
+    # `CHANGELOG.md` is already one: the packaging dry run below fails when
+    # the version being published has no entry in it, so a `**.md` glob
+    # would skip that check on exactly the pushes that change its input.
+    # Every crate's `LICENSE` ships inside its own tarball, which is the
+    # same trap one step further away.
     #
     # Anything a job *does* read stays in scope — `.cargo/` (rustflags),
-    # `.config/` (nextest), `clippy.toml`, `deny.toml`, and `scripts/`
-    # (inert today, exercised once the item above lands).
+    # `.config/` (nextest), `clippy.toml`, `deny.toml`, and `scripts/`.
     paths-ignore:
       - "docs/**"
       - "README.md"
@@ -133,6 +132,14 @@ jobs:
       - name: Tests
         run: cargo nextest run --no-fail-fast --locked
 
+  # The one job that is two checks, because they share one apt install. Both
+  # need the DPDK SDK, and apt is what rust-cache does not cover — it caches
+  # cargo's registry and target directory, and every run starts on a fresh
+  # VM, so a second job would pay for the SDK a second time. Sharing costs
+  # the property the rest of this file relies on, that a failure in one check
+  # cannot hide another, so the second step carries `if: ${{ !cancelled() }}`
+  # to buy it back: it runs and reports whatever the first one did.
+  #
   # The DPDK transport is the one configuration nothing else compiles. The
   # pre-commit hook cannot cover it: `melin-dpdk`'s build script hard-fails
   # when pkg-config cannot find libdpdk, so building it unconditionally
@@ -149,7 +156,10 @@ jobs:
   # runner has.
   dpdk:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Two builds now, and the packaging one compiles eight crates from their
+    # tarballs with a target directory rust-cache cannot warm (each package
+    # builds under `target/package/`).
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v7
@@ -164,10 +174,10 @@ jobs:
       # If bindgen ever fails to find it, set LIBCLANG_PATH rather than
       # reinstalling the tree.
       #
-      # This is not cached: rust-cache covers cargo's registry and target
-      # directory, not apt, and every run starts on a fresh VM. So this step
-      # pays full price every time — if it stays expensive, the job belongs
-      # in Nightly rather than on every push.
+      # This step pays full price every run. If it ever stops being seconds,
+      # the DPDK check moves to Nightly — but the packaging step stays here,
+      # since its whole value is gating an ordinary push, and it would then
+      # need `--exclude melin-dpdk` and the coverage loss that implies.
       - name: Install DPDK headers
         run: |
           sudo apt-get update
@@ -175,6 +185,32 @@ jobs:
 
       - name: DPDK builds
         run: cargo check -p melin-server-runtime --all-targets --features dpdk --locked
+
+      # Proves the workspace can still be packaged. Nothing else does: `cargo
+      # check` compiles crates in place, while publishing builds each one from
+      # a generated tarball in isolation, so it is the only thing that catches
+      # a manifest that cannot ship — a path dependency missing its `version`,
+      # an `exclude` that drops a file the build needs, a crate that compiles
+      # only because a sibling's files happen to be next to it. `melin-dpdk`,
+      # with a build script and a vendored C wrapper, is the member where that
+      # last one is most likely, which is why this belongs in the job that can
+      # build it rather than being run with `--exclude melin-dpdk`.
+      #
+      # On every push rather than at release time because that breakage
+      # arrives with an ordinary commit, and the alternative is finding it
+      # during a release, when the version is already tagged and half the
+      # crates may already be on crates.io permanently.
+      #
+      # `scripts/publish.sh` rather than the cargo command directly, so CI
+      # exercises the same script a release runs. Its default mode packages
+      # and verifies every crate and uploads nothing, needing no crates.io
+      # credentials and neither jq nor curl — the already-published filter is
+      # on the `--execute` path only. It also enforces that CHANGELOG.md
+      # describes the current version, which is why `CHANGELOG.md` is
+      # deliberately absent from this workflow's `paths-ignore`.
+      - name: Packaging dry run
+        if: ${{ !cancelled() }}
+        run: scripts/publish.sh
 
   # All four cargo-deny checks, configured in `deny.toml`. Advisories run
   # here as well as in Nightly on purpose: here they catch a dependency that
