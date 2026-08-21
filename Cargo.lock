@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "melin-app"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "melin-dpdk"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "melin-example-counter"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -1129,7 +1129,7 @@ dependencies = [
 
 [[package]]
 name = "melin-journal"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1146,14 +1146,14 @@ dependencies = [
 
 [[package]]
 name = "melin-pipeline"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "melin-raft"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.22.1",
  "crc32c",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "melin-server-runtime"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "melin-transport-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "melin-wire-protocol"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "tempfile",
 ]
