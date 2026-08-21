@@ -692,7 +692,13 @@ impl HealthSnapshot {
              melin_ack_policy_degraded {}\n\
              # HELP melin_ack_policy_degraded_seconds_total Cumulative seconds the ack policy has spent unsatisfiable by the connected cluster shape.\n\
              # TYPE melin_ack_policy_degraded_seconds_total counter\n\
-             melin_ack_policy_degraded_seconds_total {:.6}\n",
+             melin_ack_policy_degraded_seconds_total {:.6}\n\
+             # HELP melin_durability_policy_degraded DEPRECATED: renamed melin_ack_policy_degraded in 0.15; this alias is removed in the next minor release.\n\
+             # TYPE melin_durability_policy_degraded gauge\n\
+             melin_durability_policy_degraded {}\n\
+             # HELP melin_durability_policy_degraded_seconds_total DEPRECATED: renamed melin_ack_policy_degraded_seconds_total in 0.15; this alias is removed in the next minor release.\n\
+             # TYPE melin_durability_policy_degraded_seconds_total counter\n\
+             melin_durability_policy_degraded_seconds_total {:.6}\n",
             self.active_connections,
             self.events_processed,
             self.journal_seq,
@@ -733,6 +739,11 @@ impl HealthSnapshot {
             self.journal_rotations_sync_fallback,
             self.journal_rotations_failed,
             self.journal_disk_lag,
+            if self.response_policy_degraded { 1 } else { 0 },
+            self.response_policy_degraded_nanos as f64 / 1e9,
+            // The deprecated aliases repeat the two values above so an
+            // alert written against the old names keeps firing for one
+            // release instead of going dark the day the rename ships.
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );
@@ -986,15 +997,16 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
     let kind = detect_request(&mut stream);
 
     // Stack buffers — sized for the largest body we serve.
-    // - Prometheus body is ~3.5 KiB with max-length u64 values
-    //   (includes per-replica replication metrics, ring depth, and
-    //   the fastest-replica cursor).
+    // - Prometheus body is ~6.5 KiB with max-length u64 values
+    //   (per-replica replication metrics, ring depth, the
+    //   fastest-replica cursor, the gate/degraded series and their
+    //   deprecated aliases), plus the raft gauges on raft nodes.
     // - StatsDump body is ~260 bytes per registered stage; current
     //   set is 9–13 stages (transport-dependent) for ~3.5 KiB tops.
-    //   8 KiB gives headroom for future stages without resizing.
+    //   16 KiB keeps the headroom test (75 % of this) meaningful.
     // Response = body + HTTP headers (~200 bytes).
-    let mut body_buf = [0u8; 8192];
-    let mut resp_buf = [0u8; 8448];
+    let mut body_buf = [0u8; 16384];
+    let mut resp_buf = [0u8; 16640];
 
     let resp_len = match kind {
         RequestKind::Metrics => {
@@ -2484,6 +2496,15 @@ mod tests {
             response.contains("melin_ack_policy_degraded_seconds_total 2.500000\n"),
             "policy_degraded_seconds_total: {response}"
         );
+        // Deprecated aliases carry the same values until they are removed.
+        assert!(
+            response.contains("melin_durability_policy_degraded 1\n"),
+            "deprecated policy_degraded alias: {response}"
+        );
+        assert!(
+            response.contains("melin_durability_policy_degraded_seconds_total 2.500000\n"),
+            "deprecated policy_degraded_seconds_total alias: {response}"
+        );
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -2557,12 +2578,13 @@ mod tests {
             .nth(1)
             .expect("HTTP head separator present");
 
-        // The body buffer in handle_health_connection is 8192 bytes.
-        // Today's body is around 3 KiB; allocate 25 % headroom and fail
-        // loudly if we ever drift past it. The point of this test is
-        // to fire before silent truncation, not to track the exact size.
-        const BODY_BUF: usize = 8192;
-        const HEADROOM_LIMIT: usize = BODY_BUF * 3 / 4; // 6144
+        // The body buffer in handle_health_connection is 16384 bytes.
+        // Today's body is around 6.5 KiB without the raft gauges; keep
+        // 25 % headroom and fail loudly if we ever drift past it. The
+        // point of this test is to fire before silent truncation, not
+        // to track the exact size.
+        const BODY_BUF: usize = 16384;
+        const HEADROOM_LIMIT: usize = BODY_BUF * 3 / 4; // 12288
 
         assert!(
             metrics_body.len() < HEADROOM_LIMIT,

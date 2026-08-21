@@ -398,7 +398,7 @@ The server is fully synchronous -- no async runtime. Eliminating tokio removes a
 
 ## Persist-Before-Ack Invariant
 
-The persist-before-ack invariant guarantees that **no client ever receives a response for an event that does not yet hold the copies the ack policy demands** — under every policy except `ram`, that includes at least one fsynced copy. This is the foundation of the event sourcing model: on crash recovery, the journal contains every event that any client was told succeeded.
+The persist-before-ack invariant guarantees that **no client ever receives a response for an event that does not yet hold the copies the ack policy demands** — under every policy except `ram`, that includes at least one fsynced copy. This is the foundation of the event sourcing model: on crash recovery, the cluster's journals together contain every event that any client was told succeeded. That is a cluster-level statement, not a per-node one — the node that holds the fsynced copy may be a replica, so recovery means failing over to the most caught-up node, never restarting a crashed primary in place (see `replication.md`).
 
 ### Why it matters
 

@@ -129,6 +129,20 @@ impl AckPolicy {
         }
     }
 
+    /// Parse the pre-0.15 "durability mode" names, for the deprecated
+    /// `DURABILITY` admin alias. Accepts the current spellings too so
+    /// the alias is a strict superset of [`parse`](Self::parse).
+    /// Removed with the alias in the next minor release.
+    pub fn parse_legacy(s: &str) -> Option<Self> {
+        match s {
+            "local" => Some(AckPolicy::Disk),
+            "replicated" => Some(AckPolicy::Ram),
+            "hybrid" => Some(AckPolicy::DiskAndRam),
+            "durably-replicated" => Some(AckPolicy::TwoDisks),
+            _ => Self::parse(s),
+        }
+    }
+
     /// Stable u8 discriminant. The response stage publishes the
     /// operator-selected policy through an [`AtomicU8`] so it can detect
     /// a runtime swap (via the admin `ACK-POLICY` command) with a
@@ -239,6 +253,24 @@ mod tests {
         ] {
             assert_eq!(AckPolicy::parse(bad), None, "{bad:?} should not parse");
         }
+    }
+
+    #[test]
+    fn parse_legacy_maps_old_names_and_accepts_new_ones() {
+        assert_eq!(AckPolicy::parse_legacy("local"), Some(AckPolicy::Disk));
+        assert_eq!(AckPolicy::parse_legacy("replicated"), Some(AckPolicy::Ram));
+        assert_eq!(
+            AckPolicy::parse_legacy("hybrid"),
+            Some(AckPolicy::DiskAndRam)
+        );
+        assert_eq!(
+            AckPolicy::parse_legacy("durably-replicated"),
+            Some(AckPolicy::TwoDisks)
+        );
+        for p in ALL {
+            assert_eq!(AckPolicy::parse_legacy(p.as_str()), Some(p));
+        }
+        assert_eq!(AckPolicy::parse_legacy("fast"), None);
     }
 
     #[test]

@@ -50,8 +50,9 @@ in client latency. It doesn't: the replica keeps receiving and keeps
 confirming receipt while its disk catches up. Only its *persisted*
 confirmation falls behind, and that is the one `two-disks` waits for.
 
-Under `two-disks` both disks are on the critical path by definition —
-that is the guarantee the policy buys. A node running behind its own
+Under `two-disks` a second disk is on the critical path by definition —
+that is the guarantee the policy buys. With one replica that is its
+disk; with two, the faster replica's. A node running behind its own
 device is visible on that node's `melin_journal_disk_lag_batches`.
 
 ### No disk on the `ram` critical path
@@ -67,9 +68,9 @@ The resulting contract:
 
 - **Any single node failure loses nothing — provided you fail over.**
   Every acked event is held by at least two nodes, so a surviving
-  replica always has it. See the warning below: this is the one policy
-  where recovering a crashed primary by restarting it *in place* is
-  not equivalent.
+  replica always has it. See the warning below: under this policy
+  recovering a crashed primary by restarting it *in place* can lose an
+  unbounded number of acked events, not just the batches in flight.
 - **Losing every node that held an event loses it.** The gate requires
   two holders, not all three, so an event can be acked while only the
   primary and one replica have it — losing that pair loses the event
@@ -89,24 +90,35 @@ guarantee against simultaneous multi-node loss.
 
 #### Failover is mandatory — never restart a crashed primary in place
 
-Under every other policy, an acked event is on at least one disk before
-the client hears about it, and the primary's own disk is at most the
-batches still in flight to it behind that ack — the journal syncs every
-batch, so the primary cannot run ahead of its disk by more than what
-the device is currently writing. That is not true here: under `ram` the
-primary acks events it has not yet written and keeps acking ahead of
-its disk indefinitely, so a crash can leave its journal **short of the
-events its clients were told were durable**.
+Because policies count copies rather than nodes, a connected replica
+can be the node that satisfies the ack. Under `disk` and `disk+ram`
+that happens whenever the replica's fsync lands before the primary's —
+normal during a primary disk hiccup — and under `two-disks` the
+primary's own fsync is never waited for when two replicas are faster.
+So under *every* policy, a primary that dies while a replica is
+connected can come back with a journal **short of events its clients
+were told were durable**. What differs is how short:
 
-Restarting that primary in place discards them. The surviving replica
-does hold them, and on reconnect it advertises a sequence beyond the
-restarted primary's tip — which the primary correctly reads as
-divergent history and resolves by rebasing the replica onto its own
-shorter journal (the replica archives its lineage first, so the events
-are recoverable from the archive, but they leave the live cluster and
-any client that read them is now ahead of the system of record).
+- Under `disk`, `disk+ram` and `two-disks` the gap is bounded by the
+  batches that were in flight to the primary's disk — the journal syncs
+  every batch, so it cannot run further behind than what the device was
+  writing at the moment of the crash. A process crash loses nothing
+  (the kernel still writes the pages out); a power loss or kernel panic
+  loses that in-flight tail.
+- Under `ram` the primary acks events it has not yet written and keeps
+  acking ahead of its disk indefinitely, so the gap is unbounded and a
+  plain process crash is enough to open it.
 
-So after a primary crash under `ram`:
+Restarting that primary in place discards the gap. The surviving
+replica does hold those events, and on reconnect it advertises a
+sequence beyond the restarted primary's tip — which the primary
+correctly reads as divergent history and resolves by rebasing the
+replica onto its own shorter journal (the replica archives its lineage
+first, so the events are recoverable from the archive, but they leave
+the live cluster and any client that read them is now ahead of the
+system of record).
+
+So after a primary crash, under any policy:
 
 - **Promote a surviving replica.** Raft-driven failover already does
   this automatically and elects the most caught-up node.
@@ -114,7 +126,10 @@ So after a primary crash under `ram`:
   replica of the newly promoted node; it will catch up from the
   authoritative journal.
 
-The other policies tolerate either recovery order. This one does not.
+Only a node that crashed with no replica connected — `--standalone`,
+or a cluster whose replicas were all down, which under every policy
+but `disk` means the gate was closed and nothing was being acked —
+can safely be restarted in place.
 
 #### Version requirement for automatic failover
 
@@ -170,6 +185,11 @@ ACK-POLICY two-disks
 Sent over the same admin connection as `PROMOTE` / `ROTATE`, authenticated
 with an operator key (Ed25519 challenge-response). Every swap is
 INFO-logged with the `prev → next` transition for the audit trail.
+
+Until the next minor release the pre-0.15 spelling is accepted as a
+deprecated alias — `DURABILITY local|replicated|hybrid|durably-replicated`
+maps onto `disk|ram|disk+ram|two-disks` and logs a warning. Update
+runbooks before it is removed.
 
 The intended workflow is failover:
 
@@ -662,6 +682,10 @@ normal-case post-recovery state.
   resets to zero on process restart (standard Prometheus counter
   semantics — `rate()`/`increase()` handle resets); cumulative degraded
   time across a restart is not retained.
+- Both are also exported under their pre-0.15 names,
+  `melin_durability_policy_degraded` and
+  `melin_durability_policy_degraded_seconds_total`, until the next minor
+  release so existing alerts keep firing; re-point them before then.
 - A warn-level log fires on transition into the degraded state and
   every 5 seconds while it persists; an info-level log fires on
   return to target.

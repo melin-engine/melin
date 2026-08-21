@@ -1733,8 +1733,9 @@ pub(crate) fn evaluate_durability(
 ///
 /// The attribution itself replaces the old "compare the journal cursor
 /// against the minimum replica *persisted* cursor" heuristic, which
-/// reported replication as the blocker under `disk` — where replicas
-/// cannot bind the gate at all — and read the persisted level under
+/// reported replication as the blocker under `disk` whenever a replica
+/// merely lagged — a replica binds `persisted>=1` only when its fsync
+/// leads the journal's — and read the persisted level under
 /// `disk+ram`, which gates on in-memory.
 #[inline]
 pub(crate) fn evaluate_gate(
@@ -1757,7 +1758,7 @@ pub(crate) fn evaluate_gate(
 
 /// The replica-side cursor the active policy is waiting on, for the
 /// `tick-to-trade` replica-wait histogram. `None` when no clause is
-/// replica-supplied (e.g. `local`).
+/// replica-supplied (e.g. `disk`).
 #[cfg(feature = "tick-to-trade")]
 #[inline]
 pub(crate) fn policy_replica_cursor(
@@ -1992,7 +1993,7 @@ impl GateCrossTracker {
     /// `replica_pos` is the replica-side cursor the *active policy*
     /// gates on — see [`policy_replica_cursor`]. `None` means no replica
     /// currently supplies a binding cursor, which happens permanently
-    /// under `local` and transiently when the binding replica drops out
+    /// under `disk` and transiently when the binding replica drops out
     /// of the cursor view part-way through a wait.
     ///
     /// Both cases must leave `replica_crossed_ts` alone. Treating
@@ -2384,9 +2385,10 @@ mod tests {
     // The attribution must follow the policy actually in force. The
     // previous heuristic compared the journal cursor against the
     // minimum replica *persisted* cursor unconditionally, which
-    // reported replication as the blocker under `disk` (where
-    // replicas cannot bind the gate) and read the wrong level under
-    // `disk+ram` (which gates replicas on in-memory).
+    // reported replication as the blocker under `disk` whenever a
+    // replica lagged (a replica binds `persisted>=1` only when its fsync
+    // leads) and read the wrong level under `disk+ram` (which gates
+    // replicas on in-memory).
     //
     // Attribution comes out of `evaluate_gate` alongside the durable
     // position, computed from the same cursor snapshot, and is `None`
@@ -2395,7 +2397,7 @@ mod tests {
     // on which the gate opens.
 
     #[test]
-    fn disk_policy_never_blames_replication() {
+    fn disk_policy_credits_journal_when_replicas_lag() {
         // `persisted>=1` is satisfied by the highest persisted cursor
         // in the cluster — here the primary's. A connected replica lagging
         // far behind is irrelevant to the gate, so it must not be
@@ -2408,6 +2410,22 @@ mod tests {
         assert_eq!(
             evaluate_gate(&p, 500, WireSeq::new(500), Some(&m), Some(&a)).1,
             Some(Blocker::Journal)
+        );
+    }
+
+    #[test]
+    fn disk_policy_credits_replication_when_a_replica_fsync_leads() {
+        // The mirror: policies count copies, not nodes. With the
+        // primary's disk stalled at 10 and a replica persisted through
+        // 500, `persisted>=1` opens on the replica's copy — and the
+        // attribution must say so, or an operator reading the gate
+        // counters would conclude the primary's disk was keeping up.
+        let p = parse("persisted>=1").unwrap();
+        let m = metrics((500, 500), (10, 10));
+        let a = both_active();
+        assert_eq!(
+            evaluate_gate(&p, 500, WireSeq::new(10), Some(&m), Some(&a)).1,
+            Some(Blocker::Replication)
         );
     }
 

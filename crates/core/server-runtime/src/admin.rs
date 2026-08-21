@@ -19,7 +19,9 @@
 //!   weaker policy immediately after a promotion (no restart, no client
 //!   reconnects) and restore the target policy once replicas reattach.
 //!   Available only when the spawn caller wired the shared policy
-//!   atomic.
+//!   atomic. `DURABILITY <local|replicated|hybrid|durably-replicated>`
+//!   is accepted as a deprecated alias for one release and logged at
+//!   `warn!`.
 //!
 //! A command for which the corresponding flag is `None` is rejected
 //! with `ERR <command> not available on this node\n` so operators get
@@ -42,7 +44,7 @@ use crate::ack_policy::AckPolicy;
 use crate::promotion::PromotionRequest;
 
 use ed25519_dalek::{Verifier, VerifyingKey};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use melin_app::auth::{AuthorizedKeys, Permission};
 use melin_wire_protocol::control::TransportResponse;
@@ -339,6 +341,24 @@ fn handle_connection(
             let _ = parts.next();
             let arg = parts.next().map(str::trim).unwrap_or("");
             handle_ack_policy(&mut stream, ack_policy, arg);
+        }
+        cmd if cmd.starts_with("DURABILITY") => {
+            // Deprecated spelling from before 0.15, kept for one release
+            // because this command's documented use is post-failover
+            // remediation — typed from memory, under pressure, when an
+            // `ERR unknown command` is the last thing anyone needs. The
+            // old policy names are mapped too: the alias is worthless
+            // if `DURABILITY local` still fails on the argument.
+            let mut parts = cmd.splitn(2, char::is_whitespace);
+            let _ = parts.next();
+            let arg = parts.next().map(str::trim).unwrap_or("");
+            let mapped = AckPolicy::parse_legacy(arg).map(AckPolicy::as_str);
+            warn!(
+                received = %cmd,
+                "DURABILITY is deprecated and will be removed in the next minor release; use ACK-POLICY {}",
+                mapped.unwrap_or("<disk|ram|disk+ram|two-disks>")
+            );
+            handle_ack_policy(&mut stream, ack_policy, mapped.unwrap_or(arg));
         }
         other => {
             debug!(received = %other, "unknown admin command");
@@ -723,6 +743,27 @@ mod tests {
     fn ack_policy_command_swaps_policy() {
         let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"ACK-POLICY disk\n");
         assert_eq!(resp, "OK");
+        assert_eq!(after, Some(AckPolicy::Disk));
+    }
+
+    #[test]
+    fn deprecated_durability_alias_maps_old_names() {
+        // `DURABILITY local` from muscle memory must still work, and
+        // land on the policy the old name meant.
+        let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"DURABILITY local\n");
+        assert_eq!(resp, "OK");
+        assert_eq!(after, Some(AckPolicy::Disk));
+
+        let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY durably-replicated\n");
+        assert_eq!(resp, "OK");
+        assert_eq!(after, Some(AckPolicy::TwoDisks));
+
+        // The alias also takes the new names, and still rejects junk.
+        let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY ram\n");
+        assert_eq!(resp, "OK");
+        assert_eq!(after, Some(AckPolicy::Ram));
+        let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY fast\n");
+        assert!(resp.starts_with("ERR ACK-POLICY unknown policy"), "{resp}");
         assert_eq!(after, Some(AckPolicy::Disk));
     }
 
