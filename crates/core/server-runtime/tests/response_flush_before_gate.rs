@@ -1,5 +1,5 @@
 //! The response stage must not hold an already-durable response in its
-//! send buffer while it blocks on a *later* event's durability gate.
+//! send buffer while it blocks on a *later* event's ack gate.
 //!
 //! Steady-state flushing happens on the ring-empty path, which batches
 //! many responses behind one `io_uring_enter`. Left alone, that also
@@ -23,7 +23,7 @@ use std::time::Duration;
 use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_server_runtime::ControlEvent;
-use melin_server_runtime::durability_policy::DurabilityMode;
+use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::response::{self, Response};
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
@@ -69,12 +69,12 @@ fn read_ack(sock: &mut UnixStream) -> std::io::Result<u64> {
 }
 
 /// Build a response-stage config gating on `journal_cursor` alone.
-/// `Local` mode needs no replica wiring, so the cursor is the only input
-/// that decides whether the gate is open.
+/// The `disk` policy needs no replica wiring, so the cursor is the only
+/// input that decides whether the gate is open.
 fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
     Response::<Counter> {
         journal_persisted_wire_seq: journal_cursor,
-        durability_mode: Arc::new(AtomicU8::new(DurabilityMode::Local.as_u8())),
+        ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
         replication_metrics: None,
         replica_active: None,
         heartbeat_interval: None,

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use melin_pipeline::ring;
 use melin_pipeline::spsc;
 
-use crate::durability_policy::Blocker;
+use crate::ack_policy::Blocker;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::DurableWireSeqCursor;
@@ -104,7 +104,7 @@ pub fn run<A: Application>(
     mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_persisted_wire_seq: DurableWireSeqCursor,
-    durability_mode: Arc<std::sync::atomic::AtomicU8>,
+    ack_policy: Arc<std::sync::atomic::AtomicU8>,
     replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: Option<[Arc<AtomicBool>; 2]>,
     shutdown: &AtomicBool,
@@ -116,17 +116,17 @@ pub fn run<A: Application>(
     encoder: crate::response::ResponseEncoderArc<A>,
 ) {
     // Mirrors `response::run`: derive the local Policy from the shared
-    // mode atomic and observe runtime swaps from the admin
-    // `DURABILITY` command.
-    use crate::durability_policy::DurabilityMode;
-    let mut active_mode =
-        DurabilityMode::from_u8(durability_mode.load(Ordering::Relaxed)).unwrap_or_else(|| {
+    // policy atomic and observe runtime swaps from the admin
+    // `ACK-POLICY` command.
+    use crate::ack_policy::AckPolicy;
+    let mut active_policy =
+        AckPolicy::from_u8(ack_policy.load(Ordering::Relaxed)).unwrap_or_else(|| {
             tracing::error!(
-                "durability_mode atomic held a corrupted byte at startup; defaulting to hybrid (DPDK)"
+                "ack_policy atomic held a corrupted byte at startup; defaulting to disk+ram (DPDK)"
             );
-            DurabilityMode::Hybrid
+            AckPolicy::DiskAndRam
         });
-    let mut policy = active_mode.to_policy();
+    let mut policy = active_policy.to_policy();
     // Track known connections (for heartbeat scheduling).
     let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
 
@@ -216,19 +216,19 @@ pub fn run<A: Application>(
     let mut last_stats_flush = Instant::now();
 
     loop {
-        // Observe runtime mode swaps from the admin `DURABILITY`
+        // Observe runtime policy swaps from the admin `ACK-POLICY`
         // command. See `response::run` for the design rationale.
-        let observed_byte = durability_mode.load(Ordering::Relaxed);
-        if observed_byte != active_mode.as_u8() {
-            match DurabilityMode::from_u8(observed_byte) {
+        let observed_byte = ack_policy.load(Ordering::Relaxed);
+        if observed_byte != active_policy.as_u8() {
+            match AckPolicy::from_u8(observed_byte) {
                 Some(next) => {
                     tracing::info!(
-                        prev = active_mode.as_str(),
+                        prev = active_policy.as_str(),
                         next = next.as_str(),
-                        "durability mode swapped at runtime (DPDK)"
+                        "ack policy swapped at runtime (DPDK)"
                     );
-                    active_mode = next;
-                    policy = active_mode.to_policy();
+                    active_policy = next;
+                    policy = active_policy.to_policy();
                     cached_durable_pos = 0;
                     // Flush accrual before re-seeding so pre-swap degraded
                     // time isn't dropped.
@@ -237,7 +237,7 @@ pub fn run<A: Application>(
                 None => {
                     tracing::error!(
                         byte = observed_byte,
-                        "durability_mode atomic held a corrupted byte; retaining prior mode (DPDK)"
+                        "ack_policy atomic held a corrupted byte; retaining prior policy (DPDK)"
                     );
                 }
             }
@@ -405,27 +405,27 @@ pub fn run<A: Application>(
             //
             // The halt-state carve-out rides inside `slot_needs_gate`.
             // Without it a halted node on DPDK stalls the halt rejection
-            // itself on a structurally unsatisfiable policy (`Hybrid`
+            // itself on a structurally unsatisfiable policy (`DiskAndRam`
             // with every replica gone), so the client never learns why
             // it was refused.
             if crate::response::slot_needs_gate(slot, cached_durable_pos) {
                 let needed = slot.wire_seq;
                 loop {
-                    // Observe a mode swap mid-gate-wait so a stuck
+                    // Observe a policy swap mid-gate-wait so a stuck
                     // batch can be unblocked by an operator
-                    // `DURABILITY <mode>` command. See `response.rs`
+                    // `ACK-POLICY <policy>` command. See `response.rs`
                     // for the rationale and ordering choice.
-                    let observed_byte = durability_mode.load(Ordering::Relaxed);
-                    if observed_byte != active_mode.as_u8()
-                        && let Some(next) = DurabilityMode::from_u8(observed_byte)
+                    let observed_byte = ack_policy.load(Ordering::Relaxed);
+                    if observed_byte != active_policy.as_u8()
+                        && let Some(next) = AckPolicy::from_u8(observed_byte)
                     {
                         tracing::info!(
-                            prev = active_mode.as_str(),
+                            prev = active_policy.as_str(),
                             next = next.as_str(),
-                            "durability mode swapped during gate wait (DPDK)"
+                            "ack policy swapped during gate wait (DPDK)"
                         );
-                        active_mode = next;
-                        policy = active_mode.to_policy();
+                        active_policy = next;
+                        policy = active_policy.to_policy();
                         // Flush accrual before re-seeding so the wedged-
                         // degraded interval up to the swap isn't dropped.
                         degraded_logger.reseed(&utilization, Instant::now());

@@ -14,7 +14,7 @@
 //!    to the output SPSC. Runs concurrently with the journal — no waiting for sync.
 //!
 //! The **response stage** (in the server crate) consumes the output SPSC but
-//! gates each event on the configured durability policy before sending: it
+//! gates each event on the configured ack policy before sending: it
 //! evaluates the durable wire-seq cursor (local fsync progress) together with
 //! the per-replica ack metrics, so a response is only sent once the policy's
 //! durability requirement is met (e.g. on disk **and** acknowledged by a
@@ -112,9 +112,9 @@ pub struct StageUtilization {
     pub gate_journal: AtomicU64,
     /// Cumulative gate opens where a *replica* supplied the binding
     /// cursor — replication was the bottleneck. Which replica cursor
-    /// counts depends on the configured durability policy: in-memory
-    /// under `hybrid`, persisted under `durably-replicated`. Under
-    /// `local` a replica can never bind, so this stays at 0.
+    /// counts depends on the configured ack policy: in-memory under
+    /// `disk+ram`, persisted under `two-disks`. Under `disk` a replica
+    /// binds only when its fsync is ahead of the primary's.
     /// Only used by the response stage; always 0 for journal/matching.
     ///
     /// Exactly one of the two counters moves per gate open: attribution
@@ -124,14 +124,14 @@ pub struct StageUtilization {
     /// satisfy the policy the gate does not open at all —
     /// `policy_degraded` covers that state.
     pub gate_replication: AtomicU64,
-    /// Whether the most recent durability-gate evaluation found a
+    /// Whether the most recent ack-gate evaluation found a
     /// clause requiring more nodes than are currently connected. The
     /// clause is not relaxed — the gate stalls until the cluster shape
-    /// recovers or an operator swaps the mode.
+    /// recovers or an operator swaps the policy.
     /// Surfaced on `/healthz` so dashboards and alerting can fire on
     /// it. Only used by the response stage.
     pub policy_degraded: AtomicBool,
-    /// Cumulative nanoseconds the durability policy has spent in the
+    /// Cumulative nanoseconds the ack policy has spent in the
     /// degraded state above. Paired with the `policy_degraded` gauge so
     /// dashboards can compute time-in-degraded over a window with
     /// `rate(...degraded_seconds_total[5m])` instead of reconstructing
@@ -356,7 +356,7 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     /// output slot, in the same space as `metrics.in_memory_sequence` /
     /// `metrics.acked_sequence` and the journal stage's allocator. The
     /// response stage uses this — *not* `input_seq` — for `needed` when
-    /// evaluating the durability policy, so the gate is sound regardless
+    /// evaluating the ack policy, so the gate is sound regardless
     /// of `starting_sequence` (fresh start vs recovery from a journal
     /// with prior history).
     ///
@@ -392,7 +392,7 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     /// replicating before delivery — the rejection records no mutation,
     /// and replicas deterministically reach the same halt decision when
     /// they replay the same inputs. Gating either under a structurally
-    /// unsatisfiable policy (e.g. `Hybrid` with no replicas) would
+    /// unsatisfiable policy (e.g. `disk+ram` with no replicas) would
     /// stall the response gate forever, including for the rejection
     /// itself, which is exactly what we want clients to see immediately.
     /// The carve-out is therefore correctness-preserving and improves
@@ -2263,8 +2263,8 @@ impl<E: AppEvent> JournalStage<E> {
     /// predictable cadence — size-driven rotation, or replica mode
     /// (primary-announced boundaries arrive at the primary's cadence;
     /// a replica's rotation stall sits on the ack path, where under
-    /// `hybrid`/`durably-replicated` gating it delays the primary's
-    /// durability gate, so the fast path matters *more* there than on
+    /// `disk+ram`/`two-disks` gating it delays the primary's
+    /// ack gate, so the fast path matters *more* there than on
     /// the primary itself). Deliberately NOT armed for manual-only
     /// rotation (`ROTATE` with `max_journal_bytes == 0`): the cadence
     /// is unpredictable and the staged segment's disk + thread cost may
@@ -2614,7 +2614,7 @@ impl<A: Application> MatchingStage<A> {
                 // payload" marker. Neither carries
                 // engine state worth replicating before delivery; gating
                 // them under a structurally unsatisfiable policy
-                // (e.g. `Hybrid` with no replicas) would stall the gate
+                // (e.g. `disk+ram` with no replicas) would stall the gate
                 // forever — including for the rejection itself, which is
                 // exactly what we want clients to see immediately. See
                 // `OutputSlot::durability_bypass` for the correctness

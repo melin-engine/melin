@@ -179,7 +179,7 @@ pub struct ServerConfig {
 
     /// Disable replication (dev/test mode). The replica quorum cursor stays
     /// at its no-replica sentinel (health reports zero replication lag) and
-    /// the durability policy evaluates against the primary's journal alone.
+    /// the ack policy evaluates against the primary's journal alone.
     /// Mutually exclusive with `--replication-bind` and `--replica-of`.
     #[arg(long, default_value_t = false)]
     pub standalone: bool,
@@ -229,31 +229,33 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 256)]
     pub replication_ring_size: usize,
 
-    /// Durability mode that gates client responses. One of:
+    /// Ack policy: which copies of an event must exist before its
+    /// response is released. One of:
     ///
-    /// - `local`              `persisted>=1`. Single-node durability;
-    ///   required with `--standalone`. Dev/staging deployments.
-    /// - `replicated`         `in_memory>=2`. A second node holds the
-    ///   event in memory before the ack; every fsync trails off the
-    ///   ack path (the journal still syncs every batch). Lowest ack
-    ///   latency; survives any single node failure via failover; loses
-    ///   only the un-fsynced tail on a whole-cluster power loss. For
-    ///   slow-fsync storage (cloud volumes) or RPO-tolerant apps.
-    /// - `hybrid` (default)   `persisted>=1 && in_memory>=2`. Primary's
-    ///   disk plus an in-memory ack from a second node. Single-failure-
-    ///   safe with a brief RAM-only window on the secondary copy. The
-    ///   default — typical live trading deployments. Saves ~50–80 µs
-    ///   per fill vs `durably-replicated`.
-    /// - `durably-replicated` `persisted>=2`. Two durable copies before
-    ///   client ack. Zero RAM-only window; the gate stalls when no
+    /// - `disk`               `persisted>=1`. One fsynced copy, on
+    ///   whichever node's disk confirms first; required with
+    ///   `--standalone`. Dev/staging deployments.
+    /// - `ram`                `in_memory>=2`. Two nodes hold the event
+    ///   in memory before the ack; every fsync trails off the ack path
+    ///   (the journal still syncs every batch). Lowest ack latency;
+    ///   survives any single node failure via failover; loses only the
+    ///   un-fsynced tail on a whole-cluster power loss. For slow-fsync
+    ///   storage (cloud volumes) or RPO-tolerant apps.
+    /// - `disk+ram` (default) `persisted>=1 && in_memory>=2`. One
+    ///   fsynced copy plus a second copy in another node's memory.
+    ///   Single-failure-safe with a brief RAM-only window for the
+    ///   second copy. Typical live trading deployments. Saves ~50–80 µs
+    ///   per fill vs `two-disks`.
+    /// - `two-disks`          `persisted>=2`. Two fsynced copies before
+    ///   the client ack. Zero RAM-only window; the gate stalls when no
     ///   replica is connected. Compliance-driven venues.
     ///
-    /// `--standalone` requires `local`. In every other mode the gate
-    /// stalls while no replica is connected — the correct behaviour
-    /// for a serious deployment that has lost its replicas. See
-    /// `docs/replication.md` for the operational menu.
-    #[arg(long, value_enum, default_value_t = crate::durability_policy::DurabilityMode::Hybrid)]
-    pub durability_mode: crate::durability_policy::DurabilityMode,
+    /// `--standalone` requires `disk`. Under every other policy the
+    /// gate stalls while no replica is connected — the correct
+    /// behaviour for a serious deployment that has lost its replicas.
+    /// See `docs/replication.md` for the operational menu.
+    #[arg(long, value_enum, default_value_t = crate::ack_policy::AckPolicy::DiskAndRam)]
+    pub ack_policy: crate::ack_policy::AckPolicy,
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
     /// of busy-spinning. Use on shared machines without isolated cores to
@@ -474,7 +476,7 @@ impl Default for ServerConfig {
             replication_heartbeat_secs: 5,
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
-            durability_mode: crate::durability_policy::DurabilityMode::Hybrid,
+            ack_policy: crate::ack_policy::AckPolicy::DiskAndRam,
             yield_idle: false,
             dpdk_eal_args: String::new(),
             dpdk_peer_ip: None,
@@ -808,13 +810,13 @@ where
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
 {
-    // Shared durability-mode atomic, constructed once per process and
-    // threaded through both modes. Wiring it on the replica path
+    // Shared ack-policy atomic, constructed once per process and
+    // threaded through both roles. Wiring it on the replica path
     // (where the live node has no response stage) lets an operator
-    // pre-stage the post-promotion mode with `DURABILITY <mode>`
+    // pre-stage the post-promotion policy with `ACK-POLICY <policy>`
     // before issuing `PROMOTE`; the same `Arc` becomes the response
     // stage's source of truth after the replica → primary transition.
-    let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
+    let ack_policy_atomic = Arc::new(AtomicU8::new(config.ack_policy.as_u8()));
 
     // Validate before the bind below so an invalid config has no side
     // effects. `run_as_primary` re-checks (it is also reached from the
@@ -879,7 +881,7 @@ where
         // The replica's control-plane bundle: promotion request (admin
         // PROMOTE / raft auto-promotion), tip readiness + advertised
         // journal tip (vote recency), primary link state, and the
-        // primary's advertised acking mode. Constructed before
+        // primary's advertised ack policy. Constructed before
         // mode-detection so it survives a replica → primary transition.
         // The rotate flag is re-wired into the new primary's journal
         // stage by `run_as_primary`.
@@ -893,7 +895,7 @@ where
                     addr,
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
-                    Some(Arc::clone(&durability_mode_atomic)),
+                    Some(Arc::clone(&ack_policy_atomic)),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -946,7 +948,7 @@ where
                 wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
-                Arc::clone(&durability_mode_atomic),
+                Arc::clone(&ack_policy_atomic),
                 wiring.peer_tips,
                 wiring.peer_ids,
                 wiring.elect_requested,
@@ -1024,7 +1026,7 @@ where
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
                     rotate_flag,
-                    durability_mode_atomic,
+                    ack_policy_atomic,
                     fence_state,
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     raft_status,
@@ -1053,7 +1055,7 @@ where
                 addr,
                 None,
                 rotate_flag.clone(),
-                Some(Arc::clone(&durability_mode_atomic)),
+                Some(Arc::clone(&ack_policy_atomic)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -1121,7 +1123,7 @@ where
         authorized_keys,
         needs_seeding,
         rotate_flag,
-        durability_mode_atomic,
+        ack_policy_atomic,
         fence_state,
         None, // not promoted — no EpochBump injection
         raft_status,
@@ -1292,7 +1294,7 @@ fn run_as_primary<A, L>(
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
     rotate_flag: Option<Arc<AtomicBool>>,
-    durability_mode_atomic: Arc<AtomicU8>,
+    ack_policy_atomic: Arc<AtomicU8>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     promotion: Option<u64>,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
@@ -1322,16 +1324,14 @@ where
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
     }
-    // `--standalone` declares "no replicas ever" — only `local` can be
-    // satisfied. Every other mode requires a second node and would
+    // `--standalone` declares "no replicas ever" — only `disk` can be
+    // satisfied. Every other policy requires a second node and would
     // stall the gate forever; reject loudly at startup with the fix in
     // the message.
-    if config.standalone
-        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
-    {
+    if config.standalone && config.ack_policy != crate::ack_policy::AckPolicy::Disk {
         return Err(format!(
-            "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
-            config.durability_mode,
+            "--standalone requires --ack-policy disk; got `{}` (this policy needs at least one connected replica)",
+            config.ack_policy,
         )
         .into());
     }
@@ -1380,7 +1380,7 @@ where
         Arc::clone(&fence_state),
     );
     // Ring-position cursors for the seed-drain gate below (Acquire loads,
-    // stronger than the bundle's monitoring reads). The durability gate and
+    // stronger than the bundle's monitoring reads). The ack gate and
     // the replication sender pull their typed handles straight from
     // `cursors`; the health endpoint takes `cursors` itself — the quorum
     // and fastest-replica gauges are derived from the bundle's per-slot
@@ -1486,8 +1486,8 @@ where
 
     let replication_metrics = build_replication_metrics(
         replication_consumers.is_some(),
-        &durability_mode_atomic,
-        config.durability_mode,
+        &ack_policy_atomic,
+        config.ack_policy,
     );
 
     // Per-slot active flags exposed by the journal stage's replication
@@ -1505,7 +1505,7 @@ where
     let journal_persisted_wire_seq_response = cursors.durable_wire_seq();
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
-    let durability_mode_response = Arc::clone(&durability_mode_atomic);
+    let ack_policy_response = Arc::clone(&ack_policy_atomic);
     let s3 = Arc::clone(&shutdown);
     let shutdown_for_response = Arc::clone(&shutdown);
     let busy_spin = !config.yield_idle;
@@ -1521,7 +1521,7 @@ where
                 control_rx,
                 crate::response::Response::<A> {
                     journal_persisted_wire_seq: journal_persisted_wire_seq_response,
-                    durability_mode: durability_mode_response,
+                    ack_policy: ack_policy_response,
                     replication_metrics: replication_metrics_response,
                     replica_active: replica_active_response,
                     heartbeat_interval,
@@ -1599,7 +1599,7 @@ where
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
-        let sender_durability = Arc::clone(&durability_mode_atomic);
+        let sender_ack_policy = Arc::clone(&ack_policy_atomic);
         // Bound in `run_impl` before any pipeline thread was spawned —
         // see the `repl_listener` parameter doc.
         let repl_listener = repl_listener
@@ -1624,7 +1624,7 @@ where
                         heartbeat_secs,
                         busy_spin,
                         fence_state: sender_fence,
-                        durability_mode: sender_durability,
+                        ack_policy: sender_ack_policy,
                     },
                     &s_repl,
                     &ready_flag,
@@ -2192,7 +2192,7 @@ where
     // Mirrors the kernel-TCP `run` path: one atomic per
     // process, threaded into both replica (pre-staging for promotion)
     // and primary admin listeners.
-    let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
+    let ack_policy_atomic = Arc::new(AtomicU8::new(config.ack_policy.as_u8()));
     // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
     let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
     // Actual queue count may be less than requested (TAP only supports 1).
@@ -2251,7 +2251,7 @@ where
                     addr,
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
-                    Some(Arc::clone(&durability_mode_atomic)),
+                    Some(Arc::clone(&ack_policy_atomic)),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -2299,7 +2299,7 @@ where
                 wiring.status,
                 control.clone(),
                 Arc::clone(&fence_state),
-                Arc::clone(&durability_mode_atomic),
+                Arc::clone(&ack_policy_atomic),
                 wiring.peer_tips,
                 wiring.peer_ids,
                 wiring.elect_requested,
@@ -2397,7 +2397,7 @@ where
                     authorized_keys,
                     false,
                     rotate_flag,
-                    durability_mode_atomic,
+                    ack_policy_atomic,
                     fence_state,
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     raft_status,
@@ -2489,16 +2489,14 @@ where
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
     }
-    // `--standalone` declares "no replicas ever" — only `local` can be
-    // satisfied. Every other mode requires a second node and would
+    // `--standalone` declares "no replicas ever" — only `disk` can be
+    // satisfied. Every other policy requires a second node and would
     // stall the gate forever; reject loudly at startup with the fix in
     // the message.
-    if config.standalone
-        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
-    {
+    if config.standalone && config.ack_policy != crate::ack_policy::AckPolicy::Disk {
         return Err(format!(
-            "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
-            config.durability_mode,
+            "--standalone requires --ack-policy disk; got `{}` (this policy needs at least one connected replica)",
+            config.ack_policy,
         )
         .into());
     }
@@ -2538,7 +2536,7 @@ where
         Arc::clone(&fence_state),
     );
     // Ring-position cursors for the seed-drain gate below (Acquire loads,
-    // stronger than the bundle's monitoring reads). The durability gate and
+    // stronger than the bundle's monitoring reads). The ack gate and
     // the replication sender pull their typed handles straight from
     // `cursors`; the health endpoint takes `cursors` itself.
     let journal_cursor = cursors.journal_ring_arc();
@@ -2590,7 +2588,7 @@ where
                 addr,
                 None,
                 rotate_flag.clone(),
-                Some(Arc::clone(&durability_mode_atomic)),
+                Some(Arc::clone(&ack_policy_atomic)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -2636,8 +2634,8 @@ where
 
     let replication_metrics = build_replication_metrics(
         replication_consumers.is_some(),
-        &durability_mode_atomic,
-        config.durability_mode,
+        &ack_policy_atomic,
+        config.ack_policy,
     );
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
@@ -2654,7 +2652,7 @@ where
     let journal_persisted_wire_seq_response = cursors.durable_wire_seq();
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
-    let durability_mode_response = Arc::clone(&durability_mode_atomic);
+    let ack_policy_response = Arc::clone(&ack_policy_atomic);
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
@@ -2667,7 +2665,7 @@ where
                 output_consumer,
                 control_rx,
                 journal_persisted_wire_seq_response,
-                durability_mode_response,
+                ack_policy_response,
                 replication_metrics_response,
                 replica_active_response,
                 &s3,
@@ -2773,7 +2771,7 @@ where
             batch_size,
             heartbeat_secs,
             Arc::clone(&fence_state),
-            Arc::clone(&durability_mode_atomic),
+            Arc::clone(&ack_policy_atomic),
             Arc::clone(&authorized_keys),
         );
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
@@ -3139,8 +3137,8 @@ where
 
 fn build_replication_metrics(
     has_replication: bool,
-    durability_mode_atomic: &AtomicU8,
-    config_mode: crate::durability_policy::DurabilityMode,
+    ack_policy_atomic: &AtomicU8,
+    config_policy: crate::ack_policy::AckPolicy,
 ) -> Option<Arc<crate::replication::ReplicationMetrics>> {
     let metrics = if has_replication {
         Some(Arc::new(crate::replication::ReplicationMetrics::default()))
@@ -3148,14 +3146,13 @@ fn build_replication_metrics(
         None
     };
 
-    let active_mode = crate::durability_policy::DurabilityMode::from_u8(
-        durability_mode_atomic.load(Ordering::Relaxed),
-    )
-    .unwrap_or(config_mode);
+    let active_policy =
+        crate::ack_policy::AckPolicy::from_u8(ack_policy_atomic.load(Ordering::Relaxed))
+            .unwrap_or(config_policy);
     info!(
-        mode = %active_mode,
-        policy = %active_mode.to_policy(),
-        "durability mode active"
+        ack_policy = %active_policy,
+        clauses = %active_policy.to_policy(),
+        "ack policy active"
     );
 
     metrics

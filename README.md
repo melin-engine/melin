@@ -16,7 +16,7 @@ It is a deterministic, replicated sequencer: your single-threaded application lo
 
 **Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application inherits it as long as its logic stays pure.
 
-**Durable and replicated.** Every event is journaled and synchronously replicated before the client sees a response, with CRC32C integrity checks and a BLAKE3 hash chain for tamper evidence. By default an ack requires one node to have persisted and two to hold the event in memory, so a single slow disk or a single node failure costs neither latency nor data; a stricter two-disks-before-ack mode and a faster replication-only mode (no fsync on the ack path) are available. Journal catch-up, snapshot transfer, and automatic failover are built in. See [replication](docs/replication.md).
+**Durable and replicated.** Every event is journaled and synchronously replicated before the client sees a response, with CRC32C integrity checks and a BLAKE3 hash chain for tamper evidence. The ack policy says which copies of an event must exist before its response is released. By default (`disk+ram`) an ack requires one fsynced copy and two copies in memory, so a single slow disk or a single node failure costs neither latency nor data; a stricter `two-disks` policy and a faster `ram` policy (two copies in memory, no fsync on the ack path) are available. Journal catch-up, snapshot transfer, and automatic failover are built in. See [replication](docs/replication.md).
 
 **Fast.** p99 of 404 µs at 1.00M events/sec, full round trip including persistence and replication, on kernel TCP and commodity datacenter hardware. Single-event floor: 66 µs p99. See [Benchmarks](#benchmarks).
 
@@ -24,7 +24,7 @@ It is a deterministic, replicated sequencer: your single-threaded application lo
 
 ## Benchmarks
 
-All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas). Default durability mode: one node persisted, two in memory.
+All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas). Default ack policy (`disk+ram`): one fsynced copy, two copies in memory.
 
 ### Latency under load (closed-loop)
 

@@ -269,9 +269,9 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// primary's epoch onto each `StreamStart` and to self-demote when a
     /// replica handshakes with a higher epoch.
     fence_state: Arc<melin_transport_core::fence::FenceState>,
-    /// The active durability (acking) mode — stamped on `StreamStart`
-    /// and `Heartbeat` (see the kernel-TCP `Sender::durability_mode`).
-    durability_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// The active ack policy — stamped on `StreamStart` and
+    /// `Heartbeat` (see the kernel-TCP `Sender::ack_policy`).
+    ack_policy: Arc<std::sync::atomic::AtomicU8>,
     /// Operator key table. `Arc` because it's shared, read-only, with the
     /// client-auth path and the kernel-TCP sender; the driver only ever
     /// `lookup`s during a replica's challenge/response. Held by the driver
@@ -300,7 +300,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         batch_size: usize,
         heartbeat_secs: u64,
         fence_state: Arc<melin_transport_core::fence::FenceState>,
-        durability_mode: Arc<std::sync::atomic::AtomicU8>,
+        ack_policy: Arc<std::sync::atomic::AtomicU8>,
         authorized_keys: Arc<AuthorizedKeys>,
     ) -> Self {
         let [consumer_0, consumer_1] = repl_consumers;
@@ -344,7 +344,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             batch_size,
             heartbeat_interval: std::time::Duration::from_secs(heartbeat_secs),
             fence_state,
-            durability_mode,
+            ack_policy,
             authorized_keys,
             _app: PhantomData,
         }
@@ -425,7 +425,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let replicas_connected = &self.replicas_connected;
         let metrics = &self.metrics;
         let fence_state = &self.fence_state;
-        let durability_mode = &self.durability_mode;
+        let ack_policy = &self.ack_policy;
         let authorized_keys = &self.authorized_keys;
         let batch_size = self.batch_size;
         let heartbeat_interval = self.heartbeat_interval;
@@ -639,7 +639,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         lineage_start,
                                         lineage_anchor,
                                         fence_state.epoch(),
-                                        durability_mode.load(std::sync::atomic::Ordering::Relaxed),
+                                        ack_policy.load(std::sync::atomic::Ordering::Relaxed),
                                         &mut slot.send_buf,
                                     );
                                     dpdk_publish(&slot.send_buf)
@@ -689,7 +689,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         journal_path,
                                         &mut dpdk_publish,
                                         shutdown,
-                                        durability_mode.load(std::sync::atomic::Ordering::Relaxed),
+                                        ack_policy.load(std::sync::atomic::Ordering::Relaxed),
                                     )
                                 }) {
                                 Ok(CatchUpResult::Ok(end)) => {
@@ -1008,7 +1008,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         slot.send_buf.clear();
                         encode_heartbeat(
                             slot.sent.get(),
-                            durability_mode.load(std::sync::atomic::Ordering::Relaxed),
+                            ack_policy.load(std::sync::atomic::Ordering::Relaxed),
                             &mut slot.send_buf,
                         );
                         transport.queue_send(handle, &slot.send_buf);
@@ -1089,7 +1089,7 @@ where
         tip_ready,
         journal_tip,
         primary_link_up,
-        primary_acking_mode,
+        primary_ack_policy,
         pipeline_healthy,
     } = control;
     journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
@@ -1333,7 +1333,7 @@ where
                             segment_start_sequence,
                             anchor_hash,
                             epoch,
-                            durability_mode,
+                            ack_policy,
                         } => {
                             // Fence: refuse a primary behind our epoch — its
                             // divergent lineage must not overwrite our more
@@ -1358,7 +1358,7 @@ where
                                 break 'handshake None; // caught by the None check below
                             }
                             fence_state.observe_epoch(epoch);
-                            primary_acking_mode.store(durability_mode, Ordering::Release);
+                            primary_ack_policy.store(ack_policy, Ordering::Release);
                             info!(start_sequence, epoch, "streaming started (DPDK)");
                             break 'handshake Some((segment_start_sequence, anchor_hash));
                         }

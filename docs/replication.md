@@ -6,60 +6,71 @@ dedicated connection; the replica persists them locally, acknowledges,
 and replays them through its own matching engine so its state stays
 warm for failover.
 
-Every client response is gated on a configurable **durability mode**
-that decides what "the cluster has acknowledged this event" means
-before the primary tells the client it's done. Modes range from
-single-node durability (dev/test) through RAM-quorum replication
-(lowest latency, bounded RPO) to two-disk durability (compliance).
+Every client response is gated on a configurable **ack policy** that
+says which *copies* of an event must exist before the primary tells the
+client it's done. Policies range from a single fsynced copy (dev/test)
+through two in-memory copies (lowest latency, bounded RPO) to two
+fsynced copies (compliance).
 
-## Durability modes
+## Ack policies
 
-The operator picks one of four named modes via
-`--durability-mode <mode>` on the primary. Each carries a different
-guarantee about what's confirmed before the client gets a reply:
+The operator picks one of four named policies via
+`--ack-policy <policy>` on the primary. Each names the copies that must
+exist before the client gets a reply:
 
-| Mode | Guarantee at client ack | Vulnerable to | When to use |
+| Policy | Copies required at client ack | Vulnerable to | When to use |
 |---|---|---|---|
-| `local` | One node has the event on PLP-backed NVMe (the primary's own disk). | Primary disk hardware failure. | Dev, staging, single-node deployments. |
-| `replicated` | Two nodes hold the event in RAM. Disk writes trail asynchronously — the journal still syncs every batch, just off the ack path. | Simultaneous failure of every node holding the event within the fsync window (typically milliseconds) — the un-synced tail is lost. Any single node failure is fully covered by failover. | Storage where fsync is slow (cloud block volumes) or latency-critical applications that accept a small, bounded RPO. Lowest ack latency of the four modes. |
-| `hybrid` *(default)* | One node has the event on PLP-backed NVMe **and** a second node has confirmed receipt in RAM. | Primary disk hardware failure within ~80 µs of the ack — the window before the secondary completes its own fsync. PLP-protected power loss is fully handled. | Typical live-trading deployments. Saves ~50–80 µs per fill vs `durably-replicated`. |
-| `durably-replicated` | Two nodes have the event on PLP-backed NVMe. | Simultaneous disk failure on two nodes. | Compliance-driven venues that require two durable copies before client ack. |
+| `disk` | One fsynced copy on PLP-backed NVMe. | Hardware failure of the disk holding that copy. | Dev, staging, single-node deployments. |
+| `ram` | Two copies in memory, on two nodes. Disk writes trail asynchronously — every journal still syncs every batch, just off the ack path. | Simultaneous failure of every node holding the event within the fsync window (typically milliseconds) — the un-synced tail is lost. Any single node failure is fully covered by failover. | Storage where fsync is slow (cloud block volumes) or latency-critical applications that accept a small, bounded RPO. Lowest ack latency of the four policies. |
+| `disk+ram` *(default)* | One fsynced copy on PLP-backed NVMe **plus** a second copy in another node's memory. | Failure of the disk holding the fsynced copy within ~80 µs of the ack — the window before the other node completes its own fsync. PLP-protected power loss is fully handled. | Typical live-trading deployments. Saves ~50–80 µs per fill vs `two-disks`. |
+| `two-disks` | Two fsynced copies on PLP-backed NVMe, on two nodes. | Simultaneous disk failure on two nodes. | Compliance-driven venues that require two durable copies before client ack. |
 
 The PLP (Power-Loss-Protection) capacitor on the NVMe device is what
-makes `persisted` a meaningful guarantee without an explicit fsync
+makes a fsynced copy a meaningful guarantee without an explicit fsync
 round-trip on every event — the device commits the write to flash
 across a power loss.
 
-### A replica's disk is not on the `hybrid` critical path
+### Policies count copies, not nodes
 
-`hybrid` asks the second node to confirm *receipt in RAM*, not a second
-fsync, so a replica whose own device stalls — a p99.9 NVMe hiccup, a
-network-attached volume, a rotation pause — must not show up in client
-latency. It doesn't: the replica keeps receiving and keeps confirming
-receipt while its disk catches up. Only its *persisted* confirmation
-falls behind, and that is the one `durably-replicated` waits for.
+No policy names a node. `disk` and `disk+ram` require *one* fsynced
+copy, and it is satisfied by whichever node's disk confirms first. That
+is usually the primary, but not always: when the primary's device hits a
+p99.9 hiccup, the replica's fsync of the same event wins and the ack
+goes out without waiting for the primary's disk. Likewise the in-memory
+copy of `ram` and `disk+ram` is "a second node has it", not "a specific
+replica has it". The names say what must hold the event at ack time and
+nothing about where.
 
-Under `durably-replicated` the replica's disk is on the critical path by
-definition — that is the guarantee the mode buys. A replica running
-behind its own device is visible on that node's
-`melin_journal_disk_lag_batches`.
+### A replica's disk is not on the `disk+ram` critical path
 
-### No disk on the `replicated` critical path
+`disk+ram` asks the second node to confirm *receipt in RAM*, not a
+second fsync, so a replica whose own device stalls — a p99.9 NVMe
+hiccup, a network-attached volume, a rotation pause — must not show up
+in client latency. It doesn't: the replica keeps receiving and keeps
+confirming receipt while its disk catches up. Only its *persisted*
+confirmation falls behind, and that is the one `two-disks` waits for.
 
-`replicated` takes the `hybrid` idea one step further: *no* disk gates
-the ack, not even the primary's. A response goes out once a second node
+Under `two-disks` a second disk is on the critical path by definition —
+that is the guarantee the policy buys. With one replica that is its
+disk; with two, the faster replica's. A node running behind its own
+device is visible on that node's `melin_journal_disk_lag_batches`.
+
+### No disk on the `ram` critical path
+
+`ram` takes the `disk+ram` idea one step further: *no* disk gates the
+ack, not even the primary's. A response goes out once a second node
 has confirmed receipt in RAM. Every node's journal keeps writing and
-syncing every batch exactly as in the other modes — durability is not
-disabled, it is moved off the ack path — so the on-disk copies trail
-the acked frontier by roughly one disk-sync interval.
+syncing every batch exactly as under the other policies — durability is
+not disabled, it is moved off the ack path — so the on-disk copies
+trail the acked frontier by roughly one disk-sync interval.
 
 The resulting contract:
 
 - **Any single node failure loses nothing — provided you fail over.**
   Every acked event is held by at least two nodes, so a surviving
-  replica always has it. See the warning below: this is the one mode
-  where recovering a crashed primary by restarting it *in place* is
-  not equivalent.
+  replica always has it. See the warning below: under this policy
+  recovering a crashed primary by restarting it *in place* can lose an
+  unbounded number of acked events, not just the batches in flight.
 - **Losing every node that held an event loses it.** The gate requires
   two holders, not all three, so an event can be acked while only the
   primary and one replica have it — losing that pair loses the event
@@ -68,33 +79,46 @@ The resulting contract:
   full cluster outage.
 - **What is lost is the un-synced tail** — the acked events no journal
   had synced yet, typically the final few milliseconds. That window is
-  the mode's recovery point objective (RPO), and it is the price of
+  the policy's recovery point objective (RPO), and it is the price of
   taking fsync out of the ack path.
 
-Pick `replicated` when that trade is right: deployments whose storage
-makes fsync expensive (cloud block volumes, network-attached disks) —
-where the other modes would put milliseconds of disk latency inside
-every ack — or applications that value the lowest possible ack latency
-over a guarantee against simultaneous multi-node loss.
+Pick `ram` when that trade is right: deployments whose storage makes
+fsync expensive (cloud block volumes, network-attached disks) — where
+the other policies would put milliseconds of disk latency inside every
+ack — or applications that value the lowest possible ack latency over a
+guarantee against simultaneous multi-node loss.
 
 #### Failover is mandatory — never restart a crashed primary in place
 
-Under every other mode, an acked event is on the primary's own disk
-before the client hears about it, so restarting a crashed primary in
-place brings back a node that still holds the acked frontier. That is
-not true here: under `replicated` the primary acks events it has not
-yet written, so a crash can leave its journal **short of the events
-its clients were told were durable**.
+Because policies count copies rather than nodes, a connected replica
+can be the node that satisfies the ack. Under `disk` and `disk+ram`
+that happens whenever the replica's fsync lands before the primary's —
+normal during a primary disk hiccup — and under `two-disks` the
+primary's own fsync is never waited for when two replicas are faster.
+So under *every* policy, a primary that dies while a replica is
+connected can come back with a journal **short of events its clients
+were told were durable**. What differs is how short:
 
-Restarting that primary in place discards them. The surviving replica
-does hold them, and on reconnect it advertises a sequence beyond the
-restarted primary's tip — which the primary correctly reads as
-divergent history and resolves by rebasing the replica onto its own
-shorter journal (the replica archives its lineage first, so the events
-are recoverable from the archive, but they leave the live cluster and
-any client that read them is now ahead of the system of record).
+- Under `disk`, `disk+ram` and `two-disks` the gap is bounded by the
+  batches that were in flight to the primary's disk — the journal syncs
+  every batch, so it cannot run further behind than what the device was
+  writing at the moment of the crash. A process crash loses nothing
+  (the kernel still writes the pages out); a power loss or kernel panic
+  loses that in-flight tail.
+- Under `ram` the primary acks events it has not yet written and keeps
+  acking ahead of its disk indefinitely, so the gap is unbounded and a
+  plain process crash is enough to open it.
 
-So after a primary crash under `replicated`:
+Restarting that primary in place discards the gap. The surviving
+replica does hold those events, and on reconnect it advertises a
+sequence beyond the restarted primary's tip — which the primary
+correctly reads as divergent history and resolves by rebasing the
+replica onto its own shorter journal (the replica archives its lineage
+first, so the events are recoverable from the archive, but they leave
+the live cluster and any client that read them is now ahead of the
+system of record).
+
+So after a primary crash, under any policy:
 
 - **Promote a surviving replica.** Raft-driven failover already does
   this automatically and elects the most caught-up node.
@@ -102,78 +126,86 @@ So after a primary crash under `replicated`:
   replica of the newly promoted node; it will catch up from the
   authoritative journal.
 
-The other modes tolerate either recovery order. This one does not.
+Only a node that crashed with no replica connected — `--standalone`,
+or a cluster whose replicas were all down, which under every policy
+but `disk` means the gate was closed and nothing was being acked —
+can safely be restarted in place.
 
 #### Version requirement for automatic failover
 
-The acking mode is advertised to replicas on the replication stream,
-and a node refuses to auto-promote on a mode it does not recognise —
+The ack policy is advertised to replicas on the replication stream,
+and a node refuses to auto-promote on a policy it does not recognise —
 the correct fail-closed behaviour, but it means a replica running a
-build that predates `replicated` will decline to take over from a
-primary using it. Upgrade every replica before switching a primary to
-`replicated`, or automatic failover is silently unavailable until you
-do. Manual `PROMOTE` is unaffected.
+build that predates `ram` will decline to take over from a primary
+using it. Upgrade every replica before switching a primary to `ram`,
+or automatic failover is silently unavailable until you do. Manual
+`PROMOTE` is unaffected.
 
 ### Strict fail-closed semantics
 
-Every mode is **strict**. If the configured guarantee can't be met by
-the current cluster shape (e.g. `hybrid` configured but no replica is
+Every policy is **strict**. If the required copies can't exist in the
+current cluster shape (e.g. `disk+ram` configured but no replica is
 connected), the response gate stalls and clients see no reply rather
 than the system silently weakening the contract. The
-`melin_durability_policy_degraded` gauge on `/healthz` flips to `1` and
-a warn-level log line is emitted on transition and every 5 seconds
-while degraded.
+`melin_ack_policy_degraded` gauge on `/healthz` flips to `1` and a
+warn-level log line is emitted on transition and every 5 seconds while
+degraded.
 
-This is deliberate: silently down-grading the durability contract under
-load is exactly the kind of failure mode regulators and exchange
-operators write off in post-mortems. Operators who want the system to
-keep trading at reduced durability during a partial outage use the
-runtime mode swap below.
+This is deliberate: silently down-grading the ack contract under load
+is exactly the kind of failure mode regulators and exchange operators
+write off in post-mortems. Operators who want the system to keep
+trading under a weaker policy during a partial outage use the runtime
+policy swap below.
 
 ### Trading halts when all replicas disconnect
 
-Independent of the durability gate, the matching engine halts when
-**every** configured replica disconnects. New client orders are
-rejected with a `ReplicaDisconnected` reason code immediately —
-clients see the halt reason rather than a TCP read timeout. The
-rejection bypasses the durability gate because no engine state
-changed: replicas will deterministically produce the same rejection
-when they replay the same input on reconnect.
+Independent of the ack gate, the matching engine halts when **every**
+configured replica disconnects. New client orders are rejected with a
+`ReplicaDisconnected` reason code immediately — clients see the halt
+reason rather than a TCP read timeout. The rejection bypasses the ack
+gate because no engine state changed: replicas will deterministically
+produce the same rejection when they replay the same input on
+reconnect.
 
 Standalone deployments (no replication configured) skip this halt
-entirely and run under `local`.
+entirely and run under `disk`.
 
-### Runtime mode swap
+### Runtime policy swap
 
-The operator can change the active durability mode without restarting
-the node via a signed admin command:
+The operator can change the active ack policy without restarting the
+node via a signed admin command:
 
 ```
-DURABILITY local
-DURABILITY replicated
-DURABILITY hybrid
-DURABILITY durably-replicated
+ACK-POLICY disk
+ACK-POLICY ram
+ACK-POLICY disk+ram
+ACK-POLICY two-disks
 ```
 
 Sent over the same admin connection as `PROMOTE` / `ROTATE`, authenticated
 with an operator key (Ed25519 challenge-response). Every swap is
 INFO-logged with the `prev → next` transition for the audit trail.
 
+Until the next minor release the pre-0.15 spelling is accepted as a
+deprecated alias — `DURABILITY local|replicated|hybrid|durably-replicated`
+maps onto `disk|ram|disk+ram|two-disks` and logs a warning. Update
+runbooks before it is removed.
+
 The intended workflow is failover:
 
 1. Primary dies, replica is promoted (`PROMOTE`).
-2. The promoted node is now standalone — under `hybrid` its gate is
-   structurally unsatisfiable (no second node to ack in memory) and
-   trading would stall.
-3. Operator sends `DURABILITY local` → the gate re-evaluates under
-   `local` and trading resumes in seconds, no restart, no dropped
+2. The promoted node is now standalone — under `disk+ram` its gate is
+   structurally unsatisfiable (no second node to hold the in-memory
+   copy) and trading would stall.
+3. Operator sends `ACK-POLICY disk` → the gate re-evaluates under
+   `disk` and trading resumes in seconds, no restart, no dropped
    client connections.
 4. New replicas are spun up and connect.
-5. Operator sends `DURABILITY hybrid` → the gate is satisfied by the
+5. Operator sends `ACK-POLICY disk+ram` → the gate is satisfied by the
    new cluster shape and trading continues at the full contract.
 
-The replica's admin listener also accepts `DURABILITY` — operators can
-**pre-stage** the post-promotion mode by sending `DURABILITY local`
+The replica's admin listener also accepts `ACK-POLICY` — operators can
+**pre-stage** the post-promotion policy by sending `ACK-POLICY disk`
 *before* `PROMOTE`; the value persists across the in-process
 transition.
 
@@ -194,7 +226,7 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
   that advances as soon as the batch is received, and an
   `acked_sequence` that advances once the local journal write is
   durable. Both fields are populated on every ack so the primary's
-  gate can evaluate any mode without separate ack streams.
+  gate can evaluate any policy without separate ack streams.
 - Does not accept client connections.
 
 If the primary disconnects or evicts the replica, the receiver
@@ -224,8 +256,8 @@ no journal re-replay, no snapshot reload. Sub-second switchover.
 
 After promotion the new primary will halt new orders if it has no
 replicas connected (see above) — the operator's playbook is to either
-spin up new replicas immediately or send `DURABILITY local` to resume
-trading at reduced durability.
+spin up new replicas immediately or send `ACK-POLICY disk` to resume
+trading under the single-copy policy.
 
 The old primary should still be stopped promptly, but epoch fencing
 (below) now closes the split-brain window if it isn't: the moment the
@@ -270,7 +302,7 @@ election term as the new epoch, closing that gap.
 Nodes can optionally run a **control-plane consensus service** (Raft)
 that carries leader election, cluster membership, and fencing epochs —
 and nothing else. Order flow stays on the replication path above, and
-the durability modes are unchanged. The control plane is fully isolated
+the ack policies are unchanged. The control plane is fully isolated
 from trading: losing control-plane quorum never halts or slows the
 data plane; failover simply degrades to the manual `PROMOTE` playbook
 until quorum returns.
@@ -328,12 +360,13 @@ Auto-promotion is deliberately conservative. The elected replica
   journal is empty — a blank node winning an election is a cluster
   bring-up race, not a failover, and must not depose a primary that is
   merely slow to start;
-- the primary was acking under `local` durability — acks never waited
-  for any replica, so no election can prove the winner holds every
-  acked order; failover stays a manual, eyes-on decision under `local`;
+- the primary was acking under the `disk` policy — acks never waited
+  for a second copy on another node, so no election can prove the
+  winner holds every acked order; failover stays a manual, eyes-on
+  decision under `disk`;
 - **a reachable peer holds more data than it does.** Election steering
   is best-effort, so a behind replica can end up holding leadership —
-  and under `hybrid`/`replicated` an ack only requires the *fastest*
+  and under `disk+ram`/`ram` an ack only requires the *fastest*
   replica, so at the moment of a crash the slower replica legitimately
   lacks the newest acked events. Every raft message carries the
   sender's journal position; the winner refuses to promote while any
@@ -462,8 +495,8 @@ instead of looping (each repair cycle archives a full journal copy,
 and recurrence at that rate means something upstream is seriously
 wrong). Either way, the replica's
 old journal and snapshot are **archived, never deleted** — moved to a
-sibling directory named `<journal>.divergent.<n>`. Under `local`
-durability that journal may hold acked orders that did not survive the
+sibling directory named `<journal>.divergent.<n>`. Under the `disk`
+policy that journal may hold acked orders that did not survive the
 failover, which is exactly what an operator or regulator needs for
 reconciliation. Routine (non-divergent) resyncs archive to
 `<journal>.resync.<n>` for the same conservative reason — and note
@@ -505,11 +538,11 @@ requiring the full journal history.
 | Flag | Required | Default | Purpose |
 |---|---|---|---|
 | `--replication-bind <addr>` | No | — | Address to listen for replica connections. Bound at startup on any node that sets it — including a replica, which holds the port from boot and starts serving on it at promotion. |
-| `--standalone` | No | `false` | Explicitly disable replication. Requires `--durability-mode local`. |
+| `--standalone` | No | `false` | Explicitly disable replication. Requires `--ack-policy disk`. |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary. |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
-| `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `DURABILITY <mode>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
-| `--durability-mode <mode>` | Primary | `hybrid` | Active durability mode at startup. `local`, `replicated`, `hybrid`, or `durably-replicated`. Can be swapped at runtime via admin `DURABILITY`. |
+| `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `ACK-POLICY <policy>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
+| `--ack-policy <policy>` | Primary | `disk+ram` | Active ack policy at startup: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Can be swapped at runtime via admin `ACK-POLICY`. |
 
 `--standalone` is mutually exclusive with both `--replication-bind`
 and `--replica-of`. `--replica-of` **combines** with
@@ -530,7 +563,7 @@ connection separate from the client protocol.
 | Message | Layout | Purpose |
 |---|---|---|
 | Handshake | `[len:u32][type=0x01][last_sequence:u64][chain_hash:[u8;32]][epoch:u64][protocol_version:u16]` | Initial connection — replica reports its last durable sequence, the chain hash at that point, its fencing epoch, and the replication protocol version it speaks. A version mismatch is rejected with an explicit log line naming both versions. |
-| Ack | `[len:u32][type=0x02][acked_sequence:u64][in_memory_sequence:u64]` | Replica confirms persisted writes up to `acked_sequence` and pre-journal receipt up to `in_memory_sequence`. Both fields are populated on every ack so the primary's gate can evaluate any mode without separate ack streams. |
+| Ack | `[len:u32][type=0x02][acked_sequence:u64][in_memory_sequence:u64]` | Replica confirms persisted writes up to `acked_sequence` and pre-journal receipt up to `in_memory_sequence`. Both fields are populated on every ack so the primary's gate can evaluate any policy without separate ack streams. |
 
 ### Primary → Replica
 
@@ -553,41 +586,41 @@ connection separate from the client protocol.
 Most failures resolve without operator action:
 
 - **Primary crashes, one or both replicas alive** — promote the most
-  caught-up surviving replica. With a single replica, the durability
-  contract guarantees it holds every acked event (`replicated`,
-  `hybrid`, and `durably-replicated` all required its confirmation
-  before each ack). With two replicas, an ack only ever required the
+  caught-up surviving replica. With a single replica, the ack policy
+  guarantees it holds every acked event (`ram`, `disk+ram`, and
+  `two-disks` all required its confirmation before each ack). With
+  two replicas, an ack only ever required the
   *faster* one, so the two may differ by the final instants of
   traffic: a raft-driven failover handles this — it steers the
   election toward the most caught-up node, and a winner refuses to
   promote while a reachable peer holds more (see "Automatic
   failover"). For a manual `PROMOTE`, compare `journal_sequence` on
   each replica's `/healthz` first and promote the higher one. Under
-  `replicated`, additionally **do not restart the old primary as
+  `ram`, additionally **do not restart the old primary as
   primary**: its journal may be short of events it already acked, and
   bringing it back in that role discards them (see "Failover is
   mandatory" above). Bring it back as a replica instead. Send
-  `DURABILITY local` after promotion if the new primary is standalone;
-  restore the target mode once new replicas attach.
+  `ACK-POLICY disk` after promotion if the new primary is standalone;
+  restore the target policy once new replicas attach.
 - **One replica crashes, primary and other replica alive** — the
-  cluster continues at the configured mode. Under `hybrid` the gate
-  is satisfied by the primary plus the surviving replica's in-memory
-  ack. Under `durably-replicated` it's satisfied by both nodes
-  persisting. The crashed replica reconnects and catches up
+  cluster continues under the configured policy. Under `disk+ram` the
+  gate is satisfied by whichever node fsyncs first plus the surviving
+  replica's in-memory ack. Under `two-disks` it's satisfied by both
+  nodes persisting. The crashed replica reconnects and catches up
   automatically.
 
 ### Cluster-wide outage
 
 When all nodes restart with their own journals they may differ in
-length. Under every mode except `replicated` the contract is that
-every event the client was told about is on at least one PLP-backed
-disk, so the node with the longest journal holds the acked frontier
-(and possibly some events past it that were locally durable but never
-confirmed to a client). Under `replicated` the longest journal holds
-the acked frontier *minus the un-synced tail* — a whole-cluster
-outage may lose the final few milliseconds of acked events, which is
-that mode's documented RPO ("No disk on the `replicated` critical
-path" above). The recovery procedure is the same in every mode:
+length. Under every policy except `ram` the contract is that every
+event the client was told about is on at least one PLP-backed disk, so
+the node with the longest journal holds the acked frontier (and
+possibly some events past it that were locally durable but never
+confirmed to a client). Under `ram` the longest journal holds the
+acked frontier *minus the un-synced tail* — a whole-cluster outage may
+lose the final few milliseconds of acked events, which is that
+policy's documented RPO ("No disk on the `ram` critical path" above).
+The recovery procedure is the same under every policy:
 
 1. Stop all nodes if not already stopped.
 2. Determine each node's journal end sequence. Today this means
@@ -604,7 +637,7 @@ path" above). The recovery procedure is the same in every mode:
    authoritative, and the archived entries remain available for
    reconciliation.
 
-Under `durably-replicated`, the second-longest journal is also
+Under `two-disks`, the second-longest journal is also
 guaranteed to hold the acked frontier (by contract two nodes had each
 acked event on disk), so the top two journals being tied is the
 normal-case post-recovery state.
@@ -615,7 +648,7 @@ normal-case post-recovery state.
   protocol carries a version number and frame layouts change between
   releases; a mixed-version pair refuses to connect, logging which
   side is behind. Replication (and trading, under the
-  replicas-required durability modes) is down until the versions
+  replica-requiring ack policies) is down until the versions
   match, so upgrade the whole cluster in one maintenance window.
 - **Snapshots are forward-compatible.** This release reads snapshots
   written by pre-fencing releases (their epoch is taken as 0, which
@@ -635,24 +668,28 @@ normal-case post-recovery state.
   `melin_trading_active` gauge) reports `halted` on a fenced node even
   while replicas remain connected — point load-balancer probes and
   failover alerting at it.
-- `melin_durability_policy_degraded` (Prometheus gauge on the health
-  endpoint) — `1` while the active mode can't be satisfied by the
+- `melin_ack_policy_degraded` (Prometheus gauge on the health
+  endpoint) — `1` while the active policy can't be satisfied by the
   current cluster shape, `0` otherwise. Alert on sustained `1`.
-- `melin_durability_policy_degraded_seconds_total` (Prometheus counter)
+- `melin_ack_policy_degraded_seconds_total` (Prometheus counter)
   — cumulative seconds spent in the degraded state. Advances on each
   policy evaluation (per response batch under load, sub-second while the
-  durability gate is stalled, and roughly once a second while idle), so a
+  ack gate is stalled, and roughly once a second while idle), so a
   degradation shorter than that interval on a quiet venue may not be
-  resolved. Use `rate(melin_durability_policy_degraded_seconds_total[5m])`
+  resolved. Use `rate(melin_ack_policy_degraded_seconds_total[5m])`
   for the fraction of the last 5 minutes spent degraded, without scraping
   the gauge at high frequency to reconstruct intervals. The accumulator
   resets to zero on process restart (standard Prometheus counter
   semantics — `rate()`/`increase()` handle resets); cumulative degraded
   time across a restart is not retained.
+- Both are also exported under their pre-0.15 names,
+  `melin_durability_policy_degraded` and
+  `melin_durability_policy_degraded_seconds_total`, until the next minor
+  release so existing alerts keep firing; re-point them before then.
 - A warn-level log fires on transition into the degraded state and
   every 5 seconds while it persists; an info-level log fires on
   return to target.
-- Every admin `DURABILITY` swap emits an info-level audit log with
+- Every admin `ACK-POLICY` swap emits an info-level audit log with
   the `prev → next` transition.
 - On raft-enabled nodes, the `melin_raft_node_id` / `melin_raft_term` /
   `melin_raft_leader_id` / `melin_raft_role` / `melin_raft_is_leader` /

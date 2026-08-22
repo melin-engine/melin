@@ -12,6 +12,31 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Changed
+
+- **"Durability mode" is now the "ack policy"**, and its values name the
+  copies that must exist before a response is released: `disk` (one fsynced
+  copy), `ram` (two in-memory copies), `disk+ram` (one fsynced copy plus a
+  second in memory — the default), `two-disks` (two fsynced copies). The old
+  names implied that the journal fsyncs less in some modes (it never did) and
+  that the fsynced copy is the primary's (it is whichever node confirms
+  first). Source-breaking: `--durability-mode` is `--ack-policy`, the admin
+  command `DURABILITY` is `ACK-POLICY`, `DurabilityMode` is `AckPolicy`, and
+  the `melin_durability_policy_degraded*` metrics are
+  `melin_ack_policy_degraded*`. The byte advertised on the replication stream
+  is unchanged, so mixed-version clusters keep interoperating. For this one
+  release the old admin verb still works (old value names included, logged at
+  `warn`) and the old metric names are still exported alongside the new ones,
+  so alerts and runbooks have a release to migrate; both go away in the next
+  minor.
+- **Failover guidance now covers every policy.** The "never restart a crashed
+  primary in place" rule was documented for `replicated` only; because a
+  policy counts copies rather than nodes, a replica's fsync can be the copy
+  that satisfied `disk` or `disk+ram`, so a primary lost to power failure can
+  come back short of acked events under any policy — bounded by the batches
+  in flight under the disk-gated ones, unbounded under `ram`. Behaviour is
+  unchanged; the docs now say so.
+
 ## [0.14.0] - 2026-08-21
 
 ### Added

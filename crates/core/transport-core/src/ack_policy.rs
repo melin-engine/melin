@@ -1,8 +1,9 @@
-//! Durability ack policy — application-agnostic core.
+//! Ack policy — application-agnostic core.
 //!
-//! The response stage gates outgoing acks on a cluster-wide durability
-//! condition. This module expresses that condition as a structured
-//! policy over per-node durability levels.
+//! The response stage gates outgoing acks on a cluster-wide condition:
+//! which copies of an event must exist before its response is released.
+//! This module expresses that condition as a structured policy over
+//! per-node durability levels.
 //!
 //! # Levels
 //!
@@ -33,8 +34,8 @@
 //!
 //! # What is _not_ here
 //!
-//! The operator-facing CLI shape (the named modes — `local`, `hybrid`,
-//! `durably-replicated`) is application policy and lives in the
+//! The operator-facing CLI shape (the named policies — `disk`, `ram`,
+//! `disk+ram`, `two-disks`) is application policy and lives in the
 //! consuming crate. Core only knows about clauses and levels.
 
 use std::fmt;
@@ -99,7 +100,7 @@ impl fmt::Display for Clause {
     }
 }
 
-/// Durability ack policy: an AND-combined list of clauses.
+/// Ack policy: an AND-combined list of clauses.
 ///
 /// The empty policy is rejected by the parser; an "ack immediately"
 /// behaviour can be expressed as `in_memory>=1`, which is satisfied by
@@ -189,8 +190,9 @@ impl Policy {
     /// threshold rank was the primary or a replica. This is the honest
     /// answer to "journal or replication?" for *any* policy shape,
     /// unlike comparing the journal cursor against a fixed replica
-    /// level: under `local` (`persisted>=1`) replicas cannot bind at
-    /// all, and under `hybrid` (`persisted>=1 && in_memory>=2`) the
+    /// level: under `disk` (`persisted>=1`) the binding node is
+    /// whichever fsynced furthest (usually, not always, the primary),
+    /// and under `disk+ram` (`persisted>=1 && in_memory>=2`) the
     /// binding replica cursor is in-memory, not persisted.
     ///
     /// Returns `None` when a clause is unsatisfiable by the current
@@ -226,8 +228,9 @@ impl Policy {
     /// cursor this policy is actually waiting on.
     ///
     /// Returns `None` when no clause is supplied by a replica (e.g.
-    /// `local`, where the primary alone satisfies `persisted>=1`), or
-    /// when a clause is unsatisfiable by the current cluster shape.
+    /// `disk` while the primary's fsync leads, so it alone satisfies
+    /// `persisted>=1`), or when a clause is unsatisfiable by the
+    /// current cluster shape.
     /// Callers use this to measure replica wait against the level the
     /// policy really gates on rather than a hardcoded one.
     pub fn replica_gate_cursor(&self, cursors: &CursorView<'_>) -> Option<u64> {
@@ -245,7 +248,7 @@ impl Policy {
     }
 }
 
-/// Which subsystem the durability gate was waiting on. Reported by
+/// Which subsystem the ack gate was waiting on. Reported by
 /// [`Policy::attribute_blocker`] and surfaced as the `blocker` label on
 /// the `melin_response_gate_total` counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,13 +434,13 @@ pub const MAX_CLUSTER_SIZE: u8 = 3;
 impl fmt::Display for PolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PolicyError::Empty => f.write_str("durability policy must contain at least one clause"),
+            PolicyError::Empty => f.write_str("ack policy must contain at least one clause"),
             PolicyError::ZeroCount(c) => {
-                write!(f, "durability policy clause `{c}` has zero count")
+                write!(f, "ack policy clause `{c}` has zero count")
             }
             PolicyError::CountExceedsClusterCap { count, max } => write!(
                 f,
-                "durability policy clause requires {count} nodes but the server caps cluster size at {max} (1 primary + 2 replicas)"
+                "ack policy clause requires {count} nodes but the server caps cluster size at {max} (1 primary + 2 replicas)"
             ),
         }
     }
@@ -471,7 +474,7 @@ mod tests {
 
     #[test]
     fn blocker_follows_the_binding_clause_not_a_fixed_level() {
-        // hybrid: primary persisted 300, replica in-memory 400 (fsync
+        // disk+ram: primary persisted 300, replica in-memory 400 (fsync
         // trailing at 250). The binding term is the primary's own
         // persisted cursor.
         let p = and_policy(&[(Level::Persisted, 1), (Level::InMemory, 2)]);
@@ -490,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn blocker_never_credits_replication_for_a_single_node_clause() {
+    fn blocker_credits_journal_when_replicas_lag_a_single_node_clause() {
         // `persisted>=1` is met by whichever node is furthest along. A
         // lagging replica cannot bind it, so the journal must be the
         // verdict no matter how far behind the replica is.
@@ -529,10 +532,11 @@ mod tests {
         // tie-break direction. `persisted>=1` is met at rank 0, and a
         // replica that has caught up *exactly* to the primary ties for
         // it. Ranking must break that tie by ascending node index so
-        // rank 0 stays the primary: a replica can never bind a
-        // single-node clause, so the verdict has to be Journal.
-        // Ranking ties the other way would silently report replication
-        // under `local` — the original bug, in a new disguise.
+        // rank 0 stays the primary: a replica that is merely level
+        // with the primary has not out-fsynced it, so the verdict has
+        // to be Journal. Ranking ties the other way would silently
+        // report replication under `disk` — the original bug, in a
+        // new disguise.
         let p = policy(Level::Persisted, 1);
         let nodes = [[u64::MAX, 300], [300, 300]];
         assert_eq!(
@@ -568,12 +572,12 @@ mod tests {
 
     #[test]
     fn replica_gate_cursor_reports_the_level_the_policy_uses() {
-        // hybrid gates replicas on in-memory: 400, not the fsync at 250.
+        // disk+ram gates replicas on in-memory: 400, not the fsync at 250.
         let p = and_policy(&[(Level::Persisted, 1), (Level::InMemory, 2)]);
         let nodes = [[u64::MAX, 300], [400, 250]];
         assert_eq!(p.replica_gate_cursor(&CursorView::new(&nodes)), Some(400));
 
-        // durably-replicated gates them on persisted: 250.
+        // two-disks gates them on persisted: 250.
         let p = policy(Level::Persisted, 2);
         assert_eq!(p.replica_gate_cursor(&CursorView::new(&nodes)), Some(250));
     }
@@ -768,10 +772,10 @@ mod tests {
             // u64::MAX is indistinguishable from an empty view. Not
             // reachable in production — the only `u64::MAX` cursor in a
             // real view is the primary's in-memory sentinel, and every
-            // `DurabilityMode` clause is either persisted-level or
+            // `AckPolicy` clause is either persisted-level or
             // requires a second node, so the binding value always comes
             // from some other node's real cursor (a replica's in-memory
-            // receipt under `replicated`, a journal position otherwise)
+            // receipt under `ram`, a journal position otherwise)
             // — so the fold is left alone and the case is excluded here
             // rather than papered over.
             prop_assume!(expected != u64::MAX);

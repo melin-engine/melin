@@ -253,7 +253,7 @@ const COMMIT_EVERY: u64 = 16;
 /// burst: after a stall the primary can hand over hundreds of kilobytes
 /// at once, and without a bound the loop decodes all of it — thousands
 /// of slots — before returning to the ack flush at the top of the loop.
-/// Both ack tracks (in-memory, which the primary's `hybrid` gate runs
+/// Both ack tracks (in-memory, which the primary's `disk+ram` gate runs
 /// on, and persisted) would then sit still for the whole drain. At ~50 ns
 /// a slot this bounds that blind spot to a few tens of microseconds; the
 /// remainder stays in the recv buffer and is picked up on the next
@@ -277,10 +277,10 @@ pub(super) struct StreamingFrameOutcome {
     /// `SequenceGap` to `SessionExit::StreamGap` (reconnect) and a
     /// `Fatal` to `SessionExit::Fatal`.
     pub frame_err: Option<FrameError>,
-    /// The primary's acking mode as advertised by the last `Heartbeat`
+    /// The primary's ack policy as advertised by the last `Heartbeat`
     /// in this cycle, if any — the caller folds it into the
-    /// control-plane gauge (`ReplicaControlPlane::primary_acking_mode`).
-    pub observed_acking_mode: Option<u8>,
+    /// control-plane gauge (`ReplicaControlPlane::primary_ack_policy`).
+    pub observed_ack_policy: Option<u8>,
 }
 
 /// Process complete frames from `recv_buf`, publishing decoded slots
@@ -337,7 +337,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     let mut published_this_cycle = 0usize;
     let mut heard_from_primary = false;
     let mut frame_err: Option<FrameError> = None;
-    let mut observed_acking_mode: Option<u8> = None;
+    let mut observed_ack_policy: Option<u8> = None;
     let mut batch = input_producer.batch();
     let mut pending_accum = accum_end_sequence;
 
@@ -435,10 +435,10 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                     Err(_) => match decode_primary_message(payload) {
                         Ok(PrimaryMessage::Heartbeat {
                             sequence,
-                            durability_mode,
+                            ack_policy,
                         }) => {
-                            debug!(sequence, durability_mode, "heartbeat from primary");
-                            observed_acking_mode = Some(durability_mode);
+                            debug!(sequence, ack_policy, "heartbeat from primary");
+                            observed_ack_policy = Some(ack_policy);
                             // A heartbeat is the primary speaking — on a
                             // quiet system it is the only liveness
                             // evidence a session produces.
@@ -529,7 +529,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
         accum_end_sequence: pending_accum,
         heard_from_primary,
         frame_err,
-        observed_acking_mode,
+        observed_ack_policy,
     }
 }
 
@@ -690,7 +690,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     shutdown: &AtomicBool,
     // The replica's control-plane bundle: the promotion request this
     // loop polls, the advertised journal tip it advances, and the
-    // primary-acking-mode gauge heartbeats refresh — see
+    // primary-ack-policy gauge heartbeats refresh — see
     // [`super::ReplicaControlPlane`].
     control: &super::ReplicaControlPlane,
     pipeline_depth: usize,
@@ -718,7 +718,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         // published, so raft vote filtering sees everything a promotion
         // would carry into the journal — not just the fsynced position.
         journal_tip,
-        primary_acking_mode,
+        primary_ack_policy,
         // Recovery seeded it long before any streaming session.
         tip_ready: _,
         primary_link_up: _,
@@ -888,10 +888,10 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
         journal_tip.advance(melin_transport_core::WireSeq::new(accum_end_sequence));
-        if let Some(mode) = outcome.observed_acking_mode {
-            // Heartbeats refresh the replica's view of the mode the
-            // primary acks under (runtime `DURABILITY` retunes).
-            primary_acking_mode.store(mode, Ordering::Release);
+        if let Some(policy) = outcome.observed_ack_policy {
+            // Heartbeats refresh the replica's view of the policy the
+            // primary acks under (runtime `ACK-POLICY` retunes).
+            primary_ack_policy.store(policy, Ordering::Release);
         }
         heard_from_primary |= outcome.heard_from_primary;
 
@@ -1446,7 +1446,7 @@ mod tests {
     /// `pipeline_depth = 1` the pending-ack queue is full after the
     /// first batch and the journal cursor never moves, which is exactly
     /// the state that used to park the loop in `pop_oldest_blocking` —
-    /// freezing the *in-memory* ack track the primary's `hybrid` gate
+    /// freezing the *in-memory* ack track the primary's `disk+ram` gate
     /// runs on, i.e. putting the replica's disk tail on the client
     /// critical path.
     #[test]
@@ -1662,9 +1662,9 @@ mod tests {
         assert!(outcome.heard_from_primary);
         assert_eq!(outcome.accum_end_sequence, 9);
         assert_eq!(
-            outcome.observed_acking_mode,
+            outcome.observed_ack_policy,
             Some(1),
-            "the heartbeat's acking mode must surface for the control-plane gauge"
+            "the heartbeat's ack policy must surface for the control-plane gauge"
         );
 
         let slots = drain(&mut consumer);

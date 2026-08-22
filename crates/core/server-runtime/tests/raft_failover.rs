@@ -1,5 +1,5 @@
 //! End-to-end auto-promotion: a primary and two replicas (counter app,
-//! hybrid durability, raft + `--raft-auto-promote` on all three), real
+//! `disk+ram` ack policy, raft + `--raft-auto-promote` on all three), real
 //! TCP and real Ed25519 auth throughout. Kill the primary; exactly one
 //! replica must win the election and promote itself into a serving
 //! primary, and the other must keep following. Then the killed primary
@@ -145,7 +145,7 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
         }
     };
 
-    // --- Primary (node 0): hybrid durability, replication bind. ---
+    // --- Primary (node 0): `disk+ram` ack policy, replication bind. ---
     let primary_shutdown = Arc::new(AtomicBool::new(false));
     let primary_handle = {
         let mut config = make_config(0);

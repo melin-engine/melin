@@ -10,7 +10,7 @@
 //!
 //! # 2. Start the counter server:
 //! cargo run --bin counter-server -- \
-//!     --standalone --durability-mode local \
+//!     --standalone --ack-policy disk \
 //!     --authorized-keys /tmp/authorized_keys \
 //!     --journal /tmp/counter.journal
 //! ```

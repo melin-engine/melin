@@ -13,13 +13,15 @@
 //!   boundary and start a fresh one. Available only when the spawn
 //!   caller wired a rotation flag (any node with `--max-journal-mib >
 //!   0` or runtime rotation enabled).
-//! - `DURABILITY <local|replicated|hybrid|durably-replicated>` — atomically swap
-//!   the active durability mode on a node running a response stage
-//!   (primary, or post-promotion replica). Lets an operator resume
-//!   trading at reduced durability immediately after a promotion (no
-//!   restart, no client reconnects) and restore the target mode once
-//!   replicas reattach. Available only when the spawn caller wired the
-//!   shared mode atomic.
+//! - `ACK-POLICY <disk|ram|disk+ram|two-disks>` — atomically swap the
+//!   active ack policy on a node running a response stage (primary, or
+//!   post-promotion replica). Lets an operator resume trading under a
+//!   weaker policy immediately after a promotion (no restart, no client
+//!   reconnects) and restore the target policy once replicas reattach.
+//!   Available only when the spawn caller wired the shared policy
+//!   atomic. `DURABILITY <local|replicated|hybrid|durably-replicated>`
+//!   is accepted as a deprecated alias for one release and logged at
+//!   `warn!`.
 //!
 //! A command for which the corresponding flag is `None` is rejected
 //! with `ERR <command> not available on this node\n` so operators get
@@ -38,11 +40,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::durability_policy::DurabilityMode;
+use crate::ack_policy::AckPolicy;
 use crate::promotion::PromotionRequest;
 
 use ed25519_dalek::{Verifier, VerifyingKey};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use melin_app::auth::{AuthorizedKeys, Permission};
 use melin_wire_protocol::control::TransportResponse;
@@ -53,11 +55,11 @@ use melin_wire_protocol::control_codec;
 /// The listener is bound (and set non-blocking) here, before the thread
 /// starts, so a taken or misconfigured admin port fails startup loudly —
 /// bound inside the thread it died with an `error!` nobody joins on,
-/// leaving `PROMOTE`/`ROTATE`/`DURABILITY` silently dead on a
+/// leaving `PROMOTE`/`ROTATE`/`ACK-POLICY` silently dead on a
 /// healthy-looking node. Returns the bound address alongside the
 /// handle (they differ from `bind_addr` when it carries port 0).
 ///
-/// Any of `promote` / `rotate_requested` / `durability_mode` may be
+/// Any of `promote` / `rotate_requested` / `ack_policy` may be
 /// `None` to disable the corresponding command on this node. The
 /// listener still accepts connections and authenticates them — a
 /// disabled command is rejected at the command-dispatch step, not at
@@ -67,7 +69,7 @@ pub fn spawn(
     bind_addr: SocketAddr,
     promote: Option<PromotionRequest>,
     rotate_requested: Option<Arc<AtomicBool>>,
-    durability_mode: Option<Arc<AtomicU8>>,
+    ack_policy: Option<Arc<AtomicU8>>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
 ) -> Result<(JoinHandle<()>, SocketAddr), Box<dyn std::error::Error>> {
@@ -88,7 +90,7 @@ pub fn spawn(
                     addr,
                     promote.as_ref(),
                     rotate_requested.as_deref(),
-                    durability_mode.as_deref(),
+                    ack_policy.as_deref(),
                     &shutdown,
                     &authorized_keys,
                 )
@@ -119,7 +121,7 @@ fn run(
     addr: SocketAddr,
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
-    durability_mode: Option<&AtomicU8>,
+    ack_policy: Option<&AtomicU8>,
     shutdown: &AtomicBool,
     authorized_keys: &AuthorizedKeys,
 ) {
@@ -127,7 +129,7 @@ fn run(
         addr = %addr,
         promote_enabled = promote.is_some(),
         rotate_enabled = rotate_requested.is_some(),
-        durability_enabled = durability_mode.is_some(),
+        ack_policy_enabled = ack_policy.is_some(),
         "admin listener started"
     );
 
@@ -143,7 +145,7 @@ fn run(
                     stream,
                     promote,
                     rotate_requested,
-                    durability_mode,
+                    ack_policy,
                     authorized_keys,
                 );
             }
@@ -268,7 +270,7 @@ fn handle_connection(
     mut stream: TcpStream,
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
-    durability_mode: Option<&AtomicU8>,
+    ack_policy: Option<&AtomicU8>,
     authorized_keys: &AuthorizedKeys,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -327,10 +329,10 @@ fn handle_connection(
                 debug!("rejected ROTATE — flag not wired");
             }
         },
-        cmd if cmd.starts_with("DURABILITY") => {
-            // Parse `DURABILITY <mode>` with any positive whitespace
+        cmd if cmd.starts_with("ACK-POLICY") => {
+            // Parse `ACK-POLICY <policy>` with any positive whitespace
             // between the verb and the argument. `splitn(2, ' ')` is
-            // intentional: future modes (e.g. multi-region variants)
+            // intentional: future policies (e.g. multi-region variants)
             // will pass additional whitespace-separated parameters
             // through this same line and we don't want to lock in
             // single-space framing now.
@@ -338,7 +340,25 @@ fn handle_connection(
             // Discard the verb token; we already matched on it.
             let _ = parts.next();
             let arg = parts.next().map(str::trim).unwrap_or("");
-            handle_durability(&mut stream, durability_mode, arg);
+            handle_ack_policy(&mut stream, ack_policy, arg);
+        }
+        cmd if cmd.starts_with("DURABILITY") => {
+            // Deprecated spelling from before 0.15, kept for one release
+            // because this command's documented use is post-failover
+            // remediation — typed from memory, under pressure, when an
+            // `ERR unknown command` is the last thing anyone needs. The
+            // old policy names are mapped too: the alias is worthless
+            // if `DURABILITY local` still fails on the argument.
+            let mut parts = cmd.splitn(2, char::is_whitespace);
+            let _ = parts.next();
+            let arg = parts.next().map(str::trim).unwrap_or("");
+            let mapped = AckPolicy::parse_legacy(arg).map(AckPolicy::as_str);
+            warn!(
+                received = %cmd,
+                "DURABILITY is deprecated and will be removed in the next minor release; use ACK-POLICY {}",
+                mapped.unwrap_or("<disk|ram|disk+ram|two-disks>")
+            );
+            handle_ack_policy(&mut stream, ack_policy, mapped.unwrap_or(arg));
         }
         other => {
             debug!(received = %other, "unknown admin command");
@@ -347,58 +367,58 @@ fn handle_connection(
     }
 }
 
-/// Apply a `DURABILITY <mode>` command. Validates the argument,
-/// publishes the new mode through the shared atomic if the node has a
-/// response stage wired, and emits an INFO log carrying the prev → next
-/// transition for the audit trail. Auth is enforced upstream in
+/// Apply an `ACK-POLICY <policy>` command. Validates the argument,
+/// publishes the new policy through the shared atomic if the node has
+/// a response stage wired, and emits an INFO log carrying the prev →
+/// next transition for the audit trail. Auth is enforced upstream in
 /// [`authenticate`], so reaching this point already implies an
 /// operator-signed request.
-fn handle_durability(stream: &mut TcpStream, durability_mode: Option<&AtomicU8>, arg: &str) {
-    let Some(atomic) = durability_mode else {
-        send_best_effort(stream, b"ERR DURABILITY not available on this node\n");
-        debug!("rejected DURABILITY — atomic not wired (replica node?)");
+fn handle_ack_policy(stream: &mut TcpStream, ack_policy: Option<&AtomicU8>, arg: &str) {
+    let Some(atomic) = ack_policy else {
+        send_best_effort(stream, b"ERR ACK-POLICY not available on this node\n");
+        debug!("rejected ACK-POLICY — atomic not wired (replica node?)");
         return;
     };
     if arg.is_empty() {
         send_best_effort(
             stream,
-            b"ERR DURABILITY requires a mode (local|replicated|hybrid|durably-replicated)\n",
+            b"ERR ACK-POLICY requires a policy (disk|ram|disk+ram|two-disks)\n",
         );
-        debug!("rejected DURABILITY — missing argument");
+        debug!("rejected ACK-POLICY — missing argument");
         return;
     }
-    let Some(next) = DurabilityMode::parse(arg) else {
+    let Some(next) = AckPolicy::parse(arg) else {
         // Build the diagnostic into a small stack buffer to avoid
         // allocating on the admin path. The longest valid name is
-        // `durably-replicated` (18 chars); a 128-byte buffer covers
-        // any reasonable bad input the operator might paste.
+        // `two-disks` (9 chars); a 128-byte buffer covers any
+        // reasonable bad input the operator might paste.
         let mut buf = [0u8; 128];
-        let msg = format_unknown_mode(&mut buf, arg);
+        let msg = format_unknown_policy(&mut buf, arg);
         send_best_effort(stream, msg);
-        debug!(received = %arg, "rejected DURABILITY — unknown mode");
+        debug!(received = %arg, "rejected ACK-POLICY — unknown policy");
         return;
     };
     // Relaxed exchange: the only writer is the admin handler itself
-    // (the response stage only reads), and only the current mode
+    // (the response stage only reads), and only the current policy
     // matters — losing the ordering of prev observations relative to
     // unrelated events on other threads is fine.
     let prev_byte = atomic.swap(next.as_u8(), Ordering::Relaxed);
-    let prev = DurabilityMode::from_u8(prev_byte)
-        .map(|m| m.as_str())
+    let prev = AckPolicy::from_u8(prev_byte)
+        .map(|p| p.as_str())
         .unwrap_or("<corrupted>");
     send_best_effort(stream, b"OK\n");
     info!(
         prev = prev,
         next = next.as_str(),
-        "durability mode changed by operator"
+        "ack policy changed by operator"
     );
 }
 
-/// Format an "unknown mode" diagnostic into `buf` without allocating.
+/// Format an "unknown policy" diagnostic into `buf` without allocating.
 /// Returns the populated subslice. The buffer is sized so the longest
 /// realistic operator input fits; truncation is acceptable here since
 /// the operator already knows what they typed.
-fn format_unknown_mode<'a>(buf: &'a mut [u8], arg: &str) -> &'a [u8] {
+fn format_unknown_policy<'a>(buf: &'a mut [u8], arg: &str) -> &'a [u8] {
     use std::io::Write as _;
     let mut cursor = std::io::Cursor::new(&mut buf[..]);
     // Best-effort write — if `arg` is pathologically long the write
@@ -406,7 +426,7 @@ fn format_unknown_mode<'a>(buf: &'a mut [u8], arg: &str) -> &'a [u8] {
     // strictly better than allocating on the admin hot path.
     let _ = writeln!(
         cursor,
-        "ERR DURABILITY unknown mode `{arg}` (expected local|replicated|hybrid|durably-replicated)"
+        "ERR ACK-POLICY unknown policy `{arg}` (expected disk|ram|disk+ram|two-disks)"
     );
     let n = cursor.position() as usize;
     &cursor.into_inner()[..n]
@@ -500,7 +520,7 @@ mod tests {
 
     /// A taken admin port must fail `spawn` loudly. The old
     /// bind-inside-the-thread pattern died with an `error!` nobody
-    /// joins on, leaving PROMOTE/ROTATE/DURABILITY silently dead on a
+    /// joins on, leaving PROMOTE/ROTATE/ACK-POLICY silently dead on a
     /// healthy-looking node.
     #[test]
     fn spawn_errs_when_port_taken() {
@@ -695,76 +715,97 @@ mod tests {
         shutdown.store(true, Ordering::Release);
     }
 
-    /// Driver: spawn an admin listener with only the durability-mode
+    /// Driver: spawn an admin listener with only the ack-policy
     /// atomic wired (mirrors a primary-only node in commit 2), pre-seed
     /// it with `initial`, send the supplied command, and return
-    /// `(response, mode_after)`.
-    fn run_durability(initial: DurabilityMode, cmd: &[u8]) -> (String, Option<DurabilityMode>) {
+    /// `(response, policy_after)`.
+    fn run_ack_policy(initial: AckPolicy, cmd: &[u8]) -> (String, Option<AckPolicy>) {
         let (key, auth_keys) = operator_keys();
-        let mode = Arc::new(AtomicU8::new(initial.as_u8()));
+        let policy = Arc::new(AtomicU8::new(initial.as_u8()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (_h, addr) = spawn(
             "127.0.0.1:0".parse().unwrap(),
             None,
             None,
-            Some(Arc::clone(&mode)),
+            Some(Arc::clone(&policy)),
             Arc::clone(&shutdown),
             auth_keys,
         )
         .expect("spawn admin listener");
 
         let resp = send_command(addr, &key, cmd);
-        let after = DurabilityMode::from_u8(mode.load(Ordering::Relaxed));
+        let after = AckPolicy::from_u8(policy.load(Ordering::Relaxed));
         shutdown.store(true, Ordering::Release);
         (resp, after)
     }
 
     #[test]
-    fn durability_command_swaps_mode() {
-        let (resp, after) = run_durability(DurabilityMode::Hybrid, b"DURABILITY local\n");
+    fn ack_policy_command_swaps_policy() {
+        let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"ACK-POLICY disk\n");
         assert_eq!(resp, "OK");
-        assert_eq!(after, Some(DurabilityMode::Local));
+        assert_eq!(after, Some(AckPolicy::Disk));
     }
 
     #[test]
-    fn durability_command_accepts_each_mode() {
+    fn deprecated_durability_alias_maps_old_names() {
+        // `DURABILITY local` from muscle memory must still work, and
+        // land on the policy the old name meant.
+        let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"DURABILITY local\n");
+        assert_eq!(resp, "OK");
+        assert_eq!(after, Some(AckPolicy::Disk));
+
+        let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY durably-replicated\n");
+        assert_eq!(resp, "OK");
+        assert_eq!(after, Some(AckPolicy::TwoDisks));
+
+        // The alias also takes the new names, and still rejects junk.
+        let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY ram\n");
+        assert_eq!(resp, "OK");
+        assert_eq!(after, Some(AckPolicy::Ram));
+        let (resp, after) = run_ack_policy(AckPolicy::Disk, b"DURABILITY fast\n");
+        assert!(resp.starts_with("ERR ACK-POLICY unknown policy"), "{resp}");
+        assert_eq!(after, Some(AckPolicy::Disk));
+    }
+
+    #[test]
+    fn ack_policy_command_accepts_each_policy() {
         for target in [
-            DurabilityMode::Local,
-            DurabilityMode::Replicated,
-            DurabilityMode::Hybrid,
-            DurabilityMode::DurablyReplicated,
+            AckPolicy::Disk,
+            AckPolicy::Ram,
+            AckPolicy::DiskAndRam,
+            AckPolicy::TwoDisks,
         ] {
-            let cmd = format!("DURABILITY {}\n", target.as_str());
-            let (resp, after) = run_durability(DurabilityMode::Local, cmd.as_bytes());
-            assert_eq!(resp, "OK", "mode {target}");
+            let cmd = format!("ACK-POLICY {}\n", target.as_str());
+            let (resp, after) = run_ack_policy(AckPolicy::Disk, cmd.as_bytes());
+            assert_eq!(resp, "OK", "policy {target}");
             assert_eq!(after, Some(target));
         }
     }
 
     #[test]
-    fn durability_command_rejects_unknown_mode() {
-        let (resp, after) = run_durability(DurabilityMode::Hybrid, b"DURABILITY fast\n");
+    fn ack_policy_command_rejects_unknown_policy() {
+        let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"ACK-POLICY fast\n");
         assert!(
-            resp.starts_with("ERR DURABILITY unknown mode"),
-            "expected unknown-mode ERR, got {resp}"
+            resp.starts_with("ERR ACK-POLICY unknown policy"),
+            "expected unknown-policy ERR, got {resp}"
         );
         // Atomic must NOT have been clobbered on a bad command.
-        assert_eq!(after, Some(DurabilityMode::Hybrid));
+        assert_eq!(after, Some(AckPolicy::DiskAndRam));
     }
 
     #[test]
-    fn durability_command_rejects_missing_argument() {
-        let (resp, after) = run_durability(DurabilityMode::Hybrid, b"DURABILITY\n");
+    fn ack_policy_command_rejects_missing_argument() {
+        let (resp, after) = run_ack_policy(AckPolicy::DiskAndRam, b"ACK-POLICY\n");
         assert!(
-            resp.starts_with("ERR DURABILITY requires a mode"),
+            resp.starts_with("ERR ACK-POLICY requires a policy"),
             "expected missing-arg ERR, got {resp}"
         );
-        assert_eq!(after, Some(DurabilityMode::Hybrid));
+        assert_eq!(after, Some(AckPolicy::DiskAndRam));
     }
 
     #[test]
-    fn durability_command_rejected_when_not_wired() {
-        // On a pure-replica node (no response stage), DURABILITY must
+    fn ack_policy_command_rejected_when_not_wired() {
+        // On a pure-replica node (no response stage), ACK-POLICY must
         // not silently no-op — operators get a structured ERR.
         let (key, auth_keys) = operator_keys();
         let promote = PromotionRequest::new();
@@ -779,9 +820,9 @@ mod tests {
         )
         .expect("spawn admin listener");
 
-        let resp = send_command(addr, &key, b"DURABILITY local\n");
+        let resp = send_command(addr, &key, b"ACK-POLICY disk\n");
         assert!(
-            resp.starts_with("ERR DURABILITY not available"),
+            resp.starts_with("ERR ACK-POLICY not available"),
             "expected not-available ERR, got {resp}"
         );
 

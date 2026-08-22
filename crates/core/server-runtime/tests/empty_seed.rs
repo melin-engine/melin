@@ -137,7 +137,7 @@ fn server_starts_with_empty_seed_events() {
         journal: tmp.path().join("test.journal"),
         authorized_keys: auth_path,
         standalone: true,
-        durability_mode: melin_server_runtime::durability_policy::DurabilityMode::Local,
+        ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         no_mlock: true,
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,

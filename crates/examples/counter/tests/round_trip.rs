@@ -143,7 +143,7 @@ fn start_server() -> (
         journal: journal_path,
         authorized_keys: auth_path,
         standalone: true,
-        durability_mode: melin_server_runtime::durability_policy::DurabilityMode::Local,
+        ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         no_mlock: true,
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,

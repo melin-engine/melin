@@ -506,7 +506,7 @@ Inserting a field in the middle or changing field sizes breaks all entries in th
 
 A sustained non-zero lag with a healthy device usually means the journal is sharing a device with something else, or `journal-disk` is unpinned and competing for its core.
 
-Two related signals: `melin_journal_rotations_total{path="sync_fallback"}` climbing means segment staging is falling behind (see [Journal Rotation & Recovery](journal-rotation.md)), and under a `local` durability policy a stalled device shows up directly as client latency, because no replica can supply the durability the gate needs.
+Two related signals: `melin_journal_rotations_total{path="sync_fallback"}` climbing means segment staging is falling behind (see [Journal Rotation & Recovery](journal-rotation.md)), and under the `disk` ack policy with no replica attached (standalone), a stalled device shows up directly as client latency, because no other node's fsync can supply the copy the gate needs.
 
 ### Journal File Growth
 

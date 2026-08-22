@@ -1,14 +1,14 @@
 //! Owning module for the primary's view of replica progress.
 //!
 //! Every store to the per-replica progress cursors — the values the
-//! response gate's durability policy and the health endpoint read —
+//! response gate's ack policy and the health endpoint read —
 //! goes through [`ReplicaCursors`]. Before this module existed, the
 //! same store group (per-slot acked position and the
 //! `ReplicationMetrics` gauge pair) was repeated at ~10 call sites
 //! across the TCP and DPDK senders, each re-stating the memory-ordering
 //! contract in comments. During the pre-v14 vacuous-gate incident,
 //! monitoring reported `replica_lag = 0` from these cursors the entire
-//! time the durability gate was being satisfied by sequence-space
+//! time the ack gate was being satisfied by sequence-space
 //! drift — scattered stores are exactly what made that class of bug
 //! invisible. One owning module means one place to state the ordering
 //! contract and one store site to guard with invariants.
@@ -45,8 +45,7 @@
 //!   `active = false` also observes the zeroed pair. Reversing this
 //!   leaves a window on weak-memory architectures (ARM/AArch64) where
 //!   a reader sees `active = true` (stale) paired with `cursor = 0`
-//!   (fresh) — see the B2 notes in
-//!   `docs/durability-policy-followups.md`.
+//!   (fresh).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -63,7 +62,7 @@ use super::protocol::Ack;
 /// in-memory track. Either is a protocol violation (a bug in the
 /// cluster software or a rogue replica binary), never a load effect —
 /// the caller must evict the replica. The violating ack is NOT applied:
-/// advancing the gate's cursors from it would let the durability policy
+/// advancing the gate's cursors from it would let the ack policy
 /// release client acks against confirmation that never happened — the
 /// exact failure shape of the pre-v14 vacuous-gate incident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

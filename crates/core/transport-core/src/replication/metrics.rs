@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 /// The two-element arrays mirror the topology cap of `1 primary + 2
 /// replica slots`. Sized at compile time because the cluster shape is
 /// fixed by the response gate's `MAX_CLUSTER_SIZE` (see
-/// [`crate::durability_policy::MAX_CLUSTER_SIZE`]); a `Vec` would add
+/// [`crate::ack_policy::MAX_CLUSTER_SIZE`]); a `Vec` would add
 /// a layer of indirection on every health-endpoint read for zero
 /// gain.
 pub struct ReplicationMetrics {
@@ -21,8 +21,8 @@ pub struct ReplicationMetrics {
     pub acked_sequence: [AtomicU64; 2],
     /// Per-slot in-memory sequence (last sequence the replica has
     /// accepted into its pipeline pre-journal). Always
-    /// `>= acked_sequence`. Used by the multi-level durability gate
-    /// (see [`crate::durability_policy`]).
+    /// `>= acked_sequence`. Used by the multi-level ack gate
+    /// (see [`crate::ack_policy`]).
     pub in_memory_sequence: [AtomicU64; 2],
     /// Per-slot bytes sent to the replica (cumulative). Includes
     /// catch-up and live streaming.
@@ -36,7 +36,7 @@ pub struct ReplicationMetrics {
     /// `in_memory_sequence` by the growth of this counter between two
     /// health samples gives the mean ack quantum — how many sequences
     /// each cursor advance covers, the number that bounds the
-    /// durability gate's queueing delay under load.
+    /// ack gate's queueing delay under load.
     pub acks_received: [AtomicU64; 2],
     /// Per-slot catch-up state: true while streaming historical
     /// journal entries, false once the replica enters live mode.

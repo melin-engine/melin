@@ -1,7 +1,7 @@
 //! Application-agnostic LMAX-pipeline server runtime.
 //!
 //! Groups the application-agnostic parts of the Melin server: the
-//! accept loop, frame reader, durability-policy wiring, admin
+//! accept loop, frame reader, ack-policy wiring, admin
 //! endpoint, replication, and the optional DPDK transport. Generic
 //! over `A: Application` — the binary supplies a concrete app via
 //! [`server::run`] (or [`server::run_dpdk`] under `feature = "dpdk"`) along with caller-supplied
@@ -12,10 +12,10 @@
 //! `ExchangeResponseEncoder`, market-data firehose) lives in the
 //! separate `melin-server` crate.
 
+pub mod ack_policy;
 pub mod admin;
 mod buf_ring;
 mod client_frames;
-pub mod durability_policy;
 pub mod process;
 pub mod promotion;
 mod raft;

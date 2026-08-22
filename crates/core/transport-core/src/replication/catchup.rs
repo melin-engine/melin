@@ -423,9 +423,9 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     journal_path: &std::path::Path,
     publisher: CatchUpPublisher<'_>,
     shutdown: &AtomicBool,
-    // The primary's current acking mode, stamped on the post-transfer
+    // The primary's current ack policy, stamped on the post-transfer
     // `StreamStart` (see the protocol docs). Opaque byte at this layer.
-    durability_mode: u8,
+    ack_policy: u8,
 ) -> io::Result<CatchUpResult> {
     use super::protocol::{encode_segment_seed_begin, encode_snapshot_begin, encode_stream_start};
 
@@ -529,7 +529,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
         seed_info.starting_sequence,
         seed_info.anchor_hash,
         snap_epoch,
-        durability_mode,
+        ack_policy,
         &mut send_buf,
     );
     publisher(&send_buf)?;
@@ -1079,12 +1079,12 @@ mod tests {
             frames.push(buf.to_vec());
             Ok(())
         };
-        // Opaque at this layer (the mode enum lives in the server
+        // Opaque at this layer (the policy enum lives in the server
         // crate) — a distinctive non-default byte so the StreamStart
         // assertion below proves it is carried through rather than
         // defaulted.
-        const ACKING_MODE: u8 = 2;
-        let res = snapshot_transfer_with::<TestEvent>(&live, &mut publish, &shutdown, ACKING_MODE)
+        const ACK_POLICY: u8 = 2;
+        let res = snapshot_transfer_with::<TestEvent>(&live, &mut publish, &shutdown, ACK_POLICY)
             .unwrap();
         assert_eq!(res, CatchUpResult::Ok(5), "catch-up must reach the tip");
 
@@ -1141,15 +1141,15 @@ mod tests {
                 segment_start_sequence,
                 anchor_hash,
                 epoch,
-                durability_mode,
+                ack_policy,
             } => {
                 assert_eq!(start_sequence, 4);
                 assert_eq!(segment_start_sequence, live_info.starting_sequence);
                 assert_eq!(anchor_hash, live_info.anchor_hash);
                 assert_eq!(epoch, 7, "snapshot's epoch rides StreamStart");
                 assert_eq!(
-                    durability_mode, ACKING_MODE,
-                    "primary's acking mode rides StreamStart"
+                    ack_policy, ACK_POLICY,
+                    "primary's ack policy rides StreamStart"
                 );
             }
             other => panic!("expected StreamStart, got {other:?}"),

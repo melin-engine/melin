@@ -1,8 +1,8 @@
 //! Ack queueing and dual-track cursor coordination for the
 //! replication response path.
 //!
-//! The primary's response gate evaluates a multi-level durability
-//! policy (see [`crate::durability_policy`]) against per-node cursor
+//! The primary's response gate evaluates a multi-level ack
+//! policy (see [`crate::ack_policy`]) against per-node cursor
 //! pairs. The types here translate between local-disruptor-ring
 //! positions and primary-sequence positions, queue pending acks while
 //! the journal stage catches up, and decide when a fresh ack frame
@@ -34,7 +34,7 @@ pub struct PendingAck {
 /// The queue never refuses a push and never makes the caller wait: at
 /// capacity it *coarsens* instead (see [`PendingAckQueue::push`]). A
 /// replica receiver that blocked here would stop receiving — and stop
-/// producing the in-memory acks the primary's `hybrid` gate depends on —
+/// producing the in-memory acks the primary's `disk+ram` gate depends on —
 /// for as long as its own fsync took, transplanting the replica's disk
 /// tail into the primary's client latency.
 ///

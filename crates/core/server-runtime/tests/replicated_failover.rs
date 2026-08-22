@@ -1,17 +1,17 @@
-//! End-to-end contract test for the `replicated` durability mode: acks
-//! gate on a second node's *in-memory* receipt only — no disk anywhere
-//! on the ack path — so every acked event must survive the death of the
-//! primary via failover.
+//! End-to-end contract test for the `ram` ack policy: acks gate on a
+//! second node's *in-memory* receipt only — no disk anywhere on the ack
+//! path — so every acked event must survive the death of the primary
+//! via failover.
 //!
-//! A primary and two replicas (counter app, `--durability-mode
-//! replicated`, raft + `--raft-auto-promote` on all three) over real TCP
-//! and real Ed25519 auth. A client sends increments and collects acks —
-//! proof the RAM-quorum gate opens on live replica cursors. The primary
-//! is then killed; exactly one replica must auto-promote (exercising the
-//! new acking-mode byte end-to-end: the primary advertised `replicated`
-//! on the replication stream, and the promotion policy must accept it on
-//! the same grounds as `hybrid`). The operator then swaps the promoted
-//! node to `local` over the admin endpoint — the documented
+//! A primary and two replicas (counter app, `--ack-policy ram`, raft +
+//! `--raft-auto-promote` on all three) over real TCP and real Ed25519
+//! auth. A client sends increments and collects acks — proof the
+//! RAM-quorum gate opens on live replica cursors. The primary is then
+//! killed; exactly one replica must auto-promote (exercising the
+//! ack-policy byte end-to-end: the primary advertised `ram` on the
+//! replication stream, and the promotion policy must accept it on the
+//! same grounds as `disk+ram`). The operator then swaps the promoted
+//! node to `disk` over the admin endpoint — the documented
 //! post-failover workflow, since its own gate is unsatisfiable with no
 //! replicas attached — and a fresh client connection must read back the
 //! full acked total: nothing the client was told about died with the
@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use counter_server::{CounterFactory, RequestDecoder, ResponseEncoder};
 use ed25519_dalek::{Signer, SigningKey};
-use melin_server_runtime::durability_policy::DurabilityMode;
+use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::{
@@ -109,7 +109,7 @@ fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
                 .set_read_timeout(Some(Duration::from_millis(500)))
                 .expect("set timeout");
             if answer_challenge(&mut stream, key).is_some() {
-                // Generous post-auth timeout: acks under `replicated`
+                // Generous post-auth timeout: acks under `ram`
                 // wait on a live replica round-trip, and CI machines
                 // schedule these three servers on shared cores.
                 stream
@@ -221,7 +221,7 @@ fn cluster_summary(nodes: &[NodeSetup]) -> String {
 
 #[test]
 #[serial]
-fn acked_events_survive_primary_death_under_replicated_mode() {
+fn acked_events_survive_primary_death_under_ram_policy() {
     // Opt-in diagnostics: with RUST_LOG set, capture the nodes' tracing
     // output (all three run in this process) so a failing run records
     // the control-plane election dialogue, not just the panic-time
@@ -277,7 +277,7 @@ fn acked_events_survive_primary_death_under_replicated_mode() {
             bind: nodes[i].client_addr,
             journal: tmp.path().join(format!("node-{i}.journal")),
             authorized_keys: auth_path.clone(),
-            durability_mode: DurabilityMode::Replicated,
+            ack_policy: AckPolicy::Ram,
             no_mlock: true,
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
@@ -295,7 +295,7 @@ fn acked_events_survive_primary_death_under_replicated_mode() {
         }
     };
 
-    // --- Primary (node 0): replicated durability, replication bind. ---
+    // --- Primary (node 0): `ram` ack policy, replication bind. ---
     let primary_shutdown = Arc::new(AtomicBool::new(false));
     let primary_handle = {
         let mut config = make_config(0);
@@ -365,8 +365,8 @@ fn acked_events_survive_primary_death_under_replicated_mode() {
     };
 
     // --- Phase 2: acked client traffic. Each response returned only
-    // after a replica confirmed in-memory receipt — the `replicated`
-    // gate live, on real cursors. Total after 1 + 2 + 4 = 7.
+    // after a replica confirmed in-memory receipt — the `ram` gate
+    // live, on real cursors. Total after 1 + 2 + 4 = 7.
     {
         let mut stream = connect_authenticated(nodes[0].client_addr, &client_key);
         let mut expected_total = 0u64;
@@ -392,8 +392,8 @@ fn acked_events_survive_primary_death_under_replicated_mode() {
         .expect("primary returned error");
 
     // --- Phase 4: exactly one replica auto-promotes. The promotion
-    // policy sees the acking mode the dead primary advertised on the
-    // replication stream — `replicated` — and must accept it (an ack
+    // policy sees the ack policy the dead primary advertised on the
+    // replication stream — `ram` — and must accept it (an ack
     // always waited for a second node, so the election recency filter
     // proves the winner holds every acked event). ---
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -419,19 +419,19 @@ fn acked_events_survive_primary_death_under_replicated_mode() {
     );
 
     // --- Phase 5: the documented post-failover workflow. The promoted
-    // node still runs `replicated`, whose gate is structurally
+    // node still runs `ram`, whose gate is structurally
     // unsatisfiable with no replicas attached (fail-closed), so the
-    // operator swaps it to `local` over the admin endpoint. Retried:
+    // operator swaps it to `disk` over the admin endpoint. Retried:
     // the admin listener is up from boot, but promotion may still be
     // settling when the first command lands.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match admin_command(nodes[winner].admin_addr, &client_key, "DURABILITY local") {
+        match admin_command(nodes[winner].admin_addr, &client_key, "ACK-POLICY disk") {
             Some(reply) if reply == "OK" => break,
             reply => {
                 assert!(
                     Instant::now() < deadline,
-                    "DURABILITY local never accepted by the promoted node; last reply: {reply:?}"
+                    "ACK-POLICY disk never accepted by the promoted node; last reply: {reply:?}"
                 );
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -440,7 +440,7 @@ fn acked_events_survive_primary_death_under_replicated_mode() {
 
     // --- Phase 6: the acked total survived. A fresh client reads the
     // counter from the new primary; every event the old primary acked
-    // under RAM-quorum durability must be in it. ---
+    // under the `ram` ack policy must be in it. ---
     {
         let mut stream = connect_authenticated(nodes[winner].client_addr, &client_key);
         send_request(&mut stream, 1, TAG_GET_VALUE, &[]);
@@ -465,7 +465,7 @@ fn acked_events_survive_primary_death_under_replicated_mode() {
         assert_eq!(
             value,
             7,
-            "the promoted node must hold every event acked under `replicated` \
+            "the promoted node must hold every event acked under `ram` \
              (winner=node {}, leader at formation=node {:?}, {})",
             winner + 1,
             leader_at_formation.map(|i| i + 1),

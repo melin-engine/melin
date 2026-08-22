@@ -9,7 +9,7 @@ covers the design arguments a contributor needs before touching it.
 
 The control plane carries **election, membership, and fencing epochs —
 nothing else**. Order flow stays on the synchronous replication data
-plane with its durability modes untouched. Non-goals on this iteration:
+plane with its ack policies untouched. Non-goals on this iteration:
 runtime voter changes (static `--raft-peer` lists only), client
 redirects / follow-the-leader, witness (data-plane-less) voters.
 
@@ -30,7 +30,7 @@ One dedicated `raft-driver` thread per node owns:
 Everything that *acts* on elections lives outside the async world:
 `raft_promotion.rs` is a plain `std` thread polling `RaftStatus` every
 100 ms and filing a `PromotionRequest`. This keeps promotion policy —
-whose inputs (acking mode, primary link state, fence state) are all
+whose inputs (ack policy, primary link state, fence state) are all
 data-plane concepts — synchronous and unit-testable without tokio.
 
 The data plane never calls into `melin-raft`. The only raft →
@@ -111,11 +111,11 @@ otherwise never re-arm. Two openraft-specific consequences:
 operator-facing. An election win is the data-safety proof (a quorum of
 voters held no more data than this node); the rules cover what an
 election cannot prove — see the rustdoc on the function for each rule's
-argument. The `local`-durability refusal is the load-bearing one: acks
-in `local` mode never waited for any replica, so no election can prove
-data completeness, and C3's acking-mode propagation exists precisely so
-the replica judges the mode the *dead primary* acked under rather than
-its own configuration.
+argument. The `disk`-policy refusal is the load-bearing one: acks under
+`disk` never waited for a second copy on another node, so no election
+can prove data completeness, and C3's ack-policy propagation exists
+precisely so the replica judges the policy the *dead primary* acked
+under rather than its own configuration.
 
 Under `--raft-auto-promote` the raft mesh doubles as a fencing channel
 (`SupersessionPolicy` in `rpc_server.rs`): a serving node — a primary,
