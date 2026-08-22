@@ -18,7 +18,7 @@ It is a deterministic, replicated sequencer: your single-threaded application lo
 
 **Durable and replicated.** Every event is journaled and synchronously replicated before the client sees a response, with CRC32C integrity checks and a BLAKE3 hash chain for tamper evidence. The ack policy says which copies of an event must exist before its response is released. By default (`disk+ram`) an ack requires one fsynced copy and two copies in memory, so a single slow disk or a single node failure costs neither latency nor data; a stricter `two-disks` policy and a faster `ram` policy (two copies in memory, no fsync on the ack path) are available. Journal catch-up, snapshot transfer, and automatic failover are built in. See [replication](docs/replication.md).
 
-**Fast.** p99 of 404 µs at 1.00M events/sec, full round trip including persistence and replication, on kernel TCP and commodity datacenter hardware. Single-event floor: 66 µs p99. See [Benchmarks](#benchmarks).
+**Fast.** p99 of 254 µs at 1.0M events/sec, full round trip including persistence and replication, on kernel TCP and commodity datacenter hardware. Single-event floor: 82 µs p99. See [Benchmarks](#benchmarks).
 
 **Tested for the failures that matter.** Every commit runs the full suite, including crash-recovery and three-node failover tests. Nightly, the suite runs again under ThreadSanitizer, the lock-free core runs under Miri across multiple scheduler seeds, and dependencies are checked against the RUSTSEC advisory database.
 
@@ -26,19 +26,21 @@ It is a deterministic, replicated sequencer: your single-threaded application lo
 
 All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas). Default ack policy (`disk+ram`): one fsynced copy, two copies in memory.
 
-### Latency under load (closed-loop)
+### Latency under load
 
-Four connections, 56 requests in flight each.
+Four connections, 34 requests in flight each.
 
 | Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 |
 |-----------|-----|-----|-------|--------|---------|
-| 1.00M/s | 207 µs | 404 µs | 511 µs | 595 µs | 691 µs |
+| 1.0M/s | 124 µs | 254 µs | 313 µs | 380 µs | 481 µs |
 
-### Single-event latency (1 client, window 1)
+### Single-event latency
+    
+1 client, window 1
 
 | Throughput | p50 | p99 | p99.9 | p99.99 |
 |-----------|-----|-----|-------|--------|
-| 20K/s | 49 µs | 66 µs | 113 µs | 138 µs |
+| 15.8K/s | 60 µs | 82 µs | 116 µs | 152 µs |
 
 The benchmark harness and tuning guidance ship with the Melin Exchange Core.
 
