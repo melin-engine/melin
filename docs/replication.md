@@ -543,6 +543,27 @@ requiring the full journal history.
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `ACK-POLICY <policy>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
 | `--ack-policy <policy>` | Primary | `disk+ram` | Active ack policy at startup: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Can be swapped at runtime via admin `ACK-POLICY`. |
+| `--dpdk-peer-mac <mac>` | Replica on DPDK | derived | Ethernet address of the primary named by `--replica-of`. Only consulted when replicating over DPDK. See below. |
+
+### Addressing the primary over DPDK
+
+A replica dials out, so it must address its first frame to the primary
+before any address resolution can happen — and on a DPDK port, ARP
+cannot supply the answer. An SR-IOV VF does not receive broadcast, and
+a port shared with the kernel steers only IPv4 by source address, so
+ARP is never delivered to the userspace stack at all.
+
+Without `--dpdk-peer-mac`, the replica assumes the address convention
+that `dpdk-setup.sh` assigns to SR-IOV VFs. That assumption holds only
+on that path. A port that keeps its real hardware address — anything
+sharing the NIC with the kernel netdev — needs the flag, or the
+replica's connection attempts go to an address nothing on the segment
+answers for. There is no error in that case: the replica simply retries
+with backoff and never connects.
+
+Read the value from `/sys/class/net/<iface>/address` on the primary.
+The startup log line reporting the seeded address names its source, so
+check there first when a replica will not connect.
 
 `--standalone` is mutually exclusive with both `--replication-bind`
 and `--replica-of`. `--replica-of` **combines** with

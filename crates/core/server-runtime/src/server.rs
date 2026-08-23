@@ -302,6 +302,18 @@ pub struct ServerConfig {
     #[arg(long)]
     pub dpdk_gateway_mac: Option<String>,
 
+    /// MAC (aa:bb:cc:dd:ee:ff) of the primary named by `--replica-of`,
+    /// seeded into smoltcp so the replica's first frame is addressed
+    /// before any ARP. Required on ports that keep a real hardware MAC —
+    /// an mlx5 in bifurcated mode shares the kernel netdev's — where the
+    /// SR-IOV `02:00:<ip>` fallback is wrong and the replica would spin
+    /// on connect with no error. Read it from
+    /// `/sys/class/net/<iface>/address` on the primary, or from
+    /// `DPDK_MAC` in `/etc/melin-dpdk.conf`. Ignored on a primary, which
+    /// learns peer MACs from inbound frames.
+    #[arg(long)]
+    pub dpdk_peer_mac: Option<String>,
+
     /// MTU for the DPDK interface. Use 9000 for jumbo frames (6x fewer TCP
     /// segments). Requires switch and PF MTU to be set accordingly.
     #[arg(long, default_value_t = 1500)]
@@ -481,6 +493,7 @@ impl Default for ServerConfig {
             dpdk_eal_args: String::new(),
             dpdk_peer_ip: None,
             dpdk_gateway_mac: None,
+            dpdk_peer_mac: None,
             dpdk_ports: vec![0],
             dpdk_ip: "10.0.0.1".into(),
             dpdk_prefix_len: 24,
@@ -2150,8 +2163,9 @@ where
 ///
 /// Every operator-supplied string is validated here, before EAL init and
 /// before any thread is spawned, and a bad value is returned as an error
-/// rather than a panic — a typo should not be able to take down a node
-/// that is already running.
+/// rather than a panic. That ordering is the point: the peer MAC is only
+/// consumed inside the replica's reconnect loop, so parsing it there
+/// would turn a typo into a crash of an already-running node.
 #[cfg(feature = "dpdk")]
 fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String> {
     let parse_ip = |value: &str, flag: &str| -> Result<std::net::Ipv4Addr, String> {
@@ -2189,6 +2203,11 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String
             .dpdk_gateway_mac
             .as_deref()
             .map(|s| parse_mac(s, "--dpdk-gateway-mac"))
+            .transpose()?,
+        peer_mac: cfg
+            .dpdk_peer_mac
+            .as_deref()
+            .map(|s| parse_mac(s, "--dpdk-peer-mac"))
             .transpose()?,
         num_queues: 1,
     })
@@ -3932,15 +3951,46 @@ mod tests {
 
 /// Startup-time validation of the DPDK CLI surface.
 ///
-/// What these pin is *when* a bad flag is caught: during config
-/// translation, before EAL init and before any thread exists, rather
-/// than as a panic somewhere later in startup.
+/// The value these pin is *when* a bad flag is caught. `--dpdk-peer-mac`
+/// is consumed inside the replica's reconnect loop, so the failure has to
+/// surface here — during config translation, before EAL init and before
+/// any thread exists — rather than as a panic in a node that is already
+/// serving.
 #[cfg(all(test, feature = "dpdk"))]
 mod dpdk_config_tests {
     use super::{ServerConfig, dpdk_config_from};
 
     #[test]
+    fn a_supplied_peer_mac_reaches_the_transport_config() {
+        let cfg = ServerConfig {
+            dpdk_peer_mac: Some("0c:42:a1:5b:2e:80".into()),
+            ..Default::default()
+        };
+        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        assert_eq!(dpdk.peer_mac, Some([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80]));
+    }
+
+    #[test]
+    fn an_absent_peer_mac_leaves_the_transport_to_derive_one() {
+        let cfg = ServerConfig::default();
+        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        assert_eq!(dpdk.peer_mac, None);
+    }
+
+    #[test]
+    fn a_malformed_peer_mac_fails_config_translation() {
+        let cfg = ServerConfig {
+            dpdk_peer_mac: Some("0c:42:a1:5b:2e".into()),
+            ..Default::default()
+        };
+        let err = dpdk_config_from(&cfg).expect_err("a 5-octet MAC must be rejected");
+        assert!(err.contains("--dpdk-peer-mac"), "{err}");
+    }
+
+    #[test]
     fn a_malformed_gateway_mac_fails_config_translation() {
+        // The same guarantee for the pre-existing flag, which used to
+        // panic out of this function.
         let cfg = ServerConfig {
             dpdk_gateway_mac: Some("not-a-mac".into()),
             ..Default::default()

@@ -1205,20 +1205,26 @@ where
         );
 
         // Seed the primary's MAC into smoltcp's neighbor cache. Without
-        // this, smoltcp emits a broadcast ARP on connect which the SR-IOV
-        // PF silently drops, and the SYN never goes out — the replica
-        // spins on "failed to connect (DPDK)" forever. VF MACs follow the
-        // 02:00:<IP-bytes> convention set by dpdk-setup.sh, matching
-        // what the bench client does on its outbound connect.
-        let primary_mac = [
-            0x02,
-            0x00,
-            primary_ip.octets()[0],
-            primary_ip.octets()[1],
-            primary_ip.octets()[2],
-            primary_ip.octets()[3],
-        ];
-        transport.seed_neighbor(primary_ip, primary_mac);
+        // this the replica has no way to address its first frame: an
+        // acceptor learns the peer MAC from the inbound packet, but an
+        // initiator has to know it before anything goes out. ARP cannot
+        // supply it — an SR-IOV VF does not receive broadcast, and in
+        // bifurcated mode the `rte_flow` rule matches on IPv4 source
+        // address so ARP is never steered into DPDK at all. Either way
+        // the SYN never ships and the replica spins on "failed to
+        // connect (DPDK)" with no error to show for it.
+        //
+        // `--dpdk-peer-mac` wins when supplied; otherwise this falls back
+        // to the SR-IOV `02:00:<ip>` convention, which holds only on
+        // ports whose MAC dpdk-setup.sh assigned. Re-seeded on every
+        // reconnect so an expired neighbour entry cannot strand a
+        // reconnecting replica.
+        let mac_source = transport.seed_peer_neighbor(primary_ip);
+        info!(
+            primary_ip = %primary_ip,
+            mac_source = mac_source.as_str(),
+            "seeded primary MAC into the neighbour cache"
+        );
         // Drain the injected ARP reply through smoltcp so the neighbor
         // cache is populated BEFORE connect_to() runs. Without this poll
         // smoltcp's connect tries to resolve ARP from an empty cache,

@@ -165,6 +165,14 @@ pub struct DpdkConfig {
     /// it would be eaten by the kernel. Operators source this MAC from
     /// the kernel's existing `ip neigh` cache and pass it in.
     pub gateway_mac: Option<[u8; 6]>,
+    /// MAC address of the peer this node dials out to — the primary, for
+    /// a replica. Only a connection *initiator* needs it: an acceptor
+    /// learns the peer's address from the inbound frame. When None the
+    /// initiator falls back to the SR-IOV `02:00:<ip>` convention, which
+    /// is wrong on any port that keeps a real hardware address (an mlx5
+    /// in bifurcated mode shares the kernel netdev's). See
+    /// [`crate::mac::resolve_peer_mac`].
+    pub peer_mac: Option<[u8; 6]>,
     pub listen_port: u16,
     /// MTU for the DPDK interface. 1500 for standard Ethernet, 9000 for
     /// jumbo frames (6x fewer TCP segments, ~6x less per-segment overhead).
@@ -189,6 +197,7 @@ impl Default for DpdkConfig {
             gateway: None,
             peer_ip: None,
             gateway_mac: None,
+            peer_mac: None,
             listen_port: LISTEN_PORT,
             mtu: 1500,
             vlan_id: None,
@@ -296,6 +305,11 @@ pub struct DpdkTransport {
     gateway: Option<(Ipv4Addr, [u8; 6])>,
     /// When the gateway was last seeded. Only read when `gateway` is set.
     gateway_seeded_at: Instant,
+    /// Operator-supplied MAC for the peer this transport dials out to,
+    /// carried over from `DpdkConfig` so an outbound connect can seed the
+    /// neighbour cache without the caller having to thread config down.
+    /// `None` = fall back to the derived convention.
+    peer_mac: Option<[u8; 6]>,
     /// Shared EAL/mempool/ports. MUST be the last field so it drops LAST:
     /// Rust drops fields in declaration order, and `device`/`sockets`/
     /// `tx_queues` return their in-flight mbufs to the mempool when they
@@ -548,6 +562,7 @@ impl DpdkTransport {
             pending_tx_bytes: 0,
             gateway: config.gateway.zip(config.gateway_mac),
             gateway_seeded_at: now,
+            peer_mac: config.peer_mac,
         };
 
         // In bifurcated L3 mode, ARP for the gateway would not match our
@@ -1167,6 +1182,18 @@ impl DpdkTransport {
             peer_mac = ?mac,
             "seeded neighbor cache with ARP reply"
         );
+    }
+
+    /// Seed the neighbour cache for a peer this node dials out to,
+    /// preferring the configured MAC over the derived fallback.
+    ///
+    /// Returns which source was used so the caller can log it. That
+    /// distinction is worth surfacing: when the address is wrong there is
+    /// no error to observe, only a connect that never completes.
+    pub fn seed_peer_neighbor(&mut self, peer_ip: Ipv4Addr) -> crate::mac::PeerMacSource {
+        let (mac, source) = crate::mac::resolve_peer_mac(self.peer_mac, peer_ip);
+        self.seed_neighbor(peer_ip, mac);
+        source
     }
 }
 
