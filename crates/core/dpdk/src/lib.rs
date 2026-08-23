@@ -10,6 +10,12 @@
 //! feature this crate is an empty shell, letting it live in the workspace
 //! without requiring system dependencies.
 
+// Ungated: MAC parsing and the peer-MAC convention are pure logic with
+// no libdpdk dependency, and operators configure them through the same
+// CLI whether or not this build has the transport compiled in.
+pub mod mac;
+pub use mac::{MacAddr, MacParseError, PeerMacSource, parse_mac, resolve_peer_mac, try_parse_mac};
+
 #[cfg(feature = "dpdk-sys")]
 mod dpdk;
 #[cfg(feature = "dpdk-sys")]
