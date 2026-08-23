@@ -142,7 +142,7 @@ fn gateway_reseed_due(now: Instant, last_seeded: Instant) -> bool {
 }
 
 /// Configuration for the DPDK transport.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DpdkConfig {
     pub eal_args: Vec<String>,
     /// DPDK port IDs to poll. The first port is used for TX; all ports

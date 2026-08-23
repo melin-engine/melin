@@ -2133,7 +2133,7 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
 {
-    let dpdk_config = dpdk_config_from(&config);
+    let dpdk_config = dpdk_config_from(&config)?;
 
     run_dpdk_impl::<A>(
         config,
@@ -2146,31 +2146,52 @@ where
     )
 }
 
+/// Translate the CLI surface into a [`melin_dpdk::DpdkConfig`].
+///
+/// Every operator-supplied string is validated here, before EAL init and
+/// before any thread is spawned, and a bad value is returned as an error
+/// rather than a panic — a typo should not be able to take down a node
+/// that is already running.
 #[cfg(feature = "dpdk")]
-fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
-    melin_dpdk::DpdkConfig {
+fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String> {
+    let parse_ip = |value: &str, flag: &str| -> Result<std::net::Ipv4Addr, String> {
+        value
+            .parse()
+            .map_err(|e| format!("invalid {flag} address '{value}': {e}"))
+    };
+    let parse_mac = |value: &str, flag: &str| -> Result<[u8; 6], String> {
+        melin_dpdk::try_parse_mac(value).map_err(|e| format!("invalid {flag}: {e}"))
+    };
+
+    Ok(melin_dpdk::DpdkConfig {
         eal_args: cfg
             .dpdk_eal_args
             .split_whitespace()
             .map(String::from)
             .collect(),
         port_ids: cfg.dpdk_ports.clone(),
-        ip_addr: cfg.dpdk_ip.parse().expect("invalid --dpdk-ip address"),
+        ip_addr: parse_ip(&cfg.dpdk_ip, "--dpdk-ip")?,
         prefix_len: cfg.dpdk_prefix_len,
         gateway: cfg
             .dpdk_gateway
             .as_deref()
-            .map(|s| s.parse().expect("invalid --dpdk-gateway address")),
+            .map(|s| parse_ip(s, "--dpdk-gateway"))
+            .transpose()?,
         listen_port: cfg.bind.port(),
         mtu: cfg.dpdk_mtu,
         vlan_id: cfg.dpdk_vlan,
         peer_ip: cfg
             .dpdk_peer_ip
             .as_deref()
-            .map(|s| s.parse().expect("invalid --dpdk-peer-ip address")),
-        gateway_mac: cfg.dpdk_gateway_mac.as_deref().map(melin_dpdk::parse_mac),
+            .map(|s| parse_ip(s, "--dpdk-peer-ip"))
+            .transpose()?,
+        gateway_mac: cfg
+            .dpdk_gateway_mac
+            .as_deref()
+            .map(|s| parse_mac(s, "--dpdk-gateway-mac"))
+            .transpose()?,
         num_queues: 1,
-    }
+    })
 }
 
 #[cfg(feature = "dpdk")]
@@ -3906,5 +3927,46 @@ mod tests {
         let perm = handle.join().unwrap().unwrap();
         assert_eq!(perm, Permission::ReadOnly);
         assert!(!perm.can_trade());
+    }
+}
+
+/// Startup-time validation of the DPDK CLI surface.
+///
+/// What these pin is *when* a bad flag is caught: during config
+/// translation, before EAL init and before any thread exists, rather
+/// than as a panic somewhere later in startup.
+#[cfg(all(test, feature = "dpdk"))]
+mod dpdk_config_tests {
+    use super::{ServerConfig, dpdk_config_from};
+
+    #[test]
+    fn a_malformed_gateway_mac_fails_config_translation() {
+        let cfg = ServerConfig {
+            dpdk_gateway_mac: Some("not-a-mac".into()),
+            ..Default::default()
+        };
+        let err = dpdk_config_from(&cfg).expect_err("a non-MAC must be rejected");
+        assert!(err.contains("--dpdk-gateway-mac"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_ip_names_the_flag_it_came_from() {
+        let cfg = ServerConfig {
+            dpdk_peer_ip: Some("10.0.0".into()),
+            ..Default::default()
+        };
+        let err = dpdk_config_from(&cfg).expect_err("a truncated IPv4 must be rejected");
+        assert!(err.contains("--dpdk-peer-ip"), "{err}");
+    }
+
+    #[test]
+    fn a_valid_configuration_translates() {
+        let cfg = ServerConfig {
+            dpdk_gateway: Some("10.0.0.254".into()),
+            dpdk_gateway_mac: Some("0c:42:a1:5b:2e:80".into()),
+            ..Default::default()
+        };
+        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        assert_eq!(dpdk.gateway_mac, Some([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80]));
     }
 }
