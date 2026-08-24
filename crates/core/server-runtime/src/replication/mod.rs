@@ -73,6 +73,12 @@ mod dpdk;
 mod receiver_transport;
 mod tcp_receiver;
 mod tcp_sender;
+// Only the DPDK sender uses the worker, but it is pure thread/channel
+// plumbing with no libdpdk dependency — so it is also compiled under
+// `test`, keeping its mechanics (and the affinity trap it exists to
+// avoid) testable on a build without the `dpdk` feature.
+#[cfg(any(feature = "dpdk", test))]
+mod validation_worker;
 
 use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
 

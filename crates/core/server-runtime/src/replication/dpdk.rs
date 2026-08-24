@@ -25,6 +25,7 @@ use super::receiver_transport::{
     ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, streaming_loop,
     try_extract_frame,
 };
+use super::validation_worker::ValidationWorker;
 use super::{
     AfterSession, ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles,
     ReplicationMetrics, ResyncDecision, SentHighWater, build_replica_pipeline_with_threads,
@@ -144,8 +145,8 @@ enum SlotState {
 /// blocking adapter's deadline (receiver), never by stalling the poll thread.
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// In-flight handshake chain validation, running on a short-lived
-/// background thread. `validate_replica_handshake_settled` can scan a
+/// In-flight handshake chain validation, running on this slot's parked
+/// [`ValidationWorker`]. `validate_replica_handshake_settled` can scan a
 /// full segment per attempt and sleeps between retries (~400 ms budget
 /// on a divergent verdict) — far too long to run inline on the poll
 /// thread, which also services client traffic and the other replica
@@ -174,6 +175,12 @@ struct DpdkReplicaSlot {
     sent: SentHighWater,
     /// `Some` while this slot's handshake validation runs off-thread.
     pending_validation: Option<PendingValidation>,
+    /// This slot's parked validation thread. Spawned once at driver
+    /// construction — never from `tick`: the poll thread is pinned to an
+    /// isolated core at `SCHED_FIFO` and busy-spins, so a thread created
+    /// from it inherits that context and is never scheduled. See
+    /// [`ValidationWorker`].
+    validator: ValidationWorker,
     /// `Some` while this slot is `Authenticating` — the challenge we issued
     /// and its deadline. Cleared on transition out of `Authenticating`.
     auth: Option<AuthChallenge>,
@@ -322,10 +329,30 @@ impl<A: Application> DpdkReplicationDriver<A> {
         fence_state: Arc<melin_transport_core::fence::FenceState>,
         ack_policy: Arc<std::sync::atomic::AtomicU8>,
         authorized_keys: Arc<AuthorizedKeys>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let [consumer_0, consumer_1] = repl_consumers;
         let now = std::time::Instant::now();
-        DpdkReplicationDriver {
+
+        // Spawn both validation workers here, on the caller's thread.
+        // This runs at startup, before the client poll thread pins
+        // itself, which is the only moment a thread can be created with a
+        // context the poll loop would never let it acquire on its own —
+        // see `ValidationWorker`. A failure fails the boot cleanly
+        // (nothing is running yet to leak) rather than surfacing later as
+        // a replica that hangs in `Handshaking`.
+        let [validator_0, validator_1] = [0usize, 1].map(|idx| {
+            ValidationWorker::spawn(
+                format!("repl-validate-{idx}"),
+                journal_path.clone(),
+                validate_replica_handshake_settled,
+            )
+        });
+        let validator_0 =
+            validator_0.map_err(|e| format!("spawn handshake validation worker 0: {e}"))?;
+        let validator_1 =
+            validator_1.map_err(|e| format!("spawn handshake validation worker 1: {e}"))?;
+
+        Ok(DpdkReplicationDriver {
             slots: [
                 DpdkReplicaSlot {
                     state: SlotState::Idle,
@@ -339,6 +366,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // every handshake.
                     sent: SentHighWater::seed(0, 0),
                     pending_validation: None,
+                    validator: validator_0,
                     auth: None,
                 },
                 DpdkReplicaSlot {
@@ -353,6 +381,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // every handshake.
                     sent: SentHighWater::seed(0, 0),
                     pending_validation: None,
+                    validator: validator_1,
                     auth: None,
                 },
             ],
@@ -367,7 +396,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             ack_policy,
             authorized_keys,
             _app: PhantomData,
-        }
+        })
     }
 
     /// Take ownership of a freshly-accepted connection on the replication
@@ -549,11 +578,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 continue;
                             }
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                // The validation thread can only drop the
-                                // sender without a verdict by panicking.
-                                warn!(
+                                // The worker can only drop the sender
+                                // without a verdict by panicking — our
+                                // bug, so `error!`.
+                                error!(
                                     slot = slot_idx,
-                                    "handshake validation thread died — disconnecting"
+                                    "handshake validation worker died — disconnecting"
                                 );
                                 slot.go_idle(
                                     slot_idx,
@@ -829,39 +859,36 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
 
                                     // The handshake frame is consumed here;
-                                    // chain validation runs on a short-lived
-                                    // thread (it can scan a full segment per
-                                    // attempt and sleeps between retries —
+                                    // chain validation is handed to this slot's
+                                    // parked worker (it can scan a full segment
+                                    // per attempt and sleeps between retries —
                                     // blocking tick() would freeze client
                                     // traffic and the other slot). The slot
                                     // stays Handshaking; the verdict is picked
                                     // up by the pending_validation poll at the
                                     // top of this arm.
+                                    //
+                                    // Deliberately a submission, not a spawn:
+                                    // this is the pinned, busy-spinning poll
+                                    // thread, and a thread created here would
+                                    // inherit its core and SCHED_FIFO priority
+                                    // and never run at all — the handshake would
+                                    // hang forever. See `ValidationWorker`.
                                     compact_recv_buf(&mut slot.recv_buf, frame_end);
-                                    let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
-                                    let validate_path = journal_path.clone();
-                                    let validate_hs = h.clone();
-                                    match std::thread::Builder::new()
-                                        .name(format!("repl-validate-{slot_idx}"))
-                                        .spawn(move || {
-                                            // Send failure means the slot was
-                                            // torn down while validating —
-                                            // nobody is waiting for the verdict.
-                                            let _ = verdict_tx.send(
-                                                validate_replica_handshake_settled(
-                                                    &validate_path,
-                                                    &validate_hs,
-                                                ),
-                                            );
-                                        }) {
-                                        Ok(_detached) => {
+                                    match slot.validator.submit(h.clone()) {
+                                        Ok(verdict_rx) => {
                                             slot.pending_validation = Some(PendingValidation {
                                                 handshake: h,
                                                 verdict_rx,
                                             });
                                         }
                                         Err(e) => {
-                                            warn!(slot = slot_idx, error = %e, "failed to spawn handshake validation thread — disconnecting");
+                                            // `error!`, not `warn!`: the
+                                            // worker only disappears by
+                                            // panicking, which is a bug in
+                                            // us, not bad input from the
+                                            // replica.
+                                            error!(slot = slot_idx, error = %e, "cannot validate handshake — disconnecting");
                                             slot.go_idle(
                                                 slot_idx,
                                                 transport,

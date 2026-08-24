@@ -2819,7 +2819,7 @@ where
             Arc::clone(&fence_state),
             Arc::clone(&ack_policy_atomic),
             Arc::clone(&authorized_keys),
-        );
+        )?;
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
         // off "DPDK replication sender started" to know the primary
         // is ready to accept replicas. Kept verbatim for backward
