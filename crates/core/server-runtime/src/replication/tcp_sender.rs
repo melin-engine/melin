@@ -314,7 +314,16 @@ pub fn run_sender<A: Application>(
                         .spawn(move || {
                             // Pin to a dedicated core if configured (> 0),
                             // otherwise clear inherited affinity from the
-                            // sender thread so the OS can schedule freely.
+                            // accept thread so the OS can schedule freely.
+                            //
+                            // Both branches only work because the accept
+                            // thread is left unpinned (see its spawn in
+                            // `server.rs`). A child inherits its creator's
+                            // affinity and scheduling policy at creation,
+                            // and cannot fix that itself if the parent is
+                            // pinned real-time and never yields — fixing
+                            // itself requires running. Pin the accept
+                            // thread and this handler may never start.
                             if handler_core > 0 {
                                 match melin_app::affinity::pin_to_core(handler_core) {
                                     Ok(c) => tracing::info!(
@@ -376,6 +385,12 @@ pub fn run_sender<A: Application>(
         // rings where active_flag is true (set by handler on live loop
         // entry, cleared on disconnect). Idle consumers stay empty.
 
+        // Supervisory cadence. Nothing on the data path runs in this loop
+        // — the ring consumers are moved into the handler threads — so the
+        // only cost is up to 50 ms to notice a new connection or a handler
+        // that has finished, both negligible against the journal catch-up
+        // that follows. In exchange the thread costs ~no CPU when idle,
+        // which is why it needs no core of its own.
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }

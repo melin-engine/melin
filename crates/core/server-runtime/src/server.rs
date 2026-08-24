@@ -4,7 +4,7 @@
 //! 1. Recovers or creates the `JournaledApp<A>`.
 //! 2. Decomposes it into `(A, W)` via `into_parts()`, where `W` is the journal writer.
 //! 3. Builds the disruptor pipeline (input ring + output ring).
-//! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
+//! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-accept], [event-publisher].
 //! 5. Runs the accept loop, registering connections with the io_uring reader.
 //!
 //! Fully synchronous — no async runtime needed. Reader threads use io_uring
@@ -95,11 +95,14 @@ pub struct ServerConfig {
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
-    /// Pipeline core IDs: journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,journal-disk
+    /// Pipeline core IDs: journal,matching,response,reader,(unused),event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,journal-disk
     /// (comma-separated; the last two entries are optional and default to
     /// unpinned when omitted). Core 0 is reserved for OS/IRQ handling.
     /// reader pins the io_uring reader (TCP) or DPDK poll thread.
-    /// repl-sender is used when replication is enabled, event-publisher when
+    /// The fifth entry once pinned the replication accept thread and is now
+    /// ignored — that thread does no work worth a core, and the replica data
+    /// path is pinned by repl-handler-0/1. The position is kept so existing
+    /// `--cores` values keep their meaning. event-publisher applies when
     /// `--event-bind` is set, shadow when `--snapshot-interval-ms` > 0.
     /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
     /// journal-disk pins the thread that writes and syncs the journal; give it
@@ -561,10 +564,10 @@ impl ServerConfig {
 
 /// Core assignments for pipeline threads.
 ///
-/// All fields are always stored; repl-sender is only used when replication is
-/// enabled, event-publisher only when `--event-bind` is set, and shadow only
-/// when `--snapshot-interval-ms` > 0. repl-handler-0/1 are spawned on replica
-/// connect, not at startup. 0 = unpinned (OS scheduled) for any field.
+/// All fields are always stored; event-publisher is only used when
+/// `--event-bind` is set, and shadow only when `--snapshot-interval-ms` > 0.
+/// repl-handler-0/1 are spawned on replica connect, not at startup.
+/// 0 = unpinned (OS scheduled) for any field.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineCores {
     pub journal: usize,
@@ -572,6 +575,12 @@ pub struct PipelineCores {
     pub response: usize,
     /// io_uring reader thread (TCP) or DPDK poll thread.
     pub reader: usize,
+    /// Historically pinned the replication accept thread (`repl-accept`).
+    /// **Ignored** — that thread only accepts connections and reaps
+    /// finished handlers, so it is left to the OS scheduler; the replica
+    /// data path lives on `repl_handler_0`/`repl_handler_1`. Kept so the
+    /// `--cores` positions, and callers constructing this struct, do not
+    /// shift.
     pub repl_sender: usize,
     pub event_publisher: usize,
     pub shadow: usize,
@@ -659,7 +668,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     // `journal_disk` field docs for why they should then give it one.
     if !(9..=11).contains(&parts.len()) {
         return Err(format!(
-            "expected 9 to 11 comma-separated core IDs (journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1[,journal-prep[,journal-disk]]), got {}",
+            "expected 9 to 11 comma-separated core IDs (journal,matching,response,reader,unused,event-publisher,shadow,repl-handler-0,repl-handler-1[,journal-prep[,journal-disk]]), got {}",
             parts.len()
         ));
     }
@@ -1617,10 +1626,29 @@ where
         // see the `repl_listener` parameter doc.
         let repl_listener = repl_listener
             .ok_or("replication listener must be pre-bound when replication is enabled")?;
-        let repl_sender_handle = std::thread::Builder::new()
-            .name("repl-sender".into())
+        let repl_accept_handle = std::thread::Builder::new()
+            // `repl-accept`, not `repl-sender`: this thread sends nothing.
+            // The ring consumers are moved into the per-replica handler
+            // threads, which do all the streaming; this one accepts
+            // connections, reaps finished handlers, and sleeps 50 ms.
+            .name("repl-accept".into())
             .spawn(move || {
-                melin_app::affinity::pin_thread("repl-sender", cores.repl_sender);
+                // Deliberately NOT pinned. Reserving a core — at
+                // SCHED_FIFO, on an isolated one — for a thread that idles
+                // 99.9% of the time bought nothing.
+                //
+                // Staying unpinned is now load-bearing, not just thrifty.
+                // The handler threads are spawned from here and inherit
+                // this thread's affinity and scheduling policy at
+                // creation; a child of a pinned real-time parent cannot
+                // move itself off that core, because moving itself
+                // requires running. That is the DPDK handshake hang, and
+                // this path escaped it only because the 50 ms sleep
+                // happened to yield the core. See
+                // `replication::validation_worker`.
+                //
+                // `cores.repl_sender` is consequently ignored. The
+                // `--cores` position stays for compatibility.
                 crate::replication::run_sender::<A>(
                     crate::replication::Sender {
                         listener: repl_listener,
@@ -1646,7 +1674,7 @@ where
             })
             .map_err(|e| format!("spawn replication sender thread: {e}"))?;
 
-        Some(repl_sender_handle)
+        Some(repl_accept_handle)
     } else {
         if !config.standalone && config.replica_of.is_none() {
             info!("running in standalone mode (no replication)");
@@ -2851,7 +2879,7 @@ where
     // connect after seeding catch up via the journal protocol (a few
     // hundred batches at startup — measured in tens of milliseconds, not
     // a meaningful operational cost). The kernel-TCP path still has its
-    // own gate via the spawned `repl-sender` thread which can accept
+    // own gate via the spawned `repl-accept` thread which can accept
     // replicas independently of seeding; this only changes DPDK behavior.
     let _ = (&enable_replication, &replica_ready); // suppress unused warnings on non-DPDK paths
     if needs_seeding {

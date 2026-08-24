@@ -420,7 +420,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep, journal-disk (comma-separated). 0 = unpinned. The last two entries are optional — a 9- or 10-entry value still parses, leaving the omitted threads unpinned, so a configuration written before either existed keeps working. Place journal-disk on the same CCD as journal. |
+| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: journal, matching, response, reader, *(unused)*, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep, journal-disk (comma-separated). 0 = unpinned. The fifth entry is ignored — it once pinned the thread that accepts replica connections, which does no work worth a core; the replica data path is pinned by repl-handler-0/1. Set it to 0 to hand that core back. The last two entries are optional — a 9- or 10-entry value still parses, leaving the omitted threads unpinned, so a configuration written before either existed keeps working. Place journal-disk on the same CCD as journal. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |

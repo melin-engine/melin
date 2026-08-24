@@ -631,7 +631,7 @@ pub fn run_dpdk_poll<A: Application>(
         // progression, journal catch-up (blocking on first connect),
         // ack processing, and live data-batch sends. With a single
         // queue + single thread, this is what replaces the previous
-        // dedicated repl-sender thread; the poll above flushed any TX
+        // dedicated replication sender thread; the poll above flushed any TX
         // the driver queued on the prior iteration and received any
         // pending ACKs from replicas.
         if let Some(ref mut driver) = repl_driver {
