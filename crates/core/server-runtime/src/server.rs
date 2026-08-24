@@ -462,7 +462,6 @@ impl Default for ServerConfig {
                 matching: 2,
                 response: 3,
                 reader: 4,
-                repl_sender: 5,
                 event_publisher: 6,
                 shadow: 7,
                 repl_handler_0: 8,
@@ -575,13 +574,12 @@ pub struct PipelineCores {
     pub response: usize,
     /// io_uring reader thread (TCP) or DPDK poll thread.
     pub reader: usize,
-    /// Historically pinned the replication accept thread (`repl-accept`).
-    /// **Ignored** — that thread only accepts connections and reaps
-    /// finished handlers, so it is left to the OS scheduler; the replica
-    /// data path lives on `repl_handler_0`/`repl_handler_1`. Kept so the
-    /// `--cores` positions, and callers constructing this struct, do not
-    /// shift.
-    pub repl_sender: usize,
+    // There is no field for the fifth `--cores` entry. It once pinned the
+    // replication accept thread (`repl-accept`), which does no work worth
+    // a core — it accepts connections, reaps finished handlers, and
+    // sleeps. `parse_cores` validates that position and discards it, so
+    // existing `--cores` values keep every other entry's meaning; the
+    // replica data path is pinned by `repl_handler_0`/`repl_handler_1`.
     pub event_publisher: usize,
     pub shadow: usize,
     /// Core for replication handler thread 0. 0 = unpinned (OS scheduled).
@@ -634,8 +632,6 @@ impl PipelineCores {
             matching: 2,
             response: 3,
             reader: 4,
-            // repl_sender not spawned in compact (no --replication-bind).
-            repl_sender: 0,
             event_publisher: 5,
             shadow: 6,
             // repl handlers not spawned in compact; 0 = unpinned.
@@ -676,12 +672,17 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         p.parse::<usize>()
             .map_err(|_| format!("invalid core ID: {p}"))
     };
+    // The fifth entry is the retired replication-accept core: validated,
+    // then dropped. Validating it still matters — a typo there would
+    // otherwise pass silently, and an operator who shifted their list by
+    // one should hear about it rather than have every later thread land
+    // on the wrong core.
+    parse(parts[4])?;
     Ok(PipelineCores {
         journal: parse(parts[0])?,
         matching: parse(parts[1])?,
         response: parse(parts[2])?,
         reader: parse(parts[3])?,
-        repl_sender: parse(parts[4])?,
         event_publisher: parse(parts[5])?,
         shadow: parse(parts[6])?,
         repl_handler_0: parse(parts[7])?,
@@ -1647,8 +1648,10 @@ where
                 // happened to yield the core. See
                 // `replication::validation_worker`.
                 //
-                // `cores.repl_sender` is consequently ignored. The
-                // `--cores` position stays for compatibility.
+                // `PipelineCores` consequently has no field for it. The
+                // fifth `--cores` position stays, validated and discarded,
+                // so existing operator configurations keep every other
+                // entry's meaning.
                 crate::replication::run_sender::<A>(
                     crate::replication::Sender {
                         listener: repl_listener,
@@ -3649,6 +3652,38 @@ mod tests {
 
         assert!(super::parse_cores("1,2,3").is_err());
         assert!(super::parse_cores("1,2,3,4,5,6,7,8,9,10,11,12").is_err());
+    }
+
+    /// The fifth entry once pinned the replication accept thread and now
+    /// has no field. It must be *skipped*, not dropped: everything after
+    /// it has to keep its position, or an existing `--cores` value would
+    /// silently move every later thread onto the wrong core.
+    #[test]
+    fn parse_cores_skips_the_retired_fifth_entry_without_shifting() {
+        // A distinctive value in position five that must not surface
+        // anywhere in the result.
+        let cores = super::parse_cores("1,2,3,4,99,6,7,8,9,10,11").expect("11 entries must parse");
+        assert_eq!(cores.journal, 1);
+        assert_eq!(cores.matching, 2);
+        assert_eq!(cores.response, 3);
+        assert_eq!(cores.reader, 4);
+        assert_eq!(
+            cores.event_publisher, 6,
+            "sixth entry stays event-publisher"
+        );
+        assert_eq!(cores.shadow, 7);
+        assert_eq!(cores.repl_handler_0, 8);
+        assert_eq!(cores.repl_handler_1, 9);
+        assert_eq!(cores.journal_prep, 10);
+        assert_eq!(cores.journal_disk, 11);
+    }
+
+    /// Discarded is not unvalidated. A typo in the retired position still
+    /// fails the boot, because the likeliest cause is a list shifted by
+    /// one — which would otherwise mispin every thread after it.
+    #[test]
+    fn parse_cores_still_rejects_a_malformed_fifth_entry() {
+        assert!(super::parse_cores("1,2,3,4,x,6,7,8,9").is_err());
     }
 
     /// Full bootstrap decision matrix. The two archive-only cells are

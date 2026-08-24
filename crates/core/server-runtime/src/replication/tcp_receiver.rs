@@ -1219,7 +1219,6 @@ mod tests {
                 matching: 0,
                 response: 0,
                 reader: 0,
-                repl_sender: 0,
                 event_publisher: 0,
                 shadow: 0,
                 repl_handler_0: 0,
