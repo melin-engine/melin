@@ -331,6 +331,16 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
 /// `ENTRY_HEADER_SIZE + 16 + 1 + max(transport variant size, E::encoded_size()) + CRC_SIZE`
 /// always suffices. A 128-byte buffer covers every transport variant plus
 /// a generously-sized app payload.
+///
+/// A destination too small for the event is refused with
+/// [`JournalError::CorruptEntry`] rather than panicking. That matters
+/// because the bound an application actually has to respect is not
+/// [`MAX_PAYLOAD_SIZE`] (which only reflects the `u16` length field) but
+/// whatever the caller's buffer leaves after framing — in every hot path,
+/// `MAX_ENTRY_SIZE`, an order of magnitude smaller. Without this check an
+/// application whose `encoded_size` overran it took the journal thread
+/// down mid-batch with a slice-range panic naming neither the app nor the
+/// limit.
 pub fn encode<E: AppEvent>(
     sequence: u64,
     timestamp_ns: u64,
@@ -344,6 +354,16 @@ pub fn encode<E: AppEvent>(
     // metadata back-filled in one block once the tag is known.
     let payload_start = ENTRY_HEADER_SIZE + ENTRY_META_SIZE;
     let mut pos = payload_start;
+
+    // Covers the header, metadata, the 8-byte payload of the fixed-size
+    // transport variants, and the CRC. The App variant's payload is
+    // variable and gets its own check below.
+    if buf.len() < payload_start + 8 + CRC_SIZE {
+        return Err(JournalError::CorruptEntry {
+            sequence,
+            reason: "destination buffer too small for a journal entry",
+        });
+    }
 
     let event_tag = match event {
         JournalEvent::Tick { now_ns } => {
@@ -362,6 +382,15 @@ pub fn encode<E: AppEvent>(
                 return Err(JournalError::CorruptEntry {
                     sequence,
                     reason: "app event exceeds u16 length field",
+                });
+            }
+            // The real bound on an app payload is what the destination
+            // leaves after framing, not `MAX_PAYLOAD_SIZE`. Checked before
+            // the subslice below, which would otherwise panic.
+            if buf.len() < pos + n + CRC_SIZE {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "app event too large for the journal entry buffer",
                 });
             }
             // Subslice passed to encode so bugs in `encoded_size` produce
@@ -623,6 +652,87 @@ mod tests {
     #[test]
     fn round_trip_app_payload() {
         round_trip(JournalEvent::App(TestEvent::Payload(u64::MAX)));
+    }
+
+    /// An app event far larger than any hot-path scratch buffer. Exists to
+    /// prove the destination bound is reported, not hit as a panic —
+    /// `encode` is never reached for it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FatEvent;
+
+    impl AppEvent for FatEvent {
+        fn encoded_size(&self) -> usize {
+            4096
+        }
+
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[..4096].fill(0xAB);
+            4096
+        }
+
+        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(FatEvent)
+        }
+
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn app_event_too_large_for_destination_is_refused() {
+        // A `MAX_ENTRY_SIZE`-shaped destination, as every hot path uses.
+        let mut buf = [0u8; 144];
+        let err = encode(7, 0, 0, 0, &JournalEvent::App(FatEvent), &mut buf)
+            .expect_err("oversized app event must be refused, not panic");
+        assert!(
+            matches!(
+                err,
+                JournalError::CorruptEntry { sequence: 7, reason }
+                    if reason.contains("too large")
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn destination_too_small_for_framing_is_refused() {
+        let mut buf = [0u8; 8];
+        let err = encode(
+            3,
+            0,
+            0,
+            0,
+            &JournalEvent::App::<TestEvent>(TestEvent::Ping),
+            &mut buf,
+        )
+        .expect_err("undersized destination must be refused");
+        assert!(
+            matches!(err, JournalError::CorruptEntry { sequence: 3, .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn destination_bound_is_exact() {
+        // Pins the boundary rather than only "much too small fails": an
+        // entry must encode into exactly its own size and fail one byte
+        // under it.
+        let ev = JournalEvent::App::<TestEvent>(TestEvent::Payload(1));
+        let mut probe = [0u8; 256];
+        let needed = encode(1, 0, 0, 0, &ev, &mut probe).expect("probe encode");
+
+        let mut exact = vec![0u8; needed];
+        assert_eq!(
+            encode(1, 0, 0, 0, &ev, &mut exact).expect("exact fit encodes"),
+            needed
+        );
+
+        let mut short = vec![0u8; needed - 1];
+        assert!(
+            encode(1, 0, 0, 0, &ev, &mut short).is_err(),
+            "one byte short must be refused"
+        );
     }
 
     #[test]
