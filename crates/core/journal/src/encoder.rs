@@ -43,19 +43,31 @@ use crate::event::JournalEvent;
 /// by. An app declaring an [`AppEvent::MAX_ENCODED_SIZE`] that does not
 /// fit under this ceiling fails to compile — see [`JournalEncoder`].
 ///
-/// Public because every caller has to guarantee the destination buffer
-/// has an entry's headroom before each [`JournalEncoder::encode_event`]
-/// — the encoder cannot grow a buffer it does not own.
+/// Public because it is what the encoder's scratch is sized to, and
+/// because the rings a batch lands in assert against it — a slot too
+/// small for a single entry of *some* application would make batch sizing
+/// compute a zero-length batch.
 pub const MAX_ENTRY_SIZE: usize = 1088;
 
-/// Bytes one entry of `E` can occupy: framing plus the app's declared
-/// bound.
+/// Bytes one entry of `E` can occupy: framing plus the widest payload
+/// the journal can put in it.
+///
+/// That payload is the app's declared bound *or*
+/// [`TRANSPORT_PAYLOAD_SIZE`](codec::TRANSPORT_PAYLOAD_SIZE), whichever
+/// is larger — `Tick` and `EpochBump` are journaled whatever `E` is, so
+/// an app narrower than 8 bytes still has to leave room for them.
 ///
 /// This, not [`MAX_ENTRY_SIZE`], is the per-application reservation. An
 /// app with 9-byte events reserves 50 bytes per entry and is unaffected
 /// by another app's wider payloads.
 pub const fn entry_size<E: AppEvent>() -> usize {
-    codec::ENTRY_FRAMING_SIZE + E::MAX_ENCODED_SIZE
+    // `Ord::max` is not const, hence the branch.
+    let payload = if E::MAX_ENCODED_SIZE > codec::TRANSPORT_PAYLOAD_SIZE {
+        E::MAX_ENCODED_SIZE
+    } else {
+        codec::TRANSPORT_PAYLOAD_SIZE
+    };
+    codec::ENTRY_FRAMING_SIZE + payload
 }
 
 /// Sequencing, framing, and chaining for one journal segment.
@@ -227,7 +239,7 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// segment hash chain; nothing else is emitted — the chain has no
     /// in-stream metadata.
     ///
-    /// `dst` must have [`MAX_ENTRY_SIZE`] bytes free past
+    /// `dst` must have [`entry_size::<E>()`](entry_size) bytes free past
     /// [`batch_len`](Self::batch_len) — the encoder cannot grow a
     /// buffer it does not own, so a short destination is a caller bug
     /// and is refused rather than silently truncated. It must also be
@@ -268,8 +280,10 @@ impl<E: AppEvent> JournalEncoder<E> {
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "journal batch destination too small: {} bytes free at offset {offset}, \
-                     entry needs {written} (caller must reserve MAX_ENTRY_SIZE per event)",
-                    dst.len() - offset
+                     entry needs {written} (caller must reserve entry_size::<E>() = {} \
+                     per event)",
+                    dst.len() - offset,
+                    entry_size::<E>()
                 ),
             )));
         }
@@ -412,9 +426,40 @@ mod tests {
         }
     }
 
-    fn encode_len(event: VarEvent) -> usize {
+    /// Declares less than the 8-byte payload the transport's own
+    /// variants carry, so "what the app can encode" and "what the widest
+    /// entry costs" are different numbers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TinyEvent;
+
+    impl AppEvent for TinyEvent {
+        const MAX_ENCODED_SIZE: usize = 1;
+
+        fn encoded_size(&self) -> usize {
+            1
+        }
+
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[0] = 0x5A;
+            1
+        }
+
+        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(TinyEvent)
+        }
+
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    fn encode_len<E: AppEvent>(event: JournalEvent<E>) -> usize {
         let mut buf = [0u8; MAX_ENTRY_SIZE];
-        crate::codec::encode(1, 0, 0, 0, &JournalEvent::App(event), &mut buf).expect("encodes")
+        crate::codec::encode(1, 0, 0, 0, &event, &mut buf).expect("encodes")
+    }
+
+    fn encode_app_len(event: VarEvent) -> usize {
+        encode_len(JournalEvent::App(event))
     }
 
     #[test]
@@ -430,15 +475,35 @@ mod tests {
     /// that is too generous silently shortens every fsync batch.
     #[test]
     fn widest_event_encodes_to_exactly_entry_size() {
-        assert_eq!(encode_len(VarEvent::Wide), entry_size::<VarEvent>());
+        assert_eq!(encode_app_len(VarEvent::Wide), entry_size::<VarEvent>());
     }
 
     #[test]
     fn entry_size_bounds_every_variant() {
         for event in [VarEvent::Narrow, VarEvent::Wide] {
             assert!(
-                encode_len(event) <= entry_size::<VarEvent>(),
+                encode_app_len(event) <= entry_size::<VarEvent>(),
                 "{event:?} encoded past the declared bound"
+            );
+        }
+    }
+
+    /// `entry_size` is what every caller reserves, and the journal writes
+    /// more than app events: `Tick` and `EpochBump` carry an 8-byte
+    /// payload whatever `E` is. An app narrower than that must still
+    /// reserve enough for them, or a tick lands in a hole too small for
+    /// it and a durable write fails.
+    #[test]
+    fn entry_size_bounds_the_transport_variants() {
+        for event in [
+            JournalEvent::<TinyEvent>::Tick { now_ns: u64::MAX },
+            JournalEvent::<TinyEvent>::EpochBump { epoch: u64::MAX },
+        ] {
+            let len = encode_len(event);
+            assert!(
+                len <= entry_size::<TinyEvent>(),
+                "{event:?} encodes to {len}, past the {} reserved per entry",
+                entry_size::<TinyEvent>()
             );
         }
     }

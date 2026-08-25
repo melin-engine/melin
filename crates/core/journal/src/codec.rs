@@ -208,12 +208,21 @@ pub(crate) const CRC_SIZE: usize = 4;
 /// metadata (17) + CRC (4) = 41.
 ///
 /// Public because sizing an entry is an application-facing calculation:
-/// `ENTRY_FRAMING_SIZE + E::MAX_ENCODED_SIZE` is what the journal
-/// reserves per event, and what the transport divides a hand-off chunk by
-/// to decide batch length.
+/// `ENTRY_FRAMING_SIZE + max(TRANSPORT_PAYLOAD_SIZE, E::MAX_ENCODED_SIZE)`
+/// is what the journal reserves per event, and what the transport divides
+/// a hand-off chunk by to decide batch length.
 pub const ENTRY_FRAMING_SIZE: usize = ENTRY_HEADER_SIZE + ENTRY_META_SIZE + CRC_SIZE;
 
 const _: () = assert!(ENTRY_FRAMING_SIZE == 41);
+
+/// Payload width of the transport-intrinsic variants — `Tick`'s `now_ns`
+/// and `EpochBump`'s `epoch`, both a `u64`.
+///
+/// The journal writes these whatever `E` is, so an entry's true ceiling is
+/// this *or* the app's declared bound, whichever is larger. An application
+/// narrower than 8 bytes that reserved only its own width would leave a
+/// tick a hole too small to land in — see [`crate::encoder::entry_size`].
+pub const TRANSPORT_PAYLOAD_SIZE: usize = 8;
 
 const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 52);
 const _: () = assert!(FILE_HEADER_SIZE >= FILE_HEADER_FIELDS_SIZE);
@@ -339,17 +348,15 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
 ///
 /// Returns the total number of bytes written (header + tag + payload + CRC).
 /// The caller must ensure `buf` is large enough:
-/// `ENTRY_HEADER_SIZE + 16 + 1 + max(transport variant size, E::encoded_size()) + CRC_SIZE`
-/// always suffices. A 128-byte buffer covers every transport variant plus
-/// a generously-sized app payload.
+/// [`crate::encoder::entry_size::<E>()`](crate::encoder::entry_size)
+/// always suffices.
 ///
 /// A destination too small for the event is refused with
 /// [`JournalError::CorruptEntry`] rather than panicking. That matters
 /// because the bound an application actually has to respect is not
 /// [`MAX_PAYLOAD_SIZE`] (which only reflects the `u16` length field) but
-/// whatever the caller's buffer leaves after framing — in every hot path,
-/// `MAX_ENTRY_SIZE`, an order of magnitude smaller. Without this check an
-/// application whose `encoded_size` overran it took the journal thread
+/// whatever the caller's buffer leaves after framing. Without this check
+/// an application whose `encoded_size` overran it took the journal thread
 /// down mid-batch with a slice-range panic naming neither the app nor the
 /// limit.
 pub fn encode<E: AppEvent>(
@@ -366,10 +373,10 @@ pub fn encode<E: AppEvent>(
     let payload_start = ENTRY_HEADER_SIZE + ENTRY_META_SIZE;
     let mut pos = payload_start;
 
-    // Covers the header, metadata, the 8-byte payload of the fixed-size
+    // Covers the header, metadata, the payload of the fixed-size
     // transport variants, and the CRC. The App variant's payload is
     // variable and gets its own check below.
-    if buf.len() < payload_start + 8 + CRC_SIZE {
+    if buf.len() < payload_start + TRANSPORT_PAYLOAD_SIZE + CRC_SIZE {
         return Err(JournalError::CorruptEntry {
             sequence,
             reason: "destination buffer too small for a journal entry",
