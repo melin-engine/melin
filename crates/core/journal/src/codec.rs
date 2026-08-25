@@ -351,14 +351,21 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
 /// [`crate::encoder::entry_size::<E>()`](crate::encoder::entry_size)
 /// always suffices.
 ///
-/// A destination too small for the event is refused with
-/// [`JournalError::CorruptEntry`] rather than panicking. That matters
-/// because the bound an application actually has to respect is not
-/// [`MAX_PAYLOAD_SIZE`] (which only reflects the `u16` length field) but
-/// whatever the caller's buffer leaves after framing. Without this check
-/// an application whose `encoded_size` overran it took the journal thread
-/// down mid-batch with a slice-range panic naming neither the app nor the
-/// limit.
+/// Two things are refused with [`JournalError::CorruptEntry`] rather than
+/// panicking:
+///
+/// - **An app event wider than its declared
+///   [`AppEvent::MAX_ENCODED_SIZE`].** Every reservation downstream — the
+///   writer's headroom, the transport's batch length — is computed from
+///   that constant, so an event that outgrows it is caught here, at the
+///   one place that can name what went wrong, instead of blowing a
+///   reservation layers away.
+/// - **A destination too small for the entry.** The bound an application
+///   actually has to respect is not [`MAX_PAYLOAD_SIZE`] (which only
+///   reflects the `u16` length field) but whatever the caller's buffer
+///   leaves after framing. Without this check an application whose
+///   `encoded_size` overran it took the journal thread down mid-batch
+///   with a slice-range panic naming neither the app nor the limit.
 pub fn encode<E: AppEvent>(
     sequence: u64,
     timestamp_ns: u64,
@@ -396,10 +403,18 @@ pub fn encode<E: AppEvent>(
         }
         JournalEvent::App(e) => {
             let n = e.encoded_size();
-            if n > MAX_PAYLOAD_SIZE {
+            // One compare against a monomorphised constant, and it is the
+            // only place an under-declared bound can still be caught:
+            // past here the event is just bytes, and the reservations it
+            // overran were sized from `MAX_ENCODED_SIZE` long before.
+            // Subsumes `MAX_PAYLOAD_SIZE` for any `E` the encoder accepts
+            // — the compile-time gate keeps `MAX_ENCODED_SIZE` far under
+            // the `u16` length field — and the `u16::try_from` below
+            // still backstops an `E` that never built an encoder.
+            if n > E::MAX_ENCODED_SIZE {
                 return Err(JournalError::CorruptEntry {
                     sequence,
-                    reason: "app event exceeds u16 length field",
+                    reason: "app event is wider than its declared MAX_ENCODED_SIZE",
                 });
             }
             // The real bound on an app payload is what the destination
@@ -707,7 +722,8 @@ mod tests {
 
     #[test]
     fn app_event_too_large_for_destination_is_refused() {
-        // A `MAX_ENTRY_SIZE`-shaped destination, as every hot path uses.
+        // Sized for a modest application, as a caller reserving
+        // `entry_size::<E>()` would be.
         let mut buf = [0u8; 144];
         let err = encode(7, 0, 0, 0, &JournalEvent::App(FatEvent), &mut buf)
             .expect_err("oversized app event must be refused, not panic");
@@ -716,6 +732,53 @@ mod tests {
                 err,
                 JournalError::CorruptEntry { sequence: 7, reason }
                     if reason.contains("too large")
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Declares a bound its own `encode` walks straight past — the
+    /// mistake `MAX_ENCODED_SIZE` exists to catch, and the one nothing
+    /// else can: every reservation downstream is computed from the
+    /// declared number.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct UnderDeclaredEvent;
+
+    impl AppEvent for UnderDeclaredEvent {
+        const MAX_ENCODED_SIZE: usize = 16;
+
+        fn encoded_size(&self) -> usize {
+            200
+        }
+
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[..200].fill(0xCD);
+            200
+        }
+
+        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(UnderDeclaredEvent)
+        }
+
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    /// An event wider than it claims must be refused where it happens,
+    /// not left to blow a reservation several layers away. The
+    /// destination here has ample room, so only the declared bound can
+    /// catch it.
+    #[test]
+    fn app_event_wider_than_its_declared_bound_is_refused() {
+        let mut buf = [0u8; crate::encoder::MAX_ENTRY_SIZE];
+        let err = encode(9, 0, 0, 0, &JournalEvent::App(UnderDeclaredEvent), &mut buf)
+            .expect_err("an event past its declared bound must be refused");
+        assert!(
+            matches!(
+                err,
+                JournalError::CorruptEntry { sequence: 9, reason }
+                    if reason.contains("MAX_ENCODED_SIZE")
             ),
             "unexpected error: {err:?}"
         );

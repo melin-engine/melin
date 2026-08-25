@@ -206,9 +206,11 @@ pub trait AppEvent: Copy {
     ///
     /// This is a *bound*, not a measurement: it must be at least the
     /// largest `encoded_size` this type can return. Declaring it too
-    /// small is a bug the journal cannot paper over, so the value is
-    /// checked at compile time against the journal's entry ceiling and at
-    /// run time against the destination buffer.
+    /// small is a bug the journal cannot paper over — every reservation
+    /// downstream is computed from this number — so it is checked at
+    /// compile time against the journal's entry ceiling, and at encode
+    /// time against each event's actual `encoded_size`, which is refused
+    /// if it exceeds what was declared.
     ///
     /// Deliberately has no default. The right value is a property of the
     /// implementor's wire format and nothing else can infer it; a default
