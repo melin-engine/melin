@@ -66,6 +66,7 @@ exceptions = [
     { allow = ["BUSL-1.1"], name = "melin-app" },
     { allow = ["BUSL-1.1"], name = "melin-dpdk" },
     { allow = ["BUSL-1.1"], name = "melin-example-counter" },
+    { allow = ["BUSL-1.1"], name = "melin-example-notary" },
     { allow = ["BUSL-1.1"], name = "melin-journal" },
     { allow = ["BUSL-1.1"], name = "melin-pipeline" },
     { allow = ["BUSL-1.1"], name = "melin-raft" },
