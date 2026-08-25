@@ -55,6 +55,9 @@ struct PadApp;
 struct PadEvent;
 
 impl AppEvent for PadEvent {
+    // Never journaled — this test drives the response stage only.
+    const MAX_ENCODED_SIZE: usize = 1;
+
     fn encoded_size(&self) -> usize {
         unreachable!("response-stage-only test")
     }

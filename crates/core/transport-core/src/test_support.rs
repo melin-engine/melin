@@ -18,6 +18,8 @@ pub enum TestEvent {
 }
 
 impl AppEvent for TestEvent {
+    const MAX_ENCODED_SIZE: usize = 1 + 8;
+
     fn encoded_size(&self) -> usize {
         match self {
             TestEvent::Add(_) => 1 + 8,

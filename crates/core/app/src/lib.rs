@@ -196,11 +196,39 @@ pub struct ApplyCtx {
 /// `Copy` is required so events can live inside the disruptor ring slots
 /// without heap indirection — the disruptor publishes by byte-copy.
 pub trait AppEvent: Copy {
+    /// Upper bound on [`encoded_size`](AppEvent::encoded_size) across
+    /// every value of this type.
+    ///
+    /// The journal reserves this much per entry, and it is what decides
+    /// how many events fit in one fsync batch — the transport divides the
+    /// hand-off chunk by it, so a wider event yields a shorter batch
+    /// rather than a larger allocation.
+    ///
+    /// This is a *bound*, not a measurement: it must be at least the
+    /// largest `encoded_size` this type can return. Declaring it too
+    /// small is a bug the journal cannot paper over — every reservation
+    /// downstream is computed from this number — so it is checked at
+    /// compile time against the journal's entry ceiling, and at encode
+    /// time against each event's actual `encoded_size`, which is refused
+    /// if it exceeds what was declared.
+    ///
+    /// The compile-time check fires when the journal is instantiated for
+    /// this type, so it surfaces on `cargo build` and `cargo test`, not on
+    /// `cargo check` — a check-only CI or rust-analyzer will stay green
+    /// on a bound the journal cannot carry.
+    ///
+    /// Deliberately has no default. The right value is a property of the
+    /// implementor's wire format and nothing else can infer it; a default
+    /// would silently hand a wrong bound to exactly the application that
+    /// most needed to think about it.
+    const MAX_ENCODED_SIZE: usize;
+
     /// Number of bytes [`AppEvent::encode`] will write for this value.
     ///
     /// The transport uses this to allocate a single batch buffer and to
     /// compute the per-entry length prefix. Must be exact, not an upper
-    /// bound.
+    /// bound — see [`MAX_ENCODED_SIZE`](AppEvent::MAX_ENCODED_SIZE) for
+    /// the type-level bound.
     fn encoded_size(&self) -> usize;
 
     /// Encode this event into `buf`. Caller guarantees `buf.len() >=

@@ -17,7 +17,21 @@ use melin_pipeline::padding::Sequence;
 
 /// Maximum batch buffer size. Matches `BATCH_BUF_CAPACITY` in writer.rs.
 /// Each ring slot has one pre-allocated chunk of this size.
-const CHUNK_SIZE: usize = 512 * 1024;
+///
+/// Public because it is a hard bound on the producer, not an internal
+/// detail: a batch too large for a slot is refused by
+/// [`ReplicationProducer::try_publish`] with a panic, since a replication
+/// frame cannot be split or dropped without tearing a replica's journal.
+/// The transport sizes its journal batch so this can never happen — see
+/// `max_journal_batch` — and needs the number to do it. Smaller than the
+/// journal's own hand-off chunk, so it, not the journal, is what bounds a
+/// wide-event application's batch.
+pub const CHUNK_SIZE: usize = 512 * 1024;
+
+// A slot must hold at least one entry of any application, or the batch
+// sizing that divides by this would compute a zero-length batch. The
+// journal's write ring asserts the same against its own chunk.
+const _: () = assert!(crate::encoder::MAX_ENTRY_SIZE <= CHUNK_SIZE);
 
 /// Capacity of the replication ring (number of batch slots).
 /// 2^8 = 256 slots. At 512 KiB per slot, total buffer = 128 MiB per
@@ -78,7 +92,7 @@ impl ReplicationProducer {
     /// the slowest consumer).
     ///
     /// # Panics
-    /// Panics if `data.len() > CHUNK_SIZE` (128 KiB).
+    /// Panics if `data.len() > CHUNK_SIZE` (512 KiB).
     pub fn publish(&mut self, data: &[u8], end_sequence: u64) {
         assert!(
             data.len() <= CHUNK_SIZE,

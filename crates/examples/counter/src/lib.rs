@@ -49,6 +49,9 @@ pub enum CounterEvent {
 }
 
 impl AppEvent for CounterEvent {
+    // The widest variant: `Increment`'s tag(1) + amount(8).
+    const MAX_ENCODED_SIZE: usize = 9;
+
     fn encoded_size(&self) -> usize {
         match self {
             // tag(1) + amount(8)

@@ -38,7 +38,7 @@ use crate::pipeline::build_replica_pipeline;
 use crate::pipeline::{AdoptedRotation, StreamMark};
 use crate::pipeline::{
     InputSlot, JournalStage, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload, OutputSlot,
-    build_pipeline_with_replication,
+    build_pipeline_with_replication, max_journal_batch,
 };
 use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport};
 use crate::trace::mono_trace_ns;
@@ -2957,7 +2957,8 @@ fn preparer_arms_for_size_and_replica_modes_only() {
 #[test]
 fn size_trigger_tracks_the_segments_real_size() {
     const THRESHOLD: u64 = 16 * 1024;
-    /// Generous bound on one encoded entry (`MAX_ENTRY_SIZE` is 144).
+    /// Generous bound on one encoded entry for this test's event type
+    /// (framing is 41 bytes; `TestEvent::MAX_ENCODED_SIZE` is 9).
     const ONE_ENTRY: u64 = 256;
 
     let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
@@ -3600,4 +3601,175 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     shutdown.store(true, Ordering::Relaxed);
     let _writer = t_journal.join().unwrap();
     let _app = t_matching.join().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Journal batch sizing
+// ---------------------------------------------------------------------------
+
+/// A wide-event application, for the sizing tests below.
+#[derive(Debug, Clone, Copy)]
+struct WideEvent(u8);
+
+impl melin_app::AppEvent for WideEvent {
+    const MAX_ENCODED_SIZE: usize = 289;
+
+    fn encoded_size(&self) -> usize {
+        Self::MAX_ENCODED_SIZE
+    }
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        buf[..Self::MAX_ENCODED_SIZE].fill(self.0);
+        Self::MAX_ENCODED_SIZE
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, melin_app::CodecError> {
+        Ok(WideEvent(buf[0]))
+    }
+
+    fn is_query(&self) -> bool {
+        false
+    }
+}
+
+/// Bytes `last_user_entry_replication_slice` trims from each entry: the
+/// 2-byte magic at the front and the 4-byte CRC at the back.
+const REPLICATION_SLICE_TRIM: usize = 6;
+
+/// The invariant the sequencer depends on: it encodes a whole batch into
+/// one claimed chunk with no mid-batch byte cut, so a full batch must fit.
+/// This is what stops a wide-event app from overrunning the slot.
+///
+/// A batch lands in *two* rings, with different slot sizes: the journal
+/// hand-off chunk and — with a replica attached — a replication chunk,
+/// which is smaller. Both are checked, because the sizing has to respect
+/// whichever binds first.
+#[test]
+fn a_full_batch_always_fits_both_rings() {
+    fn check<E: melin_app::AppEvent>(label: &str) {
+        let batch = max_journal_batch::<E>();
+        let entry = melin_journal::encoder::entry_size::<E>();
+
+        let journal_bytes = batch * entry;
+        assert!(
+            journal_bytes <= melin_journal::write_ring::CHUNK_SIZE,
+            "{label}: a full batch is {journal_bytes} bytes against a {}-byte journal chunk",
+            melin_journal::write_ring::CHUNK_SIZE
+        );
+
+        // Each entry reaches replication with its magic and CRC stripped
+        // (`last_user_entry_replication_slice`), under one frame header.
+        let repl_bytes =
+            crate::replication_wire::FRAME_HEADER_LEN + batch * (entry - REPLICATION_SLICE_TRIM);
+        assert!(
+            repl_bytes <= melin_journal::replication::CHUNK_SIZE,
+            "{label}: a full batch is {repl_bytes} bytes against a {}-byte replication chunk",
+            melin_journal::replication::CHUNK_SIZE
+        );
+    }
+    check::<TestEvent>("narrow");
+    check::<WideEvent>("wide");
+}
+
+/// A narrow-event app keeps the full ceiling; a wide-event one trades
+/// batch length for width rather than growing the ring.
+#[test]
+fn batch_length_adapts_to_event_width() {
+    assert_eq!(
+        max_journal_batch::<TestEvent>(),
+        MAX_JOURNAL_BATCH,
+        "a narrow-event app must not be penalised by another app's width"
+    );
+
+    let wide = max_journal_batch::<WideEvent>();
+    assert!(
+        wide < MAX_JOURNAL_BATCH,
+        "a 289-byte event should not still batch {MAX_JOURNAL_BATCH}"
+    );
+    // What the device cost amortises over is bytes per sync, not events.
+    // Trading length for width is only sound while the wide-event app
+    // still fills a sync at least as full as a narrow one does.
+    let narrow_bytes = MAX_JOURNAL_BATCH * melin_journal::encoder::entry_size::<TestEvent>();
+    let wide_bytes = wide * melin_journal::encoder::entry_size::<WideEvent>();
+    assert!(
+        wide_bytes >= narrow_bytes,
+        "a batch of {wide} wide events is {wide_bytes} bytes against a narrow app's \
+         {narrow_bytes} — fsync amortisation would suffer"
+    );
+}
+
+/// The sizing above, exercised rather than computed: a wide-event
+/// application under sustained load, with a replica attached, has to
+/// survive its own full batch.
+///
+/// The input ring is filled *before* the sequencer starts, so its first
+/// read span is as long as the stage will allow by construction rather
+/// than by outrunning it — the span is bounded by the per-app cap, *not*
+/// by the configured `max_batch`, because the sync check runs only after
+/// the whole span is encoded. A `Shutdown` sentinel behind the events
+/// ends the run from inside the steady-state loop, which is the path
+/// that failed; the shutdown flag would route everything through the
+/// drain instead.
+///
+/// Not gated on `no-persist`: that feature skips the write syscall, not
+/// the replication publish, so the batch is framed either way.
+#[test]
+fn a_wide_event_app_survives_a_full_batch_with_a_replica_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.journal");
+    let writer = melin_journal::BufferedWriter::<WideEvent>::create(&path).unwrap();
+
+    // Room for every event plus the sentinel while nothing is consuming.
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot<WideEvent>>::new(16384)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    // The default `ServerConfig::max_journal_batch`, to show it is not
+    // what bounds the span.
+    let mut stage = JournalStage::new(writer, consumer, Duration::from_micros(50), 1024, false);
+
+    let (repl_producer_0, _consumers_0) =
+        melin_journal::replication::build_replication_ring(1, REPLICATION_RING_CAPACITY);
+    let (repl_producer_1, _consumers_1) =
+        melin_journal::replication::build_replication_ring(1, REPLICATION_RING_CAPACITY);
+    stage.set_replication_producers(
+        [repl_producer_0, repl_producer_1],
+        [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ],
+        [
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        ],
+    );
+
+    // Every event sits unread when the stage starts, so nothing about
+    // the span length depends on thread timing.
+    let total = 2 * MAX_JOURNAL_BATCH as u64;
+    for i in 0..total {
+        producer.publish(InputSlot::<WideEvent> {
+            timestamp_ns: 1_000_000_000 + i,
+            event: melin_journal::JournalEvent::App(WideEvent(0xAB)),
+            ..Default::default()
+        });
+    }
+    producer.publish(InputSlot::<WideEvent> {
+        event: melin_journal::JournalEvent::Shutdown,
+        ..Default::default()
+    });
+
+    // Never raised: the sentinel is what ends the run.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handle = std::thread::spawn(move || stage.run(&shutdown));
+
+    let writer = handle
+        .join()
+        .expect("the sequencing thread must not die on a full batch")
+        .expect("journal stage");
+
+    // Every event reached the journal — the batch was bounded, not
+    // truncated.
+    assert_eq!(writer.next_sequence(), total + 1);
 }

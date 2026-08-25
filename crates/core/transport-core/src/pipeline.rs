@@ -220,7 +220,54 @@ pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
 /// ~104 bytes ≈ 416 KiB still fits in one write. Under low load, batches are
 /// naturally small (drain what's available); the cap only matters at
 /// sustained high throughput.
+///
+/// This is the ceiling; [`max_journal_batch`] is the value actually used,
+/// which additionally keeps a batch inside one hand-off chunk.
 pub const MAX_JOURNAL_BATCH: usize = 4096;
+
+/// Events per journal batch for a given application.
+///
+/// A finished batch lands whole in a pre-allocated slot of two rings, and
+/// neither can take it in pieces:
+///
+/// - the journal hand-off ring
+///   ([`CHUNK_SIZE`](melin_journal::write_ring::CHUNK_SIZE), 640 KiB) —
+///   the sequencer encodes the batch into one claimed slot with no
+///   mid-batch byte cut, so an overrun makes the encoder refuse the entry
+///   and fails the pipeline;
+/// - the replication ring
+///   ([`CHUNK_SIZE`](melin_journal::replication::CHUNK_SIZE), 512 KiB) —
+///   with a replica attached the same entries are framed into one
+///   `InputBatch`, and a frame too large for a slot is refused with a
+///   panic, since it can be neither split nor dropped without tearing the
+///   replica's journal.
+///
+/// So the batch is bounded by the **smaller** of the two. Dividing by the
+/// full [`entry_size`](melin_journal::encoder::entry_size) is deliberately
+/// conservative for the replication side, which strips 6 bytes of magic
+/// and CRC from each entry: the ~2% of batch length that costs is not
+/// worth a second, subtly different divisor.
+///
+/// Bounding the *count* rather than growing either chunk is what keeps
+/// ring memory independent of event width: the rings stay 40 MiB and
+/// 128 MiB for every application, and only batch length varies. Bytes per
+/// fsync stay in the same range either way — 4096 × ~104 B ≈ 416 KiB for
+/// a narrow app, ~1588 × 330 B ≈ 512 KiB for a 288-byte-payload one — and
+/// bytes, not event count, is what the NVMe write amortises over.
+pub const fn max_journal_batch<E: AppEvent>() -> usize {
+    // `Ord::min` is not const, hence the branches.
+    let chunk = if melin_journal::replication::CHUNK_SIZE < melin_journal::write_ring::CHUNK_SIZE {
+        melin_journal::replication::CHUNK_SIZE
+    } else {
+        melin_journal::write_ring::CHUNK_SIZE
+    };
+    let by_chunk = chunk / melin_journal::encoder::entry_size::<E>();
+    if by_chunk < MAX_JOURNAL_BATCH {
+        by_chunk
+    } else {
+        MAX_JOURNAL_BATCH
+    }
+}
 
 /// Spin-wait idle hint. When `busy_spin` is false (default), falls back to
 /// `sched_yield` after 1000 spins — courteous on shared cores but expensive
@@ -778,7 +825,7 @@ impl<E: AppEvent> JournalStage<E> {
             _marker: std::marker::PhantomData,
             consumer,
             group_commit_delay,
-            max_batch: max_batch.min(MAX_JOURNAL_BATCH),
+            max_batch: max_batch.min(max_journal_batch::<E>()),
             repl: Box::default(),
             chain_hash: None,
             last_seq: None,
@@ -995,6 +1042,26 @@ impl<E: AppEvent> JournalStage<E> {
 }
 
 impl<E: AppEvent> Sequencer<E> {
+    /// This application's batch cap, folded at compile time.
+    ///
+    /// Bound to an associated const rather than calling
+    /// [`max_journal_batch`] in the loops below: it is read once per
+    /// iteration on the sequencing thread, and an associated const is
+    /// evaluated at monomorphisation instead of leaving a division for
+    /// the optimiser to fold.
+    ///
+    /// The `assert!` closes the reasoning that spans two crates — both
+    /// rings guarantee one entry fits a chunk
+    /// (`MAX_ENTRY_SIZE <= CHUNK_SIZE`, asserted against each) and the
+    /// encoder guarantees `E` fits one entry
+    /// (`JournalEncoder::FITS_ONE_ENTRY`), so this can never be zero.
+    /// A zero would make the sequencer read empty spans forever.
+    const MAX_BATCH: usize = {
+        let n = max_journal_batch::<E>();
+        assert!(n > 0, "a hand-off chunk must hold at least one entry");
+        n
+    };
+
     /// Drive the sequencing loop, then tear the disk thread down.
     ///
     /// The wrapper exists so the thread is stopped and joined on *every*
@@ -1083,7 +1150,9 @@ impl<E: AppEvent> Sequencer<E> {
             // target as `read_start + encoded slots` (publishing the
             // read cursor there would over-commit; see `submit_batch`).
             let read_start = self.consumer.next_read();
-            let remaining = MAX_JOURNAL_BATCH.saturating_sub(pending);
+            // Per-application, not the raw ceiling: this span is encoded
+            // into the claimed chunk below, which must hold all of it.
+            let remaining = Self::MAX_BATCH.saturating_sub(pending);
             let slots: &[InputSlot<E>] = if remaining > 0 {
                 self.consumer.read_contiguous(remaining)
             } else {
@@ -1364,7 +1433,9 @@ impl<E: AppEvent> Sequencer<E> {
             // stops at the ring's wrap point just means one extra
             // hand-off per lap — this is the shutdown path.
             let read_start = self.consumer.next_read();
-            let slots = self.consumer.read_contiguous(MAX_JOURNAL_BATCH);
+            // Same per-application bound as the steady-state loop: this
+            // drain encodes into a claimed chunk too.
+            let slots = self.consumer.read_contiguous(Self::MAX_BATCH);
             if slots.is_empty() {
                 break;
             }

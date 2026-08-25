@@ -215,7 +215,7 @@ The journal stage is responsible for making every event durable before it can be
 
 The sequencing thread:
 
-1. Borrows up to `MAX_JOURNAL_BATCH` (4,096) events in place from the input ring — no copy out of the ring. This does not advance the progress cursor.
+1. Borrows a batch of events in place from the input ring — no copy out of the ring. This does not advance the progress cursor. The batch is capped at 4,096 events, or at whatever number of the application's events fills one slot of the rings it is handed to, whichever is smaller.
 2. Batch-encodes them directly into a slot of the hand-off ring shared with the disk thread. Queries are skipped (they cause no state change and are not journaled), and each encoded entry is also appended to the batch being sent to replicas.
 3. When a sync trigger fires, publishes the slot -- the batch's bytes plus everything the disk thread must make true once it is durable. This does not wait for the device; the sequencing thread returns immediately to reading and encoding.
 
@@ -226,10 +226,16 @@ The disk thread:
 
 The hand-off ring holds 64 batches. A device stall is absorbed up to that depth before the sequencing thread stalls at its next batch and producers feel backpressure.
 
+Its size does not depend on how large the application's events are. Each slot is a fixed 640 KiB, and it is the batch *length* that adapts: an application with small events batches the full 4,096, one with 288-byte payloads batches roughly 1,588. Both write a comparable number of bytes per sync, which is what the device cost amortises over, and the ring stays 40 MiB either way.
+
+A batch is handed to two places, and the length is bounded by whichever slot fills first: the hand-off ring above, and — on a node with a replica attached — the replication ring, whose 512 KiB slots are the smaller of the two. Batch length therefore does not change when a replica connects; it is sized for the replicated case from the start, so a node behaves identically standalone and replicated.
+
+An application's events are capped at 1,047 bytes encoded. The limit is checked when the server is built, not at run time, so an application declaring more than the journal can carry fails to compile.
+
 ### Sync triggers
 
 A batch is handed to the disk thread when any of:
-- The batch reaches `max_batch` (`MAX_JOURNAL_BATCH` = 4,096 events by default)
+- The batch reaches `max_batch` (4,096 events by default, lowered automatically for applications whose events are wide enough that fewer fill a ring slot)
 - The group commit delay has elapsed since the first unsynced write
 - Group commit delay is zero (hand over after each read batch)
 
@@ -441,7 +447,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 |----------|-------|----------|
 | `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
 | `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
-| `MAX_JOURNAL_BATCH` | `4096` | `crates/core/transport-core/src/pipeline.rs` |
+| `MAX_JOURNAL_BATCH` | `4096` (ceiling; the effective cap is the lesser of this and what fills one ring slot) | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_BATCH` (response) | `1024` | `crates/core/server-runtime/src/response.rs` |
 | `MAX_RESPONSE_BUF` | `512` bytes | `crates/core/server-runtime/src/response.rs` |
 | `NUM_BUFFERS` | `2048` | `crates/core/server-runtime/src/reader.rs` (io_uring provided buffer pool) |

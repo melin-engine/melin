@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use melin_app::AppEvent;
 
 use crate::codec;
-use crate::encoder::{JournalEncoder, MAX_ENTRY_SIZE};
+use crate::encoder::{JournalEncoder, entry_size};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 use crate::segment_file::SegmentFile;
@@ -152,10 +152,13 @@ impl<E: AppEvent> BufferedWriter<E> {
         request_seq: u64,
     ) -> Result<(), JournalError> {
         // The encoder cannot grow a buffer it does not own, so keep a
-        // whole entry's headroom ahead of it. Growth is the rare
-        // oversize-batch fallback — Vec's amortised growth absorbs it.
+        // whole entry's headroom ahead of it. `entry_size::<E>()` rather
+        // than the cross-application ceiling: reserving the ceiling would
+        // make an app with 9-byte events grow its batch buffer twenty
+        // times sooner than it needs to. Growth is the rare oversize-batch
+        // fallback — Vec's amortised growth absorbs it.
         let headroom = self.batch_buf.len() - self.encoder.batch_len();
-        if headroom < MAX_ENTRY_SIZE {
+        if headroom < entry_size::<E>() {
             let grown = self.batch_buf.len() + BATCH_BUF_CAPACITY;
             tracing::warn!(
                 batch_len = self.encoder.batch_len(),
@@ -367,6 +370,8 @@ mod tests {
     struct TestEvent(u64);
 
     impl AppEvent for TestEvent {
+        const MAX_ENCODED_SIZE: usize = 8;
+
         fn encoded_size(&self) -> usize {
             8
         }
@@ -433,6 +438,61 @@ mod tests {
         drop(w);
 
         assert!(BufferedWriter::<TestEvent>::create(&path).is_err());
+    }
+
+    /// An application narrower than the transport's own 8-byte payloads.
+    /// Its reservation is the smallest the journal ever makes, so it is
+    /// where a reservation that forgot `Tick` shows up.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TinyEvent;
+
+    impl AppEvent for TinyEvent {
+        const MAX_ENCODED_SIZE: usize = 1;
+
+        fn encoded_size(&self) -> usize {
+            1
+        }
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[0] = 0x5A;
+            1
+        }
+        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(TinyEvent)
+        }
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    /// The headroom kept ahead of the encoder has to cover the *widest*
+    /// entry the journal can write, not just the app's own — a tick is
+    /// journaled whatever `E` is.
+    ///
+    /// Fills the batch buffer down to a gap too small for a tick, then
+    /// writes one. A reservation derived from the app's width alone
+    /// leaves that gap looking sufficient, so the buffer is not grown and
+    /// the tick is refused mid-batch.
+    #[test]
+    fn a_tick_fits_the_headroom_a_narrow_app_reserves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.journal");
+        let mut w = BufferedWriter::<TinyEvent>::create(&path).unwrap();
+
+        let tick = JournalEvent::Tick { now_ns: u64::MAX };
+        let tick_len = {
+            let mut probe = [0u8; crate::encoder::MAX_ENTRY_SIZE];
+            codec::encode(1, 0, 0, 0, &tick, &mut probe).unwrap()
+        };
+
+        while BATCH_BUF_CAPACITY - w.encoder.batch_len() >= tick_len {
+            let seq = w.allocate_sequence();
+            w.encode_event(seq, 1_000, &JournalEvent::App(TinyEvent), 0, 0)
+                .expect("narrow entry");
+        }
+
+        let seq = w.allocate_sequence();
+        w.encode_event(seq, 2_000, &tick, 0, 0)
+            .expect("a tick must always fit the reserved headroom");
     }
 
     #[test]

@@ -204,6 +204,26 @@ pub const ENTRY_META_SIZE: usize = core::mem::size_of::<EntryMetadata>();
 /// CRC32C checksum size in bytes.
 pub(crate) const CRC_SIZE: usize = 4;
 
+/// Bytes every entry costs regardless of its payload: header (20) +
+/// metadata (17) + CRC (4) = 41.
+///
+/// Public because sizing an entry is an application-facing calculation:
+/// `ENTRY_FRAMING_SIZE + max(TRANSPORT_PAYLOAD_SIZE, E::MAX_ENCODED_SIZE)`
+/// is what the journal reserves per event, and what the transport divides
+/// a hand-off chunk by to decide batch length.
+pub const ENTRY_FRAMING_SIZE: usize = ENTRY_HEADER_SIZE + ENTRY_META_SIZE + CRC_SIZE;
+
+const _: () = assert!(ENTRY_FRAMING_SIZE == 41);
+
+/// Payload width of the transport-intrinsic variants — `Tick`'s `now_ns`
+/// and `EpochBump`'s `epoch`, both a `u64`.
+///
+/// The journal writes these whatever `E` is, so an entry's true ceiling is
+/// this *or* the app's declared bound, whichever is larger. An application
+/// narrower than 8 bytes that reserved only its own width would leave a
+/// tick a hole too small to land in — see [`crate::encoder::entry_size`].
+pub const TRANSPORT_PAYLOAD_SIZE: usize = 8;
+
 const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 52);
 const _: () = assert!(FILE_HEADER_SIZE >= FILE_HEADER_FIELDS_SIZE);
 const _: () = assert!(ENTRY_HEADER_SIZE == 20);
@@ -231,13 +251,6 @@ const TAG_TICK: u8 = 0x03;
 /// the journal itself is healthy.
 const TAG_EPOCH_BUMP: u8 = 0x04;
 const TAG_APP: u8 = 0x80;
-
-/// Bytes after the header + key_hash + request_seq reserved for the
-/// event payload, excluding the CRC. The `length` field is a `u16` and
-/// covers `key_hash(8) + request_seq(8) + tag(1) + payload`, so the
-/// payload itself can grow to `u16::MAX - 17 ≈ 65 518` bytes before the
-/// frame overflows. App codecs may assume their `encoded_size` fits.
-pub const MAX_PAYLOAD_SIZE: usize = u16::MAX as usize - 17;
 
 /// Encode the file header into `buf`.
 ///
@@ -328,9 +341,24 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
 ///
 /// Returns the total number of bytes written (header + tag + payload + CRC).
 /// The caller must ensure `buf` is large enough:
-/// `ENTRY_HEADER_SIZE + 16 + 1 + max(transport variant size, E::encoded_size()) + CRC_SIZE`
-/// always suffices. A 128-byte buffer covers every transport variant plus
-/// a generously-sized app payload.
+/// [`crate::encoder::entry_size::<E>()`](crate::encoder::entry_size)
+/// always suffices.
+///
+/// Two things are refused with [`JournalError::CorruptEntry`] rather than
+/// panicking:
+///
+/// - **An app event wider than its declared
+///   [`AppEvent::MAX_ENCODED_SIZE`].** Every reservation downstream — the
+///   writer's headroom, the transport's batch length — is computed from
+///   that constant, so an event that outgrows it is caught here, at the
+///   one place that can name what went wrong, instead of blowing a
+///   reservation layers away.
+/// - **A destination too small for the entry.** The bound an application
+///   actually has to respect is not the `u16` length field's ceiling but
+///   whatever the caller's buffer leaves after framing. Without this
+///   check an application whose `encoded_size` overran it took the
+///   journal thread down mid-batch with a slice-range panic naming
+///   neither the app nor the limit.
 pub fn encode<E: AppEvent>(
     sequence: u64,
     timestamp_ns: u64,
@@ -345,6 +373,16 @@ pub fn encode<E: AppEvent>(
     let payload_start = ENTRY_HEADER_SIZE + ENTRY_META_SIZE;
     let mut pos = payload_start;
 
+    // Covers the header, metadata, the payload of the fixed-size
+    // transport variants, and the CRC. The App variant's payload is
+    // variable and gets its own check below.
+    if buf.len() < payload_start + TRANSPORT_PAYLOAD_SIZE + CRC_SIZE {
+        return Err(JournalError::CorruptEntry {
+            sequence,
+            reason: "destination buffer too small for a journal entry",
+        });
+    }
+
     let event_tag = match event {
         JournalEvent::Tick { now_ns } => {
             le::put_u64(&mut buf[pos..], *now_ns);
@@ -358,10 +396,27 @@ pub fn encode<E: AppEvent>(
         }
         JournalEvent::App(e) => {
             let n = e.encoded_size();
-            if n > MAX_PAYLOAD_SIZE {
+            // One compare against a monomorphised constant, and it is the
+            // only place an under-declared bound can still be caught:
+            // past here the event is just bytes, and the reservations it
+            // overran were sized from `MAX_ENCODED_SIZE` long before.
+            // Also keeps the payload under the `u16` length field for
+            // any `E` the encoder accepts — the compile-time gate holds
+            // `MAX_ENCODED_SIZE` far below it — and the `u16::try_from`
+            // below still backstops an `E` that never built an encoder.
+            if n > E::MAX_ENCODED_SIZE {
                 return Err(JournalError::CorruptEntry {
                     sequence,
-                    reason: "app event exceeds u16 length field",
+                    reason: "app event is wider than its declared MAX_ENCODED_SIZE",
+                });
+            }
+            // The real bound on an app payload is what the destination
+            // leaves after framing, not the `u16` length field. Checked
+            // before the subslice below, which would otherwise panic.
+            if buf.len() < pos + n + CRC_SIZE {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "app event too large for the journal entry buffer",
                 });
             }
             // Subslice passed to encode so bugs in `encoded_size` produce
@@ -547,6 +602,8 @@ mod tests {
     }
 
     impl AppEvent for TestEvent {
+        const MAX_ENCODED_SIZE: usize = 9;
+
         fn encoded_size(&self) -> usize {
             match self {
                 TestEvent::Ping => 1,
@@ -623,6 +680,141 @@ mod tests {
     #[test]
     fn round_trip_app_payload() {
         round_trip(JournalEvent::App(TestEvent::Payload(u64::MAX)));
+    }
+
+    /// An app event far larger than any hot-path scratch buffer. Exists to
+    /// prove the destination bound is reported, not hit as a panic —
+    /// `encode` is never reached for it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FatEvent;
+
+    impl AppEvent for FatEvent {
+        // Declares the truth about itself: larger than any entry can
+        // hold. A `JournalEncoder<FatEvent>` would therefore fail to
+        // compile, which is the intended outcome — this type exists only
+        // to drive `codec::encode` directly.
+        const MAX_ENCODED_SIZE: usize = 4096;
+
+        fn encoded_size(&self) -> usize {
+            4096
+        }
+
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[..4096].fill(0xAB);
+            4096
+        }
+
+        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(FatEvent)
+        }
+
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn app_event_too_large_for_destination_is_refused() {
+        // Sized for a modest application, as a caller reserving
+        // `entry_size::<E>()` would be.
+        let mut buf = [0u8; 144];
+        let err = encode(7, 0, 0, 0, &JournalEvent::App(FatEvent), &mut buf)
+            .expect_err("oversized app event must be refused, not panic");
+        assert!(
+            matches!(
+                err,
+                JournalError::CorruptEntry { sequence: 7, reason }
+                    if reason.contains("too large")
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Declares a bound its own `encode` walks straight past — the
+    /// mistake `MAX_ENCODED_SIZE` exists to catch, and the one nothing
+    /// else can: every reservation downstream is computed from the
+    /// declared number.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct UnderDeclaredEvent;
+
+    impl AppEvent for UnderDeclaredEvent {
+        const MAX_ENCODED_SIZE: usize = 16;
+
+        fn encoded_size(&self) -> usize {
+            200
+        }
+
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[..200].fill(0xCD);
+            200
+        }
+
+        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(UnderDeclaredEvent)
+        }
+
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    /// An event wider than it claims must be refused where it happens,
+    /// not left to blow a reservation several layers away. The
+    /// destination here has ample room, so only the declared bound can
+    /// catch it.
+    #[test]
+    fn app_event_wider_than_its_declared_bound_is_refused() {
+        let mut buf = [0u8; crate::encoder::MAX_ENTRY_SIZE];
+        let err = encode(9, 0, 0, 0, &JournalEvent::App(UnderDeclaredEvent), &mut buf)
+            .expect_err("an event past its declared bound must be refused");
+        assert!(
+            matches!(
+                err,
+                JournalError::CorruptEntry { sequence: 9, reason }
+                    if reason.contains("MAX_ENCODED_SIZE")
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn destination_too_small_for_framing_is_refused() {
+        let mut buf = [0u8; 8];
+        let err = encode(
+            3,
+            0,
+            0,
+            0,
+            &JournalEvent::App::<TestEvent>(TestEvent::Ping),
+            &mut buf,
+        )
+        .expect_err("undersized destination must be refused");
+        assert!(
+            matches!(err, JournalError::CorruptEntry { sequence: 3, .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn destination_bound_is_exact() {
+        // Pins the boundary rather than only "much too small fails": an
+        // entry must encode into exactly its own size and fail one byte
+        // under it.
+        let ev = JournalEvent::App::<TestEvent>(TestEvent::Payload(1));
+        let mut probe = [0u8; 256];
+        let needed = encode(1, 0, 0, 0, &ev, &mut probe).expect("probe encode");
+
+        let mut exact = vec![0u8; needed];
+        assert_eq!(
+            encode(1, 0, 0, 0, &ev, &mut exact).expect("exact fit encodes"),
+            needed
+        );
+
+        let mut short = vec![0u8; needed - 1];
+        assert!(
+            encode(1, 0, 0, 0, &ev, &mut short).is_err(),
+            "one byte short must be refused"
+        );
     }
 
     #[test]

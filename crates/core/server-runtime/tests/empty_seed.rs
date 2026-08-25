@@ -27,6 +27,8 @@ use melin_wire_protocol::tcp::BlockingTcpListener;
 struct NoOpEvent;
 
 impl AppEvent for NoOpEvent {
+    const MAX_ENCODED_SIZE: usize = 1;
+
     fn encoded_size(&self) -> usize {
         1
     }
