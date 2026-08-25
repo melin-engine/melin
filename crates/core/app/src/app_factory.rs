@@ -4,14 +4,17 @@
 //! contexts: a fresh primary at startup, a replica preparing to
 //! receive a snapshot transfer, a replica catching up from genesis
 //! via journal replay, and the shadow stage (which maintains a
-//! parallel copy for snapshotting). All share [`AppFactory::empty`].
-//! The primary startup path additionally calls
-//! [`AppFactory::prefault`] to pre-size collections before the
-//! bulk-seed phase, then [`AppFactory::apply_operator_policy`] for
-//! non-journaled config.
+//! parallel copy for snapshotting). All share
+//! [`AppFactory::empty`](crate::app_factory::AppFactory::empty). The
+//! primary startup path additionally calls
+//! [`AppFactory::prefault`](crate::app_factory::AppFactory::prefault) to
+//! pre-size collections before the bulk-seed phase, then
+//! [`AppFactory::apply_operator_policy`](crate::app_factory::AppFactory::apply_operator_policy)
+//! for non-journaled config.
 //!
 //! Operator-controlled policy (rate limits, caps, ...) is kept
-//! separate from journaled state. [`AppFactory::apply_operator_policy`]
+//! separate from journaled state.
+//! [`AppFactory::apply_operator_policy`](crate::app_factory::AppFactory::apply_operator_policy)
 //! reapplies these knobs after snapshot restore so primary and
 //! replica converge on matching values even though the journal
 //! carries no record of them.

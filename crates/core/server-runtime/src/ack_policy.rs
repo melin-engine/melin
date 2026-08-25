@@ -144,14 +144,15 @@ impl AckPolicy {
     }
 
     /// Stable u8 discriminant. The response stage publishes the
-    /// operator-selected policy through an [`AtomicU8`] so it can detect
+    /// operator-selected policy through an
+    /// [`AtomicU8`](std::sync::atomic::AtomicU8) so it can detect
     /// a runtime swap (via the admin `ACK-POLICY` command) with a
     /// relaxed load on every gate iteration — cheaper than crossing a
     /// `Mutex` or carrying a refcounted `Arc<Policy>` snapshot.
     ///
     /// **These values are a wire format**, not just an in-process ABI:
     /// the primary stamps this byte onto every `StreamStart` and
-    /// `Heartbeat`, and the replica decodes it with [`from_u8`] to
+    /// `Heartbeat`, and the replica decodes it with [`from_u8`](Self::from_u8) to
     /// judge auto-promotion (see `raft_promotion`). So they must stay
     /// stable across releases in two directions — the round-trip
     /// `from_u8(as_u8(x)) == Some(x)` has to hold, *and* a value once
@@ -177,7 +178,7 @@ impl AckPolicy {
         }
     }
 
-    /// Inverse of [`as_u8`]. Returns `None` for an unknown byte —
+    /// Inverse of [`as_u8`](Self::as_u8). Returns `None` for an unknown byte —
     /// callers initialise the atomic from a valid policy and the admin
     /// path only writes `as_u8(parse(s)?)`, so an unknown byte
     /// indicates memory corruption or a programmer bug. The response

@@ -9,25 +9,29 @@
 //!
 //! Two levels matter:
 //!
-//! - [`Level::InMemory`] — the event has been accepted into the node's
+//! - [`Level::InMemory`](crate::ack_policy::Level::InMemory) — the event has been accepted into the node's
 //!   pipeline. Survives nothing — process death loses it. Useful as a
 //!   "received this far" signal in cross-node policies.
-//! - [`Level::Persisted`] — `pwrite` *and* `fdatasync` have returned, so
+//! - [`Level::Persisted`](crate::ack_policy::Level::Persisted) — `pwrite` *and* `fdatasync` have returned, so
 //!   the kernel reports the bytes on stable media. Survives power loss
 //!   on any drive, with or without power-loss-protection capacitors.
 //!
 //! # Policy shape
 //!
-//! A [`Policy`] is an AND-combined list of [`Clause`]s. Each clause is
+//! A [`Policy`](crate::ack_policy::Policy) is an AND-combined list of
+//! [`Clause`](crate::ack_policy::Clause)s. Each clause is
 //! `<level>>=<count>` — "at least `count` nodes (counting both the
 //! primary and any connected replicas) have reached `level`". Clauses
 //! are strict: if the current cluster shape can't satisfy the count,
-//! the gate stalls and [`EvalStatus::degraded`] reports it.
+//! the gate stalls and
+//! [`EvalStatus::degraded`](crate::ack_policy::EvalStatus::degraded) reports it.
 //!
 //! # Evaluation
 //!
-//! Given a [`CursorView`] exposing per-(node, level) sequence cursors,
-//! [`Policy::evaluate`] returns the highest sequence at which every
+//! Given a [`CursorView`](crate::ack_policy::CursorView) exposing
+//! per-(node, level) sequence cursors,
+//! [`Policy::evaluate`](crate::ack_policy::Policy::evaluate) returns the
+//! highest sequence at which every
 //! clause is satisfied. Per clause: take the `count`-th largest cursor
 //! at that level — that is the highest seq for which `count` nodes have
 //! crossed. Across clauses: take the `min` (AND semantics).

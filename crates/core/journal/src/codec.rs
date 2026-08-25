@@ -18,8 +18,8 @@
 //! | anchor_hash       | [u8; 32] | 32    | Chain anchor: random salt (fresh journal) or previous segment's tail hash (rotation) |
 //! | header_crc        | u32      | 4     | CRC32C of the preceding 48 bytes    |
 //!
-//! The anchor seeds the segment's BLAKE3 hash chain (see
-//! [`crate::chain`]); chain metadata lives *only* here — the entry
+//! The anchor seeds the segment's BLAKE3 hash chain (see the crate's
+//! `chain` module); chain metadata lives *only* here — the entry
 //! stream contains application events exclusively, so sequence numbers
 //! are dense over user-visible entries.
 //!
@@ -84,7 +84,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// file header gained `starting_sequence`, `anchor_hash`, and its own
 /// CRC; the `GenesisHash` (0x01) and `Checkpoint` (0x02) entry tags were
 /// retired. The chain is anchored per segment and schedule-free —
-/// `chain(S) = BLAKE3(entry bytes ≤ S || anchor)` (see [`crate::chain`]).
+/// `chain(S) = BLAKE3(entry bytes ≤ S || anchor)` (see the crate's `chain`
+/// module).
 pub const FORMAT_VERSION: u16 = 14;
 
 /// Entry magic bytes for corruption/misalignment detection.

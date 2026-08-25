@@ -11,8 +11,10 @@
 //! delegate that decoding to the application without ever naming the
 //! concrete wire enum.
 //!
-//! The runtime calls [`RequestDecoder::decode`] once per incoming
-//! frame; the [`Decoded`] return value encodes exactly the four
+//! The runtime calls
+//! [`RequestDecoder::decode`](crate::decoder::RequestDecoder::decode) once
+//! per incoming frame; the [`Decoded`](crate::decoder::Decoded) return
+//! value encodes exactly the four
 //! outcomes the runtime acts on (drop, publish, reject with reason,
 //! log decode error).
 

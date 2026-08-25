@@ -11,8 +11,9 @@
 //! ~10 % of total process cycles landed on `__vdso_clock_gettime`
 //! before this timer was adopted).
 //!
-//! [`AmortizedTimer::tick`] reads the clock only once every
-//! [`Self::CHECK_MASK`] + 1 iterations (~65 k) **while spinning**. When
+//! [`AmortizedTimer::tick`](crate::amortized_timer::AmortizedTimer::tick)
+//! reads the clock only once every `CHECK_MASK` + 1 iterations (~65 k)
+//! **while spinning**. When
 //! the caller has fallen back to `yield_now()` the loop rate drops to
 //! scheduler timeslice frequency (typically hundreds of iterations per
 //! second), so the mask would delay a 5 s heartbeat by 2^16 × yield_latency

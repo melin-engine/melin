@@ -4,7 +4,7 @@
 //! accept loop, frame reader, ack-policy wiring, admin
 //! endpoint, replication, and the optional DPDK transport. Generic
 //! over `A: Application` — the binary supplies a concrete app via
-//! [`server::run`] (or [`server::run_dpdk`] under `feature = "dpdk"`) along with caller-supplied
+//! [`server::run`] (or `server::run_dpdk` under `feature = "dpdk"`) along with caller-supplied
 //! `AppFactory`, `RequestDecoder`, `ResponseEncoder`, and event-
 //! publisher fn.
 //!

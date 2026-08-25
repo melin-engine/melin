@@ -7,8 +7,8 @@
 //!
 //! Stages register their per-stage histograms with a process-global
 //! `StatsRegistry` (single server per process). Each registered stage
-//! is backed by a [`hdrhistogram::sync::SyncHistogram`]: every recording
-//! thread holds its own [`hdrhistogram::sync::Recorder`] (a per-thread
+//! is backed by a `hdrhistogram::sync::SyncHistogram`: every recording
+//! thread holds its own `hdrhistogram::sync::Recorder` (a per-thread
 //! lock-free local buffer), and the health endpoint snapshots all of
 //! them via `global_registry().snapshot_all()` for the bench's
 //! tick-to-trade dump.
