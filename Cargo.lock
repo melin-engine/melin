@@ -673,7 +673,7 @@ dependencies = [
 [[package]]
 name = "fastcp"
 version = "0.13.0"
-source = "git+https://github.com/melin-engine/fastcp.git?branch=feat%2Fzc-rx-window-and-index-eviction#d105f1fca98b623126457b4f5255e35b0a6a0502"
+source = "git+https://github.com/melin-engine/fastcp.git?branch=feat%2Fzc-rx-window-and-index-eviction#b3c43addb626539a077f259b6309a7ddea2fb2d1"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
