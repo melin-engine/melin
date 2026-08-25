@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use melin_app::AppEvent;
 
 use crate::codec;
-use crate::encoder::{JournalEncoder, MAX_ENTRY_SIZE};
+use crate::encoder::{JournalEncoder, entry_size};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 use crate::segment_file::SegmentFile;
@@ -152,10 +152,13 @@ impl<E: AppEvent> BufferedWriter<E> {
         request_seq: u64,
     ) -> Result<(), JournalError> {
         // The encoder cannot grow a buffer it does not own, so keep a
-        // whole entry's headroom ahead of it. Growth is the rare
-        // oversize-batch fallback — Vec's amortised growth absorbs it.
+        // whole entry's headroom ahead of it. `entry_size::<E>()` rather
+        // than the cross-application ceiling: reserving the ceiling would
+        // make an app with 9-byte events grow its batch buffer twenty
+        // times sooner than it needs to. Growth is the rare oversize-batch
+        // fallback — Vec's amortised growth absorbs it.
         let headroom = self.batch_buf.len() - self.encoder.batch_len();
-        if headroom < MAX_ENTRY_SIZE {
+        if headroom < entry_size::<E>() {
             let grown = self.batch_buf.len() + BATCH_BUF_CAPACITY;
             tracing::warn!(
                 batch_len = self.encoder.batch_len(),
@@ -367,6 +370,8 @@ mod tests {
     struct TestEvent(u64);
 
     impl AppEvent for TestEvent {
+        const MAX_ENCODED_SIZE: usize = 8;
+
         fn encoded_size(&self) -> usize {
             8
         }

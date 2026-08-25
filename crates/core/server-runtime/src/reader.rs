@@ -1368,6 +1368,8 @@ mod tests {
     }
 
     impl AppEvent for TestEvent {
+        const MAX_ENCODED_SIZE: usize = 2;
+
         fn encoded_size(&self) -> usize {
             // Unused — the tests never round-trip through encode/decode.
             2

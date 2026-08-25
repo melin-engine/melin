@@ -204,6 +204,17 @@ pub const ENTRY_META_SIZE: usize = core::mem::size_of::<EntryMetadata>();
 /// CRC32C checksum size in bytes.
 pub(crate) const CRC_SIZE: usize = 4;
 
+/// Bytes every entry costs regardless of its payload: header (20) +
+/// metadata (17) + CRC (4) = 41.
+///
+/// Public because sizing an entry is an application-facing calculation:
+/// `ENTRY_FRAMING_SIZE + E::MAX_ENCODED_SIZE` is what the journal
+/// reserves per event, and what the transport divides a hand-off chunk by
+/// to decide batch length.
+pub const ENTRY_FRAMING_SIZE: usize = ENTRY_HEADER_SIZE + ENTRY_META_SIZE + CRC_SIZE;
+
+const _: () = assert!(ENTRY_FRAMING_SIZE == 41);
+
 const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 52);
 const _: () = assert!(FILE_HEADER_SIZE >= FILE_HEADER_FIELDS_SIZE);
 const _: () = assert!(ENTRY_HEADER_SIZE == 20);
@@ -576,6 +587,8 @@ mod tests {
     }
 
     impl AppEvent for TestEvent {
+        const MAX_ENCODED_SIZE: usize = 9;
+
         fn encoded_size(&self) -> usize {
             match self {
                 TestEvent::Ping => 1,
@@ -661,6 +674,12 @@ mod tests {
     struct FatEvent;
 
     impl AppEvent for FatEvent {
+        // Declares the truth about itself: larger than any entry can
+        // hold. A `JournalEncoder<FatEvent>` would therefore fail to
+        // compile, which is the intended outcome — this type exists only
+        // to drive `codec::encode` directly.
+        const MAX_ENCODED_SIZE: usize = 4096;
+
         fn encoded_size(&self) -> usize {
             4096
         }

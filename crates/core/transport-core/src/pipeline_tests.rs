@@ -38,7 +38,7 @@ use crate::pipeline::build_replica_pipeline;
 use crate::pipeline::{AdoptedRotation, StreamMark};
 use crate::pipeline::{
     InputSlot, JournalStage, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload, OutputSlot,
-    build_pipeline_with_replication,
+    build_pipeline_with_replication, max_journal_batch,
 };
 use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport};
 use crate::trace::mono_trace_ns;
@@ -2957,7 +2957,8 @@ fn preparer_arms_for_size_and_replica_modes_only() {
 #[test]
 fn size_trigger_tracks_the_segments_real_size() {
     const THRESHOLD: u64 = 16 * 1024;
-    /// Generous bound on one encoded entry (`MAX_ENTRY_SIZE` is 144).
+    /// Generous bound on one encoded entry for this test's event type
+    /// (framing is 41 bytes; `TestEvent::MAX_ENCODED_SIZE` is 9).
     const ONE_ENTRY: u64 = 256;
 
     let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
@@ -3600,4 +3601,72 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     shutdown.store(true, Ordering::Relaxed);
     let _writer = t_journal.join().unwrap();
     let _app = t_matching.join().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Journal batch sizing
+// ---------------------------------------------------------------------------
+
+/// A wide-event application, for the sizing tests below. Never journaled
+/// — only its declared bound is read.
+#[derive(Debug, Clone, Copy)]
+struct WideEvent;
+
+impl melin_app::AppEvent for WideEvent {
+    const MAX_ENCODED_SIZE: usize = 289;
+
+    fn encoded_size(&self) -> usize {
+        Self::MAX_ENCODED_SIZE
+    }
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        buf[..Self::MAX_ENCODED_SIZE].fill(0);
+        Self::MAX_ENCODED_SIZE
+    }
+
+    fn decode(_buf: &[u8]) -> Result<Self, melin_app::CodecError> {
+        Ok(WideEvent)
+    }
+
+    fn is_query(&self) -> bool {
+        false
+    }
+}
+
+/// The invariant the sequencer depends on: it encodes a whole batch into
+/// one claimed chunk with no mid-batch byte cut, so a full batch must fit.
+/// This is what stops a wide-event app from overrunning the slot.
+#[test]
+fn a_full_batch_always_fits_one_handoff_chunk() {
+    fn check<E: melin_app::AppEvent>(label: &str) {
+        let bytes = max_journal_batch::<E>() * melin_journal::encoder::entry_size::<E>();
+        assert!(
+            bytes <= melin_journal::write_ring::CHUNK_SIZE,
+            "{label}: a full batch is {bytes} bytes against a {}-byte chunk",
+            melin_journal::write_ring::CHUNK_SIZE
+        );
+    }
+    check::<TestEvent>("narrow");
+    check::<WideEvent>("wide");
+}
+
+/// A narrow-event app keeps the full ceiling; a wide-event one trades
+/// batch length for width rather than growing the ring.
+#[test]
+fn batch_length_adapts_to_event_width() {
+    assert_eq!(
+        max_journal_batch::<TestEvent>(),
+        MAX_JOURNAL_BATCH,
+        "a narrow-event app must not be penalised by another app's width"
+    );
+
+    let wide = max_journal_batch::<WideEvent>();
+    assert!(
+        wide < MAX_JOURNAL_BATCH,
+        "a 289-byte event should not still batch {MAX_JOURNAL_BATCH}"
+    );
+    assert!(
+        wide > 1000,
+        "batch collapsed to {wide} — fsync amortisation would suffer"
+    );
 }

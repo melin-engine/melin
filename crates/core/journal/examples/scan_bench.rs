@@ -28,6 +28,8 @@ struct BenchEvent {
 }
 
 impl AppEvent for BenchEvent {
+    const MAX_ENCODED_SIZE: usize = 40;
+
     fn encoded_size(&self) -> usize {
         40
     }

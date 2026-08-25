@@ -362,6 +362,8 @@ mod tests {
     struct TestEvent(u32);
 
     impl AppEvent for TestEvent {
+        const MAX_ENCODED_SIZE: usize = 4;
+
         fn encoded_size(&self) -> usize {
             4
         }

@@ -37,16 +37,27 @@ pub use melin_pipeline::ring::Full;
 
 /// Bytes per slot.
 ///
-/// Must hold the largest batch the pipeline can encode: its cap is
-/// `MAX_JOURNAL_BATCH` (4096) events of at most
-/// [`crate::encoder::MAX_ENTRY_SIZE`] (144) bytes = 576 KiB. The
-/// sequencer also stops filling a slot once fewer than one entry's
-/// headroom remains, so the bound is enforced at both ends.
+/// Must hold the largest batch the pipeline can encode. That used to be a
+/// fixed product — `MAX_JOURNAL_BATCH` (4096) events at a fixed 144-byte
+/// entry cap = 576 KiB — which meant every application paid for the
+/// widest event any application might have. It is now the other way
+/// round: the chunk size is fixed and the *batch length* adapts, because
+/// the transport clamps its batch cap to `CHUNK_SIZE /
+/// entry_size::<E>()`. An app with 9-byte events still batches 4096; one
+/// with 288-byte payloads batches ~1985, and both write a similar number
+/// of bytes per fsync, which is what the amortisation actually depends
+/// on.
+///
+/// The sequencer has no mid-batch byte cut — it encodes a whole borrowed
+/// span into one claimed slot — so that clamp is what keeps a batch
+/// inside a chunk, and it is not optional.
 pub const CHUNK_SIZE: usize = 640 * 1024;
 
-// Compile-time proof of the paragraph above: a full-size batch fits in
-// one slot. Keep in sync with `MAX_JOURNAL_BATCH` in the pipeline.
-const _: () = assert!(4096 * crate::encoder::MAX_ENTRY_SIZE <= CHUNK_SIZE);
+// A slot must hold at least one entry of any application, or the clamp
+// above would compute a zero-length batch and the sequencer would make no
+// progress. `MAX_ENTRY_SIZE` is the cross-application ceiling, so this
+// covers every `E` at once.
+const _: () = assert!(crate::encoder::MAX_ENTRY_SIZE <= CHUNK_SIZE);
 
 /// Slots in the ring.
 ///

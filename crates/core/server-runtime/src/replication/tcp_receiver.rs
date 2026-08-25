@@ -1139,6 +1139,8 @@ mod tests {
         pub(super) struct EvtAdd(pub(super) u64);
 
         impl AppEvent for EvtAdd {
+            const MAX_ENCODED_SIZE: usize = 8;
+
             fn encoded_size(&self) -> usize {
                 8
             }
