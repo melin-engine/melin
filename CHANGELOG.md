@@ -26,6 +26,25 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **An application declares how wide its events can get**, via
+  `AppEvent::MAX_ENCODED_SIZE`, and the journal sizes itself from that.
+  Previously every entry got a fixed 144-byte reservation — 102 bytes of
+  payload — which was invisible to application authors until an oversized
+  event failed at run time, and which could not be raised without making
+  every application pay for the widest event any of them might have. The
+  relationship now inverts: ring slots stay a fixed size and the batch
+  *length* adapts, so an application with narrow events still batches 4,096
+  while one with 288-byte payloads batches about 1,588. Both write a
+  comparable number of bytes per sync, which is what the device cost
+  amortises over, and memory is unchanged for everyone. The ceiling on an
+  application event rises from 102 to 1,047 bytes, enough for the widest
+  event a 1 KiB client frame can induce. Source-breaking: the constant is
+  required and has no default — the right value is a property of the
+  implementor's wire format, and a default would hand a wrong bound to the
+  application that most needed to think about it. Declaring more than the
+  journal can carry fails to compile; an event that outgrows its own
+  declared bound is refused at encode time rather than corrupting a
+  reservation several layers away.
 - **"Durability mode" is now the "ack policy"**, and its values name the
   copies that must exist before a response is released: `disk` (one fsynced
   copy), `ram` (two in-memory copies), `disk+ram` (one fsynced copy plus a
