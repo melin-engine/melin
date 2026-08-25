@@ -23,12 +23,12 @@ dpdk-sys = ["dep:libc", "dep:bindgen", "dep:pkg-config", "dep:cc"]
 # `std` feature needed for smoltcp to link against system time; `medium-ethernet`
 # for Ethernet frame processing; `proto-ipv4` + `socket-tcp` for TCP/IPv4.
 #
-# Tracking a branch while the zero-copy RX window bound, the
-# descriptor-capacity ordering fix and `Interface::forget_tcp_socket` land
-# upstream. `version` is deliberately omitted so `cargo publish` fails loudly
-# rather than silently resolving to the registry copy, which lacks all three.
-# Restore `version = "0.14"` once fastcp is published.
-smoltcp = { package = "fastcp", git = "https://github.com/melin-engine/fastcp.git", branch = "feat/zc-rx-window-and-index-eviction", default-features = false, features = [
+# `fastcp` is our smoltcp fork, now published to crates.io: 0.13.1 is the
+# release of the branch this crate used to track, so it carries the
+# zero-copy RX window bound, the descriptor-capacity ordering fix and
+# `Interface::forget_tcp_socket`. Back on the registry the workspace's
+# source policy (`deny.toml`: no git dependencies) holds again.
+smoltcp = { package = "fastcp", version = "0.13.1", default-features = false, features = [
     "std",
     "medium-ethernet",
     "proto-ipv4",

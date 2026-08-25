@@ -101,6 +101,46 @@ const SOCKET_TX_BUF_SIZE: usize = 16 * 1024;
 /// poll rate gives ~10ms resolution — plenty for TCP timers.
 const TIMESTAMP_REFRESH_INTERVAL: u32 = 100;
 
+/// How often the statically configured gateway is re-seeded into the
+/// neighbor cache, in milliseconds.
+///
+/// smoltcp expires a neighbor entry 60 s after it was filled, and the
+/// gateway is the one entry nothing refreshes on its own: inbound frames
+/// teach us `(source MAC, source IP)`, and a packet forwarded by the
+/// gateway carries the *originator's* IP, never the gateway's own. Since
+/// off-subnet destinations resolve through the default route's next hop —
+/// the gateway's IP — that entry expiring silences every off-subnet
+/// destination until an ARP that the PF swallows in bifurcated L3 mode.
+///
+/// 20 s gives three re-seeds per lifetime, so two consecutive misses
+/// (a stalled poll loop, a coarse cached timestamp) still leave the entry
+/// live. The cost is one injected 42-byte ARP frame per interval.
+const GATEWAY_RESEED_INTERVAL_MS: i64 = 20_000;
+
+/// smoltcp's neighbor entry lifetime. Not exposed by the crate (it is
+/// `pub(crate)` there), so this is a copy: if a future fastcp release
+/// shortens it, nothing here breaks — the const assert below only pins
+/// our own interval against the value we believe. Verify it against
+/// `iface::neighbor::Cache::ENTRY_LIFETIME` when bumping fastcp.
+const NEIGHBOR_ENTRY_LIFETIME_MS: i64 = 60_000;
+
+// A re-seed interval at or above the entry lifetime would leave a window
+// where the gateway is unresolvable — the exact failure this timer exists
+// to prevent.
+const _: () = assert!(GATEWAY_RESEED_INTERVAL_MS < NEIGHBOR_ENTRY_LIFETIME_MS);
+
+/// Whether the gateway entry is due for a re-seed at `now`.
+///
+/// Split out from [`DpdkTransport::poll`] so the interval arithmetic —
+/// the part that can be wrong — is testable without a NIC. Re-seeds when
+/// the interval has elapsed, and also when `now` runs backwards: the poll
+/// loop's cached timestamp is sampled from the wall clock, so a clock step
+/// must not park the entry until the clock catches up again.
+fn gateway_reseed_due(now: Instant, last_seeded: Instant) -> bool {
+    let elapsed = now.total_millis() - last_seeded.total_millis();
+    !(0..GATEWAY_RESEED_INTERVAL_MS).contains(&elapsed)
+}
+
 /// Configuration for the DPDK transport.
 #[derive(Clone)]
 pub struct DpdkConfig {
@@ -248,6 +288,14 @@ pub struct DpdkTransport {
     /// Total pending TX bytes across all connections. Avoids iterating
     /// tx_queues.values().any() on every poll cycle.
     pending_tx_bytes: usize,
+    /// Statically configured gateway, kept so `poll` can re-seed it before
+    /// its neighbor entry expires. `None` when the deployment is
+    /// single-subnet (no gateway configured) — nothing to refresh then.
+    /// A tuple rather than two fields: the IP is useless without the MAC,
+    /// and holding them together makes half-configured unrepresentable.
+    gateway: Option<(Ipv4Addr, [u8; 6])>,
+    /// When the gateway was last seeded. Only read when `gateway` is set.
+    gateway_seeded_at: Instant,
     /// Shared EAL/mempool/ports. MUST be the last field so it drops LAST:
     /// Rust drops fields in declaration order, and `device`/`sockets`/
     /// `tx_queues` return their in-flight mbufs to the mempool when they
@@ -498,6 +546,8 @@ impl DpdkTransport {
             cached_timestamp: now,
             poll_count: 0,
             pending_tx_bytes: 0,
+            gateway: config.gateway.zip(config.gateway_mac),
+            gateway_seeded_at: now,
         };
 
         // In bifurcated L3 mode, ARP for the gateway would not match our
@@ -505,7 +555,8 @@ impl DpdkTransport {
         // kernel instead of smoltcp. Seed the gateway MAC statically
         // (operators source it from `ip neigh` on the host) so smoltcp
         // can route its first outbound packet without needing ARP.
-        if let (Some(gw), Some(gw_mac)) = (config.gateway, config.gateway_mac) {
+        // `poll` re-seeds it on `GATEWAY_RESEED_INTERVAL_MS` from here.
+        if let Some((gw, gw_mac)) = transport.gateway {
             transport.seed_neighbor(gw, gw_mac);
         }
 
@@ -647,6 +698,17 @@ impl DpdkTransport {
         for (mac, ip_bytes) in self.device.take_learned_neighbors() {
             let ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
             self.seed_neighbor(ip, mac);
+        }
+
+        // Inbound frames refresh every peer we talk to, but never the
+        // gateway (see GATEWAY_RESEED_INTERVAL_MS), so its entry is the
+        // one that has to be re-seeded on a timer or off-subnet traffic
+        // stops resolving 60 s after startup.
+        if let Some((gw, gw_mac)) = self.gateway
+            && gateway_reseed_due(self.cached_timestamp, self.gateway_seeded_at)
+        {
+            self.seed_neighbor(gw, gw_mac);
+            self.gateway_seeded_at = self.cached_timestamp;
         }
         // Drain any ARP frames injected by seed_neighbor() into the
         // batch so they're processed before the SYN.
@@ -1131,5 +1193,44 @@ impl<'a> smoltcp::phy::Device for DpdkDeviceRef<'a> {
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         self.0.capabilities()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smoltcp::time::Duration;
+
+    #[test]
+    fn reseed_is_not_due_before_the_interval_elapses() {
+        let seeded = Instant::from_millis(1_000);
+        assert!(!gateway_reseed_due(seeded, seeded));
+        assert!(!gateway_reseed_due(
+            seeded + Duration::from_millis(GATEWAY_RESEED_INTERVAL_MS as u64 - 1),
+            seeded
+        ));
+    }
+
+    #[test]
+    fn reseed_is_due_once_the_interval_elapses() {
+        let seeded = Instant::from_millis(1_000);
+        assert!(gateway_reseed_due(
+            seeded + Duration::from_millis(GATEWAY_RESEED_INTERVAL_MS as u64),
+            seeded
+        ));
+        assert!(gateway_reseed_due(
+            seeded + Duration::from_millis(600_000),
+            seeded
+        ));
+    }
+
+    /// The poll loop samples its timestamp from the wall clock, so a step
+    /// backwards must re-seed rather than park the entry until the clock
+    /// catches up — which for a large step outlasts the 60 s lifetime.
+    #[test]
+    fn reseed_is_due_when_the_clock_steps_backwards() {
+        let seeded = Instant::from_millis(600_000);
+        assert!(gateway_reseed_due(Instant::from_millis(599_999), seeded));
+        assert!(gateway_reseed_due(Instant::from_millis(0), seeded));
     }
 }
