@@ -93,7 +93,10 @@ struct SlotHeader {
     event_tag: u8,
 }
 
-const FRAME_HEADER_LEN: usize = core::mem::size_of::<FrameHeader>();
+/// Visible to the crate because the journal batch has to be sized so a
+/// finished `InputBatch` frame fits one replication chunk, and the header
+/// is part of that frame.
+pub(crate) const FRAME_HEADER_LEN: usize = core::mem::size_of::<FrameHeader>();
 const SLOT_HEADER_LEN: usize = core::mem::size_of::<SlotHeader>();
 
 // Pin the wire layout. Reordering or extending these structs would silently

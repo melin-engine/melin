@@ -227,21 +227,41 @@ pub const MAX_JOURNAL_BATCH: usize = 4096;
 
 /// Events per journal batch for a given application.
 ///
-/// The sequencer encodes a whole batch into one claimed
-/// [`CHUNK_SIZE`](melin_journal::write_ring::CHUNK_SIZE) slot and has no
-/// mid-batch byte cut, so the batch has to be bounded by what a chunk
-/// holds — otherwise a wide-event application overruns the slot and the
-/// encoder refuses the entry, failing the pipeline.
+/// A finished batch lands whole in a pre-allocated slot of two rings, and
+/// neither can take it in pieces:
 ///
-/// Bounding the *count* rather than growing the chunk is what keeps ring
-/// memory independent of event width: the hand-off ring stays 40 MiB for
-/// every application, and only batch length varies. Bytes per fsync stay
-/// in the same range either way — 4096 × ~104 B ≈ 416 KiB for a narrow
-/// app, ~1985 × 330 B ≈ 640 KiB for a 288-byte-payload one — and bytes,
-/// not event count, is what the NVMe write amortises over.
+/// - the journal hand-off ring
+///   ([`CHUNK_SIZE`](melin_journal::write_ring::CHUNK_SIZE), 640 KiB) —
+///   the sequencer encodes the batch into one claimed slot with no
+///   mid-batch byte cut, so an overrun makes the encoder refuse the entry
+///   and fails the pipeline;
+/// - the replication ring
+///   ([`CHUNK_SIZE`](melin_journal::replication::CHUNK_SIZE), 512 KiB) —
+///   with a replica attached the same entries are framed into one
+///   `InputBatch`, and a frame too large for a slot is refused with a
+///   panic, since it can be neither split nor dropped without tearing the
+///   replica's journal.
+///
+/// So the batch is bounded by the **smaller** of the two. Dividing by the
+/// full [`entry_size`](melin_journal::encoder::entry_size) is deliberately
+/// conservative for the replication side, which strips 6 bytes of magic
+/// and CRC from each entry: the ~2% of batch length that costs is not
+/// worth a second, subtly different divisor.
+///
+/// Bounding the *count* rather than growing either chunk is what keeps
+/// ring memory independent of event width: the rings stay 40 MiB and
+/// 128 MiB for every application, and only batch length varies. Bytes per
+/// fsync stay in the same range either way — 4096 × ~104 B ≈ 416 KiB for
+/// a narrow app, ~1588 × 330 B ≈ 512 KiB for a 288-byte-payload one — and
+/// bytes, not event count, is what the NVMe write amortises over.
 pub const fn max_journal_batch<E: AppEvent>() -> usize {
-    let by_chunk =
-        melin_journal::write_ring::CHUNK_SIZE / melin_journal::encoder::entry_size::<E>();
+    // `Ord::min` is not const, hence the branches.
+    let chunk = if melin_journal::replication::CHUNK_SIZE < melin_journal::write_ring::CHUNK_SIZE {
+        melin_journal::replication::CHUNK_SIZE
+    } else {
+        melin_journal::write_ring::CHUNK_SIZE
+    };
+    let by_chunk = chunk / melin_journal::encoder::entry_size::<E>();
     if by_chunk < MAX_JOURNAL_BATCH {
         by_chunk
     } else {
@@ -1030,9 +1050,10 @@ impl<E: AppEvent> Sequencer<E> {
     /// evaluated at monomorphisation instead of leaving a division for
     /// the optimiser to fold.
     ///
-    /// The `assert!` closes the reasoning that spans two crates — the
-    /// journal guarantees one entry fits a chunk
-    /// (`MAX_ENTRY_SIZE <= CHUNK_SIZE`) and that `E` fits one entry
+    /// The `assert!` closes the reasoning that spans two crates — both
+    /// rings guarantee one entry fits a chunk
+    /// (`MAX_ENTRY_SIZE <= CHUNK_SIZE`, asserted against each) and the
+    /// encoder guarantees `E` fits one entry
     /// (`JournalEncoder::FITS_ONE_ENTRY`), so this can never be zero.
     /// A zero would make the sequencer read empty spans forever.
     const MAX_BATCH: usize = {

@@ -42,15 +42,18 @@ pub use melin_pipeline::ring::Full;
 /// entry cap = 576 KiB — which meant every application paid for the
 /// widest event any application might have. It is now the other way
 /// round: the chunk size is fixed and the *batch length* adapts, because
-/// the transport clamps its batch cap to `CHUNK_SIZE /
-/// entry_size::<E>()`. An app with 9-byte events still batches 4096; one
-/// with 288-byte payloads batches ~1985, and both write a similar number
-/// of bytes per fsync, which is what the amortisation actually depends
-/// on.
+/// the transport clamps its batch cap to what one chunk holds. An app
+/// with 9-byte events still batches 4096; one with 288-byte payloads
+/// batches ~1588, and both write a similar number of bytes per fsync,
+/// which is what the amortisation actually depends on.
 ///
 /// The sequencer has no mid-batch byte cut — it encodes a whole borrowed
 /// span into one claimed slot — so that clamp is what keeps a batch
-/// inside a chunk, and it is not optional.
+/// inside a chunk, and it is not optional. Note that this is not the only
+/// chunk a batch has to fit: with a replica attached the same entries are
+/// framed into a [`crate::replication`] slot, which is smaller — so
+/// whenever a chunk is what binds the batch, it is that one. See
+/// `max_journal_batch`.
 pub const CHUNK_SIZE: usize = 640 * 1024;
 
 // A slot must hold at least one entry of any application, or the clamp
