@@ -92,7 +92,7 @@ impl ReplicationProducer {
     /// the slowest consumer).
     ///
     /// # Panics
-    /// Panics if `data.len() > CHUNK_SIZE` (128 KiB).
+    /// Panics if `data.len() > CHUNK_SIZE` (512 KiB).
     pub fn publish(&mut self, data: &[u8], end_sequence: u64) {
         assert!(
             data.len() <= CHUNK_SIZE,

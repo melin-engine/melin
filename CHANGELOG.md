@@ -42,7 +42,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   required and has no default — the right value is a property of the
   implementor's wire format, and a default would hand a wrong bound to the
   application that most needed to think about it. Declaring more than the
-  journal can carry fails to compile; an event that outgrows its own
+  journal can carry fails to build (`cargo build` or `cargo test` — the
+  check runs when the journal is instantiated for the type, which `cargo
+  check` does not do); an event that outgrows its own
   declared bound is refused at encode time rather than corrupting a
   reservation several layers away.
 - **"Durability mode" is now the "ack policy"**, and its values name the
@@ -93,6 +95,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Removed
 
+- **`melin_journal::codec::MAX_PAYLOAD_SIZE`.** It described the `u16` length
+  field, not a bound any application could rely on, and its documentation
+  said codecs could assume it — 65 KiB against a real ceiling of 1,047
+  bytes. The bound that applies is `AppEvent::MAX_ENCODED_SIZE`.
 - **`PipelineCores::repl_sender`.** Source-breaking for anything constructing
   the struct directly — drop the initializer. No `--cores` value needs to
   change: the fifth entry is still validated and then ignored, deliberately,

@@ -3702,10 +3702,14 @@ fn batch_length_adapts_to_event_width() {
 /// application under sustained load, with a replica attached, has to
 /// survive its own full batch.
 ///
-/// The input ring is filled ahead of the sequencer so one read span is as
-/// long as the stage will allow — the span is bounded by the per-app cap,
-/// *not* by the configured `max_batch`, because the sync check runs only
-/// after the whole span is encoded.
+/// The input ring is filled *before* the sequencer starts, so its first
+/// read span is as long as the stage will allow by construction rather
+/// than by outrunning it — the span is bounded by the per-app cap, *not*
+/// by the configured `max_batch`, because the sync check runs only after
+/// the whole span is encoded. A `Shutdown` sentinel behind the events
+/// ends the run from inside the steady-state loop, which is the path
+/// that failed; the shutdown flag would route everything through the
+/// drain instead.
 ///
 /// Not gated on `no-persist`: that feature skips the write syscall, not
 /// the replication publish, so the batch is framed either way.
@@ -3715,7 +3719,8 @@ fn a_wide_event_app_survives_a_full_batch_with_a_replica_attached() {
     let path = dir.path().join("wide.journal");
     let writer = melin_journal::BufferedWriter::<WideEvent>::create(&path).unwrap();
 
-    let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot<WideEvent>>::new(8192)
+    // Room for every event plus the sentinel while nothing is consuming.
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot<WideEvent>>::new(16384)
         .add_consumer()
         .build();
     let consumer = consumers.pop().unwrap();
@@ -3740,10 +3745,8 @@ fn a_wide_event_app_survives_a_full_batch_with_a_replica_attached() {
         ],
     );
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let s = Arc::clone(&shutdown);
-    let handle = std::thread::spawn(move || stage.run(&s));
-
+    // Every event sits unread when the stage starts, so nothing about
+    // the span length depends on thread timing.
     let total = 2 * MAX_JOURNAL_BATCH as u64;
     for i in 0..total {
         producer.publish(InputSlot::<WideEvent> {
@@ -3752,8 +3755,15 @@ fn a_wide_event_app_survives_a_full_batch_with_a_replica_attached() {
             ..Default::default()
         });
     }
+    producer.publish(InputSlot::<WideEvent> {
+        event: melin_journal::JournalEvent::Shutdown,
+        ..Default::default()
+    });
 
-    shutdown.store(true, Ordering::Relaxed);
+    // Never raised: the sentinel is what ends the run.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handle = std::thread::spawn(move || stage.run(&shutdown));
+
     let writer = handle
         .join()
         .expect("the sequencing thread must not die on a full batch")

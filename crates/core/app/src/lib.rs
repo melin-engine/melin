@@ -212,6 +212,11 @@ pub trait AppEvent: Copy {
     /// time against each event's actual `encoded_size`, which is refused
     /// if it exceeds what was declared.
     ///
+    /// The compile-time check fires when the journal is instantiated for
+    /// this type, so it surfaces on `cargo build` and `cargo test`, not on
+    /// `cargo check` — a check-only CI or rust-analyzer will stay green
+    /// on a bound the journal cannot carry.
+    ///
     /// Deliberately has no default. The right value is a property of the
     /// implementor's wire format and nothing else can infer it; a default
     /// would silently hand a wrong bound to exactly the application that

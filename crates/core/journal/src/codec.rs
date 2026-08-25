@@ -252,13 +252,6 @@ const TAG_TICK: u8 = 0x03;
 const TAG_EPOCH_BUMP: u8 = 0x04;
 const TAG_APP: u8 = 0x80;
 
-/// Bytes after the header + key_hash + request_seq reserved for the
-/// event payload, excluding the CRC. The `length` field is a `u16` and
-/// covers `key_hash(8) + request_seq(8) + tag(1) + payload`, so the
-/// payload itself can grow to `u16::MAX - 17 ≈ 65 518` bytes before the
-/// frame overflows. App codecs may assume their `encoded_size` fits.
-pub const MAX_PAYLOAD_SIZE: usize = u16::MAX as usize - 17;
-
 /// Encode the file header into `buf`.
 ///
 /// `buf` must be exactly `sector_size` bytes long. Writes the meaningful
@@ -361,11 +354,11 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
 ///   one place that can name what went wrong, instead of blowing a
 ///   reservation layers away.
 /// - **A destination too small for the entry.** The bound an application
-///   actually has to respect is not [`MAX_PAYLOAD_SIZE`] (which only
-///   reflects the `u16` length field) but whatever the caller's buffer
-///   leaves after framing. Without this check an application whose
-///   `encoded_size` overran it took the journal thread down mid-batch
-///   with a slice-range panic naming neither the app nor the limit.
+///   actually has to respect is not the `u16` length field's ceiling but
+///   whatever the caller's buffer leaves after framing. Without this
+///   check an application whose `encoded_size` overran it took the
+///   journal thread down mid-batch with a slice-range panic naming
+///   neither the app nor the limit.
 pub fn encode<E: AppEvent>(
     sequence: u64,
     timestamp_ns: u64,
@@ -407,10 +400,10 @@ pub fn encode<E: AppEvent>(
             // only place an under-declared bound can still be caught:
             // past here the event is just bytes, and the reservations it
             // overran were sized from `MAX_ENCODED_SIZE` long before.
-            // Subsumes `MAX_PAYLOAD_SIZE` for any `E` the encoder accepts
-            // — the compile-time gate keeps `MAX_ENCODED_SIZE` far under
-            // the `u16` length field — and the `u16::try_from` below
-            // still backstops an `E` that never built an encoder.
+            // Also keeps the payload under the `u16` length field for
+            // any `E` the encoder accepts — the compile-time gate holds
+            // `MAX_ENCODED_SIZE` far below it — and the `u16::try_from`
+            // below still backstops an `E` that never built an encoder.
             if n > E::MAX_ENCODED_SIZE {
                 return Err(JournalError::CorruptEntry {
                     sequence,
@@ -418,8 +411,8 @@ pub fn encode<E: AppEvent>(
                 });
             }
             // The real bound on an app payload is what the destination
-            // leaves after framing, not `MAX_PAYLOAD_SIZE`. Checked before
-            // the subslice below, which would otherwise panic.
+            // leaves after framing, not the `u16` length field. Checked
+            // before the subslice below, which would otherwise panic.
             if buf.len() < pos + n + CRC_SIZE {
                 return Err(JournalError::CorruptEntry {
                     sequence,
