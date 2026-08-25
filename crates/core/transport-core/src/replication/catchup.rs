@@ -540,7 +540,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
 }
 
 /// Bridge a replica from journal catch-up into live ring streaming,
-/// returning the slot's seeded [`SentHighWater`].
+/// returning the slot's seeded [`SentHighWater`](super::SentHighWater).
 ///
 /// The journal stage only publishes to a slot's ring while the slot's
 /// `active_flag` is set — and the bulk catch-up pass runs with it
@@ -559,7 +559,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
 /// 2. **Residual journal pass** from `bulk_catchup_end`: re-reads off
 ///    the disk the entries that fell into the window — those skipped
 ///    from the ring because their publish-check preceded the store.
-/// 3. **Contiguity drain** ([`drain_into_contiguity`]): before going
+/// 3. **Contiguity drain** (`drain_into_contiguity`): before going
 ///    live, walk the ring's accumulated chunks. The first chunk that
 ///    is *ahead* of what has been streamed is the boundary — its lead
 ///    sequence proves the journal observed the activation, so every
@@ -573,7 +573,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
 /// published chunks since activation, so the drain takes the
 /// chunk-present path and closes the gap deterministically; the
 /// receiver's contiguity gate never fires. The drain returns `Err`
-/// only if the journal stalls past [`HANDOFF_BRIDGE_TIMEOUT`] while a
+/// only if the journal stalls past `HANDOFF_BRIDGE_TIMEOUT` while a
 /// chunk waits (tear down and reconnect, never ship a gap).
 ///
 /// The one case the sender does *not* close is a skipped entry still

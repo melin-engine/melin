@@ -498,7 +498,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 ///
 /// This type is the stage before it runs: configuration, plus the
 /// composed writer. [`run`](Self::run) splits the writer, starts the
-/// disk thread on the file half, and drives a [`Sequencer`] over the
+/// disk thread on the file half, and drives a `Sequencer` over the
 /// stream half.
 ///
 /// The sequencing thread never touches the device. It orders events,
@@ -744,7 +744,7 @@ impl StreamMark {
 /// slot past the mark's position), the journal stage pops.
 /// `Mutex<VecDeque>` rather than a lock-free queue: marks are strictly
 /// cold (rotations a few per gigabyte, chain checks one per
-/// [`CHAIN_CHECK_INTERVAL_BATCHES`] fsync batches), and the journal
+/// `CHAIN_CHECK_INTERVAL_BATCHES` fsync batches), and the journal
 /// stage only locks at batch/sync boundaries — never per entry.
 pub type StreamMarkQueue = Arc<Mutex<VecDeque<StreamMark>>>;
 
@@ -2311,7 +2311,7 @@ impl<E: AppEvent> JournalStage<E> {
     /// Spawn the background segment preparer in zero-fill mode. Called
     /// from the stage's `run` before entering `run_sync`; no-op if
     /// already spawned. Arming policy lives in
-    /// [`JournalStage::arm_preparer_if_recurring`].
+    /// `JournalStage::arm_preparer_if_recurring`.
     ///
     /// Zero-fill — physical zeros, not `FALLOC_FL_ZERO_RANGE` — is the
     /// load-bearing detail: appends into pre-written extents generate

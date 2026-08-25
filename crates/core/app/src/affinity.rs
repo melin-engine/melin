@@ -14,7 +14,8 @@
 //! `SCHED_OTHER` if unavailable.
 //!
 //! **Pipeline `--cores 0` means "do not pin"**. The pipeline-thread
-//! wrapper [`pin_thread`] treats `0` as a sentinel and skips affinity
+//! wrapper [`pin_thread`](crate::affinity::pin_thread) treats `0` as a
+//! sentinel and skips affinity
 //! entirely, leaving the thread on the default OS scheduler across all
 //! CPUs. Production deployments never run pipeline threads on core 0
 //! (it is reserved for the kernel, IRQ handlers, and other system
@@ -24,7 +25,8 @@
 //! — which previously caused the io_uring reader to starve under
 //! contention and the failover suite to time out.
 //!
-//! The lower-level [`pin_to_core`] still pins literally — non-pipeline
+//! The lower-level [`pin_to_core`](crate::affinity::pin_to_core) still
+//! pins literally — non-pipeline
 //! callers (e.g. the bench progress thread that pins to core 0 on
 //! purpose to stay off the bench cores) keep the old semantics.
 
@@ -37,7 +39,7 @@
 /// Affinity is always set. `SCHED_FIFO` is granted only on a non-zero core
 /// that the kernel reports isolated (listed in
 /// `/sys/devices/system/cpu/isolated`, i.e. booted with `isolcpus=`) — see
-/// [`core_is_isolated`]. On a shared core a busy-spinning RT thread would
+/// `core_is_isolated`. On a shared core a busy-spinning RT thread would
 /// starve every `SCHED_OTHER` thread co-located with it, so RT priority is
 /// withheld there (the thread keeps plain affinity). Core 0 is the shared
 /// housekeeping core and never gets RT priority regardless.
@@ -254,7 +256,7 @@ pub fn restore_context(ctx: &SchedContext) -> Result<(), String> {
 /// The only place that ordering can be broken is the parent, before the
 /// child exists. Call this, spawn, then [`restore_context`]:
 ///
-/// ```ignore
+/// ```text
 /// let saved = take_context()?;
 /// prepare_child_context(child_core);
 /// let handle = std::thread::Builder::new().spawn(move || { … })?;

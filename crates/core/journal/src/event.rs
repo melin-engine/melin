@@ -5,8 +5,8 @@
 //! 1. **Transport-intrinsic**: `Tick` for the scheduler clock (and the
 //!    in-memory-only `Shutdown` sentinel). Hash-chain metadata is *not*
 //!    an event — the chain anchor lives in the segment file header and
-//!    the chain itself is recomputed from entry bytes (see
-//!    [`crate::chain`]), so every journaled entry carries a dense,
+//!    the chain itself is recomputed from entry bytes (see the crate's
+//!    `chain` module), so every journaled entry carries a dense,
 //!    user-visible sequence number.
 //! 2. **Application**: delivered to the `Application` for state mutation,
 //!    wrapped in `App(E)` so the journal is agnostic to what the app does.

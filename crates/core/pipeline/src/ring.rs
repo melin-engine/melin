@@ -318,7 +318,7 @@ impl<T: Copy + Default> Producer<T> {
 /// Handle for accumulating in-place publishes that commit with a single
 /// release store on the cursor. See [`Producer::batch`].
 ///
-/// Drop without [`commit`] rolls back — no slots are published.
+/// Drop without [`commit`](Batch::commit) rolls back — no slots are published.
 pub struct Batch<'a, T: Copy + Default> {
     producer: &'a mut Producer<T>,
     start_seq: u64,
@@ -359,7 +359,7 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
     /// fills the ring, commits the accumulated entries (single release
     /// store), starts a fresh batch at the new cursor, then retries.
     ///
-    /// Blocking equivalent of [`try_push_with`]. Matches [`Producer::publish_with`]
+    /// Blocking equivalent of [`try_push_with`](Self::try_push_with). Matches [`Producer::publish_with`]
     /// semantics — the caller never observes backpressure.
     pub fn push_with<F: FnOnce(&mut T)>(&mut self, f: F) -> u64 {
         let capacity = self.producer.shared.buffer.mask + 1;
@@ -540,8 +540,8 @@ impl<T: Copy + Default> Consumer<T> {
     /// and `buf.len()`). Advances the consumer's progress counter once for the batch.
     ///
     /// For consumers that need to defer cursor advancement (e.g., the journal
-    /// stage must fsync before signaling downstream), use [`read_batch`] +
-    /// [`commit`] instead.
+    /// stage must fsync before signaling downstream), use
+    /// [`read_batch`](Self::read_batch) + [`commit`](Self::commit) instead.
     pub fn consume_batch(&mut self, buf: &mut [T], max: usize) -> usize {
         let count = self.read_batch(buf, max);
         if count > 0 {
@@ -553,7 +553,7 @@ impl<T: Copy + Default> Consumer<T> {
     /// Read a batch of entries **without** advancing the progress counter.
     ///
     /// The entries are copied into `buf` and `next_read` advances internally,
-    /// but downstream consumers won't see the progress until [`commit`] is
+    /// but downstream consumers won't see the progress until [`commit`](Self::commit) is
     /// called. This is critical for the journal stage: it must fsync before
     /// signaling the matching stage that entries are durable.
     ///
@@ -584,17 +584,18 @@ impl<T: Copy + Default> Consumer<T> {
     /// non-empty only when the batch crosses the ring's wrap point.
     ///
     /// The slices borrow from the ring; the producer cannot overwrite
-    /// any of these slots until [`commit_consumed`] has been called
+    /// any of these slots until [`commit_consumed`](Self::commit_consumed) has been called
     /// with a count covering them, because the producer's backpressure
     /// gate is the consumer's published `processed` cursor — which
     /// `peek_batch` does not advance.
     ///
-    /// Pairs with [`commit_consumed`]: the caller iterates the slices,
+    /// Pairs with [`commit_consumed`](Self::commit_consumed): the caller iterates the slices,
     /// then calls `commit_consumed(first.len() + second.len())` once
     /// the borrowed view is dropped, which advances both `next_read`
     /// and the published progress counter.
     ///
-    /// Use this instead of [`consume_batch`] / [`read_batch`] when the
+    /// Use this instead of [`consume_batch`](Self::consume_batch) /
+    /// [`read_batch`](Self::read_batch) when the
     /// caller would otherwise copy the batch into a stack array just
     /// to iterate it — the matching stage does this on every disruptor
     /// batch and the copy is pure overhead.
@@ -639,7 +640,7 @@ impl<T: Copy + Default> Consumer<T> {
     }
 
     /// Advance both `next_read` and the published progress counter by
-    /// `count`. Pairs with [`peek_batch`]: call after the borrowed
+    /// `count`. Pairs with [`peek_batch`](Self::peek_batch): call after the borrowed
     /// slices have been processed and dropped.
     ///
     /// Must not be called with a count larger than the most recent
@@ -748,7 +749,7 @@ impl<T: Copy + Default> Consumer<T> {
 
     /// Set the progress counter to an explicit sequence number.
     ///
-    /// Unlike [`commit`] which publishes `next_read`, this publishes an
+    /// Unlike [`commit`](Self::commit) which publishes `next_read`, this publishes an
     /// arbitrary sequence. Used by the io_uring journal stage to commit
     /// only the events covered by a completed fsync, while `next_read`
     /// may have advanced further during the async fsync wait.

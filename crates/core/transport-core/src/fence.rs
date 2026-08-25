@@ -11,7 +11,8 @@
 //! The epoch is the **fencing** mechanism for failover: a node that
 //! observes an epoch strictly higher than its own (on a replication
 //! handshake, in either direction) has been superseded by a newer primary
-//! and must stop acting as one. That observation latches [`FenceState`]
+//! and must stop acting as one. That observation latches
+//! [`FenceState`](crate::fence::FenceState)
 //! into the *fenced* state, which the matching stage (halt) and response
 //! stage (ack gate) read to stop accepting and acknowledging client work.
 //! The latch is one-way: once fenced, the node stays fenced until the

@@ -7,9 +7,10 @@
 #   1. Cargo.lock is staged when modified (prevents dep drift)
 #   2. cargo fmt (formatting)
 #   3. cargo clippy on all targets with warnings as errors
-#   4. off-by-default features: `hash-chain` builds, `no-persist` builds
+#   4. cargo doc with warnings as errors (intra-doc links)
+#   5. off-by-default features: `hash-chain` builds, `no-persist` builds
 #      and passes its tests
-#   5. cargo nextest run, falling back to cargo test if nextest is missing
+#   6. cargo nextest run, falling back to cargo test if nextest is missing
 
 set -e
 
@@ -40,7 +41,19 @@ if ! cargo clippy --all-targets -- -D warnings 2>"$STDERR_LOG"; then
     exit 1
 fi
 
-# 4. Non-default features. Steps 3 and 5 build the default feature set
+# 4. Doc comments. Clippy does not read them, and rustdoc only warns by
+# default, so a link to a renamed or private item renders as plain text
+# and nothing fails — forty of them had accumulated across six crates
+# before this step existed. `--no-deps` so a dependency's own doc
+# warnings cannot fail the commit. Cheap on a warm target: rustdoc reuses
+# the check metadata step 3 just built.
+if ! RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps 2>"$STDERR_LOG"; then
+    cat "$STDERR_LOG" >&2
+    echo "error: rustdoc reported warnings (broken intra-doc links?). Fix them and try again."
+    exit 1
+fi
+
+# 5. Non-default features. Steps 3 and 6 build the default feature set
 # only, so code behind an off-by-default feature can stop compiling
 # without anything noticing: the `hash-chain` tests in
 # `replication/catchup.rs` sat broken for a month and a full release
@@ -99,7 +112,7 @@ if ! cargo check -p melin-server-runtime --all-targets --features no-persist 2>"
     exit 1
 fi
 
-# 5. Tests. Prefer cargo-nextest (~3× faster on the failover suite via
+# 6. Tests. Prefer cargo-nextest (~3× faster on the failover suite via
 # per-test process isolation) and fall back to cargo test if it isn't
 # installed. Install with `cargo install cargo-nextest --locked`.
 if command -v cargo-nextest >/dev/null 2>&1; then

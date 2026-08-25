@@ -150,7 +150,7 @@ impl SegmentPreparer {
     ///
     /// `rotate_threshold_bytes` is the size trigger the pipeline rotates
     /// at (`max_journal_bytes`); the staged file is initially zeroed to
-    /// that plus [`ZERO_FILL_MARGIN_BYTES`]. Pass `0` when the threshold
+    /// that plus `ZERO_FILL_MARGIN_BYTES`. Pass `0` when the threshold
     /// is unknown locally (replica mode — rotation follows the primary's
     /// announced boundaries): the initial target falls back to one
     /// prealloc chunk plus margin, and every

@@ -90,6 +90,20 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # Nothing else checks doc comments: clippy does not read them, and
+      # rustdoc only warns by default, so a link to a renamed or private
+      # item renders as plain text and nothing fails. Forty of them had
+      # accumulated across six crates before this step existed.
+      #
+      # `--no-deps` so a dependency's own doc warnings cannot fail the
+      # build. Default features, like Clippy above: `--all-features` would
+      # enable `dpdk`, whose build script needs the SDK only the dpdk job
+      # installs.
+      - name: Rustdoc
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   test:
     runs-on: ubuntu-latest
     # The cluster tests are serialized to one at a time

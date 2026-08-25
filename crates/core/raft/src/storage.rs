@@ -339,7 +339,7 @@ impl SmInner {
 ///
 /// Recovery rules:
 /// - `vote`/`sm`/`snapshot` are atomically-replaced files — corruption there
-///   is real damage and refuses to open (see [`read_single_record_file`]).
+///   is real damage and refuses to open (see `read_single_record_file`).
 /// - `log` is append-only, so a torn tail is the expected crash artifact:
 ///   scanning stops at the first bad record and the file is truncated there.
 ///   Correct because the append callback (and thus any ack built on it)

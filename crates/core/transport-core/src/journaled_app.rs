@@ -1,18 +1,21 @@
 //! Generic journal-plus-application wrapper.
 //!
-//! Holds an `A: Application` and a [`JournalWriter<A::Event>`]; handles
+//! Holds an `A: Application` and a
+//! [`JournalWrite<A::Event>`](melin_journal::JournalWrite); handles
 //! the startup paths a server cares about:
 //!
-//! - [`create`]: fresh journal, fresh app.
-//! - [`recover`]: replay the journal into a fresh app.
-//! - [`recover_from_snapshot`]: restore from snapshot, replay the
-//!   post-snapshot delta.
-//! - [`save_snapshot`]: write the current state via the generic
-//!   [`crate::snapshot`] framing.
-//! - [`rotate_segment`]: archive the live journal segment and start a
-//!   fresh one. Snapshots are written separately by the shadow stage.
-//! - [`into_parts`]: hand the (app, writer) pair to the disruptor
-//!   pipeline.
+//! - [`create`](JournaledApp::create): fresh journal, fresh app.
+//! - [`recover`](JournaledApp::recover): replay the journal into a fresh
+//!   app.
+//! - [`recover_from_snapshot`](JournaledApp::recover_from_snapshot):
+//!   restore from snapshot, replay the post-snapshot delta.
+//! - [`save_snapshot`](JournaledApp::save_snapshot): write the current
+//!   state via the generic [`crate::snapshot`] framing.
+//! - [`rotate_segment`](JournaledApp::rotate_segment): archive the live
+//!   journal segment and start a fresh one. Snapshots are written
+//!   separately by the shadow stage.
+//! - [`into_parts`](JournaledApp::into_parts): hand the (app, writer)
+//!   pair to the disruptor pipeline.
 //!
 //! This crate is application-agnostic — the journal replay goes through
 //! `Application::apply` / `Application::tick`, and the snapshot payload
@@ -25,7 +28,7 @@ use melin_journal::{JournalError, JournalEvent, JournalReader, JournalWrite};
 
 use crate::snapshot;
 
-/// Error surfaced by [`JournaledApp::*`] — wraps journal I/O errors and
+/// Error surfaced by every [`JournaledApp`] method — wraps journal I/O errors and
 /// snapshot framing errors under one umbrella.
 #[derive(Debug)]
 pub enum JournaledAppError {

@@ -167,7 +167,7 @@ pub struct Response<A: Application> {
     /// journal stage after every fsync batch via `set_last_seq_publisher`.
     pub journal_persisted_wire_seq: DurableWireSeqCursor,
     /// Operator-selected ack policy, published through a shared
-    /// [`AtomicU8`] so the admin `ACK-POLICY` command can swap it at
+    /// [`AtomicU8`](std::sync::atomic::AtomicU8) so the admin `ACK-POLICY` command can swap it at
     /// runtime without restarting the node. The response stage reads
     /// this once per gate iteration with a relaxed load (cheaper than a
     /// `Mutex` or refcounted `Arc<Policy>` snapshot) and rebuilds its
@@ -248,7 +248,7 @@ struct ConnectionEntry {
 /// Ack gating: every gate iteration reads the journal cursor (this
 /// node's persisted) plus per-slot replica cursors (in-memory and
 /// persisted) from `replication_metrics` and feeds them through the
-/// configured [`Policy`]. See [`evaluate_durability`].
+/// configured [`Policy`]. See `evaluate_durability`.
 pub fn run<A: Application>(
     mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,

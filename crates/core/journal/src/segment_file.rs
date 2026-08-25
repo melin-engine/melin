@@ -59,7 +59,7 @@ impl SegmentFile {
     /// also the rotation fallback path, and by then a preparer is
     /// usually alive with a staging file in flight that unlinking would
     /// destroy. Orphan cleanup belongs to the startup entry points only
-    /// (see [`crate::preparer::cleanup_staging_orphan`]).
+    /// (see `preparer::cleanup_staging_orphan`).
     pub fn create_continuing(
         path: &Path,
         starting_sequence: u64,
@@ -177,7 +177,7 @@ impl SegmentFile {
     /// against 59 µs of `pwritev`.
     ///
     /// `bufs` is taken by mutable reference because resuming a short
-    /// write consumes it (see [`write_all_vectored_at`]).
+    /// write consumes it (see `write_all_vectored_at`).
     pub fn write_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> Result<(), JournalError> {
         let total: usize = bufs.iter().map(|b| b.len()).sum();
         if total == 0 {

@@ -39,7 +39,7 @@
 //! Which mechanism prevents that depends on the profile. Release builds
 //! set `panic = "abort"`, so a panic here takes the process down
 //! immediately — loud, and impossible to hang. Debug and test builds
-//! unwind, and there [`PoisonOnUnwind`] converts the unwind into the
+//! unwind, and there `PoisonOnUnwind` converts the unwind into the
 //! same poison a write failure produces, so the sequencer reports a
 //! broken journal instead of spinning. The guarantee holds in both;
 //! only the failure's shape differs.

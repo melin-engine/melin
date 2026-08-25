@@ -554,7 +554,7 @@ impl DirFsyncRetry {
     }
 
     /// Retry a pending fsync, paced to one attempt per
-    /// [`DIR_FSYNC_RETRY_INTERVAL`]. A single branch when nothing is
+    /// `DIR_FSYNC_RETRY_INTERVAL`. A single branch when nothing is
     /// pending — safe to call from per-batch paths.
     ///
     /// The emptiness check comes before the clock read, not after: this
