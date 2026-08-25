@@ -12,6 +12,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`--dpdk-peer-mac <mac>`** — the Ethernet address of the primary a replica
+  dials over DPDK. ARP cannot supply it on a DPDK port: an SR-IOV VF receives
+  no broadcast, and a port shared with the kernel steers only IPv4 by source
+  address. The replica previously assumed the address convention
+  `dpdk-setup.sh` assigns to VFs, which is wrong on any port that keeps its
+  real hardware address — the replica's connection attempts then went to an
+  address nothing answered for, with no error to show for it, retrying with
+  backoff forever. The derived fallback is unchanged, and the startup log
+  names which source supplied the address.
+
 ### Changed
 
 - **"Durability mode" is now the "ack policy"**, and its values name the
@@ -36,6 +48,58 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   come back short of acked events under any policy — bounded by the batches
   in flight under the disk-gated ones, unbounded under `ram`. Behaviour is
   unchanged; the docs now say so.
+- **Replication hands its bytes to the DPDK wire in bounded slices.** The poll
+  thread that receives client packets is also the one that serialises
+  replication traffic, so a full queue was a client-ingress stall of that
+  length. What one tick hands over is now capped, and the replication listener
+  sends a whole in-flight window per egress pass instead of a few segments at
+  a time; the trading port keeps its fan-in behaviour, so one client's burst
+  still cannot delay its peers. Catch-up and snapshot transfer still run on
+  that thread and are unaffected.
+- **Lower per-request cost on the DPDK path.** A response and its batch
+  terminator ride in one frame rather than two, and the connection table is
+  cheaper to look up.
+- **The DPDK packet buffer pool is allocated on the NIC's NUMA node** instead
+  of node 0. On a two-socket host with the NIC on the far node, every received
+  and transmitted frame previously crossed the interconnect. Ports on
+  different nodes warn and follow the first.
+- **The replication accept thread is no longer pinned**, and is named
+  `repl-accept` for what it does — it accepts connections and sleeps, while
+  the per-replica handler threads do the streaming. Pinning it spent a
+  reserved core to idle. Operators can set the fifth `--cores` entry to `0` to
+  hand that core back; every other position keeps its meaning.
+- **The userspace TCP stack behind the DPDK transport moves to fastcp
+  0.13.1**, picking up duplicate-ACK counting in the batch ingress path and a
+  set of zero-copy receive fixes.
+
+### Removed
+
+- **`PipelineCores::repl_sender`.** Source-breaking for anything constructing
+  the struct directly — drop the initializer. No `--cores` value needs to
+  change: the fifth entry is still validated and then ignored, deliberately,
+  because the likeliest cause of a bad value there is a list shifted by one.
+
+### Fixed
+
+- **A replica handshake over DPDK could hang forever.** The per-handshake
+  validation thread inherited the poll thread's pinning and real-time
+  scheduling and so was never scheduled at all; the replica waited for a
+  stream that was never started. Validation now runs on workers created
+  before the poll thread pins itself.
+- **A transient packet buffer shortage no longer aborts the server.** Both
+  allocation sites asserted, so a shortage took down a sequencer carrying
+  live orders. The transport now leaves the data queued for the next poll.
+- **Off-subnet destinations no longer become unreachable 60 seconds after
+  startup on DPDK.** The gateway's address was resolved once at startup and
+  nothing refreshed it, so its entry expired and traffic through it fell back
+  to an ARP the port cannot deliver. It is now refreshed well inside the
+  entry's lifetime.
+- **A closed DPDK connection now frees its demultiplexing slot.** Slots were
+  held for the life of the process and new ones are refused past half
+  capacity, so a long-running server degraded with connection churn rather
+  than with concurrency.
+- **A malformed DPDK address or MAC on the command line reports a usage error
+  naming the flag**, instead of aborting the process.
 
 ## [0.14.0] - 2026-08-21
 
