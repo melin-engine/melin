@@ -1,0 +1,63 @@
+[package]
+name = "melin-example-notary"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+description = "Tamper-evident notary example: a BLAKE3 hash chain over client-submitted digests, built on the Melin core runtime."
+# Not publishable, like `melin-example-counter`: examples demonstrate the
+# runtime and are not shipped as crates. (Unlike the counter, nothing in
+# the runtime depends back on this crate — the policy alone applies.)
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "notary_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "notary-server"
+path = "src/main.rs"
+
+# Hashes a file, submits the digest, saves the receipt, and verifies a
+# receipt offline. What a user of the notary runs; the server is what an
+# operator runs.
+[[bin]]
+name = "notary-client"
+path = "src/client.rs"
+
+# Refolds the chain from the journal on disk and checks receipts against
+# it, without the server. What an auditor runs.
+[[bin]]
+name = "notary-audit"
+path = "src/audit.rs"
+
+[dependencies]
+melin-app = { workspace = true }
+# The auditor reads the journal directly: segment discovery, the lineage
+# check, and the entry reader.
+melin-journal = { workspace = true }
+# `hash-chain` is required, not a default the way the counter's is: a
+# notary's own journal must be tamper-evident, so there is no chain-less
+# build of this crate. Named explicitly because the workspace pulls the
+# runtime with `default-features = false` (see the root Cargo.toml).
+melin-server-runtime = { workspace = true, features = ["hash-chain"] }
+blake3 = { workspace = true }
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
+# The client's side of the wire: control-frame tags and Ed25519 auth.
+melin-wire-protocol = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+# For the footprint and journal-limit tests: the event width this
+# example commits to is what keeps ring slots and the fsync batch at the
+# size the pipeline was tuned for, so both are asserted rather than left
+# to be discovered on a benchmark run. `test-utils` adds `free_addr`,
+# which the replicated round trip needs for the two listeners the
+# runtime binds itself.
+melin-transport-core = { workspace = true, features = ["test-utils"] }
+tempfile = "3"

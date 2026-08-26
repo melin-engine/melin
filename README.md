@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See [`crates/examples/counter`](crates/examples/counter) for a complete working example.
+See [`crates/examples/counter`](crates/examples/counter) for the smallest complete application, and [`crates/examples/notary`](crates/examples/notary) for one that exercises the ordering and durability guarantees: a tamper-evident hash chain over client-submitted digests.
 
 ## Architecture
 

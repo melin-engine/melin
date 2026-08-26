@@ -48,8 +48,9 @@ use serial_test::serial;
 
 /// Port range this file owns for `free_addr` (10000..15000);
 /// `melin-raft`'s election tests own 15000..20000, `raft_failover.rs`
-/// 20000..25000, `raft_smoke.rs` 25000..30000. See
-/// `test_ports::free_addr` for the scheme.
+/// 20000..25000, `raft_smoke.rs` 25000..30000, and the notary example's
+/// `round_trip.rs` 5000..10000. See `test_ports::free_addr` for the
+/// scheme.
 const PORT_BASE: u16 = 10_000;
 
 const TAG_INCREMENT: u8 = 0x10;

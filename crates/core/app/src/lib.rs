@@ -322,10 +322,15 @@ pub trait Application: Sized {
     /// greater than the previously seen sequence for `key_hash` (and
     /// the high-water mark has been advanced), `false` on a duplicate.
     ///
-    /// Transport-owned data eventually; in Phase 1 the trading app
-    /// implements this against the existing `Exchange` HWM map. Phase 3
-    /// moves the map into the transport and this method becomes a
-    /// default impl.
+    /// The application owns both the map and the policy: what counts as
+    /// a duplicate, and whether duplicates are refused at all, is its
+    /// decision — an application whose requests are idempotent by
+    /// nature may return `true` unconditionally, as the examples do. The
+    /// transport's part is only to turn `false` into a
+    /// [`DuplicateRequest`](RejectReason::DuplicateRequest) report built
+    /// by [`build_reject`](Application::build_reject) instead of a call
+    /// to [`apply`](Application::apply). Whether the map ever moves into
+    /// the transport is an open question, not a plan.
     fn check_request_seq(&mut self, key_hash: u64, seq: u64) -> bool;
 
     /// Synthesise a rejection report for a transport-originated reject.

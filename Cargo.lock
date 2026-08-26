@@ -1128,6 +1128,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-example-notary"
+version = "0.14.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "clap",
+ "ed25519-dalek",
+ "melin-app",
+ "melin-journal",
+ "melin-server-runtime",
+ "melin-transport-core",
+ "melin-wire-protocol",
+ "tempfile",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "melin-journal"
 version = "0.14.0"
 dependencies = [
