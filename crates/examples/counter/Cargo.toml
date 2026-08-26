@@ -37,5 +37,5 @@ melin-wire-protocol = { workspace = true }
 tempfile = "3"
 
 [features]
-default = []
+default = ["hash-chain"]
 hash-chain = ["melin-server-runtime/hash-chain"]

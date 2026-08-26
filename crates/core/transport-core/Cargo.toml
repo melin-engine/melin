@@ -17,6 +17,7 @@ name = "melin_transport_core"
 path = "src/lib.rs"
 
 [features]
+default = ["hash-chain"]
 ## Record per-stage latency histograms on shutdown. Adds ~20 ns of clock
 ## overhead per event. Not for production.
 latency-trace = ["dep:hdrhistogram"]
@@ -25,10 +26,13 @@ pipeline-stats = []
 ## Skip all journal I/O (no writes, no fsync). Unsafe for production —
 ## nothing is persisted — but useful for benchmarking.
 no-persist = []
-## BLAKE3 tamper-evident hash chain — the chain state itself lives in
-## melin-journal, but the pipeline forwards chain hash publishes through
-## a SeqLock gated on this feature so downstream snapshot consumers see
-## the same value.
+## BLAKE3 tamper-evident hash chain, on by default — the chain state
+## itself lives in melin-journal, but the pipeline forwards chain hash
+## publishes through a SeqLock gated on this feature so downstream
+## snapshot consumers see the same value. Enabling it here and leaving it
+## off in melin-journal (or the reverse) is a half-configured chain, which
+## is why the melin-journal dependency is pulled with `default-features =
+## false` and switched from this one feature.
 hash-chain = ["melin-journal/hash-chain"]
 ## Expose `JournaledApp::apply_journaled` / `tick_journaled` /
 ## `writer_mut` — synchronous test-only primitives that journal an
