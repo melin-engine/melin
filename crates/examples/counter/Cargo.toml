@@ -37,5 +37,9 @@ melin-wire-protocol = { workspace = true }
 tempfile = "3"
 
 [features]
-default = []
+default = ["hash-chain"]
+# A pure forward: the runtime is pulled with `default-features = false`
+# (see the root Cargo.toml), so the reference application has to switch
+# the chain itself, the way a real deployment's crate does. On by default
+# for the same reason the runtime's is.
 hash-chain = ["melin-server-runtime/hash-chain"]

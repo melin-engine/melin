@@ -50,13 +50,22 @@ authors = ["P.L.S.C."]
 # `melin-example-counter` is deliberately absent: it is `publish = false`
 # and must stay version-less. See the dev-dependency note in
 # crates/core/server-runtime/Cargo.toml.
+#
+# The three crates that carry the `hash-chain` feature are pulled with
+# `default-features = false`: a dependent states which half of the chain
+# it wants through its own feature rather than inheriting it. That keeps
+# `--no-default-features` a true off switch (otherwise a dependent built
+# without the feature would still drag melin-journal's default in and
+# compute a chain nothing publishes) and makes the half-configured
+# combinations unreachable. Dependents that want the chain — every
+# deployable one — get it from their own `default = ["hash-chain"]`.
 melin-app = { path = "crates/core/app", version = "0.14.0" }
 melin-dpdk = { path = "crates/core/dpdk", version = "0.14.0" }
-melin-journal = { path = "crates/core/journal", version = "0.14.0" }
+melin-journal = { path = "crates/core/journal", version = "0.14.0", default-features = false }
 melin-pipeline = { path = "crates/core/pipeline", version = "0.14.0" }
 melin-raft = { path = "crates/core/raft", version = "0.14.0" }
-melin-server-runtime = { path = "crates/core/server-runtime", version = "0.14.0" }
-melin-transport-core = { path = "crates/core/transport-core", version = "0.14.0" }
+melin-server-runtime = { path = "crates/core/server-runtime", version = "0.14.0", default-features = false }
+melin-transport-core = { path = "crates/core/transport-core", version = "0.14.0", default-features = false }
 melin-wire-protocol = { path = "crates/core/wire-protocol", version = "0.14.0" }
 
 base64 = "0.22"

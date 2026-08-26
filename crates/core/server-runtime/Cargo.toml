@@ -13,6 +13,7 @@ description = "Application-agnostic server runtime with accept loop, journaling,
 workspace = true
 
 [features]
+default = ["hash-chain"]
 ## Compile out debug! and trace! at build time. Eliminates the tracing
 ## filter check (~5-10 ns) on every call site in the hot path.
 release-tracing = ["tracing/max_level_info"]
@@ -28,6 +29,10 @@ io-uring = []
 ## DPDK userspace TCP transport.
 dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
 pipeline-stats = ["melin-transport-core/pipeline-stats"]
+## Tamper-evident BLAKE3 journal chain and the cross-node divergence
+## checks built on it (handshake, rotation boundary, periodic ChainCheck).
+## On by default; both halves are switched together because a node with
+## only one of them verifies nothing.
 hash-chain = [
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
@@ -70,7 +75,16 @@ melin-dpdk = { workspace = true, optional = true }
 # (counter depends on the runtime), which Cargo permits. The counter's own
 # package version tracks the workspace, but that is unrelated — declaring a
 # version requirement here would break `cargo publish` for this crate.
-melin-example-counter = { path = "../../examples/counter" }
+#
+# `default-features = false` because the counter's default is
+# `hash-chain`, which forwards to *this* crate's `hash-chain`. A dev-
+# dependency's features unify into the crate under test whenever its tests
+# are built, so without this the chain-less check (`--all-targets
+# --no-default-features`, in the hook and CI) would compile the runtime
+# with the chain back on and prove nothing. The runtime's own `default`
+# supplies the chain in every ordinary build; the counter's `hash-chain`
+# feature is a pure forward with no code of its own, so nothing is lost.
+melin-example-counter = { path = "../../examples/counter", default-features = false }
 tempfile = "3"
 serial_test = "3"
 proptest = "1"

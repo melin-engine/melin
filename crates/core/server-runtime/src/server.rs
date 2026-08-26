@@ -817,6 +817,30 @@ where
     )
 }
 
+/// Announce at boot that this binary was built without the
+/// tamper-evident journal chain.
+///
+/// A chain-less build is otherwise silent: the journal still writes and
+/// replication still streams, but segment-continuity verification at
+/// recovery, the snapshot/journal cross-check, and cross-node divergence
+/// detection are all absent — a rejoining ex-primary carrying a
+/// journaled-but-unreplicated suffix gets streamed to rather than
+/// resynced. A deployment can arrive here without meaning to, because
+/// `--no-default-features` anywhere in the dependency graph turns the
+/// chain off wholesale, so boot says so out loud rather than leaving the
+/// absence to be discovered during an incident.
+///
+/// `warn!` rather than `error!`: it is a deliberate build configuration,
+/// not a malfunction.
+fn warn_if_chain_disabled() {
+    #[cfg(not(feature = "hash-chain"))]
+    warn!(
+        "built without the `hash-chain` feature: journal tamper evidence, \
+         segment-continuity and snapshot cross-checks at recovery, and \
+         cross-node divergence detection are all disabled"
+    );
+}
+
 fn run_impl<A, L>(
     listener: L,
     config: ServerConfig,
@@ -833,6 +857,8 @@ where
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
 {
+    warn_if_chain_disabled();
+
     // Shared ack-policy atomic, constructed once per process and
     // threaded through both roles. Wiring it on the replica path
     // (where the live node has no response stage) lets an operator
@@ -2260,6 +2286,8 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
 {
+    warn_if_chain_disabled();
+
     // Mirrors the kernel-TCP `run` path: one atomic per
     // process, threaded into both replica (pre-staging for promotion)
     // and primary admin listeners.

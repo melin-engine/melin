@@ -17,10 +17,18 @@ name = "melin_journal"
 path = "src/lib.rs"
 
 [features]
-## BLAKE3 tamper-evident hash chain. Hashes every journal entry into a
-## per-segment chain anchored in the segment header and verified at
-## segment boundaries and snapshot anchors. Catches deliberate
-## tampering (CRC32C only catches corruption). Adds ~15-30 ns per event.
+default = ["hash-chain"]
+## BLAKE3 tamper-evident hash chain, **on by default**. Hashes every
+## journal entry into a per-segment chain anchored in the segment header
+## and verified at segment boundaries and snapshot anchors. Catches
+## deliberate tampering (CRC32C only catches corruption) and — more
+## routinely — is what makes a divergent replica journal detectable at
+## all: with it off, an ex-primary rejoining after failover with a
+## journaled-but-unreplicated suffix is streamed to rather than resynced,
+## silently forking the audit trail. Costs one incremental BLAKE3 update
+## per entry on the journal stage, which runs parallel to matching. Turn
+## off with `--no-default-features` only where no audit trail and no
+## cross-node divergence detection are required.
 hash-chain = ["dep:blake3"]
 ## Expose `test_utils` hooks used by consuming crates' tests — notably
 ## an in-process override for the prealloc chunk size, so recovery

@@ -8,8 +8,8 @@
 #   2. cargo fmt (formatting)
 #   3. cargo clippy on all targets with warnings as errors
 #   4. cargo doc with warnings as errors (intra-doc links)
-#   5. off-by-default features: `hash-chain` builds, `no-persist` builds
-#      and passes its tests
+#   5. non-default configurations: the chain-less build
+#      (`--no-default-features`), `no-persist` builds and passes its tests
 #   6. cargo nextest run, falling back to cargo test if nextest is missing
 
 set -e
@@ -53,15 +53,19 @@ if ! RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps 2>"$STDERR_LOG";
     exit 1
 fi
 
-# 5. Non-default features. Steps 3 and 6 build the default feature set
-# only, so code behind an off-by-default feature can stop compiling
+# 5. Non-default configurations. Steps 3 and 6 build the default feature
+# set only, so code the default set does not select can stop compiling
 # without anything noticing: the `hash-chain` tests in
 # `replication/catchup.rs` sat broken for a month and a full release
-# that way, because nothing in the loop ever enabled the feature.
-# `hash-chain` is a production durability feature (the tamper-evident
-# audit chain). `check` rather than `clippy`/`nextest`: catching the
-# compile rot is the whole point, and the extra minute of lint/test
-# time per commit is not.
+# that way, back when the chain was off by default and nothing in the
+# loop ever enabled it.
+#
+# The chain is on by default now, so steps 3 and 6 cover it — including
+# running its tests, which a build check never did. What needs guarding
+# is the opposite direction: the chain-less build a deployment that wants
+# no audit trail selects with `--no-default-features`. `check` rather
+# than `clippy`/`nextest`: catching the compile rot is the whole point,
+# and the extra minute of lint/test time per commit is not.
 #
 # `check` is enough to catch dead code left behind by a feature gate
 # because `unused` is denied in `[workspace.lints.rust]`, so the
@@ -70,15 +74,19 @@ fi
 # the default configuration, which is exactly why it needs to be fatal
 # in this one.
 #
-# Enabled per package because a virtual workspace has no features of
-# its own. Deliberately WITHOUT `--no-default-features` — stripping
-# defaults across the workspace breaks the failover suite's binary
-# selection and would test a configuration nobody ships.
-HASH_CHAIN_PKGS=(melin-journal melin-transport-core melin-server-runtime melin-example-counter)
-for pkg in "${HASH_CHAIN_PKGS[@]}"; do
-    if ! cargo check -p "$pkg" --all-targets --features hash-chain 2>"$STDERR_LOG"; then
+# Per package because a virtual workspace has no features of its own,
+# and because stripping defaults workspace-wide would also strip
+# unrelated ones.
+CHAIN_OFF_PKGS=(
+    melin-journal
+    melin-transport-core
+    melin-server-runtime
+    melin-example-counter
+)
+for pkg in "${CHAIN_OFF_PKGS[@]}"; do
+    if ! cargo check -p "$pkg" --all-targets --no-default-features 2>"$STDERR_LOG"; then
         cat "$STDERR_LOG" >&2
-        echo "error: $pkg does not build with --features hash-chain."
+        echo "error: $pkg does not build with --no-default-features (hash chain off)."
         exit 1
     fi
 done

@@ -26,6 +26,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **The tamper-evident journal hash chain is on by default.** Every crate
+  shipped with it off, so a stock build had no tamper evidence and — the
+  loss that needs no attacker — no cross-node divergence detection. The
+  replica handshake, every rotation boundary and the periodic chain checks
+  compare BLAKE3 chain values, and without the chain those comparisons
+  compile out: an ex-primary rejoining after failover with events it
+  journaled but never replicated was streamed to on top of its forked
+  history instead of being resynced. The cost is one incremental hash update
+  per entry on the journal stage, off the matching thread. A build without
+  the chain now says so at startup, at `warn`. Not source-breaking: the
+  `hash-chain` feature keeps its name on every crate and a manifest that
+  already enabled it is unchanged. One thing to check downstream:
+  `default-features = false` on `melin-journal`, `melin-transport-core` or
+  `melin-server-runtime` — previously a no-op on the latter two, which had
+  no default features — now turns the chain off, and only the runtime's
+  `hash-chain` feature switches all three together.
 - **An application declares how wide its events can get**, via
   `AppEvent::MAX_ENCODED_SIZE`, and the journal sizes itself from that.
   Previously every entry got a fixed 144-byte reservation — 102 bytes of
