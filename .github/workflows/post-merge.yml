@@ -78,10 +78,10 @@ jobs:
       - name: Workspace builds on the MSRV
         run: cargo check --workspace --all-targets --locked
 
-      - name: hash-chain builds on the MSRV
+      - name: chain-less builds on the MSRV
         run: |
           for pkg in melin-journal melin-transport-core melin-server-runtime melin-example-counter; do
-            cargo check -p "$pkg" --all-targets --features hash-chain --locked
+            cargo check -p "$pkg" --all-targets --no-default-features --locked
           done
 
       - name: no-persist builds on the MSRV

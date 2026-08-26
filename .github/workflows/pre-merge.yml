@@ -123,13 +123,15 @@ jobs:
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
-      # Off-by-default features that no other step builds. `hash-chain` is a
-      # production durability feature (the tamper-evident audit chain) and
-      # sat broken for a full release once because nothing enabled it.
-      - name: hash-chain builds
+      # Configurations no other step builds. The tamper-evident chain is on
+      # by default now, so the Tests step below runs it — what needs its own
+      # guard is the chain-less build, which nothing else compiles. (When
+      # the chain was the off-by-default side, it sat broken for a full
+      # release because nothing enabled it.)
+      - name: chain-less builds
         run: |
           for pkg in melin-journal melin-transport-core melin-server-runtime melin-example-counter; do
-            cargo check -p "$pkg" --all-targets --features hash-chain --locked
+            cargo check -p "$pkg" --all-targets --no-default-features --locked
           done
 
       # no-persist needs a real test run, not a build check: its last
@@ -142,7 +144,7 @@ jobs:
         run: cargo check -p melin-server-runtime --all-targets --features no-persist --locked
 
       # `--no-fail-fast` so one flaky cluster test cannot hide the verdict on
-      # the other 686. Costs nothing when the suite is green.
+      # the rest of the suite. Costs nothing when the suite is green.
       - name: Tests
         run: cargo nextest run --no-fail-fast --locked
 
