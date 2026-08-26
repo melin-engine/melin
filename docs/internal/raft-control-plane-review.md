@@ -16,8 +16,10 @@ bugs found.
    replica journal stage's failure latch. Fixing this also surfaced and
    fixed a branch regression: the `hash-chain`-gated divergence-resync
    tests had been left uncompiled against the new receiver/protocol
-   signatures — remember to run the `hash-chain` feature in
-   verification, not just the default set.
+   signatures. The chain was off by default then, so the default
+   verification set never built them; it is on by default now and the
+   ordinary suite runs them, with the chain-less build guarded by its own
+   check instead.
 4. Test gaps — the 3-voter auto-promote refusal and the tip-readiness
    vote gate are now covered.
 5. Nits — duplicated epoch-adoption comment removed, `WRITE_TIMEOUT`
