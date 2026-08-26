@@ -4,10 +4,10 @@ version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 license.workspace = true
-description = "Variable-payload example: an echo and a tamper-evident notary built on the Melin core runtime."
-# Not publishable, for the same reason as `melin-example-counter`: examples
-# depend on `melin-server-runtime` and the runtime's tests depend back on
-# them. Cargo permits the dev-dependency cycle only for unpublished crates.
+description = "Tamper-evident notary example: a BLAKE3 hash chain over client-submitted digests, built on the Melin core runtime."
+# Not publishable, like `melin-example-counter`: examples demonstrate the
+# runtime and are not shipped as crates. (Unlike the counter, nothing in
+# the runtime depends back on this crate — the policy alone applies.)
 publish = false
 
 [lints]
@@ -23,7 +23,10 @@ path = "src/main.rs"
 
 [dependencies]
 melin-app = { workspace = true }
-melin-server-runtime = { workspace = true }
+# `hash-chain` is required rather than optional: a notary's own journal
+# must be tamper-evident. (Being a workspace member, this also turns the
+# feature on in every workspace-wide build — resolver 3 unifies features.)
+melin-server-runtime = { workspace = true, features = ["hash-chain"] }
 blake3 = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -32,14 +35,10 @@ tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 melin-wire-protocol = { workspace = true }
-# Only for the footprint and journal-limit tests: this example's payload
-# width is the dominant term in every pipeline slot and sits just under a
-# hard journal entry cap, so both costs are asserted rather than left to
-# be discovered on a benchmark run.
+# Only for the footprint and journal-limit tests: the event width this
+# example commits to is what keeps ring slots and the fsync batch at the
+# size the pipeline was tuned for, so both are asserted rather than left
+# to be discovered on a benchmark run.
 melin-transport-core = { workspace = true }
 melin-journal = { workspace = true }
 tempfile = "3"
-
-[features]
-default = []
-hash-chain = ["melin-server-runtime/hash-chain"]

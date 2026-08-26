@@ -6,6 +6,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -13,6 +14,7 @@ use std::time::Duration;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 
+use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::control_codec::{
     TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
@@ -20,8 +22,8 @@ use melin_wire_protocol::control_codec::{
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use notary_server::{
-    GENESIS_HEAD, HEAD_LEN, LEAF_LEN, NotaryFactory, RequestDecoder, ResponseEncoder, TAG_GET_HEAD,
-    TAG_NOTARIZE, TAG_RESP_HEAD, TAG_RESP_RECEIPT,
+    GENESIS_HEAD, HEAD_LEN, LEAF_LEN, NotaryEvent, NotaryFactory, RequestDecoder, ResponseEncoder,
+    TAG_GET_HEAD, TAG_NOTARIZE, TAG_RESP_HEAD, TAG_RESP_RECEIPT,
 };
 
 // ---------------------------------------------------------------------------
@@ -145,31 +147,68 @@ fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
     }
 }
 
-fn start_server() -> (
-    Arc<AtomicBool>,
-    SocketAddr,
-    std::thread::JoinHandle<Result<(), String>>,
-) {
-    let key = SigningKey::from_bytes(&[0xAA; 32]);
-    let pubkey_b64 =
-        base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
+/// The writing identity. `trader`, not `operator`: this example gates
+/// submissions on a writing role, so the round trip must authenticate as
+/// one.
+fn trader_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xAA; 32])
+}
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let auth_path = tmp.path().join("authorized_keys");
-    // `trader`, not `operator`: this example gates submissions on a
-    // writing role, so the round trip must authenticate as one.
-    std::fs::write(&auth_path, format!("trader {pubkey_b64} test\n")).expect("write auth keys");
+/// The auditing identity: may read the head, may not extend the chain.
+fn readonly_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xBB; 32])
+}
 
-    let journal_path = tmp.path().join("notary.journal");
+fn pubkey_b64(key: &SigningKey) -> String {
+    base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes())
+}
+
+/// A running server: its shutdown flag, listening address, and thread.
+struct Server {
+    shutdown: Arc<AtomicBool>,
+    addr: SocketAddr,
+    handle: std::thread::JoinHandle<Result<(), String>>,
+}
+
+impl Server {
+    fn stop(self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Best-effort poke so the accept loop wakes and sees the flag;
+        // whether the connect itself succeeds is irrelevant.
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(100));
+        self.handle
+            .join()
+            .expect("server thread panicked")
+            .expect("server returned error");
+    }
+}
+
+/// Start a server whose journal and `authorized_keys` live in `dir`.
+///
+/// Starting twice on the same `dir` restarts the node on its existing
+/// journal, which is how the recovery test exercises replay. Both test
+/// identities are authorized every time, so a test picks its role by
+/// picking its key.
+fn start_server_in(dir: &Path) -> Server {
+    let auth_path = dir.join("authorized_keys");
+    std::fs::write(
+        &auth_path,
+        format!(
+            "trader {} test\nreadonly {} audit\n",
+            pubkey_b64(&trader_key()),
+            pubkey_b64(&readonly_key())
+        ),
+    )
+    .expect("write auth keys");
 
     let listener =
         BlockingTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().expect("parse addr"))
             .expect("bind");
-    let server_addr = listener.local_addr().expect("local_addr");
+    let addr = listener.local_addr().expect("local_addr");
 
     let config = ServerConfig {
-        bind: server_addr,
-        journal: journal_path,
+        bind: addr,
+        journal: dir.join("notary.journal"),
         authorized_keys: auth_path,
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
@@ -185,9 +224,7 @@ fn start_server() -> (
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
 
-    // tempdir must outlive the server thread (journal lives inside it).
     let handle = std::thread::spawn(move || -> Result<(), String> {
-        let _tmp = tmp;
         server::run_with_listener(
             listener,
             config,
@@ -200,21 +237,20 @@ fn start_server() -> (
         .map_err(|e| e.to_string())
     });
 
-    (shutdown, server_addr, handle)
+    Server {
+        shutdown,
+        addr,
+        handle,
+    }
 }
 
-fn stop_server(
-    shutdown: Arc<AtomicBool>,
-    addr: SocketAddr,
-    handle: std::thread::JoinHandle<Result<(), String>>,
-) {
-    shutdown.store(true, Ordering::Relaxed);
-    // Poke the accept loop so it notices the shutdown flag.
-    let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(100));
-    handle
-        .join()
-        .expect("server thread panicked")
-        .expect("server returned error");
+/// Start a server in a fresh temporary directory. The directory is
+/// returned so the caller keeps it alive for as long as the server runs —
+/// the journal lives inside it.
+fn start_server() -> (tempfile::TempDir, Server) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let server = start_server_in(tmp.path());
+    (tmp, server)
 }
 
 // ---------------------------------------------------------------------------
@@ -223,9 +259,8 @@ fn stop_server(
 
 #[test]
 fn an_empty_log_reports_genesis() {
-    let (shutdown, addr, handle) = start_server();
-    let key = SigningKey::from_bytes(&[0xAA; 32]);
-    let mut stream = connect_authenticated(addr, &key);
+    let (_tmp, server) = start_server();
+    let mut stream = connect_authenticated(server.addr, &trader_key());
 
     send_request(&mut stream, 1, TAG_GET_HEAD, &[]);
     let response = single_response(&mut stream);
@@ -234,14 +269,13 @@ fn an_empty_log_reports_genesis() {
     assert_eq!(head_of(&response), GENESIS_HEAD);
 
     drop(stream);
-    stop_server(shutdown, addr, handle);
+    server.stop();
 }
 
 #[test]
 fn notarize_builds_a_chain_the_client_can_reproduce() {
-    let (shutdown, addr, handle) = start_server();
-    let key = SigningKey::from_bytes(&[0xAA; 32]);
-    let mut stream = connect_authenticated(addr, &key);
+    let (_tmp, server) = start_server();
+    let mut stream = connect_authenticated(server.addr, &trader_key());
 
     // Stand-in documents. Only their digests ever leave the client.
     let documents: [&[u8]; 4] = [b"", b"the quick brown fox", b"contract v1", b"contract v2"];
@@ -272,14 +306,13 @@ fn notarize_builds_a_chain_the_client_can_reproduce() {
     assert_eq!(head_of(&response), expected);
 
     drop(stream);
-    stop_server(shutdown, addr, handle);
+    server.stop();
 }
 
 #[test]
 fn a_malformed_leaf_is_refused_without_dropping_the_connection() {
-    let (shutdown, addr, handle) = start_server();
-    let key = SigningKey::from_bytes(&[0xAA; 32]);
-    let mut stream = connect_authenticated(addr, &key);
+    let (_tmp, server) = start_server();
+    let mut stream = connect_authenticated(server.addr, &trader_key());
 
     // Wrong digest width: the runtime drops the frame and logs at debug,
     // leaving the connection usable — a malformed client request is not a
@@ -295,20 +328,47 @@ fn a_malformed_leaf_is_refused_without_dropping_the_connection() {
     assert_eq!(head_of(&response), GENESIS_HEAD);
 
     drop(stream);
-    stop_server(shutdown, addr, handle);
+    server.stop();
+}
+
+#[test]
+fn a_read_only_key_can_audit_but_not_notarize() {
+    let (_tmp, server) = start_server();
+    let mut stream = connect_authenticated(server.addr, &readonly_key());
+
+    // The submission is refused at the decoder: the runtime drops it
+    // without a response and keeps the connection, so the refusal is
+    // observable only as the chain not having moved. Had the gate let it
+    // through, the next frame read would be a receipt, not the head.
+    send_request(&mut stream, 1, TAG_NOTARIZE, &digest(b"not mine to attest"));
+
+    send_request(&mut stream, 2, TAG_GET_HEAD, &[]);
+    let response = single_response(&mut stream);
+    assert_eq!(
+        response[0], TAG_RESP_HEAD,
+        "a read-only key must still be able to audit"
+    );
+    assert_eq!(
+        count_of(&response),
+        0,
+        "a read-only key must not be able to extend the chain"
+    );
+    assert_eq!(head_of(&response), GENESIS_HEAD);
+
+    drop(stream);
+    server.stop();
 }
 
 #[test]
 fn second_connection_sees_persisted_chain() {
-    let (shutdown, addr, handle) = start_server();
-    let key = SigningKey::from_bytes(&[0xAA; 32]);
+    let (_tmp, server) = start_server();
 
     let leaf = digest(b"a document worth attesting");
     let expected = fold(&GENESIS_HEAD, &leaf);
 
     // First connection: notarize once.
     {
-        let mut s = connect_authenticated(addr, &key);
+        let mut s = connect_authenticated(server.addr, &trader_key());
         send_request(&mut s, 1, TAG_NOTARIZE, &leaf);
         let r = single_response(&mut s);
         assert_eq!(r[0], TAG_RESP_RECEIPT);
@@ -317,7 +377,7 @@ fn second_connection_sees_persisted_chain() {
 
     // Second connection: the chain survives the first one closing.
     {
-        let mut s = connect_authenticated(addr, &key);
+        let mut s = connect_authenticated(server.addr, &trader_key());
         send_request(&mut s, 1, TAG_GET_HEAD, &[]);
         let r = single_response(&mut s);
         assert_eq!(r[0], TAG_RESP_HEAD);
@@ -325,5 +385,86 @@ fn second_connection_sees_persisted_chain() {
         assert_eq!(head_of(&r), expected);
     }
 
-    stop_server(shutdown, addr, handle);
+    server.stop();
+}
+
+#[test]
+fn the_chain_survives_a_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let documents: [&[u8]; 3] = [b"minutes 2026-08-26", b"invoice 1041", b"invoice 1042"];
+    let mut expected = GENESIS_HEAD;
+
+    // First life: notarize three documents. Under the `disk` ack policy a
+    // receipt means the leaf is fsynced, so everything receipted here is
+    // on disk before the node goes down.
+    let server = start_server_in(tmp.path());
+    {
+        let mut stream = connect_authenticated(server.addr, &trader_key());
+        for (i, document) in documents.iter().enumerate() {
+            let leaf = digest(document);
+            expected = fold(&expected, &leaf);
+            send_request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf);
+            let response = single_response(&mut stream);
+            assert_eq!(response[0], TAG_RESP_RECEIPT);
+            assert_eq!(head_of(&response), expected);
+        }
+    }
+    server.stop();
+
+    // Second life, same journal: the head is not stored anywhere the
+    // restarted node can read it from — it is rebuilt by replaying the
+    // journaled leaves in order. Matching the client's fold is the
+    // determinism the example exists to demonstrate, applied to recovery.
+    let server = start_server_in(tmp.path());
+    let mut stream = connect_authenticated(server.addr, &trader_key());
+    send_request(&mut stream, 1, TAG_GET_HEAD, &[]);
+    let response = single_response(&mut stream);
+    assert_eq!(response[0], TAG_RESP_HEAD);
+    assert_eq!(count_of(&response), documents.len() as u64);
+    assert_eq!(
+        head_of(&response),
+        expected,
+        "recovered head diverged from the client's fold"
+    );
+
+    drop(stream);
+    server.stop();
+}
+
+#[test]
+fn the_journal_carries_the_runtime_hash_chain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let server = start_server_in(tmp.path());
+    {
+        let mut stream = connect_authenticated(server.addr, &trader_key());
+        for i in 1..=3u64 {
+            send_request(&mut stream, i, TAG_NOTARIZE, &digest(&i.to_le_bytes()));
+            assert_eq!(single_response(&mut stream)[0], TAG_RESP_RECEIPT);
+        }
+    }
+    server.stop();
+
+    // `hash-chain` is a hard dependency of this crate, not a feature: the
+    // reader's chain accessors are `None` only when the runtime was built
+    // without it, which is the regression this guards against. The value
+    // is then checked against the documented formula, recomputed from the
+    // raw file bytes: `BLAKE3(entry bytes || anchor)`.
+    let path = tmp.path().join("notary.journal");
+    let mut reader = JournalReader::<NotaryEvent>::open(&path).expect("open journal");
+    let anchor = reader
+        .anchor()
+        .expect("journal must be built with hash-chain");
+    let mut leaves = 0;
+    while let Some(entry) = reader.next_entry().expect("read entry") {
+        if matches!(entry.event, JournalEvent::App(NotaryEvent::Notarize { .. })) {
+            leaves += 1;
+        }
+    }
+    assert_eq!(leaves, 3);
+
+    let bytes = std::fs::read(&path).expect("read journal");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes[reader.sector_size()..reader.valid_file_end() as usize]);
+    hasher.update(&anchor);
+    assert_eq!(reader.chain_hash(), Some(*hasher.finalize().as_bytes()));
 }
