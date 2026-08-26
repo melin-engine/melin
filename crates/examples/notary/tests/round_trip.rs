@@ -2,20 +2,24 @@
 //! client with Ed25519 auth, notarize a series of digests, and check the
 //! chain head the server reports against one folded independently on the
 //! client — the same check an auditor holding the original documents
-//! would perform.
+//! would perform. The replicated case at the end checks the same head
+//! across nodes: a replica promoted after the primary's death must report
+//! what the primary receipted.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 
 use melin_journal::{JournalEvent, JournalReader};
+use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::{self, ServerConfig};
+use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::{
     TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
 };
@@ -30,13 +34,17 @@ use notary_server::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+fn try_read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).expect("read frame length");
+    stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).expect("read frame payload");
-    payload
+    stream.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
+fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+    try_read_frame(stream).expect("read frame")
 }
 
 fn write_frame(stream: &mut TcpStream, payload: &[u8]) {
@@ -126,51 +134,47 @@ fn head_of(frame: &[u8]) -> (u64, [u8; HEAD_LEN]) {
     )
 }
 
+/// Answer the server's Challenge on a connected stream and consume the
+/// ServerReady. `None` if the handshake stalls or the frames are not the
+/// expected tags — the node is not serving yet — so callers retry. The
+/// client and admin listeners share this handshake.
+fn answer_challenge(stream: &mut TcpStream, key: &SigningKey) -> Option<()> {
+    let challenge = try_read_frame(stream).ok()?;
+    if challenge.first() != Some(&TAG_CHALLENGE) {
+        return None;
+    }
+    let signature = key.sign(&challenge[1..33]);
+    let mut frame = Vec::with_capacity(105);
+    frame.extend_from_slice(&0u64.to_le_bytes());
+    frame.push(TAG_CHALLENGE_RESPONSE);
+    frame.extend_from_slice(&signature.to_bytes());
+    frame.extend_from_slice(&key.verifying_key().to_bytes());
+    write_frame(stream, &frame);
+    let ready = try_read_frame(stream).ok()?;
+    (ready.first() == Some(&TAG_SERVER_READY)).then_some(())
+}
+
 /// Connect and authenticate, retrying until the server is ready.
 /// The kernel backlog accepts the TCP SYN before the server's accept
 /// loop starts, so a successful `connect` doesn't mean the server is
 /// ready — we must also read the Challenge to confirm.
 fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+        if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
             stream
                 .set_read_timeout(Some(Duration::from_millis(500)))
                 .expect("set timeout");
-            let mut stream = stream;
-            if stream.read(&mut [0u8; 0]).is_ok() {
-                // Try reading the Challenge — timeout means server hasn't accepted yet.
-                let mut len_buf = [0u8; 4];
-                if stream.read_exact(&mut len_buf).is_ok() {
-                    let len = u32::from_le_bytes(len_buf) as usize;
-                    let mut payload = vec![0u8; len];
-                    stream.read_exact(&mut payload).expect("read challenge");
-                    assert_eq!(payload[0], TAG_CHALLENGE, "expected Challenge");
-
-                    let nonce = &payload[1..33];
-                    let signature = key.sign(nonce);
-                    let pubkey = key.verifying_key().to_bytes();
-
-                    let mut frame = Vec::with_capacity(105);
-                    frame.extend_from_slice(&0u64.to_le_bytes());
-                    frame.push(TAG_CHALLENGE_RESPONSE);
-                    frame.extend_from_slice(&signature.to_bytes());
-                    frame.extend_from_slice(&pubkey);
-                    write_frame(&mut stream, &frame);
-
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .expect("set timeout");
-                    let ready = read_frame(&mut stream);
-                    assert_eq!(ready[0], TAG_SERVER_READY, "expected ServerReady");
-
-                    return stream;
-                }
+            if answer_challenge(&mut stream, key).is_some() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("set timeout");
+                return stream;
             }
         }
         assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for server"
+            Instant::now() < deadline,
+            "timed out waiting for a serving node at {addr}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -230,18 +234,18 @@ fn start_server_in(dir: &Path) -> Server {
     )
     .expect("write auth keys");
 
-    let listener =
-        BlockingTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().expect("parse addr"))
-            .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-
+    let listener = bind_client_listener();
     let config = ServerConfig {
-        bind: addr,
+        bind: listener.local_addr().expect("local_addr"),
         journal: dir.join("notary.journal"),
         authorized_keys: auth_path,
         standalone: true,
-        ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
+        ack_policy: AckPolicy::Disk,
         no_mlock: true,
+        // Test servers share the machine with the rest of the suite; a
+        // busy-spinning pipeline per node starves the clients (and the
+        // other nodes) of CPU time under full-suite load.
+        yield_idle: true,
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
@@ -249,10 +253,22 @@ fn start_server_in(dir: &Path) -> Server {
         instruments: 0,
         ..ServerConfig::default()
     };
+    spawn_node(listener, config)
+}
 
+/// The client listener is bound here and handed to the runtime, so it
+/// can take a kernel-assigned port; the listeners the runtime binds
+/// itself (replication, admin) cannot — see `free_addr`.
+fn bind_client_listener() -> BlockingTcpListener {
+    BlockingTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().expect("parse addr"))
+        .expect("bind")
+}
+
+/// Run a node on `listener` with `config`, on its own thread.
+fn spawn_node(listener: BlockingTcpListener, config: ServerConfig) -> Server {
+    let addr = config.bind;
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
-
     let handle = std::thread::spawn(move || -> Result<(), String> {
         server::run_with_listener(
             listener,
@@ -265,7 +281,6 @@ fn start_server_in(dir: &Path) -> Server {
         )
         .map_err(|e| e.to_string())
     });
-
     Server {
         shutdown,
         addr,
@@ -650,4 +665,175 @@ fn the_client_reports_an_unauthorized_key() {
     );
 
     server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Replication
+// ---------------------------------------------------------------------------
+
+/// Port range this file owns for `free_addr` (5000..10000). The
+/// runtime's cluster tests own 10000..30000 in 5000-port ranges, which
+/// is all the room below the ephemeral floor; `test_ports`' own unit
+/// tests probe a couple of ports in this range too, and bind nothing
+/// for longer than the probe.
+const PORT_BASE: u16 = 5_000;
+
+/// The replica's identity on the replication link.
+fn node_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xDD; 32])
+}
+
+/// The operator: the only role the admin endpoint accepts.
+fn operator_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xEE; 32])
+}
+
+/// Send one admin command over a fresh authenticated connection and
+/// return the reply line, or `None` if the connection or handshake
+/// failed (the node is not up yet — callers retry).
+fn admin_command(addr: SocketAddr, key: &SigningKey, command: &str) -> Option<String> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    answer_challenge(&mut stream, key)?;
+    stream.write_all(command.as_bytes()).ok()?;
+    stream.write_all(b"\n").ok()?;
+    stream.flush().ok()?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).ok()?;
+    Some(line.trim_end().to_owned())
+}
+
+/// Retry `command` until the node answers `OK`. The admin listener is up
+/// from boot, but a promotion may still be settling when a command lands.
+fn admin_until_ok(addr: SocketAddr, key: &SigningKey, command: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match admin_command(addr, key, command) {
+            Some(reply) if reply == "OK" => return,
+            reply => {
+                assert!(
+                    Instant::now() < deadline,
+                    "`{command}` never accepted; last reply: {reply:?}"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// The claim in the crate docs — two nodes that applied the same events
+/// agree on the head byte for byte — checked the way an operator meets
+/// it. The primary dies, the replica is promoted, and the new primary
+/// hands out the head the old one receipted, then chains onto it. The
+/// time in each receipt is part of what must agree: it is folded into
+/// the head, and the replica never took a clock reading of its own.
+#[test]
+fn a_promoted_replica_reports_the_head_the_primary_receipted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Three roles: the trader submits, the replica authenticates its
+    // link as `replication`, and the operator drives the admin endpoint.
+    let auth_path = tmp.path().join("authorized_keys");
+    std::fs::write(
+        &auth_path,
+        format!(
+            "trader {} test\nreplication {} replica\noperator {} ops\n",
+            pubkey_b64(&trader_key()),
+            pubkey_b64(&node_key()),
+            pubkey_b64(&operator_key())
+        ),
+    )
+    .expect("write auth keys");
+    let key_path = tmp.path().join("replica.key");
+    std::fs::write(&key_path, node_key().to_bytes()).expect("write replica key");
+
+    let replication_addr = free_addr(PORT_BASE);
+    let admin_addr = free_addr(PORT_BASE);
+
+    // `disk+ram`, the default and the typical deployment: a receipt means
+    // one fsynced copy plus a second copy in the replica's memory. That
+    // is what makes the primary's death below safe to reason about —
+    // every receipted leaf is already on the replica.
+    let node_config = |journal: &str, listener: &BlockingTcpListener| ServerConfig {
+        bind: listener.local_addr().expect("local_addr"),
+        journal: tmp.path().join(journal),
+        authorized_keys: auth_path.clone(),
+        ack_policy: AckPolicy::DiskAndRam,
+        no_mlock: true,
+        yield_idle: true,
+        tick_interval_ms: 0,
+        snapshot_interval_ms: 0,
+        health_bind: None,
+        accounts: 0,
+        instruments: 0,
+        ..ServerConfig::default()
+    };
+
+    let primary = {
+        let listener = bind_client_listener();
+        let mut config = node_config("primary.journal", &listener);
+        config.replication_bind = Some(replication_addr);
+        spawn_node(listener, config)
+    };
+    let replica = {
+        let listener = bind_client_listener();
+        let mut config = node_config("replica.journal", &listener);
+        config.replica_of = Some(replication_addr);
+        config.replication_key = Some(key_path);
+        config.admin_bind = Some(admin_addr);
+        spawn_node(listener, config)
+    };
+
+    // Notarize on the primary. Under `disk+ram` the first receipt is
+    // released only once the replica has attached, so nothing polls for
+    // readiness — but that wait is longer than a local round trip.
+    let documents: [&[u8]; 3] = [b"deed", b"codicil", b"witness statement"];
+    let mut last: Option<Receipt> = None;
+    {
+        let mut stream = connect_authenticated(primary.addr, &trader_key());
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("set timeout");
+        let mut expected = GENESIS_HEAD;
+        for (i, document) in documents.iter().enumerate() {
+            let leaf = digest(document);
+            send_request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf);
+            let receipt = receipt_of(&single_response(&mut stream));
+            expected = fold(&expected, &leaf, receipt.timestamp_ns);
+            assert_eq!(receipt.head, expected, "primary head at entry {}", i + 1);
+            last = Some(receipt);
+        }
+    }
+    let last = last.expect("notarized at least one document");
+
+    // The primary dies. The replica loses its link and waits to
+    // reconnect; the operator promotes it instead. Its gate still
+    // demands a second node, so the operator relaxes it to `disk` — the
+    // documented post-failover workflow.
+    primary.stop();
+    admin_until_ok(admin_addr, &operator_key(), "PROMOTE");
+    admin_until_ok(admin_addr, &operator_key(), "ACK-POLICY disk");
+
+    let mut stream = connect_authenticated(replica.addr, &trader_key());
+    send_request(&mut stream, 1, TAG_GET_HEAD, &[]);
+    assert_eq!(
+        head_of(&single_response(&mut stream)),
+        (documents.len() as u64, last.head),
+        "the promoted replica's head diverged from the primary's receipts"
+    );
+
+    // The chain continues where the old primary left off: the new
+    // primary's first receipt chains onto the old primary's last.
+    let leaf = digest(b"first deed after the failover");
+    send_request(&mut stream, 2, TAG_NOTARIZE, &leaf);
+    let receipt = receipt_of(&single_response(&mut stream));
+    assert_eq!(receipt.entry, documents.len() as u64 + 1);
+    assert_eq!(
+        receipt.prev, last.head,
+        "the first receipt after failover must chain onto the last before it"
+    );
+    assert_eq!(receipt.head, fold(&last.head, &leaf, receipt.timestamp_ns));
+
+    drop(stream);
+    replica.stop();
 }

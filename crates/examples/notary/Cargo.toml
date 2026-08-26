@@ -44,10 +44,12 @@ ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
-# Only for the footprint and journal-limit tests: the event width this
+# For the footprint and journal-limit tests: the event width this
 # example commits to is what keeps ring slots and the fsync batch at the
 # size the pipeline was tuned for, so both are asserted rather than left
-# to be discovered on a benchmark run.
-melin-transport-core = { workspace = true }
+# to be discovered on a benchmark run. `test-utils` adds `free_addr`,
+# which the replicated round trip needs for the two listeners the
+# runtime binds itself.
+melin-transport-core = { workspace = true, features = ["test-utils"] }
 melin-journal = { workspace = true }
 tempfile = "3"
