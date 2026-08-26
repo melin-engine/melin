@@ -32,6 +32,14 @@
 //! cannot detect a reordering that happens to commute, and a hash chain
 //! cannot miss one.
 //!
+//! A chain is deliberately the simplest structure that gives this. What
+//! it does not give is a short proof that one receipt sits under the
+//! current head without walking every link between: that is what a
+//! Merkle log (the shape Certificate Transparency uses) adds, at the
+//! price of a tree that has to be persisted and compacted as the log
+//! grows. It is the upgrade path if inclusion proofs are ever wanted,
+//! not something an example needs.
+//!
 //! ## Sizing
 //!
 //! A fixed 32-byte leaf keeps [`AppEvent::MAX_ENCODED_SIZE`] at 33, so a

@@ -684,6 +684,47 @@ fn the_client_reports_an_unauthorized_key() {
     server.stop();
 }
 
+/// A key the server knows but whose role may not write: the runtime
+/// drops the submission without a reply and keeps the connection, so the
+/// client has only silence to go on. It must turn that silence into an
+/// error that says where to look, not hang. Waits out the client's
+/// reply timeout — the one slow test in this file, by design.
+#[test]
+fn the_client_explains_a_silently_dropped_request() {
+    let (tmp, server) = start_server();
+    drop(connect_authenticated(server.addr, &trader_key()));
+
+    let key = tmp.path().join("readonly.key");
+    std::fs::write(&key, readonly_key().to_bytes()).expect("write key");
+    let document = tmp.path().join("audit-only.txt");
+    std::fs::write(&document, "may read, may not attest").expect("write document");
+
+    let started = Instant::now();
+    let (code, _, stderr) = notary_client(&[
+        "notarize",
+        document.to_str().expect("utf-8 path"),
+        "--server",
+        &server.addr.to_string(),
+        "--key",
+        key.to_str().expect("utf-8 path"),
+    ]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("no reply within") && stderr.contains("authorized_keys"),
+        "{stderr}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "the client gave up before its reply timeout"
+    );
+    assert!(
+        !tmp.path().join("audit-only.txt.receipt").exists(),
+        "no receipt may be written for a refused submission"
+    );
+
+    server.stop();
+}
+
 // ---------------------------------------------------------------------------
 // The auditor
 // ---------------------------------------------------------------------------
