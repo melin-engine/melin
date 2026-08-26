@@ -28,8 +28,17 @@ path = "src/main.rs"
 name = "notary-client"
 path = "src/client.rs"
 
+# Refolds the chain from the journal on disk and checks receipts against
+# it, without the server. What an auditor runs.
+[[bin]]
+name = "notary-audit"
+path = "src/audit.rs"
+
 [dependencies]
 melin-app = { workspace = true }
+# The auditor reads the journal directly: segment discovery, the lineage
+# check, and the entry reader.
+melin-journal = { workspace = true }
 # `hash-chain` is required, not a default the way the counter's is: a
 # notary's own journal must be tamper-evident, so there is no chain-less
 # build of this crate. Named explicitly because the workspace pulls the
@@ -51,5 +60,4 @@ base64 = { workspace = true }
 # which the replicated round trip needs for the two listeners the
 # runtime binds itself.
 melin-transport-core = { workspace = true, features = ["test-utils"] }
-melin-journal = { workspace = true }
 tempfile = "3"

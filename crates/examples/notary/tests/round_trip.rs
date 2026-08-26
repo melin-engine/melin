@@ -25,6 +25,7 @@ use melin_wire_protocol::control_codec::{
 };
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
+use notary_server::receipt::Receipt as SavedReceipt;
 use notary_server::{
     GENESIS_HEAD, HEAD_LEN, LEAF_LEN, NotaryEvent, NotaryFactory, RequestDecoder, ResponseEncoder,
     TAG_GET_HEAD, TAG_NOTARIZE, TAG_RESP_HEAD, TAG_RESP_RECEIPT,
@@ -219,23 +220,29 @@ impl Server {
 /// Start a server whose journal and `authorized_keys` live in `dir`.
 ///
 /// Starting twice on the same `dir` restarts the node on its existing
-/// journal, which is how the recovery test exercises replay. Both test
-/// identities are authorized every time, so a test picks its role by
+/// journal, which is how the recovery test exercises replay. Every test
+/// identity is authorized every time, so a test picks its role by
 /// picking its key.
 fn start_server_in(dir: &Path) -> Server {
+    start_server_with(dir, |_| {})
+}
+
+/// [`start_server_in`], with `configure` applied to the config first.
+fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> Server {
     let auth_path = dir.join("authorized_keys");
     std::fs::write(
         &auth_path,
         format!(
-            "trader {} test\nreadonly {} audit\n",
+            "trader {} test\nreadonly {} audit\noperator {} ops\n",
             pubkey_b64(&trader_key()),
-            pubkey_b64(&readonly_key())
+            pubkey_b64(&readonly_key()),
+            pubkey_b64(&operator_key())
         ),
     )
     .expect("write auth keys");
 
     let listener = bind_client_listener();
-    let config = ServerConfig {
+    let mut config = ServerConfig {
         bind: listener.local_addr().expect("local_addr"),
         journal: dir.join("notary.journal"),
         authorized_keys: auth_path,
@@ -253,6 +260,7 @@ fn start_server_in(dir: &Path) -> Server {
         instruments: 0,
         ..ServerConfig::default()
     };
+    configure(&mut config);
     spawn_node(listener, config)
 }
 
@@ -556,17 +564,26 @@ fn the_journal_carries_the_runtime_hash_chain() {
 // The command-line client
 // ---------------------------------------------------------------------------
 
-/// Run `notary-client` with `args`, returning `(exit code, stdout, stderr)`.
-fn notary_client(args: &[&str]) -> (i32, String, String) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_notary-client"))
+/// Run one of this crate's binaries with `args`, returning
+/// `(exit code, stdout, stderr)`.
+fn run_bin(exe: &str, args: &[&str]) -> (i32, String, String) {
+    let output = std::process::Command::new(exe)
         .args(args)
         .output()
-        .expect("spawn notary-client");
+        .unwrap_or_else(|e| panic!("spawn {exe}: {e}"));
     (
-        output.status.code().expect("client exited normally"),
+        output.status.code().expect("exited normally"),
         String::from_utf8(output.stdout).expect("utf-8 stdout"),
         String::from_utf8(output.stderr).expect("utf-8 stderr"),
     )
+}
+
+fn notary_client(args: &[&str]) -> (i32, String, String) {
+    run_bin(env!("CARGO_BIN_EXE_notary-client"), args)
+}
+
+fn notary_audit(args: &[&str]) -> (i32, String, String) {
+    run_bin(env!("CARGO_BIN_EXE_notary-audit"), args)
 }
 
 #[test]
@@ -665,6 +682,169 @@ fn the_client_reports_an_unauthorized_key() {
     );
 
     server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// The auditor
+// ---------------------------------------------------------------------------
+
+/// The auditor's claim: the journal alone refolds to the head the server
+/// reported, and a receipt is found at the position it names. Exercised
+/// across a rotation so the walk covers an archived segment as well as
+/// the live one, then each way the evidence can fail: an edited receipt,
+/// a receipt past the end of the log, a wrong expected head, and a
+/// journal edited after the fact.
+#[test]
+fn the_auditor_refolds_the_head_from_the_journal_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let admin_addr = free_addr(PORT_BASE);
+    let server = start_server_with(tmp.path(), |config| config.admin_bind = Some(admin_addr));
+    drop(connect_authenticated(server.addr, &trader_key()));
+
+    let key = tmp.path().join("trader.key");
+    std::fs::write(&key, trader_key().to_bytes()).expect("write key");
+    let path_of = |name: &str| tmp.path().join(name);
+    let arg = |path: &Path| path.to_str().expect("utf-8 path").to_owned();
+    let server_arg = server.addr.to_string();
+
+    // Three documents; the journal is rotated after the first so the
+    // second and third land in a new segment.
+    for (i, (name, body)) in [
+        ("deed", "the deed"),
+        ("codicil", "the codicil"),
+        ("witness", "the witness statement"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(path_of(name), body).expect("write document");
+        let (code, out, err) = notary_client(&[
+            "notarize",
+            &arg(&path_of(name)),
+            "--server",
+            &server_arg,
+            "--key",
+            &arg(&key),
+        ]);
+        assert_eq!(code, 0, "{out}{err}");
+        if i == 0 {
+            admin_until_ok(admin_addr, &operator_key(), "ROTATE");
+        }
+    }
+    let (code, out, err) = notary_client(&["head", "--server", &server_arg, "--key", &arg(&key)]);
+    assert_eq!(code, 0, "{out}{err}");
+    let head = out
+        .lines()
+        .find_map(|line| line.strip_prefix("head:"))
+        .expect("the client prints the head")
+        .trim()
+        .to_owned();
+    server.stop();
+
+    let journal = arg(&path_of("notary.journal"));
+    let deed_receipt = arg(&path_of("deed.receipt"));
+    let witness_receipt = arg(&path_of("witness.receipt"));
+
+    // Everything checks out: two segments, three leaves, the server's
+    // head, and both receipts at their positions.
+    let (code, out, err) = notary_audit(&[
+        &journal,
+        "--receipt",
+        &deed_receipt,
+        "--receipt",
+        &witness_receipt,
+        "--expect-head",
+        &head,
+    ]);
+    assert_eq!(code, 0, "{out}{err}");
+    for line in [
+        "segments: 2",
+        "notarized: 3",
+        &format!("head: {head}"),
+        "entry 1 OK",
+        "entry 3 OK",
+        "expected head: matches",
+    ] {
+        assert!(out.contains(line), "missing `{line}` in:\n{out}");
+    }
+
+    // A forged receipt: the time moved and the head recomputed, so it
+    // still folds — `notary-client verify` would accept it. Only the
+    // journal can say the sequencer never attested that time.
+    let witness =
+        SavedReceipt::from_text(&std::fs::read_to_string(&witness_receipt).expect("read receipt"))
+            .expect("parse receipt");
+    let edited = SavedReceipt {
+        timestamp_ns: witness.timestamp_ns + 1,
+        head: fold(&witness.prev, &witness.leaf, witness.timestamp_ns + 1),
+        ..witness
+    };
+    assert!(edited.verifies(), "the forgery must pass the offline check");
+    let edited_path = path_of("edited.receipt");
+    std::fs::write(&edited_path, edited.to_text()).expect("write receipt");
+    let (code, out, _) = notary_audit(&[&journal, "--receipt", &arg(&edited_path)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("entry 3 differs from the journal in time_ns, head"),
+        "{out}"
+    );
+
+    // A receipt for an entry the log does not have.
+    let beyond = SavedReceipt {
+        entry: 4,
+        ..witness
+    };
+    let beyond_path = path_of("beyond.receipt");
+    std::fs::write(&beyond_path, beyond.to_text()).expect("write receipt");
+    let (code, out, _) = notary_audit(&[&journal, "--receipt", &arg(&beyond_path)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("claims entry 4 but the log has 3"), "{out}");
+
+    // A head the log does not refold to.
+    let (code, out, _) = notary_audit(&[&journal, "--expect-head", &"0".repeat(64)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("FAIL: the log refolds to"), "{out}");
+
+    // A journal edited after the fact: one bit flipped inside the first
+    // entry of the archived segment. The runtime's own chain catches it
+    // before the notary's is even refolded.
+    let archive = path_of("notary.journal.000001");
+    let sector_size = JournalReader::<NotaryEvent>::open(&archive)
+        .expect("open archive")
+        .sector_size();
+    let mut bytes = std::fs::read(&archive).expect("read archive");
+    bytes[sector_size + 16] ^= 0x01;
+    std::fs::write(&archive, bytes).expect("write archive");
+    let (code, out, _) = notary_audit(&[&journal]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("FAIL: the journal's own hash chain is broken"),
+        "{out}"
+    );
+}
+
+/// The audit needs no receipt and no head to be useful: a bare run
+/// reports what the log holds. And a missing journal is an error, not a
+/// finding — the audit did not run.
+#[test]
+fn the_auditor_reports_an_empty_log_and_a_missing_one() {
+    let (tmp, server) = start_server();
+    drop(connect_authenticated(server.addr, &trader_key()));
+    server.stop();
+
+    let journal = tmp.path().join("notary.journal");
+    let (code, out, err) = notary_audit(&[journal.to_str().expect("utf-8 path")]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("notarized: 0"), "{out}");
+    assert!(
+        out.contains(&format!("head: {}", "0".repeat(64))),
+        "an empty log refolds to genesis:\n{out}"
+    );
+
+    let missing = tmp.path().join("nothing.journal");
+    let (code, _, err) = notary_audit(&[missing.to_str().expect("utf-8 path")]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.starts_with("error: cannot read"), "{err}");
 }
 
 // ---------------------------------------------------------------------------

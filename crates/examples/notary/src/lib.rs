@@ -51,6 +51,9 @@ use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
 
+/// The receipt as clients keep it — shared by the client and the auditor.
+pub mod receipt;
+
 // ---------------------------------------------------------------------------
 // Wire tags — domain tags start at 0x10 to avoid colliding with transport-
 // level control tags (0x01–0x0F) reserved by melin-wire-protocol.
