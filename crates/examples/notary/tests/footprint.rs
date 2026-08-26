@@ -20,14 +20,14 @@ use notary_server::{NotaryEvent, NotaryHead, NotaryReport};
 /// (connection id, key hash, request sequence, journal sequence,
 /// timestamp) before the event is counted at all, and shrinking the event
 /// further would barely move it — the floor is structural. The output
-/// slot is the receipt's: two 32-byte heads make it 112 bytes. The two
-/// rings come to ~240 MiB.
+/// slot is the receipt's: two 32-byte heads, a position and a timestamp
+/// make it 120 bytes. The two rings come to ~248 MiB.
 ///
-/// That is the state worth protecting. 256 MiB leaves room for
+/// That is the state worth protecting. 320 MiB leaves room for
 /// slot-layout drift while still failing loudly if the event grows back
 /// into the dominant term, which is what carrying documents inline would
 /// do: the same rings came to ~712 MiB at a 288-byte inline payload.
-const RING_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const RING_BUDGET_BYTES: usize = 320 * 1024 * 1024;
 
 #[test]
 fn ring_footprint_is_within_budget() {

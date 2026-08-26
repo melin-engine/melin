@@ -3,19 +3,24 @@
 //! A tamper-evident notary built on the Melin core runtime.
 //!
 //! Clients submit a 32-byte digest of whatever they want attested. The
-//! sequencer assigns it a total order, folds it into a rolling BLAKE3
-//! commitment, and returns a receipt: the position the digest landed at,
-//! the chain head before it, and the head after folding it in. A receipt
-//! is a self-contained link: anyone holding the original document can
-//! recompute its digest and check `BLAKE3(prev ‖ digest) == head` with
-//! nothing else, and consecutive receipts chain — one's `head` is the
-//! next's `prev` — so a set of them proves order as well as membership.
+//! sequencer assigns it a total order and a time, folds both into a
+//! rolling BLAKE3 commitment, and returns a receipt: the position the
+//! digest landed at, the time it was sequenced, the chain head before it,
+//! and the head after folding it in. A receipt is a self-contained link:
+//! anyone holding the original document can recompute its digest and
+//! check `BLAKE3(prev ‖ digest ‖ time) == head` with nothing else, and
+//! consecutive receipts chain — one's `head` is the next's `prev` — so a
+//! set of them proves order as well as membership.
 //!
 //! This is how a real notary or timestamping service works, and the
 //! reason it takes a digest rather than a document is not efficiency but
 //! design: the service attests to *when and in what order* something
 //! existed, without ever holding the thing itself. Clients keep their
-//! documents; the log keeps proof.
+//! documents; the log keeps proof. The time is the sequencer's clock at
+//! dispatch, journaled with the event, so replay and replicas fold the
+//! same value — and because it is folded in, the service cannot later
+//! claim a different time for an entry without breaking every receipt
+//! after it.
 //!
 //! ## Why this makes a good example
 //!
@@ -164,8 +169,13 @@ pub enum NotaryReport {
         /// dependent, so deriving journaled state from it would break
         /// determinism between primary and replica.
         entry: u64,
+        /// When the sequencer dispatched the leaf, in nanoseconds since
+        /// the Unix epoch. Folded into `head`, so it is attested, not
+        /// merely reported.
+        timestamp_ns: u64,
         /// Commitment before this leaf was folded in. What makes the
-        /// receipt verifiable on its own: `fold(prev, leaf) == head`.
+        /// receipt verifiable on its own:
+        /// `fold(prev, leaf, timestamp_ns) == head`.
         prev: [u8; HEAD_LEN],
         /// Commitment after folding this leaf in.
         head: [u8; HEAD_LEN],
@@ -191,15 +201,17 @@ pub struct Notary {
     entries: u64,
 }
 
-/// Fold one leaf into the chain: `BLAKE3(prev || leaf)`.
+/// Fold one leaf into the chain: `BLAKE3(prev || leaf || timestamp_ns)`.
 ///
-/// Both inputs are fixed-width, so the concatenation parses unambiguously
-/// and distinct `(prev, leaf)` pairs cannot collide by re-splitting at a
-/// different point. No length prefix or domain separator is needed.
-fn fold(prev: &[u8; HEAD_LEN], leaf: &[u8; LEAF_LEN]) -> [u8; HEAD_LEN] {
+/// All three inputs are fixed-width (32 + 32 + 8 bytes, the time in
+/// little-endian), so the concatenation parses unambiguously and distinct
+/// inputs cannot collide by re-splitting at a different point. No length
+/// prefix or domain separator is needed.
+fn fold(prev: &[u8; HEAD_LEN], leaf: &[u8; LEAF_LEN], timestamp_ns: u64) -> [u8; HEAD_LEN] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(prev);
     hasher.update(leaf);
+    hasher.update(&timestamp_ns.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -225,13 +237,17 @@ impl Application for Notary {
     fn apply(
         &mut self,
         event: Self::Event,
-        _ctx: &ApplyCtx,
+        ctx: &ApplyCtx,
         out: &mut Vec<Self::Report>,
     ) -> Option<Self::QueryResponse> {
         match event {
             NotaryEvent::Notarize { leaf } => {
+                // `now_ns` is the sequencer's dispatch clock, journaled
+                // with the entry, so replay and replicas see the same
+                // value — which is what makes folding it deterministic.
+                let timestamp_ns = ctx.now_ns;
                 let prev = self.head;
-                self.head = fold(&prev, &leaf);
+                self.head = fold(&prev, &leaf, timestamp_ns);
                 // Saturating rather than wrapping: a receipt attests to a
                 // position, so the counter must never run backwards. At
                 // 10M events/sec saturation is ~58,000 years out — this
@@ -239,6 +255,7 @@ impl Application for Notary {
                 self.entries = self.entries.saturating_add(1);
                 out.push(NotaryReport::Receipt {
                     entry: self.entries,
+                    timestamp_ns,
                     prev,
                     head: self.head,
                 });
@@ -361,13 +378,14 @@ impl RequestDecoderTrait for RequestDecoder {
 /// Encodes `NotaryReport` / `NotaryHead` into length-prefixed wire frames.
 ///
 /// Wire format: `[length: u32 LE][tag: u8][payload...]`, where the payload is
-///   - receipt:  `[entry: u64][prev: 32 bytes][head: 32 bytes]`
+///   - receipt:  `[entry: u64][timestamp_ns: u64][prev: 32 bytes][head: 32 bytes]`
 ///   - head:     `[entries: u64][head: 32 bytes]`
 ///   - rejected: empty
 pub struct ResponseEncoder;
 
-/// Length prefix (4) + tag (1) + entry (8) + prev (32) + head (32).
-const RECEIPT_FRAME_LEN: usize = 4 + 1 + 8 + HEAD_LEN + HEAD_LEN;
+/// Length prefix (4) + tag (1) + entry (8) + timestamp (8) + prev (32) +
+/// head (32).
+const RECEIPT_FRAME_LEN: usize = 4 + 1 + 8 + 8 + HEAD_LEN + HEAD_LEN;
 
 /// Length prefix (4) + tag (1) + entries (8) + head (32).
 const HEAD_FRAME_LEN: usize = 4 + 1 + 8 + HEAD_LEN;
@@ -394,11 +412,17 @@ impl ResponseEncoderTrait for ResponseEncoder {
 
     fn encode_report(&self, report: &NotaryReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match report {
-            NotaryReport::Receipt { entry, prev, head } => {
+            NotaryReport::Receipt {
+                entry,
+                timestamp_ns,
+                prev,
+                head,
+            } => {
                 frame_header(buf, RECEIPT_FRAME_LEN, TAG_RESP_RECEIPT)?;
                 buf[5..13].copy_from_slice(&entry.to_le_bytes());
-                buf[13..45].copy_from_slice(prev);
-                buf[45..RECEIPT_FRAME_LEN].copy_from_slice(head);
+                buf[13..21].copy_from_slice(&timestamp_ns.to_le_bytes());
+                buf[21..53].copy_from_slice(prev);
+                buf[53..RECEIPT_FRAME_LEN].copy_from_slice(head);
                 Ok(RECEIPT_FRAME_LEN)
             }
             NotaryReport::Rejected => {
@@ -424,14 +448,18 @@ impl ResponseEncoderTrait for ResponseEncoder {
 mod tests {
     use super::*;
 
-    fn ctx() -> ApplyCtx {
+    fn ctx_at(now_ns: u64) -> ApplyCtx {
         ApplyCtx {
-            now_ns: 0,
+            now_ns,
             journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,
         }
+    }
+
+    fn ctx() -> ApplyCtx {
+        ctx_at(0)
     }
 
     /// A distinct, deterministic leaf per `n`.
@@ -530,6 +558,7 @@ mod tests {
             out[0],
             NotaryReport::Receipt {
                 entry: 1,
+                timestamp_ns: 0,
                 prev: GENESIS_HEAD,
                 head: first
             }
@@ -543,6 +572,7 @@ mod tests {
             out[0],
             NotaryReport::Receipt {
                 entry: 2,
+                timestamp_ns: 0,
                 prev: first,
                 head: app.head()
             },
@@ -562,16 +592,51 @@ mod tests {
         out.clear();
 
         let mine = leaf(0xC3);
-        app.apply(NotaryEvent::Notarize { leaf: mine }, &ctx(), &mut out);
-        let NotaryReport::Receipt { entry, prev, head } = out[0] else {
+        let at = 1_700_000_000_000_000_000;
+        app.apply(NotaryEvent::Notarize { leaf: mine }, &ctx_at(at), &mut out);
+        let NotaryReport::Receipt {
+            entry,
+            timestamp_ns,
+            prev,
+            head,
+        } = out[0]
+        else {
             panic!("expected a receipt");
         };
         assert_eq!(entry, 6);
-        assert_eq!(fold(&prev, &mine), head);
+        assert_eq!(timestamp_ns, at, "the receipt carries the dispatch time");
+        assert_eq!(fold(&prev, &mine, timestamp_ns), head);
         assert_ne!(
-            fold(&prev, &leaf(0xC4)),
+            fold(&prev, &leaf(0xC4), timestamp_ns),
             head,
             "a different leaf must not verify"
+        );
+        assert_ne!(
+            fold(&prev, &mine, timestamp_ns + 1),
+            head,
+            "a different time must not verify"
+        );
+    }
+
+    #[test]
+    fn the_time_is_part_of_the_commitment() {
+        let mut a = NotaryFactory.empty();
+        let mut b = NotaryFactory.empty();
+        let mut out = Vec::new();
+        a.apply(
+            NotaryEvent::Notarize { leaf: leaf(1) },
+            &ctx_at(1),
+            &mut out,
+        );
+        b.apply(
+            NotaryEvent::Notarize { leaf: leaf(1) },
+            &ctx_at(2),
+            &mut out,
+        );
+        assert_ne!(
+            a.head(),
+            b.head(),
+            "the same leaf sequenced at a different time is a different commitment"
         );
     }
 
@@ -753,18 +818,20 @@ mod tests {
             .encode_report(
                 &NotaryReport::Receipt {
                     entry: 7,
+                    timestamp_ns: 9,
                     prev,
                     head,
                 },
                 &mut buf,
             )
             .unwrap();
-        assert_eq!(n, 77);
-        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 73);
+        assert_eq!(n, 85);
+        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 81);
         assert_eq!(buf[4], TAG_RESP_RECEIPT);
         assert_eq!(u64::from_le_bytes(buf[5..13].try_into().unwrap()), 7);
-        assert_eq!(&buf[13..45], &prev);
-        assert_eq!(&buf[45..77], &head);
+        assert_eq!(u64::from_le_bytes(buf[13..21].try_into().unwrap()), 9);
+        assert_eq!(&buf[21..53], &prev);
+        assert_eq!(&buf[53..85], &head);
     }
 
     #[test]
@@ -799,6 +866,7 @@ mod tests {
                 .encode_report(
                     &NotaryReport::Receipt {
                         entry: 1,
+                        timestamp_ns: 0,
                         prev: GENESIS_HEAD,
                         head: GENESIS_HEAD
                     },

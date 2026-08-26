@@ -79,19 +79,30 @@ fn digest(document: &[u8]) -> [u8; LEAF_LEN] {
     *blake3::hash(document).as_bytes()
 }
 
-/// The client-side model of the server's chain: `BLAKE3(prev || leaf)`.
-/// Kept independent of the server implementation on purpose — if the two
-/// ever disagree, the test should fail rather than agree by construction.
-fn fold(prev: &[u8; HEAD_LEN], leaf: &[u8; LEAF_LEN]) -> [u8; HEAD_LEN] {
+/// The client-side model of the server's chain:
+/// `BLAKE3(prev || leaf || timestamp_ns)`. Kept independent of the server
+/// implementation on purpose — if the two ever disagree, the test should
+/// fail rather than agree by construction.
+fn fold(prev: &[u8; HEAD_LEN], leaf: &[u8; LEAF_LEN], timestamp_ns: u64) -> [u8; HEAD_LEN] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(prev);
     hasher.update(leaf);
+    hasher.update(&timestamp_ns.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
-/// A decoded receipt frame: `[tag][entry: u64][prev: 32][head: 32]`.
+fn unix_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the epoch")
+        .as_nanos() as u64
+}
+
+/// A decoded receipt frame:
+/// `[tag][entry: u64][timestamp_ns: u64][prev: 32][head: 32]`.
 struct Receipt {
     entry: u64,
+    timestamp_ns: u64,
     prev: [u8; HEAD_LEN],
     head: [u8; HEAD_LEN],
 }
@@ -100,8 +111,9 @@ fn receipt_of(frame: &[u8]) -> Receipt {
     assert_eq!(frame[0], TAG_RESP_RECEIPT, "expected a receipt frame");
     Receipt {
         entry: u64::from_le_bytes(frame[1..9].try_into().expect("8-byte entry")),
-        prev: frame[9..41].try_into().expect("32-byte prev"),
-        head: frame[41..73].try_into().expect("32-byte head"),
+        timestamp_ns: u64::from_le_bytes(frame[9..17].try_into().expect("8-byte time")),
+        prev: frame[17..49].try_into().expect("32-byte prev"),
+        head: frame[49..81].try_into().expect("32-byte head"),
     }
 }
 
@@ -294,6 +306,7 @@ fn notarize_builds_a_chain_the_client_can_reproduce() {
     // Stand-in documents. Only their digests ever leave the client.
     let documents: [&[u8]; 4] = [b"", b"the quick brown fox", b"contract v1", b"contract v2"];
     let mut expected = GENESIS_HEAD;
+    let started = unix_now_ns();
 
     for (i, document) in documents.iter().enumerate() {
         let leaf = digest(document);
@@ -302,8 +315,12 @@ fn notarize_builds_a_chain_the_client_can_reproduce() {
         let receipt = receipt_of(&single_response(&mut stream));
 
         assert_eq!(receipt.entry, i as u64 + 1, "entry position");
+        assert!(
+            receipt.timestamp_ns >= started,
+            "the receipt's time must be the sequencer's clock, not a placeholder"
+        );
         assert_eq!(receipt.prev, expected, "receipts must chain");
-        expected = fold(&expected, &leaf);
+        expected = fold(&expected, &leaf, receipt.timestamp_ns);
         assert_eq!(
             receipt.head,
             expected,
@@ -343,10 +360,22 @@ fn an_independent_client_verifies_its_own_receipt() {
     send_request(&mut stream, 1, TAG_NOTARIZE, &leaf);
     let receipt = receipt_of(&single_response(&mut stream));
     assert_eq!(receipt.entry, 4);
-    assert_eq!(fold(&receipt.prev, &leaf), receipt.head);
-    assert_ne!(
-        fold(&receipt.prev, &digest(b"my document, altered")),
+    assert_eq!(
+        fold(&receipt.prev, &leaf, receipt.timestamp_ns),
         receipt.head
+    );
+    assert_ne!(
+        fold(
+            &receipt.prev,
+            &digest(b"my document, altered"),
+            receipt.timestamp_ns
+        ),
+        receipt.head
+    );
+    assert_ne!(
+        fold(&receipt.prev, &leaf, receipt.timestamp_ns + 1),
+        receipt.head,
+        "the time is attested, not merely reported"
     );
 
     drop(stream);
@@ -408,14 +437,18 @@ fn second_connection_sees_persisted_chain() {
     let (_tmp, server) = start_server();
 
     let leaf = digest(b"a document worth attesting");
-    let expected = fold(&GENESIS_HEAD, &leaf);
 
     // First connection: notarize once.
-    {
+    let expected = {
         let mut s = connect_authenticated(server.addr, &trader_key());
         send_request(&mut s, 1, TAG_NOTARIZE, &leaf);
-        assert_eq!(receipt_of(&single_response(&mut s)).head, expected);
-    }
+        let receipt = receipt_of(&single_response(&mut s));
+        assert_eq!(
+            fold(&GENESIS_HEAD, &leaf, receipt.timestamp_ns),
+            receipt.head
+        );
+        receipt.head
+    };
 
     // Second connection: the chain survives the first one closing.
     {
@@ -441,9 +474,10 @@ fn the_chain_survives_a_restart() {
         let mut stream = connect_authenticated(server.addr, &trader_key());
         for (i, document) in documents.iter().enumerate() {
             let leaf = digest(document);
-            expected = fold(&expected, &leaf);
             send_request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf);
-            assert_eq!(receipt_of(&single_response(&mut stream)).head, expected);
+            let receipt = receipt_of(&single_response(&mut stream));
+            expected = fold(&expected, &leaf, receipt.timestamp_ns);
+            assert_eq!(receipt.head, expected);
         }
     }
     server.stop();
