@@ -325,7 +325,7 @@ Every journal segment maintains a BLAKE3 hash chain for tamper evidence. The cha
 
 2. **Chain definition** — `chain(S) = BLAKE3(raw bytes of entries 1..=S ‖ anchor)`, where "raw bytes" are the entries exactly as written on disk, CRC trailers included. An empty segment's chain value is its anchor. Because the definition is over the byte stream, the chain over a sealed segment can be recomputed by any tool that can hash a byte range — no journal-aware decoding required.
 
-3. **Cost** — entries are absorbed into an incremental hasher (~15-30 ns each, in memory only) on the journal stage, which runs parallel to matching. The 32-byte value is finalized on demand — at fsync boundaries (for snapshot coordination), at snapshot saves, and at rotation — never per entry.
+3. **Cost** — entries are absorbed into an incremental hasher, in memory only, on the journal stage, which runs parallel to matching. The 32-byte value is finalized on demand — at fsync boundaries (for snapshot coordination), at snapshot saves, and at rotation — never per entry.
 
 4. **Rotation continuity** — the new segment's header anchor is the outgoing segment's tail chain hash. Recovery verifies this link *before* replaying each segment, so a tampered, missing, or foreign archive is rejected before any of its events reach the engine.
 
