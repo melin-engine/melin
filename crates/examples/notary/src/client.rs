@@ -43,9 +43,10 @@ use notary_server::{
 
 type Error = Box<dyn std::error::Error>;
 
-/// How long to wait for any single frame from the server. Generous for a
-/// local round trip; short enough that a request the server silently
-/// dropped (see [`request`]) turns into an error rather than a hang.
+/// How long to wait for any single frame from the server (and for the
+/// connection itself). Generous for a local round trip; short enough that
+/// a request the server silently dropped (see [`request`]) turns into an
+/// error rather than a hang.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------

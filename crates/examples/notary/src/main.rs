@@ -6,7 +6,7 @@
 //! # 1. Generate an Ed25519 keypair and write an authorized_keys file:
 //! openssl genpkey -algorithm ed25519 -out /tmp/notary-key.pem
 //! PUB=$(openssl pkey -in /tmp/notary-key.pem -pubout -outform DER | tail -c 32 | base64)
-//! echo "trader $PUB bench" > /tmp/authorized_keys
+//! echo "trader $PUB me" > /tmp/authorized_keys
 //!
 //! # 2. Start the notary server:
 //! cargo run --bin notary-server -- --standalone --ack-policy disk --authorized-keys /tmp/authorized_keys --journal /tmp/notary.journal
@@ -25,6 +25,12 @@
 //! before and after folding it in. See the `lib.rs` module docs for the
 //! wire format and the reasoning behind the shape, `client.rs` for the
 //! reference client, and `audit.rs` for the auditor.
+//!
+//! `--standalone` runs a single node. The binary takes every runtime
+//! flag, so a replicated pair is the same server with `--replication-bind`
+//! on the primary and `--replica-of` on the replica — see
+//! `docs/replication.md` at the repository root, and the replicated
+//! round trip in `tests/round_trip.rs` for a worked example.
 
 use clap::Parser;
 use melin_server_runtime::server::{self, ServerConfig};

@@ -50,6 +50,20 @@
 //! shorten the journal's fsync batches, since the transport sizes a batch
 //! by how many entries fit one hand-off chunk. Neither cost applies here. See
 //! `tests/footprint.rs` and `tests/journal_limit.rs`, which assert both.
+//!
+//! ## Where to look
+//!
+//! - `lib.rs` (this file): the application — event, state machine, and
+//!   the request/response codecs the runtime plugs into. Read top to
+//!   bottom; it is short.
+//! - `main.rs`: the server binary, and the recipe for running it.
+//! - `client.rs`: what a user runs — hash a file, submit, keep the
+//!   receipt, verify it offline.
+//! - `audit.rs`: what an auditor runs — refold the chain from the journal
+//!   on disk, without the server, and check receipts against it.
+//! - `receipt.rs`: the receipt as clients keep it; shared by the two above.
+//! - `tests/round_trip.rs`: the guarantees, end to end — over raw frames,
+//!   through the client and the auditor, and across a replica failover.
 
 use std::io::{self, Read, Write};
 
@@ -191,13 +205,18 @@ pub enum NotaryReport {
         /// Commitment after folding this leaf in.
         head: [u8; HEAD_LEN],
     },
+    /// The runtime refused the event before `apply` saw it (see
+    /// [`Application::build_reject`]). Nothing was folded in.
     Rejected,
 }
 
 /// 1:1 query response returned directly from `apply`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotaryHead {
+    /// Leaves folded in so far — the position the next receipt will get,
+    /// less one.
     pub entries: u64,
+    /// The current commitment.
     pub head: [u8; HEAD_LEN],
 }
 

@@ -1,10 +1,15 @@
-//! Full round-trip integration test: start notary-server, connect a TCP
-//! client with Ed25519 auth, notarize a series of digests, and check the
-//! chain head the server reports against one folded independently on the
-//! client — the same check an auditor holding the original documents
-//! would perform. The replicated case at the end checks the same head
-//! across nodes: a replica promoted after the primary's death must report
-//! what the primary receipted.
+//! The example's guarantees, end to end, in four sections:
+//!
+//! 1. Over raw frames: start notary-server, connect a TCP client with
+//!    Ed25519 auth, notarize a series of digests, and check the chain head
+//!    the server reports against one folded independently on the client —
+//!    the same check an auditor holding the original documents would
+//!    perform. Then recovery: the head survives a restart because it is
+//!    rebuilt from the journal.
+//! 2. Through the command-line client, run as a real process.
+//! 3. Through the auditor, against a rotated journal on disk.
+//! 4. Across nodes: a replica promoted after the primary's death must
+//!    report the head the primary receipted, and chain onto it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -860,6 +865,21 @@ fn the_auditor_refolds_the_head_from_the_journal_alone() {
     assert_eq!(code, 1, "{out}");
     assert!(
         out.contains("FAIL: the journal's own hash chain is broken"),
+        "{out}"
+    );
+
+    // History that no longer starts at genesis: the archive removed, the
+    // live segment alone is internally consistent, but a head refolded
+    // from it would be a head of the wrong log. The auditor must refuse
+    // rather than report one. (Which sequence the live segment starts at
+    // depends on the fsync the rotation landed on; what matters is that
+    // it is not 1.)
+    std::fs::remove_file(&archive).expect("remove archive");
+    let (code, out, _) = notary_audit(&[&journal]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("FAIL: the on-disk history starts at sequence")
+            && out.contains("not 1: the head cannot be refolded from genesis"),
         "{out}"
     );
 }
