@@ -21,6 +21,13 @@ path = "src/lib.rs"
 name = "notary-server"
 path = "src/main.rs"
 
+# Hashes a file, submits the digest, saves the receipt, and verifies a
+# receipt offline. What a user of the notary runs; the server is what an
+# operator runs.
+[[bin]]
+name = "notary-client"
+path = "src/client.rs"
+
 [dependencies]
 melin-app = { workspace = true }
 # `hash-chain` is required rather than optional: a notary's own journal
@@ -30,11 +37,12 @@ melin-server-runtime = { workspace = true, features = ["hash-chain"] }
 blake3 = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The client's side of the wire: control-frame tags and Ed25519 auth.
+melin-wire-protocol = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
-base64 = { workspace = true }
-ed25519-dalek = { workspace = true }
-melin-wire-protocol = { workspace = true }
 # Only for the footprint and journal-limit tests: the event width this
 # example commits to is what keeps ring slots and the fsync batch at the
 # size the pipeline was tuned for, so both are asserted rather than left

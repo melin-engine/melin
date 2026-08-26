@@ -207,7 +207,10 @@ pub struct Notary {
 /// little-endian), so the concatenation parses unambiguously and distinct
 /// inputs cannot collide by re-splitting at a different point. No length
 /// prefix or domain separator is needed.
-fn fold(prev: &[u8; HEAD_LEN], leaf: &[u8; LEAF_LEN], timestamp_ns: u64) -> [u8; HEAD_LEN] {
+///
+/// Public because it is the verification rule as much as the folding
+/// rule: `notary-client verify` recomputes it from a receipt, offline.
+pub fn fold(prev: &[u8; HEAD_LEN], leaf: &[u8; LEAF_LEN], timestamp_ns: u64) -> [u8; HEAD_LEN] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(prev);
     hasher.update(leaf);

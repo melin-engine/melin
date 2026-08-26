@@ -10,11 +10,17 @@
 //!
 //! # 2. Start the notary server:
 //! cargo run --bin notary-server -- --standalone --ack-policy disk --authorized-keys /tmp/authorized_keys --journal /tmp/notary.journal
+//!
+//! # 3. Notarize a file, then verify it against its receipt — offline:
+//! cargo run --bin notary-client -- notarize contract.pdf --key /tmp/notary-key.pem
+//! cargo run --bin notary-client -- verify contract.pdf
 //! ```
 //!
-//! Clients submit a 32-byte digest per request and receive the position
-//! it landed at plus the chain head after folding it in. See the `lib.rs`
-//! module docs for the wire format and the reasoning behind the shape.
+//! Clients submit a 32-byte digest per request and receive a receipt: the
+//! position it landed at, the time it was sequenced, and the chain head
+//! before and after folding it in. See the `lib.rs` module docs for the
+//! wire format and the reasoning behind the shape, and `client.rs` for
+//! the reference client.
 
 use clap::Parser;
 use melin_server_runtime::server::{self, ServerConfig};

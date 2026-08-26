@@ -536,3 +536,118 @@ fn the_journal_carries_the_runtime_hash_chain() {
     hasher.update(&anchor);
     assert_eq!(reader.chain_hash(), Some(*hasher.finalize().as_bytes()));
 }
+
+// ---------------------------------------------------------------------------
+// The command-line client
+// ---------------------------------------------------------------------------
+
+/// Run `notary-client` with `args`, returning `(exit code, stdout, stderr)`.
+fn notary_client(args: &[&str]) -> (i32, String, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_notary-client"))
+        .args(args)
+        .output()
+        .expect("spawn notary-client");
+    (
+        output.status.code().expect("client exited normally"),
+        String::from_utf8(output.stdout).expect("utf-8 stdout"),
+        String::from_utf8(output.stderr).expect("utf-8 stderr"),
+    )
+}
+
+#[test]
+fn the_client_notarizes_a_file_and_verifies_it_offline() {
+    let (tmp, server) = start_server();
+    // The binary connects once, without retrying, so wait for the server
+    // to be ready the way the in-process tests do before spawning it.
+    drop(connect_authenticated(server.addr, &trader_key()));
+
+    let key = tmp.path().join("trader.key");
+    std::fs::write(&key, trader_key().to_bytes()).expect("write key");
+    let document = tmp.path().join("contract.txt");
+    std::fs::write(&document, b"I, the undersigned, ...").expect("write document");
+    let receipt = tmp.path().join("contract.txt.receipt");
+    let addr = server.addr.to_string();
+    let document_arg = document.to_str().expect("utf-8 path");
+    let key_arg = key.to_str().expect("utf-8 path");
+
+    let (code, stdout, stderr) = notary_client(&[
+        "notarize",
+        document_arg,
+        "--server",
+        &addr,
+        "--key",
+        key_arg,
+    ]);
+    assert_eq!(code, 0, "notarize failed: {stderr}");
+    assert!(stdout.contains("entry: 1"), "{stdout}");
+    assert!(receipt.exists(), "the receipt lands next to the document");
+
+    // The server's view agrees with the receipt the client kept.
+    let (code, stdout, stderr) = notary_client(&["head", "--server", &addr, "--key", key_arg]);
+    assert_eq!(code, 0, "head failed: {stderr}");
+    let receipt_text = std::fs::read_to_string(&receipt).expect("read receipt");
+    let head_line = receipt_text
+        .lines()
+        .find(|l| l.starts_with("head: "))
+        .expect("receipt has a head");
+    let head_hex = &head_line["head: ".len()..];
+    assert!(stdout.contains("entries: 1"), "{stdout}");
+    assert!(
+        stdout.contains(head_hex),
+        "server head must match the receipt: {stdout}"
+    );
+
+    // Verification is offline: the server is gone, and no key is given.
+    server.stop();
+    let (code, stdout, _) = notary_client(&["verify", document_arg]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.starts_with("OK: "), "{stdout}");
+
+    // A changed document no longer matches its receipt.
+    std::fs::write(&document, b"I, the undersigned, ... (amended)").expect("amend document");
+    let (code, stdout, _) = notary_client(&["verify", document_arg]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.starts_with("MISMATCH: "), "{stdout}");
+    assert!(stdout.contains("changed"), "{stdout}");
+
+    // A receipt whose attested time was edited no longer folds, even
+    // though the document is the original again.
+    std::fs::write(&document, b"I, the undersigned, ...").expect("restore document");
+    let forged = receipt_text
+        .lines()
+        .map(|l| match l.strip_prefix("time_ns: ") {
+            Some(ns) => format!("time_ns: {}", ns.parse::<u64>().unwrap() + 1),
+            None => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&receipt, forged).expect("forge receipt");
+    let (code, stdout, _) = notary_client(&["verify", document_arg]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("does not fold"), "{stdout}");
+}
+
+#[test]
+fn the_client_reports_an_unauthorized_key() {
+    let (tmp, server) = start_server();
+    drop(connect_authenticated(server.addr, &trader_key()));
+
+    // A key the server has never heard of: the handshake fails, and the
+    // client says which public key to authorize.
+    let key = tmp.path().join("stranger.key");
+    std::fs::write(&key, [0xCC; 32]).expect("write key");
+    let (code, _, stderr) = notary_client(&[
+        "head",
+        "--server",
+        &server.addr.to_string(),
+        "--key",
+        key.to_str().expect("utf-8 path"),
+    ]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains(&pubkey_b64(&SigningKey::from_bytes(&[0xCC; 32]))),
+        "{stderr}"
+    );
+
+    server.stop();
+}
