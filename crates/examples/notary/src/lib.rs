@@ -270,9 +270,12 @@ impl Application for Notary {
 
     fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
 
-    // Simplification, as in the counter example: always accepts. A
-    // production app should track per-key high-water marks and reject
-    // duplicates.
+    // Simplification, as in the counter example: always accepts, so a
+    // client retrying a request after losing its receipt lands a second
+    // entry. A production app decides its own dedup policy, typically a
+    // per-key high-water mark. Not to be confused with re-attesting the
+    // same digest under a new request, which is supported by design: a
+    // later position and a later time are a different commitment.
     fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
         true
     }
