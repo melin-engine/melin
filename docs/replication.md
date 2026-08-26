@@ -464,12 +464,21 @@ streaming. A mismatch anywhere means the replica's journal holds
 failover with orders it journaled but never replicated.
 
 Chain validation requires the tamper-evident hash chain on **both**
-nodes (the `hash-chain` build feature, on by default). A pair where one
-node was built without it still replicates, but with reduced
-verification: boundary and connect-time checks fall back to
-sequence-only validation, so a fork on such a pair goes undetected
-until both nodes run hash-chain builds. Run matching builds across a
-deployment.
+nodes. It is on by default; a node lacks it only if it was built with
+`--no-default-features`. Such a node still replicates, but the pair runs
+with reduced verification, and how reduced depends on which side is
+missing it:
+
+- **Replica without it, primary with it** — boundary and connect-time
+  checks fall back to sequence-only validation. A replica claiming
+  history past the primary's tip is still caught; a replica holding a
+  *different* history at the same position is not.
+- **Primary without it** — nothing is verified. The position check reads
+  the same journal machinery the chain comparison does, so both are
+  absent together and every replica handshake is accepted as-is.
+
+Either way a fork on such a pair goes undetected, and the symptom is
+silence rather than an error. Run matching builds across a deployment.
 
 **Divergence repair is automatic.** A divergent replica is re-seeded
 from the primary through the snapshot path on the same connection.

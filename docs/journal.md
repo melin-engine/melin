@@ -325,7 +325,7 @@ Every journal segment maintains a BLAKE3 hash chain for tamper evidence. The cha
 
 2. **Chain definition** — `chain(S) = BLAKE3(raw bytes of entries 1..=S ‖ anchor)`, where "raw bytes" are the entries exactly as written on disk, CRC trailers included. An empty segment's chain value is its anchor. Because the definition is over the byte stream, the chain over a sealed segment can be recomputed by any tool that can hash a byte range — no journal-aware decoding required.
 
-3. **Cost** — entries are absorbed into an incremental hasher (~15-30 ns each, in memory only). The 32-byte value is finalized on demand — at fsync boundaries (for snapshot coordination), at snapshot saves, and at rotation — never per entry.
+3. **Cost** — entries are absorbed into an incremental hasher (~15-30 ns each, in memory only) on the journal stage, which runs parallel to matching. The 32-byte value is finalized on demand — at fsync boundaries (for snapshot coordination), at snapshot saves, and at rotation — never per entry.
 
 4. **Rotation continuity** — the new segment's header anchor is the outgoing segment's tail chain hash. Recovery verifies this link *before* replaying each segment, so a tampered, missing, or foreign archive is rejected before any of its events reach the engine.
 
@@ -342,6 +342,10 @@ Every journal segment maintains a BLAKE3 hash chain for tamper evidence. The cha
 
 - **Tamper in the live segment after the last snapshot anchor** — nothing has committed to those bytes yet. (An attacker with that level of access could equally truncate the tail, which is likewise undetectable in any design; sealing the segment — rotation — or the next snapshot closes the window.)
 - **Truncation attacks** — removing entries from the end of the live segment produces a valid (shorter) chain. Sequence numbers detect this if the expected sequence is known externally.
+
+### Turning It Off
+
+The chain is on by default. A build with `--no-default-features` omits it and saves the per-entry hashing cost, giving up more than tamper evidence: the rotation-continuity check at recovery, the snapshot/journal cross-check, and the cross-node divergence detection built on top of them all go with it. That last one is the consequential loss in ordinary operation, with no attacker involved — it is what routes a rejoining ex-primary through resync instead of letting it be streamed to on top of a forked history (see [replication.md](replication.md)). Leave the chain on for any deployment that is replicated or carries an audit requirement.
 
 ## Journal Rotation
 
@@ -542,4 +546,4 @@ The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`
 - **No output event log** — execution reports are not persisted. Audit trail requires replaying the journal.
 - **Single journal file** — no striping or parallel writes. The journal is single-threaded by design (LMAX architecture).
 - **No encryption** — journal and snapshot files are plaintext binary. Sensitive data (account IDs, order details) is visible to anyone with file access.
-- **No cross-node chain comparison at runtime** — each node verifies its own journal's integrity locally. Comparing chain values between primary and replica requires aligned segment boundaries (primary-driven rotation), tracked on the roadmap.
+- **No verification without the chain** — a build with `--no-default-features` omits the hash chain, and with it every tamper and divergence check described above. See "Turning It Off".
