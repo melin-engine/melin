@@ -2535,6 +2535,11 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         .journal_stage
         .set_rotation(0, Some(Arc::clone(&rotate_flag)));
     let p_util = primary.journal_stage.utilization();
+    // Durable-progress readers on both nodes: the test observes what
+    // each stage has actually synced instead of sleeping and hoping.
+    let (p_fsync_writer, p_fsync) =
+        melin_pipeline::seqlock::split(crate::pipeline::FsyncState::default());
+    primary.journal_stage.set_chain_hash_lock(p_fsync_writer);
 
     let replica_writer = Writer::create_continuing(&replica_path, 1, shared_anchor).unwrap();
     let mut replica = build_replica_pipeline(
@@ -2552,6 +2557,9 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         .journal_stage
         .set_stream_marks(Arc::clone(&rotations));
     let r_util = replica.journal_stage.utilization();
+    let (r_fsync_writer, r_fsync) =
+        melin_pipeline::seqlock::split(crate::pipeline::FsyncState::default());
+    replica.journal_stage.set_chain_hash_lock(r_fsync_writer);
 
     if let Some(ref count) = primary.replicas_connected {
         count.store(1, Ordering::Relaxed);
@@ -2676,10 +2684,34 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     let t_r_journal = std::thread::spawn(move || replica.journal_stage.run(&r_j_stop));
     let t_r_matching = std::thread::spawn(move || replica.matching_stage.run(&r_m_stop));
 
+    // Progress is observed, never waited out. The journal stage's
+    // shutdown drain encodes whatever is left in the ring but adopts no
+    // pending stream mark, so a replica stopped with a `Rotate` still
+    // queued writes the tail into the wrong segment. A fixed sleep is
+    // exactly that race: with the rest of the suite alongside on four
+    // CPUs the replica lost it often enough to fail CI.
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            // Yield rather than spin: seven stage/relay threads are
+            // already spinning, and this one has nothing to add.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let primary_durable = |seq: u64| p_fsync.load().journal_seq.get() >= seq;
+    let primary_rotations = || p_util.rotations_sync_fallback.load(Ordering::Relaxed);
+
     // Three phases with a manual rotation between each: flip the flag,
     // then keep publishing — the rotation fires at the next fsync
     // boundary, wherever that lands. The assertions below don't depend
-    // on the exact boundary, only on the replica mirroring it.
+    // on the exact boundary, only on the replica mirroring it. Each
+    // flag is raised only once the previous phase is durable, so the
+    // live segment it rotates is never empty (an empty-live rotation is
+    // skipped, and the flag with it).
     let mut next: u64 = 0;
     let mut publish_phase = |n: u64, producer: &mut ring::Producer<TestInput>| {
         for _ in 0..n {
@@ -2688,20 +2720,32 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         }
     };
     publish_phase(2_000, &mut primary.input_producer);
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until("phase 1 durable on the primary", || primary_durable(2_000));
     rotate_flag.store(true, Ordering::Release);
     publish_phase(2_000, &mut primary.input_producer);
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until("the first primary rotation", || primary_rotations() == 1);
     rotate_flag.store(true, Ordering::Release);
     publish_phase(1_000, &mut primary.input_producer);
-    std::thread::sleep(Duration::from_millis(500));
+    wait_until("the second primary rotation", || primary_rotations() == 2);
+    wait_until("phase 3 durable on the primary", || primary_durable(5_000));
 
     primary_shutdown.store(true, Ordering::Relaxed);
     let primary_journal_result = t_p_journal.join().unwrap();
     let _ = t_p_matching.join().unwrap();
+    // The relay exits only once the primary's ring is empty, so after
+    // the join every slot and mark is on the replica's side.
     relay_shutdown.store(true, Ordering::Relaxed);
     let _ = t_relay.join();
-    std::thread::sleep(Duration::from_millis(500));
+    let replica_caught_up = || {
+        r_util.rotations_fast_path.load(Ordering::Relaxed)
+            + r_util.rotations_sync_fallback.load(Ordering::Relaxed)
+            == 2
+            && r_fsync.load().journal_seq.get() >= 5_000
+    };
+    wait_until(
+        "the replica to adopt both rotations and sync the tail",
+        replica_caught_up,
+    );
     replica_shutdown.store(true, Ordering::Relaxed);
     let replica_journal_result = t_r_journal.join().unwrap();
     let _ = t_r_matching.join().unwrap();
@@ -2742,10 +2786,10 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
 
     let primary_files = segment_files(&primary_path);
     let replica_files = segment_files(&replica_path);
-    assert!(
-        primary_files.len() >= 2,
-        "at least one rotation must have fired on the primary (got {} segment files)",
-        primary_files.len()
+    assert_eq!(
+        primary_files.len(),
+        3,
+        "both manual rotations fired on the primary, so two archives plus the live segment"
     );
     assert_eq!(
         primary_files.len(),
