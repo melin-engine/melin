@@ -75,7 +75,16 @@ melin-dpdk = { workspace = true, optional = true }
 # (counter depends on the runtime), which Cargo permits. The counter's own
 # package version tracks the workspace, but that is unrelated — declaring a
 # version requirement here would break `cargo publish` for this crate.
-melin-example-counter = { path = "../../examples/counter" }
+#
+# `default-features = false` because the counter's default is
+# `hash-chain`, which forwards to *this* crate's `hash-chain`. A dev-
+# dependency's features unify into the crate under test whenever its tests
+# are built, so without this the chain-less check (`--all-targets
+# --no-default-features`, in the hook and CI) would compile the runtime
+# with the chain back on and prove nothing. The runtime's own `default`
+# supplies the chain in every ordinary build; the counter's `hash-chain`
+# feature is a pure forward with no code of its own, so nothing is lost.
+melin-example-counter = { path = "../../examples/counter", default-features = false }
 tempfile = "3"
 serial_test = "3"
 proptest = "1"
