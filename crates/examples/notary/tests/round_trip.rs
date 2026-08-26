@@ -89,12 +89,29 @@ fn fold(prev: &[u8; HEAD_LEN], leaf: &[u8; LEAF_LEN]) -> [u8; HEAD_LEN] {
     *hasher.finalize().as_bytes()
 }
 
-fn head_of(frame: &[u8]) -> [u8; HEAD_LEN] {
-    frame[9..9 + HEAD_LEN].try_into().expect("32-byte head")
+/// A decoded receipt frame: `[tag][entry: u64][prev: 32][head: 32]`.
+struct Receipt {
+    entry: u64,
+    prev: [u8; HEAD_LEN],
+    head: [u8; HEAD_LEN],
 }
 
-fn count_of(frame: &[u8]) -> u64 {
-    u64::from_le_bytes(frame[1..9].try_into().expect("8-byte count"))
+fn receipt_of(frame: &[u8]) -> Receipt {
+    assert_eq!(frame[0], TAG_RESP_RECEIPT, "expected a receipt frame");
+    Receipt {
+        entry: u64::from_le_bytes(frame[1..9].try_into().expect("8-byte entry")),
+        prev: frame[9..41].try_into().expect("32-byte prev"),
+        head: frame[41..73].try_into().expect("32-byte head"),
+    }
+}
+
+/// `(entries, head)` from a head frame: `[tag][entries: u64][head: 32]`.
+fn head_of(frame: &[u8]) -> (u64, [u8; HEAD_LEN]) {
+    assert_eq!(frame[0], TAG_RESP_HEAD, "expected a head frame");
+    (
+        u64::from_le_bytes(frame[1..9].try_into().expect("8-byte count")),
+        frame[9..41].try_into().expect("32-byte head"),
+    )
 }
 
 /// Connect and authenticate, retrying until the server is ready.
@@ -263,10 +280,7 @@ fn an_empty_log_reports_genesis() {
     let mut stream = connect_authenticated(server.addr, &trader_key());
 
     send_request(&mut stream, 1, TAG_GET_HEAD, &[]);
-    let response = single_response(&mut stream);
-    assert_eq!(response[0], TAG_RESP_HEAD);
-    assert_eq!(count_of(&response), 0);
-    assert_eq!(head_of(&response), GENESIS_HEAD);
+    assert_eq!(head_of(&single_response(&mut stream)), (0, GENESIS_HEAD));
 
     drop(stream);
     server.stop();
@@ -283,15 +297,15 @@ fn notarize_builds_a_chain_the_client_can_reproduce() {
 
     for (i, document) in documents.iter().enumerate() {
         let leaf = digest(document);
-        expected = fold(&expected, &leaf);
 
         send_request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf);
-        let response = single_response(&mut stream);
+        let receipt = receipt_of(&single_response(&mut stream));
 
-        assert_eq!(response[0], TAG_RESP_RECEIPT);
-        assert_eq!(count_of(&response), i as u64 + 1, "entry position");
+        assert_eq!(receipt.entry, i as u64 + 1, "entry position");
+        assert_eq!(receipt.prev, expected, "receipts must chain");
+        expected = fold(&expected, &leaf);
         assert_eq!(
-            head_of(&response),
+            receipt.head,
             expected,
             "server head diverged from the client's fold at entry {}",
             i + 1
@@ -300,10 +314,40 @@ fn notarize_builds_a_chain_the_client_can_reproduce() {
 
     // The query must agree with the last receipt.
     send_request(&mut stream, 100, TAG_GET_HEAD, &[]);
-    let response = single_response(&mut stream);
-    assert_eq!(response[0], TAG_RESP_HEAD);
-    assert_eq!(count_of(&response), documents.len() as u64);
-    assert_eq!(head_of(&response), expected);
+    assert_eq!(
+        head_of(&single_response(&mut stream)),
+        (documents.len() as u64, expected)
+    );
+
+    drop(stream);
+    server.stop();
+}
+
+#[test]
+fn an_independent_client_verifies_its_own_receipt() {
+    let (_tmp, server) = start_server();
+
+    // Someone else's history, unknown to the verifier below.
+    {
+        let mut other = connect_authenticated(server.addr, &trader_key());
+        for i in 1..=3u64 {
+            send_request(&mut other, i, TAG_NOTARIZE, &digest(&i.to_le_bytes()));
+            receipt_of(&single_response(&mut other));
+        }
+    }
+
+    // The verifier holds only its document and its receipt — no earlier
+    // leaves, no query — and that is enough to check the commitment.
+    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let leaf = digest(b"my document");
+    send_request(&mut stream, 1, TAG_NOTARIZE, &leaf);
+    let receipt = receipt_of(&single_response(&mut stream));
+    assert_eq!(receipt.entry, 4);
+    assert_eq!(fold(&receipt.prev, &leaf), receipt.head);
+    assert_ne!(
+        fold(&receipt.prev, &digest(b"my document, altered")),
+        receipt.head
+    );
 
     drop(stream);
     server.stop();
@@ -322,10 +366,11 @@ fn a_malformed_leaf_is_refused_without_dropping_the_connection() {
     // The connection still serves the next request, and nothing was
     // committed.
     send_request(&mut stream, 2, TAG_GET_HEAD, &[]);
-    let response = single_response(&mut stream);
-    assert_eq!(response[0], TAG_RESP_HEAD);
-    assert_eq!(count_of(&response), 0, "a refused leaf must not be folded");
-    assert_eq!(head_of(&response), GENESIS_HEAD);
+    assert_eq!(
+        head_of(&single_response(&mut stream)),
+        (0, GENESIS_HEAD),
+        "a refused leaf must not be folded"
+    );
 
     drop(stream);
     server.stop();
@@ -349,11 +394,10 @@ fn a_read_only_key_can_audit_but_not_notarize() {
         "a read-only key must still be able to audit"
     );
     assert_eq!(
-        count_of(&response),
-        0,
+        head_of(&response),
+        (0, GENESIS_HEAD),
         "a read-only key must not be able to extend the chain"
     );
-    assert_eq!(head_of(&response), GENESIS_HEAD);
 
     drop(stream);
     server.stop();
@@ -370,19 +414,14 @@ fn second_connection_sees_persisted_chain() {
     {
         let mut s = connect_authenticated(server.addr, &trader_key());
         send_request(&mut s, 1, TAG_NOTARIZE, &leaf);
-        let r = single_response(&mut s);
-        assert_eq!(r[0], TAG_RESP_RECEIPT);
-        assert_eq!(head_of(&r), expected);
+        assert_eq!(receipt_of(&single_response(&mut s)).head, expected);
     }
 
     // Second connection: the chain survives the first one closing.
     {
         let mut s = connect_authenticated(server.addr, &trader_key());
         send_request(&mut s, 1, TAG_GET_HEAD, &[]);
-        let r = single_response(&mut s);
-        assert_eq!(r[0], TAG_RESP_HEAD);
-        assert_eq!(count_of(&r), 1);
-        assert_eq!(head_of(&r), expected);
+        assert_eq!(head_of(&single_response(&mut s)), (1, expected));
     }
 
     server.stop();
@@ -404,9 +443,7 @@ fn the_chain_survives_a_restart() {
             let leaf = digest(document);
             expected = fold(&expected, &leaf);
             send_request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf);
-            let response = single_response(&mut stream);
-            assert_eq!(response[0], TAG_RESP_RECEIPT);
-            assert_eq!(head_of(&response), expected);
+            assert_eq!(receipt_of(&single_response(&mut stream)).head, expected);
         }
     }
     server.stop();
@@ -418,12 +455,9 @@ fn the_chain_survives_a_restart() {
     let server = start_server_in(tmp.path());
     let mut stream = connect_authenticated(server.addr, &trader_key());
     send_request(&mut stream, 1, TAG_GET_HEAD, &[]);
-    let response = single_response(&mut stream);
-    assert_eq!(response[0], TAG_RESP_HEAD);
-    assert_eq!(count_of(&response), documents.len() as u64);
     assert_eq!(
-        head_of(&response),
-        expected,
+        head_of(&single_response(&mut stream)),
+        (documents.len() as u64, expected),
         "recovered head diverged from the client's fold"
     );
 

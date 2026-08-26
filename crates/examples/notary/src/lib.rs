@@ -4,10 +4,12 @@
 //!
 //! Clients submit a 32-byte digest of whatever they want attested. The
 //! sequencer assigns it a total order, folds it into a rolling BLAKE3
-//! commitment, and returns a receipt: the position the digest landed at
-//! and the chain head after folding it in. Later, anyone holding the
-//! original document can recompute its digest and — given the chain —
-//! verify it was committed to at that position, in that order.
+//! commitment, and returns a receipt: the position the digest landed at,
+//! the chain head before it, and the head after folding it in. A receipt
+//! is a self-contained link: anyone holding the original document can
+//! recompute its digest and check `BLAKE3(prev ‖ digest) == head` with
+//! nothing else, and consecutive receipts chain — one's `head` is the
+//! next's `prev` — so a set of them proves order as well as membership.
 //!
 //! This is how a real notary or timestamping service works, and the
 //! reason it takes a digest rather than a document is not efficiency but
@@ -162,6 +164,9 @@ pub enum NotaryReport {
         /// dependent, so deriving journaled state from it would break
         /// determinism between primary and replica.
         entry: u64,
+        /// Commitment before this leaf was folded in. What makes the
+        /// receipt verifiable on its own: `fold(prev, leaf) == head`.
+        prev: [u8; HEAD_LEN],
         /// Commitment after folding this leaf in.
         head: [u8; HEAD_LEN],
     },
@@ -225,7 +230,8 @@ impl Application for Notary {
     ) -> Option<Self::QueryResponse> {
         match event {
             NotaryEvent::Notarize { leaf } => {
-                self.head = fold(&self.head, &leaf);
+                let prev = self.head;
+                self.head = fold(&prev, &leaf);
                 // Saturating rather than wrapping: a receipt attests to a
                 // position, so the counter must never run backwards. At
                 // 10M events/sec saturation is ~58,000 years out — this
@@ -233,6 +239,7 @@ impl Application for Notary {
                 self.entries = self.entries.saturating_add(1);
                 out.push(NotaryReport::Receipt {
                     entry: self.entries,
+                    prev,
                     head: self.head,
                 });
                 None
@@ -353,14 +360,33 @@ impl RequestDecoderTrait for RequestDecoder {
 
 /// Encodes `NotaryReport` / `NotaryHead` into length-prefixed wire frames.
 ///
-/// Wire format: `[length: u32 LE][tag: u8][payload...]`
+/// Wire format: `[length: u32 LE][tag: u8][payload...]`, where the payload is
+///   - receipt:  `[entry: u64][prev: 32 bytes][head: 32 bytes]`
+///   - head:     `[entries: u64][head: 32 bytes]`
+///   - rejected: empty
 pub struct ResponseEncoder;
 
-/// `entry`/`entries` (8) + head (32), shared by the receipt and head frames.
-const CHAIN_BODY_LEN: usize = 8 + HEAD_LEN;
+/// Length prefix (4) + tag (1) + entry (8) + prev (32) + head (32).
+const RECEIPT_FRAME_LEN: usize = 4 + 1 + 8 + HEAD_LEN + HEAD_LEN;
 
-/// Total frame: length prefix (4) + tag (1) + body.
-const CHAIN_FRAME_LEN: usize = 4 + 1 + CHAIN_BODY_LEN;
+/// Length prefix (4) + tag (1) + entries (8) + head (32).
+const HEAD_FRAME_LEN: usize = 4 + 1 + 8 + HEAD_LEN;
+
+/// Length prefix (4) + tag (1).
+const REJECTED_FRAME_LEN: usize = 4 + 1;
+
+/// Write the length prefix and tag of a `frame_len`-byte frame, checking
+/// `buf` can hold the whole frame first so the callers' fixed-offset
+/// writes cannot panic.
+fn frame_header(buf: &mut [u8], frame_len: usize, tag: u8) -> Result<(), &'static str> {
+    if buf.len() < frame_len {
+        return Err("buffer too small");
+    }
+    let payload_len = (frame_len - 4) as u32;
+    buf[..4].copy_from_slice(&payload_len.to_le_bytes());
+    buf[4] = tag;
+    Ok(())
+}
 
 impl ResponseEncoderTrait for ResponseEncoder {
     type Report = NotaryReport;
@@ -368,42 +394,26 @@ impl ResponseEncoderTrait for ResponseEncoder {
 
     fn encode_report(&self, report: &NotaryReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match report {
-            NotaryReport::Receipt { entry, head } => {
-                encode_chain_frame(TAG_RESP_RECEIPT, *entry, head, buf)
+            NotaryReport::Receipt { entry, prev, head } => {
+                frame_header(buf, RECEIPT_FRAME_LEN, TAG_RESP_RECEIPT)?;
+                buf[5..13].copy_from_slice(&entry.to_le_bytes());
+                buf[13..45].copy_from_slice(prev);
+                buf[45..RECEIPT_FRAME_LEN].copy_from_slice(head);
+                Ok(RECEIPT_FRAME_LEN)
             }
             NotaryReport::Rejected => {
-                // len(4) + tag(1) = 5
-                if buf.len() < 5 {
-                    return Err("buffer too small");
-                }
-                let payload_len: u32 = 1;
-                buf[..4].copy_from_slice(&payload_len.to_le_bytes());
-                buf[4] = TAG_RESP_REJECTED;
-                Ok(5)
+                frame_header(buf, REJECTED_FRAME_LEN, TAG_RESP_REJECTED)?;
+                Ok(REJECTED_FRAME_LEN)
             }
         }
     }
 
     fn encode_query(&self, query: &NotaryHead, buf: &mut [u8]) -> Result<usize, &'static str> {
-        encode_chain_frame(TAG_RESP_HEAD, query.entries, &query.head, buf)
+        frame_header(buf, HEAD_FRAME_LEN, TAG_RESP_HEAD)?;
+        buf[5..13].copy_from_slice(&query.entries.to_le_bytes());
+        buf[13..HEAD_FRAME_LEN].copy_from_slice(&query.head);
+        Ok(HEAD_FRAME_LEN)
     }
-}
-
-fn encode_chain_frame(
-    tag: u8,
-    count: u64,
-    head: &[u8; HEAD_LEN],
-    buf: &mut [u8],
-) -> Result<usize, &'static str> {
-    if buf.len() < CHAIN_FRAME_LEN {
-        return Err("buffer too small");
-    }
-    let payload_len = (1 + CHAIN_BODY_LEN) as u32;
-    buf[..4].copy_from_slice(&payload_len.to_le_bytes());
-    buf[4] = tag;
-    buf[5..13].copy_from_slice(&count.to_le_bytes());
-    buf[13..CHAIN_FRAME_LEN].copy_from_slice(head);
-    Ok(CHAIN_FRAME_LEN)
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +530,7 @@ mod tests {
             out[0],
             NotaryReport::Receipt {
                 entry: 1,
+                prev: GENESIS_HEAD,
                 head: first
             }
         );
@@ -528,6 +539,40 @@ mod tests {
         app.apply(NotaryEvent::Notarize { leaf: leaf(1) }, &ctx(), &mut out);
         assert_ne!(app.head(), first, "the same leaf twice must still advance");
         assert_eq!(app.entries(), 2);
+        assert_eq!(
+            out[0],
+            NotaryReport::Receipt {
+                entry: 2,
+                prev: first,
+                head: app.head()
+            },
+            "consecutive receipts must chain: prev is the previous head"
+        );
+    }
+
+    #[test]
+    fn a_receipt_verifies_on_its_own() {
+        // Fold some history the verifier knows nothing about, then check
+        // the next receipt with only the receipt and the leaf in hand.
+        let mut app = NotaryFactory.empty();
+        let mut out = Vec::new();
+        for n in 1..=5 {
+            app.apply(NotaryEvent::Notarize { leaf: leaf(n) }, &ctx(), &mut out);
+        }
+        out.clear();
+
+        let mine = leaf(0xC3);
+        app.apply(NotaryEvent::Notarize { leaf: mine }, &ctx(), &mut out);
+        let NotaryReport::Receipt { entry, prev, head } = out[0] else {
+            panic!("expected a receipt");
+        };
+        assert_eq!(entry, 6);
+        assert_eq!(fold(&prev, &mine), head);
+        assert_ne!(
+            fold(&prev, &leaf(0xC4)),
+            head,
+            "a different leaf must not verify"
+        );
     }
 
     #[test]
@@ -701,16 +746,25 @@ mod tests {
 
     #[test]
     fn encoder_receipt() {
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 128];
+        let prev = [0xCDu8; HEAD_LEN];
         let head = [0xABu8; HEAD_LEN];
         let n = ResponseEncoder
-            .encode_report(&NotaryReport::Receipt { entry: 7, head }, &mut buf)
+            .encode_report(
+                &NotaryReport::Receipt {
+                    entry: 7,
+                    prev,
+                    head,
+                },
+                &mut buf,
+            )
             .unwrap();
-        assert_eq!(n, 45);
-        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 41);
+        assert_eq!(n, 77);
+        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 73);
         assert_eq!(buf[4], TAG_RESP_RECEIPT);
         assert_eq!(u64::from_le_bytes(buf[5..13].try_into().unwrap()), 7);
-        assert_eq!(&buf[13..45], &head);
+        assert_eq!(&buf[13..45], &prev);
+        assert_eq!(&buf[45..77], &head);
     }
 
     #[test]
@@ -745,6 +799,7 @@ mod tests {
                 .encode_report(
                     &NotaryReport::Receipt {
                         entry: 1,
+                        prev: GENESIS_HEAD,
                         head: GENESIS_HEAD
                     },
                     &mut small
