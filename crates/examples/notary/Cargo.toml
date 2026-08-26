@@ -30,9 +30,10 @@ path = "src/client.rs"
 
 [dependencies]
 melin-app = { workspace = true }
-# `hash-chain` is required rather than optional: a notary's own journal
-# must be tamper-evident. (Being a workspace member, this also turns the
-# feature on in every workspace-wide build — resolver 3 unifies features.)
+# `hash-chain` is required, not a default the way the counter's is: a
+# notary's own journal must be tamper-evident, so there is no chain-less
+# build of this crate. Named explicitly because the workspace pulls the
+# runtime with `default-features = false` (see the root Cargo.toml).
 melin-server-runtime = { workspace = true, features = ["hash-chain"] }
 blake3 = { workspace = true }
 clap = { workspace = true }
