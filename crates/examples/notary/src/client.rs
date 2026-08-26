@@ -482,6 +482,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex<const N: usize>(text: &str) -> Result<[u8; N], String> {
+    // Checked up front so the byte-indexed slicing below can never land
+    // inside a multi-byte character and panic on a mangled receipt.
+    if !text.is_ascii() {
+        return Err(format!("not hex: {text}"));
+    }
     if text.len() != 2 * N {
         return Err(format!("expected {} hex digits, got {}", 2 * N, text.len()));
     }
@@ -656,6 +661,9 @@ mod tests {
         assert_eq!(unhex::<4>("007F80FF").unwrap(), bytes);
         assert!(unhex::<4>("007f80").is_err());
         assert!(unhex::<4>("007f80fg").is_err());
+        // Eight bytes of UTF-8 but not eight ASCII digits: must be an
+        // error, not a panic from slicing mid-character.
+        assert!(unhex::<4>("00é7f80f").is_err());
     }
 
     #[test]
