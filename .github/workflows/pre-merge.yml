@@ -130,7 +130,7 @@ jobs:
       # release because nothing enabled it.)
       - name: chain-less builds
         run: |
-          for pkg in melin-journal melin-transport-core melin-server-runtime melin-example-counter; do
+          for pkg in melin-journal melin-transport-core melin-server-runtime melin-example-counter melin-example-echo; do
             cargo check -p "$pkg" --all-targets --no-default-features --locked
           done
 

@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See [`crates/examples/counter`](crates/examples/counter) for the smallest complete application, and [`crates/examples/notary`](crates/examples/notary) for one that exercises the ordering and durability guarantees: a tamper-evident hash chain over client-submitted digests.
+Three examples, in order of size: [`crates/examples/echo`](crates/examples/echo) is the runtime with nothing on top — a state-free echo, and the sequencer's latency floor to measure any application against; [`crates/examples/counter`](crates/examples/counter) is the smallest application with state to keep; and [`crates/examples/notary`](crates/examples/notary) exercises the ordering and durability guarantees: a tamper-evident hash chain over client-submitted digests.
 
 ## Architecture
 
