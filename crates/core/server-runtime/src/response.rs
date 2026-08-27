@@ -35,10 +35,16 @@ use melin_wire_protocol::control_codec;
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
 
-/// Maximum encoded response size. PositionSnapshot is the largest variant
-/// at up to 330 bytes (length(4) + tag(1) + account(4) + count(1) +
-/// 16*(currency(4)+free(8)+reserved(8))). 512 bytes covers all variants.
-const MAX_RESPONSE_BUF: usize = 512;
+/// Bound on one encoded response frame, length prefix included.
+///
+/// The response stage encodes every report and query response into a
+/// stack buffer of this size. An application whose `ResponseEncoder`
+/// needs more does not get a larger buffer: the encode fails, the reply
+/// is dropped, and the failure is logged at `error!` — so an application
+/// should check its widest frame against this bound at compile time
+/// rather than discover it under load. Public for that reason; see the
+/// re-export in the crate root.
+pub const MAX_RESPONSE_BUF: usize = 512;
 
 /// io_uring submission queue depth for sends. Must be ≥ max concurrent
 /// connections to avoid SQ overflow when all connections are dirty.

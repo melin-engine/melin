@@ -56,7 +56,10 @@
 //! them. `tests/footprint.rs` and `tests/journal_limit.rs` print both
 //! figures and assert them as the price of the width — an application
 //! that can commit to a narrower event (the notary's 32-byte digest is
-//! the model) gets the full batch and the small rings back.
+//! the model) gets the full batch and the small rings back. The wire has
+//! two bounds of its own — the widest request frame the reader accepts
+//! and the widest reply the response stage can encode — and the cap is
+//! checked against both at compile time, next to its definition.
 //!
 //! ## Where to look
 //!
@@ -69,6 +72,8 @@
 //!   round-trip latency distribution.
 //! - `tests/round_trip.rs`: the behaviour, end to end — over raw frames,
 //!   against the journal on disk, and through the client as a process.
+//! - `tests/footprint.rs`, `tests/journal_limit.rs`: what the payload
+//!   width costs the rings and the journal, printed and pinned.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -87,7 +92,7 @@ use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
 pub const TAG_ECHO: u8 = 0x10;
 
 pub const TAG_RESP_ECHO: u8 = 0x30;
-pub const TAG_RESP_REJECTED: u8 = 0x32;
+pub const TAG_RESP_REJECTED: u8 = 0x31;
 
 /// Most bytes one request may carry, and therefore one reply.
 ///
@@ -96,6 +101,21 @@ pub const TAG_RESP_REJECTED: u8 = 0x32;
 /// the width a real application's widest event has, and the cost of that
 /// width is what the sizing tests report.
 pub const MAX_PAYLOAD: usize = 288;
+
+// The wire has bounds of its own, and both fail at runtime rather than
+// at build time: a request frame past the reader's limit costs the
+// client its connection, and a reply the response stage cannot encode is
+// dropped with an `error!`. Checked here so that raising the cap past
+// either is a compile error naming the reason. The journal's bound is
+// checked the same way by the journal itself, from `MAX_ENCODED_SIZE`.
+const _: () = assert!(
+    8 + 1 + MAX_PAYLOAD <= melin_server_runtime::MAX_FRAME_SIZE,
+    "a request (sequence, tag, payload) must fit one client frame"
+);
+const _: () = assert!(
+    4 + 1 + MAX_PAYLOAD <= melin_server_runtime::MAX_RESPONSE_BUF,
+    "a reply (length prefix, tag, payload) must fit the response stage's encode buffer"
+);
 
 // ---------------------------------------------------------------------------
 // Event

@@ -17,8 +17,16 @@ use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::{MonoTraceInstant, mono_trace_ns};
 
-/// Maximum frame payload size (matches `BlockingFrameReader`).
-pub(crate) const MAX_FRAME_SIZE: usize = 1024;
+/// Bound on one client request frame, after the 4-byte length prefix
+/// (matches `BlockingFrameReader`).
+///
+/// A frame declaring more is not read: both readers treat it as a
+/// protocol violation and drop the connection. What an application's
+/// `RequestDecoder` can be handed is therefore at most this many bytes,
+/// request-sequence header and tag included. Public so an application
+/// can check its widest request against it at compile time; see the
+/// re-export in the crate root.
+pub const MAX_FRAME_SIZE: usize = 1024;
 
 /// Outcome of [`process_client_frames`].
 pub(crate) enum FrameAction {

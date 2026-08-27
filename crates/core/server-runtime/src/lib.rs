@@ -31,6 +31,14 @@ pub mod dpdk_response;
 #[cfg(feature = "dpdk")]
 pub mod dpdk_transport;
 
+// The two wire bounds an application's codecs have to fit: the widest
+// request frame the readers accept, and the widest response frame the
+// response stage can encode. Re-exported here so an application can
+// assert against them at compile time, next to the bounds it declares
+// (`AppEvent::MAX_ENCODED_SIZE` is the journal's; these are the wire's).
+pub use client_frames::MAX_FRAME_SIZE;
+pub use response::MAX_RESPONSE_BUF;
+
 /// Control-plane event the accept loop, reader, and response stage
 /// exchange. Transport-agnostic — the payload is a socket fd + writer,
 /// not an app event — so both build modes refer to the same type.
