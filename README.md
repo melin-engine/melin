@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See [`crates/examples/counter`](crates/examples/counter) for the smallest complete application, and [`crates/examples/notary`](crates/examples/notary) for one that exercises the ordering and durability guarantees: a tamper-evident hash chain over client-submitted digests.
+Three examples, in order of size: [`crates/examples/echo`](crates/examples/echo) is the runtime with nothing on top — a state-free echo, and the sequencer's latency floor to measure any application against; [`crates/examples/counter`](crates/examples/counter) is the smallest application with state to keep; and [`crates/examples/notary`](crates/examples/notary) exercises the ordering and durability guarantees: a tamper-evident hash chain over client-submitted digests.
 
 ## Architecture
 
@@ -122,3 +122,5 @@ By submitting a pull request, you agree to the terms of our [Contributor License
 Licensed under the [Business Source License 1.1](LICENSE). Production use requires a commercial license from P.L.S.C. Contact [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
 Each version of the Licensed Work converts to Apache License, Version 2.0 on the fourth anniversary of its first public distribution.
+
+The examples under [`crates/examples`](crates/examples) are licensed under the [Apache License, Version 2.0](crates/examples/echo/LICENSE) from the start: they exist to be copied into your own application, and the runtime's licence does not travel with the copied code.

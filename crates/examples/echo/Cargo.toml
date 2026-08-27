@@ -1,0 +1,58 @@
+[package]
+name = "melin-example-echo"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+# Apache-2.0 rather than the workspace's BSL: examples exist to be copied
+# into an application, and the runtime's licence should not travel with
+# the copied lines. The crate's LICENSE file is the Apache text, not the
+# root BSL, and the release tooling leaves it alone.
+license = "Apache-2.0"
+description = "Echo example: the smallest application on the Melin core runtime, and the sequencer's latency floor."
+# Not publishable, like the other examples: they demonstrate the runtime
+# and are not shipped as crates.
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "echo_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "echo-server"
+path = "src/main.rs"
+
+# Sends payloads in a closed loop and reports the round-trip latency
+# distribution. What a user of the floor runs; the server is what an
+# operator runs.
+[[bin]]
+name = "echo-client"
+path = "src/client.rs"
+
+[dependencies]
+melin-app = { workspace = true }
+melin-server-runtime = { workspace = true }
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
+# The client's side of the wire: control-frame tags and Ed25519 auth.
+melin-wire-protocol = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+# The tests read the journal back to check what was — and was not —
+# written, and the sizing tests take the ring and batch constants from
+# the transport.
+melin-journal = { workspace = true }
+melin-transport-core = { workspace = true }
+tempfile = "3"
+
+[features]
+default = ["hash-chain"]
+# A pure forward, as in the counter: the runtime is pulled with
+# `default-features = false` (see the root Cargo.toml), so the crate
+# switches the chain itself. On by default because a deployment's is;
+# `--no-default-features` is the chain-less floor.
+hash-chain = ["melin-server-runtime/hash-chain"]

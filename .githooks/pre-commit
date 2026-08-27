@@ -82,6 +82,7 @@ CHAIN_OFF_PKGS=(
     melin-transport-core
     melin-server-runtime
     melin-example-counter
+    melin-example-echo
 )
 for pkg in "${CHAIN_OFF_PKGS[@]}"; do
     if ! cargo check -p "$pkg" --all-targets --no-default-features 2>"$STDERR_LOG"; then

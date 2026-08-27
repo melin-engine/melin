@@ -24,8 +24,9 @@
 //!
 //! ## Why this makes a good example
 //!
-//! Where `melin-example-counter` is the smallest application that can
-//! exist, this one exercises the guarantees the sequencer actually sells.
+//! Where `melin-example-echo` is the runtime with nothing on top and
+//! `melin-example-counter` the smallest application with state to keep,
+//! this one exercises the guarantees the sequencer actually sells.
 //! The head is a deterministic function of the ordered leaves, so two
 //! nodes that applied the same events agree on it byte for byte. That is
 //! a far sharper cross-node assertion than comparing a counter: a counter

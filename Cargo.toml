@@ -34,8 +34,10 @@ rust-version = "1.91"
 # would not satisfy our own terms.
 #
 # Those copies must stay identical to the root LICENSE. Stamping the Change
-# Date means rewriting all ten; that belongs in the release tooling, not in
-# a manual edit.
+# Date means rewriting every one of them; that belongs in the release
+# tooling, not in a manual edit. The examples under `crates/examples` are
+# the exception: they override this with Apache-2.0 (see their manifests)
+# and carry that text instead, so the tooling skips them.
 license = "BUSL-1.1"
 repository = "https://github.com/melin-engine/melin"
 homepage = "https://github.com/melin-engine/melin"
