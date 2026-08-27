@@ -16,7 +16,7 @@ It is the runtime under a matching engine, a ledger, or any system whose busines
 
 **Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application inherits it as long as its logic stays pure.
 
-**Durable and replicated.** Every event is journaled and synchronously replicated before the client sees a response, with CRC32C integrity checks and a BLAKE3 hash chain for tamper evidence. The ack policy says which copies of an event must exist before its response is released. By default (`disk+ram`) an ack requires one fsynced copy and two in-memory copies on separate nodes, so a single slow disk or a single node failure costs neither latency nor data; a stricter `two-disks` policy and a faster `ram` policy (two in-memory copies on separate nodes, no fsync on the ack path) are available. Journal catch-up, snapshot transfer, and automatic failover are built in. See [replication](docs/replication.md).
+**Durable and replicated.** Every event is journaled and synchronously replicated before the client sees a response, with CRC32C integrity checks and a BLAKE3 hash chain that detects a node whose journal has diverged from the cluster's (an ex-primary rejoining with events it never replicated is resynced, not streamed onto) and doubles as tamper evidence. The ack policy says which copies of an event must exist before its response is released. By default (`disk+ram`) an ack requires one fsynced copy and two in-memory copies on separate nodes, so a single slow disk or a single node failure costs neither latency nor data; a stricter `two-disks` policy and a faster `ram` policy (two in-memory copies on separate nodes, no fsync on the ack path) are available. Journal catch-up, snapshot transfer, and automatic failover are built in. See [replication](docs/replication.md).
 
 **Fast.** p99 of 245 µs at 1M events/sec on kernel TCP, and 40 µs with DPDK kernel bypass, full round trip including persistence and replication on commodity datacenter hardware. Single-event latency floor: 62 µs p99 on kernel TCP, 45 µs with DPDK. See [Benchmarks](#benchmarks).
 
@@ -60,10 +60,11 @@ The benchmark harness and tuning guidance ship with the Melin Exchange Core.
 
 ## Building an application on Melin
 
-Melin's core crates form a generic sequencer. Your application plugs in via four traits:
+Melin's core crates form a generic sequencer. Your application plugs in via five traits:
 
 | Trait | Role |
 |-------|------|
+| `AppEvent` | Your journaled event type: its encoding, and the widest it can get, which the journal sizes itself from |
 | `Application` | Your business logic: receives events, produces output |
 | `AppFactory` | Constructs your application, deserializes snapshots, seeds initial state |
 | `RequestDecoder` | Deserializes wire bytes into your domain request type |

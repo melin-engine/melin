@@ -22,7 +22,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   real hardware address — the replica's connection attempts then went to an
   address nothing answered for, with no error to show for it, retrying with
   backoff forever. The derived fallback is unchanged, and the startup log
-  names which source supplied the address.
+  names which source supplied the address. Source-breaking for anything
+  constructing `melin_dpdk::DpdkConfig` directly: it gained a `peer_mac`
+  field.
+- **Two more examples.** `echo` is a state-free application whose client
+  measures closed-loop round trips: the sequencer's latency floor.
+  `notary` exercises the ordering guarantee with a hash chain over
+  client-submitted digests, self-verifying receipts, a command-line client
+  and an offline journal auditor.
+- **The bounds an application must fit are public**, so a codec can assert
+  against them at compile time: `melin_server_runtime::MAX_FRAME_SIZE` and
+  `MAX_RESPONSE_BUF` for the wire; `melin_journal::codec::ENTRY_FRAMING_SIZE`,
+  `TRANSPORT_PAYLOAD_SIZE`, `melin_journal::encoder::entry_size::<E>()` and
+  `melin_transport_core::pipeline::max_journal_batch::<E>()` for the
+  journal.
 
 ### Changed
 
@@ -41,7 +54,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `default-features = false` on `melin-journal`, `melin-transport-core` or
   `melin-server-runtime` — previously a no-op on the latter two, which had
   no default features — now turns the chain off, and only the runtime's
-  `hash-chain` feature switches all three together.
+  `hash-chain` feature switches all three together. **Upgrade-breaking for
+  a node that ran 0.14 without the chain** (the old default): such a build
+  wrote an all-zero anchor into every rotated segment and an all-zero chain
+  value into every snapshot, and a build with the chain rejects both at
+  recovery (`SegmentChainBreak`, `SnapshotChainMismatch`). Upgrade it the
+  way a format bump is upgraded (see `docs/journal.md`): snapshot, deploy,
+  start on a fresh journal directory, and give replicas a clean directory
+  to re-bootstrap from. Restarting in place over a journal that has rotated,
+  or over a snapshot plus its journal, is refused at boot. Mixed-version
+  clusters interoperate during the rollout: a peer without the chain is
+  skipped by the handshake and rotation checks, not judged divergent.
 - **An application declares how wide its events can get**, via
   `AppEvent::MAX_ENCODED_SIZE`, and the journal sizes itself from that.
   Previously every entry got a fixed 144-byte reservation — 102 bytes of
@@ -62,7 +85,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   check runs when the journal is instantiated for the type, which `cargo
   check` does not do); an event that outgrows its own
   declared bound is refused at encode time rather than corrupting a
-  reservation several layers away.
+  reservation several layers away. `melin_journal::encoder::MAX_ENTRY_SIZE`
+  is now the ceiling across every application (1,088 bytes, up from 144),
+  not the per-application reservation, which is `entry_size::<E>()`.
 - **"Durability mode" is now the "ack policy"**, and its values name the
   copies that must exist before a response is released: `disk` (one fsynced
   copy), `ram` (two in-memory copies), `disk+ram` (one fsynced copy plus a
@@ -72,8 +97,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   first). Source-breaking: `--durability-mode` is `--ack-policy`, the admin
   command `DURABILITY` is `ACK-POLICY`, `DurabilityMode` is `AckPolicy`, and
   the `melin_durability_policy_degraded*` metrics are
-  `melin_ack_policy_degraded*`. The byte advertised on the replication stream
-  is unchanged, so mixed-version clusters keep interoperating. For this one
+  `melin_ack_policy_degraded*`. The `durability_policy` module is
+  `ack_policy` in both `melin-transport-core` and `melin-server-runtime`,
+  `ServerConfig::durability_mode` is `ack_policy`, `ACKING_MODE_UNKNOWN` is
+  `ACK_POLICY_UNKNOWN`, and the `durability_mode` fields on `StreamStart`,
+  `Heartbeat` and `ReplicaControlPlane` (`primary_acking_mode`) follow. The
+  startup and admin log lines say "ack policy" where they said "durability
+  mode". The byte advertised on the replication stream is unchanged, so
+  mixed-version clusters keep interoperating. For this one
   release the old admin verb still works (old value names included, logged at
   `warn`) and the old metric names are still exported alongside the new ones,
   so alerts and runbooks have a release to migrate; both go away in the next
@@ -107,7 +138,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   hand that core back; every other position keeps its meaning.
 - **The userspace TCP stack behind the DPDK transport moves to fastcp
   0.13.1**, picking up duplicate-ACK counting in the batch ingress path and a
-  set of zero-copy receive fixes.
+  set of zero-copy receive fixes. Its neighbour cache is widened from 8 to
+  64 entries: past 8 peers an evicted entry silenced a socket for the
+  discovery timeout.
+- **The examples are Apache-2.0**, `counter` included (it shipped under
+  BUSL-1.1). They exist to be copied into an application, and the
+  runtime's licence should not travel with the copied code. `counter` now
+  enables `hash-chain` by default like the runtime it forwards to.
 
 ### Removed
 
