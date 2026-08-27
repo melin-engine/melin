@@ -413,12 +413,14 @@ cargo metadata --locked --format-version 1 >/dev/null
 
 # --- BSL Change Date ---------------------------------------------------------
 
-# The root LICENSE and one byte-identical copy per crate — cargo packages files
-# under a package root automatically, and BSL requires the licence on every
-# copy of the Licensed Work, so a published crate without its own copy would
-# not satisfy our own terms. They are stamped by rewriting the root and copying
-# it out, which makes them identical by construction rather than by nine
-# separate edits that have to agree.
+# The root LICENSE and one byte-identical copy per BSL crate — cargo packages
+# files under a package root automatically, and BSL requires the licence on
+# every copy of the Licensed Work, so a published crate without its own copy
+# would not satisfy our own terms. They are stamped by rewriting the root and
+# copying it out, which makes them identical by construction rather than by
+# separate edits that have to agree. Crates under another licence (the
+# examples, Apache-2.0) carry that licence's text instead and are left alone;
+# the manifest's `license` field is what decides.
 step "Stamping the BSL Change Date"
 
 # `mapfile` from a process substitution cannot fail the script under `set -e`,
@@ -430,6 +432,7 @@ mapfile -t CRATE_DIRS < <(
     cargo metadata --no-deps --format-version 1 | jq -r '
         .workspace_root as $root
         | .packages[]
+        | select(.license == "BUSL-1.1")
         | [(.publish != []),
            (.manifest_path | ltrimstr($root + "/") | rtrimstr("/Cargo.toml"))]
         | @tsv'

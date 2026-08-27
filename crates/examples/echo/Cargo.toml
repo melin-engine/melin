@@ -3,7 +3,11 @@ name = "melin-example-echo"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
-license.workspace = true
+# Apache-2.0 rather than the workspace's BSL: examples exist to be copied
+# into an application, and the runtime's licence should not travel with
+# the copied lines. The crate's LICENSE file is the Apache text, not the
+# root BSL, and the release tooling leaves it alone.
+license = "Apache-2.0"
 description = "Echo example: the smallest application on the Melin core runtime, and the sequencer's latency floor."
 # Not publishable, like the other examples: they demonstrate the runtime
 # and are not shipped as crates.
