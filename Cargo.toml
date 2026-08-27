@@ -11,7 +11,7 @@ resolver = "3"
 # plus the `melin-*` pins in `[workspace.dependencies]` below, all in this
 # file. Keep the two in lockstep: a member's inherited version and the
 # version requirement its dependents resolve against must always match.
-version = "0.14.0"
+version = "0.15.0"
 # Minimum supported Rust version, inherited by every member via
 # `rust-version.workspace = true` and enforced by the post-merge `msrv`
 # CI job on every push to main — a declared-but-untested MSRV silently rots
@@ -61,14 +61,14 @@ authors = ["P.L.S.C."]
 # compute a chain nothing publishes) and makes the half-configured
 # combinations unreachable. Dependents that want the chain — every
 # deployable one — get it from their own `default = ["hash-chain"]`.
-melin-app = { path = "crates/core/app", version = "0.14.0" }
-melin-dpdk = { path = "crates/core/dpdk", version = "0.14.0" }
-melin-journal = { path = "crates/core/journal", version = "0.14.0", default-features = false }
-melin-pipeline = { path = "crates/core/pipeline", version = "0.14.0" }
-melin-raft = { path = "crates/core/raft", version = "0.14.0" }
-melin-server-runtime = { path = "crates/core/server-runtime", version = "0.14.0", default-features = false }
-melin-transport-core = { path = "crates/core/transport-core", version = "0.14.0", default-features = false }
-melin-wire-protocol = { path = "crates/core/wire-protocol", version = "0.14.0" }
+melin-app = { path = "crates/core/app", version = "0.15.0" }
+melin-dpdk = { path = "crates/core/dpdk", version = "0.15.0" }
+melin-journal = { path = "crates/core/journal", version = "0.15.0", default-features = false }
+melin-pipeline = { path = "crates/core/pipeline", version = "0.15.0" }
+melin-raft = { path = "crates/core/raft", version = "0.15.0" }
+melin-server-runtime = { path = "crates/core/server-runtime", version = "0.15.0", default-features = false }
+melin-transport-core = { path = "crates/core/transport-core", version = "0.15.0", default-features = false }
+melin-wire-protocol = { path = "crates/core/wire-protocol", version = "0.15.0" }
 
 base64 = "0.22"
 blake3 = "1"

@@ -12,6 +12,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-27
+
 ### Added
 
 - **`--dpdk-peer-mac <mac>`** — the Ethernet address of the primary a replica
@@ -267,6 +269,7 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - A rotation that committed is no longer reported as failed when the directory
   fsync errors afterwards.
 
-[Unreleased]: https://github.com/melin-engine/melin/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/melin-engine/melin/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/melin-engine/melin/releases/tag/v0.15.0
 [0.14.0]: https://github.com/melin-engine/melin/releases/tag/v0.14.0
 [0.13.0]: https://github.com/melin-engine/melin/releases/tag/v0.13.0
