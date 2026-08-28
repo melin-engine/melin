@@ -35,7 +35,7 @@ use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::encoder::JournalEncoder;
-use melin_journal::preparer::SegmentPreparer;
+use melin_journal::preparer::{SegmentPreparer, StagingMode};
 use melin_journal::segment_file::SegmentFile;
 use melin_journal::write_ring::{
     ClaimedChunk, JournalWriteMeta, JournalWriteProducer, build_journal_write_ring,
@@ -590,6 +590,10 @@ pub struct JournalStage<E: AppEvent> {
     /// pipeline cores deterministically, same convention as the shadow
     /// and event-publisher threads.
     preparer_core: usize,
+    /// How the preparer materialises staged segments. Set via
+    /// [`set_staging_mode`](Self::set_staging_mode) before the stage
+    /// runs; defaults to [`StagingMode::ZeroFill`].
+    staging_mode: StagingMode,
     /// Primary-announced stream marks to apply (replica mode only;
     /// `None` on primaries/standalone). Pushed by the replication
     /// receiver, popped here. See [`StreamMark`].
@@ -837,6 +841,7 @@ impl<E: AppEvent> JournalStage<E> {
             rotation_backoff_until: None,
             preparer: None,
             preparer_core: 0,
+            staging_mode: StagingMode::default(),
             stream_marks: None,
             pending_mark: None,
             disk_core: 0,
@@ -2308,24 +2313,30 @@ impl<E: AppEvent> JournalStage<E> {
         }
     }
 
-    /// Spawn the background segment preparer in zero-fill mode. Called
-    /// from the stage's `run` before entering `run_sync`; no-op if
-    /// already spawned. Arming policy lives in
+    /// Spawn the background segment preparer in the configured staging
+    /// mode. Called from the stage's `run` before entering `run_sync`;
+    /// no-op if already spawned. Arming policy lives in
     /// `JournalStage::arm_preparer_if_recurring`.
     ///
-    /// Zero-fill — physical zeros, not `FALLOC_FL_ZERO_RANGE` — is the
-    /// load-bearing detail: appends into pre-written extents generate
-    /// no extent-conversion metadata, so `flush_batch_sync`'s
-    /// `fdatasync` stays on its data-only fast path instead of
-    /// periodically forcing the filesystem journal on the order
-    /// pipeline's critical path (see the preparer module docs and
+    /// Under the default [`StagingMode::ZeroFill`], physical zeros
+    /// rather than `FALLOC_FL_ZERO_RANGE` are the load-bearing detail:
+    /// appends into pre-written extents generate no extent-conversion
+    /// metadata, so `flush_batch_sync`'s `fdatasync` stays on its
+    /// data-only fast path instead of periodically forcing the
+    /// filesystem journal on the order pipeline's critical path (see the
+    /// preparer module docs and
     /// `docs/internal/journal-fsync-beat-2026-08.md`).
+    ///
+    /// [`StagingMode::Allocate`] trades that back for staging that costs
+    /// no device bandwidth; the preparer module docs give the storage
+    /// classes each mode suits.
     pub fn enable_preparer(&mut self) {
         self.arm_preparer_if_recurring(|stage| {
-            SegmentPreparer::spawn_zero_fill(
+            SegmentPreparer::spawn(
                 stage.writer.path().to_path_buf(),
                 stage.max_journal_bytes,
                 stage.preparer_core,
+                stage.staging_mode,
             )
         });
     }
@@ -2353,6 +2364,14 @@ impl<E: AppEvent> JournalStage<E> {
     /// already-running worker.
     pub fn set_preparer_core(&mut self, core: usize) {
         self.preparer_core = core;
+    }
+
+    /// Set how the preparer materialises staged segments. Call before
+    /// the stage runs — like [`set_preparer_core`](Self::set_preparer_core),
+    /// `enable_preparer` reads it at spawn time and an already-running
+    /// worker keeps the mode it was spawned with.
+    pub fn set_staging_mode(&mut self, mode: StagingMode) {
+        self.staging_mode = mode;
     }
 
     /// Test-only probe: whether `enable_preparer` armed the preparer.

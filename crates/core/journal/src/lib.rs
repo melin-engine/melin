@@ -40,6 +40,7 @@ pub use codec::FileHeaderInfo;
 pub use encoder::JournalEncoder;
 pub use error::JournalError;
 pub use event::JournalEvent;
+pub use preparer::StagingMode;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
 pub use segment_file::SegmentFile;
 pub use write::JournalWrite;

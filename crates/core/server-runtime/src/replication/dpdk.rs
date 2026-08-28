@@ -1119,6 +1119,9 @@ pub fn run_receiver_dpdk<A>(
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
+    // Passed straight to the replica's journal stage; see
+    // `build_replica_pipeline_with_threads`.
+    staging_mode: melin_journal::StagingMode,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
@@ -1549,6 +1552,7 @@ where
                 cur_exchange,
                 cur_writer,
                 cores,
+                staging_mode,
                 snapshot_interval_ms,
                 snapshot_path.clone(),
                 group_commit_delay,
