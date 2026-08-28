@@ -11,23 +11,18 @@
 //! 4. Across nodes: a replica promoted after the primary's death must
 //!    report the head the primary receipted, and chain onto it.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use ed25519_dalek::{Signer, SigningKey};
-
+use melin_client::{Connection, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
-use melin_wire_protocol::control_codec::{
-    TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
-};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use notary_server::receipt::Receipt as SavedReceipt;
@@ -40,51 +35,14 @@ use notary_server::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn try_read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-    Ok(payload)
+/// Send one request and return its one response frame (tag first).
+fn request(node: &mut Connection, seq: u64, tag: u8, body: &[u8]) -> Vec<u8> {
+    node.request_one(seq, tag, body).expect("one response")
 }
 
-fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
-    try_read_frame(stream).expect("read frame")
-}
-
-fn write_frame(stream: &mut TcpStream, payload: &[u8]) {
-    let len = (payload.len() as u32).to_le_bytes();
-    stream.write_all(&len).expect("write frame length");
-    stream.write_all(payload).expect("write frame payload");
-    stream.flush().expect("flush");
-}
-
-fn send_request(stream: &mut TcpStream, seq: u64, tag: u8, payload: &[u8]) {
-    let mut frame = Vec::with_capacity(9 + payload.len());
-    frame.extend_from_slice(&seq.to_le_bytes());
-    frame.push(tag);
-    frame.extend_from_slice(payload);
-    write_frame(stream, &frame);
-}
-
-fn read_until_batch_end(stream: &mut TcpStream) -> Vec<Vec<u8>> {
-    let mut responses = Vec::new();
-    loop {
-        let frame = read_frame(stream);
-        if frame[0] == TAG_BATCH_END {
-            break;
-        }
-        responses.push(frame);
-    }
-    responses
-}
-
-/// One response frame, asserting the batch carried exactly one.
-fn single_response(stream: &mut TcpStream) -> Vec<u8> {
-    let mut responses = read_until_batch_end(stream);
-    assert_eq!(responses.len(), 1, "expected exactly one response frame");
-    responses.pop().expect("one response")
+/// Send a request the server is expected to drop: no reply is read.
+fn send(node: &mut Connection, seq: u64, tag: u8, body: &[u8]) {
+    node.send(seq, tag, body).expect("send");
 }
 
 /// The digest a client would submit for `document` — hashed client-side,
@@ -140,50 +98,18 @@ fn head_of(frame: &[u8]) -> (u64, [u8; HEAD_LEN]) {
     )
 }
 
-/// Answer the server's Challenge on a connected stream and consume the
-/// ServerReady. `None` if the handshake stalls or the frames are not the
-/// expected tags — the node is not serving yet — so callers retry. The
-/// client and admin listeners share this handshake.
-fn answer_challenge(stream: &mut TcpStream, key: &SigningKey) -> Option<()> {
-    let challenge = try_read_frame(stream).ok()?;
-    if challenge.first() != Some(&TAG_CHALLENGE) {
-        return None;
-    }
-    let signature = key.sign(&challenge[1..33]);
-    let mut frame = Vec::with_capacity(105);
-    frame.extend_from_slice(&0u64.to_le_bytes());
-    frame.push(TAG_CHALLENGE_RESPONSE);
-    frame.extend_from_slice(&signature.to_bytes());
-    frame.extend_from_slice(&key.verifying_key().to_bytes());
-    write_frame(stream, &frame);
-    let ready = try_read_frame(stream).ok()?;
-    (ready.first() == Some(&TAG_SERVER_READY)).then_some(())
-}
-
-/// Connect and authenticate, retrying until the server is ready.
-/// The kernel backlog accepts the TCP SYN before the server's accept
-/// loop starts, so a successful `connect` doesn't mean the server is
-/// ready — we must also read the Challenge to confirm.
-fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-            stream
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .expect("set timeout");
-            if answer_challenge(&mut stream, key).is_some() {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("set timeout");
-                return stream;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for a serving node at {addr}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+/// Connect and authenticate, retrying until the server is serving: the
+/// kernel accepts the connection before the accept loop runs, so the
+/// client has to get through the handshake to know.
+fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
+    let mut node = Connection::connect_by(addr, key, Instant::now() + Duration::from_secs(10))
+        .expect("a serving node");
+    // Generous: the suite shares the machine, and how fast a node answers
+    // under full-suite load is not what these tests check. A refused
+    // request still surfaces — as a 30 s failure rather than a 5 s one.
+    node.set_read_timeout(Duration::from_secs(30))
+        .expect("set timeout");
+    node
 }
 
 /// The writing identity. `trader`, not `operator`: this example gates
@@ -199,7 +125,7 @@ fn readonly_key() -> SigningKey {
 }
 
 fn pubkey_b64(key: &SigningKey) -> String {
-    base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes())
+    key::public_key_base64(&key.verifying_key())
 }
 
 /// A running server: its shutdown flag, listening address, and thread.
@@ -319,8 +245,10 @@ fn an_empty_log_reports_genesis() {
     let (_tmp, server) = start_server();
     let mut stream = connect_authenticated(server.addr, &trader_key());
 
-    send_request(&mut stream, 1, TAG_GET_HEAD, &[]);
-    assert_eq!(head_of(&single_response(&mut stream)), (0, GENESIS_HEAD));
+    assert_eq!(
+        head_of(&request(&mut stream, 1, TAG_GET_HEAD, &[])),
+        (0, GENESIS_HEAD)
+    );
 
     drop(stream);
     server.stop();
@@ -339,8 +267,7 @@ fn notarize_builds_a_chain_the_client_can_reproduce() {
     for (i, document) in documents.iter().enumerate() {
         let leaf = digest(document);
 
-        send_request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf);
-        let receipt = receipt_of(&single_response(&mut stream));
+        let receipt = receipt_of(&request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf));
 
         assert_eq!(receipt.entry, i as u64 + 1, "entry position");
         assert!(
@@ -358,9 +285,8 @@ fn notarize_builds_a_chain_the_client_can_reproduce() {
     }
 
     // The query must agree with the last receipt.
-    send_request(&mut stream, 100, TAG_GET_HEAD, &[]);
     assert_eq!(
-        head_of(&single_response(&mut stream)),
+        head_of(&request(&mut stream, 100, TAG_GET_HEAD, &[])),
         (documents.len() as u64, expected)
     );
 
@@ -376,8 +302,12 @@ fn an_independent_client_verifies_its_own_receipt() {
     {
         let mut other = connect_authenticated(server.addr, &trader_key());
         for i in 1..=3u64 {
-            send_request(&mut other, i, TAG_NOTARIZE, &digest(&i.to_le_bytes()));
-            receipt_of(&single_response(&mut other));
+            receipt_of(&request(
+                &mut other,
+                i,
+                TAG_NOTARIZE,
+                &digest(&i.to_le_bytes()),
+            ));
         }
     }
 
@@ -385,8 +315,7 @@ fn an_independent_client_verifies_its_own_receipt() {
     // leaves, no query — and that is enough to check the commitment.
     let mut stream = connect_authenticated(server.addr, &trader_key());
     let leaf = digest(b"my document");
-    send_request(&mut stream, 1, TAG_NOTARIZE, &leaf);
-    let receipt = receipt_of(&single_response(&mut stream));
+    let receipt = receipt_of(&request(&mut stream, 1, TAG_NOTARIZE, &leaf));
     assert_eq!(receipt.entry, 4);
     assert_eq!(
         fold(&receipt.prev, &leaf, receipt.timestamp_ns),
@@ -418,13 +347,12 @@ fn a_malformed_leaf_is_refused_without_dropping_the_connection() {
     // Wrong digest width: the runtime drops the frame and logs at debug,
     // leaving the connection usable — a malformed client request is not a
     // server fault and must not cost the session.
-    send_request(&mut stream, 1, TAG_NOTARIZE, &[0u8; LEAF_LEN - 1]);
+    send(&mut stream, 1, TAG_NOTARIZE, &[0u8; LEAF_LEN - 1]);
 
     // The connection still serves the next request, and nothing was
     // committed.
-    send_request(&mut stream, 2, TAG_GET_HEAD, &[]);
     assert_eq!(
-        head_of(&single_response(&mut stream)),
+        head_of(&request(&mut stream, 2, TAG_GET_HEAD, &[])),
         (0, GENESIS_HEAD),
         "a refused leaf must not be folded"
     );
@@ -442,10 +370,9 @@ fn a_read_only_key_can_audit_but_not_notarize() {
     // without a response and keeps the connection, so the refusal is
     // observable only as the chain not having moved. Had the gate let it
     // through, the next frame read would be a receipt, not the head.
-    send_request(&mut stream, 1, TAG_NOTARIZE, &digest(b"not mine to attest"));
+    send(&mut stream, 1, TAG_NOTARIZE, &digest(b"not mine to attest"));
 
-    send_request(&mut stream, 2, TAG_GET_HEAD, &[]);
-    let response = single_response(&mut stream);
+    let response = request(&mut stream, 2, TAG_GET_HEAD, &[]);
     assert_eq!(
         response[0], TAG_RESP_HEAD,
         "a read-only key must still be able to audit"
@@ -469,8 +396,7 @@ fn second_connection_sees_persisted_chain() {
     // First connection: notarize once.
     let expected = {
         let mut s = connect_authenticated(server.addr, &trader_key());
-        send_request(&mut s, 1, TAG_NOTARIZE, &leaf);
-        let receipt = receipt_of(&single_response(&mut s));
+        let receipt = receipt_of(&request(&mut s, 1, TAG_NOTARIZE, &leaf));
         assert_eq!(
             fold(&GENESIS_HEAD, &leaf, receipt.timestamp_ns),
             receipt.head
@@ -481,8 +407,10 @@ fn second_connection_sees_persisted_chain() {
     // Second connection: the chain survives the first one closing.
     {
         let mut s = connect_authenticated(server.addr, &trader_key());
-        send_request(&mut s, 1, TAG_GET_HEAD, &[]);
-        assert_eq!(head_of(&single_response(&mut s)), (1, expected));
+        assert_eq!(
+            head_of(&request(&mut s, 1, TAG_GET_HEAD, &[])),
+            (1, expected)
+        );
     }
 
     server.stop();
@@ -502,8 +430,7 @@ fn the_chain_survives_a_restart() {
         let mut stream = connect_authenticated(server.addr, &trader_key());
         for (i, document) in documents.iter().enumerate() {
             let leaf = digest(document);
-            send_request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf);
-            let receipt = receipt_of(&single_response(&mut stream));
+            let receipt = receipt_of(&request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf));
             expected = fold(&expected, &leaf, receipt.timestamp_ns);
             assert_eq!(receipt.head, expected);
         }
@@ -516,9 +443,8 @@ fn the_chain_survives_a_restart() {
     // determinism the example exists to demonstrate, applied to recovery.
     let server = start_server_in(tmp.path());
     let mut stream = connect_authenticated(server.addr, &trader_key());
-    send_request(&mut stream, 1, TAG_GET_HEAD, &[]);
     assert_eq!(
-        head_of(&single_response(&mut stream)),
+        head_of(&request(&mut stream, 1, TAG_GET_HEAD, &[])),
         (documents.len() as u64, expected),
         "recovered head diverged from the client's fold"
     );
@@ -534,8 +460,8 @@ fn the_journal_carries_the_runtime_hash_chain() {
     {
         let mut stream = connect_authenticated(server.addr, &trader_key());
         for i in 1..=3u64 {
-            send_request(&mut stream, i, TAG_NOTARIZE, &digest(&i.to_le_bytes()));
-            assert_eq!(single_response(&mut stream)[0], TAG_RESP_RECEIPT);
+            let receipt = request(&mut stream, i, TAG_NOTARIZE, &digest(&i.to_le_bytes()));
+            assert_eq!(receipt[0], TAG_RESP_RECEIPT);
         }
     }
     server.stop();
@@ -933,9 +859,13 @@ fn operator_key() -> SigningKey {
 /// return the reply line, or `None` if the connection or handshake
 /// failed (the node is not up yet — callers retry).
 fn admin_command(addr: SocketAddr, key: &SigningKey, command: &str) -> Option<String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
+    // The admin listener authenticates like the client one, then speaks
+    // text lines: the client crate does the handshake and hands over the
+    // socket.
+    let mut stream = Connection::connect_timeout(addr, key, Duration::from_millis(300))
+        .ok()?
+        .into_stream();
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    answer_challenge(&mut stream, key)?;
     stream.write_all(command.as_bytes()).ok()?;
     stream.write_all(b"\n").ok()?;
     stream.flush().ok()?;
@@ -1032,14 +962,10 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
     let mut last: Option<Receipt> = None;
     {
         let mut stream = connect_authenticated(primary.addr, &trader_key());
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("set timeout");
         let mut expected = GENESIS_HEAD;
         for (i, document) in documents.iter().enumerate() {
             let leaf = digest(document);
-            send_request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf);
-            let receipt = receipt_of(&single_response(&mut stream));
+            let receipt = receipt_of(&request(&mut stream, i as u64 + 1, TAG_NOTARIZE, &leaf));
             expected = fold(&expected, &leaf, receipt.timestamp_ns);
             assert_eq!(receipt.head, expected, "primary head at entry {}", i + 1);
             last = Some(receipt);
@@ -1056,9 +982,8 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
     admin_until_ok(admin_addr, &operator_key(), "ACK-POLICY disk");
 
     let mut stream = connect_authenticated(replica.addr, &trader_key());
-    send_request(&mut stream, 1, TAG_GET_HEAD, &[]);
     assert_eq!(
-        head_of(&single_response(&mut stream)),
+        head_of(&request(&mut stream, 1, TAG_GET_HEAD, &[])),
         (documents.len() as u64, last.head),
         "the promoted replica's head diverged from the primary's receipts"
     );
@@ -1066,8 +991,7 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
     // The chain continues where the old primary left off: the new
     // primary's first receipt chains onto the old primary's last.
     let leaf = digest(b"first deed after the failover");
-    send_request(&mut stream, 2, TAG_NOTARIZE, &leaf);
-    let receipt = receipt_of(&single_response(&mut stream));
+    let receipt = receipt_of(&request(&mut stream, 2, TAG_NOTARIZE, &leaf));
     assert_eq!(receipt.entry, documents.len() as u64 + 1);
     assert_eq!(
         receipt.prev, last.head,

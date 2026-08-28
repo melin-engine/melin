@@ -23,6 +23,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   address nothing answered for, with no error to show for it, retrying with
   backoff forever. The derived fallback is unchanged, and the startup log
   names which source supplied the address.
+- **`melin-client`** — the client side of the wire protocol as a crate:
+  connect and authenticate with an Ed25519 key (PEM or raw seed), send
+  requests, read reply batches with heartbeats skipped, and a node's silence
+  reported as an error that says what it usually means. Blocking, `std::net`
+  only, and generic over the application's tags — a client of an application
+  is its own codec and nothing else. Every example client and test harness
+  now uses it instead of a private copy of the framing and handshake.
+  Apache-2.0, like the examples: it is the code a customer links into their
+  own client binaries.
+- `melin-wire-protocol`: `encode_challenge_response` and
+  `CHALLENGE_RESPONSE_LEN` beside the decoder, so the handshake frame has one
+  home; `BlockingFrameReader::frame` returns the last frame read.
+- `melin-server-runtime` re-exports the two wire bounds an application's
+  codecs have to fit — `MAX_FRAME_SIZE` for a request frame and
+  `MAX_RESPONSE_BUF` for a reply — so an application can check its widest
+  message against them at compile time, as the echo example does. Exceeding
+  either was a runtime failure only: a dropped connection, or a reply
+  dropped with an error log.
 
 ### Changed
 

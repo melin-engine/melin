@@ -1101,6 +1101,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-client"
+version = "0.14.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "melin-wire-protocol",
+]
+
+[[package]]
 name = "melin-dpdk"
 version = "0.14.0"
 dependencies = [
@@ -1117,10 +1126,9 @@ dependencies = [
 name = "melin-example-counter"
 version = "0.14.0"
 dependencies = [
- "base64 0.22.1",
  "clap",
- "ed25519-dalek",
  "melin-app",
+ "melin-client",
  "melin-server-runtime",
  "melin-wire-protocol",
  "tempfile",
@@ -1131,10 +1139,9 @@ dependencies = [
 name = "melin-example-echo"
 version = "0.14.0"
 dependencies = [
- "base64 0.22.1",
  "clap",
- "ed25519-dalek",
  "melin-app",
+ "melin-client",
  "melin-journal",
  "melin-server-runtime",
  "melin-transport-core",
@@ -1147,11 +1154,10 @@ dependencies = [
 name = "melin-example-notary"
 version = "0.14.0"
 dependencies = [
- "base64 0.22.1",
  "blake3",
  "clap",
- "ed25519-dalek",
  "melin-app",
+ "melin-client",
  "melin-journal",
  "melin-server-runtime",
  "melin-transport-core",

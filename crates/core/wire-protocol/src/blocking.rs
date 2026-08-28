@@ -63,6 +63,14 @@ impl<R: Read> BlockingFrameReader<R> {
         Ok(Some(&self.buf[..len]))
     }
 
+    /// The frame the last successful [`read_frame`](Self::read_frame)
+    /// returned, for callers that decided what it was and now want it
+    /// back without holding the borrow across that decision. Empty
+    /// before the first read.
+    pub fn frame(&self) -> &[u8] {
+        &self.buf[..self.frame_len]
+    }
+
     /// Borrow the underlying reader. Mirrors `BufReader::get_ref` — used
     /// by callers that need to reach the raw stream for socket-level
     /// configuration (`set_read_timeout`, `set_nodelay`, …) without

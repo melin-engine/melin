@@ -62,6 +62,7 @@ authors = ["P.L.S.C."]
 # combinations unreachable. Dependents that want the chain — every
 # deployable one — get it from their own `default = ["hash-chain"]`.
 melin-app = { path = "crates/core/app", version = "0.14.0" }
+melin-client = { path = "crates/core/client", version = "0.14.0" }
 melin-dpdk = { path = "crates/core/dpdk", version = "0.14.0" }
 melin-journal = { path = "crates/core/journal", version = "0.14.0", default-features = false }
 melin-pipeline = { path = "crates/core/pipeline", version = "0.14.0" }
