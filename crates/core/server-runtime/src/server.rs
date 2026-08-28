@@ -82,6 +82,34 @@ use melin_wire_protocol::transport::BlockingTransportListener;
 /// hiccup rather than to save memory.
 const DEFAULT_REPLICATION_PIPELINE_DEPTH: usize = 256;
 
+/// CLI spelling of [`melin_journal::StagingMode`].
+///
+/// A separate enum rather than a `clap::ValueEnum` derive on the journal
+/// type: `melin-journal` has no clap dependency and should not acquire
+/// one for a flag: the crate is a library first, and its callers are not
+/// all command-line servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum JournalStagingMode {
+    /// Pre-write every staged segment so appends generate no
+    /// extent-conversion metadata. Costs one extra pass over each
+    /// segment in device bandwidth.
+    #[default]
+    ZeroFill,
+    /// Allocate staged extents without materialising them. No staging
+    /// bandwidth; appends convert extents and `fdatasync` periodically
+    /// forces the filesystem log.
+    Allocate,
+}
+
+impl From<JournalStagingMode> for melin_journal::StagingMode {
+    fn from(m: JournalStagingMode) -> Self {
+        match m {
+            JournalStagingMode::ZeroFill => melin_journal::StagingMode::ZeroFill,
+            JournalStagingMode::Allocate => melin_journal::StagingMode::Allocate,
+        }
+    }
+}
+
 /// Server configuration, parsed from CLI arguments via clap.
 #[derive(clap::Parser)]
 #[command(name = "melin-server", about = "Low-latency matching engine server")]
@@ -144,6 +172,24 @@ pub struct ServerConfig {
     /// and starts a fresh journal. Set to 0 to disable. Default: 256 MiB.
     #[arg(long, default_value_t = 256)]
     pub max_journal_mib: u64,
+    /// How the background preparer materialises the next journal
+    /// segment's extents.
+    ///
+    /// - `zero-fill` (default) physically pre-writes the segment, so
+    ///   appends carry no extent-conversion metadata and each flush's
+    ///   `fdatasync` never forces the filesystem log. It costs one extra
+    ///   pass over every segment in device bandwidth.
+    /// - `allocate` reserves the extents and stops. Staging becomes
+    ///   free, and the periodic log force returns to the flush path.
+    ///
+    /// Keep the default on local NVMe, where sequential bandwidth is
+    /// cheap and the log forces are what hurts. Consider `allocate` on
+    /// network-attached storage (EBS and similar), where staging
+    /// bandwidth is metered and drawn from the same budget as the hot
+    /// path — measure both on the volume in question rather than
+    /// assuming, since which one wins is a property of the device.
+    #[arg(long, value_enum, default_value_t = JournalStagingMode::ZeroFill)]
+    pub journal_staging_mode: JournalStagingMode,
     /// Maximum number of open orders (resting limits + pending stops, across
     /// all instruments) per account. New submissions are rejected with
     /// `ExceedsMaxOpenOrders` once an account hits this cap. `0` means
@@ -477,6 +523,7 @@ impl Default for ServerConfig {
             instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
+            journal_staging_mode: JournalStagingMode::ZeroFill,
             max_orders_per_account: 10_000,
             max_orders_per_second: 1_000,
             max_orders_burst: 5_000,
@@ -1031,6 +1078,7 @@ where
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
+            config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
@@ -1477,6 +1525,7 @@ where
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     journal_stage.set_preparer_core(config.cores.journal_prep);
+    journal_stage.set_staging_mode(config.journal_staging_mode.into());
     journal_stage.set_disk_core(config.cores.journal_disk);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
@@ -2446,6 +2495,7 @@ where
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
+            config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
@@ -2696,6 +2746,7 @@ where
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     journal_stage.set_preparer_core(config.cores.journal_prep);
+    journal_stage.set_staging_mode(config.journal_staging_mode.into());
     journal_stage.set_disk_core(config.cores.journal_disk);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path

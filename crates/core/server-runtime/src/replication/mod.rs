@@ -436,6 +436,11 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     exchange: A,
     writer: BufferedWriter<A::Event>,
     cores: crate::server::PipelineCores,
+    // How the replica's segment preparer materialises staged extents.
+    // A replica's rotation stall sits on the ack path — under
+    // `disk+ram`/`two-disks` it delays the primary's ack gate — so this
+    // is not a primary-only tuning knob.
+    staging_mode: melin_journal::StagingMode,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,
@@ -483,6 +488,7 @@ where
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     journal_stage.set_stream_marks(Arc::clone(&stream_marks));
     journal_stage.set_preparer_core(cores.journal_prep);
+    journal_stage.set_staging_mode(staging_mode);
     journal_stage.set_disk_core(cores.journal_disk);
     let journal_failed = Arc::new(AtomicBool::new(false));
     let journal_failed_latch = Arc::clone(&journal_failed);

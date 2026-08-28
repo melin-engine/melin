@@ -308,7 +308,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     }
 
     /// Rotate, adopting a pre-staged segment produced by
-    /// [`crate::preparer::SegmentPreparer::spawn_zero_fill`].
+    /// [`crate::preparer::SegmentPreparer::spawn`].
     ///
     /// Same contract as [`Self::rotate_segment`], but the new segment
     /// is the preparer's zero-filled staging file instead of a fresh
@@ -634,8 +634,12 @@ mod tests {
 
         // Stage a zero-filled segment the way the pipeline's preparer
         // would (small threshold keeps the test fast).
-        let preparer =
-            crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024, 0);
+        let preparer = crate::preparer::SegmentPreparer::spawn(
+            path.clone(),
+            1024 * 1024,
+            0,
+            crate::preparer::StagingMode::ZeroFill,
+        );
         let mut prepared = None;
         for _ in 0..500 {
             if let Some(p) = preparer.take() {
@@ -674,6 +678,63 @@ mod tests {
         assert_eq!(read_all_payloads(&archived), vec![1, 2]);
     }
 
+    /// `StagingMode::Allocate` must be adoptable on exactly the same
+    /// terms as `ZeroFill`. The two modes differ only in whether the
+    /// staged extents are materialised, which is a performance property
+    /// of the flush path — everything the writer and reader observe
+    /// (allocation end, archive layout, sequence continuation, readable
+    /// entries) has to be identical, or the mode is not a tuning knob
+    /// but a behaviour change.
+    #[test]
+    fn rotate_with_prepared_allocate_mode_matches_zero_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&sample(1)).unwrap();
+        writer.append(&sample(2)).unwrap();
+        let seq_before_rotate = writer.next_sequence();
+
+        let preparer = crate::preparer::SegmentPreparer::spawn(
+            path.clone(),
+            1024 * 1024,
+            0,
+            crate::preparer::StagingMode::Allocate,
+        );
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let prepared = prepared.expect("preparer should stage a segment within 5 s");
+        let allocated_end = prepared.allocated_end;
+
+        let sealed_end = writer.valid_end();
+        let archived = writer.rotate_segment_with_prepared(prepared).unwrap();
+        assert!(archived.exists(), "archived segment {archived:?} missing");
+        assert_eq!(
+            std::fs::metadata(&archived).unwrap().len(),
+            sealed_end,
+            "archive must be truncated to its valid data"
+        );
+        assert_eq!(writer.next_sequence(), seq_before_rotate);
+        // The allocation the adopter inherits is the staged one, so the
+        // first appends do not re-`fallocate` — the same guarantee the
+        // zero-fill path gives, reached without the staging pass.
+        assert_eq!(writer.segment.allocated_end(), allocated_end);
+        assert!(!crate::preparer::staging_path(&path).exists());
+
+        writer.append(&sample(3)).unwrap();
+        drop(writer);
+        preparer.shutdown();
+
+        assert_eq!(read_all_payloads(&path), vec![3]);
+        assert_eq!(read_all_payloads(&archived), vec![1, 2]);
+    }
+
     /// A crash between prepared adoption and the first append must
     /// leave a parseable empty journal (header durable, zero entries).
     #[test]
@@ -684,8 +745,12 @@ mod tests {
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         writer.append(&sample(7)).unwrap();
 
-        let preparer =
-            crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024, 0);
+        let preparer = crate::preparer::SegmentPreparer::spawn(
+            path.clone(),
+            1024 * 1024,
+            0,
+            crate::preparer::StagingMode::ZeroFill,
+        );
         let mut prepared = None;
         for _ in 0..500 {
             if let Some(p) = preparer.take() {
@@ -736,8 +801,12 @@ mod tests {
         writer.append(&sample(1)).unwrap();
         let chain_before = writer.chain_hash().unwrap();
 
-        let preparer =
-            crate::preparer::SegmentPreparer::spawn_zero_fill(path.clone(), 1024 * 1024, 0);
+        let preparer = crate::preparer::SegmentPreparer::spawn(
+            path.clone(),
+            1024 * 1024,
+            0,
+            crate::preparer::StagingMode::ZeroFill,
+        );
         let mut prepared = None;
         for _ in 0..500 {
             if let Some(p) = preparer.take() {
