@@ -1,0 +1,26 @@
+[package]
+name = "melin-client"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+# Apache-2.0 rather than the workspace's BSL, like the examples: this is
+# the code a customer links into their own client binaries and copies
+# from, so the runtime's licence must not travel with it. The crate's
+# LICENSE file is the Apache text, not the root BSL, and the release
+# tooling leaves it alone.
+license = "Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Blocking client for a Melin node: framing, Ed25519 authentication, and the request/response batch protocol"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The wire layer proper: frame reader/writer, control tags, and the
+# challenge-response codec. The client adds the client side of the
+# conversation on top, nothing of the wire format itself.
+melin-wire-protocol = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }

@@ -7,22 +7,16 @@
 //!    node comes back from a snapshot plus the tail.
 //! 3. Through the command-line client, run as a real process.
 
-use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use ed25519_dalek::{Signer, SigningKey};
-
+use melin_client::{Connection, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::{self, ServerConfig};
-use melin_wire_protocol::control_codec::{
-    TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
-};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use echo_server::{
@@ -33,58 +27,15 @@ use echo_server::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn try_read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-    Ok(payload)
-}
-
-fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
-    try_read_frame(stream).expect("read frame")
-}
-
-fn write_frame(stream: &mut TcpStream, payload: &[u8]) {
-    let len = (payload.len() as u32).to_le_bytes();
-    stream.write_all(&len).expect("write frame length");
-    stream.write_all(payload).expect("write frame payload");
-    stream.flush().expect("flush");
-}
-
-fn send_request(stream: &mut TcpStream, seq: u64, tag: u8, payload: &[u8]) {
-    let mut frame = Vec::with_capacity(9 + payload.len());
-    frame.extend_from_slice(&seq.to_le_bytes());
-    frame.push(tag);
-    frame.extend_from_slice(payload);
-    write_frame(stream, &frame);
-}
-
-fn read_until_batch_end(stream: &mut TcpStream) -> Vec<Vec<u8>> {
-    let mut responses = Vec::new();
-    loop {
-        let frame = read_frame(stream);
-        if frame[0] == TAG_BATCH_END {
-            break;
-        }
-        responses.push(frame);
-    }
-    responses
-}
-
-/// One response frame, asserting the batch carried exactly one.
-fn single_response(stream: &mut TcpStream) -> Vec<u8> {
-    let mut responses = read_until_batch_end(stream);
-    assert_eq!(responses.len(), 1, "expected exactly one response frame");
-    responses.pop().expect("one response")
-}
-
 /// Echo `payload` and return the reply's `(tag, bytes)`.
-fn exchange(stream: &mut TcpStream, seq: u64, payload: &[u8]) -> (u8, Vec<u8>) {
-    send_request(stream, seq, TAG_ECHO, payload);
-    let reply = single_response(stream);
+fn exchange(node: &mut Connection, seq: u64, payload: &[u8]) -> (u8, Vec<u8>) {
+    let reply = node.request_one(seq, TAG_ECHO, payload).expect("one reply");
     (reply[0], reply[1..].to_vec())
+}
+
+/// Send a request the server is expected to drop: no reply is read.
+fn send(node: &mut Connection, seq: u64, payload: &[u8]) {
+    node.send(seq, TAG_ECHO, payload).expect("send");
 }
 
 /// `len` bytes that no other length or seed produces, so a reply can only
@@ -93,49 +44,18 @@ fn bytes(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
 }
 
-/// Answer the server's Challenge on a connected stream and consume the
-/// ServerReady. `None` if the handshake stalls or the frames are not the
-/// expected tags — the node is not serving yet — so callers retry.
-fn answer_challenge(stream: &mut TcpStream, key: &SigningKey) -> Option<()> {
-    let challenge = try_read_frame(stream).ok()?;
-    if challenge.first() != Some(&TAG_CHALLENGE) {
-        return None;
-    }
-    let signature = key.sign(&challenge[1..33]);
-    let mut frame = Vec::with_capacity(105);
-    frame.extend_from_slice(&0u64.to_le_bytes());
-    frame.push(TAG_CHALLENGE_RESPONSE);
-    frame.extend_from_slice(&signature.to_bytes());
-    frame.extend_from_slice(&key.verifying_key().to_bytes());
-    write_frame(stream, &frame);
-    let ready = try_read_frame(stream).ok()?;
-    (ready.first() == Some(&TAG_SERVER_READY)).then_some(())
-}
-
-/// Connect and authenticate, retrying until the server is ready.
-/// The kernel backlog accepts the TCP SYN before the server's accept
-/// loop starts, so a successful `connect` doesn't mean the server is
-/// ready — we must also read the Challenge to confirm.
-fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-            stream
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .expect("set timeout");
-            if answer_challenge(&mut stream, key).is_some() {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("set timeout");
-                return stream;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for a serving node at {addr}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+/// Connect and authenticate, retrying until the server is serving: the
+/// kernel accepts the connection before the accept loop runs, so the
+/// client has to get through the handshake to know.
+fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
+    let mut node = Connection::connect_by(addr, key, Instant::now() + Duration::from_secs(10))
+        .expect("a serving node");
+    // Generous: the suite shares the machine, and how fast a node answers
+    // under full-suite load is not what these tests check. A refused
+    // request still surfaces — as a 30 s failure rather than a 5 s one.
+    node.set_read_timeout(Duration::from_secs(30))
+        .expect("set timeout");
+    node
 }
 
 /// The writing identity. `trader`, not `operator`: echoing is gated on a
@@ -150,7 +70,7 @@ fn readonly_key() -> SigningKey {
 }
 
 fn pubkey_b64(key: &SigningKey) -> String {
-    base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes())
+    key::public_key_base64(&key.verifying_key())
 }
 
 /// A running server: its shutdown flag, listening address, and thread.
@@ -294,7 +214,7 @@ fn an_oversized_payload_is_refused_without_dropping_the_connection() {
     // without a response and keeps the connection, so the refusal is
     // observable only as the next reply answering the next request rather
     // than this one.
-    send_request(&mut stream, 1, TAG_ECHO, &bytes(MAX_PAYLOAD + 1, 1));
+    send(&mut stream, 1, &bytes(MAX_PAYLOAD + 1, 1));
 
     let sent = bytes(MAX_PAYLOAD, 2);
     let (tag, back) = exchange(&mut stream, 2, &sent);
@@ -312,7 +232,7 @@ fn a_read_only_key_cannot_echo() {
     // request a read-only key can make that would be answered, so the
     // refusal is observable only in the journal afterwards.
     let mut watcher = connect_authenticated(server.addr, &readonly_key());
-    send_request(&mut watcher, 1, TAG_ECHO, b"not mine to journal");
+    send(&mut watcher, 1, b"not mine to journal");
 
     let sent = bytes(MAX_PAYLOAD, 9);
     let mut stream = connect_authenticated(server.addr, &trader_key());

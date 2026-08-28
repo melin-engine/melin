@@ -33,6 +33,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   next rotation. Logged once per affected segment; segments that were never
   pre-written (rotation disabled, the first segment after start, `allocate`
   staging) extend silently, as before.
+- **`melin-client`** — the client side of the wire protocol as a crate:
+  connect and authenticate with an Ed25519 key (PEM or raw seed), send
+  requests, read reply batches with heartbeats skipped, and a node's silence
+  reported as an error that says what it usually means. Blocking, `std::net`
+  only, and generic over the application's tags — a client of an application
+  is its own codec and nothing else. Every example client and test harness
+  now uses it instead of a private copy of the framing and handshake.
+  Apache-2.0, like the examples: it is the code a customer links into their
+  own client binaries.
+- `melin-wire-protocol`: `encode_challenge_response` and
+  `CHALLENGE_RESPONSE_LEN` beside the decoder, so the handshake frame has one
+  home; `BlockingFrameReader::frame` returns the last frame read.
 
 ### Changed
 

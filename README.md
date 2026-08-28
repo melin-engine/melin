@@ -82,6 +82,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Three examples, in order of size: [`crates/examples/echo`](crates/examples/echo) is the runtime with nothing on top — a state-free echo, and the sequencer's latency floor to measure any application against; [`crates/examples/counter`](crates/examples/counter) is the smallest application with state to keep; and [`crates/examples/notary`](crates/examples/notary) exercises the ordering and durability guarantees: a tamper-evident hash chain over client-submitted digests.
 
+On the other side of the socket, [`melin-client`](crates/core/client) speaks the wire protocol — length-prefixed framing, the Ed25519 challenge/response, the per-request sequence, the reply batch — so a client of your application is your own request and response codec and nothing else. Every example client and test harness is built on it. Like the examples, it is Apache-2.0: it is the code you link into your own client binaries.
+
 ## Architecture
 
 A node runs a fixed set of pinned threads connected by lock-free disruptor rings. No async runtime, no locks on the hot path.
