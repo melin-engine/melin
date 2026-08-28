@@ -156,7 +156,8 @@ pub struct StageUtilization {
     /// for both writers — growth means the preparer isn't keeping up
     /// (or isn't armed) and the rotation stall is landing on the
     /// journal thread. For the buffered writer a fallback segment also
-    /// loses the pre-zeroed-extents property until the next rotation
+    /// lacks the pre-written-extents property `StagingMode::ZeroFill`
+    /// gives a staged one, until the next rotation
     /// (see `BufferedWriter::rotate_segment_with_prepared`). Only used
     /// by the journal stage.
     pub rotations_sync_fallback: AtomicU64,
@@ -2013,7 +2014,7 @@ impl<E: AppEvent> SequencerCore<E> {
                 self.rotation_backoff_until = None;
                 // Kick the preparer to start staging the *next*
                 // segment ahead of the next rotation, tuning the
-                // zero-fill target to the segment size just observed
+                // staging target to the segment size just observed
                 // (a replica's only source of truth for the primary's
                 // segment size).
                 if let Some(p) = self.preparer.as_ref() {
@@ -2270,7 +2271,7 @@ impl<E: AppEvent> SequencerCore<E> {
         let pre_size = self.segment_bytes;
         let (rotate_result, used_fast_path) = self.rotate_taking_prepared();
         // Re-arm regardless of outcome so the next boundary also has a
-        // chance at the fast path, tuning the zero-fill target to the
+        // chance at the fast path, tuning the staging target to the
         // observed segment size (the replica's only source of truth
         // for the primary's segment size).
         if let Some(p) = self.preparer.as_ref() {

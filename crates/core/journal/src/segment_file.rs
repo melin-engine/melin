@@ -45,6 +45,14 @@ pub struct SegmentFile {
     // Byte offset of the end of pre-allocated space. When `write_pos`
     // approaches this, another `prealloc_chunk_bytes()` is allocated.
     allocated_end: u64,
+    // Whether `[0, allocated_end)` was physically pre-written by the
+    // preparer (`StagingMode::ZeroFill`), so appends carry no
+    // extent-conversion metadata. Cleared by the first extension past
+    // it, which is the one moment worth logging: a segment that never
+    // had the property (fresh, reopened, or staged in `Allocate` mode)
+    // is a documented operating mode, not a regression. A `bool`, not
+    // a byte offset: the property is all-or-nothing per segment.
+    pre_written: bool,
     // Retries a failed post-rotation directory fsync until it succeeds
     // (see `crate::segment::DirFsyncRetry`). Polled from the flush
     // path — a single branch in steady state.
@@ -88,6 +96,7 @@ impl SegmentFile {
             path: path.to_path_buf(),
             write_pos: HEADER_OFFSET,
             allocated_end,
+            pre_written: false,
             dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
@@ -142,6 +151,7 @@ impl SegmentFile {
                 path: path.to_path_buf(),
                 write_pos: valid_end,
                 allocated_end,
+                pre_written: false,
                 dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
             },
             info,
@@ -223,6 +233,12 @@ impl SegmentFile {
     #[cfg(test)]
     pub(crate) fn allocated_end(&self) -> u64 {
         self.allocated_end
+    }
+
+    /// Test-only probe: whether the current allocation is pre-written.
+    #[cfg(test)]
+    pub(crate) fn pre_written(&self) -> bool {
+        self.pre_written
     }
 
     /// On-disk path of the live segment.
@@ -333,10 +349,11 @@ impl SegmentFile {
         self.file = fresh.file;
         self.write_pos = fresh.write_pos;
         self.allocated_end = fresh.allocated_end;
+        self.pre_written = fresh.pre_written;
         Ok(())
     }
 
-    /// Point this segment at a freshly prepared (zero-filled) file.
+    /// Point this segment at a freshly prepared (staged) file.
     ///
     /// All fallible work (header pwrite, fsync, rename) happens before
     /// any field is assigned, so on error the segment continues on the
@@ -353,6 +370,7 @@ impl SegmentFile {
             file,
             path: staging_path,
             allocated_end,
+            written,
         } = prepared;
 
         // Write the file header into the staging file *before* the
@@ -361,9 +379,8 @@ impl SegmentFile {
         // header-write failure plus a failed rename-back leaves an
         // all-zeros live file that recovery rejects as invalid instead
         // of handling as the "no live file" Phase-B case. The staging
-        // file is zero-filled including `[0, ENTRY_OFFSET)`, so this
-        // pwrite lands in already-written extents like every append
-        // after it.
+        // file covers `[0, ENTRY_OFFSET)` too, so this pwrite lands in
+        // the same kind of extent as every append after it.
         write_header(&file, starting_sequence, anchor_hash)?;
         // Commit the header durably before the rename — a crash before
         // the next user write must still leave a parseable empty
@@ -372,10 +389,15 @@ impl SegmentFile {
         // rotation, and a full fsync forces the filesystem log for the
         // timestamp metadata — the stall class this whole design
         // removes. The header pwrite changes no file size (the staging
-        // file is pre-written to full length) and no allocation (the
-        // extents are written), so the data-only flush covers
-        // everything the header needs; the preparer already made the
-        // file's size and allocation durable at staging time.
+        // file is at full length) and no allocation, and the preparer
+        // already made both durable at staging time. With `written`
+        // extents that leaves the data-only flush nothing but the data.
+        // With allocate-mode (unwritten) extents the pwrite converts
+        // one, and `fdatasync` commits that conversion too: it is
+        // metadata the data cannot be read back without, which is
+        // precisely what `fdatasync` guarantees to include. So the call
+        // is sufficient in both modes; the second merely pays the log
+        // force that mode accepts.
         file.sync_data()?;
 
         // Rename staging onto the live path. `archive_live` has already
@@ -389,6 +411,7 @@ impl SegmentFile {
         self.file = file;
         self.write_pos = HEADER_OFFSET;
         self.allocated_end = allocated_end;
+        self.pre_written = written;
         Ok(())
     }
 
@@ -396,10 +419,12 @@ impl SegmentFile {
     /// would land past it. Allocates one chunk at a time via
     /// `posix_fallocate` — extent allocation only, no zero-fill cost.
     /// In the prepared-segment flow this only fires when a segment
-    /// outgrows its pre-zeroed region (threshold overshoot past the
+    /// outgrows its staged region (threshold overshoot past the
     /// preparer's margin, or a replica following larger-than-expected
-    /// primary segments) — appends past here generate extent-conversion
-    /// metadata again until the next rotation.
+    /// primary segments). For a pre-written segment that is a
+    /// regression — appends past here generate extent-conversion
+    /// metadata again until the next rotation — and it is logged once,
+    /// at the transition.
     fn ensure_allocated(&mut self, adding: u64) -> Result<(), JournalError> {
         let need = self.write_pos + adding;
         if need <= self.allocated_end {
@@ -407,23 +432,31 @@ impl SegmentFile {
         }
         let from = self.allocated_end;
         self.allocated_end = fallocate_chunk(&self.file, from)?;
-        // Degraded, not broken, and invisible until now: every append
-        // into this range converts an unwritten extent, and the
-        // conversions are logged filesystem metadata that `fdatasync`
-        // then has to force — the exact cost the preparer's zero-fill
-        // exists to remove. On a local NVMe that is a periodic ~2 ms
-        // stall; on network-attached storage it is an extra device
-        // round trip on every affected flush. Rare by design (the
-        // preparer's margin absorbs the usual overshoot), so one line
-        // per extension is proportionate, and an operator seeing it
-        // repeatedly is looking at a mis-sized rotation threshold.
-        tracing::warn!(
-            path = %self.path.display(),
-            from,
-            to = self.allocated_end,
-            "journal extended past its pre-written region; appends here \
-             carry extent-conversion metadata until the next rotation"
-        );
+        if self.pre_written {
+            self.pre_written = false;
+            // Degraded, not broken, and invisible until now: every
+            // append from here on converts an unwritten extent, and the
+            // conversions are logged filesystem metadata that
+            // `fdatasync` then has to force — the exact cost zero-fill
+            // staging exists to remove. On a local NVMe that is a
+            // periodic ~2 ms stall; on network-attached storage it is
+            // an extra device round trip on every affected flush. Rare
+            // by design (the preparer's margin absorbs the usual
+            // overshoot), so one line per affected segment is
+            // proportionate, and an operator seeing it on every
+            // rotation is looking at a mis-sized rotation threshold.
+            // Segments that were never pre-written (rotation disabled,
+            // the first segment after start, allocate-mode staging)
+            // extend silently: that is their documented mode, and a
+            // line per chunk would be noise nobody can act on.
+            tracing::warn!(
+                path = %self.path.display(),
+                from,
+                to = self.allocated_end,
+                "journal extended past its pre-written region; appends here \
+                 carry extent-conversion metadata until the next rotation"
+            );
+        }
         Ok(())
     }
 }
@@ -534,7 +567,86 @@ mod tests {
             file,
             path: staging,
             allocated_end: 4096,
+            written: true,
         }
+    }
+
+    /// A real staged file at the canonical staging path, `allocated_end`
+    /// bytes long, flagged as `written` or not. Small enough that the
+    /// first batch past `allocated_end` forces an extension.
+    fn staged(live: &Path, allocated_end: u64, written: bool) -> crate::preparer::PreparedSegment {
+        let path = crate::preparer::staging_path(live);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(allocated_end).unwrap();
+        crate::preparer::PreparedSegment {
+            file,
+            path,
+            allocated_end,
+            written,
+        }
+    }
+
+    /// The pre-written property is what the "extended past its
+    /// pre-written region" warning keys off, so its lifecycle is the
+    /// contract: a fresh segment never has it, adopting a `written`
+    /// staged segment grants it, adopting an allocate-mode one does
+    /// not, and the first extension past the staged region clears it
+    /// (so the warning fires once per affected segment, and never for
+    /// a segment that never had the property to lose).
+    #[test]
+    fn pre_written_tracks_adoption_and_is_cleared_by_extension() {
+        // Small chunks so an extension is cheap on tmpfs and so the
+        // staged region below is exhausted by one batch.
+        let _prealloc = crate::prealloc::PreallocOverrideGuard::new(64 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("test.journal");
+
+        let mut segment = SegmentFile::create_continuing(&live, 1, [0u8; 32]).unwrap();
+        assert!(
+            !segment.pre_written(),
+            "a fresh segment is allocated, not pre-written"
+        );
+
+        // Adopt a written staging file: property granted, then lost at
+        // the first extension and not regained by further extensions.
+        let staged_end = HEADER_OFFSET + 8 * 1024;
+        segment
+            .rotate(Some(staged(&live, staged_end, true)), 1, [0u8; 32])
+            .unwrap();
+        assert!(segment.pre_written());
+        assert_eq!(segment.allocated_end(), staged_end);
+
+        segment.write_batch(&[1u8; 4 * 1024]).unwrap();
+        assert!(
+            segment.pre_written(),
+            "writes inside the staged region keep it"
+        );
+        segment.write_batch(&[2u8; 8 * 1024]).unwrap();
+        assert!(
+            !segment.pre_written(),
+            "the first extension past it clears it"
+        );
+        assert!(segment.allocated_end() > staged_end);
+        segment.write_batch(&[3u8; 64 * 1024]).unwrap();
+        assert!(!segment.pre_written());
+
+        // Adopt an allocate-mode staging file: never granted.
+        segment
+            .rotate(Some(staged(&live, staged_end, false)), 1, [0u8; 32])
+            .unwrap();
+        assert!(!segment.pre_written());
+        segment.write_batch(&[4u8; 16 * 1024]).unwrap();
+        assert!(!segment.pre_written());
+
+        // The synchronous fallback installs a fresh segment: never
+        // granted either.
+        segment.rotate(None, 1, [0u8; 32]).unwrap();
+        assert!(!segment.pre_written());
     }
 
     /// A rotation that fails while installing the new segment must

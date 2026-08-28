@@ -84,9 +84,10 @@ use crate::error::JournalError;
 /// A fully-prepared journal segment file ready to be adopted by the
 /// writer on the next rotation.
 ///
-/// The file has real zeros physically written over `[0, allocated_end)`
-/// and synced, so every extent is *written* (not merely allocated) —
-/// see the module docs for why that distinction is the entire point.
+/// The file reads as zeros over `[0, allocated_end)`, its length and
+/// allocation are durable, and whether the extents are *written* rather
+/// than merely allocated is recorded in `written` — see the module docs
+/// for why that distinction matters.
 ///
 /// The file header is *not* yet written — the adopting writer
 /// (`BufferedWriter::install_prepared_segment`) writes it at adopt time
@@ -97,9 +98,14 @@ pub struct PreparedSegment {
     /// Path of the staging file (`<live>.next-staging`). The adopter
     /// renames it onto the live path.
     pub path: PathBuf,
-    /// End of the pre-zeroed region (matches the writer's
-    /// `allocated_end`).
+    /// End of the staged region (matches the writer's `allocated_end`).
     pub allocated_end: u64,
+    /// Whether `[0, allocated_end)` is physically written
+    /// ([`StagingMode::ZeroFill`]) or only allocated
+    /// ([`StagingMode::Allocate`]). The adopter uses it to tell a
+    /// segment that *lost* its pre-written property by outgrowing the
+    /// staged region from one that never had it.
+    pub written: bool,
 }
 
 /// How the preparer materialises a staged segment's extents.
@@ -128,14 +134,15 @@ pub enum StagingMode {
     Allocate,
 }
 
-/// Extra zeroed bytes past the rotation threshold in zero-fill mode.
-/// The size trigger is evaluated per flushed batch (≤ 512 KiB), so the
-/// live segment overshoots the threshold by at most a batch plus
-/// whatever a manual-rotation command lags by; 8 MiB of margin keeps
-/// even those writes inside the pre-written region. Writes past the
-/// margin fall back to `posix_fallocate` extension (rare, and only
-/// costs the metadata-per-append behavior this mode exists to avoid).
-const ZERO_FILL_MARGIN_BYTES: u64 = 8 * 1024 * 1024;
+/// Extra staged bytes past the rotation threshold. The size trigger is
+/// evaluated per flushed batch (≤ 512 KiB), so the live segment
+/// overshoots the threshold by at most a batch plus whatever a
+/// manual-rotation command lags by; 8 MiB of margin keeps even those
+/// writes inside the staged region. Writes past the margin fall back to
+/// `posix_fallocate` extension (rare; under `ZeroFill` it also costs the
+/// metadata-per-append behaviour that mode exists to avoid, and the
+/// writer logs the transition).
+const STAGE_MARGIN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Manages a background thread that pre-stages the next segment.
 ///
@@ -159,9 +166,10 @@ struct State {
     /// and the choice is a property of the volume, which does not change
     /// under a running server.
     mode: StagingMode,
-    /// How many bytes the next staged segment is zeroed
-    /// to. Seeded at spawn (threshold + margin, or one prealloc
-    /// chunk + margin when the threshold is unknown) and updated on
+    /// How many bytes the next staged segment is sized to (zeroed or
+    /// allocated, per `mode`). Seeded at spawn (threshold + margin, or
+    /// one prealloc chunk + margin when the threshold is unknown) and
+    /// updated on
     /// every [`SegmentPreparer::arm_with_observed_len`] so the target
     /// tracks the segment sizes the deployment actually produces —
     /// critical on replicas, which never know the primary's
@@ -171,12 +179,12 @@ struct State {
     /// ordering dependency beyond the value itself (`Relaxed`) — a
     /// stale read stages one segment at the previous size, which the
     /// margin absorbs.
-    zero_fill_target: AtomicU64,
-    /// Floor for `zero_fill_target` updates: the configured rotation
+    stage_target: AtomicU64,
+    /// Floor for `stage_target` updates: the configured rotation
     /// threshold + margin when known, else 0. Keeps an early manual
     /// rotation (tiny observed segment) from shrinking the target below
     /// what size-driven rotation needs.
-    zero_fill_floor: u64,
+    stage_floor: u64,
     /// Core the worker pins itself to; `0` = unpinned. Read once at
     /// worker startup.
     pin_core: usize,
@@ -209,8 +217,8 @@ impl SegmentPreparer {
     /// would cause `create_new` to fail at the next prepare.
     ///
     /// `rotate_threshold_bytes` is the size trigger the pipeline rotates
-    /// at (`max_journal_bytes`); the staged file is initially zeroed to
-    /// that plus `ZERO_FILL_MARGIN_BYTES`. Pass `0` when the threshold
+    /// at (`max_journal_bytes`); the staged file is initially sized to
+    /// that plus `STAGE_MARGIN_BYTES`. Pass `0` when the threshold
     /// is unknown locally (replica mode — rotation follows the primary's
     /// announced boundaries): the initial target falls back to one
     /// prealloc chunk plus margin, and every
@@ -230,15 +238,15 @@ impl SegmentPreparer {
         pin_core: usize,
         mode: StagingMode,
     ) -> Self {
-        let zero_fill_floor = if rotate_threshold_bytes > 0 {
-            rotate_threshold_bytes + ZERO_FILL_MARGIN_BYTES
+        let stage_floor = if rotate_threshold_bytes > 0 {
+            rotate_threshold_bytes + STAGE_MARGIN_BYTES
         } else {
             0
         };
-        let zero_fill_target = if zero_fill_floor > 0 {
-            zero_fill_floor
+        let stage_target = if stage_floor > 0 {
+            stage_floor
         } else {
-            crate::prealloc::prealloc_chunk_bytes() + ZERO_FILL_MARGIN_BYTES
+            crate::prealloc::prealloc_chunk_bytes() + STAGE_MARGIN_BYTES
         };
 
         cleanup_staging_orphan(&live_path);
@@ -246,8 +254,8 @@ impl SegmentPreparer {
         let state = Arc::new(State {
             live_path,
             mode,
-            zero_fill_target: AtomicU64::new(zero_fill_target),
-            zero_fill_floor,
+            stage_target: AtomicU64::new(stage_target),
+            stage_floor,
             pin_core,
             slot: Mutex::new(None),
             // Pre-arm at startup so the worker prepares the first spare
@@ -292,15 +300,15 @@ impl SegmentPreparer {
         }
     }
 
-    /// [`arm`](Self::arm) plus a zero-fill target update from the size
+    /// [`arm`](Self::arm) plus a staging-target update from the size
     /// of the segment that just rotated out. Called by the journal
     /// stage after every rotation so staged segments track the sizes
     /// the deployment actually produces (a replica's only source of
     /// truth for the primary's segment size).
     pub fn arm_with_observed_len(&self, observed_len: u64) {
         if observed_len > 0 {
-            let target = (observed_len + ZERO_FILL_MARGIN_BYTES).max(self.state.zero_fill_floor);
-            self.state.zero_fill_target.store(target, Ordering::Relaxed);
+            let target = (observed_len + STAGE_MARGIN_BYTES).max(self.state.stage_floor);
+            self.state.stage_target.store(target, Ordering::Relaxed);
         }
         self.arm();
     }
@@ -467,7 +475,7 @@ fn prepare_one(state: &State) -> Result<PreparedSegment, JournalError> {
         }
     }
 
-    let bytes = state.zero_fill_target.load(Ordering::Relaxed);
+    let bytes = state.stage_target.load(Ordering::Relaxed);
     match state.mode {
         StagingMode::ZeroFill => prepare_zero_filled(&staging, bytes, &state.shutdown),
         StagingMode::Allocate => prepare_allocated(&staging, bytes),
@@ -502,6 +510,7 @@ fn prepare_allocated(staging: &Path, bytes: u64) -> Result<PreparedSegment, Jour
         file,
         path: staging.to_path_buf(),
         allocated_end: bytes,
+        written: false,
     })
 }
 
@@ -681,6 +690,7 @@ fn prepare_zero_filled(
             file,
             path: staging.to_path_buf(),
             allocated_end: bytes,
+            written: true,
         });
     }
 
@@ -736,6 +746,7 @@ fn prepare_zero_filled(
         file,
         path: staging.to_path_buf(),
         allocated_end: bytes,
+        written: true,
     })
 }
 
@@ -897,7 +908,7 @@ mod tests {
         let prepared = prepared.expect("preparer should publish a segment within 5 s");
 
         assert_eq!(prepared.path, staging_path(&live));
-        assert_eq!(prepared.allocated_end, threshold + ZERO_FILL_MARGIN_BYTES);
+        assert_eq!(prepared.allocated_end, threshold + STAGE_MARGIN_BYTES);
 
         // Drop the file before shutdown so the staging file can be
         // cleaned by the test harness.
@@ -941,7 +952,7 @@ mod tests {
         let prepared = prepared.expect("preparer should publish a segment within 5 s");
 
         assert_eq!(prepared.path, staging_path(&live));
-        assert_eq!(prepared.allocated_end, threshold + ZERO_FILL_MARGIN_BYTES);
+        assert_eq!(prepared.allocated_end, threshold + STAGE_MARGIN_BYTES);
 
         let staging = prepared.path.clone();
         drop(prepared);
@@ -950,7 +961,7 @@ mod tests {
         // `fallocate` extends the file to the allocated end, so the
         // adopter sees the same length a zero-filled stage would leave.
         let len = std::fs::metadata(&staging).expect("staging metadata").len();
-        assert_eq!(len, threshold + ZERO_FILL_MARGIN_BYTES);
+        assert_eq!(len, threshold + STAGE_MARGIN_BYTES);
 
         let contents = std::fs::read(&staging).expect("read staging");
         assert!(
@@ -1013,7 +1024,7 @@ mod tests {
         }
         let prepared = prepared.expect("preparer should publish a segment within 5 s");
 
-        let expected = threshold + ZERO_FILL_MARGIN_BYTES;
+        let expected = threshold + STAGE_MARGIN_BYTES;
         assert_eq!(prepared.allocated_end, expected);
         assert_eq!(
             std::fs::metadata(&prepared.path)
@@ -1041,13 +1052,13 @@ mod tests {
         preparer.shutdown();
     }
 
-    /// `arm_with_observed_len` retunes the zero-fill target: the next
+    /// `arm_with_observed_len` retunes the staging target: the next
     /// staged segment tracks the observed segment size (the replica
     /// path, where the primary's threshold is unknown), while the
     /// configured floor keeps a small observation from shrinking a
     /// size-driven primary's target.
     #[test]
-    fn zero_fill_target_adapts_to_observed_len() {
+    fn stage_target_adapts_to_observed_len() {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("test.journal");
 
@@ -1069,7 +1080,7 @@ mod tests {
         let first = take_one();
         assert_eq!(
             first.allocated_end,
-            1024 * 1024 + ZERO_FILL_MARGIN_BYTES,
+            1024 * 1024 + STAGE_MARGIN_BYTES,
             "initial replica target = prealloc chunk + margin"
         );
         std::fs::remove_file(&first.path).expect("consume first staging");
@@ -1081,7 +1092,7 @@ mod tests {
         let second = take_one();
         assert_eq!(
             second.allocated_end,
-            observed + ZERO_FILL_MARGIN_BYTES,
+            observed + STAGE_MARGIN_BYTES,
             "staged size must track the observed segment size"
         );
 

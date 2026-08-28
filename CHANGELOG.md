@@ -12,8 +12,35 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`--journal-staging-mode <zero-fill|allocate>`** — how the background
+  preparer stages the next journal segment. `zero-fill` (the default, and the
+  previous behaviour) pre-writes it so appends never carry extent-conversion
+  metadata; `allocate` only reserves it, trading that back for staging that
+  costs no device bandwidth. Aimed at network-attached volumes such as EBS,
+  where the pre-write draws from the same metered bandwidth as the hot path
+  and the preparer keeps up only while the journal rate stays under a quarter
+  of it, a ratio the segment size does not change. Which mode wins on a given
+  volume is a property of that volume; measure both. Source-breaking for
+  direct users of the runtime: `melin_journal::preparer::SegmentPreparer::
+  spawn_zero_fill` is now `spawn` with a `StagingMode` argument,
+  `PreparedSegment` gained a `written` field, `ServerConfig` gained
+  `journal_staging_mode`, and `melin_server_runtime::replication::run_receiver`
+  / `run_receiver_dpdk` take the mode.
+- **A warning when a pre-written segment outgrows its staged region.** Appends
+  past it silently regained the periodic filesystem-metadata commit until the
+  next rotation. Logged once per affected segment; segments that were never
+  pre-written (rotation disabled, the first segment after start, `allocate`
+  staging) extend silently, as before.
+
 ### Changed
 
+- **Journal replay readers hint sequential access** to the kernel
+  (`POSIX_FADV_SEQUENTIAL`), so readahead runs further ahead of the recovery,
+  catch-up and chain-rebuild scans. Invisible on local NVMe; on
+  network-attached storage, where a device round trip is closer to a
+  millisecond, it shortens restart and failover.
 - **A replica serves its health endpoint without control-plane raft.**
   `--health-bind` (default `127.0.0.1:9878`) now starts the endpoint on a
   replica whether or not election is enabled; previously a non-raft
