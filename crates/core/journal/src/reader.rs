@@ -32,6 +32,29 @@ use super::event::JournalEvent;
 /// boundaries, and because rare oversized entries grow the buffer.
 const INITIAL_BUF_SIZE: usize = 1 << 20;
 
+/// Tell the kernel this handle will be read start-to-end, so readahead
+/// runs ahead of the reader instead of being rebuilt per `read()`.
+///
+/// Every reader in this module is a single forward scan, and the scan is
+/// what sets restart and failover time. `fill_buffer` issues one blocking
+/// `read()` at a time, so replay throughput is bounded by how much the
+/// kernel keeps in flight, not by the buffer size: with the default
+/// 128 KiB readahead window a 1 MiB refill is several dependent device
+/// round trips. `POSIX_FADV_SEQUENTIAL` doubles that window.
+///
+/// The gap this closes is small on a local NVMe, where a round trip is
+/// tens of microseconds, and large on network-attached storage (EBS and
+/// friends), where it is closer to a millisecond and readahead depth is
+/// the whole story.
+///
+/// Best-effort: the hint is an optimisation with no correctness content,
+/// and a kernel that rejects it (or a filesystem that ignores it) must
+/// not turn a recoverable journal into a failed startup. Hence the
+/// discarded `Result`.
+fn advise_sequential(file: &File) {
+    let _ = rustix::fs::fadvise(file, 0, None, rustix::fs::Advice::Sequential);
+}
+
 /// A decoded journal entry with its metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalEntry<E: AppEvent> {
@@ -88,6 +111,7 @@ impl<E: AppEvent> JournalReader<E> {
     pub fn open(path: &Path) -> Result<Self, JournalError> {
         use std::io::Seek;
         let mut file = File::open(path)?;
+        advise_sequential(&file);
 
         // Read and validate the file header. We use pread so the file cursor
         // stays at zero; we then seek to sector_size to position the reader
@@ -495,6 +519,9 @@ impl RawJournalScanner {
     pub fn open(path: &Path) -> Result<Self, JournalError> {
         use std::io::Seek;
         let mut file = File::open(path)?;
+        // Also a pure forward scan, and on a smaller buffer than
+        // `JournalReader`'s, so it depends on readahead even more.
+        advise_sequential(&file);
         let mut header = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut header)?;
         let info = codec::decode_file_header(&header)?;
