@@ -884,6 +884,7 @@ mod tests {
                 file,
                 path: staging,
                 allocated_end: 4096,
+                written: true,
             }),
             starting_sequence: 7,
             anchor_hash: [1u8; 32],

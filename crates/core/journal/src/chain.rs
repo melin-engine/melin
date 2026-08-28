@@ -106,6 +106,9 @@ impl SegmentChain {
             return Ok(chain);
         }
         let file = std::fs::File::open(path)?;
+        // A forward scan on the recovery path, like the readers: let
+        // readahead run ahead of it (see `reader::advise_sequential`).
+        crate::reader::advise_sequential(&file);
         // 1 MiB scratch: large enough to amortize syscalls over thousands
         // of entries, small enough to keep recovery's working set flat.
         let mut scratch = vec![0u8; 1 << 20];

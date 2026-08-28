@@ -40,7 +40,9 @@ const INITIAL_BUF_SIZE: usize = 1 << 20;
 /// `read()` at a time, so replay throughput is bounded by how much the
 /// kernel keeps in flight, not by the buffer size: with the default
 /// 128 KiB readahead window a 1 MiB refill is several dependent device
-/// round trips. `POSIX_FADV_SEQUENTIAL` doubles that window.
+/// round trips. `POSIX_FADV_SEQUENTIAL` doubles that window. The
+/// chain rebuild in `chain.rs` is the same shape of scan (positional
+/// reads share the handle's readahead state) and uses this too.
 ///
 /// The gap this closes is small on a local NVMe, where a round trip is
 /// tens of microseconds, and large on network-attached storage (EBS and
@@ -51,7 +53,8 @@ const INITIAL_BUF_SIZE: usize = 1 << 20;
 /// and a kernel that rejects it (or a filesystem that ignores it) must
 /// not turn a recoverable journal into a failed startup. Hence the
 /// discarded `Result`.
-fn advise_sequential(file: &File) {
+pub(crate) fn advise_sequential(file: &File) {
+    // Best-effort hint; a failure changes nothing the caller can act on.
     let _ = rustix::fs::fadvise(file, 0, None, rustix::fs::Advice::Sequential);
 }
 

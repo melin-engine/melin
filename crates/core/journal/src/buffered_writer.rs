@@ -311,16 +311,17 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// [`crate::preparer::SegmentPreparer::spawn`].
     ///
     /// Same contract as [`Self::rotate_segment`], but the new segment
-    /// is the preparer's zero-filled staging file instead of a fresh
+    /// is the preparer's staging file instead of a fresh
     /// `create_continuing`. Two wins over the sync path:
     ///
     /// - rotation cost drops to two renames + a header pwrite + fsyncs
     ///   (no `create_new` + `posix_fallocate` on the journal thread),
-    /// - the segment's extents are already *written*, so subsequent
-    ///   appends generate no extent-conversion metadata and
-    ///   `flush_batch_sync`'s `fdatasync` never has to force the
-    ///   filesystem journal (the ~2 ms periodic pipeline freeze
-    ///   documented in `docs/internal/journal-fsync-beat-2026-08.md`).
+    /// - under `StagingMode::ZeroFill` the segment's extents are
+    ///   already *written*, so subsequent appends generate no
+    ///   extent-conversion metadata and `flush_batch_sync`'s `fdatasync`
+    ///   never has to force the filesystem journal (the ~2 ms periodic
+    ///   pipeline freeze documented in
+    ///   `docs/internal/journal-fsync-beat-2026-08.md`).
     ///
     /// On error the prepared file is consumed (renamed onto the live
     /// path then rolled back, or left as staging for the next preparer
@@ -666,6 +667,7 @@ mod tests {
         // The adopted segment's pre-zeroed region is the allocation —
         // appends must not immediately re-fallocate.
         assert_eq!(writer.segment.allocated_end(), zeroed_end);
+        assert!(writer.segment.pre_written());
         // The staging file is gone (renamed onto the live path).
         assert!(!crate::preparer::staging_path(&path).exists());
 
@@ -725,6 +727,10 @@ mod tests {
         // first appends do not re-`fallocate` — the same guarantee the
         // zero-fill path gives, reached without the staging pass.
         assert_eq!(writer.segment.allocated_end(), allocated_end);
+        assert!(
+            !writer.segment.pre_written(),
+            "allocate-mode extents are not pre-written, and must not be reported as such"
+        );
         assert!(!crate::preparer::staging_path(&path).exists());
 
         writer.append(&sample(3)).unwrap();
