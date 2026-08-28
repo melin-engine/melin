@@ -405,7 +405,25 @@ impl SegmentFile {
         if need <= self.allocated_end {
             return Ok(());
         }
-        self.allocated_end = fallocate_chunk(&self.file, self.allocated_end)?;
+        let from = self.allocated_end;
+        self.allocated_end = fallocate_chunk(&self.file, from)?;
+        // Degraded, not broken, and invisible until now: every append
+        // into this range converts an unwritten extent, and the
+        // conversions are logged filesystem metadata that `fdatasync`
+        // then has to force — the exact cost the preparer's zero-fill
+        // exists to remove. On a local NVMe that is a periodic ~2 ms
+        // stall; on network-attached storage it is an extra device
+        // round trip on every affected flush. Rare by design (the
+        // preparer's margin absorbs the usual overshoot), so one line
+        // per extension is proportionate, and an operator seeing it
+        // repeatedly is looking at a mis-sized rotation threshold.
+        tracing::warn!(
+            path = %self.path.display(),
+            from,
+            to = self.allocated_end,
+            "journal extended past its pre-written region; appends here \
+             carry extent-conversion metadata until the next rotation"
+        );
         Ok(())
     }
 }
