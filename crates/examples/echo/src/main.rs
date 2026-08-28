@@ -13,12 +13,17 @@
 //!
 //! # 3. Measure the floor: a closed loop of full-sized requests, one in flight:
 //! cargo run --release --bin echo-client -- --key /tmp/echo-key.pem --count 10000
+//!
+//! # 4. Measure it under load: an open loop at a fixed rate, latency counted from
+//! #    when each request was due, written as an HdrHistogram log:
+//! cargo run --release --bin echo-bench -- --key /tmp/echo-key.pem --rate 100K --iterations 20 --output-directory /tmp/results --output-file echo
 //! ```
 //!
-//! The client prints the round-trip distribution — p99 and p99.9 are the
+//! Both clients print the round-trip distribution — p99 and p99.9 are the
 //! figures to read, not the minimum. `--size` takes the payload down from
 //! the cap. See the `lib.rs` module docs for what the floor is and why
-//! the payload is the width it is, and `client.rs` for the client.
+//! the payload is the width it is, `client.rs` for the closed loop, and
+//! `bench.rs` for the paced one and its `--transport dpdk`.
 //!
 //! ## Taking the floor apart
 //!

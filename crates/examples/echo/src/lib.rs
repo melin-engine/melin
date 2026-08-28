@@ -70,8 +70,12 @@
 //!   runtime switches that take the floor apart.
 //! - `client.rs`: the client — a closed loop of requests and the
 //!   round-trip latency distribution.
+//! - `bench.rs` and `bench/`: the paced client — requests on a fixed
+//!   schedule, each latency counted from when it was due, over kernel
+//!   TCP or DPDK, written as an HdrHistogram log.
+//! - `keys.rs`: the Ed25519 key loading both clients share.
 //! - `tests/round_trip.rs`: the behaviour, end to end — over raw frames,
-//!   against the journal on disk, and through the client as a process.
+//!   against the journal on disk, and through both clients as processes.
 //! - `tests/footprint.rs`, `tests/journal_limit.rs`: what the payload
 //!   width costs the rings and the journal, printed and pinned.
 

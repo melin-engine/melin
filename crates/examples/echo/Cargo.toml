@@ -31,6 +31,14 @@ path = "src/main.rs"
 name = "echo-client"
 path = "src/client.rs"
 
+# Drives a chosen rate on one connection and writes the round-trip
+# distribution as an HdrHistogram log, shaped like the Aeron benchmark
+# harness so the two sit side by side. Kernel TCP by default; the `dpdk`
+# feature adds the kernel-bypass transport.
+[[bin]]
+name = "echo-bench"
+path = "src/bench.rs"
+
 [dependencies]
 melin-app = { workspace = true }
 melin-server-runtime = { workspace = true }
@@ -40,6 +48,21 @@ tracing-subscriber = { workspace = true }
 melin-wire-protocol = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
+# echo-bench records every sample into an HdrHistogram and writes the
+# interval-log format the Aeron benchmark tooling reads. `serialization`
+# is that writer; the `sync` default is a channel-backed recorder for
+# multi-threaded producers, which a single-threaded loop has no use for.
+hdrhistogram = { version = "7", default-features = false, features = ["serialization"] }
+# The kernel-bypass transport, behind the `dpdk` feature: the NIC through
+# DPDK's poll-mode driver and TCP in userspace via the sequencer's smoltcp
+# fork. Both are what the server uses on that path.
+melin-dpdk = { workspace = true, optional = true }
+smoltcp = { package = "fastcp", version = "0.13", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+], optional = true }
 
 [dev-dependencies]
 # The tests read the journal back to check what was — and was not —
@@ -56,3 +79,7 @@ default = ["hash-chain"]
 # switches the chain itself. On by default because a deployment's is;
 # `--no-default-features` is the chain-less floor.
 hash-chain = ["melin-server-runtime/hash-chain"]
+# echo-bench over DPDK. Needs libdpdk at build time, like the server's own
+# `melin-server-runtime/dpdk`; without the feature the binary still builds
+# and runs over kernel TCP.
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "dep:smoltcp"]
