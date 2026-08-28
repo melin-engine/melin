@@ -35,8 +35,9 @@ clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-base64 = { workspace = true }
-ed25519-dalek = { workspace = true }
+# The round trip talks to the server through the client crate, and binds
+# the server's listener itself so it can take a kernel-assigned port.
+melin-client = { workspace = true }
 melin-wire-protocol = { workspace = true }
 tempfile = "3"
 

@@ -51,10 +51,9 @@ melin-server-runtime = { workspace = true, features = ["hash-chain"] }
 blake3 = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
-# The client's side of the wire: control-frame tags and Ed25519 auth.
-melin-wire-protocol = { workspace = true }
-ed25519-dalek = { workspace = true }
-base64 = { workspace = true }
+# The client's side of the wire — framing, Ed25519 auth, the batch
+# protocol — so `notary-client` is only the notary's own logic.
+melin-client = { workspace = true }
 
 [dev-dependencies]
 # For the footprint and journal-limit tests: the event width this
@@ -62,6 +61,8 @@ base64 = { workspace = true }
 # size the pipeline was tuned for, so both are asserted rather than left
 # to be discovered on a benchmark run. `test-utils` adds `free_addr`,
 # which the replicated round trip needs for the two listeners the
-# runtime binds itself.
+# runtime binds itself; the client listener it binds itself, through
+# the wire crate, so it can take a kernel-assigned port.
 melin-transport-core = { workspace = true, features = ["test-utils"] }
+melin-wire-protocol = { workspace = true }
 tempfile = "3"
