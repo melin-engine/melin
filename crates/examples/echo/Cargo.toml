@@ -34,19 +34,20 @@ path = "src/client.rs"
 [dependencies]
 melin-app = { workspace = true }
 melin-server-runtime = { workspace = true }
+# The client's side of the wire — framing, Ed25519 auth, the batch
+# protocol — so `echo-client` is only the closed loop and its figures.
+melin-client = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
-# The client's side of the wire: control-frame tags and Ed25519 auth.
-melin-wire-protocol = { workspace = true }
-ed25519-dalek = { workspace = true }
-base64 = { workspace = true }
 
 [dev-dependencies]
-# The tests read the journal back to check what was — and was not —
-# written, and the sizing tests take the ring and batch constants from
-# the transport.
+# The tests read the journal back to check what was written, the sizing
+# tests take the ring and batch constants from the transport, and the
+# round trip binds the server's listener itself so it can take a
+# kernel-assigned port.
 melin-journal = { workspace = true }
 melin-transport-core = { workspace = true }
+melin-wire-protocol = { workspace = true }
 tempfile = "3"
 
 [features]

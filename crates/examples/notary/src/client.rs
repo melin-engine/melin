@@ -16,6 +16,9 @@
 //! The receipt is a small text file (`entry`, `time_ns`, `leaf`, `prev`,
 //! `head`) so it can be read, mailed and diffed without tooling.
 //!
+//! The wire — framing, the Ed25519 handshake, the reply batch, a node's
+//! silence — is `melin-client`'s; this file is the notary's own logic.
+//!
 //! ```sh
 //! notary-client notarize contract.pdf --key /tmp/notary-key.pem
 //! notary-client verify contract.pdf            # exit 0: attested, 1: mismatch
@@ -23,31 +26,19 @@
 //! ```
 
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
-use base64::Engine;
 use clap::{Args, Parser, Subcommand};
-use ed25519_dalek::{Signer, SigningKey};
-use melin_wire_protocol::control_codec::{
-    TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_ENGINE_ERROR,
-    TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
-};
+use melin_client::{Connection, key};
 use notary_server::receipt::{Receipt, hex};
 use notary_server::{
     HEAD_LEN, LEAF_LEN, TAG_GET_HEAD, TAG_NOTARIZE, TAG_RESP_HEAD, TAG_RESP_REJECTED,
 };
 
 type Error = Box<dyn std::error::Error>;
-
-/// How long to wait for any single frame from the server (and for the
-/// connection itself). Generous for a local round trip; short enough that
-/// a request the server silently dropped (see [`request`]) turns into an
-/// error rather than a hang.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Command line
@@ -69,7 +60,7 @@ enum Command {
         #[arg(long)]
         receipt: Option<PathBuf>,
         #[command(flatten)]
-        connection: Connection,
+        endpoint: Endpoint,
     },
     /// Check FILE against its receipt. Offline: needs neither key nor server.
     Verify {
@@ -81,12 +72,13 @@ enum Command {
     /// Print the chain head and entry count.
     Head {
         #[command(flatten)]
-        connection: Connection,
+        endpoint: Endpoint,
     },
 }
 
+/// Where the server is and who the client is.
 #[derive(Args)]
-struct Connection {
+struct Endpoint {
     /// Server address.
     #[arg(long, default_value = "127.0.0.1:9876")]
     server: SocketAddr,
@@ -111,10 +103,10 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::Notarize {
             file,
             receipt,
-            connection,
+            endpoint,
         } => {
             let receipt_path = receipt.unwrap_or_else(|| default_receipt_path(&file));
-            let receipt = notarize(&file, &connection)?;
+            let receipt = notarize(&file, &endpoint)?;
             std::fs::write(&receipt_path, receipt.to_text())
                 .map_err(|e| format!("cannot write {}: {e}", receipt_path.display()))?;
             println!("notarized {}", file.display());
@@ -150,8 +142,8 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 }
             }
         }
-        Command::Head { connection } => {
-            let (entries, head) = query_head(&connection)?;
+        Command::Head { endpoint } => {
+            let (entries, head) = query_head(&endpoint)?;
             println!("entries: {entries}");
             println!("head:    {}", hex(&head));
             Ok(ExitCode::SUCCESS)
@@ -171,10 +163,10 @@ fn default_receipt_path(file: &Path) -> PathBuf {
 // Commands
 // ---------------------------------------------------------------------------
 
-fn notarize(file: &Path, connection: &Connection) -> Result<Receipt, Error> {
+fn notarize(file: &Path, endpoint: &Endpoint) -> Result<Receipt, Error> {
     let leaf = digest_file(file)?;
-    let mut stream = connect(connection)?;
-    let response = request(&mut stream, TAG_NOTARIZE, &leaf)?;
+    let mut node = connect(endpoint)?;
+    let response = request(&mut node, TAG_NOTARIZE, &leaf)?;
     let receipt = Receipt::from_frame(&response, leaf)?;
     // The server is not trusted blindly: a receipt that does not fold is
     // worthless, and better refused now than discovered at verification.
@@ -202,9 +194,9 @@ fn verify(file: &Path, receipt: &Receipt) -> Result<Result<(), String>, Error> {
     Ok(Ok(()))
 }
 
-fn query_head(connection: &Connection) -> Result<(u64, [u8; HEAD_LEN]), Error> {
-    let mut stream = connect(connection)?;
-    let response = request(&mut stream, TAG_GET_HEAD, &[])?;
+fn query_head(endpoint: &Endpoint) -> Result<(u64, [u8; HEAD_LEN]), Error> {
+    let mut node = connect(endpoint)?;
+    let response = request(&mut node, TAG_GET_HEAD, &[])?;
     // `[tag][entries: u64][head: 32]`
     if response.first() != Some(&TAG_RESP_HEAD) || response.len() != 1 + 8 + HEAD_LEN {
         return Err(format!("unexpected response to a head query: {}", hex(&response)).into());
@@ -229,144 +221,22 @@ fn digest_file(path: &Path) -> Result<[u8; LEAF_LEN], Error> {
 // Wire
 // ---------------------------------------------------------------------------
 
-/// Connect and authenticate: read the challenge, sign its nonce, send the
-/// signature with the public key, and wait for the server to say it is
-/// ready.
-fn connect(connection: &Connection) -> Result<TcpStream, Error> {
-    let key = load_key(&connection.key)?;
-    let mut stream = TcpStream::connect_timeout(&connection.server, READ_TIMEOUT)
-        .map_err(|e| format!("cannot connect to {}: {e}", connection.server))?;
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
-    stream.set_nodelay(true)?;
-
-    let challenge = read_frame(&mut stream)?;
-    // `[tag][nonce: 32]`
-    if challenge.first() != Some(&TAG_CHALLENGE) || challenge.len() != 33 {
-        return Err("expected an auth challenge from the server".into());
-    }
-    let signature = key.sign(&challenge[1..]);
-
-    // `[seq: u64][tag][signature: 64][public key: 32]`
-    let mut response = Vec::with_capacity(8 + 1 + 64 + 32);
-    response.extend_from_slice(&0u64.to_le_bytes());
-    response.push(TAG_CHALLENGE_RESPONSE);
-    response.extend_from_slice(&signature.to_bytes());
-    response.extend_from_slice(&key.verifying_key().to_bytes());
-    write_frame(&mut stream, &response)?;
-
-    match read_frame(&mut stream)?.first() {
-        Some(&TAG_SERVER_READY) => Ok(stream),
-        Some(&TAG_AUTH_FAILED) => Err(format!(
-            "authentication failed: is {} listed in the server's authorized_keys?",
-            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes())
-        )
-        .into()),
-        other => Err(format!("unexpected reply to authentication: {other:?}").into()),
-    }
+fn connect(endpoint: &Endpoint) -> Result<Connection, Error> {
+    let key = key::load_signing_key(&endpoint.key)?;
+    Ok(Connection::connect(endpoint.server, &key)?)
 }
 
-/// Send one request and return its one domain response (tag included,
-/// length prefix stripped), draining the batch it arrives in.
-fn request(stream: &mut TcpStream, tag: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
-    // `[request_seq: u64][tag][body]`. The sequence is 1 rather than a
-    // counter: the example accepts every request (see `check_request_seq`
-    // in the library) and this client sends one per connection.
-    let mut frame = Vec::with_capacity(8 + 1 + body.len());
-    frame.extend_from_slice(&1u64.to_le_bytes());
-    frame.push(tag);
-    frame.extend_from_slice(body);
-    write_frame(stream, &frame)?;
-
-    let mut response = None;
-    loop {
-        let frame = read_frame(stream).map_err(|e| match e.kind() {
-            // The server does not answer a request it refuses — a key
-            // whose role may not write, or a malformed frame — it drops
-            // it and keeps the connection. Silence is the only signal.
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => format!(
-                "no reply within {}s: the server silently drops requests it refuses — \
-                 check that the key's role in authorized_keys may write \
-                 (operator, trader or custodian)",
-                READ_TIMEOUT.as_secs()
-            ),
-            _ => format!("connection lost: {e}"),
-        })?;
-        match frame.first() {
-            Some(&TAG_BATCH_END) => break,
-            Some(&TAG_RESPONSE_HEARTBEAT) => {}
-            Some(&TAG_SERVER_BUSY) => return Err("the server is busy, retry later".into()),
-            Some(&TAG_ENGINE_ERROR) => return Err("the server reported an engine error".into()),
-            Some(&TAG_RESP_REJECTED) => return Err("the server rejected the request".into()),
-            Some(_) if response.is_none() => response = Some(frame),
-            _ => return Err(format!("unexpected frame from the server: {}", hex(&frame)).into()),
-        }
+/// Send one request and return its one response (tag included), with
+/// the notary's own rejection turned into an error.
+fn request(node: &mut Connection, tag: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
+    // The sequence is 1 rather than a counter: the example accepts every
+    // request (see `check_request_seq` in the library) and this client
+    // sends one per connection.
+    let response = node.request_one(1, tag, body)?;
+    if response.first() == Some(&TAG_RESP_REJECTED) {
+        return Err("the server rejected the request".into());
     }
-    response.ok_or_else(|| "the server ended the batch without a response".into())
-}
-
-/// Frames are `[len: u32 LE][payload]`. Anything larger than this is not
-/// a notary frame, so the length is refused before it drives an allocation.
-const MAX_FRAME_LEN: usize = 4096;
-
-fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut len = [0u8; 4];
-    stream.read_exact(&mut len)?;
-    let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(io::Error::other(format!(
-            "frame of {len} bytes is not plausible"
-        )));
-    }
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-    Ok(payload)
-}
-
-fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
-    stream.write_all(&(payload.len() as u32).to_le_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()
-}
-
-// ---------------------------------------------------------------------------
-// Keys
-// ---------------------------------------------------------------------------
-
-/// The DER prefix `openssl genpkey -algorithm ed25519` puts in front of the
-/// 32-byte seed: a PKCS#8 v1 `PrivateKeyInfo` for the Ed25519 OID
-/// (1.3.101.112) with the seed wrapped in a `CurvePrivateKey` OCTET
-/// STRING. Ed25519 has no parameters, so the encoding is fixed and the
-/// whole key is this prefix plus the seed — no ASN.1 parser needed.
-const PKCS8_ED25519_PREFIX: [u8; 16] = [
-    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
-];
-
-/// Load a signing key from a raw 32-byte seed (the runtime's own
-/// convention, e.g. `--replication-key`) or a PKCS#8 PEM.
-fn load_key(path: &Path) -> Result<SigningKey, Error> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("cannot read key {}: {e}", path.display()))?;
-    let seed = seed_from(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(SigningKey::from_bytes(&seed))
-}
-
-fn seed_from(bytes: &[u8]) -> Result<[u8; 32], String> {
-    if let Ok(seed) = <[u8; 32]>::try_from(bytes) {
-        return Ok(seed);
-    }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| "not a 32-byte seed, and not PEM text either".to_string())?;
-    let body: String = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
-        .collect();
-    let der = base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .map_err(|e| format!("not a 32-byte seed, and PEM body is not base64: {e}"))?;
-    der.strip_prefix(&PKCS8_ED25519_PREFIX)
-        .and_then(|seed| <[u8; 32]>::try_from(seed).ok())
-        .ok_or_else(|| "PEM is not an unencrypted PKCS#8 Ed25519 private key".to_string())
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -415,50 +285,6 @@ fn format_utc(ns: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- Keys ---
-
-    /// As written by `openssl genpkey -algorithm ed25519`, with the seed
-    /// and public key that `openssl pkey` reports for it.
-    const OPENSSL_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-        MC4CAQAwBQYDK2VwBCIEIDclw/zwdZEQraidYISn+CjytFLopT9cneV0G7+MvdtR\n\
-        -----END PRIVATE KEY-----\n";
-    const OPENSSL_SEED: &str = "3725c3fcf0759110ada89d6084a7f828f2b452e8a53f5c9de5741bbf8cbddb51";
-    const OPENSSL_PUBKEY_B64: &str = "+tVsQuDHgy200knb+jTv5Zs6XAr4eV5crZS0j/578Ac=";
-
-    #[test]
-    fn a_pem_from_openssl_loads_as_the_key_openssl_derives() {
-        let seed = seed_from(OPENSSL_PEM.as_bytes()).unwrap();
-        assert_eq!(hex(&seed), OPENSSL_SEED);
-        let key = SigningKey::from_bytes(&seed);
-        assert_eq!(
-            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes()),
-            OPENSSL_PUBKEY_B64,
-            "the public key must match what the README's authorized_keys recipe produces"
-        );
-    }
-
-    #[test]
-    fn a_raw_seed_loads_as_is() {
-        let seed = [0xAA; 32];
-        assert_eq!(seed_from(&seed).unwrap(), seed);
-    }
-
-    #[test]
-    fn other_key_material_is_refused() {
-        assert!(seed_from(&[0u8; 31]).is_err(), "short seed");
-        assert!(seed_from(&[0u8; 33]).is_err(), "long seed, not text");
-        assert!(seed_from(b"not a key at all").is_err(), "text, not base64");
-        // Valid base64 but not a PKCS#8 Ed25519 key.
-        let rsa_ish = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
-        assert!(seed_from(rsa_ish.as_bytes()).is_err(), "wrong DER prefix");
-        // Right prefix, but the seed is one byte short.
-        let short = base64::engine::general_purpose::STANDARD
-            .encode([&PKCS8_ED25519_PREFIX[..], &[0u8; 31]].concat());
-        assert!(seed_from(short.as_bytes()).is_err(), "truncated seed");
-    }
-
-    // --- Formatting ---
 
     #[test]
     fn utc_formatting() {

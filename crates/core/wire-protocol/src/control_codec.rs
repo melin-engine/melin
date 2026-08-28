@@ -80,6 +80,32 @@ pub fn encode_transport_response(
     Ok(pos)
 }
 
+/// Wire size of a challenge-response frame payload:
+/// seq(8) + tag(1) + signature(64) + public_key(32).
+pub const CHALLENGE_RESPONSE_LEN: usize = 8 + 1 + 64 + 32;
+
+/// Encode a client's auth challenge-response into `buf`, as the frame
+/// payload *without* the 4-byte length prefix:
+/// `[seq:u64][tag:u8][signature:64][pubkey:32]`.
+///
+/// The inverse of [`decode_challenge_response`], kept beside it so the
+/// layout has one home. Returns `Err(Truncated)` if `buf` is shorter
+/// than [`CHALLENGE_RESPONSE_LEN`].
+pub fn encode_challenge_response(
+    request_seq: u64,
+    response: &ChallengeResponse,
+    buf: &mut [u8],
+) -> Result<usize, ProtocolError> {
+    if buf.len() < CHALLENGE_RESPONSE_LEN {
+        return Err(ProtocolError::Truncated);
+    }
+    buf[..8].copy_from_slice(&request_seq.to_le_bytes());
+    buf[8] = TAG_CHALLENGE_RESPONSE;
+    buf[9..73].copy_from_slice(&response.signature);
+    buf[73..105].copy_from_slice(&response.public_key);
+    Ok(CHALLENGE_RESPONSE_LEN)
+}
+
 /// Decode a client's auth challenge-response from a wire frame.
 ///
 /// `buf` must contain the frame payload *after* the 4-byte length
@@ -88,8 +114,7 @@ pub fn encode_transport_response(
 /// Returns `(request_seq, ChallengeResponse)`. Returns
 /// `Err(UnknownTag)` if the tag is not `TAG_CHALLENGE_RESPONSE`.
 pub fn decode_challenge_response(buf: &[u8]) -> Result<(u64, ChallengeResponse), ProtocolError> {
-    // seq(8) + tag(1) + signature(64) + public_key(32) = 105
-    if buf.len() < 105 {
+    if buf.len() < CHALLENGE_RESPONSE_LEN {
         return Err(ProtocolError::Truncated);
     }
 
@@ -190,6 +215,24 @@ mod tests {
         assert_eq!(seq, 42);
         assert_eq!(cr.signature, sig);
         assert_eq!(cr.public_key, pubkey);
+    }
+
+    #[test]
+    fn challenge_response_round_trips() {
+        let response = ChallengeResponse {
+            signature: [0x33; 64],
+            public_key: [0x44; 32],
+        };
+        let mut buf = [0u8; CHALLENGE_RESPONSE_LEN];
+        let written = encode_challenge_response(7, &response, &mut buf).unwrap();
+        assert_eq!(written, CHALLENGE_RESPONSE_LEN);
+        assert_eq!(decode_challenge_response(&buf).unwrap(), (7, response));
+
+        let mut short = [0u8; CHALLENGE_RESPONSE_LEN - 1];
+        assert!(matches!(
+            encode_challenge_response(7, &response, &mut short),
+            Err(ProtocolError::Truncated)
+        ));
     }
 
     #[test]
