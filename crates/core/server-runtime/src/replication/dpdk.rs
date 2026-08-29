@@ -318,6 +318,11 @@ pub struct DpdkReplicationDriver<A: Application> {
     rec_publish_to_send: melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "latency-trace")]
     rec_send_to_ack: melin_transport_core::trace::StageRecorder,
+    /// The `poll` that puts a tick's batches on the wire: the stack's
+    /// segmenting and the driver's transmit, which is the part of the
+    /// round trip this side spends before the wire.
+    #[cfg(feature = "latency-trace")]
+    rec_send_flush: melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "latency-trace")]
     last_trace_flush: std::time::Instant,
     // Anchors the `A` type parameter — the struct holds no app-typed
@@ -424,6 +429,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                 "repl: send → in-memory ack (replica round trip)",
             ),
             #[cfg(feature = "latency-trace")]
+            rec_send_flush: melin_transport_core::trace::register_stage(
+                "repl: send flush (queue_send → poll returned)",
+            ),
+            #[cfg(feature = "latency-trace")]
             last_trace_flush: std::time::Instant::now(),
             _app: PhantomData,
         })
@@ -517,6 +526,8 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let rec_publish_to_send = &mut self.rec_publish_to_send;
         #[cfg(feature = "latency-trace")]
         let rec_send_to_ack = &mut self.rec_send_to_ack;
+        #[cfg(feature = "latency-trace")]
+        let rec_send_flush = &mut self.rec_send_flush;
 
         // Check eviction flags from the journal stage.
         for (i, slot) in slots.iter_mut().enumerate() {
@@ -541,6 +552,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
         }
 
         let mut any_active = false;
+        // Set by a slot that queued data; the one flush for every slot's
+        // data is after the loop, so the replicas' batches share a burst.
+        let mut flush_pending = false;
 
         for (slot_idx, slot) in slots.iter_mut().enumerate() {
             match slot.state {
@@ -1127,13 +1141,19 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         continue;
                     }
                     if !slot.send_buf.is_empty() {
-                        // Flush immediately so replication data hits the
-                        // wire without waiting for the next outer-loop
-                        // poll. Without this, a client-traffic burst
-                        // starves the replication TX path: the TxQueue
-                        // fills, the driver backs off, the ring overflows,
-                        // and the response gate freezes the exchange.
-                        transport.poll();
+                        // Flushed after the slot loop, in this tick, so
+                        // replication data hits the wire without waiting
+                        // for the next outer-loop poll (without that, a
+                        // client-traffic burst starves the replication TX
+                        // path: the TxQueue fills, the driver backs off,
+                        // the ring overflows, and the response gate
+                        // freezes the exchange) -- and once for both
+                        // slots rather than once each. Flushing per slot
+                        // put the two replicas' batches in two bursts a
+                        // few microseconds apart, and on the AWS rig the
+                        // second such burst cost the driver 2.9 µs where
+                        // a lone one cost 0.1.
+                        flush_pending = true;
                         slot.last_send = std::time::Instant::now();
                     }
 
@@ -1164,6 +1184,15 @@ impl<A: Application> DpdkReplicationDriver<A> {
             }
         }
 
+        if flush_pending {
+            #[cfg(feature = "latency-trace")]
+            let flush_start = melin_transport_core::trace::mono_trace_ns();
+            transport.poll();
+            #[cfg(feature = "latency-trace")]
+            rec_send_flush
+                .record_elapsed(flush_start, melin_transport_core::trace::mono_trace_ns());
+        }
+
         // Hand the tracing samples over on the idle cadence the trace
         // module asks for; a busy tick is not the place to take its lock.
         #[cfg(feature = "latency-trace")]
@@ -1171,6 +1200,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             self.last_trace_flush = std::time::Instant::now();
             self.rec_publish_to_send.flush();
             self.rec_send_to_ack.flush();
+            self.rec_send_flush.flush();
         }
 
         any_active

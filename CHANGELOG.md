@@ -101,6 +101,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **The DPDK replication sender flushes once per tick, after every slot
+  has queued**, rather than once per slot. With two replicas that put
+  their batches in two bursts a few microseconds apart, and on the AWS
+  rig a doorbell that follows another within a few microseconds stalls
+  the thread ~3 µs (0.1 µs for one on its own -- the same on the client
+  port once responses come a microsecond apart at 1M/s). One burst
+  carries both. Measured on that rig (c6id.4xlarge, isolated, io2): a
+  working tick 15 → 9 µs at p99, the replication ring dwell 8.2 → 6.0 at
+  p50. End to end, three runs each: at 100K/s the median is unchanged
+  (the first ack now waits for the second slot's queueing) and the tail
+  tighter (p99.9 136-298 → 134-145 µs); at 1M/s p50 156-158 → 134-143,
+  p90 175-178 → 150-160, p99.9 502-526 → 412-514 and the maximum
+  2.6-3.6 ms → 1.2-2.4 ms, while p99 came out worse, 274-281 → 304-342,
+  in all three runs -- kept on the strength of the rest, with that open.
 - **`--dpdk-ip` no longer defaults to `10.0.0.1`.** A server built with the
   `dpdk` feature and started without it now serves over kernel TCP, as a
   build without the feature does, instead of initialising the EAL and
