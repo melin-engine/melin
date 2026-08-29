@@ -753,6 +753,19 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     #[cfg(feature = "latency-trace")]
     let mut rec_recv_to_ack =
         melin_transport_core::trace::register_stage("replica: recv → in-memory ack sent");
+    // This loop's cadence: a batch that lands on the NIC waits for the
+    // next `poll_recv`, and its ack goes at the top of the iteration
+    // after, so the iteration time is what the primary's round trip
+    // includes of this side beyond the stages above. Every iteration,
+    // idle ones too -- below the saturating rate that is most of them,
+    // and the cadence is the point.
+    #[cfg(feature = "latency-trace")]
+    let mut rec_iter =
+        melin_transport_core::trace::register_stage("replica loop: iteration (every iteration)");
+    #[cfg(feature = "latency-trace")]
+    let mut rec_poll = melin_transport_core::trace::register_stage("replica loop: poll_recv()");
+    #[cfg(feature = "latency-trace")]
+    let mut iter_start = melin_transport_core::trace::mono_trace_ns();
     #[cfg(feature = "latency-trace")]
     let mut unacked: std::collections::VecDeque<(u64, u64, u64)> =
         std::collections::VecDeque::with_capacity(TRACE_UNACKED_CAP);
@@ -794,6 +807,13 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     const RECV_COMPACT_THRESHOLD: usize = 64 * 1024;
 
     let exit = loop {
+        #[cfg(feature = "latency-trace")]
+        {
+            let now = melin_transport_core::trace::mono_trace_ns();
+            rec_iter.record_elapsed(iter_start, now);
+            iter_start = now;
+        }
+
         // --- Check flags ---
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down");
@@ -897,13 +917,19 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         }
 
         // --- Receive data ---
+        #[cfg(feature = "latency-trace")]
+        let poll_start = melin_transport_core::trace::mono_trace_ns();
         let any_data = match transport.poll_recv(&mut recv_buf) {
             Ok(d) => d,
             Err(_) => break SessionExit::Disconnected,
         };
         #[cfg(feature = "latency-trace")]
-        if any_data {
-            cycle_recv_ts = melin_transport_core::trace::mono_trace_ns();
+        {
+            let now = melin_transport_core::trace::mono_trace_ns();
+            rec_poll.record_elapsed(poll_start, now);
+            if any_data {
+                cycle_recv_ts = now;
+            }
         }
 
         // Check connection after recv — if disconnected and nothing is
@@ -979,6 +1005,8 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 rec_recv_to_publish.flush();
                 rec_publish_to_ack.flush();
                 rec_recv_to_ack.flush();
+                rec_iter.flush();
+                rec_poll.flush();
             }
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);

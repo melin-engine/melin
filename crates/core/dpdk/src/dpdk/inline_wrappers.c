@@ -8,10 +8,23 @@
 
 #include <rte_ethdev.h>
 #include <rte_flow.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 
 #include <string.h>
+
+/* Register the calling thread as a non-EAL lcore, so that the mempool hands
+ * it a per-lcore cache: without one, every mbuf alloc and free is an
+ * operation on the pool's shared ring. Idempotent. Returns the thread's
+ * lcore id, or -1 when DPDK refused (no lcore id left). rte_lcore_id() is
+ * a thread-local read behind an inline, hence the wrapper. */
+int dpdk_thread_register(void) {
+    if (rte_lcore_id() == LCORE_ID_ANY && rte_thread_register() != 0) {
+        return -1;
+    }
+    return (int)rte_lcore_id();
+}
 
 uint16_t dpdk_eth_rx_burst(uint16_t port_id, uint16_t queue_id,
                            struct rte_mbuf **rx_pkts, uint16_t nb_pkts) {

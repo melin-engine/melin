@@ -14,6 +14,31 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **Loop-cadence stages and the proxy's own round trip**, for placing the
+  replica round trip and the client path. In the `latency-trace` build,
+  on the primary: `repl loop: iteration (every iteration)`, `repl loop:
+  transport.poll()`, `repl loop: driver.tick()` and `repl: send flush
+  (queue_send → poll returned)`; on a replica: `replica loop: iteration
+  (every iteration)` and `replica loop: poll_recv()`. Unlike the client
+  poll loop's stage these count idle iterations too -- the question they
+  answer is how long an ack or a batch waits on the NIC for the loop to
+  come round, which is the idle cadence. And `shm-proxy --trace`: the
+  proxy's loop iteration, its `service()` of the stack, and the round
+  trip from an echo request reaching the stack to its reply being in
+  hand (matched by order, by tag), as percentiles on stderr when the
+  bridge ends. The proxy's round trip less the server's `server e2e` is
+  the wire both ways plus the two poll cadences, which no stage on the
+  server can see. And inside the DPDK transport, `melin-dpdk`'s own
+  `latency-trace` feature (the runtime's implies it): `dpdk p<port>q<n>
+  poll: rx burst (with frames)`, `ingress (smoltcp, with frames)`,
+  `egress (smoltcp, tx queued)`, `egress tx_burst` and `egress tx_burst:
+  frames per burst (a count)`, per port and queue, recorded only by the
+  polls that carried a packet -- what a packet costs this side of the
+  wire, split between the stack and the driver. On the AWS rig they put
+  the stack at 0.2-1 µs and the driver's `tx_burst` at 0.1 µs for a
+  doorbell on its own and ~3 µs for one within a few microseconds of the
+  previous, which is what the one-flush-per-tick change below acts on.
+
 - **Replication round-trip stages** in the `latency-trace` build, on
   `/stats-dump` of the node that measured them. On the primary: `repl:
   journal publish → send` (how long a batch sat in the replication ring
@@ -59,6 +84,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   written when the loop turns goes out as one segment, so the packet rate
   follows the backlog rather than the message rate. The layout is
   documented in `crates/examples/echo/src/proxy/shm.rs`.
+
+### Fixed
+
+- **DPDK polling threads are registered as lcores**, on their first poll.
+  The mbuf pool's per-lcore cache is what makes an mbuf alloc or free
+  cheap; a `std` thread has no lcore id, so it got no cache, and every
+  receive refill and transmit completion was an operation on the pool's
+  shared ring, contended between every DPDK thread of the process.
+  `rte_thread_register` behind a C wrapper, since `rte_lcore_id` is an
+  inline over thread-local state. Measured on the AWS rig at 100K
+  events/s it changed no stage -- the ring was not what a poll's time
+  went to there -- but it is the documented requirement for a non-EAL
+  thread to have a cache, and a process with more DPDK threads, or more
+  packets per second, contends the ring more.
 
 ### Changed
 

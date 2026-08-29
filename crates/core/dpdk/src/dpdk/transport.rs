@@ -322,6 +322,65 @@ unsafe impl Sync for DpdkShared {}
 /// SocketSet. Each poll thread gets one of these.
 ///
 /// All methods must be called from the owning poll thread.
+/// A poll's phases as stages, one set per queue -- that is, per thread,
+/// since a queue has one owner. Only the polls that carry a packet
+/// record: the receive burst when it brought frames, the stack's ingress
+/// over them, the stack's egress pass when TX was queued (which is also
+/// where the pure ACKs for what ingress received are built) and the
+/// driver's transmit of what that pass produced, with the frames per
+/// transmit as a count. Together
+/// they say what a packet costs this side of the wire, and whether that
+/// is the stack's work or the driver's.
+#[cfg(feature = "latency-trace")]
+struct PollTrace {
+    rx_burst: melin_transport_core::trace::StageRecorder,
+    ingress: melin_transport_core::trace::StageRecorder,
+    egress: melin_transport_core::trace::StageRecorder,
+    egress_tx: melin_transport_core::trace::StageRecorder,
+    /// Not a duration: how many frames each egress `tx_burst` carried,
+    /// recorded as a plain count, so a burst's cost can be read per frame.
+    egress_tx_frames: melin_transport_core::trace::StageRecorder,
+    last_flush_ns: u64,
+}
+
+#[cfg(feature = "latency-trace")]
+impl PollTrace {
+    fn new(port_id: u16, queue_id: u16) -> Self {
+        // A stage name is `&'static str`; one leak per transport, at
+        // construction, in a trace build only. Named by port as well as
+        // queue: a process's transports may all be queue 0 of different
+        // ports, and the port is then what tells the threads apart.
+        let stage = |what: &str| {
+            melin_transport_core::trace::register_stage(Box::leak(
+                format!("dpdk p{port_id}q{queue_id} poll: {what}").into_boxed_str(),
+            ))
+        };
+        Self {
+            rx_burst: stage("rx burst (with frames)"),
+            ingress: stage("ingress (smoltcp, with frames)"),
+            egress: stage("egress (smoltcp, tx queued)"),
+            egress_tx: stage("egress tx_burst"),
+            egress_tx_frames: stage("egress tx_burst: frames per burst (a count)"),
+            last_flush_ns: melin_transport_core::trace::mono_trace_ns(),
+        }
+    }
+
+    /// Hand the samples to the registry on the idle cadence the trace
+    /// module asks for, so a dump taken after traffic stops sees them.
+    fn flush_if_due(&mut self, now: u64) {
+        let interval = melin_transport_core::trace::IDLE_FLUSH_INTERVAL.as_nanos() as u64;
+        if now.saturating_sub(self.last_flush_ns) < interval {
+            return;
+        }
+        self.last_flush_ns = now;
+        self.rx_burst.flush();
+        self.ingress.flush();
+        self.egress.flush();
+        self.egress_tx.flush();
+        self.egress_tx_frames.flush();
+    }
+}
+
 pub struct DpdkTransport {
     /// The interface's own hardware address: the port's, for a transport
     /// over one port.
@@ -355,6 +414,9 @@ pub struct DpdkTransport {
     /// Total pending TX bytes across all connections. Avoids iterating
     /// tx_queues.values().any() on every poll cycle.
     pending_tx_bytes: usize,
+    /// Where a poll's time goes, as stages named after this queue.
+    #[cfg(feature = "latency-trace")]
+    trace: PollTrace,
     /// Statically configured gateway, kept so `poll` can re-seed it before
     /// its neighbor entry expires. `None` when the deployment is
     /// single-subnet (no gateway configured) — nothing to refresh then.
@@ -647,6 +709,8 @@ impl DpdkTransport {
             cached_timestamp: now,
             poll_count: 0,
             pending_tx_bytes: 0,
+            #[cfg(feature = "latency-trace")]
+            trace: PollTrace::new(config.port_ids[0], queue_id),
             gateway: config.gateway.zip(config.gateway_mac),
             gateway_seeded_at: now,
             peer_mac: config.peer_mac,
@@ -774,6 +838,12 @@ impl DpdkTransport {
     }
 
     /// Run one poll iteration.
+    ///
+    /// Under `latency-trace`, the phases that carry a packet are stages
+    /// named after this port and queue: the receive burst that brought
+    /// frames, the stack's ingress over them, the stack's egress pass when
+    /// there was TX queued, and the driver's transmit with its frame
+    /// count. Idle polls record nothing.
     pub fn poll(&mut self) -> Instant {
         // Refresh the smoltcp timestamp periodically, not every poll.
         // smoltcp only needs ms-precision for TCP retransmit/keepalive timers.
@@ -789,7 +859,11 @@ impl DpdkTransport {
 
         // Batch ingress: poll all ports in one pass. MAC learning happens
         // inside collect_rx_batch() for every IPv4 frame.
+        #[cfg(feature = "latency-trace")]
+        let t_rx0 = melin_transport_core::trace::mono_trace_ns();
         let mut batch = self.device.collect_rx_batch();
+        #[cfg(feature = "latency-trace")]
+        let t_rx1 = melin_transport_core::trace::mono_trace_ns();
 
         // Seed neighbor cache from MACs learned in THIS batch (not the
         // previous one). This ensures smoltcp knows the client's MAC
@@ -832,13 +906,24 @@ impl DpdkTransport {
                     count,
                 )
             };
+            #[cfg(feature = "latency-trace")]
+            let t_in0 = melin_transport_core::trace::mono_trace_ns();
             self.iface.poll_ingress_batch_zero_copy(
                 self.cached_timestamp,
                 &mut self.device,
                 &mut self.sockets,
                 frames,
             );
-            // Flush TX generated by ingress processing (ACKs, window updates).
+            #[cfg(feature = "latency-trace")]
+            {
+                let t_in1 = melin_transport_core::trace::mono_trace_ns();
+                self.trace.rx_burst.record_elapsed(t_rx0, t_rx1);
+                self.trace.ingress.record_elapsed(t_in0, t_in1);
+            }
+            // Flush TX generated by ingress processing (ACKs, window
+            // updates). In practice the stack emits those from its egress
+            // pass below, not here: a stage on this flush recorded a
+            // handful of samples per run.
             self.device.flush_tx();
         }
         let rx_had_data = !batch.is_empty();
@@ -852,10 +937,32 @@ impl DpdkTransport {
             || has_pending_tx
             || self.poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL)
         {
+            #[cfg(feature = "latency-trace")]
+            let t_eg0 = melin_transport_core::trace::mono_trace_ns();
             self.flush_tx_queues();
             self.iface
                 .poll(self.cached_timestamp, &mut self.device, &mut self.sockets);
+            #[cfg(feature = "latency-trace")]
+            let t_eg1 = melin_transport_core::trace::mono_trace_ns();
+            #[cfg(feature = "latency-trace")]
+            let egress_tx_frames = self.device.tx_pending_frames();
             self.device.flush_tx();
+            #[cfg(feature = "latency-trace")]
+            {
+                let t_eg2 = melin_transport_core::trace::mono_trace_ns();
+                if has_pending_tx {
+                    self.trace.egress.record_elapsed(t_eg0, t_eg1);
+                }
+                if egress_tx_frames > 0 {
+                    self.trace.egress_tx.record_elapsed(t_eg1, t_eg2);
+                    self.trace
+                        .egress_tx_frames
+                        .record_ns(egress_tx_frames as u64);
+                }
+                // This branch is also the timer branch, so an idle
+                // transport still passes here on the refresh cadence.
+                self.trace.flush_if_due(t_eg2);
+            }
             self.check_listener();
         }
 

@@ -680,8 +680,37 @@ pub fn run_dpdk_repl_poll<A: Application>(
     shutdown: &AtomicBool,
     busy_spin: bool,
 ) {
+    // This loop's cadence, for reading the round-trip stage: an ack that
+    // lands on the NIC while `tick` runs waits for the next `poll`, and a
+    // batch published while `poll` runs waits for the next `tick`, so the
+    // iteration time is what the ring dwell and the replica round trip
+    // include of this side. Every iteration counts, idle ones too -- the
+    // cadence is the point, and below the saturating rate this loop is
+    // idle between batches. Unlike the client poll loop's stage, which
+    // records work iterations only: there the question is how long a
+    // cycle with an order in it takes, here how long an ack waits.
+    #[cfg(feature = "latency-trace")]
+    let mut rec_iter =
+        melin_transport_core::trace::register_stage("repl loop: iteration (every iteration)");
+    #[cfg(feature = "latency-trace")]
+    let mut rec_poll = melin_transport_core::trace::register_stage("repl loop: transport.poll()");
+    #[cfg(feature = "latency-trace")]
+    let mut rec_tick = melin_transport_core::trace::register_stage("repl loop: driver.tick()");
+    #[cfg(feature = "latency-trace")]
+    let mut iter_start = mono_trace_ns();
+    #[cfg(feature = "latency-trace")]
+    let mut last_flush = iter_start;
+    #[cfg(feature = "latency-trace")]
+    let flush_interval_ns = melin_transport_core::trace::IDLE_FLUSH_INTERVAL.as_nanos() as u64;
+
     while !shutdown.load(Ordering::Relaxed) {
         transport.poll();
+        #[cfg(feature = "latency-trace")]
+        let after_poll = {
+            let now = mono_trace_ns();
+            rec_poll.record_elapsed(iter_start, now);
+            now
+        };
         for accepted in transport.take_accepted() {
             if accepted.listen_port == repl_listen_port {
                 driver.accept_connection(accepted.peer, accepted.handle, &mut transport);
@@ -695,6 +724,19 @@ pub fn run_dpdk_repl_poll<A: Application>(
             }
         }
         let active = driver.tick(&mut transport, shutdown);
+        #[cfg(feature = "latency-trace")]
+        {
+            let now = mono_trace_ns();
+            rec_tick.record_elapsed(after_poll, now);
+            rec_iter.record_elapsed(iter_start, now);
+            iter_start = now;
+            if now.saturating_sub(last_flush) >= flush_interval_ns {
+                last_flush = now;
+                rec_iter.flush();
+                rec_poll.flush();
+                rec_tick.flush();
+            }
+        }
         if !busy_spin && !active {
             std::thread::yield_now();
         }

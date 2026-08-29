@@ -51,6 +51,8 @@ tracing-subscriber = { workspace = true }
 melin-wire-protocol = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
+# shm-proxy's `--trace` percentiles.
+hdrhistogram = "7"
 # The kernel-bypass transport, behind the `dpdk` feature: the NIC through
 # DPDK's poll-mode driver and TCP in userspace via the sequencer's smoltcp
 # fork. Both are what the server uses on that path.

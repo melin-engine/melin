@@ -88,6 +88,9 @@ pub struct DpdkDevice {
     /// Pending TX mbufs accumulated during smoltcp poll. Flushed in a
     /// single `tx_burst(N)` call via `flush_tx()` after each poll cycle.
     tx_batch: Vec<*mut ffi::rte_mbuf>,
+    /// Whether the polling thread has been registered as an lcore yet;
+    /// see [`Self::ensure_lcore`].
+    lcore_registered: bool,
 }
 
 // SAFETY: DpdkDevice is only used from the single DPDK poll thread.
@@ -152,7 +155,44 @@ impl DpdkDevice {
             batch_mbufs: Vec::with_capacity(BURST_SIZE * port_ids.len()),
             batch_injected: Vec::new(),
             tx_batch: Vec::with_capacity(BURST_SIZE),
+            lcore_registered: false,
         }
+    }
+
+    /// Register the polling thread with DPDK as a non-EAL lcore, once.
+    ///
+    /// The mempool's per-lcore cache is what makes an mbuf alloc or free
+    /// cheap. A thread without an lcore id -- any `std` thread, which is
+    /// every thread that polls a device here -- gets no cache, and each
+    /// alloc (the receive refill) and free (the transmit completion) is a
+    /// CAS on the pool's shared ring, contended between every such thread
+    /// on the pool. On the AWS rig that was the difference between a
+    /// `tx_burst` of 0.1 µs on a node with one DPDK thread and 2.8 µs on
+    /// the primary with three. On the first poll rather than at
+    /// construction: a device is built on one thread and polled on
+    /// another, and the registration is the polling thread's.
+    #[inline]
+    fn ensure_lcore(&mut self) {
+        if self.lcore_registered {
+            return;
+        }
+        self.lcore_registered = true;
+        // SAFETY: EAL is initialised (a device exists); the call touches
+        // DPDK's own thread-local state only.
+        let lcore = unsafe { ffi::dpdk_thread_register() };
+        if lcore < 0 {
+            tracing::warn!(
+                "DPDK: this thread could not be registered as an lcore; \
+                 mbuf alloc and free go through the pool's shared ring"
+            );
+        } else {
+            tracing::info!(lcore, "DPDK: polling thread registered as an lcore");
+        }
+    }
+
+    /// How many frames [`Self::flush_tx`] would transmit.
+    pub fn tx_pending_frames(&self) -> usize {
+        self.tx_batch.len()
     }
 
     /// Flush pending TX mbufs via `tx_burst`. Unsent mbufs are retained
@@ -186,6 +226,7 @@ impl DpdkDevice {
     /// from the current one. With LACP, this ensures traffic arriving on
     /// either bond member's VF is received.
     pub fn poll_rx(&mut self) {
+        self.ensure_lcore();
         // Still draining current burst — nothing to do.
         let active = &self.rx_ports[self.active_rx];
         if active.rx_cursor < active.rx_count {
@@ -234,6 +275,7 @@ impl DpdkDevice {
     /// owns all received frames. Call `iface.poll()` after processing
     /// the batch for egress and maintenance (ingress will be a no-op).
     pub fn collect_rx_batch(&mut self) -> RxBatch {
+        self.ensure_lcore();
         // Reuse pre-allocated buffers to avoid per-poll heap allocation.
         let mut mbufs = std::mem::take(&mut self.batch_mbufs);
         mbufs.clear();

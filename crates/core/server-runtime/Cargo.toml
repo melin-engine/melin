@@ -21,6 +21,7 @@ no-persist = ["melin-transport-core/no-persist"]
 ## Lightweight per-stage histograms.
 latency-trace = [
     "melin-transport-core/latency-trace",
+    "melin-dpdk?/latency-trace",
 ]
 ## Full tick-to-trade decomposition. Implies latency-trace.
 tick-to-trade = ["latency-trace"]
