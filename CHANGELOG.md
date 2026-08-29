@@ -14,6 +14,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **`shm-proxy`** (echo example) — a process that holds one connection to a
+  server, over kernel TCP or, with `--features dpdk`, kernel bypass, and
+  offers it to a client in another process through two shared-memory byte
+  rings and a state word in a mapped file (`--shm`). For load generators
+  that cannot host DPDK themselves — the Aeron benchmark harness's Java
+  rig — and arranged the way Aeron's own DPDK driver is: the rig in one
+  process, the NIC in another. Nothing is framed or timed in between; the
+  client keeps its own handshake and clock. Whatever the client has
+  written when the loop turns goes out as one segment, so the packet rate
+  follows the backlog rather than the message rate. The layout is
+  documented in `crates/examples/echo/src/proxy/shm.rs`; `echo-bench`'s
+  transport modules are shared, and its `authenticate` moved from
+  `bench/transport.rs` to `bench/auth.rs` to make that possible.
+
 - **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib`,
   `--dpdk-client-tx-queue-kib`** — the per-connection buffering of the
   sockets accepted on the DPDK trading port, previously fixed at 64 KiB,

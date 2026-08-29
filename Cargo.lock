@@ -1136,6 +1136,7 @@ dependencies = [
  "ed25519-dalek",
  "fastcp",
  "hdrhistogram",
+ "libc",
  "melin-app",
  "melin-dpdk",
  "melin-journal",

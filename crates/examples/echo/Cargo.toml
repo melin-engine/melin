@@ -39,10 +39,20 @@ path = "src/client.rs"
 name = "echo-bench"
 path = "src/bench.rs"
 
+# Holds one connection to a server -- over kernel TCP or, with the `dpdk`
+# feature, kernel bypass -- and bridges it to shared-memory rings for a
+# client in another process: the Java benchmark harness, which cannot
+# host DPDK itself. Shares echo-bench's transport modules.
+[[bin]]
+name = "shm-proxy"
+path = "src/shm_proxy.rs"
+
 [dependencies]
 melin-app = { workspace = true }
 melin-server-runtime = { workspace = true }
 clap = { workspace = true }
+# shm-proxy maps its file with mmap; nothing in std exposes that.
+libc = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The client's side of the wire: control-frame tags and Ed25519 auth.
 melin-wire-protocol = { workspace = true }
