@@ -75,6 +75,21 @@ pub fn mono_trace_ns() -> MonoTraceInstant {
 #[inline]
 pub fn mono_trace_ns() -> MonoTraceInstant {}
 
+/// The trace clock as a plain number, for a field that has the same
+/// layout with tracing on or off -- a ring slot's publish stamp. Zero
+/// when tracing is off, and the only value such a field then carries.
+#[cfg(feature = "latency-trace")]
+#[inline]
+pub fn mono_trace_raw_ns() -> u64 {
+    mono_nanos()
+}
+
+#[cfg(not(feature = "latency-trace"))]
+#[inline]
+pub fn mono_trace_raw_ns() -> u64 {
+    0
+}
+
 /// Monotonic nanoseconds since process start. Uses a static epoch to
 /// avoid overflow and keep values small.
 #[cfg(feature = "latency-trace")]

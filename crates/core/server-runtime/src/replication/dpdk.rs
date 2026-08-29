@@ -305,6 +305,21 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// (not threaded per-call) so the `Authenticating` tick arm can verify
     /// without the caller re-supplying it each poll.
     authorized_keys: Arc<AuthorizedKeys>,
+    /// Latency tracing of the replication round trip. Per slot, the
+    /// batches sent that no in-memory ack has covered yet, as
+    /// `(end_sequence, sent_ns)`; bounded, so a replica that stops
+    /// acking cannot grow it. Two stages: how long a batch sat in the
+    /// ring before this thread sent it, and how long from the send to
+    /// the replica's in-memory ack -- the wire both ways plus the
+    /// replica's own receive-to-ack, which the replica measures itself.
+    #[cfg(feature = "latency-trace")]
+    in_flight: [std::collections::VecDeque<(u64, u64)>; 2],
+    #[cfg(feature = "latency-trace")]
+    rec_publish_to_send: melin_transport_core::trace::StageRecorder,
+    #[cfg(feature = "latency-trace")]
+    rec_send_to_ack: melin_transport_core::trace::StageRecorder,
+    #[cfg(feature = "latency-trace")]
+    last_trace_flush: std::time::Instant,
     // Anchors the `A` type parameter — the struct holds no app-typed
     // state, but `tick`'s journal-catchup and snapshot-transfer paths
     // do, and we want the type system to enforce that the same `A`
@@ -395,6 +410,21 @@ impl<A: Application> DpdkReplicationDriver<A> {
             fence_state,
             ack_policy,
             authorized_keys,
+            #[cfg(feature = "latency-trace")]
+            in_flight: [
+                std::collections::VecDeque::with_capacity(TRACE_IN_FLIGHT_CAP),
+                std::collections::VecDeque::with_capacity(TRACE_IN_FLIGHT_CAP),
+            ],
+            #[cfg(feature = "latency-trace")]
+            rec_publish_to_send: melin_transport_core::trace::register_stage(
+                "repl: journal publish → send (ring dwell)",
+            ),
+            #[cfg(feature = "latency-trace")]
+            rec_send_to_ack: melin_transport_core::trace::register_stage(
+                "repl: send → in-memory ack (replica round trip)",
+            ),
+            #[cfg(feature = "latency-trace")]
+            last_trace_flush: std::time::Instant::now(),
             _app: PhantomData,
         })
     }
@@ -418,6 +448,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
             transport.close(handle);
             return;
         };
+        // A new session: nothing the previous occupant sent is owed an ack.
+        #[cfg(feature = "latency-trace")]
+        self.in_flight[idx].clear();
 
         // Issue the auth challenge immediately (non-blocking): the replica
         // must sign this nonce with a key carrying Replication permission
@@ -478,6 +511,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let authorized_keys = &self.authorized_keys;
         let batch_size = self.batch_size;
         let heartbeat_interval = self.heartbeat_interval;
+        #[cfg(feature = "latency-trace")]
+        let in_flight = &mut self.in_flight;
+        #[cfg(feature = "latency-trace")]
+        let rec_publish_to_send = &mut self.rec_publish_to_send;
+        #[cfg(feature = "latency-trace")]
+        let rec_send_to_ack = &mut self.rec_send_to_ack;
 
         // Check eviction flags from the journal stage.
         for (i, slot) in slots.iter_mut().enumerate() {
@@ -946,13 +985,31 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 let payload = &remaining[payload_start..frame_end];
                                 if let Ok(ReplicaMessage::Ack(ack)) =
                                     decode_replica_message(payload)
-                                    && cursors.record_ack(slot_idx, &ack, slot.sent.get()).is_err()
                                 {
-                                    // Eviction on violation: reuse the ack-error
-                                    // teardown below (the store already logged
-                                    // the violation at error level).
-                                    ack_error = true;
-                                    break;
+                                    if cursors.record_ack(slot_idx, &ack, slot.sent.get()).is_err()
+                                    {
+                                        // Eviction on violation: reuse the ack-error
+                                        // teardown below (the store already logged
+                                        // the violation at error level).
+                                        ack_error = true;
+                                        break;
+                                    }
+                                    // Every batch this ack covers has completed
+                                    // its round trip; acks are cumulative, so
+                                    // the front of the queue is the oldest.
+                                    #[cfg(feature = "latency-trace")]
+                                    {
+                                        let now = melin_transport_core::trace::mono_trace_ns();
+                                        while let Some(&(end_seq, sent_ns)) =
+                                            in_flight[slot_idx].front()
+                                        {
+                                            if end_seq > ack.in_memory_sequence {
+                                                break;
+                                            }
+                                            rec_send_to_ack.record_elapsed(sent_ns, now);
+                                            in_flight[slot_idx].pop_front();
+                                        }
+                                    }
                                 }
                                 consumed += frame_end;
                             }
@@ -1034,6 +1091,20 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         slot.send_buf.extend_from_slice(data);
                         slot.consumer.commit();
                         slot.sent.advance(meta.end_sequence);
+                        // The batch leaves the ring here and the wire at
+                        // the flush a few microseconds on; the stamp is
+                        // taken here so the ring dwell and the round trip
+                        // meet without a gap.
+                        #[cfg(feature = "latency-trace")]
+                        {
+                            let now = melin_transport_core::trace::mono_trace_ns();
+                            rec_publish_to_send.record_elapsed(meta.published_ns, now);
+                            let queue = &mut in_flight[slot_idx];
+                            if queue.len() == TRACE_IN_FLIGHT_CAP {
+                                queue.pop_front();
+                            }
+                            queue.push_back((meta.end_sequence, now));
+                        }
                         batches_sent += 1;
                         bytes_this_tick += data_len;
                         available = available.saturating_sub(data_len);
@@ -1093,9 +1164,26 @@ impl<A: Application> DpdkReplicationDriver<A> {
             }
         }
 
+        // Hand the tracing samples over on the idle cadence the trace
+        // module asks for; a busy tick is not the place to take its lock.
+        #[cfg(feature = "latency-trace")]
+        if self.last_trace_flush.elapsed() >= TRACE_FLUSH_INTERVAL {
+            self.last_trace_flush = std::time::Instant::now();
+            self.rec_publish_to_send.flush();
+            self.rec_send_to_ack.flush();
+        }
+
         any_active
     }
 }
+
+/// Sent batches remembered per slot for the round-trip stage. Deeper than
+/// any ack lag a healthy replica shows; a replica that stops acking loses
+/// its oldest samples rather than growing the queue.
+#[cfg(feature = "latency-trace")]
+const TRACE_IN_FLIGHT_CAP: usize = 8192;
+#[cfg(feature = "latency-trace")]
+const TRACE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// DPDK variant of the replication receiver. Uses a `DpdkTransport` (smoltcp)
 /// to connect to the primary via DPDK instead of kernel TCP.

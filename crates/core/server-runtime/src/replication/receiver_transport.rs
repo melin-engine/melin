@@ -260,6 +260,16 @@ const COMMIT_EVERY: u64 = 16;
 /// iteration, one ack later.
 const MAX_SLOTS_PER_CYCLE: usize = 512;
 
+/// Published batches remembered until an in-memory ack covers them, for
+/// the tracing stages. Deeper than the ack coalescing ever leaves
+/// outstanding; if acks stop, the oldest samples go rather than memory.
+#[cfg(feature = "latency-trace")]
+const TRACE_UNACKED_CAP: usize = 8192;
+/// How often the tracing recorders hand their samples over, from the
+/// loop's idle branch -- the cadence the trace module asks for.
+#[cfg(feature = "latency-trace")]
+const TRACE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Outcome of [`process_streaming_frames`] for one recv-cycle.
 pub(super) struct StreamingFrameOutcome {
     /// Bytes consumed from the recv buffer.
@@ -728,6 +738,29 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);
 
+    // Latency tracing of this replica's side of the round trip: from the
+    // bytes arriving to the batch being published into the input ring,
+    // and from that publish to the in-memory ack that covers it leaving.
+    // The primary measures the whole round trip; the difference is the
+    // wire. `recv_ts` is per receive cycle, so a frame carried over from
+    // an earlier cycle is charged from the cycle that finished it.
+    #[cfg(feature = "latency-trace")]
+    let mut rec_recv_to_publish =
+        melin_transport_core::trace::register_stage("replica: recv → ring publish");
+    #[cfg(feature = "latency-trace")]
+    let mut rec_publish_to_ack =
+        melin_transport_core::trace::register_stage("replica: ring publish → in-memory ack sent");
+    #[cfg(feature = "latency-trace")]
+    let mut rec_recv_to_ack =
+        melin_transport_core::trace::register_stage("replica: recv → in-memory ack sent");
+    #[cfg(feature = "latency-trace")]
+    let mut unacked: std::collections::VecDeque<(u64, u64, u64)> =
+        std::collections::VecDeque::with_capacity(TRACE_UNACKED_CAP);
+    #[cfg(feature = "latency-trace")]
+    let mut cycle_recv_ts = melin_transport_core::trace::mono_trace_ns();
+    #[cfg(feature = "latency-trace")]
+    let mut last_trace_flush = std::time::Instant::now();
+
     // All four cursors seed from the resume point: `accum` anchors the
     // contiguity gate, `last_committed` keeps the in-memory-ack
     // debug_assert honest, and the `last_sent_*` pair suppresses a
@@ -841,6 +874,20 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             );
             match transport.send_ack(&ack) {
                 Ok(true) => {
+                    // The transports flush an accepted ack to the wire
+                    // before returning, so this is the moment it left.
+                    #[cfg(feature = "latency-trace")]
+                    if ack.in_memory_sequence > last_sent_in_memory_seq {
+                        let now = melin_transport_core::trace::mono_trace_ns();
+                        while let Some(&(seq, recv_ts, publish_ts)) = unacked.front() {
+                            if seq > ack.in_memory_sequence {
+                                break;
+                            }
+                            rec_publish_to_ack.record_elapsed(publish_ts, now);
+                            rec_recv_to_ack.record_elapsed(recv_ts, now);
+                            unacked.pop_front();
+                        }
+                    }
                     last_sent_acked_seq = ack.acked_sequence;
                     last_sent_in_memory_seq = ack.in_memory_sequence;
                 }
@@ -854,6 +901,10 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             Ok(d) => d,
             Err(_) => break SessionExit::Disconnected,
         };
+        #[cfg(feature = "latency-trace")]
+        if any_data {
+            cycle_recv_ts = melin_transport_core::trace::mono_trace_ns();
+        }
 
         // Check connection after recv — if disconnected and nothing is
         // left unparsed there's nothing more to process.
@@ -885,6 +936,15 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             journal_failed,
             &mut pending_acks,
         );
+        #[cfg(feature = "latency-trace")]
+        if outcome.accum_end_sequence > accum_end_sequence {
+            let publish_ts = melin_transport_core::trace::mono_trace_ns();
+            rec_recv_to_publish.record_elapsed(cycle_recv_ts, publish_ts);
+            if unacked.len() == TRACE_UNACKED_CAP {
+                unacked.pop_front();
+            }
+            unacked.push_back((outcome.accum_end_sequence, cycle_recv_ts, publish_ts));
+        }
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
         journal_tip.advance(melin_transport_core::WireSeq::new(accum_end_sequence));
@@ -913,6 +973,13 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         // --- Idle wait ---
         if !any_data && !outcome.any_published {
             idle_count += 1;
+            #[cfg(feature = "latency-trace")]
+            if last_trace_flush.elapsed() >= TRACE_FLUSH_INTERVAL {
+                last_trace_flush = std::time::Instant::now();
+                rec_recv_to_publish.flush();
+                rec_publish_to_ack.flush();
+                rec_recv_to_ack.flush();
+            }
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();

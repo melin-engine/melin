@@ -1605,7 +1605,10 @@ impl<E: AppEvent> SequencerCore<E> {
                 if evict_flags[i].load(Ordering::Relaxed) {
                     continue;
                 }
-                if producer.try_publish(bytes, end_seq).is_err() {
+                if producer
+                    .try_publish(bytes, end_seq, crate::trace::mono_trace_raw_ns())
+                    .is_err()
+                {
                     // Ring full — evict immediately. A skipped batch creates
                     // a sequence gap in the replica's journal that can only
                     // be repaired by reconnection + catch-up from journal

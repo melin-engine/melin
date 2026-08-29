@@ -1276,7 +1276,7 @@ mod drain_into_contiguity_tests {
     #[test]
     fn contiguous_first_chunk_forwards_without_refill() {
         let (mut producer, mut consumer) = ring();
-        producer.publish(&frame(&[101, 102]), 102);
+        producer.publish(&frame(&[101, 102]), 102, 0);
 
         let mut sent = super::super::sent::SentHighWater::seed(100, 100);
         let forwarded = RefCell::new(Vec::<u64>::new());
@@ -1318,8 +1318,8 @@ mod drain_into_contiguity_tests {
     #[test]
     fn covered_chunk_is_skipped_then_contiguous_chunk_forwards() {
         let (mut producer, mut consumer) = ring();
-        producer.publish(&frame(&[98, 99]), 99); // covered (<= sent 100)
-        producer.publish(&frame(&[101, 102]), 102);
+        producer.publish(&frame(&[98, 99]), 99, 0); // covered (<= sent 100)
+        producer.publish(&frame(&[101, 102]), 102, 0);
 
         let mut sent = super::super::sent::SentHighWater::seed(100, 100);
         let forwarded = RefCell::new(Vec::<u64>::new());
@@ -1353,7 +1353,7 @@ mod drain_into_contiguity_tests {
     #[test]
     fn gap_backfills_from_disk_then_forwards_the_held_chunk() {
         let (mut producer, mut consumer) = ring();
-        producer.publish(&frame(&[103, 104]), 104); // first=103, gap over 101,102
+        producer.publish(&frame(&[103, 104]), 104, 0); // first=103, gap over 101,102
 
         let mut sent = super::super::sent::SentHighWater::seed(100, 100);
         let forwarded = RefCell::new(Vec::<u64>::new());
@@ -1409,7 +1409,7 @@ mod drain_into_contiguity_tests {
     #[test]
     fn gap_that_never_flushes_times_out_fatally() {
         let (mut producer, mut consumer) = ring();
-        producer.publish(&frame(&[103, 104]), 104);
+        producer.publish(&frame(&[103, 104]), 104, 0);
 
         let mut sent = super::super::sent::SentHighWater::seed(100, 100);
         let forwarded = RefCell::new(Vec::<u64>::new());
@@ -1491,8 +1491,8 @@ mod drain_into_contiguity_tests {
     #[test]
     fn covered_rotate_chunk_is_discarded() {
         let (mut producer, mut consumer) = ring();
-        producer.publish(&rotate_chunk(99), 99); // covered (<= sent 100)
-        producer.publish(&frame(&[101, 102]), 102);
+        producer.publish(&rotate_chunk(99), 99, 0); // covered (<= sent 100)
+        producer.publish(&frame(&[101, 102]), 102, 0);
 
         let mut sent = super::super::sent::SentHighWater::seed(100, 100);
         let forwarded = RefCell::new(Vec::<u64>::new());
@@ -1530,7 +1530,7 @@ mod drain_into_contiguity_tests {
     #[test]
     fn uncovered_rotate_chunk_waits_for_backfill_then_forwards() {
         let (mut producer, mut consumer) = ring();
-        producer.publish(&rotate_chunk(102), 102); // ahead of sent=100
+        producer.publish(&rotate_chunk(102), 102, 0); // ahead of sent=100
 
         let mut sent = super::super::sent::SentHighWater::seed(100, 100);
         #[derive(Debug, PartialEq)]
@@ -1594,7 +1594,7 @@ mod drain_into_contiguity_tests {
     #[test]
     fn boundary_equal_rotate_chunk_is_forwarded() {
         let (mut producer, mut consumer) = ring();
-        producer.publish(&rotate_chunk(100), 100); // exactly at sent=100
+        producer.publish(&rotate_chunk(100), 100, 0); // exactly at sent=100
 
         let mut sent = super::super::sent::SentHighWater::seed(100, 100);
         let forwarded_controls = Cell::new(0usize);
@@ -1636,8 +1636,8 @@ mod drain_into_contiguity_tests {
     #[test]
     fn covered_chunks_then_empty_goes_live() {
         let (mut producer, mut consumer) = ring();
-        producer.publish(&frame(&[98, 99]), 99);
-        producer.publish(&frame(&[100]), 100);
+        producer.publish(&frame(&[98, 99]), 99, 0);
+        producer.publish(&frame(&[100]), 100, 0);
 
         let mut sent = super::super::sent::SentHighWater::seed(100, 100);
         let forwarded = RefCell::new(Vec::<u64>::new());

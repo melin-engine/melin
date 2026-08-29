@@ -14,6 +14,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **Replication round-trip stages** in the `latency-trace` build, on
+  `/stats-dump` of the node that measured them. On the primary: `repl:
+  journal publish → send` (how long a batch sat in the replication ring
+  before the sender's turn came) and `repl: send → in-memory ack` (the
+  round trip to the replica's in-memory ack, wire both ways plus the
+  replica's own time). On a replica: `replica: recv → ring publish`,
+  `replica: ring publish → in-memory ack sent` (the ack cadence) and
+  `replica: recv → in-memory ack sent`. Each side uses its own clock, so
+  nothing is synchronised, and the wire is the primary's round trip
+  less the replica's total. Under `ram` the response stage's
+  `replica-wait` was 43 of the 87 µs measured end to end on a
+  three-node DPDK rig; these say how that divides. The replication ring's
+  slot metadata carries the publish stamp as a plain `u64` (zero when not
+  tracing), so `ReplicationProducer::publish`, `try_publish` and
+  `try_publish_timeout` take one more argument.
+
 - **`--dpdk-repl-port` and `--dpdk-repl-ip`** — replication over a DPDK
   interface of its own, on a thread of its own. The client poll thread
   carries the client's responses *and* the replication stream to every

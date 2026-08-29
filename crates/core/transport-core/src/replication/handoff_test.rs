@@ -148,7 +148,7 @@ fn handoff_must_not_skip_entries_journaled_before_ring_activation() {
     let (mut producer, mut consumers) = build_replication_ring(1, 8);
     let mut chunk = Vec::new();
     encode_input_batch(&[slot(13), slot(14)], &mut chunk);
-    producer.publish(&chunk, 14);
+    producer.publish(&chunk, 14, 0);
     let mut consumer = consumers.pop().expect("ring built with one consumer");
 
     // Phase 4: the handoff — the bridge both senders call. It owns the
@@ -235,7 +235,7 @@ fn bridge_with_no_window_traffic_is_a_plain_drain() {
     let (mut producer, mut consumers) = build_replication_ring(1, 8);
     let mut chunk = Vec::new();
     encode_input_batch(&[slot(11), slot(12)], &mut chunk);
-    producer.publish(&chunk, 12);
+    producer.publish(&chunk, 12, 0);
     let mut consumer = consumers.pop().expect("ring built with one consumer");
 
     let active_flag = AtomicBool::new(false);
