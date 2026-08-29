@@ -765,6 +765,8 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     #[cfg(feature = "latency-trace")]
     let mut rec_poll = melin_transport_core::trace::register_stage("replica loop: poll_recv()");
     #[cfg(feature = "latency-trace")]
+    let mut rec_send_ack = melin_transport_core::trace::register_stage("replica: send_ack()");
+    #[cfg(feature = "latency-trace")]
     let mut iter_start = melin_transport_core::trace::mono_trace_ns();
     #[cfg(feature = "latency-trace")]
     let mut unacked: std::collections::VecDeque<(u64, u64, u64)> =
@@ -892,7 +894,12 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 ack.in_memory_sequence,
                 last_committed_primary_seq,
             );
-            match transport.send_ack(&ack) {
+            #[cfg(feature = "latency-trace")]
+            let ack_start = melin_transport_core::trace::mono_trace_ns();
+            let sent = transport.send_ack(&ack);
+            #[cfg(feature = "latency-trace")]
+            rec_send_ack.record_elapsed(ack_start, melin_transport_core::trace::mono_trace_ns());
+            match sent {
                 Ok(true) => {
                     // The transports flush an accepted ack to the wire
                     // before returning, so this is the moment it left.
@@ -1007,6 +1014,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 rec_recv_to_ack.flush();
                 rec_iter.flush();
                 rec_poll.flush();
+                rec_send_ack.flush();
             }
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);

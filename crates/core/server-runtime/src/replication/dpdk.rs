@@ -348,6 +348,10 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// round trip this side spends before the wire.
     #[cfg(feature = "latency-trace")]
     rec_send_flush: melin_transport_core::trace::StageRecorder,
+    /// A slot's send loop: ring reads, the copy into `send_buf`, the
+    /// queueing -- the tick's own per-batch work before the flush.
+    #[cfg(feature = "latency-trace")]
+    rec_send_loop: melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "latency-trace")]
     last_trace_flush: std::time::Instant,
     // Anchors the `A` type parameter — the struct holds no app-typed
@@ -458,6 +462,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                 "repl: send flush (queue_send → poll returned)",
             ),
             #[cfg(feature = "latency-trace")]
+            rec_send_loop: melin_transport_core::trace::register_stage(
+                "repl: slot send loop (ring read → queued, per slot with data)",
+            ),
+            #[cfg(feature = "latency-trace")]
             last_trace_flush: std::time::Instant::now(),
             _app: PhantomData,
         })
@@ -553,6 +561,8 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let rec_send_to_ack = &mut self.rec_send_to_ack;
         #[cfg(feature = "latency-trace")]
         let rec_send_flush = &mut self.rec_send_flush;
+        #[cfg(feature = "latency-trace")]
+        let rec_send_loop = &mut self.rec_send_loop;
 
         // Check eviction flags from the journal stage.
         for (i, slot) in slots.iter_mut().enumerate() {
@@ -1079,6 +1089,8 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     //    its acked-progress cursor stalls, and the
                     //    response gate freezes the whole exchange. We saw
                     //    this exact symptom on dpdk-dual-repl.
+                    #[cfg(feature = "latency-trace")]
+                    let send_loop_start = melin_transport_core::trace::mono_trace_ns();
                     let max_tx = transport.max_tx_queue_size(handle);
                     let used = transport.tx_queue_bytes(handle);
                     let mut available = max_tx.saturating_sub(used);
@@ -1149,6 +1161,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         available = available.saturating_sub(data_len);
                     }
 
+                    #[cfg(feature = "latency-trace")]
+                    if batches_sent > 0 {
+                        rec_send_loop.record_elapsed(
+                            send_loop_start,
+                            melin_transport_core::trace::mono_trace_ns(),
+                        );
+                    }
                     if !tx_overflow && !slot.send_buf.is_empty() {
                         metrics.bytes_sent[slot_idx]
                             .fetch_add(slot.send_buf.len() as u64, Ordering::Relaxed);
@@ -1226,6 +1245,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             self.rec_publish_to_send.flush();
             self.rec_send_to_ack.flush();
             self.rec_send_flush.flush();
+            self.rec_send_loop.flush();
         }
 
         any_active

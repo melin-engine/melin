@@ -38,6 +38,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the stack at 0.2-1 µs and the driver's `tx_burst` at 0.1 µs for a
   doorbell on its own and ~3 µs for one within a few microseconds of the
   previous, which is what the one-flush-per-tick change below acts on.
+  Three more for the per-batch view at 1M/s: `whole poll (tx queued)`
+  per port (what the phases do not cover: ~1.3-1.6 µs of every poll that
+  carries a packet, on both ends), `repl: slot send loop` (the tick's
+  ring reads, copy and queueing per slot: 0.6 µs, so the copies are not
+  worth removing) and `replica: send_ack()` (2.2 µs, of which the timed
+  phases are 0.5).
 
 - **Replication round-trip stages** in the `latency-trace` build, on
   `/stats-dump` of the node that measured them. On the primary: `repl:

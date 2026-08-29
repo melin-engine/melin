@@ -380,6 +380,9 @@ struct PollTrace {
     /// Not a duration: how many frames each egress `tx_burst` carried,
     /// recorded as a plain count, so a burst's cost can be read per frame.
     egress_tx_frames: melin_transport_core::trace::StageRecorder,
+    /// The whole poll, when it had TX queued: what the phases above do
+    /// not cover is the rest of the poll's own work.
+    total_tx: melin_transport_core::trace::StageRecorder,
     last_flush_ns: u64,
 }
 
@@ -401,6 +404,7 @@ impl PollTrace {
             egress: stage("egress (smoltcp, tx queued)"),
             egress_tx: stage("egress tx_burst"),
             egress_tx_frames: stage("egress tx_burst: frames per burst (a count)"),
+            total_tx: stage("whole poll (tx queued)"),
             last_flush_ns: melin_transport_core::trace::mono_trace_ns(),
         }
     }
@@ -418,6 +422,7 @@ impl PollTrace {
         self.egress.flush();
         self.egress_tx.flush();
         self.egress_tx_frames.flush();
+        self.total_tx.flush();
     }
 }
 
@@ -994,6 +999,13 @@ impl DpdkTransport {
                 self.trace.flush_if_due(t_eg2);
             }
             self.check_listener();
+        }
+
+        #[cfg(feature = "latency-trace")]
+        if has_pending_tx {
+            self.trace
+                .total_tx
+                .record_elapsed(t_rx0, melin_transport_core::trace::mono_trace_ns());
         }
 
         self.cached_timestamp
