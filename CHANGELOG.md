@@ -14,6 +14,23 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib`,
+  `--dpdk-client-tx-queue-kib`**: the per-connection buffering of the
+  client connections a DPDK node accepts, previously fixed at 64 KiB of
+  receive buffer, 16 KiB of send buffer and 64 KiB of queue. The send
+  buffer is the in-flight window, so it caps one connection's response
+  bandwidth at that much per round trip; the queue is the slack behind it
+  before the connection is dropped as fallen behind. The old sizes dropped a
+  single client at a million messages a second on the first round-trip
+  hiccup, with nothing but "the server closed the connection" on the
+  client's side, so the defaults rise: the send buffer to 64 KiB, which
+  carries such a client with headroom, and the queue to 8 MiB, several
+  milliseconds of its hiccups. The receive buffer stays at 64 KiB. A
+  connection driven at the stack's full rate wants a larger send buffer
+  still (256 KiB). Each client connection allocates its send and receive
+  buffers up front, so they multiply by the number of clients; the queue
+  is allocated only while a client is behind, up to the limit.
+
 - **`melin-shm-proxy`** (`crates/tools/melin-shm-proxy`, the `shm-proxy`
   binary) — a sidecar that holds one connection to a node, over kernel TCP
   or, with `--features dpdk`, kernel bypass, and offers it to a client in
@@ -214,6 +231,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **`melin_dpdk::DpdkConfig` has a new field, `client_buffers:
+  SocketBuffers`**, the sizes behind the `--dpdk-client-*-kib` flags.
+  Source-breaking for a `DpdkConfig` built field by field: add it, or end
+  the literal with `..DpdkConfig::default()`. A promoted replica's client
+  listener now takes them too, through `DpdkTransport::add_client_listener`.
 - **`melin_client::Error` has a new variant, `Error::Nic(io::Error)`**,
   for a DPDK NIC that cannot be brought up (EAL initialisation, a missing
   port, the mbuf pool, the port's configuration). Only the `dpdk`
@@ -318,6 +340,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   run; done by hand they were done partly, which is how pipeline threads
   came to start on a core a real-time thread held. Spawn through either
   function instead.
+- **`melin_dpdk::DpdkTransport::add_listener`**. It listened with the
+  client port's fixed sizes, which is how a promoted replica's client port
+  came to ignore the `--dpdk-client-*-kib` flags. Use
+  `add_client_listener` for the client port, and
+  `add_listener_with_buffers` for any other.
 
 ### Fixed
 

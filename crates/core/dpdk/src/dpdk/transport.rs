@@ -14,7 +14,7 @@ use smoltcp::socket::tcp::{self, OpaqueFrameHandle, State};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-use crate::config::NicConfig;
+use crate::config::{NicConfig, SOCKET_RX_BUF_SIZE, SocketBuffers};
 use crate::device::DpdkDevice;
 use crate::eal::Eal;
 use crate::mempool::Mempool;
@@ -84,20 +84,18 @@ fn mbuf_to_handle(mbuf: *mut ffi::rte_mbuf) -> OpaqueFrameHandle {
     OpaqueFrameHandle::from_bytes(bytes)
 }
 
-/// Maximum TX queue size per connection (bytes). If a client falls behind
-/// and the queue exceeds this, the connection is dropped.
+/// Maximum TX queue size per connection (bytes) for a socket opened
+/// without sizes of its own: a dialled stream (`connect_to`, the client
+/// NIC handle's). If the peer falls behind and the queue exceeds this, the
+/// connection is dropped. The client port has its own limit, in
+/// [`SocketBuffers::DEFAULT`].
 const MAX_TX_QUEUE_SIZE: usize = 64 * 1024;
 
-/// smoltcp TCP RX buffer size. Determines the advertised receive window.
-/// 64 KiB provides enough window for pipelined requests (256+ in-flight
-/// messages at ~100 bytes each).
-const SOCKET_RX_BUF_SIZE: usize = 64 * 1024;
-
-/// smoltcp TCP TX buffer size. Controls how much response data queues
-/// per connection before dispatch_burst generates TCP segments. Smaller
-/// values reduce per-socket egress burst size, improving p99 latency
-/// with many connections (fewer segments serialized per egress pass).
-/// 16 KiB ≈ 11 segments at 1500 MTU vs 43 segments with 64 KiB.
+/// smoltcp TCP TX buffer size of a socket opened without sizes of its own
+/// (`connect_to`). Smaller values reduce per-socket egress burst size
+/// (fewer segments serialized per egress pass). 16 KiB ≈ 11 segments at
+/// 1500 MTU vs 43 segments with 64 KiB. The client port has its own, in
+/// [`SocketBuffers::DEFAULT`].
 const SOCKET_TX_BUF_SIZE: usize = 16 * 1024;
 
 /// How often to refresh the smoltcp timestamp (in poll iterations).
@@ -152,7 +150,7 @@ pub struct AcceptedConnection {
     pub peer: std::net::SocketAddr,
     /// The local TCP port the connection was accepted on. With a single
     /// listener this is always the same value (config.listen_port); with
-    /// multiple listeners (added via `DpdkTransport::add_listener`) the
+    /// multiple listeners (added via `DpdkTransport::add_listener_with_buffers`) the
     /// caller uses this to dispatch the connection to the right handler
     /// (e.g. client port → client logic, replication port → replication
     /// state machine).
@@ -257,7 +255,8 @@ pub struct DpdkTransport {
     /// (port, handle) for every TCP listening socket the transport
     /// currently maintains. Initialised with one entry from
     /// `config.listen_port` (none for `from_shared_unlistening`); callers
-    /// can add more via `add_listener`.
+    /// can add more via `add_listener_with_buffers` and
+    /// `add_client_listener`.
     /// `check_listener` iterates this list, accepts any socket that
     /// transitioned to Established, and replaces it with a fresh
     /// listener on the same port — so the slot for that port stays
@@ -498,32 +497,49 @@ impl DpdkTransport {
         config: &DpdkConfig,
         queue_id: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::build(shared, &config.nic, queue_id, Some(config.listen_port))
+        let mut transport = Self::build(shared, &config.nic, queue_id)?;
+        transport.listen_for_clients(config)?;
+        tracing::info!(
+            ip = %config.nic.ip_addr,
+            port = config.listen_port,
+            mac = ?shared.mac,
+            queue_id,
+            rx_buf = config.client_buffers.rx_buf_size,
+            tx_buf = config.client_buffers.tx_buf_size,
+            tx_queue = config.client_buffers.tx_queue_limit,
+            "DPDK transport initialized"
+        );
+        Ok(transport)
     }
 
     /// Like [`Self::from_shared`], but listening on no port: for a
     /// transport that only dials out, such as a replica's link to its
     /// primary. The stack refuses (RST) a connection attempt to any port of
-    /// it. Listeners can be added later with [`Self::add_listener`]: a
-    /// promoted replica adds its client port to the transport it ran on.
+    /// it. Listeners can be added later: a promoted replica adds its client
+    /// port to the transport it ran on with [`Self::add_client_listener`].
     pub fn from_shared_unlistening(
         shared: &Arc<DpdkShared>,
         config: &DpdkConfig,
         queue_id: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::build(shared, &config.nic, queue_id, None)
+        let transport = Self::build(shared, &config.nic, queue_id)?;
+        tracing::info!(
+            ip = %config.nic.ip_addr,
+            mac = ?shared.mac,
+            queue_id,
+            "DPDK transport initialized (no listener)"
+        );
+        Ok(transport)
     }
 
-    /// The constructors' common body: `listen_port` is the port of the
-    /// transport's first listener, with the client buffer sizes, or none.
+    /// The constructors' common body: the interface, listening on nothing.
     /// Takes the NIC's configuration rather than a node's whole
-    /// [`DpdkConfig`]: beyond the listen port passed here, the interface
-    /// and its neighbour seeding need nothing of a node's.
+    /// [`DpdkConfig`]: the interface and its neighbour seeding need nothing
+    /// of a node's.
     fn build(
         shared: &Arc<DpdkShared>,
         config: &NicConfig,
         queue_id: u16,
-        listen_port: Option<u16>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut device = DpdkDevice::new(
             &config.port_ids,
@@ -570,55 +586,15 @@ impl DpdkTransport {
                 .expect("default route capacity");
         }
 
-        let mut sockets = SocketSet::new(Vec::with_capacity(MAX_CONNECTIONS));
-
-        // A `Vec`, as `listeners` is: a transport holds one or two.
-        let mut listeners = Vec::with_capacity(2);
-        if let Some(port) = listen_port {
-            let listen_socket = {
-                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
-                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
-                let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-                tune_socket(&mut socket);
-                socket
-                    .listen(port)
-                    .map_err(|e| format!("TCP listen failed: {e}"))?;
-                socket
-            };
-            listeners.push(ListenerEntry {
-                port,
-                handle: sockets.add(listen_socket),
-                rx_buf_size: SOCKET_RX_BUF_SIZE,
-                tx_buf_size: SOCKET_TX_BUF_SIZE,
-                tx_queue_limit: MAX_TX_QUEUE_SIZE,
-                // Client port: keep the fan-in default so one client's burst
-                // cannot delay its peers within an egress pass.
-                dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
-            });
-        }
-
-        match listen_port {
-            Some(port) => tracing::info!(
-                ip = %config.ip_addr,
-                port,
-                mac = ?shared.mac,
-                queue_id,
-                "DPDK transport initialized"
-            ),
-            None => tracing::info!(
-                ip = %config.ip_addr,
-                mac = ?shared.mac,
-                queue_id,
-                "DPDK transport initialized (no listener)"
-            ),
-        }
+        let sockets = SocketSet::new(Vec::with_capacity(MAX_CONNECTIONS));
 
         let mut transport = DpdkTransport {
             _shared: Arc::clone(shared),
             device,
             iface,
             sockets,
-            listeners,
+            // A `Vec`, as `listeners` is: a transport holds one or two.
+            listeners: Vec::with_capacity(2),
             accepted: Vec::new(),
             // Pre-allocate all MAX_CONNECTIONS slots so index lookup is
             // always in-bounds. Each empty slot is a single discriminant
@@ -1042,23 +1018,14 @@ impl DpdkTransport {
     }
 
     /// Add another TCP port to listen on, sharing the same DPDK NIC and
-    /// smoltcp interface. Returns immediately; the new listener is
-    /// active on the next `poll()`. Used when a single transport handles
-    /// multiple distinct services (e.g. clients on 9876 and replication
-    /// on 9877) without needing separate queues / threads.
-    pub fn add_listener(&mut self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-        self.add_listener_with_buffers(
-            port,
-            SOCKET_RX_BUF_SIZE,
-            SOCKET_TX_BUF_SIZE,
-            MAX_TX_QUEUE_SIZE,
-            tcp::DEFAULT_DISPATCH_BURST_LIMIT,
-        )
-    }
-
-    /// Like `add_listener` but with custom buffer sizes for sockets
-    /// accepted on this port. Used for replication, which needs larger
-    /// TX buffers to keep up with journal batch throughput.
+    /// smoltcp interface, with the given sizes for the sockets accepted on
+    /// it. Returns immediately; the new listener is active on the next
+    /// `poll()`. Used when a single transport handles multiple distinct
+    /// services (clients and replication) without separate queues or
+    /// threads: replication needs larger TX buffers to keep up with journal
+    /// batch throughput. The client port goes through
+    /// [`Self::add_client_listener`] instead, which takes its sizes from the
+    /// node's configuration.
     ///
     /// `dispatch_burst_limit` caps how many data segments a socket accepted
     /// here may dispatch in one egress pass. The stack repeats the pass over
@@ -1067,6 +1034,70 @@ impl DpdkTransport {
     /// single-flow burst cost a pass per few segments. Bulk flows want a value
     /// covering a whole in-flight window in one pass.
     pub fn add_listener_with_buffers(
+        &mut self,
+        port: u16,
+        rx_buf_size: usize,
+        tx_buf_size: usize,
+        tx_queue_limit: usize,
+        dispatch_burst_limit: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.listen_on(
+            port,
+            rx_buf_size,
+            tx_buf_size,
+            tx_queue_limit,
+            dispatch_burst_limit,
+        )?;
+        tracing::info!(port, "DPDK transport: added listener");
+        Ok(())
+    }
+
+    /// Add the node's client listener, on `config.listen_port` with
+    /// `config.client_buffers`: what [`Self::from_shared`] gives a primary
+    /// at boot, for a transport built without it (a replica's, on
+    /// promotion).
+    pub fn add_client_listener(
+        &mut self,
+        config: &DpdkConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.listen_for_clients(config)?;
+        tracing::info!(
+            port = config.listen_port,
+            rx_buf = config.client_buffers.rx_buf_size,
+            tx_buf = config.client_buffers.tx_buf_size,
+            tx_queue = config.client_buffers.tx_queue_limit,
+            "DPDK transport: added client listener"
+        );
+        Ok(())
+    }
+
+    /// The client listener, sized by `config.client_buffers`, for
+    /// [`Self::from_shared`] and [`Self::add_client_listener`] alike, so
+    /// that a promoted replica's clients get what a booted primary's do.
+    fn listen_for_clients(
+        &mut self,
+        config: &DpdkConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let SocketBuffers {
+            rx_buf_size,
+            tx_buf_size,
+            tx_queue_limit,
+        } = config.client_buffers;
+        self.listen_on(
+            config.listen_port,
+            rx_buf_size,
+            tx_buf_size,
+            tx_queue_limit,
+            // Client port: keep the fan-in default so one client's burst
+            // cannot delay its peers within an egress pass.
+            tcp::DEFAULT_DISPATCH_BURST_LIMIT,
+        )
+    }
+
+    /// A listening socket on `port`, whose accepted connections are sized
+    /// as given. The listening socket becomes the accepted connection, so
+    /// it is sized as one; `check_listener` re-listens with the same sizes.
+    fn listen_on(
         &mut self,
         port: u16,
         rx_buf_size: usize,
@@ -1090,7 +1121,6 @@ impl DpdkTransport {
             tx_queue_limit,
             dispatch_burst_limit,
         });
-        tracing::info!(port, "DPDK transport: added listener");
         Ok(())
     }
 
