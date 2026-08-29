@@ -12,6 +12,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Changed
+
+- **A replica serves its health endpoint without control-plane raft.**
+  `--health-bind` (default `127.0.0.1:9878`) now starts the endpoint on a
+  replica whether or not election is enabled; previously a non-raft
+  replica stayed headless, which hid its liveness and, under
+  `latency-trace`, its `/stats-dump` — the only place the replica's half
+  of the replication round trip is visible. The election gauges are
+  absent without raft, as before. A process that runs a primary and a
+  replica on one host now needs distinct binds for the two.
+
 ## [0.15.0] - 2026-08-27
 
 ### Added

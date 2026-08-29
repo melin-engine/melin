@@ -304,15 +304,16 @@ impl Drop for ReplicaHealthGuard {
     }
 }
 
-/// Spawn a minimal health endpoint for a replica so its control-plane
-/// raft election gauges and liveness are observable — a replica
-/// otherwise serves no `/metrics`, which hides election state on exactly
-/// the nodes that survive a failover.
+/// Spawn a minimal health endpoint for a replica so its liveness, its
+/// `/stats-dump` under `latency-trace`, and — when control-plane raft is
+/// enabled — its election gauges are observable. A replica otherwise
+/// serves no `/metrics`, which hides election state on exactly the nodes
+/// that survive a failover, and hides the replica's half of the
+/// replication round trip on exactly the node that measures it.
 ///
-/// Only spawned when control-plane raft is enabled: without raft a
-/// replica stays headless as before, so this doesn't perturb non-raft
-/// deployments. The returned guard is inert when raft is off or no
-/// `--health-bind` is configured.
+/// Spawned whenever `--health-bind` is configured, raft or not; the
+/// election gauges are simply absent without raft. The returned guard is
+/// inert when no bind is configured.
 pub(crate) fn spawn_replica_health(
     config: &ServerConfig,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
@@ -322,9 +323,6 @@ pub(crate) fn spawn_replica_health(
     // OK/ERR status and the `melin_pipeline_healthy` gauge.
     pipeline_healthy: Arc<AtomicBool>,
 ) -> Result<ReplicaHealthGuard, Box<dyn std::error::Error>> {
-    if raft_status.is_none() {
-        return Ok(ReplicaHealthGuard { inner: None });
-    }
     let Some(addr) = config.health_bind else {
         return Ok(ReplicaHealthGuard { inner: None });
     };
@@ -338,7 +336,11 @@ pub(crate) fn spawn_replica_health(
         ),
         Arc::clone(&stop),
     )?;
-    info!(addr = %addr, "replica health endpoint started (election + liveness)");
+    info!(
+        addr = %addr,
+        election = raft_status.is_some(),
+        "replica health endpoint started"
+    );
     Ok(ReplicaHealthGuard {
         inner: Some((handle, stop)),
     })
