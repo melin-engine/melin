@@ -398,9 +398,12 @@ pub struct ServerConfig {
     #[arg(long, default_value = "0", value_delimiter = ',')]
     pub dpdk_ports: Vec<u16>,
 
-    /// IPv4 address for the DPDK interface (e.g., "10.0.0.1").
-    #[arg(long, default_value = "10.0.0.1")]
-    pub dpdk_ip: String,
+    /// IPv4 address for the DPDK interface (e.g., "10.0.0.1"). Giving it is
+    /// what selects the DPDK transport in a build that has one; without it
+    /// the server listens over kernel TCP on `--bind`, whatever it was
+    /// built with.
+    #[arg(long)]
+    pub dpdk_ip: Option<String>,
 
     /// IPv4 prefix length for the DPDK interface. Default: 24.
     #[arg(long, default_value_t = 24)]
@@ -638,7 +641,7 @@ impl Default for ServerConfig {
             dpdk_gateway_mac: None,
             dpdk_peer_mac: None,
             dpdk_ports: vec![0],
-            dpdk_ip: "10.0.0.1".into(),
+            dpdk_ip: None,
             dpdk_prefix_len: 24,
             dpdk_gateway: None,
             dpdk_mtu: 1500,
@@ -884,31 +887,31 @@ where
         crate::process::try_lock_memory();
     }
 
+    // `--dpdk-ip` is what asks for the DPDK transport. A build that has
+    // one and is not given the address serves over the kernel like any
+    // other, rather than initialising the EAL for a NIC nobody named.
     #[cfg(feature = "dpdk")]
-    {
-        run_dpdk(
+    if config.dpdk_ip.is_some() {
+        return run_dpdk(
             config,
             Arc::new(factory),
             Arc::new(decoder),
             Arc::new(encoder),
             event_publisher,
             shutdown,
-        )
+        );
     }
 
-    #[cfg(not(feature = "dpdk"))]
-    {
-        let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
-        run_tcp(
-            listener,
-            config,
-            Arc::new(factory),
-            Arc::new(decoder),
-            Arc::new(encoder),
-            event_publisher,
-            shutdown,
-        )
-    }
+    let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
+    run_tcp(
+        listener,
+        config,
+        Arc::new(factory),
+        Arc::new(decoder),
+        Arc::new(encoder),
+        event_publisher,
+        shutdown,
+    )
 }
 
 /// Run the server with a caller-supplied listener.
@@ -2405,7 +2408,12 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String
             .map(String::from)
             .collect(),
         port_ids: cfg.dpdk_ports.clone(),
-        ip_addr: parse_ip(&cfg.dpdk_ip, "--dpdk-ip")?,
+        ip_addr: parse_ip(
+            cfg.dpdk_ip
+                .as_deref()
+                .ok_or("--dpdk-ip is required to run over DPDK")?,
+            "--dpdk-ip",
+        )?,
         prefix_len: cfg.dpdk_prefix_len,
         gateway: cfg
             .dpdk_gateway
@@ -4302,13 +4310,28 @@ mod tests {
 mod dpdk_config_tests {
     use super::{ServerConfig, dpdk_config_from};
 
+    /// A configuration that asks for DPDK: the address is what does the
+    /// asking, so the default has none.
+    fn with_dpdk() -> ServerConfig {
+        ServerConfig {
+            dpdk_ip: Some("10.0.0.1".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn without_an_address_there_is_no_dpdk_configuration() {
+        let err =
+            dpdk_config_from(&ServerConfig::default()).expect_err("no address, no DPDK transport");
+        assert!(err.contains("--dpdk-ip"), "{err}");
+    }
+
     #[test]
     fn the_client_buffer_defaults_are_the_transports_own() {
         // The flags' defaults are literals in this crate; this pins them to
         // what the transport would have used without the flags, so raising
         // one there is not silently undone here.
-        let cfg = ServerConfig::default();
-        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        let dpdk = dpdk_config_from(&with_dpdk()).expect("valid config");
         assert_eq!(dpdk.client_buffers, melin_dpdk::SocketBuffers::default());
     }
 
@@ -4318,7 +4341,7 @@ mod dpdk_config_tests {
             dpdk_client_rx_buf_kib: 256,
             dpdk_client_tx_buf_kib: 512,
             dpdk_client_tx_queue_kib: 1024,
-            ..Default::default()
+            ..with_dpdk()
         };
         let dpdk = dpdk_config_from(&cfg).expect("valid config");
         assert_eq!(dpdk.client_buffers.rx_buf_size, 256 * 1024);
@@ -4330,7 +4353,7 @@ mod dpdk_config_tests {
     fn a_supplied_peer_mac_reaches_the_transport_config() {
         let cfg = ServerConfig {
             dpdk_peer_mac: Some("0c:42:a1:5b:2e:80".into()),
-            ..Default::default()
+            ..with_dpdk()
         };
         let dpdk = dpdk_config_from(&cfg).expect("valid config");
         assert_eq!(dpdk.peer_mac, Some([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80]));
@@ -4338,8 +4361,7 @@ mod dpdk_config_tests {
 
     #[test]
     fn an_absent_peer_mac_leaves_the_transport_to_derive_one() {
-        let cfg = ServerConfig::default();
-        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        let dpdk = dpdk_config_from(&with_dpdk()).expect("valid config");
         assert_eq!(dpdk.peer_mac, None);
     }
 
@@ -4347,7 +4369,7 @@ mod dpdk_config_tests {
     fn a_malformed_peer_mac_fails_config_translation() {
         let cfg = ServerConfig {
             dpdk_peer_mac: Some("0c:42:a1:5b:2e".into()),
-            ..Default::default()
+            ..with_dpdk()
         };
         let err = dpdk_config_from(&cfg).expect_err("a 5-octet MAC must be rejected");
         assert!(err.contains("--dpdk-peer-mac"), "{err}");
@@ -4359,7 +4381,7 @@ mod dpdk_config_tests {
         // panic out of this function.
         let cfg = ServerConfig {
             dpdk_gateway_mac: Some("not-a-mac".into()),
-            ..Default::default()
+            ..with_dpdk()
         };
         let err = dpdk_config_from(&cfg).expect_err("a non-MAC must be rejected");
         assert!(err.contains("--dpdk-gateway-mac"), "{err}");
@@ -4369,7 +4391,7 @@ mod dpdk_config_tests {
     fn a_malformed_ip_names_the_flag_it_came_from() {
         let cfg = ServerConfig {
             dpdk_peer_ip: Some("10.0.0".into()),
-            ..Default::default()
+            ..with_dpdk()
         };
         let err = dpdk_config_from(&cfg).expect_err("a truncated IPv4 must be rejected");
         assert!(err.contains("--dpdk-peer-ip"), "{err}");
@@ -4380,7 +4402,7 @@ mod dpdk_config_tests {
         let cfg = ServerConfig {
             dpdk_gateway: Some("10.0.0.254".into()),
             dpdk_gateway_mac: Some("0c:42:a1:5b:2e:80".into()),
-            ..Default::default()
+            ..with_dpdk()
         };
         let dpdk = dpdk_config_from(&cfg).expect("valid config");
         assert_eq!(dpdk.gateway_mac, Some([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80]));
