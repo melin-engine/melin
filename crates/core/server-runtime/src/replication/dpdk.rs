@@ -76,6 +76,31 @@ const ACK_RETRY_CAP: u32 = 32;
 /// durability gate.
 pub(crate) const REPL_DISPATCH_BURST: usize = 256;
 
+/// How long a replication socket may hold a pure TCP ACK, at either end.
+///
+/// Under load the ACK never waits this long: the replica answers every
+/// batch with an application ack within a microsecond and the primary
+/// answers every ack with the next batch, and each carries the TCP ACK.
+/// The timer is for the idle connection, where the heartbeat carries it
+/// or this fires; the stack acks every second segment at once regardless,
+/// so a peer's window never waits on it.
+///
+/// Short against the sockets' 1 ms minimum retransmission timeout, and
+/// deliberately so: a delay of the RTO's own size let the last segment
+/// before any lull wait long enough for the peer's RTO to fire, a
+/// spurious retransmit and a collapsed window, which showed as 3-7 ms
+/// maxima at 1M/s on the AWS rig. The stack's clock is microseconds and
+/// refreshed every few polls, so the timer is honoured at about this
+/// resolution.
+///
+/// Without the delay every received segment cost a transmit with nothing
+/// in it, and on that rig a transmit that followed another within a few
+/// microseconds stalled the thread ~3 µs in the driver -- two of them per
+/// event on the primary's replication thread, one per batch on a replica,
+/// all on the ack path. Removing them took 18-20 µs off the median at
+/// both rates.
+pub(crate) const REPL_ACK_DELAY: std::time::Duration = std::time::Duration::from_micros(100);
+
 /// Soft cap on the bytes one replication slot hands to the transport per tick.
 ///
 /// Sized to roughly one in-flight window ([`REPL_DISPATCH_BURST`] segments at
@@ -1391,10 +1416,13 @@ where
             primary_ip,
             primary_port,
             local_port,
-            REPL_RX_BUF,
-            REPL_TX_BUF,
-            REPL_TX_QUEUE,
-            REPL_DISPATCH_BURST,
+            melin_dpdk::SocketBuffers {
+                rx_buf_size: REPL_RX_BUF,
+                tx_buf_size: REPL_TX_BUF,
+                tx_queue_limit: REPL_TX_QUEUE,
+                dispatch_burst_limit: REPL_DISPATCH_BURST,
+                ack_delay: Some(REPL_ACK_DELAY),
+            },
         );
         local_port = local_port.wrapping_add(1).max(40000);
 

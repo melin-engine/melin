@@ -2510,6 +2510,7 @@ fn dpdk_replication_config_from(
         tx_buf_size: REPL_TX_BUF,
         tx_queue_limit: REPL_TX_QUEUE,
         dispatch_burst_limit: crate::replication::REPL_DISPATCH_BURST,
+        ack_delay: Some(crate::replication::REPL_ACK_DELAY),
     };
     Ok(Some(repl))
 }
@@ -3129,10 +3130,13 @@ where
             transports[0]
                 .add_listener_with_buffers(
                     repl_port,
-                    REPL_RX_BUF,
-                    REPL_TX_BUF,
-                    REPL_TX_QUEUE,
-                    crate::replication::REPL_DISPATCH_BURST,
+                    melin_dpdk::SocketBuffers {
+                        rx_buf_size: REPL_RX_BUF,
+                        tx_buf_size: REPL_TX_BUF,
+                        tx_queue_limit: REPL_TX_QUEUE,
+                        dispatch_burst_limit: crate::replication::REPL_DISPATCH_BURST,
+                        ack_delay: Some(crate::replication::REPL_ACK_DELAY),
+                    },
                 )
                 .map_err(|e| format!("add replication listener: {e}"))?;
         }

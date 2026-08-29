@@ -101,6 +101,26 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **Delayed ACK on the DPDK replication sockets**, both ends, 100 µs.
+  Every socket acked every received segment at once; on a replication
+  socket that was a transmit with nothing in it, since the replica's
+  application ack answers each batch within a microsecond and the
+  primary's next batch answers each ack, and either carries the TCP ACK.
+  The timer is for idle; the stack still acks every second segment at
+  once, so a peer's window never waits on it under load. Client-facing
+  sockets keep acking at once (a client's stack may hold a small segment
+  behind Nagle until the ACK). Measured on the AWS rig (c6id.4xlarge,
+  isolated, io2), three runs each: the median fell 18-20 µs at both rates
+  (100K/s 100-105 → 81-85, 1M/s 134-143 → 111-121), the replication
+  round trip 54 → 41 and the ring dwell 6 → 1 µs; with a 1 ms delay the
+  tail beyond p99.9 was worse, at 1M/s badly (3-7 ms maxima), the delay
+  being the size of the sockets' minimum RTO -- hence 100 µs, and the
+  transport's smoltcp clock in microseconds, refreshed every 16 polls
+  rather than in milliseconds every 100, so such a timer is honoured.
+  `SocketBuffers` gains `ack_delay` (`None` by default), and
+  `DpdkTransport::add_listener_with_buffers` and `connect_to_with_buffers`
+  take a `SocketBuffers` in place of four sizes.
+
 - **The DPDK replication sender flushes once per tick, after every slot
   has queued**, rather than once per slot. With two replicas that put
   their batches in two bursts a few microseconds apart, and on the AWS

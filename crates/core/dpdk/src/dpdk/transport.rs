@@ -129,6 +129,19 @@ pub struct SocketBuffers {
     /// low default keeps one client's burst from delaying its peers under
     /// fan-in; a bulk flow wants a whole in-flight window per pass.
     pub dispatch_burst_limit: usize,
+    /// How long the stack may hold a pure ACK for data it received, in
+    /// the hope of carrying it on a segment of its own. `None` acks every
+    /// segment at once, which is the default and what a client-facing
+    /// socket wants: a client's stack may hold a small segment behind
+    /// Nagle until the ACK comes. On a socket whose peer always has a
+    /// segment of its own to send within microseconds -- a replication
+    /// socket, where the application ack answers every batch and the next
+    /// batch answers every ack -- the pure ACK is a transmit with nothing
+    /// in it, and on the AWS rig each transmit that follows another
+    /// closely stalled the thread ~3 µs in the driver. The stack still
+    /// acks every second segment at once, so a peer's window never waits
+    /// on the timer under load; the timer is for idle.
+    pub ack_delay: Option<std::time::Duration>,
 }
 
 impl Default for SocketBuffers {
@@ -138,15 +151,39 @@ impl Default for SocketBuffers {
             tx_buf_size: SOCKET_TX_BUF_SIZE,
             tx_queue_limit: MAX_TX_QUEUE_SIZE,
             dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
+            ack_delay: None,
         }
     }
 }
 
-/// How often to refresh the smoltcp timestamp (in poll iterations).
-/// smoltcp only needs millisecond-precision timestamps for TCP timers
-/// (retransmit, keepalive). Refreshing every 100 iterations at ~1MHz
-/// poll rate gives ~10ms resolution — plenty for TCP timers.
-const TIMESTAMP_REFRESH_INTERVAL: u32 = 100;
+/// The stack's own duration type, from a `std` one. The stack's clock is
+/// refreshed every `TIMESTAMP_REFRESH_INTERVAL` polls, which bounds how
+/// finely a delay is honoured.
+fn stack_duration(duration: std::time::Duration) -> smoltcp::time::Duration {
+    smoltcp::time::Duration::from_micros(duration.as_micros() as u64)
+}
+
+/// How often to refresh the smoltcp timestamp, in poll iterations.
+///
+/// The stack's timers were content with milliseconds (retransmit,
+/// keepalive) until the replication sockets' delayed ACK, which wants a
+/// timer of ~100 µs honoured: the ACK must leave well inside the peer's
+/// 1 ms minimum RTO when nothing carries it. So the clock is microseconds
+/// and refreshed every 16 polls -- one `SystemTime::now` (~20 ns) per
+/// ~3 µs idle, per ~50 µs under load. The egress pass also runs on this
+/// cadence when the transport is otherwise idle, which is where an
+/// expired timer gets its transmit.
+const TIMESTAMP_REFRESH_INTERVAL: u32 = 16;
+
+/// The wall clock as the stack's `Instant`, in microseconds.
+fn stack_now() -> Instant {
+    Instant::from_micros(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is before UNIX epoch")
+            .as_micros() as i64,
+    )
+}
 
 /// How often the statically configured gateway is re-seeded into the
 /// neighbor cache, in milliseconds.
@@ -283,6 +320,9 @@ struct ListenerEntry {
     /// Data segments a socket accepted on this port may dispatch per egress
     /// pass. See [`DpdkTransport::add_listener_with_buffers`].
     dispatch_burst_limit: usize,
+    /// The delayed-ACK setting for sockets accepted on this port; see
+    /// [`SocketBuffers::ack_delay`].
+    ack_delay: Option<std::time::Duration>,
 }
 
 /// Shared DPDK resources created once and shared across all poll threads.
@@ -623,12 +663,7 @@ impl DpdkTransport {
         };
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
         let iface_config = Config::new(hw_addr);
-        let now = Instant::from_millis(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is before UNIX epoch")
-                .as_millis() as i64,
-        );
+        let now = stack_now();
         let mut iface = Interface::new(iface_config, &mut DpdkDeviceRef(&device), now);
 
         let ip = Ipv4Address::new(
@@ -699,6 +734,7 @@ impl DpdkTransport {
                 tx_buf_size: client_buffers.tx_buf_size,
                 tx_queue_limit: client_buffers.tx_queue_limit,
                 dispatch_burst_limit: client_buffers.dispatch_burst_limit,
+                ack_delay: client_buffers.ack_delay,
             }],
             accepted: Vec::new(),
             // Pre-allocate all MAX_CONNECTIONS slots so index lookup is
@@ -757,31 +793,27 @@ impl DpdkTransport {
         remote_port: u16,
         local_port: u16,
     ) -> SocketHandle {
-        self.connect_to_with_buffers(
-            remote_ip,
-            remote_port,
-            local_port,
-            SOCKET_RX_BUF_SIZE,
-            SOCKET_TX_BUF_SIZE,
-            MAX_TX_QUEUE_SIZE,
-            tcp::DEFAULT_DISPATCH_BURST_LIMIT,
-        )
+        self.connect_to_with_buffers(remote_ip, remote_port, local_port, SocketBuffers::default())
     }
 
-    /// Like `connect_to` but with custom buffer sizes, TX queue limit and
-    /// egress burst limit. Used for replication connections that need larger
-    /// RX/TX buffers. See [`Self::add_listener_with_buffers`] for what
-    /// `dispatch_burst_limit` controls.
+    /// Like `connect_to` but with the socket's buffering, egress burst
+    /// limit and delayed-ACK setting given. Used for replication
+    /// connections, which need larger buffers and carry their ACKs on the
+    /// application's own segments. See [`SocketBuffers`].
     pub fn connect_to_with_buffers(
         &mut self,
         remote_ip: std::net::Ipv4Addr,
         remote_port: u16,
         local_port: u16,
-        rx_buf_size: usize,
-        tx_buf_size: usize,
-        tx_queue_limit: usize,
-        dispatch_burst_limit: usize,
+        buffers: SocketBuffers,
     ) -> SocketHandle {
+        let SocketBuffers {
+            rx_buf_size,
+            tx_buf_size,
+            tx_queue_limit,
+            dispatch_burst_limit,
+            ack_delay,
+        } = buffers;
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -789,6 +821,9 @@ impl DpdkTransport {
         socket.set_zero_copy_retain_fn(retain_mbuf);
         socket.set_zero_copy_release_fn(release_mbuf);
         socket.set_dispatch_burst_limit(dispatch_burst_limit);
+        if let Some(delay) = ack_delay {
+            socket.set_ack_delay(Some(stack_duration(delay)));
+        }
 
         let remote_addr = Ipv4Address::new(
             remote_ip.octets()[0],
@@ -845,16 +880,11 @@ impl DpdkTransport {
     /// there was TX queued, and the driver's transmit with its frame
     /// count. Idle polls record nothing.
     pub fn poll(&mut self) -> Instant {
-        // Refresh the smoltcp timestamp periodically, not every poll.
-        // smoltcp only needs ms-precision for TCP retransmit/keepalive timers.
+        // Refresh the smoltcp timestamp periodically, not every poll; see
+        // TIMESTAMP_REFRESH_INTERVAL for the resolution this buys.
         self.poll_count = self.poll_count.wrapping_add(1);
         if self.poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
-            self.cached_timestamp = Instant::from_millis(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock is before UNIX epoch")
-                    .as_millis() as i64,
-            );
+            self.cached_timestamp = stack_now();
         }
 
         // Batch ingress: poll all ports in one pass. MAC learning happens
@@ -1028,6 +1058,7 @@ impl DpdkTransport {
             // the entry instead of crashing.
             // Copied out before the socket borrow so both can be held.
             let dispatch_burst_limit = self.listeners[i].dispatch_burst_limit;
+            let ack_delay = self.listeners[i].ack_delay;
             let Some(accepted_socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) else {
                 tracing::warn!(
                     handle = ?handle,
@@ -1041,6 +1072,9 @@ impl DpdkTransport {
             accepted_socket.set_zero_copy_retain_fn(retain_mbuf);
             accepted_socket.set_zero_copy_release_fn(release_mbuf);
             accepted_socket.set_dispatch_burst_limit(dispatch_burst_limit);
+            if let Some(delay) = ack_delay {
+                accepted_socket.set_ack_delay(Some(stack_duration(delay)));
+            }
 
             // Replace the listener slot in-place so the port stays
             // receptive while the just-accepted handle is moved out
@@ -1085,13 +1119,7 @@ impl DpdkTransport {
     /// multiple distinct services (e.g. trading on 9876 and replication
     /// on 9877) without needing separate queues / threads.
     pub fn add_listener(&mut self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-        self.add_listener_with_buffers(
-            port,
-            SOCKET_RX_BUF_SIZE,
-            SOCKET_TX_BUF_SIZE,
-            MAX_TX_QUEUE_SIZE,
-            tcp::DEFAULT_DISPATCH_BURST_LIMIT,
-        )
+        self.add_listener_with_buffers(port, SocketBuffers::default())
     }
 
     /// Like `add_listener` but with custom buffer sizes for sockets
@@ -1104,14 +1132,21 @@ impl DpdkTransport {
     /// one client from delaying its peers under fan-in) makes a large
     /// single-flow burst cost a pass per few segments. Bulk flows want a value
     /// covering a whole in-flight window in one pass.
+    ///
+    /// `ack_delay` is applied to each socket accepted here; see
+    /// [`SocketBuffers::ack_delay`].
     pub fn add_listener_with_buffers(
         &mut self,
         port: u16,
-        rx_buf_size: usize,
-        tx_buf_size: usize,
-        tx_queue_limit: usize,
-        dispatch_burst_limit: usize,
+        buffers: SocketBuffers,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let SocketBuffers {
+            rx_buf_size,
+            tx_buf_size,
+            tx_queue_limit,
+            dispatch_burst_limit,
+            ack_delay,
+        } = buffers;
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -1127,6 +1162,7 @@ impl DpdkTransport {
             tx_buf_size,
             tx_queue_limit,
             dispatch_burst_limit,
+            ack_delay,
         });
         tracing::info!(port, "DPDK transport: added listener");
         Ok(())
