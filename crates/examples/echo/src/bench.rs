@@ -56,6 +56,8 @@ mod keys;
 #[cfg(any(feature = "dpdk", test))]
 #[path = "bench/arp.rs"]
 mod arp;
+#[path = "bench/auth.rs"]
+mod auth;
 #[cfg(feature = "dpdk")]
 #[path = "bench/dpdk.rs"]
 mod dpdk;
@@ -221,7 +223,7 @@ fn execute<T: Transport>(
         next_seq: 1,
         received: 0,
     };
-    transport::authenticate(&mut transport, key, clock, &mut rx.inbound, AUTH_TIMEOUT)?;
+    auth::authenticate(&mut transport, key, clock, &mut rx.inbound, AUTH_TIMEOUT)?;
     eprintln!("connected to {} over {}", cli.server, transport.name());
 
     let mut frame = RequestFrame::new(cli.message_length)?;
