@@ -14,9 +14,29 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **`--journal-sync <batch|writeback>`** — whether the disk thread
+  `fdatasync`s each batch. `batch` is the default and the previous
+  behaviour. `writeback` writes and never syncs, leaving the device to the
+  kernel's writeback; accepted only under `--ack-policy ram`, whose gate
+  needs no persisted copy, and refused at startup with every other policy.
+  For network-attached volumes, where the per-batch sync is a round trip
+  that no ack waits on under `ram` but every batch pays, backing the
+  journal ring up behind the device; the durability contract becomes that
+  of a replicated log that never syncs. Applies on replicas too; rotation
+  still syncs. Under `writeback` the staging mode defaults to `allocate`:
+  `zero-fill` exists to keep the per-batch sync metadata-free, and without
+  that sync its pre-writes would only spend a segment of bandwidth per
+  rotation. Source-breaking for direct users of the runtime:
+  `melin_transport_core::journal_disk::SyncMode` and a `set_sync_mode` on
+  `JournalStage` and `JournalDisk`, `ServerConfig` gained `journal_sync` and
+  its `journal_staging_mode` became an `Option` resolved by
+  `ServerConfig::staging_mode`, and
+  `melin_server_runtime::replication::run_receiver` / `run_receiver_dpdk`
+  take the mode.
 - **`--journal-staging-mode <zero-fill|allocate>`** — how the background
-  preparer stages the next journal segment. `zero-fill` (the default, and the
-  previous behaviour) pre-writes it so appends never carry extent-conversion
+  preparer stages the next journal segment. `zero-fill` (the default under
+  `--journal-sync batch`, and the previous behaviour) pre-writes it so
+  appends never carry extent-conversion
   metadata; `allocate` only reserves it, trading that back for staging that
   costs no device bandwidth. Aimed at network-attached volumes such as EBS,
   where the pre-write draws from the same metered bandwidth as the hot path

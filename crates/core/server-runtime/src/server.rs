@@ -110,6 +110,44 @@ impl From<JournalStagingMode> for melin_journal::StagingMode {
     }
 }
 
+/// CLI face of [`melin_transport_core::journal_disk::SyncMode`]; a
+/// separate enum for the same reason as [`JournalStagingMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum JournalSyncMode {
+    /// `fdatasync` every batch: a copy the ack policies can count as
+    /// persisted.
+    #[default]
+    Batch,
+    /// Write and never sync; the kernel's writeback reaches the device
+    /// on its own schedule. Only with `--ack-policy ram`.
+    Writeback,
+}
+
+impl From<JournalSyncMode> for melin_transport_core::journal_disk::SyncMode {
+    fn from(m: JournalSyncMode) -> Self {
+        match m {
+            JournalSyncMode::Batch => Self::Batch,
+            JournalSyncMode::Writeback => Self::Writeback,
+        }
+    }
+}
+
+/// `writeback` is only honest under `ram`: every other policy counts a
+/// persisted copy, and without the sync that cursor names nothing that
+/// survived a power loss. Checked at startup so the combination cannot
+/// be deployed by accident.
+fn validate_journal_sync(config: &ServerConfig) -> Result<(), String> {
+    if config.journal_sync == JournalSyncMode::Writeback
+        && config.ack_policy != crate::ack_policy::AckPolicy::Ram
+    {
+        return Err(format!(
+            "--journal-sync writeback requires --ack-policy ram; got `{}` (this policy counts a persisted copy, which writeback does not provide)",
+            config.ack_policy,
+        ));
+    }
+    Ok(())
+}
+
 /// Server configuration, parsed from CLI arguments via clap.
 #[derive(clap::Parser)]
 #[command(name = "melin-server", about = "Low-latency matching engine server")]
@@ -175,21 +213,47 @@ pub struct ServerConfig {
     /// How the background preparer materialises the next journal
     /// segment's extents.
     ///
-    /// - `zero-fill` (default) physically pre-writes the segment, so
-    ///   appends carry no extent-conversion metadata and each flush's
-    ///   `fdatasync` never forces the filesystem log. It costs one extra
-    ///   pass over every segment in device bandwidth.
+    /// - `zero-fill` physically pre-writes the segment, so appends carry
+    ///   no extent-conversion metadata and each flush's `fdatasync`
+    ///   never forces the filesystem log. It costs one extra pass over
+    ///   every segment in device bandwidth.
     /// - `allocate` reserves the extents and stops. Staging becomes
     ///   free, and the periodic log force returns to the flush path.
     ///
-    /// Keep the default on local NVMe, where sequential bandwidth is
-    /// cheap and the log forces are what hurts. Consider `allocate` on
-    /// network-attached storage (EBS and similar), where staging
-    /// bandwidth is metered and drawn from the same budget as the hot
-    /// path — measure both on the volume in question rather than
+    /// Unset, the mode follows `--journal-sync`: `zero-fill` under
+    /// `batch`, `allocate` under `writeback` — with no per-batch sync
+    /// there is no log force to keep off the flush path, and the
+    /// pre-write would only spend a segment of bandwidth on exactly the
+    /// volumes that mode is for.
+    ///
+    /// Under `batch`, keep `zero-fill` on local NVMe, where sequential
+    /// bandwidth is cheap and the log forces are what hurts. Consider
+    /// `allocate` on network-attached storage (EBS and similar), where
+    /// staging bandwidth is metered and drawn from the same budget as
+    /// the hot path — measure both on the volume in question rather than
     /// assuming, since which one wins is a property of the device.
-    #[arg(long, value_enum, default_value_t = JournalStagingMode::ZeroFill)]
-    pub journal_staging_mode: JournalStagingMode,
+    #[arg(long, value_enum)]
+    pub journal_staging_mode: Option<JournalStagingMode>,
+    /// What the journal's disk thread does after writing a batch.
+    ///
+    /// - `batch` (default) `fdatasync`s every batch: a copy the ack
+    ///   policies can count as persisted.
+    /// - `writeback` writes and never syncs; a batch reaches the device
+    ///   when the kernel's writeback gets to it. Accepted only with
+    ///   `--ack-policy ram`, whose gate needs no persisted copy — with
+    ///   any other policy the server refuses to start.
+    ///
+    /// The trade: on storage where the sync is a network round trip
+    /// (EBS and similar) it takes the device off the journal path
+    /// entirely — under `ram` no ack waits on the sync, but every batch
+    /// still pays it, and the journal ring backs up behind it. The
+    /// price is the bound on what a simultaneous loss of every holder
+    /// of an event can cost: the kernel's un-written-back tail rather
+    /// than the last batch — the contract of a replicated log that
+    /// never syncs. Applies on replicas too. Rotation still syncs, and
+    /// `--journal-staging-mode` defaults to `allocate` (see there).
+    #[arg(long, value_enum, default_value_t = JournalSyncMode::Batch)]
+    pub journal_sync: JournalSyncMode,
     /// Maximum number of open orders (resting limits + pending stops, across
     /// all instruments) per account. New submissions are rejected with
     /// `ExceedsMaxOpenOrders` once an account hits this cap. `0` means
@@ -526,7 +590,8 @@ impl Default for ServerConfig {
             instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
-            journal_staging_mode: JournalStagingMode::ZeroFill,
+            journal_staging_mode: None,
+            journal_sync: JournalSyncMode::Batch,
             max_orders_per_account: 10_000,
             max_orders_per_second: 1_000,
             max_orders_burst: 5_000,
@@ -572,6 +637,21 @@ impl ServerConfig {
     /// Group commit delay as a Duration.
     pub fn group_commit_delay(&self) -> std::time::Duration {
         std::time::Duration::from_micros(self.group_commit_us)
+    }
+
+    /// The staging mode in effect: the one given, or the one the sync
+    /// mode implies. `zero-fill` exists to keep the per-batch
+    /// `fdatasync` metadata-free; under `writeback` there is no such
+    /// sync, so a full segment of pre-writes would buy nothing and cost
+    /// a segment of device bandwidth on exactly the volumes that mode
+    /// targets. `allocate` keeps what still matters — the next segment
+    /// reserved ahead of the rotation boundary — for one `fallocate`.
+    pub fn staging_mode(&self) -> melin_journal::StagingMode {
+        match (self.journal_staging_mode, self.journal_sync) {
+            (Some(mode), _) => mode.into(),
+            (None, JournalSyncMode::Batch) => melin_journal::StagingMode::ZeroFill,
+            (None, JournalSyncMode::Writeback) => melin_journal::StagingMode::Allocate,
+        }
     }
 
     /// Heartbeat interval as a Duration. Returns `None` if disabled (0).
@@ -1081,7 +1161,8 @@ where
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
-            config.journal_staging_mode.into(),
+            config.staging_mode(),
+            config.journal_sync.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
@@ -1435,6 +1516,7 @@ where
         )
         .into());
     }
+    validate_journal_sync(config)?;
     // Clone the exchange for the shadow snapshot stage before the pipeline
     // consumes it. Uses snapshot_state() + restore_state() round-trip since
     // `A` doesn't implement Clone (internal data structures are complex).
@@ -1528,7 +1610,8 @@ where
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     journal_stage.set_preparer_core(config.cores.journal_prep);
-    journal_stage.set_staging_mode(config.journal_staging_mode.into());
+    journal_stage.set_staging_mode(config.staging_mode());
+    journal_stage.set_sync_mode(config.journal_sync.into());
     journal_stage.set_disk_core(config.cores.journal_disk);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
@@ -2498,7 +2581,8 @@ where
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
-            config.journal_staging_mode.into(),
+            config.staging_mode(),
+            config.journal_sync.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
@@ -2652,6 +2736,7 @@ where
         )
         .into());
     }
+    validate_journal_sync(&config)?;
 
     // Build disruptor pipeline (same flags as the kernel TCP path).
     // DPDK doesn't currently spawn the publisher thread (see
@@ -2749,7 +2834,8 @@ where
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     journal_stage.set_preparer_core(config.cores.journal_prep);
-    journal_stage.set_staging_mode(config.journal_staging_mode.into());
+    journal_stage.set_staging_mode(config.staging_mode());
+    journal_stage.set_sync_mode(config.journal_sync.into());
     journal_stage.set_disk_core(config.cores.journal_disk);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
@@ -3696,6 +3782,49 @@ fn send_auth_failed(writer: &mut impl std::io::Write) {
 
 #[cfg(test)]
 mod tests {
+    /// `writeback` and a policy that counts a persisted copy is refused;
+    /// the default pairs with everything, and `writeback` with `ram`.
+    #[test]
+    fn writeback_is_accepted_only_under_the_ram_policy() {
+        use super::{JournalSyncMode, ServerConfig, validate_journal_sync};
+        use crate::ack_policy::AckPolicy;
+
+        let mut config = ServerConfig::default();
+        assert!(validate_journal_sync(&config).is_ok(), "default: batch");
+
+        config.journal_sync = JournalSyncMode::Writeback;
+        for policy in [AckPolicy::Disk, AckPolicy::DiskAndRam, AckPolicy::TwoDisks] {
+            config.ack_policy = policy;
+            let err = validate_journal_sync(&config).expect_err("refused");
+            assert!(err.contains("requires --ack-policy ram"), "{err}");
+        }
+        config.ack_policy = AckPolicy::Ram;
+        assert!(validate_journal_sync(&config).is_ok());
+    }
+
+    /// Unset, the staging mode follows the sync mode; set, it is what
+    /// was set, whatever the sync mode.
+    #[test]
+    fn staging_mode_follows_the_sync_mode_unless_set() {
+        use super::{JournalStagingMode, JournalSyncMode, ServerConfig};
+        use melin_journal::StagingMode;
+
+        let mut config = ServerConfig::default();
+        assert!(matches!(config.staging_mode(), StagingMode::ZeroFill));
+
+        config.journal_sync = JournalSyncMode::Writeback;
+        assert!(matches!(config.staging_mode(), StagingMode::Allocate));
+
+        config.journal_staging_mode = Some(JournalStagingMode::ZeroFill);
+        assert!(
+            matches!(config.staging_mode(), StagingMode::ZeroFill),
+            "an explicit choice wins"
+        );
+        config.journal_sync = JournalSyncMode::Batch;
+        config.journal_staging_mode = Some(JournalStagingMode::Allocate);
+        assert!(matches!(config.staging_mode(), StagingMode::Allocate));
+    }
+
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 

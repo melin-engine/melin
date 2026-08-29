@@ -41,7 +41,7 @@ use melin_journal::write_ring::{
     ClaimedChunk, JournalWriteMeta, JournalWriteProducer, build_journal_write_ring,
 };
 
-use crate::journal_disk::{DiskControl, DurabilityCursors, JournalDisk, RotateRequest};
+use crate::journal_disk::{DiskControl, DurabilityCursors, JournalDisk, RotateRequest, SyncMode};
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
 
 use melin_pipeline::padding::Sequence;
@@ -595,6 +595,10 @@ pub struct JournalStage<E: AppEvent> {
     /// [`set_staging_mode`](Self::set_staging_mode) before the stage
     /// runs; defaults to [`StagingMode::ZeroFill`].
     staging_mode: StagingMode,
+    /// Whether the disk thread syncs each drain. Set via
+    /// [`set_sync_mode`](Self::set_sync_mode) before the stage runs;
+    /// defaults to [`SyncMode::Batch`].
+    sync_mode: SyncMode,
     /// Primary-announced stream marks to apply (replica mode only;
     /// `None` on primaries/standalone). Pushed by the replication
     /// receiver, popped here. See [`StreamMark`].
@@ -843,6 +847,7 @@ impl<E: AppEvent> JournalStage<E> {
             preparer: None,
             preparer_core: 0,
             staging_mode: StagingMode::default(),
+            sync_mode: SyncMode::default(),
             stream_marks: None,
             pending_mark: None,
             disk_core: 0,
@@ -957,13 +962,14 @@ impl<E: AppEvent> JournalStage<E> {
             advertised_tip: self.advertised_tip,
             fsync_state: self.chain_hash,
         };
-        let disk = JournalDisk::new(
+        let mut disk = JournalDisk::new(
             segment,
             batch_consumer,
             cursors,
             Arc::clone(&control),
             self.busy_spin,
         );
+        disk.set_sync_mode(self.sync_mode);
         let disk_core = self.disk_core;
 
         // The child's scheduling context must be set HERE, by the
@@ -2373,6 +2379,13 @@ impl<E: AppEvent> JournalStage<E> {
     /// worker keeps the mode it was spawned with.
     pub fn set_staging_mode(&mut self, mode: StagingMode) {
         self.staging_mode = mode;
+    }
+
+    /// Set whether the disk thread syncs each drain. Call before the
+    /// stage runs — the disk thread is handed the mode when it is
+    /// spawned. See [`SyncMode`] for what `Writeback` gives up.
+    pub fn set_sync_mode(&mut self, mode: SyncMode) {
+        self.sync_mode = mode;
     }
 
     /// Test-only probe: whether `enable_preparer` armed the preparer.

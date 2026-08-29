@@ -308,6 +308,29 @@ impl DurabilityCursors {
     }
 }
 
+/// What the disk thread does after writing a batch.
+///
+/// The ack policies count copies, and a `persisted` copy is one that
+/// survived a power loss: a synced write. `Batch` is that. `Writeback`
+/// keeps the write and drops the sync, so a batch is "durable" the
+/// moment the kernel has it and reaches the device when the kernel's
+/// writeback gets to it. It exists for storage where the sync is the
+/// cost — a network-attached volume, where it is a round trip per batch
+/// that no ack waits on under `ram` but every batch pays — and it is
+/// only honest under that policy, whose gate never reads the persisted
+/// cursor. The server refuses it with any other.
+///
+/// Segment rotation and the directory syncs are unaffected: rare, off
+/// the batch path, and what recovery relies on to find the segments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    /// `fdatasync` every drain.
+    #[default]
+    Batch,
+    /// Write, and leave the device to the kernel.
+    Writeback,
+}
+
 /// The disk thread's owned state.
 pub struct JournalDisk {
     segment: SegmentFile,
@@ -317,6 +340,8 @@ pub struct JournalDisk {
     /// When true, never yield to the OS scheduler — spin with PAUSE.
     /// Same discipline as the other pipeline stages.
     busy_spin: bool,
+    /// Whether a drain ends in a sync. See [`SyncMode`].
+    sync_mode: SyncMode,
     /// Test-only failure injection. The failures this path exists for
     /// (EIO, ENOSPC) cannot be provoked portably from a unit test, and
     /// the branch they drive — freeze durability, latch the cause — is
@@ -345,11 +370,19 @@ impl JournalDisk {
             cursors,
             control,
             busy_spin,
+            sync_mode: SyncMode::Batch,
             #[cfg(test)]
             fail_next_sync: None,
             #[cfg(test)]
             panic_next_drain: false,
         }
+    }
+
+    /// Set what follows each drain. Call before [`run`](Self::run); the
+    /// thread reads it on every drain, so a later change would apply,
+    /// but nothing hands the thread a handle to make one.
+    pub fn set_sync_mode(&mut self, mode: SyncMode) {
+        self.sync_mode = mode;
     }
 
     /// Make the next sync fail with `error` (tests only).
@@ -476,7 +509,11 @@ impl JournalDisk {
         // `no-persist`. There is nothing to make durable, so skip the
         // sync — but still publish, because the input-ring slots those
         // events occupy have to be released upstream.
-        if bytes_written > 0 {
+        //
+        // Under `Writeback` the sync is skipped for every batch and the
+        // cursors publish all the same: "durable" then means "the
+        // kernel has it", which is the contract that mode declares.
+        if bytes_written > 0 && self.sync_mode == SyncMode::Batch {
             #[cfg(test)]
             if let Some(injected) = self.fail_next_sync.take() {
                 return Err(injected);
@@ -577,6 +614,41 @@ mod tests {
         let written = std::fs::read(dir.path().join("test.journal")).unwrap();
         let start = 4096; // entries begin past the header
         assert_eq!(&written[start..start + 9], b"alphabeta");
+    }
+
+    /// Under `Writeback` the bytes reach the file and the cursors move
+    /// exactly as under `Batch`, and no sync is issued: a failure
+    /// injected into the sync path never gets the chance to fire.
+    #[test]
+    fn writeback_writes_and_publishes_without_a_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut producer, consumer) = build_journal_write_ring(4);
+        let (cursors, progress, durable) = cursors();
+        let mut disk = JournalDisk::new(
+            segment(dir.path()),
+            consumer,
+            cursors,
+            Arc::new(DiskControl::new()),
+            false,
+        );
+        disk.set_sync_mode(SyncMode::Writeback);
+        disk.inject_sync_failure(JournalError::Io(std::io::Error::other(
+            "a sync that must not happen",
+        )));
+
+        submit(&mut producer, b"gamma", meta(5, 21, 300));
+        assert!(disk.drain_and_sync().unwrap(), "the batch was written");
+        assert!(
+            disk.fail_next_sync.is_some(),
+            "the sync path was never taken"
+        );
+
+        assert_eq!(durable.load(), WireSeq::new(21));
+        assert_eq!(progress.get().load(Ordering::Acquire), 300);
+        assert!(producer.drained(), "slots released on the write");
+
+        let written = std::fs::read(dir.path().join("test.journal")).unwrap();
+        assert_eq!(&written[4096..4096 + 5], b"gamma");
     }
 
     /// A backlog deeper than `MAX_IOV` must still land as one ordered

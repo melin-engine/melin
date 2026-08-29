@@ -21,7 +21,7 @@ exist before the client gets a reply:
 | Policy | Copies required at client ack | Vulnerable to | When to use |
 |---|---|---|---|
 | `disk` | One fsynced copy on PLP-backed NVMe. | Hardware failure of the disk holding that copy. | Dev, staging, single-node deployments. |
-| `ram` | Two copies in memory, on two nodes. Disk writes trail asynchronously — every journal still syncs every batch, just off the ack path. | Simultaneous failure of every node holding the event within the fsync window (typically milliseconds) — the un-synced tail is lost. Any single node failure is fully covered by failover. | Storage where fsync is slow (cloud block volumes) or latency-critical applications that accept a small, bounded RPO. Lowest ack latency of the four policies. |
+| `ram` | Two copies in memory, on two nodes. Disk writes trail asynchronously — every journal still syncs every batch, just off the ack path; with `--journal-sync writeback` it writes without syncing at all. | Simultaneous failure of every node holding the event within the fsync window (typically milliseconds; the kernel's writeback window under `--journal-sync writeback`) — the un-synced tail is lost. Any single node failure is fully covered by failover. | Storage where fsync is slow (cloud block volumes) or latency-critical applications that accept a small, bounded RPO. Lowest ack latency of the four policies. |
 | `disk+ram` *(default)* | One fsynced copy on PLP-backed NVMe **plus** a second copy in another node's memory. | Failure of the disk holding the fsynced copy within ~80 µs of the ack — the window before the other node completes its own fsync. PLP-protected power loss is fully handled. | Typical live-trading deployments. Saves ~50–80 µs per fill vs `two-disks`. |
 | `two-disks` | Two fsynced copies on PLP-backed NVMe, on two nodes. | Simultaneous disk failure on two nodes. | Compliance-driven venues that require two durable copies before client ack. |
 
@@ -81,6 +81,16 @@ The resulting contract:
   had synced yet, typically the final few milliseconds. That window is
   the policy's recovery point objective (RPO), and it is the price of
   taking fsync out of the ack path.
+
+With `--journal-sync writeback` the journals under `ram` stop syncing
+each batch altogether: writes go to the kernel and reach the device on
+its writeback schedule. The contract above holds with one line changed —
+what is lost when every holder of an event goes down at once is the
+kernel's un-written-back tail, not the last batch. That is the contract
+of a replicated log that never syncs, and it is the right one where the
+per-batch sync is a network round trip that no ack waits on but every
+batch pays, on every node. The option is refused under every other
+policy, which all count a persisted copy.
 
 Pick `ram` when that trade is right: deployments whose storage makes
 fsync expensive (cloud block volumes, network-attached disks) — where

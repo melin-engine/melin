@@ -441,6 +441,10 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     // `disk+ram`/`two-disks` it delays the primary's ack gate — so this
     // is not a primary-only tuning knob.
     staging_mode: melin_journal::StagingMode,
+    // Likewise: under `ram` the replica's per-batch sync is what bounds
+    // how fast it drains the primary's ring, so `writeback` has to reach
+    // the replica or the primary is the only node that stops paying it.
+    sync_mode: melin_transport_core::journal_disk::SyncMode,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,
@@ -489,6 +493,7 @@ where
     journal_stage.set_stream_marks(Arc::clone(&stream_marks));
     journal_stage.set_preparer_core(cores.journal_prep);
     journal_stage.set_staging_mode(staging_mode);
+    journal_stage.set_sync_mode(sync_mode);
     journal_stage.set_disk_core(cores.journal_disk);
     let journal_failed = Arc::new(AtomicBool::new(false));
     let journal_failed_latch = Arc::clone(&journal_failed);

@@ -204,6 +204,18 @@ Batches that queue up behind a slow device coalesce further: the disk thread wri
 
 An explicit group commit delay (`group_commit_delay`) can be configured but is set to zero for TCP. Testing showed that any delay hurts TCP throughput because it holds the journal cursor longer, stalling the response stage. It only helps with UDS transport where response sends are near-free.
 
+### Sync Mode
+
+`--journal-sync` selects what follows the write. `batch`, the default, is the `fdatasync` described above. `writeback` skips it: each batch is handed to the kernel and reaches the device whenever the kernel's writeback runs, and the journal's cursors advance on the write rather than on the sync.
+
+It exists for storage where the sync itself is the cost — a network-attached volume, where it is a round trip per batch. Under `ram` no ack waits on that round trip, but every batch still pays it on the disk thread, and once the device falls behind the offered rate the journal ring backs up behind it and the pipeline stalls. `writeback` takes the device off that path entirely.
+
+It is accepted only under `--ack-policy ram`, the one policy whose ack never counts a persisted copy. Every other policy would be naming a copy that no longer exists, and the server refuses to start rather than pretend. What the mode gives up is the bound on the un-synced tail: after a simultaneous loss of every node holding an event, what is lost is whatever the kernel had not yet written back, on its own schedule, rather than the last batch. That is the contract of a replicated log that never syncs, and [replication.md](replication.md) spells it out under `ram`.
+
+Segment rotation still syncs, and so do the directory entries that recovery walks: both are rare, off the batch path, and what makes the segments findable after a crash.
+
+`writeback` also changes what the segment preparer does ahead of a rotation. Its `zero-fill` staging pre-writes the next segment so that the per-batch `fdatasync` never has to commit extent metadata — a full segment of writes spent to keep one sync cheap. With no per-batch sync there is nothing to keep cheap, so under `writeback` the preparer defaults to `allocate`: the segment is reserved ahead of the boundary, as before, but not written. An explicit `--journal-staging-mode` still applies.
+
 ## Crash Recovery
 
 ### What Can Go Wrong
