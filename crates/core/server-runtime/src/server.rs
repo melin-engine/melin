@@ -451,6 +451,28 @@ pub struct ServerConfig {
     #[arg(long)]
     pub dpdk_vlan: Option<u16>,
 
+    /// DPDK port ID of a second interface, for replication alone. With it
+    /// (and `--dpdk-repl-ip`) the replication listener and sender run on a
+    /// thread of their own, pinned by the `repl-handler-0` entry of
+    /// `--cores`, over that port; the client poll thread then carries only
+    /// client traffic. Without it, one thread and one port carry both --
+    /// the right choice on a host with a single interface to spare.
+    ///
+    /// A second *port* rather than a second queue on the same one: the
+    /// earlier two-thread design steered replica flows to a queue by
+    /// destination port and found that steering unreliable on SR-IOV
+    /// virtual functions. An interface of its own needs nothing from the
+    /// NIC's classifier. Replicas dial `--dpdk-repl-ip` on the replication
+    /// port, and on a fabric that assigns MACs itself they are told that
+    /// interface's MAC with `--dpdk-peer-mac`.
+    #[arg(long, requires = "dpdk_repl_ip")]
+    pub dpdk_repl_port: Option<u16>,
+
+    /// IPv4 address of the replication interface named by
+    /// `--dpdk-repl-port`; `--dpdk-prefix-len` applies to it too.
+    #[arg(long, requires = "dpdk_repl_port")]
+    pub dpdk_repl_ip: Option<String>,
+
     /// Receive buffer, in KiB, for each client connection on the DPDK
     /// trading port: the window advertised to the client.
     #[arg(long, default_value_t = DEFAULT_DPDK_CLIENT_RX_BUF_KIB, value_parser = clap::value_parser!(u32).range(1..))]
@@ -649,6 +671,8 @@ impl Default for ServerConfig {
             dpdk_client_rx_buf_kib: DEFAULT_DPDK_CLIENT_RX_BUF_KIB,
             dpdk_client_tx_buf_kib: DEFAULT_DPDK_CLIENT_TX_BUF_KIB,
             dpdk_client_tx_queue_kib: DEFAULT_DPDK_CLIENT_TX_QUEUE_KIB,
+            dpdk_repl_port: None,
+            dpdk_repl_ip: None,
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             admin_bind: None,
@@ -745,6 +769,7 @@ pub struct PipelineCores {
     pub event_publisher: usize,
     pub shadow: usize,
     /// Core for replication handler thread 0. 0 = unpinned (OS scheduled).
+    /// Under DPDK with `--dpdk-repl-port`, the replication poll thread.
     pub repl_handler_0: usize,
     /// Core for replication handler thread 1. 0 = unpinned (OS scheduled).
     pub repl_handler_1: usize,
@@ -2443,9 +2468,61 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String
             rx_buf_size: kib(cfg.dpdk_client_rx_buf_kib),
             tx_buf_size: kib(cfg.dpdk_client_tx_buf_kib),
             tx_queue_limit: kib(cfg.dpdk_client_tx_queue_kib),
+            ..melin_dpdk::SocketBuffers::default()
         },
     })
 }
+
+/// The transport configuration for a replication interface of its own,
+/// when `--dpdk-repl-port` asks for one: the client transport's, over
+/// that port alone, at that address, listening on the replication port
+/// with the replication listener's buffering. `None` when replication
+/// shares the client transport, which is the default.
+///
+/// The primary only accepts on this interface and learns each replica's
+/// MAC from its frames, so no peer MAC is carried over; a gateway is,
+/// for replicas beyond the subnet.
+#[cfg(feature = "dpdk")]
+fn dpdk_replication_config_from(
+    cfg: &ServerConfig,
+    client: &melin_dpdk::DpdkConfig,
+) -> Result<Option<melin_dpdk::DpdkConfig>, String> {
+    let (Some(port_id), Some(ip)) = (cfg.dpdk_repl_port, cfg.dpdk_repl_ip.as_deref()) else {
+        return Ok(None);
+    };
+    if client.port_ids.contains(&port_id) {
+        return Err(format!(
+            "--dpdk-repl-port {port_id} is also a client port (--dpdk-ports); a replication interface of its own must be a different port"
+        ));
+    }
+    let Some(bind) = cfg.replication_bind else {
+        return Err("--dpdk-repl-port needs --replication-bind for the port to listen on".into());
+    };
+    let mut repl = client.clone();
+    repl.port_ids = vec![port_id];
+    repl.ip_addr = ip
+        .parse()
+        .map_err(|e| format!("--dpdk-repl-ip: {ip:?} is not an IPv4 address: {e}"))?;
+    repl.listen_port = bind.port();
+    repl.peer_mac = None;
+    repl.client_buffers = melin_dpdk::SocketBuffers {
+        rx_buf_size: REPL_RX_BUF,
+        tx_buf_size: REPL_TX_BUF,
+        tx_queue_limit: REPL_TX_QUEUE,
+        dispatch_burst_limit: crate::replication::REPL_DISPATCH_BURST,
+    };
+    Ok(Some(repl))
+}
+
+/// The replication listener's buffering. Journal batches run to 100-200
+/// KiB, far past the trading port's window, and a replica is one bulk
+/// flow that wants a whole window per egress pass.
+#[cfg(feature = "dpdk")]
+const REPL_TX_BUF: usize = 512 * 1024;
+#[cfg(feature = "dpdk")]
+const REPL_TX_QUEUE: usize = 512 * 1024;
+#[cfg(feature = "dpdk")]
+const REPL_RX_BUF: usize = 64 * 1024;
 
 #[cfg(feature = "dpdk")]
 fn kib(value: u32) -> usize {
@@ -2475,7 +2552,17 @@ where
     // and primary admin listeners.
     let ack_policy_atomic = Arc::new(AtomicU8::new(config.ack_policy.as_u8()));
     // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
-    let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
+    // The EAL is initialised once per process, so a replication interface
+    // of its own is a second port in the same shared state; the client
+    // transports keep to `dpdk_config`'s ports.
+    let repl_dpdk_config = dpdk_replication_config_from(&config, &dpdk_config)?;
+    let shared = {
+        let mut init_config = dpdk_config.clone();
+        if let Some(repl) = &repl_dpdk_config {
+            init_config.port_ids.extend_from_slice(&repl.port_ids);
+        }
+        melin_dpdk::DpdkShared::init(&init_config)?
+    };
     // Actual queue count may be less than requested (TAP only supports 1).
     let num_dpdk_threads = shared.num_queues as usize;
 
@@ -2985,8 +3072,10 @@ where
     // single client poll thread to drive. The driver's accept dispatch
     // hangs off the second listener we added on the client transport
     // earlier (port == repl_bind.port()).
-    let (repl_driver, repl_listen_port) = if let Some((repl_consumer_1, repl_consumer_2)) =
-        replication_consumers
+    let (repl_driver, repl_listen_port, replication_handle) = if let Some((
+        repl_consumer_1,
+        repl_consumer_2,
+    )) = replication_consumers
     {
         let repl_bind = config
             .replication_bind
@@ -3033,23 +3122,20 @@ where
             });
         let journal_path = config.journal.clone();
 
-        // Add the replication listener to the client transport so the
-        // poll thread accepts both trading and replication connections
-        // off the same queue.
-        // Replication needs larger TX buffers than trading: journal batches
-        // can be 100-200 KiB, far exceeding the 16 KiB client TX buffer.
-        const REPL_TX_BUF: usize = 512 * 1024;
-        const REPL_TX_QUEUE: usize = 512 * 1024;
-        const REPL_RX_BUF: usize = 64 * 1024;
-        transports[0]
-            .add_listener_with_buffers(
-                repl_port,
-                REPL_RX_BUF,
-                REPL_TX_BUF,
-                REPL_TX_QUEUE,
-                crate::replication::REPL_DISPATCH_BURST,
-            )
-            .map_err(|e| format!("add replication listener: {e}"))?;
+        // Without an interface of its own, replication shares the client
+        // transport: the poll thread accepts both trading and replication
+        // connections off the same queue.
+        if repl_dpdk_config.is_none() {
+            transports[0]
+                .add_listener_with_buffers(
+                    repl_port,
+                    REPL_RX_BUF,
+                    REPL_TX_BUF,
+                    REPL_TX_QUEUE,
+                    crate::replication::REPL_DISPATCH_BURST,
+                )
+                .map_err(|e| format!("add replication listener: {e}"))?;
+        }
 
         let driver = crate::replication::DpdkReplicationDriver::new(
             [repl_consumer_1, repl_consumer_2],
@@ -3070,18 +3156,69 @@ where
         // off "DPDK replication sender started" to know the primary
         // is ready to accept replicas. Kept verbatim for backward
         // compatibility with existing bench tooling.
-        info!(addr = %repl_bind, "DPDK replication sender started (single-queue, in client poll thread)");
-        (Some(driver), repl_port)
+        match repl_dpdk_config.clone() {
+            None => {
+                info!(addr = %repl_bind, "DPDK replication sender started (single-queue, in client poll thread)");
+                (Some(driver), repl_port, None)
+            }
+            Some(repl_config) => {
+                // A thread of its own over the replication interface. The
+                // transport is built on the thread that polls it -- it is
+                // not Send -- and startup waits for it, so a port that
+                // cannot come up fails here, with the flag named, rather
+                // than as a primary no replica can reach.
+                let shared = Arc::clone(&shared);
+                let shutdown = Arc::clone(&shutdown);
+                let core = config.cores.repl_handler_0;
+                let busy_spin = !config.yield_idle;
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+                let thread_config = repl_config.clone();
+                let handle = std::thread::Builder::new()
+                    .name("dpdk-repl".into())
+                    .spawn(move || {
+                        melin_app::affinity::pin_thread("dpdk-repl", core);
+                        let mut transport = match melin_dpdk::DpdkTransport::from_shared(
+                            &shared,
+                            &thread_config,
+                            0,
+                        ) {
+                            Ok(transport) => transport,
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(format!(
+                                    "--dpdk-repl-port {:?}: {e}",
+                                    thread_config.port_ids
+                                )));
+                                return;
+                            }
+                        };
+                        // The switch learns this interface's MAC the way it
+                        // learns the client interface's.
+                        transport.send_gratuitous_arp();
+                        let _ = ready_tx.send(Ok(()));
+                        crate::dpdk_transport::run_dpdk_repl_poll::<A>(
+                            transport, driver, repl_port, &shutdown, busy_spin,
+                        );
+                    })
+                    .map_err(|e| format!("spawn dpdk-repl thread: {e}"))?;
+                ready_rx
+                    .recv()
+                    .map_err(|_| "the dpdk-repl thread ended before its transport came up")??;
+                info!(
+                    addr = %repl_bind,
+                    ip = %repl_config.ip_addr,
+                    ports = ?repl_config.port_ids,
+                    core,
+                    "DPDK replication sender started (own interface and thread)"
+                );
+                (None, 0, Some(handle))
+            }
+        }
     } else {
         if !config.standalone && config.replica_of.is_none() {
             info!("running in standalone mode (no replication)");
         }
-        (None, 0)
+        (None, 0, None)
     };
-    // The DPDK replication-sender thread used to be spawned here; with
-    // the single-queue / single-thread refactor the driver lives inside
-    // the client poll thread instead. Nothing to join.
-    let replication_handle: Option<std::thread::JoinHandle<()>> = None;
 
     // Seed through the pipeline if needed.
     //
@@ -4308,7 +4445,10 @@ mod tests {
 /// serving.
 #[cfg(all(test, feature = "dpdk"))]
 mod dpdk_config_tests {
-    use super::{ServerConfig, dpdk_config_from};
+    use super::{
+        REPL_RX_BUF, REPL_TX_BUF, REPL_TX_QUEUE, ServerConfig, dpdk_config_from,
+        dpdk_replication_config_from,
+    };
 
     /// A configuration that asks for DPDK: the address is what does the
     /// asking, so the default has none.
@@ -4317,6 +4457,87 @@ mod dpdk_config_tests {
             dpdk_ip: Some("10.0.0.1".into()),
             ..Default::default()
         }
+    }
+
+    /// ... and for a replication interface of its own.
+    fn with_replication_interface() -> ServerConfig {
+        ServerConfig {
+            dpdk_repl_port: Some(1),
+            dpdk_repl_ip: Some("10.0.1.40".into()),
+            replication_bind: "10.0.0.1:9877".parse().ok(),
+            ..with_dpdk()
+        }
+    }
+
+    #[test]
+    fn replication_shares_the_client_transport_unless_asked() {
+        let cfg = with_dpdk();
+        let client = dpdk_config_from(&cfg).expect("valid config");
+        assert!(
+            dpdk_replication_config_from(&cfg, &client)
+                .expect("valid")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_replication_interface_is_its_own_port_address_listener_and_buffers() {
+        let cfg = with_replication_interface();
+        let client = dpdk_config_from(&cfg).expect("valid config");
+        let repl = dpdk_replication_config_from(&cfg, &client)
+            .expect("valid")
+            .expect("asked for");
+        assert_eq!(repl.port_ids, vec![1]);
+        assert_eq!(
+            repl.ip_addr,
+            "10.0.1.40".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(repl.listen_port, 9877);
+        assert_eq!(repl.peer_mac, None);
+        assert_eq!(repl.client_buffers.rx_buf_size, REPL_RX_BUF);
+        assert_eq!(repl.client_buffers.tx_buf_size, REPL_TX_BUF);
+        assert_eq!(repl.client_buffers.tx_queue_limit, REPL_TX_QUEUE);
+        assert_eq!(
+            repl.client_buffers.dispatch_burst_limit,
+            crate::replication::REPL_DISPATCH_BURST
+        );
+        // Everything else is the client transport's: same fabric.
+        assert_eq!(repl.mtu, client.mtu);
+        assert_eq!(repl.prefix_len, client.prefix_len);
+        assert_eq!(repl.eal_args, client.eal_args);
+    }
+
+    #[test]
+    fn the_replication_port_must_not_be_a_client_port() {
+        let cfg = ServerConfig {
+            dpdk_repl_port: Some(0),
+            ..with_replication_interface()
+        };
+        let client = dpdk_config_from(&cfg).expect("valid config");
+        let err = dpdk_replication_config_from(&cfg, &client).expect_err("shared port refused");
+        assert!(err.contains("--dpdk-repl-port"), "{err}");
+    }
+
+    #[test]
+    fn a_replication_interface_needs_a_replication_bind() {
+        let cfg = ServerConfig {
+            replication_bind: None,
+            ..with_replication_interface()
+        };
+        let client = dpdk_config_from(&cfg).expect("valid config");
+        let err = dpdk_replication_config_from(&cfg, &client).expect_err("no port to listen on");
+        assert!(err.contains("--replication-bind"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_replication_address_names_its_flag() {
+        let cfg = ServerConfig {
+            dpdk_repl_ip: Some("10.0.1".into()),
+            ..with_replication_interface()
+        };
+        let client = dpdk_config_from(&cfg).expect("valid config");
+        let err = dpdk_replication_config_from(&cfg, &client).expect_err("rejected");
+        assert!(err.contains("--dpdk-repl-ip"), "{err}");
     }
 
     #[test]

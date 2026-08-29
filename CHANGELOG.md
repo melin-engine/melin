@@ -14,6 +14,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **`--dpdk-repl-port` and `--dpdk-repl-ip`** — replication over a DPDK
+  interface of its own, on a thread of its own. The client poll thread
+  carries the client's responses *and* the replication stream to every
+  replica, and its cost is per packet: on a three-node AWS rig it
+  saturated at ~420K events/s with the pipeline idle behind it, three
+  quarters of the thread in the NIC driver's transmit path and two thirds
+  of the bytes replication. With the flags, the replication listener and
+  sender run on a `dpdk-repl` thread pinned by the `repl-handler-0` entry
+  of `--cores`, over the named port at the named address; replicas dial
+  that address. Without them nothing changes: one thread and one port, as
+  before, which a host with a single interface to spare still needs. A
+  second port rather than a second RSS queue because the earlier
+  two-thread design steered by destination port and found that unreliable
+  on SR-IOV virtual functions; an interface needs nothing from the NIC's
+  classifier. `melin_dpdk::SocketBuffers` gains `dispatch_burst_limit`,
+  and a transport over one port now presents that port's own MAC
+  (`DpdkShared::mac_of`) rather than the first port's.
+
 - **`shm-proxy`** (echo example) — a process that holds one connection to a
   server, over kernel TCP or, with `--features dpdk`, kernel bypass, and
   offers it to a client in another process through two shared-memory byte

@@ -396,7 +396,7 @@ Each pipeline thread calls `sched_setaffinity` (via `crate::affinity::pin_to_cor
 
 In **kernel TCP mode**, the reader thread is pinned to the `reader` position in `--cores` (default 4). io_uring with multishot RECV multiplexes every client connection on this single thread.
 
-In **DPDK mode**, a single poll thread handles all client connections (one NIC queue, no RSS). It is also pinned to the `reader` core in `--cores`.
+In **DPDK mode**, a single poll thread handles all client connections (one NIC queue, no RSS). It is also pinned to the `reader` core in `--cores`. By default it carries replication too -- the listener, the sender to every replica and their acks -- which makes its per-packet transmit cost the ceiling on a busy primary. With `--dpdk-repl-port` and `--dpdk-repl-ip`, replication moves to a second DPDK interface and a `dpdk-repl` thread of its own, pinned by the `repl-handler-0` entry; a second interface rather than a second queue, because steering replica flows to a queue by port proved unreliable on SR-IOV VFs. Hosts with one interface to spare keep the single thread.
 
 ### Why not async
 

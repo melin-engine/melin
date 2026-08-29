@@ -662,6 +662,46 @@ pub fn run_dpdk_poll<A: Application>(
     }
 }
 
+/// The replication half of a DPDK primary on a thread of its own, over a
+/// transport of its own: accept replicas on the replication port and
+/// drive the driver's slots, and nothing else. The client poll thread
+/// then carries client traffic alone -- see `--dpdk-repl-port` for when
+/// that is worth a second interface.
+///
+/// The loop is the replication part of [`run_dpdk_poll`] lifted out:
+/// poll the NIC and the stack, hand new connections to the driver, tick
+/// it. A connection on any other port is a misdirected client and is
+/// closed. `busy_spin` false yields the core between idle ticks, for a
+/// shared machine; pinned on a core of its own it spins.
+pub fn run_dpdk_repl_poll<A: Application>(
+    mut transport: DpdkTransport,
+    mut driver: crate::replication::DpdkReplicationDriver<A>,
+    repl_listen_port: u16,
+    shutdown: &AtomicBool,
+    busy_spin: bool,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        transport.poll();
+        for accepted in transport.take_accepted() {
+            if accepted.listen_port == repl_listen_port {
+                driver.accept_connection(accepted.peer, accepted.handle, &mut transport);
+            } else {
+                warn!(
+                    peer = %accepted.peer,
+                    port = accepted.listen_port,
+                    "DPDK: connection on the replication interface's non-replication port, closing"
+                );
+                transport.close(accepted.handle);
+            }
+        }
+        let active = driver.tick(&mut transport, shutdown);
+        if !busy_spin && !active {
+            std::thread::yield_now();
+        }
+    }
+    tracing::info!("DPDK replication poll thread stopped");
+}
+
 /// Process the auth handshake frame from a pending connection.
 fn process_auth_frame(
     conn: &mut ConnectionState,

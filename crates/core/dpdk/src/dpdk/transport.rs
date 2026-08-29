@@ -124,6 +124,11 @@ pub struct SocketBuffers {
     /// Response bytes queued behind the socket before the connection is
     /// dropped as fallen behind.
     pub tx_queue_limit: usize,
+    /// Data segments the socket may dispatch in one egress pass. The stack
+    /// repeats the pass over every socket until one sends nothing, so the
+    /// low default keeps one client's burst from delaying its peers under
+    /// fan-in; a bulk flow wants a whole in-flight window per pass.
+    pub dispatch_burst_limit: usize,
 }
 
 impl Default for SocketBuffers {
@@ -132,6 +137,7 @@ impl Default for SocketBuffers {
             rx_buf_size: SOCKET_RX_BUF_SIZE,
             tx_buf_size: SOCKET_TX_BUF_SIZE,
             tx_queue_limit: MAX_TX_QUEUE_SIZE,
+            dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
         }
     }
 }
@@ -292,8 +298,12 @@ pub struct DpdkShared {
     _eal: Eal,
     /// Intersection of all ports' checksum offload capabilities.
     pub offloads: ChecksumOffloads,
-    /// MAC address of the first port (used for all smoltcp interfaces).
+    /// MAC address of the first port: what a transport over the first port,
+    /// or over several, presents.
     pub mac: [u8; 6],
+    /// Every configured port's own MAC, for a transport built over one
+    /// port that is not the first -- a replication interface of its own.
+    port_macs: Vec<(u16, [u8; 6])>,
     /// Raw mempool pointer for DpdkDevice creation. Thread-safe — DPDK
     /// mempools use per-lcore caches for lock-free alloc/free.
     pub mempool_raw: *mut crate::ffi::rte_mempool,
@@ -313,6 +323,9 @@ unsafe impl Sync for DpdkShared {}
 ///
 /// All methods must be called from the owning poll thread.
 pub struct DpdkTransport {
+    /// The interface's own hardware address: the port's, for a transport
+    /// over one port.
+    mac: [u8; 6],
     device: DpdkDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -481,6 +494,12 @@ impl DpdkShared {
         }
         let offloads = combined_offloads.unwrap_or_default();
         let mac = ports[0].mac_addr();
+        let port_macs = config
+            .port_ids
+            .iter()
+            .copied()
+            .zip(ports.iter().map(|p| p.mac_addr()))
+            .collect();
         let mempool_raw = mempool.as_raw();
 
         // Use the actual queue count from the first port (may be less
@@ -493,9 +512,19 @@ impl DpdkShared {
             _eal: eal,
             offloads,
             mac,
+            port_macs,
             mempool_raw,
             num_queues: actual_queues,
         }))
+    }
+
+    /// The MAC of one configured port, or `None` for a port `init` was not
+    /// given.
+    pub fn mac_of(&self, port_id: u16) -> Option<[u8; 6]> {
+        self.port_macs
+            .iter()
+            .find(|(pid, _)| *pid == port_id)
+            .map(|(_, mac)| *mac)
     }
 }
 
@@ -524,7 +553,13 @@ impl DpdkTransport {
             device.set_vlan_id(vlan_id);
         }
 
-        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(shared.mac));
+        // A transport over one port presents that port's own address; over
+        // several (a bond), the first's, as before.
+        let mac = match config.port_ids.as_slice() {
+            [single] => shared.mac_of(*single).unwrap_or(shared.mac),
+            _ => shared.mac,
+        };
+        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
         let iface_config = Config::new(hw_addr);
         let now = Instant::from_millis(
             std::time::SystemTime::now()
@@ -579,16 +614,19 @@ impl DpdkTransport {
         tracing::info!(
             ip = %config.ip_addr,
             port = config.listen_port,
-            mac = ?shared.mac,
+            mac = ?mac,
+            ports = ?config.port_ids,
             queue_id,
             rx_buf = client_buffers.rx_buf_size,
             tx_buf = client_buffers.tx_buf_size,
             tx_queue = client_buffers.tx_queue_limit,
+            dispatch_burst = client_buffers.dispatch_burst_limit,
             "DPDK transport initialized"
         );
 
         let mut transport = DpdkTransport {
             _shared: Arc::clone(shared),
+            mac,
             device,
             iface,
             sockets,
@@ -598,9 +636,7 @@ impl DpdkTransport {
                 rx_buf_size: client_buffers.rx_buf_size,
                 tx_buf_size: client_buffers.tx_buf_size,
                 tx_queue_limit: client_buffers.tx_queue_limit,
-                // Trading port: keep the fan-in default so one client's burst
-                // cannot delay its peers within an egress pass.
-                dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
+                dispatch_burst_limit: client_buffers.dispatch_burst_limit,
             }],
             accepted: Vec::new(),
             // Pre-allocate all MAX_CONNECTIONS slots so index lookup is
@@ -1151,7 +1187,7 @@ impl DpdkTransport {
     ///
     /// Call once after transport initialization.
     pub fn send_gratuitous_arp(&mut self) {
-        let our_mac = self._shared.mac;
+        let our_mac = self.mac;
         let our_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
 
         // Gratuitous ARP: Ethernet broadcast + ARP request where
@@ -1201,7 +1237,7 @@ impl DpdkTransport {
     /// Call this for any peer IP that smoltcp needs to reach (e.g., bench
     /// clients, gateways) when running on an SR-IOV VF.
     pub fn seed_neighbor(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
-        let our_mac = self._shared.mac;
+        let our_mac = self.mac;
         let our_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
 
         // Craft an ARP reply Ethernet frame:
