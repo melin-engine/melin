@@ -39,20 +39,21 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 
-// Shared with echo-bench, whose loop uses every item; this one does not,
-// so the parts it leaves alone are allowed to be dead here.
-#[cfg(feature = "dpdk")]
-#[path = "bench/arp.rs"]
+// A binary's root resolves `mod` against its own directory, so the
+// modules under `proxy/` are named by path. The clock carries a few
+// conversions the loop here has no use for.
+#[cfg(any(feature = "dpdk", test))]
+#[path = "proxy/arp.rs"]
 mod arp;
 #[cfg(feature = "dpdk")]
-#[path = "bench/dpdk.rs"]
+#[path = "proxy/dpdk.rs"]
 mod dpdk;
 #[path = "proxy/shm.rs"]
 mod shm;
-#[path = "bench/transport.rs"]
+#[path = "proxy/transport.rs"]
 mod transport;
 #[allow(dead_code)]
-#[path = "bench/tsc.rs"]
+#[path = "proxy/tsc.rs"]
 mod tsc;
 
 use shm::{SharedMemory, State};

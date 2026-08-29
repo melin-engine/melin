@@ -24,9 +24,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   client keeps its own handshake and clock. Whatever the client has
   written when the loop turns goes out as one segment, so the packet rate
   follows the backlog rather than the message rate. The layout is
-  documented in `crates/examples/echo/src/proxy/shm.rs`; `echo-bench`'s
-  transport modules are shared, and its `authenticate` moved from
-  `bench/transport.rs` to `bench/auth.rs` to make that possible.
+  documented in `crates/examples/echo/src/proxy/shm.rs`.
+
+### Changed
+
+- **`--dpdk-ip` no longer defaults to `10.0.0.1`.** A server built with the
+  `dpdk` feature and started without it now serves over kernel TCP, as a
+  build without the feature does, instead of initialising the EAL and
+  taking over a NIC at an address nobody asked for — which, without root,
+  failed at startup (`Cannot use IOVA as 'PA'`) and, with it, was a
+  surprise. Over DPDK the flag is required. Source-breaking:
+  `ServerConfig::dpdk_ip` is an `Option<String>`.
 
 - **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib`,
   `--dpdk-client-tx-queue-kib`** — the per-connection buffering of the

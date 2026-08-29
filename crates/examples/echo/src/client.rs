@@ -33,7 +33,8 @@ use melin_wire_protocol::control_codec::{
 
 use echo_server::{MAX_PAYLOAD, TAG_ECHO, TAG_RESP_ECHO, TAG_RESP_REJECTED};
 
-// Key loading is shared with `echo-bench`, which sends the same wire.
+// Key loading lives in its own module, where another binary that sends
+// the same wire can share it.
 mod keys;
 use keys::load_key;
 

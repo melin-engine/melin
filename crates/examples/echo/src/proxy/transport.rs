@@ -6,9 +6,8 @@
 //! two -- a userspace TCP stack -- does it. The loop is generic over the
 //! trait, so there is no indirection on the hot path.
 //!
-//! Shared by `echo-bench`, which drives a schedule over it, and
-//! `shm-proxy`, which bridges it to another process's rings; neither
-//! knows which side of the trait it is on.
+//! The proxy bridges either transport to another process's rings and
+//! never looks past the trait.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};

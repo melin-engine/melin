@@ -1,10 +1,10 @@
-//! The same loop over DPDK: TCP in userspace, polled from this thread, on
-//! a NIC the kernel never sees.
+//! The client side over DPDK: TCP in userspace, polled from this thread,
+//! on a NIC the kernel never sees.
 //!
 //! The socket is driven directly -- `send_slice` into it, then the stack
 //! polled and the NIC flushed in the same iteration -- rather than through
-//! the runtime's transport and its queue. A request is on the wire before
-//! the loop turns, which is the point of measuring from here.
+//! the runtime's transport and its queue. Whatever the loop found in the
+//! rings is on the wire before it turns.
 //!
 //! What the client has to know that the kernel would have found out for
 //! it: its own address (`--dpdk-ip`), and the server's MAC. The second is
@@ -117,9 +117,9 @@ impl DpdkTcp {
 
         let mempool = if args.dpdk_mtu > 1500 {
             // u16: the largest MTU any NIC takes fits comfortably.
-            Mempool::create_for_mtu("echo-bench", MBUFS, args.dpdk_mtu as u16, 0)
+            Mempool::create_for_mtu("shm-proxy", MBUFS, args.dpdk_mtu as u16, 0)
         } else {
-            Mempool::create_with_size("echo-bench", MBUFS, 0)
+            Mempool::create_with_size("shm-proxy", MBUFS, 0)
         }
         .map_err(|e| format!("mempool: {e:?}"))?;
 
