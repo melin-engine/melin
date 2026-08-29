@@ -14,6 +14,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib`,
+  `--dpdk-client-tx-queue-kib`** — the per-connection buffering of the
+  sockets accepted on the DPDK trading port, previously fixed at 64 KiB,
+  16 KiB and 64 KiB. The send buffer is the in-flight window, so it caps a
+  single connection's response bandwidth at that much per round trip; the
+  queue is the slack behind it before the connection is dropped as fallen
+  behind. The defaults are unchanged and suit fan-in; a single connection
+  driven at the stack's full rate — a load generator at a million
+  messages a second — reaches the window and is dropped on the first
+  round-trip hiccup, and wants both raised. Source-breaking for direct
+  users of `melin_dpdk::DpdkConfig`, which gains `client_buffers:
+  SocketBuffers`.
+
 - **`--journal-sync <batch|writeback>`** — whether the disk thread
   `fdatasync`s each batch. `batch` is the default and the previous
   behaviour. `writeback` writes and never syncs, leaving the device to the

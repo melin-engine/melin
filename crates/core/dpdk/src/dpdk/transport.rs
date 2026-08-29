@@ -95,6 +95,47 @@ const SOCKET_RX_BUF_SIZE: usize = 64 * 1024;
 /// 16 KiB ≈ 11 segments at 1500 MTU vs 43 segments with 64 KiB.
 const SOCKET_TX_BUF_SIZE: usize = 16 * 1024;
 
+/// Per-connection buffering for the sockets accepted on the trading port.
+///
+/// Together these bound how far one client's responses may run ahead of
+/// what it has acknowledged. `tx_buf_size` is the in-flight window: the
+/// stack cannot have more than this on the wire per round trip, so it
+/// caps a single connection's response bandwidth at `tx_buf_size / RTT`.
+/// `tx_queue_limit` is the slack behind it, in the response stage's queue;
+/// a connection that overruns it is dropped rather than allowed to back
+/// the response stage up into everyone else's path.
+///
+/// The defaults suit fan-in -- many clients, each at a modest rate: a
+/// 16 KiB window is ~330 MB/s at a 50 µs RTT, several times any one
+/// client's share. A single connection driven at the stack's full rate
+/// (a load generator, a bulk client) is a different shape: its
+/// bandwidth-delay product reaches the window and any RTT hiccup grows the
+/// queue past its limit within a few hundred microseconds. Such a listener
+/// wants both raised, an order of magnitude or so; the cost is a larger
+/// egress burst per socket, which is why it is not the default. Buffers
+/// above 64 KiB are advertised through window scaling, which the stack
+/// negotiates on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketBuffers {
+    /// smoltcp RX buffer, and the advertised receive window.
+    pub rx_buf_size: usize,
+    /// smoltcp TX buffer: the in-flight window.
+    pub tx_buf_size: usize,
+    /// Response bytes queued behind the socket before the connection is
+    /// dropped as fallen behind.
+    pub tx_queue_limit: usize,
+}
+
+impl Default for SocketBuffers {
+    fn default() -> Self {
+        SocketBuffers {
+            rx_buf_size: SOCKET_RX_BUF_SIZE,
+            tx_buf_size: SOCKET_TX_BUF_SIZE,
+            tx_queue_limit: MAX_TX_QUEUE_SIZE,
+        }
+    }
+}
+
 /// How often to refresh the smoltcp timestamp (in poll iterations).
 /// smoltcp only needs millisecond-precision timestamps for TCP timers
 /// (retransmit, keepalive). Refreshing every 100 iterations at ~1MHz
@@ -185,6 +226,9 @@ pub struct DpdkConfig {
     /// by a separate thread. When > 1, RSS is enabled on the NIC to
     /// distribute TCP/IP flows across queues. Default: 1.
     pub num_queues: u16,
+    /// Buffering for the sockets accepted on `listen_port`. Listeners added
+    /// later carry their own sizes; see [`DpdkTransport::add_listener_with_buffers`].
+    pub client_buffers: SocketBuffers,
 }
 
 impl Default for DpdkConfig {
@@ -202,6 +246,7 @@ impl Default for DpdkConfig {
             mtu: 1500,
             vlan_id: None,
             num_queues: 1,
+            client_buffers: SocketBuffers::default(),
         }
     }
 }
@@ -516,9 +561,12 @@ impl DpdkTransport {
 
         let mut sockets = SocketSet::new(Vec::with_capacity(MAX_CONNECTIONS));
 
+        // The listening socket becomes the accepted connection, so it is
+        // sized as one; check_listener re-listens with the same sizes.
+        let client_buffers = config.client_buffers;
         let listen_socket = {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; client_buffers.rx_buf_size]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; client_buffers.tx_buf_size]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
             tune_socket(&mut socket);
             socket
@@ -533,6 +581,9 @@ impl DpdkTransport {
             port = config.listen_port,
             mac = ?shared.mac,
             queue_id,
+            rx_buf = client_buffers.rx_buf_size,
+            tx_buf = client_buffers.tx_buf_size,
+            tx_queue = client_buffers.tx_queue_limit,
             "DPDK transport initialized"
         );
 
@@ -544,9 +595,9 @@ impl DpdkTransport {
             listeners: vec![ListenerEntry {
                 port: config.listen_port,
                 handle: listen_handle,
-                rx_buf_size: SOCKET_RX_BUF_SIZE,
-                tx_buf_size: SOCKET_TX_BUF_SIZE,
-                tx_queue_limit: MAX_TX_QUEUE_SIZE,
+                rx_buf_size: client_buffers.rx_buf_size,
+                tx_buf_size: client_buffers.tx_buf_size,
+                tx_queue_limit: client_buffers.tx_queue_limit,
                 // Trading port: keep the fan-in default so one client's burst
                 // cannot delay its peers within an egress pass.
                 dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,

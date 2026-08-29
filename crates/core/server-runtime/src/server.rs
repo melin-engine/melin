@@ -82,6 +82,13 @@ use melin_wire_protocol::transport::BlockingTransportListener;
 /// hiccup rather than to save memory.
 const DEFAULT_REPLICATION_PIPELINE_DEPTH: usize = 256;
 
+/// Defaults of the `--dpdk-client-*-kib` flags: the transport's own sizes,
+/// spelled here as literals because the config struct exists without the
+/// `dpdk` feature. A test under that feature pins them to the transport's.
+const DEFAULT_DPDK_CLIENT_RX_BUF_KIB: u32 = 64;
+const DEFAULT_DPDK_CLIENT_TX_BUF_KIB: u32 = 16;
+const DEFAULT_DPDK_CLIENT_TX_QUEUE_KIB: u32 = 64;
+
 /// CLI spelling of [`melin_journal::StagingMode`].
 ///
 /// A separate enum rather than a `clap::ValueEnum` derive on the journal
@@ -441,6 +448,25 @@ pub struct ServerConfig {
     #[arg(long)]
     pub dpdk_vlan: Option<u16>,
 
+    /// Receive buffer, in KiB, for each client connection on the DPDK
+    /// trading port: the window advertised to the client.
+    #[arg(long, default_value_t = DEFAULT_DPDK_CLIENT_RX_BUF_KIB, value_parser = clap::value_parser!(u32).range(1..))]
+    pub dpdk_client_rx_buf_kib: u32,
+
+    /// Send buffer, in KiB, for each client connection on the DPDK trading
+    /// port: the in-flight window, which caps one connection's response
+    /// bandwidth at this much per round trip. The default suits many
+    /// clients at modest rates; a single connection driven at the stack's
+    /// full rate wants it raised, with `--dpdk-client-tx-queue-kib`, or it
+    /// is dropped as fallen behind on the first round-trip hiccup.
+    #[arg(long, default_value_t = DEFAULT_DPDK_CLIENT_TX_BUF_KIB, value_parser = clap::value_parser!(u32).range(1..))]
+    pub dpdk_client_tx_buf_kib: u32,
+
+    /// Responses, in KiB, that may queue behind a client connection's
+    /// send buffer before the connection is dropped as fallen behind.
+    #[arg(long, default_value_t = DEFAULT_DPDK_CLIENT_TX_QUEUE_KIB, value_parser = clap::value_parser!(u32).range(1..))]
+    pub dpdk_client_tx_queue_kib: u32,
+
     /// Address for the output event publisher. Subscribers connect here
     /// to receive a real-time stream of all execution events (market data,
     /// fills, cancellations). Ed25519 auth required (ReadOnly or above).
@@ -617,6 +643,9 @@ impl Default for ServerConfig {
             dpdk_gateway: None,
             dpdk_mtu: 1500,
             dpdk_vlan: None,
+            dpdk_client_rx_buf_kib: DEFAULT_DPDK_CLIENT_RX_BUF_KIB,
+            dpdk_client_tx_buf_kib: DEFAULT_DPDK_CLIENT_TX_BUF_KIB,
+            dpdk_client_tx_queue_kib: DEFAULT_DPDK_CLIENT_TX_QUEUE_KIB,
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             admin_bind: None,
@@ -2402,7 +2431,17 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String
             .map(|s| parse_mac(s, "--dpdk-peer-mac"))
             .transpose()?,
         num_queues: 1,
+        client_buffers: melin_dpdk::SocketBuffers {
+            rx_buf_size: kib(cfg.dpdk_client_rx_buf_kib),
+            tx_buf_size: kib(cfg.dpdk_client_tx_buf_kib),
+            tx_queue_limit: kib(cfg.dpdk_client_tx_queue_kib),
+        },
     })
+}
+
+#[cfg(feature = "dpdk")]
+fn kib(value: u32) -> usize {
+    value as usize * 1024
 }
 
 #[cfg(feature = "dpdk")]
@@ -4262,6 +4301,30 @@ mod tests {
 #[cfg(all(test, feature = "dpdk"))]
 mod dpdk_config_tests {
     use super::{ServerConfig, dpdk_config_from};
+
+    #[test]
+    fn the_client_buffer_defaults_are_the_transports_own() {
+        // The flags' defaults are literals in this crate; this pins them to
+        // what the transport would have used without the flags, so raising
+        // one there is not silently undone here.
+        let cfg = ServerConfig::default();
+        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        assert_eq!(dpdk.client_buffers, melin_dpdk::SocketBuffers::default());
+    }
+
+    #[test]
+    fn the_client_buffer_flags_are_in_kib() {
+        let cfg = ServerConfig {
+            dpdk_client_rx_buf_kib: 256,
+            dpdk_client_tx_buf_kib: 512,
+            dpdk_client_tx_queue_kib: 1024,
+            ..Default::default()
+        };
+        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        assert_eq!(dpdk.client_buffers.rx_buf_size, 256 * 1024);
+        assert_eq!(dpdk.client_buffers.tx_buf_size, 512 * 1024);
+        assert_eq!(dpdk.client_buffers.tx_queue_limit, 1024 * 1024);
+    }
 
     #[test]
     fn a_supplied_peer_mac_reaches_the_transport_config() {
