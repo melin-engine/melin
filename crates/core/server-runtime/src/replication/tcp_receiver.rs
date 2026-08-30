@@ -2037,4 +2037,211 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------
+    // Boundary adoption under both staging modes — end to end against a
+    // scripted primary. Needs hash-chain (the boundary announce carries
+    // a chain value the replica verifies before rotating) and real
+    // persistence (the rotation archives the on-disk segment).
+    // -----------------------------------------------------------------
+    #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+    mod rotation_adoption {
+        use super::super::super::auth::authenticate_replica;
+        use super::scripted::*;
+        use super::*;
+        use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+        use melin_transport_core::replication::catchup::lineage_origin;
+        use melin_transport_core::replication::protocol::{encode_rotate, encode_stream_start};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        /// Payloads of every entry in the journal at `path`, in order.
+        fn payloads(path: &std::path::Path) -> Vec<u64> {
+            let mut reader = melin_journal::JournalReader::<EvtAdd>::open(path).expect("open");
+            let mut out = Vec::new();
+            while let Some(entry) = reader.next_entry().expect("read entry") {
+                if let JournalEvent::App(EvtAdd(v)) = entry.event {
+                    out.push(v);
+                }
+            }
+            out
+        }
+
+        /// A scripted primary streams two events, announces the rotation
+        /// boundary with the *correct* tail hash, and streams two more.
+        /// The replica must verify the boundary, rotate — adopting the
+        /// segment its preparer staged in `mode` — and keep acking on
+        /// the new segment, leaving the sealed one archived.
+        ///
+        /// Run under both modes: everything observable (archive layout,
+        /// entry placement across the boundary, acks, clean shutdown)
+        /// must be identical, or the staging mode is not a tuning knob
+        /// but a behaviour change.
+        fn boundary_adoption_rotates_and_streams_on(mode: melin_journal::StagingMode) {
+            // Shrink the prealloc chunk so the replica's preparer stages
+            // a few MiB (chunk + margin) instead of 256 MiB per test.
+            // The guard holds a process-wide lock, so the two mode
+            // variants serialise rather than race the global override.
+            let _prealloc_guard =
+                melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            // Scripted primary journal: entries 1..=2 carrying the same
+            // stamps as the InputSlots below (deterministic timestamps,
+            // zero key-hash/request-seq), so its chain value at the
+            // boundary equals the replica's — journals are byte-for-byte
+            // mirrors, and `append`'s wall-clock stamp would fork them.
+            let primary_journal = dir.path().join("primary.journal");
+            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            for v in 1..=2u64 {
+                w.batch_append_with_ts(&JournalEvent::App(EvtAdd(v)), v, 0, 0)
+                    .expect("append");
+            }
+            w.flush_batch_sync().expect("flush");
+            let chain_at_2 = w.chain_hash().expect("chain");
+            drop(w);
+            let (lineage_start, lineage_anchor) =
+                lineage_origin(&primary_journal).expect("lineage");
+
+            let authorized_keys = replica_auth();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+
+            let replica_journal = dir.path().join("replica.journal");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let control = crate::replication::ReplicaControlPlane::new();
+            let replica = {
+                let journal = replica_journal.clone();
+                let snapshot = dir.path().join("replica.snapshot");
+                let shutdown = Arc::clone(&shutdown);
+                let control = control.clone();
+                std::thread::spawn(move || -> Result<bool, String> {
+                    run_receiver::<App>(
+                        addr,
+                        &journal,
+                        &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                        &shutdown,
+                        &control,
+                        3_600_000,
+                        snapshot,
+                        unpinned_cores(),
+                        mode,
+                        Duration::ZERO,
+                        64,
+                        false,
+                        Arc::new(Factory),
+                        Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                    )
+                    // ReceiverResult's error is !Send — stringify for join().
+                    .map(|state| state.is_none())
+                    .map_err(|e| e.to_string())
+                })
+            };
+
+            let mut s1 = accept_within(&listener, 30);
+            let mut s1r = s1.try_clone().expect("clone");
+            authenticate_replica(&mut s1r, &authorized_keys).expect("auth");
+            match read_replica_msg(&mut s1) {
+                ReplicaMessage::Handshake(h) => {
+                    assert_eq!(h.last_sequence, 0, "fresh replica handshake")
+                }
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            let mut buf = Vec::new();
+            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
+            s1.write_all(&buf).expect("StreamStart");
+
+            let send_events = |s: &mut TcpStream, range: std::ops::RangeInclusive<u64>| {
+                let slots: Vec<InputSlot<EvtAdd>> = range
+                    .map(|v| InputSlot {
+                        connection_id: 0,
+                        key_hash: 0,
+                        request_seq: 0,
+                        sequence: v,
+                        timestamp_ns: v,
+                        event: JournalEvent::App(EvtAdd(v)),
+                        // `()` without latency-trace, a timestamp with it.
+                        publish_ts: Default::default(),
+                        recv_ts: Default::default(),
+                    })
+                    .collect();
+                let mut buf = Vec::new();
+                melin_transport_core::replication_wire::encode_input_batch(&slots, &mut buf);
+                s.write_all(&buf).expect("InputBatch");
+            };
+
+            send_events(&mut s1, 1..=2);
+            wait_for_ack(&mut s1, 2);
+
+            // Wait for the preparer's staged segment to reach full size
+            // (the overridden prealloc chunk + the 8 MiB margin) so the
+            // boundary below adopts it rather than racing staging into
+            // the synchronous fallback — adoption is the path under
+            // test. Both modes must produce it; a preparer that never
+            // does is itself a failure.
+            let staging = {
+                // `<live>.next-staging` — the preparer's sibling-file
+                // convention (crate-private, so spelled out here the way
+                // the `.divergent.<n>` archive name is above).
+                let mut s = replica_journal.clone().into_os_string();
+                s.push(".next-staging");
+                std::path::PathBuf::from(s)
+            };
+            let staged_len: u64 = (1 + 8) * 1024 * 1024;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if std::fs::metadata(&staging).is_ok_and(|m| m.len() == staged_len) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "preparer produced no full-size staged segment in {mode:?} mode"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Length is the last thing staging changes before the final
+            // sync and the slot hand-off; give those a moment so the
+            // rotation's `take()` finds the segment parked. (Losing this
+            // race anyway is not a failure: the rotation falls back to
+            // the synchronous path and every assertion below still
+            // holds — the staged segment is then simply adopted at a
+            // later boundary.)
+            std::thread::sleep(Duration::from_millis(300));
+
+            // The boundary, with the correct tail hash — verified
+            // against the replica's own chain, then adopted.
+            buf.clear();
+            encode_rotate(2, &chain_at_2, &mut buf);
+            s1.write_all(&buf).expect("Rotate");
+
+            // Streaming continues on the new segment. The journal stage
+            // holds entries past a pending boundary until the rotation
+            // applies, so this ack proves the adoption completed.
+            send_events(&mut s1, 3..=4);
+            wait_for_ack(&mut s1, 4);
+
+            shutdown.store(true, Ordering::Relaxed);
+            let result = replica.join().expect("replica thread panicked");
+            assert_eq!(result, Ok(true), "receiver must exit cleanly via shutdown");
+
+            // The sealed segment was archived at the first archive slot
+            // holding exactly the pre-boundary entries; the live segment
+            // carries the stream from the boundary on.
+            let archived = dir.path().join("replica.journal.000001");
+            assert!(archived.exists(), "sealed segment must be archived");
+            assert_eq!(payloads(&archived), vec![1, 2]);
+            assert_eq!(payloads(&replica_journal), vec![3, 4]);
+        }
+
+        #[test]
+        fn boundary_adoption_zero_fill() {
+            boundary_adoption_rotates_and_streams_on(melin_journal::StagingMode::ZeroFill);
+        }
+
+        #[test]
+        fn boundary_adoption_allocate() {
+            boundary_adoption_rotates_and_streams_on(melin_journal::StagingMode::Allocate);
+        }
+    }
 }
