@@ -107,6 +107,21 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **The DPDK client poll loop publishes at most four frames per
+  connection per pass** (`FRAMES_PER_PASS`), leaving the rest in the
+  parse buffer for the next pass, so the loop comes round to the NIC --
+  receiving, and draining responses -- every few frames rather than once
+  per burst. `process_client_frames` takes the cap as an argument; the
+  kernel-TCP reader passes no limit. Measured on the AWS rig
+  (c6in.4xlarge, three runs each): a modest, consistent gain -- 100K/s
+  p90 85 → 81-83 µs, p99 92-93 → 91-92; 1M/s p90 143-170 → 135-142, p99
+  289-309 → 283-291, p99.9 391-415 → 384-397 -- and no change at the
+  median at either rate: at 1M/s the poll thread's iteration is set by
+  its own throughput (each poll ~2.3 µs, ~250K polls/s at this cap), so
+  shorter passes cannot shorten the two waits a message pays on that
+  thread any further. A transmit queue of the response thread's own on
+  the client port is what would.
+
 - **Delayed ACK on the DPDK replication sockets**, both ends, 100 µs.
   Every socket acked every received segment at once; on a replication
   socket that was a transmit with nothing in it, since the replica's

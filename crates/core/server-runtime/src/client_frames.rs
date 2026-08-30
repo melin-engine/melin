@@ -44,10 +44,11 @@ pub(crate) enum FrameAction {
 
 /// Extract, decode, and publish client request frames from `parse_buf`.
 ///
-/// Processes every complete length-prefixed frame, decodes each through
-/// `decoder`, and publishes permitted events to the input ring under
-/// batched commits (cap: 16 events per commit to bound consumer
-/// visibility delay). Compacts `parse_buf` on return.
+/// Processes the complete length-prefixed frames, up to `max_frames`
+/// published, decodes each through `decoder`, and publishes permitted
+/// events to the input ring under batched commits (cap: 16 events per
+/// commit to bound consumer visibility delay). Compacts `parse_buf` on
+/// return; frames past the cap stay in it for the next call.
 ///
 /// Returns [`FrameAction`] so the caller can handle transport-specific
 /// side effects (ServerBusy write, transport close, control events).
@@ -70,11 +71,18 @@ pub(crate) fn process_client_frames<E: AppEvent>(
     decoder: &dyn RequestDecoder<Event = E>,
     batch_wall_ns: u64,
     recv_ts: MonoTraceInstant,
+    max_frames: usize,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) -> FrameAction {
     let mut cursor = 0;
     let mut result = FrameAction::Continue;
+    // Frames published this call; `max_frames` bounds it so a caller
+    // that polls a NIC between passes can keep its passes short. What is
+    // left stays in `parse_buf` for the next call, which then stamps it
+    // with that call's `recv_ts` -- later than its true receipt, a bias
+    // in the trace stages only.
+    let mut frames = 0usize;
 
     // Batch publishes into a single Release store on the input ring's
     // producer cursor. Bounded at COMMIT_EVERY to cap consumer-
@@ -83,6 +91,9 @@ pub(crate) fn process_client_frames<E: AppEvent>(
     let mut batch = producer.batch();
 
     while cursor + 4 <= parse_buf.len() {
+        if frames >= max_frames {
+            break;
+        }
         let len_bytes: [u8; 4] = parse_buf[cursor..cursor + 4]
             .try_into()
             .expect("slice is exactly 4 bytes");
@@ -140,6 +151,7 @@ pub(crate) fn process_client_frames<E: AppEvent>(
             result = FrameAction::PipelineFull;
             break;
         }
+        frames += 1;
 
         #[cfg(feature = "latency-trace")]
         {

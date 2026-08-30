@@ -1275,6 +1275,7 @@ fn process_frames<A: Application, R>(
         decoder,
         batch_wall_ns,
         recv_ts,
+        usize::MAX,
         #[cfg(feature = "latency-trace")]
         publish_rec,
         #[cfg(feature = "tick-to-trade")]

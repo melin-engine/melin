@@ -395,6 +395,15 @@ pub fn run_dpdk_poll<A: Application>(
         // responses flowing and the NIC busy without waiting for the
         // full connection iteration to complete.
         const POLL_EVERY_N_CONNS: usize = 4;
+        // Frames one connection may publish per pass before the loop
+        // comes round to the NIC again. With one client at 1M events/s a
+        // pass found ~10 frames and the iteration ran 6 µs at the median,
+        // and every message paid that twice: once in the NIC queue waiting
+        // to be read, once in the response queue waiting for the drain.
+        // The frames a pass leaves in `parse_buf` are the first thing the
+        // next pass takes. The cost is more polls -- and more transmits --
+        // per second on this thread; measured, see the CHANGELOG.
+        const FRAMES_PER_PASS: usize = 4;
 
         // One wall-clock read per outer poll iteration, reused for
         // every request stamped in this pass. Sub-microsecond precision
@@ -588,6 +597,7 @@ pub fn run_dpdk_poll<A: Application>(
                         &*decoder,
                         *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
                         recv_ts,
+                        FRAMES_PER_PASS,
                         #[cfg(feature = "latency-trace")]
                         &mut publish_rec,
                         #[cfg(feature = "tick-to-trade")]
