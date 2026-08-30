@@ -49,6 +49,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   of the replication round trip is visible. The election gauges are
   absent without raft, as before. A process that runs a primary and a
   replica on one host now needs distinct binds for the two.
+- **`--dpdk-eal-args` requires the joined form** (`--dpdk-eal-args="-l 0-7"`).
+  The space-separated form used to accept a value, but a forgotten value made
+  the parser silently take the next flag as the EAL string; now either mistake
+  is a startup error that names the fix. Launch scripts using the space form
+  must add the `=`.
 
 ## [0.15.0] - 2026-08-27
 

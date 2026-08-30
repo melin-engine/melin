@@ -314,9 +314,12 @@ pub struct ServerConfig {
     pub yield_idle: bool,
 
     // --- DPDK configuration (only used with --features dpdk) ---
-    /// DPDK EAL arguments (space-separated). Example: "-l 0-7 --huge-dir /dev/hugepages".
+    /// DPDK EAL arguments (space-separated). Example: --dpdk-eal-args="-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
-    #[arg(long, default_value = "", allow_hyphen_values = true)]
+    /// The `=` is required: the value itself starts with a dash, and requiring
+    /// the joined form keeps a forgotten value from silently swallowing the
+    /// next flag as the EAL string.
+    #[arg(long, default_value = "", require_equals = true)]
     pub dpdk_eal_args: String,
 
     /// DPDK port IDs (comma-separated). For LACP bonds, pass both VF ports
@@ -3707,6 +3710,35 @@ mod tests {
 
     use super::authenticate_connection;
     use super::{BootstrapSource, choose_bootstrap};
+
+    /// `--dpdk-eal-args` takes its value only in the joined form. The
+    /// value itself starts with a dash, and the space form let a
+    /// forgotten value silently swallow the next flag as the EAL
+    /// string; both mistakes must be startup errors instead.
+    #[test]
+    fn dpdk_eal_args_requires_the_joined_form() {
+        use clap::Parser;
+        let cfg = super::ServerConfig::try_parse_from([
+            "melin-server",
+            "--dpdk-eal-args=-l 0-7 --huge-dir /dev/hugepages",
+        ])
+        .expect("joined form must parse");
+        assert_eq!(cfg.dpdk_eal_args, "-l 0-7 --huge-dir /dev/hugepages");
+
+        let space_form =
+            super::ServerConfig::try_parse_from(["melin-server", "--dpdk-eal-args", "-l 0-7"]);
+        assert!(space_form.is_err(), "space-separated form must be rejected");
+
+        let forgotten_value = super::ServerConfig::try_parse_from([
+            "melin-server",
+            "--dpdk-eal-args",
+            "--yield-idle",
+        ]);
+        assert!(
+            forgotten_value.is_err(),
+            "a forgotten value must error, not swallow the next flag"
+        );
+    }
 
     /// The last two `--cores` entries are optional and were added in
     /// that order (journal-prep, then journal-disk). Every explicit
