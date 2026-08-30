@@ -2133,6 +2133,7 @@ mod tests {
                         snapshot,
                         unpinned_cores(),
                         mode,
+                        melin_transport_core::journal_disk::SyncMode::Batch,
                         Duration::ZERO,
                         64,
                         false,
