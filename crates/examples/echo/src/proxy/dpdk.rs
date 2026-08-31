@@ -47,8 +47,12 @@ const CONNECT_TIMEOUT_NS: u64 = 5_000_000_000;
 #[derive(Args)]
 pub struct DpdkArgs {
     /// EAL arguments, space separated, passed straight to `rte_eal_init`.
+    /// The `=` is required, same as the server's flag: the value starts
+    /// with a dash, and requiring the joined form keeps a forgotten value
+    /// from silently swallowing the next flag as the EAL string.
     #[arg(
         long,
+        require_equals = true,
         default_value = "--huge-dir /dev/hugepages --file-prefix echo-bench"
     )]
     pub dpdk_eal_args: String,
