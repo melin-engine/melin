@@ -28,37 +28,23 @@ It is the runtime under a matching engine, a ledger, or any system that must rep
 
 ## Benchmarks
 
-All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), an order-matching engine built on this sequencer. Measured over LAN with four bare-metal AMD EPYC 9275F servers (24C Zen 5, SMT off, Micron 7450 PRO PLP NVMe, Mellanox ConnectX-6 Dx 100 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas). Default ack policy (`disk+ram`): one fsynced copy, two in-memory copies on separate nodes.
+Every figure is a full round trip as the client sees it: the request leaves the client, the primary journals and replicates it, the application executes it, and the response arrives back. The application is [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), an order-matching engine built on this sequencer.
 
-### Kernel TCP
+**Setup.** Four bare-metal AMD EPYC 9275F servers over LAN: one benchmark client, one primary, two replicas. 24-core Zen 5 with SMT off, Micron 7450 PRO NVMe with power-loss protection, Mellanox ConnectX-6 Dx 100 Gb/s. Default ack policy (`disk+ram`): one fsynced copy plus a second copy in another node's memory. For the DPDK rows, the client and all three server nodes run on DPDK kernel bypass. Measured August 2026.
 
-**Under load.** Four connections, 32 requests in flight each.
+**Under load.** 1M events/s over four connections. In flight is per connection: the queue depth each transport needs to sustain the rate.
 
-| Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 |
-|-----------|-----|-----|-------|--------|---------|
-| 1M/s | 100 µs | 245 µs | 299 µs | 346 µs | 395 µs |
+| Transport | In flight | p50 | p99 | p99.9 | p99.99 | p99.999 |
+|-----------|-----------|-----|-----|-------|--------|---------|
+| Kernel TCP | 32 | 100 µs | 245 µs | 299 µs | 346 µs | 395 µs |
+| DPDK kernel bypass | 8 | 28 µs | 40 µs | 61 µs | 76 µs | 87 µs |
 
-**Single event.** 1 client, window 1.
+**Single event.** One client, one request in flight. The rate is what the closed loop sustains at that latency.
 
-| Throughput | p50 | p99 | p99.9 | p99.99 |
-|-----------|-----|-----|-------|--------|
-| 25K/s | 38 µs | 62 µs | 73 µs | 104 µs |
-
-### DPDK kernel bypass (experimental)
-
-The same workload with the client and all three server nodes on DPDK kernel bypass.
-
-**Under load.** Four connections, 8 requests in flight each.
-
-| Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 |
-|-----------|-----|-----|-------|--------|---------|
-| 1M/s | 28 µs | 40 µs | 61 µs | 76 µs | 87 µs |
-
-**Single event.** 1 client, window 1.
-
-| Throughput | p50 | p99 | p99.9 | p99.99 |
-|-----------|-----|-----|-------|--------|
-| 48K/s | 20 µs | 45 µs | 47 µs | 49 µs |
+| Transport | Rate | p50 | p99 | p99.9 | p99.99 |
+|-----------|------|-----|-----|-------|--------|
+| Kernel TCP | 25K/s | 38 µs | 62 µs | 73 µs | 104 µs |
+| DPDK kernel bypass | 48K/s | 20 µs | 45 µs | 47 µs | 49 µs |
 
 The benchmark harness and tuning guidance ship with the Melin Exchange Core.
 
