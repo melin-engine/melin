@@ -14,11 +14,15 @@ It is the runtime under a matching engine, a ledger, or any system that must rep
 
 ## Features
 
-**Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application inherits it as long as its logic stays pure.
+**Nothing is acknowledged before it is safe.** Every event is journaled and synchronously replicated before the client sees a response. The ack policy chooses what "safe" means. By default (`disk+ram`) it is one fsynced copy plus a second copy in another node's memory, so a slow disk or a dead node costs neither latency nor data. A stricter `two-disks` policy and a faster `ram` policy are available. See [replication](docs/replication.md).
 
-**Durable and replicated.** Every event is journaled and synchronously replicated before the client sees a response, with CRC32C integrity checks and a BLAKE3 hash chain that detects a node whose journal has diverged from the cluster's (an ex-primary rejoining with events it never replicated is resynced, not streamed onto) and doubles as tamper evidence. The ack policy says which copies of an event must exist before its response is released. By default (`disk+ram`) an ack requires one fsynced copy and two in-memory copies on separate nodes, so a single slow disk or a single node failure costs neither latency nor data; a stricter `two-disks` policy and a faster `ram` policy (two in-memory copies on separate nodes, no fsync on the ack path) are available. Journal catch-up, snapshot transfer, and automatic failover are built in. See [replication](docs/replication.md).
+**Fast.** p99 of 245 µs at 1M events/sec on kernel TCP, and 40 µs with DPDK kernel bypass, full round trip including persistence and replication on commodity datacenter hardware. See [Benchmarks](#benchmarks).
 
-**Fast.** p99 of 245 µs at 1M events/sec on kernel TCP, and 40 µs with DPDK kernel bypass, full round trip including persistence and replication on commodity datacenter hardware. Single-event latency floor: 62 µs p99 on kernel TCP, 45 µs with DPDK. See [Benchmarks](#benchmarks).
+**Deterministic replay.** Given the same journal, the application reaches the same state and emits the same output, on every node and after every restart. Melin supplies the total order and the timestamps, so your logic never reads a clock. Keeping it pure is the only rule left to you.
+
+**Tamper-evident history.** Per-entry CRC32C catches corruption. A BLAKE3 hash chain across segments catches rewrites, missing or foreign segments, and a node whose journal disagrees with the cluster's. See [journal](docs/journal.md).
+
+**Failover built in.** A raft control plane, off the hot path, elects the primary and promotes a replica when it fails. Journal catch-up and snapshot transfer bring a rejoining node back to the head of the log.
 
 **Tested for the failures that matter.** Every commit runs the full suite, including crash-recovery and three-node failover tests. Nightly, the suite runs again under ThreadSanitizer, the lock-free core runs under Miri across multiple scheduler seeds, and dependencies are checked against the RUSTSEC advisory database.
 
