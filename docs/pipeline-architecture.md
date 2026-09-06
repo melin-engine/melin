@@ -20,7 +20,7 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
                                               |  +--> Event Publisher --> Subscribers
                                               |       (optional, --event-bind)
                                               +----> Shadow Stage --> Snapshots
-                                                     (optional, gated on journal)
+                                                     (gated on journal)
 ```
 
 1. **Reader** -- a single thread multiplexes every TCP client connection and publishes decoded requests into the input disruptor. The same thread also generates the engine's scheduler ticks at the configured cadence (**default 250 ms**). With this, the input ring is single-producer in steady state on both transports.
@@ -31,7 +31,7 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
 4. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
 5. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
 6. **Event publisher** (optional) -- second consumer on the output ring, enabled by `--event-bind`. Broadcasts all execution events to TCP subscribers for market data gateways, analytics, and audit loggers. Ed25519 auth required.
-7. **Shadow stage** (optional) -- third consumer on the input ring, gated on the journal cursor. Periodically saves an exchange snapshot on a dedicated thread without pausing the matching engine.
+7. **Shadow stage** -- third consumer on the input ring, gated on the journal cursor. Periodically saves an exchange snapshot on a dedicated thread without pausing the matching engine. On by default; `--snapshot-interval-ms 0` disables it.
 
 **Why this design**: Single-threaded business logic (the matching stage) eliminates locks on the hot path. Parallelizing journal I/O with matching hides fsync latency. The persist-before-ack boundary is enforced at the response stage, not in the matching stage, so the engine never stalls waiting for disk.
 
@@ -65,7 +65,7 @@ The simplified diagram above shows the primary-side request path. The picture be
      |             |                |
      v             v                v (gated on journal)
  +-------+    +---------+     +-----------+
- |JOURNAL|    |MATCHING |     |  SHADOW   | (optional)
+ |JOURNAL|    |MATCHING |     |  SHADOW   |
  | STAGE |    |  STAGE  |     |  STAGE    |
  +-+--+--+    +---+-----+     +-----+-----+
    |  |           |                 |
@@ -128,7 +128,7 @@ The simplified diagram above shows the primary-side request path. The picture be
      |              |               |
      v              v               v (gated on journal)
  +-------+    +---------+     +-----------+
- |JOURNAL|    |MATCHING |     |  SHADOW   | (optional)
+ |JOURNAL|    |MATCHING |     |  SHADOW   |
  | STAGE |    |  STAGE  |     |  STAGE    |
  +---+---+    +----+----+     +-----+-----+
      |             |                |
@@ -154,7 +154,7 @@ The simplified diagram above shows the primary-side request path. The picture be
 | Seed loop (primary, boot)  | Config (`--accounts`, `--instruments`)  | `AddInstrument` / `ProvisionAccount` into input ring  |
 | Journal stage              | Input ring                              | Journal file; batch bytes into each replication ring  |
 | Matching stage             | Input ring                              | Execution reports into output ring                    |
-| Shadow stage (opt)         | Input ring (gated on journal)           | Periodic `.snapshot` files                            |
+| Shadow stage               | Input ring (gated on journal)           | Periodic `.snapshot` files                            |
 | Response stage (primary)   | Output ring (gated on journal cursor)   | Client TCP                                            |
 | Event publisher (opt)      | Output ring                             | Subscriber TCP (market data feed)                     |
 | Replication sender         | Replication ring                        | Replica TCP                                           |
@@ -192,7 +192,7 @@ The `MultiProducer` is `Clone + Send + Sync` -- each reader thread holds its own
 
 - **Consumer 0**: Journal stage
 - **Consumer 1**: Matching stage
-- **Consumer 2** (optional): Shadow exchange stage (when `--snapshot-interval-ms > 0`). Gated on the journal cursor — it only processes events after they are durable. Takes periodic snapshots on a dedicated thread without pausing the matching engine.
+- **Consumer 2**: Shadow exchange stage, on by default (`--snapshot-interval-ms 0` disables it). Gated on the journal cursor — it only processes events after they are durable. Takes periodic snapshots on a dedicated thread without pausing the matching engine.
 
 Because the journal and matching consumers are gated only on the producer, they can process events concurrently. The journal stage does not block the matching stage, and vice versa. Backpressure is applied by the producer checking the minimum progress of all terminal consumers before claiming new slots.
 
@@ -369,7 +369,7 @@ The server spawns four always-on pipeline threads plus one reader thread, and up
 | Reader | 4 | io_uring-based connection multiplexing + tick generation | No |
 | Repl Sender | 5 | Stream journal batches to replicas | Yes (`--replication-bind`) |
 | Event Publisher | 6 | Broadcast execution events to subscribers | Yes (`--event-bind`) |
-| Shadow Exchange | 7 | Periodic snapshots without pausing matching | Yes (`--snapshot-interval-ms`) |
+| Shadow Exchange | 7 | Periodic snapshots without pausing matching | On by default (`--snapshot-interval-ms 0` disables) |
 | Repl Handler 0/1 | 8, 9 | Per-replica connection handling | Yes (one per connected replica) |
 | Segment Preparer | 10 | Pre-stage the next journal segment off the rotation path | Yes (recurring rotation only) |
 
