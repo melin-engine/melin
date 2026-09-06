@@ -74,12 +74,12 @@ Three examples, in order of size: [`crates/examples/echo`](crates/examples/echo)
 
 ## Architecture
 
-A node runs a fixed set of pinned threads connected by lock-free disruptor rings. No async runtime, no locks on the hot path.
+A node runs a fixed set of pinned threads connected by lock-free disruptor rings. The hot path has no async runtime and no locks.
 
 ```
  clients ──> Reader ──┬──> Journal ──┬──> Journal Disk ┄┄┄┄┐
- (TCP or DPDK)        │              └──> Replication ┄┄┄┄┄┤ durability
-                      │                                    v cursors
+ (TCP or DPDK)        │              └──> Replication ┄┄┄┄┄┤ durability cursors
+                      │                                    v (gate)
                       ├──> Application ───────────┬──> Response ──> clients
                       │                           └──> Event publisher ──> subscribers
                       └──> Shadow ──> snapshots
@@ -87,16 +87,18 @@ A node runs a fixed set of pinned threads connected by lock-free disruptor rings
 
 - **Reader**: one thread multiplexing every client connection, over kernel TCP with io_uring or over DPDK in userspace. Sole producer into the input ring.
 - **Journal**: sequences, encodes, and hash-chains events and feeds encoded batches to the replication senders. A separate **Journal Disk** thread writes and syncs the batches and publishes the durability cursors. Because the two are split, a slow disk stalls neither ordering nor the replica feed.
-- **Application**: consumes the input ring in parallel with the journal. Runs your single-threaded logic and publishes results to the output ring. Never waits on disk.
+- **Application**: consumes the input ring in parallel with the journal. Runs your logic and publishes results to the output ring. Never waits on disk.
 - **Response**: drains the output ring but gates each response on the journal and replication cursors before sending it, so persist-before-ack is enforced without stalling the application.
 - **Event publisher**: broadcasts application output to subscribers (market data, audit, analytics).
 - **Shadow**: a third consumer on the input ring, gated on the journal cursor, that takes periodic snapshots without pausing the application.
 
-**Replicas** run the same pipeline, fed by the primary's journal batches over TCP: they journal, apply, and snapshot exactly as the primary does, with application state kept warm and outputs discarded.
+The full data flow, ring sizes, and threading model are in [pipeline architecture](docs/pipeline-architecture.md); the on-disk format in [journal](docs/journal.md).
 
-**Recovery** on any node is snapshot plus journal replay: the newest snapshot is loaded and every journaled event after it is re-applied. Determinism guarantees the result is the state clients were told about.
+**Recovery** on any node is snapshot plus journal replay: the newest snapshot is loaded and every journaled event after it is re-applied. Determinism guarantees the result is the state every acknowledged response was computed from.
 
-**Control plane.** An optional Raft service handles leader election, fencing epochs, and automatic failover, and nothing else. It runs on its own thread, isolated from the data plane. Elections steer toward the most-caught-up replica, and an elected replica refuses to promote while it can still see a live primary, or while any reachable peer holds more data than it does.
+**Replicas** run the same pipeline, fed by the primary's journal batches over the same transport as clients, TCP or DPDK. They journal, apply, and snapshot exactly as the primary does, with application state kept warm and outputs discarded. See [replication](docs/replication.md).
+
+**Control plane.** A Raft service handles leader election, fencing epochs, and automatic failover, and nothing else. It runs on its own thread, isolated from the data plane, and always over kernel TCP. Elections steer toward the most-caught-up replica. An elected replica refuses to promote while it can still see a live primary, or while any reachable peer holds more data than it does.
 
 ## Melin Exchange Core
 
