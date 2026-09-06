@@ -6,9 +6,9 @@
 [![MSRV](https://img.shields.io/crates/msrv/melin-app)](Cargo.toml)
 [![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
 
-Melin is a deterministic, replicated sequencer: your application logic plugs in, and Melin provides the event-sourced pipeline around it: durable journaling, synchronous replication, snapshots, transport, failover.
+Melin is a replicated sequencer for latency-critical systems that cannot lose an event. Your business logic plugs in as a plain state machine, and Melin makes it durable and replicated: every input is assigned a total order, then journaled and replicated before the response goes out. Snapshots and automatic failover are built in.
 
-It is the runtime under a matching engine, a ledger, or any system whose business logic must process every event in a total order, survive a crash without losing one, and replay identically for audit, while keeping tail latency inside a budget measured in microseconds. Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: lock-free disruptor rings, io_uring I/O, and mechanical sympathy throughout.
+It is the runtime under a matching engine, a ledger, or any system that must replay identically for audit while keeping tail latency inside a budget measured in microseconds. Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: lock-free disruptor rings, io_uring I/O with optional DPDK kernel bypass, and mechanical sympathy throughout.
 
 **Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity (internal crossing, a new instrument, a parallel run alongside an existing engine) in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
