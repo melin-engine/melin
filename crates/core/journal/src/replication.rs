@@ -339,12 +339,9 @@ pub fn build_replication_ring(
     }
     let (inner_producer, inner_consumers) = builder.build();
 
-    // Pre-allocate byte buffers — one 128 KiB chunk per ring slot.
-    let chunks: Vec<UnsafeCell<[u8; CHUNK_SIZE]>> = (0..capacity)
-        .map(|_| UnsafeCell::new([0u8; CHUNK_SIZE]))
-        .collect();
+    // Pre-allocate byte buffers — one [`CHUNK_SIZE`] chunk per ring slot.
     let buffers = Arc::new(SharedBuffers {
-        chunks: chunks.into_boxed_slice(),
+        chunks: crate::write_ring::alloc_zeroed_chunk_slab::<CHUNK_SIZE>(capacity),
         mask: (capacity - 1) as u64,
     });
 
