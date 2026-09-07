@@ -319,6 +319,33 @@ impl JournalWriteConsumer {
     }
 }
 
+/// Allocate a ring's per-slot chunk slab: one contiguous zeroed
+/// allocation of `capacity` chunks of `N` bytes each.
+///
+/// Built by zeroing the heap allocation in place rather than collecting
+/// `UnsafeCell::new([0u8; N])` values: in unoptimised builds each such
+/// array literal is materialised on the stack before it moves into the
+/// vector, and at this ring's chunk size that overflows the default
+/// 2 MiB thread stack (surfaced by the nightly ThreadSanitizer job,
+/// whose larger frames leave even less headroom). Zeroing in place also
+/// touches every page of the slab up front, so the faults land at
+/// construction time instead of during the ring's first lap on the hot
+/// path.
+pub(crate) fn alloc_zeroed_chunk_slab<const N: usize>(
+    capacity: usize,
+) -> Box<[UnsafeCell<[u8; N]>]> {
+    let mut slab: Vec<UnsafeCell<[u8; N]>> = Vec::with_capacity(capacity);
+    // Safety: `write_bytes` covers exactly the `capacity` elements the
+    // allocation was sized for, and all-zero bytes are a valid value of
+    // `UnsafeCell<[u8; N]>`, so `set_len` exposes only initialised
+    // memory.
+    unsafe {
+        std::ptr::write_bytes(slab.as_mut_ptr(), 0, capacity);
+        slab.set_len(capacity);
+    }
+    slab.into_boxed_slice()
+}
+
 /// Build the hand-off ring: producer for the sequencing thread,
 /// consumer for the disk thread.
 pub fn build_journal_write_ring(capacity: usize) -> (JournalWriteProducer, JournalWriteConsumer) {
@@ -335,11 +362,8 @@ pub fn build_journal_write_ring(capacity: usize) -> (JournalWriteProducer, Journ
         .pop()
         .expect("builder was asked for one consumer");
 
-    let chunks: Vec<UnsafeCell<[u8; CHUNK_SIZE]>> = (0..capacity)
-        .map(|_| UnsafeCell::new([0u8; CHUNK_SIZE]))
-        .collect();
     let chunks = Arc::new(SharedChunks {
-        chunks: chunks.into_boxed_slice(),
+        chunks: alloc_zeroed_chunk_slab::<CHUNK_SIZE>(capacity),
         mask: (capacity - 1) as u64,
     });
 
