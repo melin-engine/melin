@@ -30,6 +30,8 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
+use zerocopy::FromZeros;
+
 use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
 
@@ -322,28 +324,40 @@ impl JournalWriteConsumer {
 /// Allocate a ring's per-slot chunk slab: one contiguous zeroed
 /// allocation of `capacity` chunks of `N` bytes each.
 ///
-/// Built by zeroing the heap allocation in place rather than collecting
+/// Allocated on the heap via zerocopy rather than by collecting
 /// `UnsafeCell::new([0u8; N])` values: in unoptimised builds each such
 /// array literal is materialised on the stack before it moves into the
 /// vector, and at this ring's chunk size that overflows the default
 /// 2 MiB thread stack (surfaced by the nightly ThreadSanitizer job,
-/// whose larger frames leave even less headroom). Zeroing in place also
-/// touches every page of the slab up front, so the faults land at
-/// construction time instead of during the ring's first lap on the hot
-/// path.
+/// whose larger frames leave even less headroom). `FromZeros` carries
+/// the "all-zero bytes are a valid value of this type" proof that a
+/// hand-rolled zeroed allocation would need an `unsafe` block to
+/// assert.
+///
+/// The touch pass below is load-bearing. `new_box_zeroed_with_elems`
+/// allocates with `alloc_zeroed`, which for a slab this size hands back
+/// untouched kernel zero pages — every page would then minor-fault
+/// during the ring's first lap, on the hot path. (An explicit memset
+/// into a plain allocation is no better: LLVM rewrites
+/// allocate-then-zero into `alloc_zeroed`, deleting the touch — a
+/// release build of exactly that pattern faulted one page at
+/// construction and the rest on first use.) Re-zeroing through
+/// `get_mut` dirties every page now, and the `black_box` keeps the
+/// optimiser from discarding a zero-fill of memory it knows is already
+/// zero. Best-effort by the language's rules, but measured effective;
+/// only volatile writes or `madvise(MADV_POPULATE_WRITE)` would make
+/// it a hard guarantee, and both would reintroduce `unsafe`.
 pub(crate) fn alloc_zeroed_chunk_slab<const N: usize>(
     capacity: usize,
 ) -> Box<[UnsafeCell<[u8; N]>]> {
-    let mut slab: Vec<UnsafeCell<[u8; N]>> = Vec::with_capacity(capacity);
-    // Safety: `write_bytes` covers exactly the `capacity` elements the
-    // allocation was sized for, and all-zero bytes are a valid value of
-    // `UnsafeCell<[u8; N]>`, so `set_len` exposes only initialised
-    // memory.
-    unsafe {
-        std::ptr::write_bytes(slab.as_mut_ptr(), 0, capacity);
-        slab.set_len(capacity);
+    let mut slab: Box<[UnsafeCell<[u8; N]>]> =
+        <[UnsafeCell<[u8; N]>]>::new_box_zeroed_with_elems(capacity)
+            .expect("ring chunk slab allocation failed");
+    for chunk in &mut slab {
+        chunk.get_mut().fill(0);
     }
-    slab.into_boxed_slice()
+    std::hint::black_box(&mut slab);
+    slab
 }
 
 /// Build the hand-off ring: producer for the sequencing thread,
