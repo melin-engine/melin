@@ -385,6 +385,15 @@ impl JournalDisk {
     fn run_loop(&mut self) {
         let mut idle_spins: u32 = 0;
         loop {
+            // Sampled *before* the drain: a halting sequencer publishes
+            // its final batches and then stores the flag, so a stop
+            // observed here (Acquire, pairing with that Release store)
+            // guarantees the drain below sees every batch published
+            // before it. Checking the flag after the drain instead left
+            // a window — drain sees an empty ring, sequencer publishes
+            // and stops, flag check exits — where a handed-over batch
+            // was silently dropped on the error-path teardown.
+            let stop_requested = self.control.stop.load(Ordering::Acquire);
             match self.drain_and_sync() {
                 Ok(true) => {
                     idle_spins = 0;
@@ -408,7 +417,7 @@ impl JournalDisk {
                 continue;
             }
 
-            if self.control.stop.load(Ordering::Acquire) {
+            if stop_requested {
                 return;
             }
 

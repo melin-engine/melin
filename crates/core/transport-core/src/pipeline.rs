@@ -1810,6 +1810,12 @@ impl<E: AppEvent> SequencerCore<E> {
     /// Stop the disk thread and discard the segment. The journal is
     /// already broken (or the stream hit a fatal condition), so there is
     /// nothing to hand back — but the thread must not be left running.
+    ///
+    /// Batches handed over before this call are still written and
+    /// synced on the way out (`run_loop` drains once after observing
+    /// the flag): a replica halting on stream divergence keeps every
+    /// entry up to the divergence boundary durable, which is what the
+    /// reconnect handshake archives and resyncs from.
     fn halt_disk_thread(&mut self) {
         self.disk.stop();
         if let Some(handle) = self.disk_thread.take()
