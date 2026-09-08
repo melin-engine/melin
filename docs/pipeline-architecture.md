@@ -247,7 +247,7 @@ The `group_commit_delay` parameter (configurable via `--group-commit-us`) allows
 
 ### Idle behavior
 
-When no events are available, the journal stage uses adaptive spinning: 1,000 `spin_loop()` iterations (approximately 1 us), then falls back to `thread::yield_now()` to avoid aggressive OS preemption.
+When no events are available, the journal stage waits according to the node's wait strategy — see [Waiting](#waiting) below. The same strategy governs its waits on the disk thread: claiming a hand-off slot, draining before a rotation, and collecting the rotation result.
 
 ### Shutdown
 
@@ -280,7 +280,16 @@ The matching stage does **not** wait for the journal stage. Both consumers are g
 
 ### Idle behavior
 
-Same adaptive spinning as the journal stage: 1,000 spin loops, then `yield_now()`.
+Waits according to the node's wait strategy, like every other stage — see [Waiting](#waiting).
+
+## Waiting
+
+Every wait in the pipeline goes through one wait strategy, chosen at startup for the whole node: a stage polling an empty ring, a producer blocked on a full one, the journal stage waiting on its disk thread, the response stage's durability gate waiting on the journal and the replicas, and the startup drains that wait for seed events to clear the pipeline. There is no wait that the choice does not reach.
+
+- **Busy-spin** (default): the waiting thread spins with `PAUSE` and never yields. The lowest-latency choice, and the right one whenever each pipeline thread has an isolated core to itself (`isolcpus`), where a yield would only be a wasted syscall on the critical path.
+- **Spin, then yield** (`--yield-idle`): the thread spins for about a microsecond, then hands the CPU back to the scheduler on every further idle iteration until work arrives. For machines where pipeline threads share cores with each other or with other processes — development boxes, CI, a test run that packs several nodes onto a laptop. Without it, a thread spinning on a shared core can hold the CPU for a full scheduler slice while the very thread it is waiting for sits queued behind it, turning each hand-off between stages into milliseconds.
+
+Busy-spin on a shared core is never a deadlock under the default scheduler (the kernel still timeslices), but it is slow and it starves neighbours; on an isolated core with real-time priority it *would* be a deadlock, which is why real-time priority is only ever granted on isolated cores.
 
 ## Response Stage
 
@@ -400,7 +409,7 @@ In **DPDK mode**, a single poll thread handles all client connections (one NIC q
 
 ### Why not async
 
-The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader thread uses io_uring with multishot RECV for connection multiplexing, and the pipeline threads use spin-wait loops with adaptive yielding.
+The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader thread uses io_uring with multishot RECV for connection multiplexing, and the pipeline threads poll their rings under the node's wait strategy (see [Waiting](#waiting)).
 
 ## Persist-Before-Ack Invariant
 

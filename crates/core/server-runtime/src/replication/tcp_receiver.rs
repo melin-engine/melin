@@ -560,7 +560,7 @@ pub fn run_receiver<A>(
     staging_mode: melin_journal::StagingMode,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
-    busy_spin: bool,
+    wait: melin_pipeline::wait::WaitStrategy,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
 ) -> ReceiverResult<A, BufferedWriter<A::Event>>
@@ -844,7 +844,7 @@ where
                 snapshot_interval_ms,
                 snapshot_path.clone(),
                 group_commit_delay,
-                busy_spin,
+                wait,
                 Arc::clone(&fence_state),
                 Arc::clone(pipeline_healthy),
             )?);
@@ -884,7 +884,7 @@ where
                             shutdown,
                             control,
                             pipeline_depth,
-                            busy_spin,
+                            wait,
                             session_start,
                             Vec::with_capacity(MAX_DATA_FRAME + 4),
                             None,
@@ -1364,7 +1364,7 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        false,
+                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
@@ -1536,7 +1536,7 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        false,
+                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
@@ -1706,7 +1706,7 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        false,
+                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
@@ -1949,7 +1949,7 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        false,
+                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
@@ -2129,7 +2129,7 @@ mod tests {
                         mode,
                         Duration::ZERO,
                         64,
-                        false,
+                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )

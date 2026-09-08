@@ -34,6 +34,7 @@ use zerocopy::FromZeros;
 
 use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
+use melin_pipeline::wait::WaitStrategy;
 
 pub use melin_pipeline::ring::Full;
 
@@ -361,8 +362,15 @@ pub(crate) fn alloc_zeroed_chunk_slab<const N: usize>(
 }
 
 /// Build the hand-off ring: producer for the sequencing thread,
-/// consumer for the disk thread.
-pub fn build_journal_write_ring(capacity: usize) -> (JournalWriteProducer, JournalWriteConsumer) {
+/// consumer for the disk thread. `producer_wait` is the sequencing
+/// thread's wait strategy — today the producer exposes no blocking
+/// path (the sequencer waits between `try_claim` attempts with its own
+/// waiter), so the ring carries the same policy that thread already
+/// waits under rather than a value that could drift from it.
+pub fn build_journal_write_ring(
+    capacity: usize,
+    producer_wait: WaitStrategy,
+) -> (JournalWriteProducer, JournalWriteConsumer) {
     assert!(
         capacity.is_power_of_two(),
         "journal write ring capacity must be a power of two, got {capacity}"
@@ -371,7 +379,7 @@ pub fn build_journal_write_ring(capacity: usize) -> (JournalWriteProducer, Journ
     let (inner_producer, mut inner_consumers) =
         ring::DisruptorBuilder::<JournalWriteMeta>::new(capacity)
             .add_consumer()
-            .build();
+            .build(producer_wait);
     let inner_consumer = inner_consumers
         .pop()
         .expect("builder was asked for one consumer");
@@ -415,7 +423,7 @@ mod tests {
     /// verbatim, with their descriptor.
     #[test]
     fn published_bytes_and_meta_round_trip() {
-        let (mut producer, mut consumer) = build_journal_write_ring(4);
+        let (mut producer, mut consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
 
         let mut claim = producer.try_claim().unwrap();
         claim.bytes_mut()[..5].copy_from_slice(b"hello");
@@ -438,7 +446,7 @@ mod tests {
     /// rotation proceed over batches that are merely in the page cache.
     #[test]
     fn drain_waits_for_commit_not_merely_read() {
-        let (mut producer, mut consumer) = build_journal_write_ring(4);
+        let (mut producer, mut consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         assert!(producer.drained(), "an empty ring is drained");
 
         let claim = producer.try_claim().unwrap();
@@ -459,7 +467,7 @@ mod tests {
     /// whose bytes are still awaiting durability.
     #[test]
     fn full_ring_refuses_the_claim() {
-        let (mut producer, mut consumer) = build_journal_write_ring(2);
+        let (mut producer, mut consumer) = build_journal_write_ring(2, WaitStrategy::SpinThenYield);
 
         for seq in 0..2 {
             let claim = producer.try_claim().unwrap();
@@ -481,7 +489,7 @@ mod tests {
     /// out are the ones written for that lap — not a stale lap's.
     #[test]
     fn chunks_carry_fresh_bytes_across_wraps() {
-        let (mut producer, mut consumer) = build_journal_write_ring(2);
+        let (mut producer, mut consumer) = build_journal_write_ring(2, WaitStrategy::SpinThenYield);
 
         for lap in 0..6u8 {
             let mut claim = producer.try_claim().unwrap();
@@ -503,7 +511,7 @@ mod tests {
     /// disk thread reads a backlog, syncs once, then releases the lot.
     #[test]
     fn one_commit_releases_every_slot_read() {
-        let (mut producer, mut consumer) = build_journal_write_ring(4);
+        let (mut producer, mut consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
 
         for seq in 0..3 {
             let claim = producer.try_claim().unwrap();

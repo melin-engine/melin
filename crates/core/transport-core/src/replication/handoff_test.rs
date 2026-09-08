@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use melin_journal::replication::build_replication_ring;
 use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+use melin_pipeline::wait::WaitStrategy;
 
 use super::catchup::{CatchUpResult, bridge_catchup_to_live, catch_up_from_journal_with};
 use crate::pipeline::InputSlot;
@@ -145,7 +146,7 @@ fn handoff_must_not_skip_entries_journaled_before_ring_activation() {
     }
     // Capacity 8: smallest power of two comfortably above the single
     // chunk this test publishes.
-    let (mut producer, mut consumers) = build_replication_ring(1, 8);
+    let (mut producer, mut consumers) = build_replication_ring(1, 8, WaitStrategy::SpinThenYield);
     let mut chunk = Vec::new();
     encode_input_batch(&[slot(13), slot(14)], &mut chunk);
     producer.publish(&chunk, 14);
@@ -232,7 +233,7 @@ fn bridge_with_no_window_traffic_is_a_plain_drain() {
             .append(&JournalEvent::App(TestEvent::Add(i)))
             .unwrap();
     }
-    let (mut producer, mut consumers) = build_replication_ring(1, 8);
+    let (mut producer, mut consumers) = build_replication_ring(1, 8, WaitStrategy::SpinThenYield);
     let mut chunk = Vec::new();
     encode_input_batch(&[slot(11), slot(12)], &mut chunk);
     producer.publish(&chunk, 12);
