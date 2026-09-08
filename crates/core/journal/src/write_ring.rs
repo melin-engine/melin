@@ -368,10 +368,13 @@ pub fn build_journal_write_ring(capacity: usize) -> (JournalWriteProducer, Journ
         "journal write ring capacity must be a power of two, got {capacity}"
     );
 
+    // The producer has no blocking publish path — `try_claim` is the
+    // only way in, and the sequencer waits between attempts with its
+    // own waiter — so the strategy handed to the ring is never consulted.
     let (inner_producer, mut inner_consumers) =
         ring::DisruptorBuilder::<JournalWriteMeta>::new(capacity)
             .add_consumer()
-            .build();
+            .build(melin_pipeline::wait::WaitStrategy::BusySpin);
     let inner_consumer = inner_consumers
         .pop()
         .expect("builder was asked for one consumer");

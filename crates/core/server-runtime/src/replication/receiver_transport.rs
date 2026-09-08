@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info};
 
 use melin_app::AppEvent;
+use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
     Ack, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message, try_decode_input_batch_into,
@@ -694,7 +695,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     // [`super::ReplicaControlPlane`].
     control: &super::ReplicaControlPlane,
     pipeline_depth: usize,
-    busy_spin: bool,
+    wait: WaitStrategy,
     initial_sequence: u64,
     // Caller-owned receive buffer. May contain leftover bytes from the
     // handshake phase (DPDK path: smoltcp can deliver the StreamStart
@@ -746,7 +747,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     journal_tip.advance(melin_transport_core::WireSeq::new(initial_sequence));
 
     let mut heard_from_primary = false;
-    let mut idle_spins: u32 = 0;
+    let mut waiter = wait.waiter();
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
 
@@ -769,7 +770,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 &mut pending_acks,
                 journal_cursor,
                 accum_end_sequence,
-                busy_spin,
+                wait,
                 &mut recv_buf,
                 journal_failed,
             );
@@ -816,7 +817,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 &mut pending_acks,
                 journal_cursor,
                 accum_end_sequence,
-                busy_spin,
+                wait,
                 &mut recv_buf,
                 journal_failed,
             );
@@ -863,7 +864,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 &mut pending_acks,
                 journal_cursor,
                 accum_end_sequence,
-                busy_spin,
+                wait,
                 &mut recv_buf,
                 journal_failed,
             );
@@ -913,15 +914,10 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         // --- Idle wait ---
         if !any_data && !outcome.any_published {
             idle_count += 1;
-            if busy_spin || idle_spins < 1000 {
-                idle_spins = idle_spins.wrapping_add(1);
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
+            waiter.idle();
         } else {
             busy_count += 1;
-            idle_spins = 0;
+            waiter.reset();
         }
     };
 
@@ -957,11 +953,11 @@ fn drain_pending_acks<T: ReceiverTransport>(
     pending_acks: &mut PendingAckQueue,
     journal_cursor: &melin_pipeline::padding::Sequence,
     accum_end_sequence: u64,
-    busy_spin: bool,
+    wait: WaitStrategy,
     recv_buf: &mut Vec<u8>,
     journal_failed: &AtomicBool,
 ) {
-    if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin, journal_failed) {
+    if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, wait, journal_failed) {
         let ack = Ack {
             acked_sequence: seq,
             in_memory_sequence: accum_end_sequence,
@@ -1070,7 +1066,7 @@ mod tests {
     ) {
         let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(capacity)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         (producer, consumers.pop().expect("consumer present"))
     }
 
@@ -1194,7 +1190,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             0,
             Vec::new(),
             None,
@@ -1226,7 +1222,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             0,
             Vec::new(),
             None,
@@ -1256,7 +1252,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             0,
             Vec::new(),
             None,
@@ -1288,7 +1284,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             9,
             Vec::new(),
             None,
@@ -1332,7 +1328,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             0,
             initial,
             None,
@@ -1375,7 +1371,7 @@ mod tests {
             &shutdown,
             &control,
             1, // pipeline_depth=1 → PendingAckQueue cap=1
-            false,
+            WaitStrategy::SpinThenYield,
             0,
             Vec::new(),
             None,
@@ -1423,7 +1419,7 @@ mod tests {
             &shutdown,
             &control,
             16,
-            false,
+            WaitStrategy::SpinThenYield,
             0,
             Vec::new(),
             None,
@@ -1488,7 +1484,7 @@ mod tests {
                 &shutdown,
                 &control,
                 1, // cap 1 → full after the first batch
-                false,
+                WaitStrategy::SpinThenYield,
                 0,
                 Vec::new(),
                 None,
@@ -1534,7 +1530,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             0,
             Vec::new(),
             None,
@@ -1581,7 +1577,7 @@ mod tests {
                 shutdown_ref,
                 &control,
                 4,
-                false,
+                WaitStrategy::SpinThenYield,
                 41,
                 Vec::new(),
                 None,
@@ -1621,7 +1617,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             0,
             Vec::new(),
             Some(&utilization),
@@ -2276,7 +2272,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             0,
             Vec::new(),
             None,
@@ -2341,7 +2337,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             100, // initial_sequence — the post-snapshot resume point
             Vec::new(),
             None,
@@ -2394,7 +2390,7 @@ mod tests {
             &shutdown,
             &control,
             4,
-            false,
+            WaitStrategy::SpinThenYield,
             100,
             Vec::new(),
             None,

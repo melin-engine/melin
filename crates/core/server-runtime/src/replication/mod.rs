@@ -444,7 +444,7 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,
-    busy_spin: bool,
+    wait: melin_pipeline::wait::WaitStrategy,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     // Process-lifetime health mirror for the replica health endpoint —
     // see `ReplicaControlPlane::pipeline_healthy`. Reset `true` here (a
@@ -470,7 +470,7 @@ where
         writer,
         4096, // max_journal_batch
         group_commit_delay,
-        busy_spin,
+        wait,
         enable_shadow,
         fence_state,
     );
@@ -539,17 +539,16 @@ where
             melin_app::affinity::pin_thread("drain", drain_core);
             let mut consumer = drain_consumer;
             let mut batch = vec![OutputSlot::<A::Report, A::QueryResponse>::default(); 256];
+            let mut waiter = wait.waiter();
             loop {
                 if ps.load(Ordering::Relaxed) {
                     return;
                 }
                 let count = consumer.consume_batch(&mut batch, 256);
                 if count == 0 {
-                    if busy_spin {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
+                    waiter.idle();
+                } else {
+                    waiter.reset();
                 }
             }
         })
@@ -576,7 +575,12 @@ where
                         std::time::Duration::from_millis(snapshot_interval_ms),
                         chain_lock,
                         &ps,
-                        false,
+                        // Always yields, whatever the node's strategy —
+                        // unchanged from before the strategy type
+                        // existed. The replica shadow sits on no ack
+                        // path, so it has never been given a spinning
+                        // core.
+                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         shadow_initial_epoch,
                     );
                 })
@@ -2581,7 +2585,11 @@ mod tests {
         // Cursor already past both targets — pop_oldest_blocking
         // returns immediately.
         let cursor = make_journal_cursor(25);
-        let seq = q.pop_oldest_blocking(&cursor, true, &AtomicBool::new(false));
+        let seq = q.pop_oldest_blocking(
+            &cursor,
+            melin_pipeline::wait::WaitStrategy::BusySpin,
+            &AtomicBool::new(false),
+        );
         // Should pop both (oldest + any others that became ready).
         assert_eq!(seq, Some(200));
         assert!(q.is_empty());
@@ -2597,9 +2605,23 @@ mod tests {
         // Cursor frozen BELOW the target; abort pre-latched.
         let cursor = make_journal_cursor(5);
         let abort = AtomicBool::new(true);
-        assert_eq!(q.pop_oldest_blocking(&cursor, true, &abort), None);
+        assert_eq!(
+            q.pop_oldest_blocking(
+                &cursor,
+                melin_pipeline::wait::WaitStrategy::BusySpin,
+                &abort
+            ),
+            None
+        );
         assert!(!q.is_empty(), "aborted wait must not pop the entry");
-        assert_eq!(q.pop_all_blocking(&cursor, true, &abort), None);
+        assert_eq!(
+            q.pop_all_blocking(
+                &cursor,
+                melin_pipeline::wait::WaitStrategy::BusySpin,
+                &abort
+            ),
+            None
+        );
     }
 
     /// `shutdown_pipeline` must surface the journal stage's error kind —
@@ -2688,7 +2710,7 @@ mod tests {
         let (input_producer, mut consumers) =
             melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(capacity)
                 .add_consumer()
-                .build();
+                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().expect("one consumer");
         let handles = ReplicaPipelineHandles {
             input_producer,
@@ -2807,7 +2829,7 @@ mod tests {
         let (input_producer, mut consumers) =
             melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(4)
                 .add_consumer()
-                .build();
+                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let _consumer = consumers.pop().expect("one consumer");
         let writer_path = dir.path().join("w.journal");
         let handles = ReplicaPipelineHandles {
@@ -2929,8 +2951,12 @@ mod tests {
         let mut q = PendingAckQueue::new(8);
         let cursor = make_journal_cursor(0);
         assert!(
-            q.pop_all_blocking(&cursor, true, &AtomicBool::new(false))
-                .is_none()
+            q.pop_all_blocking(
+                &cursor,
+                melin_pipeline::wait::WaitStrategy::BusySpin,
+                &AtomicBool::new(false)
+            )
+            .is_none()
         );
     }
 

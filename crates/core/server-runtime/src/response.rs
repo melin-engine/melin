@@ -19,6 +19,7 @@ use rustc_hash::FxHashMap;
 use tracing::{debug, error};
 
 use melin_pipeline::ring;
+use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::{AckPolicy, Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
 use crate::replication::ReplicationMetrics;
@@ -93,12 +94,6 @@ const FLUSH_BYTES_THRESHOLD: usize = 1400;
 /// the per-slot cost at 1 M/s) and caps the wait at the time to encode
 /// 256 responses — tens of microseconds — however the load is spread.
 const FLUSH_SLOT_INTERVAL: usize = 256;
-
-/// Consecutive idle iterations before the loop falls back to
-/// `yield_now` (only reached when `--yield-idle` is set; production
-/// busy-spins). Doubles as the "sustained idle" threshold past which the
-/// idle housekeeping timer may mask its clock read — see the call site.
-const IDLE_SPIN_LIMIT: u32 = 1000;
 
 /// The consumed path's flush cadence: both triggers plus the counter
 /// they share.
@@ -192,7 +187,9 @@ pub struct Response<A: Application> {
     /// Mirrors `replication_metrics` — `None` in standalone.
     pub replica_active: Option<[Arc<AtomicBool>; 2]>,
     pub heartbeat_interval: Option<Duration>,
-    pub busy_spin: bool,
+    /// How this thread waits — on an empty output ring, and inside the
+    /// durability gate on the journal-disk and replication threads.
+    pub wait: WaitStrategy,
     pub utilization: Arc<StageUtilization>,
     /// Wire encoder for application-shaped payloads. Constructed
     /// once at boot (`Arc::new(ExchangeResponseEncoder)`) and shared
@@ -267,7 +264,7 @@ pub fn run<A: Application>(
         replication_metrics,
         replica_active,
         heartbeat_interval,
-        busy_spin,
+        wait,
         utilization,
         encoder,
         fence_state,
@@ -515,8 +512,7 @@ pub fn run<A: Application>(
     // tax the DPDK stage removed with this timer.
     let mut idle_housekeeping_timer = AmortizedTimer::new();
 
-    // Adaptive spin: spin first (fast wakeup), yield after threshold.
-    let mut idle_spins: u32 = 0;
+    let mut waiter = wait.waiter();
 
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
@@ -707,7 +703,7 @@ pub fn run<A: Application>(
             // the same (see `IDLE_HOUSEKEEPING_INTERVAL`).
             //
             // The timer's iteration mask is only engaged once the stage
-            // has been idle for a sustained stretch (`idle_spins` resets
+            // has been idle for a sustained stretch (the waiter resets
             // on every consumed batch). That is deliberate: the mask
             // trades cadence for clock reads, and it should only do so
             // when clock reads are the loop's whole cost. A stage that
@@ -719,7 +715,7 @@ pub fn run<A: Application>(
             if idle_housekeeping_timer
                 .tick(
                     IDLE_HOUSEKEEPING_INTERVAL,
-                    busy_spin && idle_spins >= IDLE_SPIN_LIMIT,
+                    waiter.strategy() == WaitStrategy::BusySpin && waiter.past_spin_budget(),
                 )
                 .is_some()
             {
@@ -814,15 +810,10 @@ pub fn run<A: Application>(
                 utilization.busy.store(busy_count, Ordering::Relaxed);
                 utilization.idle.store(idle_count, Ordering::Relaxed);
             }
-            if busy_spin || idle_spins < IDLE_SPIN_LIMIT {
-                idle_spins = idle_spins.wrapping_add(1);
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
+            waiter.idle();
             continue;
         }
-        idle_spins = 0;
+        waiter.reset();
         busy_count += 1;
 
         #[cfg(feature = "latency-trace")]
@@ -954,8 +945,15 @@ pub fn run<A: Application>(
                     }
                 }
 
+                // The gate waits on the journal-disk thread and the
+                // replication handlers — the exact threads a small box
+                // co-schedules with this one, so it waits the way every
+                // other wait does. A fresh waiter per gate entry: the
+                // spin budget is meant to cover one durability lag, not
+                // to carry over from the idle loop.
+                let mut gate_waiter = wait.waiter();
                 loop {
-                    // Inside the gate-wait spin loop, also observe a
+                    // Inside the gate-wait loop, also observe a
                     // policy swap. Without this, a batch whose gate
                     // becomes structurally unsatisfiable (e.g. all
                     // replicas die while a non-bypass slot is in
@@ -964,7 +962,7 @@ pub fn run<A: Application>(
                     // remediating `ACK-POLICY disk` — the outer loop
                     // observation never gets a chance to run. The
                     // relaxed load is ~1 cycle on x86; cheaper than
-                    // the `spin_loop` hint below.
+                    // the wait below.
                     let observed_byte = ack_policy.load(Ordering::Relaxed);
                     if observed_byte != active_policy.as_u8()
                         && let Some(next) = AckPolicy::from_u8(observed_byte)
@@ -1020,13 +1018,14 @@ pub fn run<A: Application>(
                     // Accrue degraded time while wedged. The post-gate
                     // tick attributes the whole wait to a single state, so
                     // without this a healthy→degraded flip during the
-                    // wedge would be mis-charged. `spinning = true`: this
-                    // loop always spins (never yields), so the clock read
-                    // behind the tick is mask-gated, landing only every
-                    // ~65 k iterations (`CHECK_MASK = 2^16`) regardless of
-                    // the period below.
+                    // wedge would be mis-charged. While the gate waiter
+                    // spins the clock read behind the tick is mask-gated,
+                    // landing only every ~65 k iterations
+                    // (`CHECK_MASK = 2^16`) regardless of the period
+                    // below; once it yields, each iteration already pays
+                    // a syscall and the read is unmasked.
                     if gate_accrual_timer
-                        .tick(GATE_ACCRUAL_INTERVAL, true)
+                        .tick(GATE_ACCRUAL_INTERVAL, gate_waiter.spinning())
                         .is_some()
                     {
                         degraded_logger.tick(
@@ -1063,7 +1062,7 @@ pub fn run<A: Application>(
                         }
                         break;
                     }
-                    std::hint::spin_loop();
+                    gate_waiter.idle();
                 }
             }
 
