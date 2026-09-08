@@ -1118,7 +1118,7 @@ pub fn run_receiver_dpdk<A>(
     control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
-    cores: crate::server::PipelineCores,
+    cores: crate::layout::PipelineCores,
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
     staging_mode: melin_journal::StagingMode,

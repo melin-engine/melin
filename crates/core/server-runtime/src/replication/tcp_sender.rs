@@ -16,7 +16,7 @@ use melin_pipeline::wait::WaitStrategy;
 
 use super::auth::authenticate_replica;
 use super::{ReplicaCursors, ReplicaGate, ReplicationMetrics, SentHighWater};
-use crate::server::Placement;
+use crate::layout::Placement;
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{

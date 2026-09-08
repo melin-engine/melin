@@ -435,7 +435,7 @@ pub(super) type ReplicaHandles<A> =
 pub(super) fn build_replica_pipeline_with_threads<A>(
     exchange: A,
     writer: BufferedWriter<A::Event>,
-    cores: crate::server::PipelineCores,
+    cores: crate::layout::PipelineCores,
     // How the replica's segment preparer materialises staged extents.
     // A replica's rotation stall sits on the ack path — under
     // `disk+ram`/`two-disks` it delays the primary's ack gate — so this

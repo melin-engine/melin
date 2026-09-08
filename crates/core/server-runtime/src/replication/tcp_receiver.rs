@@ -554,7 +554,7 @@ pub fn run_receiver<A>(
     control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
-    cores: crate::server::PipelineCores,
+    cores: crate::layout::PipelineCores,
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
     staging_mode: melin_journal::StagingMode,
@@ -1218,9 +1218,9 @@ mod tests {
 
         /// Every stage unpinned (and therefore yielding) — the layout
         /// for a test host, which is oversubscribed by design.
-        pub(super) fn unpinned_cores() -> crate::server::PipelineCores {
-            use crate::server::Placement;
-            crate::server::PipelineCores {
+        pub(super) fn unpinned_cores() -> crate::layout::PipelineCores {
+            use crate::layout::Placement;
+            crate::layout::PipelineCores {
                 journal: Placement::unpinned(),
                 matching: Placement::unpinned(),
                 response: Placement::unpinned(),
