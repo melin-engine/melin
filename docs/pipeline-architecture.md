@@ -247,7 +247,7 @@ The `group_commit_delay` parameter (configurable via `--group-commit-us`) allows
 
 ### Idle behavior
 
-When no events are available, the journal stage waits according to the node's wait strategy — see [Waiting](#waiting) below. The same strategy governs its waits on the disk thread: claiming a hand-off slot, draining before a rotation, and collecting the rotation result.
+When no events are available, the journal stage waits according to its thread's wait strategy — see [Waiting](#waiting) below. The same strategy governs its waits on the disk thread: claiming a hand-off slot, draining before a rotation, and collecting the rotation result.
 
 ### Shutdown
 
@@ -280,7 +280,7 @@ The matching stage does **not** wait for the journal stage. Both consumers are g
 
 ### Idle behavior
 
-Waits according to the node's wait strategy, like every other stage — see [Waiting](#waiting).
+Waits according to its thread's wait strategy, like every other stage — see [Waiting](#waiting).
 
 ## Waiting
 
@@ -290,6 +290,8 @@ Every wait in the pipeline goes through a wait strategy chosen at startup, per t
 - **Spin, then yield**: the thread spins for about a microsecond, then hands the CPU back to the scheduler on every further idle iteration until work arrives. For threads that share a core with each other or with other processes. Without it, a thread spinning on a shared core can hold the CPU for a full scheduler slice while the very thread it is waiting for sits queued behind it, turning each hand-off between stages into milliseconds.
 
 The policy is stated per thread in `--cores`, as a suffix on the entry: `7` (or `7s`) busy-spins on core 7, `7y` spins then yields there. An entry of `0` leaves the thread unpinned, and an unpinned thread always yields — a spinner with no core of its own is the shared-core problem with the victim chosen by the scheduler, so `0s` is refused. `--yield-idle` is the shorthand for a `y` on every entry and takes precedence over any suffix. `journal-prep` never busy-waits (it blocks in file I/O) and takes no suffix.
+
+One thread cannot take a policy: in DPDK mode the `reader` entry pins the NIC poll thread, which polls the device flat out whether or not it has work. A `y` on that entry is refused as a contradiction; under `--yield-idle` the entry is kept spinning, and any core it shares is refused on that basis. Leaving it unpinned is accepted as written, but the thread still polls flat out wherever the scheduler places it, so give it a core. On kernel TCP the reader blocks in the kernel between completions, and its entry's policy governs only the input ring it produces into.
 
 This is what lets one node mix the two: the hot stages (journal, matching, response, reader, journal-disk) each spinning on a core of their own, and the auxiliary threads packed onto one shared core, yielding:
 
@@ -417,7 +419,7 @@ In **DPDK mode**, a single poll thread handles all client connections (one NIC q
 
 ### Why not async
 
-The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader thread uses io_uring with multishot RECV for connection multiplexing, and the pipeline threads poll their rings under the node's wait strategy (see [Waiting](#waiting)).
+The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader thread uses io_uring with multishot RECV for connection multiplexing, and the pipeline threads poll their rings under their own wait strategies (see [Waiting](#waiting)).
 
 ## Persist-Before-Ack Invariant
 

@@ -74,6 +74,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **An existing `--cores` value that puts two threads on one core no
+  longer starts the node.** Previously such threads busy-spun against each
+  other; the optional threads were even documented as able to share an
+  auxiliary core. Now the node refuses at boot unless both entries carry a
+  `y` suffix (or `--yield-idle` is set), and it refuses for every entry in
+  the list, including threads no flag enables. To migrate, suffix the
+  sharing entries: `1,2,3,4,0,6,6,6,6` becomes `1,2,3,4,0,6y,6y,6y,6y`. On
+  DPDK the `reader` entry cannot take `y` — it pins the NIC poll thread,
+  which never yields — so give it a core of its own.
 - **A replica's shadow stage now busy-spins by default**, like the
   primary's, instead of always yielding: it is pinned to the `shadow` core
   the same way. A replica whose `--cores` puts the shadow on a shared core
