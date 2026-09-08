@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn batches_land_on_disk_and_publish_their_cursors() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut producer, consumer) = build_journal_write_ring(4);
+        let (mut producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, progress, durable) = cursors();
         let control = Arc::new(DiskControl::new());
         let mut disk = JournalDisk::new(
@@ -604,7 +604,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Two full iovec passes plus a partial third.
         const BATCHES: usize = MAX_IOV * 2 + 5;
-        let (mut producer, consumer) = build_journal_write_ring(256);
+        let (mut producer, consumer) = build_journal_write_ring(256, WaitStrategy::SpinThenYield);
         let (cursors, progress, durable) = cursors();
         let mut disk = JournalDisk::new(
             segment(dir.path()),
@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn an_empty_ring_publishes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let (producer, consumer) = build_journal_write_ring(4);
+        let (producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, progress, durable) = cursors();
         let mut disk = JournalDisk::new(
             segment(dir.path()),
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn rotation_rendezvous_returns_the_archived_path() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut producer, consumer) = build_journal_write_ring(4);
+        let (mut producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, _, _) = cursors();
         let control = Arc::new(DiskControl::new());
         let mut disk = JournalDisk::new(
@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn a_sync_failure_poisons_without_publishing() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut producer, consumer) = build_journal_write_ring(4);
+        let (mut producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, progress, durable) = cursors();
         let control = Arc::new(DiskControl::new());
         let mut disk = JournalDisk::new(
@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn a_panicking_disk_thread_poisons_rather_than_stranding_the_sequencer() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut producer, consumer) = build_journal_write_ring(4);
+        let (mut producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, progress, durable) = cursors();
         let control = Arc::new(DiskControl::new());
         let mut disk = JournalDisk::new(
@@ -809,7 +809,7 @@ mod tests {
     #[test]
     fn a_clean_exit_leaves_the_journal_unpoisoned() {
         let dir = tempfile::tempdir().unwrap();
-        let (_producer, consumer) = build_journal_write_ring(4);
+        let (_producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, _, _) = cursors();
         let control = Arc::new(DiskControl::new());
         let disk = JournalDisk::new(
@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn a_byte_empty_batch_skips_only_the_sync() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut producer, consumer) = build_journal_write_ring(4);
+        let (mut producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, progress, _) = cursors();
         let mut disk = JournalDisk::new(
             segment(dir.path()),
@@ -872,7 +872,7 @@ mod tests {
     #[test]
     fn a_failed_rotation_is_reported_without_poisoning() {
         let dir = tempfile::tempdir().unwrap();
-        let (_producer, consumer) = build_journal_write_ring(4);
+        let (_producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, _, _) = cursors();
         let control = Arc::new(DiskControl::new());
         let mut disk = JournalDisk::new(
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn stop_drains_before_exiting() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut producer, consumer) = build_journal_write_ring(4);
+        let (mut producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, progress, durable) = cursors();
         let control = Arc::new(DiskControl::new());
         let disk = JournalDisk::new(
