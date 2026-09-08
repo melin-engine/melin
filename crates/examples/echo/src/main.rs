@@ -39,7 +39,9 @@
 //! - Pipeline threads busy-spin by default and are pinned with `--cores`.
 //!   On a shared machine `--yield-idle` keeps them from starving
 //!   everything else; on isolated cores, leave it off — the figures that
-//!   count are taken with the threads owning their cores.
+//!   count are taken with the threads owning their cores. A `y` suffix
+//!   on individual `--cores` entries mixes the two (hot stages spinning,
+//!   the rest sharing a core), see `docs/pipeline-architecture.md`.
 
 use clap::Parser;
 use echo_server::{EchoFactory, RequestDecoder, ResponseEncoder};

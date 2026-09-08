@@ -16,6 +16,7 @@ use melin_pipeline::wait::WaitStrategy;
 
 use super::auth::authenticate_replica;
 use super::{ReplicaCursors, ReplicaGate, ReplicationMetrics, SentHighWater};
+use crate::server::Placement;
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{
@@ -65,11 +66,11 @@ pub struct Sender {
     pub evict_flags: [Arc<AtomicBool>; 2],
     pub active_flags: [Arc<AtomicBool>; 2],
     pub metrics: Arc<ReplicationMetrics>,
-    pub handler_cores: [usize; 2],
+    /// Where each replica handler thread runs and how it waits on its
+    /// replication ring, by slot.
+    pub handlers: [Placement; 2],
     pub batch_size: usize,
     pub heartbeat_secs: u64,
-    /// How each replica handler thread waits on its replication ring.
-    pub wait: WaitStrategy,
     /// Node fencing state. Read to stamp the primary's epoch onto each
     /// `StreamStart`, and to self-demote when a replica handshakes with a
     /// higher epoch (this primary has been superseded). See `crate::fence`.
@@ -102,10 +103,9 @@ pub fn run_sender<A: Application>(
         evict_flags,
         active_flags,
         metrics,
-        handler_cores,
+        handlers,
         batch_size,
         heartbeat_secs,
-        wait,
         fence_state,
         ack_policy,
     } = config;
@@ -307,7 +307,7 @@ pub fn run_sender<A: Application>(
                     let slot_fence = Arc::clone(&fence_state);
                     let slot_ack_policy = Arc::clone(&ack_policy);
                     let slot_authenticated = Arc::clone(&authenticated_flags[slot_idx]);
-                    let handler_core = handler_cores[slot_idx];
+                    let handler = handlers[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
                     let connected_flag = replicas_connected as *const AtomicU32 as usize;
@@ -326,8 +326,8 @@ pub fn run_sender<A: Application>(
                             // pinned real-time and never yields — fixing
                             // itself requires running. Pin the accept
                             // thread and this handler may never start.
-                            if handler_core > 0 {
-                                match melin_app::affinity::pin_to_core(handler_core) {
+                            if handler.is_pinned() {
+                                match melin_app::affinity::pin_to_core(handler.core) {
                                     Ok(c) => tracing::info!(
                                         core = c,
                                         slot = slot_idx,
@@ -365,7 +365,7 @@ pub fn run_sender<A: Application>(
                                 slot_idx,
                                 batch_size,
                                 heartbeat_secs,
-                                wait,
+                                wait: handler.wait,
                                 replicas_connected: connected_ref,
                                 authenticated: &slot_authenticated,
                             };

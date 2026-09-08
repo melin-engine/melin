@@ -26,7 +26,7 @@ use melin_journal::JournalError;
 use melin_journal::JournalWrite;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
-    InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline,
+    InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline, StageWaits,
     build_pipeline_with_replication,
 };
 /// Internal alias for the disruptor-built pipeline, used only by
@@ -45,6 +45,13 @@ use melin_app::decoder::RequestDecoder;
 use melin_app::encoder::ResponseEncoder;
 use melin_pipeline::ring::Consumer;
 use melin_pipeline::wait::WaitStrategy;
+
+/// How the orchestrator (main) thread waits on pipeline threads during
+/// startup — the seed drain and the promotion epoch bump. It is unpinned
+/// and on no latency path, so it yields whatever the layout says: a
+/// spinner without a core of its own is the co-location bug with the
+/// victim chosen by the scheduler.
+const ORCHESTRATOR_WAIT: WaitStrategy = WaitStrategy::SpinThenYield;
 
 /// Output-slot sugar parameterised on the application — saves spelling
 /// `<A::Report, A::QueryResponse>` at every pipeline-facing signature
@@ -137,6 +144,13 @@ pub struct ServerConfig {
     /// journal-disk pins the thread that writes and syncs the journal; give it
     /// a core on the same CCD as journal, since the two exchange a cache line
     /// per batch.
+    ///
+    /// Each entry may carry a suffix saying how that thread waits: `7`
+    /// (or `7s`) busy-spins and needs the core to itself, `7y` spins
+    /// briefly then yields and may share the core with other `y`
+    /// threads. `0` (unpinned) always yields. Two threads on one core
+    /// where either busy-spins is refused at startup — they would starve
+    /// each other. journal-prep never busy-waits and takes no suffix.
     #[arg(long, default_value = "1,2,3,4,5,6,7,8,9,10,11", value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
@@ -307,14 +321,16 @@ pub struct ServerConfig {
     #[arg(long, value_enum, default_value_t = crate::ack_policy::AckPolicy::DiskAndRam)]
     pub ack_policy: crate::ack_policy::AckPolicy,
 
-    /// Yield to the OS scheduler when pipeline threads are idle instead
-    /// of busy-spinning. Use on shared machines without isolated cores to
-    /// avoid starving other processes — or each other, when two pipeline
-    /// threads share a core. Covers every wait in the pipeline: consumers
+    /// Make every pipeline thread yield to the OS scheduler when idle
+    /// instead of busy-spinning — shorthand for a `y` suffix on every
+    /// `--cores` entry, and it wins over any suffix given. Use on shared
+    /// machines without isolated cores to avoid starving other processes,
+    /// or each other. Covers every wait in the pipeline: consumers
     /// polling an empty ring, producers blocked on a full one, and the
     /// response stage's durability gate. Default (no flag) is busy-spin,
-    /// which gives lowest latency on isolated cores (isolcpus). See
-    /// [`ServerConfig::wait_strategy`].
+    /// which gives lowest latency on isolated cores (isolcpus). To mix
+    /// the two, leave this off and suffix the sharing threads in
+    /// `--cores` instead.
     #[arg(long, default_value_t = false)]
     pub yield_idle: bool,
 
@@ -512,16 +528,16 @@ impl Default for ServerConfig {
             journal: PathBuf::from("melin.journal"),
             snapshot: None,
             cores: PipelineCores {
-                journal: 1,
-                matching: 2,
-                response: 3,
-                reader: 4,
-                event_publisher: 6,
-                shadow: 7,
-                repl_handler_0: 8,
-                repl_handler_1: 9,
-                journal_prep: 10,
-                journal_disk: 11,
+                journal: Placement::spinning(1),
+                matching: Placement::spinning(2),
+                response: Placement::spinning(3),
+                reader: Placement::spinning(4),
+                event_publisher: Placement::spinning(6),
+                shadow: Placement::spinning(7),
+                repl_handler_0: Placement::spinning(8),
+                repl_handler_1: Placement::spinning(9),
+                journal_prep: Placement::yielding(10),
+                journal_disk: Placement::spinning(11),
             },
             group_commit_us: 0,
             heartbeat_interval_secs: 10,
@@ -615,64 +631,207 @@ impl ServerConfig {
         }
     }
 
-    /// How every pipeline thread waits on the thread it depends on —
-    /// the one place `--yield-idle` is turned into a policy. Every ring
-    /// producer, every stage loop, and every startup drain takes its
-    /// strategy from here, so there is no wait in the process that the
-    /// flag does not reach.
-    pub fn wait_strategy(&self) -> WaitStrategy {
-        if self.yield_idle {
-            WaitStrategy::SpinThenYield
+    /// The per-thread layout this node actually runs: `--cores` with
+    /// `--yield-idle` applied on top, checked for threads that would
+    /// starve each other. The one place the two flags are combined —
+    /// every spawn site reads the result, so no thread can wait under a
+    /// policy the operator did not ask for.
+    ///
+    /// An `Err` is a configuration the node refuses to start with.
+    pub fn resolved_cores(&self) -> Result<PipelineCores, String> {
+        let cores = if self.yield_idle {
+            self.cores.all_yielding()
         } else {
-            WaitStrategy::BusySpin
-        }
+            self.cores
+        };
+        cores.validate()?;
+        Ok(cores)
     }
 }
 
-/// Core assignments for pipeline threads.
+/// Where one pipeline thread runs and how it waits there.
+///
+/// The two are one value because they constrain each other: a thread
+/// that busy-spins needs a core to itself, and a thread with no core of
+/// its own (`core == 0`, the unpinned sentinel) can only ever yield — a
+/// spinner the scheduler is free to place is the co-location bug with
+/// the victim chosen at random. [`PipelineCores::validate`] enforces the
+/// cross-thread half of that rule; the constructors here enforce the
+/// per-thread half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// Logical CPU to pin to. `0` = unpinned (OS scheduled).
+    pub core: usize,
+    /// How the thread waits when it has nothing to do.
+    pub wait: WaitStrategy,
+}
+
+impl Placement {
+    /// Pinned to `core` and busy-spinning: the thread owns that core.
+    /// A `core` of `0` cannot spin — see the type docs — so this yields
+    /// the unpinned placement instead.
+    pub const fn spinning(core: usize) -> Self {
+        if core == 0 {
+            Self::unpinned()
+        } else {
+            Self {
+                core,
+                wait: WaitStrategy::BusySpin,
+            }
+        }
+    }
+
+    /// Pinned to `core`, spinning briefly then yielding: the thread may
+    /// share that core with other yielding threads.
+    pub const fn yielding(core: usize) -> Self {
+        Self {
+            core,
+            wait: WaitStrategy::SpinThenYield,
+        }
+    }
+
+    /// No core of its own, left to the OS scheduler — and therefore
+    /// yielding.
+    pub const fn unpinned() -> Self {
+        Self::yielding(0)
+    }
+
+    /// Whether this thread is pinned to a core (`core != 0`).
+    pub fn is_pinned(&self) -> bool {
+        self.core != 0
+    }
+}
+
+/// Core assignments for pipeline threads, each with its wait policy.
 ///
 /// All fields are always stored; event-publisher is only used when
 /// `--event-bind` is set, and shadow only when `--snapshot-interval-ms` > 0.
 /// repl-handler-0/1 are spawned on replica connect, not at startup.
-/// 0 = unpinned (OS scheduled) for any field.
-#[derive(Debug, Clone, Copy)]
+/// A `core` of 0 = unpinned (OS scheduled) for any field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineCores {
-    pub journal: usize,
-    pub matching: usize,
-    pub response: usize,
+    pub journal: Placement,
+    pub matching: Placement,
+    pub response: Placement,
     /// io_uring reader thread (TCP) or DPDK poll thread.
-    pub reader: usize,
+    pub reader: Placement,
     // There is no field for the fifth `--cores` entry. It once pinned the
     // replication accept thread (`repl-accept`), which does no work worth
     // a core — it accepts connections, reaps finished handlers, and
     // sleeps. `parse_cores` validates that position and discards it, so
     // existing `--cores` values keep every other entry's meaning; the
     // replica data path is pinned by `repl_handler_0`/`repl_handler_1`.
-    pub event_publisher: usize,
-    pub shadow: usize,
-    /// Core for replication handler thread 0. 0 = unpinned (OS scheduled).
-    pub repl_handler_0: usize,
-    /// Core for replication handler thread 1. 0 = unpinned (OS scheduled).
-    pub repl_handler_1: usize,
-    /// Core for the journal segment preparer (background staging of the
-    /// next segment). 0 = unpinned (OS scheduled). Optional tenth entry
-    /// of `--cores` — omitted (9-entry) values leave it unpinned so
-    /// existing explicit configurations keep their exact behavior.
-    pub journal_prep: usize,
-    /// Core for the journal disk thread — the half that writes, syncs,
-    /// and publishes durability. 0 = unpinned (OS scheduled). Optional
-    /// eleventh entry of `--cores`, same compatibility rule as
-    /// `journal_prep`.
+    pub event_publisher: Placement,
+    pub shadow: Placement,
+    /// Replication handler thread 0.
+    pub repl_handler_0: Placement,
+    /// Replication handler thread 1.
+    pub repl_handler_1: Placement,
+    /// The journal segment preparer (background staging of the next
+    /// segment). Optional tenth entry of `--cores` — omitted (9-entry)
+    /// values leave it unpinned so existing explicit configurations
+    /// keep their exact behavior.
     ///
-    /// Unlike the preparer this is a hot-path thread: it busy-spins
-    /// waiting for batches, and the durability cursors every ack gates
-    /// on are published from it. Place it on the same CCD as `journal`
-    /// — the hand-off bounces a cache line between the two on every
-    /// batch, and a cross-CCD transfer costs ~100 ns of that.
-    pub journal_disk: usize,
+    /// Its wait policy is always yielding: the preparer blocks in file
+    /// I/O and sleeps between attempts, it never polls a ring. It is
+    /// carried here so the layout check knows it is harmless to share a
+    /// core with.
+    pub journal_prep: Placement,
+    /// The journal disk thread — the half that writes, syncs, and
+    /// publishes durability. Optional eleventh entry of `--cores`, same
+    /// compatibility rule as `journal_prep`.
+    ///
+    /// Unlike the preparer this is a hot-path thread: it polls for
+    /// batches, and the durability cursors every ack gates on are
+    /// published from it. Place it on the same CCD as `journal` — the
+    /// hand-off bounces a cache line between the two on every batch,
+    /// and a cross-CCD transfer costs ~100 ns of that.
+    pub journal_disk: Placement,
 }
 
 impl PipelineCores {
+    /// Every thread with its name, in `--cores` order — the one list the
+    /// layout check and its error messages iterate.
+    fn named(&self) -> [(&'static str, Placement); 10] {
+        [
+            ("journal", self.journal),
+            ("matching", self.matching),
+            ("response", self.response),
+            ("reader", self.reader),
+            ("event-publisher", self.event_publisher),
+            ("shadow", self.shadow),
+            ("repl-handler-0", self.repl_handler_0),
+            ("repl-handler-1", self.repl_handler_1),
+            ("journal-prep", self.journal_prep),
+            ("journal-disk", self.journal_disk),
+        ]
+    }
+
+    /// The per-stage policies the pipeline builders take, drawn from the
+    /// threads that own each stage: the reader produces into the input
+    /// ring, the journal thread feeds the write and replication rings,
+    /// matching produces into the output ring.
+    pub fn stage_waits(&self) -> StageWaits {
+        StageWaits {
+            ingress: self.reader.wait,
+            journal: self.journal.wait,
+            matching: self.matching.wait,
+        }
+    }
+
+    /// The same layout with every thread yielding — what `--yield-idle`
+    /// means.
+    pub fn all_yielding(self) -> Self {
+        let y = |p: Placement| Placement::yielding(p.core);
+        Self {
+            journal: y(self.journal),
+            matching: y(self.matching),
+            response: y(self.response),
+            reader: y(self.reader),
+            event_publisher: y(self.event_publisher),
+            shadow: y(self.shadow),
+            repl_handler_0: y(self.repl_handler_0),
+            repl_handler_1: y(self.repl_handler_1),
+            journal_prep: y(self.journal_prep),
+            journal_disk: y(self.journal_disk),
+        }
+    }
+
+    /// Refuse a layout in which threads would starve each other: two
+    /// threads pinned to the same core where either one busy-spins.
+    ///
+    /// Checked over every entry, whether or not today's flags spawn that
+    /// thread — a layout is meant to be right independent of which
+    /// features are on, and the message names the threads and the core
+    /// so the fix is obvious. Two yielding threads on one core is the
+    /// supported way to run on a small box and passes. Unpinned threads
+    /// (`core == 0`) always yield by construction and are not compared.
+    pub fn validate(&self) -> Result<(), String> {
+        let named = self.named();
+        for (i, (name_a, a)) in named.iter().enumerate() {
+            if !a.is_pinned() {
+                continue;
+            }
+            for (name_b, b) in &named[i + 1..] {
+                if a.core != b.core {
+                    continue;
+                }
+                let spinner = match (a.wait, b.wait) {
+                    (WaitStrategy::BusySpin, _) => name_a,
+                    (_, WaitStrategy::BusySpin) => name_b,
+                    _ => continue,
+                };
+                return Err(format!(
+                    "--cores: {name_a} and {name_b} share core {} but {spinner} busy-spins; \
+                     a busy-spinning thread needs the core to itself. Give one of them \
+                     another core, or suffix both with `y` so they yield when idle",
+                    a.core
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Compact pipeline layout that fits on `num_cpus` physical+logical
     /// cores while reserving one core for an external client (bench or
     /// reader). Used by the embedded bench so it doesn't HT-collide with
@@ -696,32 +855,87 @@ impl PipelineCores {
             ));
         }
         let cores = PipelineCores {
-            journal: 1,
-            matching: 2,
-            response: 3,
-            reader: 4,
-            event_publisher: 5,
-            shadow: 6,
-            // repl handlers not spawned in compact; 0 = unpinned.
-            repl_handler_0: 0,
-            repl_handler_1: 0,
+            journal: Placement::spinning(1),
+            matching: Placement::spinning(2),
+            response: Placement::spinning(3),
+            reader: Placement::spinning(4),
+            event_publisher: Placement::spinning(5),
+            shadow: Placement::spinning(6),
+            // repl handlers not spawned in compact; unpinned.
+            repl_handler_0: Placement::unpinned(),
+            repl_handler_1: Placement::unpinned(),
             // Preparer unpinned in compact — the embedded bench doesn't
             // rotate at production cadence, and raising compact's core
             // minimum for it isn't worth a core.
-            journal_prep: 0,
+            journal_prep: Placement::unpinned(),
             // The disk thread IS hot, but compact exists for boxes that
-            // cannot spare a core per stage. Unpinned it floats on the
-            // shared mask at SCHED_OTHER — it still spins, so it still
-            // makes progress; it just competes for the core it lands on.
-            // Give it entry 11 on any box with the cores to spare.
-            journal_disk: 0,
+            // cannot spare a core per stage. Unpinned, it yields like
+            // every thread without a core of its own: on a box with an
+            // idle core to land on that costs one `sched_yield` per
+            // poll, not a timeslice. Give it entry 11 on any box with
+            // the cores to spare.
+            journal_disk: Placement::unpinned(),
         };
         Ok((cores, 7))
     }
 }
 
+/// Renders the layout in `--cores` syntax, suffixes included, so what
+/// the node logs at boot can be pasted straight back onto a command
+/// line. The retired fifth position prints as `0`.
+impl std::fmt::Display for PipelineCores {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entry = |p: Placement| match (p.core, p.wait) {
+            (0, _) => "0".to_string(),
+            (core, WaitStrategy::BusySpin) => core.to_string(),
+            (core, WaitStrategy::SpinThenYield) => format!("{core}y"),
+        };
+        write!(
+            f,
+            "{},{},{},{},0,{},{},{},{},{},{}",
+            entry(self.journal),
+            entry(self.matching),
+            entry(self.response),
+            entry(self.reader),
+            entry(self.event_publisher),
+            entry(self.shadow),
+            entry(self.repl_handler_0),
+            entry(self.repl_handler_1),
+            // The preparer takes no suffix — its entry is a core only.
+            self.journal_prep.core,
+            entry(self.journal_disk),
+        )
+    }
+}
+
+/// Parse one `--cores` entry: a core ID with an optional wait suffix.
+///
+/// `7` and `7s` busy-spin, `7y` spins then yields, `0`/`0y` is unpinned
+/// (and yields — see [`Placement`]). `0s` is refused: it asks for a
+/// spinner with no core to spin on.
+fn parse_placement(entry: &str) -> Result<Placement, String> {
+    let (digits, suffix) = match entry.as_bytes().last() {
+        Some(b'y') => (&entry[..entry.len() - 1], Some(WaitStrategy::SpinThenYield)),
+        Some(b's') => (&entry[..entry.len() - 1], Some(WaitStrategy::BusySpin)),
+        _ => (entry, None),
+    };
+    let core = digits
+        .parse::<usize>()
+        .map_err(|_| format!("invalid core ID: {entry}"))?;
+    match (core, suffix) {
+        (0, Some(WaitStrategy::BusySpin)) => Err(format!(
+            "invalid core entry `{entry}`: 0 means unpinned, and a thread without a core \
+             of its own cannot busy-spin"
+        )),
+        (0, _) => Ok(Placement::unpinned()),
+        (core, Some(WaitStrategy::SpinThenYield)) => Ok(Placement::yielding(core)),
+        (core, _) => Ok(Placement::spinning(core)),
+    }
+}
+
 /// Parse "j,m,r,rd,rs,ep,sh,h0,h1[,jp[,jd]]" into `PipelineCores` for
-/// pipeline core affinity.
+/// pipeline core affinity. Each entry takes the suffix described at
+/// [`parse_placement`].
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
     // 9 to 11 entries: journal-prep (tenth) and journal-disk (eleventh)
@@ -736,27 +950,40 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
             parts.len()
         ));
     }
-    let parse = |p: &str| {
-        p.parse::<usize>()
-            .map_err(|_| format!("invalid core ID: {p}"))
-    };
     // The fifth entry is the retired replication-accept core: validated,
     // then dropped. Validating it still matters — a typo there would
     // otherwise pass silently, and an operator who shifted their list by
     // one should hear about it rather than have every later thread land
     // on the wrong core.
-    parse(parts[4])?;
+    parse_placement(parts[4])?;
+    // The preparer never busy-waits (it blocks in I/O), so its entry is
+    // a core and nothing else: a `y` is redundant and an `s` asks for
+    // something the thread cannot do.
+    let journal_prep = match parts.get(9) {
+        None => Placement::unpinned(),
+        Some(entry) if entry.ends_with('s') => {
+            return Err(format!(
+                "invalid journal-prep entry `{entry}`: the preparer never busy-waits and \
+                 takes no `s` suffix"
+            ));
+        }
+        Some(entry) => Placement::yielding(parse_placement(entry)?.core),
+    };
     Ok(PipelineCores {
-        journal: parse(parts[0])?,
-        matching: parse(parts[1])?,
-        response: parse(parts[2])?,
-        reader: parse(parts[3])?,
-        event_publisher: parse(parts[5])?,
-        shadow: parse(parts[6])?,
-        repl_handler_0: parse(parts[7])?,
-        repl_handler_1: parse(parts[8])?,
-        journal_prep: parts.get(9).map(|p| parse(p)).transpose()?.unwrap_or(0),
-        journal_disk: parts.get(10).map(|p| parse(p)).transpose()?.unwrap_or(0),
+        journal: parse_placement(parts[0])?,
+        matching: parse_placement(parts[1])?,
+        response: parse_placement(parts[2])?,
+        reader: parse_placement(parts[3])?,
+        event_publisher: parse_placement(parts[5])?,
+        shadow: parse_placement(parts[6])?,
+        repl_handler_0: parse_placement(parts[7])?,
+        repl_handler_1: parse_placement(parts[8])?,
+        journal_prep,
+        journal_disk: parts
+            .get(10)
+            .map(|p| parse_placement(p))
+            .transpose()?
+            .unwrap_or(Placement::unpinned()),
     })
 }
 
@@ -926,6 +1153,14 @@ where
     L: BlockingTransportListener,
 {
     warn_if_chain_disabled();
+
+    // The layout every spawn site below reads: `--yield-idle` folded in,
+    // and refused outright if two threads would starve each other.
+    let config = ServerConfig {
+        cores: config.resolved_cores()?,
+        ..config
+    };
+    info!(cores = %config.cores, "pipeline layout");
 
     // Shared ack-policy atomic, constructed once per process and
     // threaded through both roles. Wiring it on the replica path
@@ -1102,7 +1337,6 @@ where
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
-            config.wait_strategy(),
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
@@ -1492,7 +1726,7 @@ where
         enable_replication,
         config.max_journal_batch,
         config.replication_ring_size,
-        config.wait_strategy(),
+        config.cores.stage_waits(),
         enable_event_publisher,
         enable_shadow,
         Arc::clone(&fence_state),
@@ -1545,9 +1779,10 @@ where
     let mut journal_stage = journal_stage;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
-    journal_stage.set_preparer_core(config.cores.journal_prep);
+    journal_stage.set_preparer_core(config.cores.journal_prep.core);
     journal_stage.set_staging_mode(config.journal_staging_mode.into());
-    journal_stage.set_disk_core(config.cores.journal_disk);
+    journal_stage.set_disk_core(config.cores.journal_disk.core);
+    journal_stage.set_disk_wait(config.cores.journal_disk.wait);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
@@ -1574,7 +1809,7 @@ where
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("journal", cores.journal);
+            melin_app::affinity::pin_thread("journal", cores.journal.core);
             let result = journal_stage.run(&s1);
             let was_shutdown = shutdown_for_journal.load(Ordering::Relaxed);
             match &result {
@@ -1591,7 +1826,7 @@ where
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("matching", cores.matching);
+            melin_app::affinity::pin_thread("matching", cores.matching.core);
             let app = matching_stage.run(&s2);
             let was_shutdown = shutdown_for_matching.load(Ordering::Relaxed);
             if was_shutdown {
@@ -1627,14 +1862,13 @@ where
     let ack_policy_response = Arc::clone(&ack_policy_atomic);
     let s3 = Arc::clone(&shutdown);
     let shutdown_for_response = Arc::clone(&shutdown);
-    let wait = config.wait_strategy();
     let response_utilization_thread = Arc::clone(&response_utilization);
     let response_fence = Arc::clone(&fence_state);
     let active_connections_response = Arc::clone(&active_connections);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("response", cores.response);
+            melin_app::affinity::pin_thread("response", cores.response.core);
             crate::response::run::<A>(
                 output_consumer,
                 control_rx,
@@ -1644,7 +1878,7 @@ where
                     replication_metrics: replication_metrics_response,
                     replica_active: replica_active_response,
                     heartbeat_interval,
-                    wait,
+                    wait: cores.response.wait,
                     utilization: response_utilization_thread,
                     encoder,
                     fence_state: response_fence,
@@ -1716,7 +1950,7 @@ where
         let repl_metrics = replication_metrics
             .clone()
             .ok_or("replication_metrics must be Some when replication is enabled")?;
-        let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
+        let handlers = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
         let sender_ack_policy = Arc::clone(&ack_policy_atomic);
         // Bound in `run_impl` before any pipeline thread was spawned —
@@ -1759,10 +1993,9 @@ where
                         evict_flags,
                         active_flags,
                         metrics: repl_metrics,
-                        handler_cores,
+                        handlers,
                         batch_size,
                         heartbeat_secs,
-                        wait,
                         fence_state: sender_fence,
                         ack_policy: sender_ack_policy,
                     },
@@ -1793,7 +2026,6 @@ where
         &cores,
         &authorized_keys,
         &shutdown,
-        wait,
     )?;
 
     let shadow_handle = spawn_shadow_stage::<A>(
@@ -1803,7 +2035,6 @@ where
         config,
         &cores,
         &shutdown,
-        wait,
         fence_state.epoch(),
     )?;
 
@@ -1916,7 +2147,7 @@ where
             // Waits on the stage threads, which may share this thread's
             // core on a small box — so through the wait strategy, never
             // a bare spin.
-            wait.wait_until(|| {
+            ORCHESTRATOR_WAIT.wait_until(|| {
                 shutdown.load(std::sync::atomic::Ordering::Relaxed)
                     || (journal_cursor
                         .get()
@@ -1940,7 +2171,7 @@ where
                         continue;
                     }
                     let target = ring_progress.producer_cursors[i].load();
-                    wait.wait_until(|| {
+                    ORCHESTRATOR_WAIT.wait_until(|| {
                         shutdown.load(std::sync::atomic::Ordering::Relaxed)
                             || ring_progress.consumer_cursors[i]
                                 .get()
@@ -2023,7 +2254,8 @@ where
         // Wait until the matching stage observes the bump (epoch raised) so
         // the node advertises `new_epoch` on the very first handshake. Bounded
         // by the shutdown flag so a stuck pipeline can't wedge startup.
-        wait.wait_until(|| fence_state.epoch() >= new_epoch || shutdown.load(Ordering::Relaxed));
+        ORCHESTRATOR_WAIT
+            .wait_until(|| fence_state.epoch() >= new_epoch || shutdown.load(Ordering::Relaxed));
     }
 
     // Now that seeding is fully drained, spawn the reader thread. From here
@@ -2039,7 +2271,7 @@ where
         input_producer,
         decoder,
         control_tx.clone(),
-        config.cores.reader,
+        config.cores.reader.core,
         connection_timeout,
         config.tick_interval(),
         Arc::clone(&reader_shutdown),
@@ -2354,6 +2586,13 @@ where
 {
     warn_if_chain_disabled();
 
+    // As on the kernel-TCP path: resolve the layout once, up front.
+    let config = ServerConfig {
+        cores: config.resolved_cores()?,
+        ..config
+    };
+    info!(cores = %config.cores, "pipeline layout");
+
     // Mirrors the kernel-TCP `run` path: one atomic per
     // process, threaded into both replica (pre-staging for promotion)
     // and primary admin listeners.
@@ -2515,7 +2754,6 @@ where
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
-            config.wait_strategy(),
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
@@ -2696,7 +2934,7 @@ where
         enable_replication,
         config.max_journal_batch,
         config.replication_ring_size,
-        config.wait_strategy(),
+        config.cores.stage_waits(),
         enable_event_publisher,
         enable_shadow,
         Arc::clone(&fence_state),
@@ -2733,7 +2971,8 @@ where
     // connection_id bits 56..63.
     let mut tx_producers = Vec::with_capacity(num_dpdk_threads);
     let mut tx_consumers = Vec::with_capacity(num_dpdk_threads);
-    let wait = config.wait_strategy();
+    // The response thread produces into these, so they wait its way.
+    let wait = config.cores.response.wait;
     for _ in 0..num_dpdk_threads {
         let (tx_out, tx_rx) =
             melin_pipeline::spsc::channel::<crate::dpdk_response::TxFrame>(4096, wait);
@@ -2764,9 +3003,10 @@ where
         .transpose()?;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
-    journal_stage.set_preparer_core(config.cores.journal_prep);
+    journal_stage.set_preparer_core(config.cores.journal_prep.core);
     journal_stage.set_staging_mode(config.journal_staging_mode.into());
-    journal_stage.set_disk_core(config.cores.journal_disk);
+    journal_stage.set_disk_core(config.cores.journal_disk.core);
+    journal_stage.set_disk_wait(config.cores.journal_disk.wait);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
@@ -2787,7 +3027,7 @@ where
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("journal", cores.journal);
+            melin_app::affinity::pin_thread("journal", cores.journal.core);
             journal_stage.run(&s1)
         })
         .map_err(|e| format!("spawn journal thread: {e}"))?;
@@ -2796,7 +3036,7 @@ where
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("matching", cores.matching);
+            melin_app::affinity::pin_thread("matching", cores.matching.core);
             matching_stage.run(&s2)
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
@@ -2828,7 +3068,7 @@ where
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("response", cores.response);
+            melin_app::affinity::pin_thread("response", cores.response.core);
             crate::dpdk_response::run::<A>(
                 output_consumer,
                 control_rx,
@@ -2854,7 +3094,6 @@ where
         &config,
         &cores,
         &shutdown,
-        wait,
         fence_state.epoch(),
     )?;
 
@@ -3011,7 +3250,7 @@ where
         // Skip when the factory produced no seed events — nothing on the ring.
         if seed_count > 0 {
             let last_seed_seq = last_published_seq + 1;
-            wait.wait_until(|| {
+            ORCHESTRATOR_WAIT.wait_until(|| {
                 shutdown.load(std::sync::atomic::Ordering::Relaxed)
                     || (journal_cursor
                         .get()
@@ -3028,7 +3267,7 @@ where
                         continue;
                     }
                     let target = ring_progress.producer_cursors[i].load();
-                    wait.wait_until(|| {
+                    ORCHESTRATOR_WAIT.wait_until(|| {
                         shutdown.load(std::sync::atomic::Ordering::Relaxed)
                             || ring_progress.consumer_cursors[i]
                                 .get()
@@ -3080,7 +3319,7 @@ where
 
     let connection_timeout = config.connection_timeout();
     let max_conns = config.max_connections;
-    let reader_core = config.cores.reader;
+    let reader_core = config.cores.reader.core;
 
     // Exactly one client poll queue (LMAX: single reader → single matcher).
     // Additional DPDK queues, if any, are dedicated to the replication sender
@@ -3339,7 +3578,6 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
     config: &ServerConfig,
     cores: &PipelineCores,
     shutdown: &Arc<AtomicBool>,
-    wait: WaitStrategy,
     initial_epoch: u64,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>>
 where
@@ -3354,12 +3592,12 @@ where
         chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
     let shadow_ex = shadow_exchange.ok_or("shadow exchange must be Some when shadow is enabled")?;
     let s_shadow = Arc::clone(shutdown);
-    let shadow_core = cores.shadow;
+    let shadow = cores.shadow;
     let shadow_initial_epoch = initial_epoch;
     let handle = std::thread::Builder::new()
         .name("shadow".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("shadow", shadow_core);
+            melin_app::affinity::pin_thread("shadow", shadow.core);
             melin_transport_core::shadow::run(
                 shadow_cons,
                 shadow_ex,
@@ -3367,7 +3605,7 @@ where
                 interval,
                 chain_hash,
                 &s_shadow,
-                wait,
+                shadow.wait,
                 shadow_initial_epoch,
             );
         })
@@ -3456,7 +3694,6 @@ fn spawn_event_publisher<A: Application>(
     cores: &PipelineCores,
     authorized_keys: &Arc<AuthorizedKeys>,
     shutdown: &Arc<AtomicBool>,
-    wait: WaitStrategy,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>>
 where
     A::Report: Send + 'static,
@@ -3470,12 +3707,18 @@ where
         .ok_or("event_bind must be set when event publisher is enabled")?;
     let s_event = Arc::clone(shutdown);
     let event_keys = Arc::clone(authorized_keys);
-    let event_core = cores.event_publisher;
+    let publisher = cores.event_publisher;
     let event_handle = std::thread::Builder::new()
         .name("event-publisher".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("event-publisher", event_core);
-            run_fn(event_consumer, event_bind, event_keys, &s_event, wait);
+            melin_app::affinity::pin_thread("event-publisher", publisher.core);
+            run_fn(
+                event_consumer,
+                event_bind,
+                event_keys,
+                &s_event,
+                publisher.wait,
+            );
         })
         .map_err(|e| format!("spawn event publisher thread: {e}"))?;
     info!(addr = %event_bind, "event publisher started");
@@ -3712,6 +3955,8 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
+    use super::{PipelineCores, Placement, StageWaits, WaitStrategy};
+    use clap::Parser;
     use ed25519_dalek::{Signer, SigningKey};
     use melin_app::auth::AuthorizedKeys;
     use melin_app::auth::Permission;
@@ -3762,17 +4007,29 @@ mod tests {
     #[test]
     fn parse_cores_accepts_nine_through_eleven_entries() {
         let nine = super::parse_cores("1,2,3,4,5,6,7,8,9").expect("9 entries must parse");
-        assert_eq!(nine.journal_prep, 0, "omitted journal-prep = unpinned");
-        assert_eq!(nine.journal_disk, 0, "omitted journal-disk = unpinned");
-        assert_eq!(nine.repl_handler_1, 9);
+        assert_eq!(
+            nine.journal_prep,
+            Placement::unpinned(),
+            "omitted journal-prep = unpinned"
+        );
+        assert_eq!(
+            nine.journal_disk,
+            Placement::unpinned(),
+            "omitted journal-disk = unpinned"
+        );
+        assert_eq!(nine.repl_handler_1.core, 9);
 
         let ten = super::parse_cores("1,2,3,4,5,6,7,8,9,10").expect("10 entries must parse");
-        assert_eq!(ten.journal_prep, 10);
-        assert_eq!(ten.journal_disk, 0, "omitted journal-disk = unpinned");
+        assert_eq!(ten.journal_prep.core, 10);
+        assert_eq!(
+            ten.journal_disk,
+            Placement::unpinned(),
+            "omitted journal-disk = unpinned"
+        );
 
         let eleven = super::parse_cores("1,2,3,4,5,6,7,8,9,10,11").expect("11 entries must parse");
-        assert_eq!(eleven.journal_prep, 10);
-        assert_eq!(eleven.journal_disk, 11);
+        assert_eq!(eleven.journal_prep.core, 10);
+        assert_eq!(eleven.journal_disk.core, 11);
 
         assert!(super::parse_cores("1,2,3").is_err());
         assert!(super::parse_cores("1,2,3,4,5,6,7,8,9,10,11,12").is_err());
@@ -3787,19 +4044,188 @@ mod tests {
         // A distinctive value in position five that must not surface
         // anywhere in the result.
         let cores = super::parse_cores("1,2,3,4,99,6,7,8,9,10,11").expect("11 entries must parse");
-        assert_eq!(cores.journal, 1);
-        assert_eq!(cores.matching, 2);
-        assert_eq!(cores.response, 3);
-        assert_eq!(cores.reader, 4);
+        assert_eq!(cores.journal.core, 1);
+        assert_eq!(cores.matching.core, 2);
+        assert_eq!(cores.response.core, 3);
+        assert_eq!(cores.reader.core, 4);
         assert_eq!(
-            cores.event_publisher, 6,
+            cores.event_publisher.core, 6,
             "sixth entry stays event-publisher"
         );
-        assert_eq!(cores.shadow, 7);
-        assert_eq!(cores.repl_handler_0, 8);
-        assert_eq!(cores.repl_handler_1, 9);
-        assert_eq!(cores.journal_prep, 10);
-        assert_eq!(cores.journal_disk, 11);
+        assert_eq!(cores.shadow.core, 7);
+        assert_eq!(cores.repl_handler_0.core, 8);
+        assert_eq!(cores.repl_handler_1.core, 9);
+        assert_eq!(cores.journal_prep.core, 10);
+        assert_eq!(cores.journal_disk.core, 11);
+    }
+
+    /// A bare core busy-spins (the production default, and what every
+    /// existing `--cores` value means), `y` yields, `s` spells the
+    /// default out, and `0` is unpinned — which can only yield.
+    #[test]
+    fn parse_placement_reads_the_wait_suffix() {
+        assert_eq!(super::parse_placement("7"), Ok(Placement::spinning(7)));
+        assert_eq!(super::parse_placement("7s"), Ok(Placement::spinning(7)));
+        assert_eq!(super::parse_placement("7y"), Ok(Placement::yielding(7)));
+        assert_eq!(super::parse_placement("0"), Ok(Placement::unpinned()));
+        assert_eq!(super::parse_placement("0y"), Ok(Placement::unpinned()));
+        assert!(
+            super::parse_placement("0s").is_err(),
+            "a thread with no core of its own cannot busy-spin"
+        );
+        assert!(super::parse_placement("x").is_err());
+        assert!(super::parse_placement("7z").is_err());
+        assert!(super::parse_placement("").is_err());
+    }
+
+    /// The preparer blocks in I/O and never polls, so its entry is a
+    /// core only: it always yields, and asking it to spin is refused
+    /// rather than silently ignored.
+    #[test]
+    fn journal_prep_always_yields() {
+        let cores = super::parse_cores("1,2,3,4,5,6,7,8,9,10,11").expect("parses");
+        assert_eq!(cores.journal_prep, Placement::yielding(10));
+        let explicit = super::parse_cores("1,2,3,4,5,6,7,8,9,10y,11").expect("parses");
+        assert_eq!(explicit.journal_prep, Placement::yielding(10));
+        let err = super::parse_cores("1,2,3,4,5,6,7,8,9,10s,11").expect_err("must refuse");
+        assert!(err.contains("journal-prep"), "{err}");
+    }
+
+    /// The layout the whole change exists to refuse: two threads on one
+    /// core where either busy-spins. The message has to name both
+    /// threads, the core, and which one spins, or the operator is left
+    /// guessing which of eleven entries to change.
+    #[test]
+    fn validate_refuses_a_busy_spinner_sharing_a_core() {
+        // Two spinners.
+        let err = super::parse_cores("1,1,3,4,0,6,7,8,9")
+            .expect("parses")
+            .validate()
+            .expect_err("two spinners on core 1 must be refused");
+        assert!(err.contains("journal"), "{err}");
+        assert!(err.contains("matching"), "{err}");
+        assert!(err.contains("core 1"), "{err}");
+
+        // A spinner next to a yielder: the yielder would still starve.
+        let err = super::parse_cores("1,2,3,4,0,7,7y,8,9")
+            .expect("parses")
+            .validate()
+            .expect_err("a spinner sharing with a yielder must be refused");
+        assert!(err.contains("event-publisher"), "{err}");
+        assert!(err.contains("shadow"), "{err}");
+        assert!(err.contains("event-publisher busy-spins"), "{err}");
+
+        // The disk thread sharing the journal's core is the same mistake.
+        let err = super::parse_cores("1,2,3,4,0,6,7,8,9,10,1")
+            .expect("parses")
+            .validate()
+            .expect_err("journal-disk on the journal's core must be refused");
+        assert!(err.contains("journal-disk"), "{err}");
+    }
+
+    /// The supported ways to share: two yielders on one core, the
+    /// preparer (which never spins) next to anything, and unpinned
+    /// threads, which are not on any core to collide on.
+    #[test]
+    fn validate_allows_yielders_to_share_and_ignores_unpinned() {
+        super::parse_cores("1,2,3,4,0,7y,7y,7y,7y,7,7y")
+            .expect("parses")
+            .validate()
+            .expect("yielders and the preparer may share core 7");
+        super::parse_cores("0,0,0,0,0,0,0,0,0")
+            .expect("parses")
+            .validate()
+            .expect("every thread unpinned is a valid (test) layout");
+        super::parse_cores("1,2,3,4,0,6,6y,0,0")
+            .expect("parses")
+            .validate()
+            .expect_err("6 and 6y is still a spinner sharing a core");
+    }
+
+    /// The layouts the runtime ships must pass their own check.
+    #[test]
+    fn shipped_layouts_validate() {
+        super::ServerConfig::default()
+            .cores
+            .validate()
+            .expect("default layout");
+        let (compact, _) = PipelineCores::compact(16).expect("compact fits 16 cores");
+        compact.validate().expect("compact layout");
+        assert_eq!(
+            compact.journal_disk,
+            Placement::unpinned(),
+            "compact leaves the disk thread unpinned, hence yielding"
+        );
+    }
+
+    /// `--yield-idle` is shorthand for a `y` on every entry, and it is
+    /// applied before the check — so the packed layouts the test suite
+    /// runs with keep working under the flag alone.
+    #[test]
+    fn resolved_cores_folds_in_yield_idle_before_checking() {
+        let packed = ["melin-server", "--cores", "1,1,1,1,0,1,1,1,1"];
+        let spinning = super::ServerConfig::try_parse_from(packed).expect("parses");
+        assert!(
+            spinning.resolved_cores().is_err(),
+            "nine spinners on core 1 must be refused"
+        );
+
+        let mut yielding = spinning;
+        yielding.yield_idle = true;
+        let cores = yielding
+            .resolved_cores()
+            .expect("--yield-idle makes the packed layout legal");
+        assert_eq!(cores.journal, Placement::yielding(1));
+        assert_eq!(cores.journal_disk, Placement::unpinned());
+        assert_eq!(cores, cores.all_yielding(), "every thread yields");
+    }
+
+    /// What the node logs at boot is the layout in `--cores` syntax, so
+    /// an operator can copy it back verbatim — which holds only if the
+    /// rendering round-trips through the parser, suffixes and all.
+    #[test]
+    fn layout_display_round_trips_through_parse_cores() {
+        for input in [
+            "1,2,3,4,0,6,7,8,9,10,11",
+            "1,2,3,4,0,5y,5y,5y,5y,5,5y",
+            "0,0,0,0,0,0,0,0,0",
+            "1y,2y,3y,4y,0,0,0,0,0,0,7y",
+        ] {
+            let cores = super::parse_cores(input).expect("parses");
+            let rendered = cores.to_string();
+            let reparsed = super::parse_cores(&rendered).expect("rendering parses");
+            assert_eq!(reparsed, cores, "{input} -> {rendered}");
+        }
+        assert_eq!(
+            super::ServerConfig::default().cores.to_string(),
+            "1,2,3,4,0,6,7,8,9,10,11"
+        );
+    }
+
+    /// A mixed layout through the CLI: the hot stages spin on their own
+    /// cores, everything else shares one core and yields.
+    #[test]
+    fn mixed_layout_parses_and_resolves() {
+        let config = super::ServerConfig::try_parse_from([
+            "melin-server",
+            "--cores",
+            "1,2,3,4,0,5y,5y,5y,5y,5,5y",
+        ])
+        .expect("parses");
+        let cores = config.resolved_cores().expect("a legal mixed layout");
+        assert_eq!(cores.journal, Placement::spinning(1));
+        assert_eq!(cores.reader, Placement::spinning(4));
+        assert_eq!(cores.shadow, Placement::yielding(5));
+        assert_eq!(cores.journal_prep, Placement::yielding(5));
+        assert_eq!(cores.journal_disk, Placement::yielding(5));
+        assert_eq!(
+            cores.stage_waits(),
+            StageWaits {
+                ingress: WaitStrategy::BusySpin,
+                journal: WaitStrategy::BusySpin,
+                matching: WaitStrategy::BusySpin,
+            }
+        );
     }
 
     /// Discarded is not unvalidated. A typo in the retired position still
