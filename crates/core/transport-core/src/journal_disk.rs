@@ -55,10 +55,10 @@ use melin_journal::segment_file::SegmentFile;
 use melin_journal::write_ring::{JournalWriteConsumer, JournalWriteMeta};
 use melin_pipeline::padding::Sequence;
 use melin_pipeline::seqlock::SeqLockWriter;
+use melin_pipeline::wait::WaitStrategy;
 
 use crate::cursors::{AdvertisedJournalTip, DurableWireSeqCursor, RingPos, WireSeq};
 use crate::pipeline::FsyncState;
-use melin_pipeline::wait::WaitStrategy;
 
 /// Iovecs per vectored write. Comfortably under every supported
 /// kernel's `IOV_MAX` (1024 on Linux) and at least the write ring's

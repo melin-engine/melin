@@ -575,12 +575,7 @@ where
                         std::time::Duration::from_millis(snapshot_interval_ms),
                         chain_lock,
                         &ps,
-                        // Always yields, whatever the node's strategy —
-                        // unchanged from before the strategy type
-                        // existed. The replica shadow sits on no ack
-                        // path, so it has never been given a spinning
-                        // core.
-                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
+                        wait,
                         shadow_initial_epoch,
                     );
                 })
@@ -623,6 +618,11 @@ pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send
     // attempts and fall through to the flag-only teardown once it
     // trips (the sentinel has no reader then anyway: the matching
     // stage is gated behind the frozen journal cursor).
+    //
+    // Deliberately a plain yield rather than the node's wait strategy:
+    // this is the orchestrator thread on a teardown path, where
+    // latency is irrelevant and handing the CPU to the stage threads
+    // is unconditionally the right move, whatever the node's policy.
     while !handles.journal_failed.load(Ordering::Acquire) {
         match handles
             .input_producer

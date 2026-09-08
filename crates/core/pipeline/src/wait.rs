@@ -91,18 +91,17 @@ impl Waiter {
     /// Wait out one idle iteration.
     #[inline(always)]
     pub fn idle(&mut self) {
+        // Decide from the count *before* this iteration, so that
+        // `spinning()` — which reads the same count — is exactly the
+        // answer to "will the next call spin?".
+        let spin = self.spinning();
         if self.idle < SPIN_BUDGET {
             self.idle += 1;
         }
-        match self.strategy {
-            WaitStrategy::BusySpin => std::hint::spin_loop(),
-            WaitStrategy::SpinThenYield => {
-                if self.idle < SPIN_BUDGET {
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
+        if spin {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
         }
     }
 
@@ -129,16 +128,13 @@ impl Waiter {
     /// Whether the loop has been idle for at least the spin budget —
     /// "sustained idle", under every strategy. Distinct from
     /// [`spinning`](Self::spinning): a `BusySpin` loop is both spinning
-    /// and, once quiet long enough, past its budget.
+    /// and, once quiet long enough, past its budget, whereas under
+    /// `SpinThenYield` the two are never true together — so
+    /// `spinning() && past_spin_budget()` reads as "busy-spinning, and
+    /// has been for a while".
     #[inline(always)]
     pub fn past_spin_budget(&self) -> bool {
         self.idle >= SPIN_BUDGET
-    }
-
-    /// The strategy this waiter was built from.
-    #[inline]
-    pub fn strategy(&self) -> WaitStrategy {
-        self.strategy
     }
 }
 
@@ -153,9 +149,14 @@ mod tests {
         let mut w = WaitStrategy::SpinThenYield.waiter();
         assert!(w.spinning());
         assert!(!w.past_spin_budget());
-        for _ in 0..SPIN_BUDGET {
+        for _ in 0..SPIN_BUDGET - 1 {
             w.idle();
         }
+        assert!(
+            w.spinning(),
+            "one spin left in the budget: the next idle must still spin"
+        );
+        w.idle();
         assert!(!w.spinning(), "budget spent: the next idle must yield");
         assert!(w.past_spin_budget());
         // Further idle iterations keep yielding and must not wrap the

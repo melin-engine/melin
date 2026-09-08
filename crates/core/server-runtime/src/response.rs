@@ -712,10 +712,15 @@ pub fn run<A: Application>(
             // masking it would stretch the one-second heartbeat scan
             // into minutes. `--yield-idle` never masks either: the yield
             // syscall dwarfs a vDSO read.
+            //
+            // "Busy-spinning, and has been for a while": under
+            // spin-then-yield a loop past its budget is no longer
+            // spinning, so the conjunction is only ever true under
+            // `BusySpin`.
             if idle_housekeeping_timer
                 .tick(
                     IDLE_HOUSEKEEPING_INTERVAL,
-                    waiter.strategy() == WaitStrategy::BusySpin && waiter.past_spin_budget(),
+                    waiter.spinning() && waiter.past_spin_budget(),
                 )
                 .is_some()
             {
