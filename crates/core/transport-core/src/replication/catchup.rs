@@ -1268,7 +1268,8 @@ mod drain_into_contiguity_tests {
     }
 
     fn ring() -> (ReplicationProducer, ReplicationConsumer) {
-        let (producer, mut consumers) = build_replication_ring(1, 8);
+        let (producer, mut consumers) =
+            build_replication_ring(1, 8, melin_pipeline::wait::WaitStrategy::SpinThenYield);
         (producer, consumers.pop().expect("one consumer"))
     }
 

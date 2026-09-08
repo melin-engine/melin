@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use melin_pipeline::ring;
 use melin_pipeline::spsc;
+use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::Blocker;
 use melin_app::Application;
@@ -127,7 +128,7 @@ pub fn run<A: Application>(
     active_connections: Arc<AtomicU64>,
     mut tx_producers: Vec<spsc::Producer<TxFrame>>,
     utilization: Arc<StageUtilization>,
-    busy_spin: bool,
+    wait: WaitStrategy,
     encoder: crate::response::ResponseEncoderArc<A>,
 ) {
     // Mirrors `response::run`: derive the local Policy from the shared
@@ -208,10 +209,10 @@ pub fn run<A: Application>(
     let mut last_heartbeat_scan = Instant::now();
     // Gate the heartbeat scan's clock read so the count==0 spin doesn't
     // spend the response thread's CPU on `__vdso_clock_gettime`. Reads
-    // the clock every ~1 M idle iterations under busy_spin; heartbeat
+    // the clock every ~1 M idle iterations while spinning; heartbeat
     // interval is seconds, so this is plenty.
     let mut heartbeat_timer = AmortizedTimer::new();
-    let mut idle_spins: u32 = 0;
+    let mut waiter = wait.waiter();
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
     // Paces accrual ticks inside the gate-wait spin. Function-scoped so
@@ -312,7 +313,7 @@ pub fn run<A: Application>(
             // showed ~22 % of the response thread's CPU on the vDSO.
             if let Some(interval) = heartbeat_interval
                 && heartbeat_timer
-                    .tick(Duration::from_secs(1), busy_spin || idle_spins < 1000)
+                    .tick(Duration::from_secs(1), waiter.spinning())
                     .is_some()
             {
                 let now = Instant::now();
@@ -387,15 +388,10 @@ pub fn run<A: Application>(
                 }
             }
 
-            if busy_spin || idle_spins < 1000 {
-                idle_spins = idle_spins.wrapping_add(1);
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
+            waiter.idle();
             continue;
         }
-        idle_spins = 0;
+        waiter.reset();
         busy_count += 1;
 
         #[cfg(feature = "latency-trace")]
@@ -439,6 +435,8 @@ pub fn run<A: Application>(
             // it was refused.
             if crate::response::slot_needs_gate(slot, cached_durable_pos) {
                 let needed = slot.wire_seq;
+                // Fresh waiter per gate entry — see `response::run`.
+                let mut gate_waiter = wait.waiter();
                 loop {
                     // Observe a policy swap mid-gate-wait so a stuck
                     // batch can be unblocked by an operator
@@ -494,9 +492,9 @@ pub fn run<A: Application>(
 
                     // Accrue degraded time while wedged so a mid-wedge
                     // flip isn't mis-charged by the post-gate tick. The
-                    // clock read stays mask-gated; this loop always spins.
+                    // clock read stays mask-gated while the waiter spins.
                     if gate_accrual_timer
-                        .tick(GATE_ACCRUAL_INTERVAL, true)
+                        .tick(GATE_ACCRUAL_INTERVAL, gate_waiter.spinning())
                         .is_some()
                     {
                         degraded_logger.tick(
@@ -525,7 +523,7 @@ pub fn run<A: Application>(
                         }
                         break;
                     }
-                    std::hint::spin_loop();
+                    gate_waiter.idle();
                 }
             }
 
@@ -826,7 +824,7 @@ mod tests {
             payload: Option<Result<usize, &'static str>>,
             trailer: &[u8],
         ) -> Vec<(u64, Vec<u8>)> {
-            let (mut tx, mut rx) = spsc::channel::<TxFrame>(8);
+            let (mut tx, mut rx) = spsc::channel::<TxFrame>(8, WaitStrategy::SpinThenYield);
             let encode_buf = b"response-body";
             super::super::push_frame(payload, 42, &mut tx, encode_buf, trailer);
             tx.flush();

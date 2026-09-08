@@ -164,7 +164,9 @@ fn run_once<T: BenchSlot>(
     prod_core: Option<usize>,
     cons_core: Option<usize>,
 ) -> f64 {
-    let (mut producer, mut consumers) = DisruptorBuilder::<T>::new(capacity).add_consumer().build();
+    let (mut producer, mut consumers) = DisruptorBuilder::<T>::new(capacity)
+        .add_consumer()
+        .build(melin_pipeline::wait::WaitStrategy::BusySpin);
     let mut consumer = consumers.pop().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_c = Arc::clone(&stop);

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::padding::{CachePadded, Sequence};
+use crate::wait::WaitStrategy;
 
 /// Error returned when the ring buffer is full and the producer cannot publish.
 #[derive(Debug, PartialEq, Eq)]
@@ -108,6 +109,12 @@ pub struct Producer<T> {
     gates: Vec<Arc<Sequence>>,
     /// Cached minimum gate value to avoid reading atomics on every publish.
     cached_gate_min: u64,
+    /// How the blocking publish paths wait for a slow consumer to free a
+    /// slot. Fixed at build time: a ring full of unread entries is a
+    /// wait on the consumer's thread, and whether that thread can run
+    /// while this one spins is a property of the deployment, not of the
+    /// call site.
+    wait: WaitStrategy,
 }
 
 /// Consumer end of the disruptor. Reads entries from the ring buffer.
@@ -177,17 +184,19 @@ impl<T: Copy + Default> Producer<T> {
         Ok(seq)
     }
 
-    /// Publish a value, spinning until space is available.
+    /// Publish a value, waiting (per the ring's [`WaitStrategy`]) until
+    /// space is available.
     pub fn publish(&mut self, value: T) -> u64 {
+        let mut waiter = self.wait.waiter();
         loop {
             match self.try_publish(value) {
                 Ok(seq) => return seq,
-                Err(Full) => std::hint::spin_loop(),
+                Err(Full) => waiter.idle(),
             }
         }
     }
 
-    /// Publish by filling the next slot in place. Spins until space is
+    /// Publish by filling the next slot in place. Waits until space is
     /// available, then runs `f(&mut slot)` directly on the ring entry —
     /// avoiding the byte-copy `publish`/`try_publish` perform when given
     /// a `T` by value.
@@ -201,7 +210,8 @@ impl<T: Copy + Default> Producer<T> {
     /// before consumers observe the advanced cursor.
     pub fn publish_with<F: FnOnce(&mut T)>(&mut self, f: F) -> u64 {
         let capacity = self.shared.buffer.mask + 1;
-        // Spin until space is available (single-producer: seq doesn't move
+        let mut waiter = self.wait.waiter();
+        // Wait until space is available (single-producer: seq doesn't move
         // underneath us).
         loop {
             let seq = self.shared.cursor.get().load(Ordering::Relaxed);
@@ -224,7 +234,7 @@ impl<T: Copy + Default> Producer<T> {
             }
             self.cached_gate_min = min;
             if seq - min >= capacity {
-                std::hint::spin_loop();
+                waiter.idle();
             }
         }
     }
@@ -286,6 +296,13 @@ impl<T: Copy + Default> Producer<T> {
     /// Capacity of the ring buffer.
     pub fn capacity(&self) -> u64 {
         self.shared.buffer.mask + 1
+    }
+
+    /// How this producer's blocking publish paths wait. Wrappers that
+    /// add their own blocking paths on top of [`try_claim`](Self::try_claim)
+    /// wait the same way, so one ring has one policy.
+    pub fn wait_strategy(&self) -> WaitStrategy {
+        self.wait
     }
 
     /// Returns a type-erased handle for reading the producer cursor.
@@ -355,7 +372,7 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
         Ok(seq)
     }
 
-    /// Write the next entry, spinning if the ring is full. When the batch
+    /// Write the next entry, waiting if the ring is full. When the batch
     /// fills the ring, commits the accumulated entries (single release
     /// store), starts a fresh batch at the new cursor, then retries.
     ///
@@ -363,6 +380,7 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
     /// semantics — the caller never observes backpressure.
     pub fn push_with<F: FnOnce(&mut T)>(&mut self, f: F) -> u64 {
         let capacity = self.producer.shared.buffer.mask + 1;
+        let mut waiter = self.producer.wait.waiter();
         loop {
             let seq = self.start_seq + self.count;
 
@@ -389,7 +407,7 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
             }
 
             // Commit accumulated writes so consumers can advance, then
-            // spin for space.
+            // wait for space.
             if self.count > 0 {
                 self.producer
                     .shared
@@ -399,17 +417,17 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
                 self.start_seq += self.count;
                 self.count = 0;
             }
-            std::hint::spin_loop();
+            waiter.idle();
         }
     }
 
     /// [`Self::push_with`] with an escape hatch: when the ring is full
     /// and `abort()` returns true, gives up with `Err(Full)` without
-    /// invoking the closure instead of spinning forever.
+    /// invoking the closure instead of waiting forever.
     ///
     /// A blocked push only completes when a consumer advances its gate
     /// cursor; a consumer that has *died* (e.g. a replica's failed
-    /// journal stage) never will, and the unconditional spin in
+    /// journal stage) never will, and the unconditional wait in
     /// `push_with` would wedge the producer thread permanently. The
     /// predicate is only consulted on the full path — the has-space
     /// fast path pays nothing for it.
@@ -419,6 +437,7 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
         mut abort: impl FnMut() -> bool,
     ) -> Result<u64, Full> {
         let capacity = self.producer.shared.buffer.mask + 1;
+        let mut waiter = self.producer.wait.waiter();
         loop {
             let seq = self.start_seq + self.count;
 
@@ -449,7 +468,7 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
             }
 
             // Commit accumulated writes so consumers can advance, then
-            // spin for space.
+            // wait for space.
             if self.count > 0 {
                 self.producer
                     .shared
@@ -459,7 +478,7 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
                 self.start_seq += self.count;
                 self.count = 0;
             }
-            std::hint::spin_loop();
+            waiter.idle();
         }
     }
 
@@ -882,8 +901,11 @@ impl<T: Copy + Default> DisruptorBuilder<T> {
     /// Build a single-producer disruptor. Returns `(Producer, Vec<Consumer>)`.
     ///
     /// The producer is gated on all terminal consumers (those no other consumer
-    /// depends on) for backpressure.
-    pub fn build(self) -> (Producer<T>, Vec<Consumer<T>>) {
+    /// depends on) for backpressure. `producer_wait` is how its blocking
+    /// publish paths wait when that gate holds them — the consumers carry
+    /// no strategy of their own, since the ring never blocks a consumer;
+    /// the loop that polls it does, with its own [`WaitStrategy`].
+    pub fn build(self, producer_wait: WaitStrategy) -> (Producer<T>, Vec<Consumer<T>>) {
         let gates = self.collect_gates();
         let consumers = self.build_consumers(|| DependencyKind::Producer(Arc::clone(&self.shared)));
 
@@ -891,6 +913,7 @@ impl<T: Copy + Default> DisruptorBuilder<T> {
             shared: Arc::clone(&self.shared),
             gates,
             cached_gate_min: 0,
+            wait: producer_wait,
         };
 
         (producer, consumers)
@@ -901,9 +924,42 @@ impl<T: Copy + Default> DisruptorBuilder<T> {
 mod tests {
     use super::*;
 
+    /// A producer blocked on a full ring resumes once the consumer frees
+    /// a slot, under either wait strategy. The consumer runs on another
+    /// thread and drains only after a delay well past the spin budget,
+    /// so the `SpinThenYield` producer is exercised in its yield phase.
+    #[test]
+    fn blocking_publish_resumes_when_consumer_drains() {
+        for strategy in [WaitStrategy::BusySpin, WaitStrategy::SpinThenYield] {
+            let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+                .add_consumer()
+                .build(strategy);
+            let mut consumer = consumers.pop().unwrap();
+            for i in 0..4 {
+                producer.publish(i);
+            }
+            assert_eq!(producer.try_publish(99), Err(Full));
+
+            let drainer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let mut seen = Vec::new();
+                for _ in 0..4 {
+                    seen.push(consumer.try_consume().unwrap().1);
+                }
+                seen
+            });
+            // Blocks until the drainer has consumed at least one slot.
+            let seq = producer.publish(4);
+            assert_eq!(seq, 4);
+            assert_eq!(drainer.join().unwrap(), vec![0, 1, 2, 3]);
+        }
+    }
+
     #[test]
     fn single_consumer_publish_consume() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         assert_eq!(consumers.len(), 1);
 
@@ -920,7 +976,9 @@ mod tests {
 
     #[test]
     fn full_buffer_returns_error() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         for i in 0..4 {
             assert!(producer.try_publish(i).is_ok());
@@ -934,7 +992,9 @@ mod tests {
 
     #[test]
     fn wrap_around() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         for i in 0..20u64 {
             producer.publish(i);
@@ -946,7 +1006,9 @@ mod tests {
 
     #[test]
     fn batch_consume() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(16).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(16)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         for i in 0..10u64 {
             producer.publish(i * 100);
@@ -964,7 +1026,9 @@ mod tests {
 
     #[test]
     fn batch_consume_limited_by_max() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(16).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(16)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         for i in 0..10u64 {
             producer.publish(i);
@@ -983,7 +1047,7 @@ mod tests {
         let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8)
             .add_consumer()
             .add_consumer_after(0)
-            .build();
+            .build(WaitStrategy::SpinThenYield);
 
         producer.publish(42);
         producer.publish(43);
@@ -1008,7 +1072,7 @@ mod tests {
         let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
             .add_consumer()
             .add_consumer_after(0)
-            .build();
+            .build(WaitStrategy::SpinThenYield);
 
         for i in 0..4u64 {
             producer.publish(i);
@@ -1029,8 +1093,9 @@ mod tests {
 
     #[test]
     fn concurrent_publish_consume() {
-        let (mut producer, mut consumers) =
-            DisruptorBuilder::<u64>::new(1024).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(1024)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         let mut consumer = consumers.pop().unwrap();
         let count = 100_000u64;
@@ -1066,7 +1131,7 @@ mod tests {
         let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(1024)
             .add_consumer()
             .add_consumer_after(0)
-            .build();
+            .build(WaitStrategy::SpinThenYield);
 
         let count = 50_000u64;
         let mut consumer1 = consumers.pop().unwrap();
@@ -1112,12 +1177,16 @@ mod tests {
     #[test]
     #[should_panic(expected = "capacity must be a power of two")]
     fn non_power_of_two_panics() {
-        DisruptorBuilder::<u64>::new(3).add_consumer().build();
+        DisruptorBuilder::<u64>::new(3)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
     }
 
     #[test]
     fn publish_returns_correct_sequence() {
-        let (mut producer, _consumers) = DisruptorBuilder::<u64>::new(8).add_consumer().build();
+        let (mut producer, _consumers) = DisruptorBuilder::<u64>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         assert_eq!(producer.publish(1), 0);
         assert_eq!(producer.publish(2), 1);
@@ -1126,7 +1195,9 @@ mod tests {
 
     #[test]
     fn publish_with_fills_in_place() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         assert_eq!(producer.publish_with(|slot| *slot = 111), 0);
         assert_eq!(producer.publish_with(|slot| *slot = 222), 1);
@@ -1139,7 +1210,9 @@ mod tests {
 
     #[test]
     fn batch_commit_advances_cursor_once() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         // Consumer sees nothing before commit.
         {
@@ -1161,7 +1234,9 @@ mod tests {
 
     #[test]
     fn batch_drop_without_commit_rolls_back() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         // Drop without commit: cursor should not advance.
         {
@@ -1179,7 +1254,9 @@ mod tests {
 
     #[test]
     fn batch_push_with_blocks_then_auto_commits_on_full() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         // Fill the ring within a single batch (capacity = 4).
         let mut batch = producer.batch();
@@ -1218,7 +1295,9 @@ mod tests {
 
     #[test]
     fn batch_push_with_or_abort_escapes_full_ring() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         // Fill the ring to capacity within one batch; the consumer never
         // advances — modeling a dead downstream stage.
@@ -1257,7 +1336,9 @@ mod tests {
 
     #[test]
     fn batch_respects_backpressure() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         // Pre-fill the ring to capacity without consuming.
         for i in 0..4u64 {
@@ -1276,7 +1357,9 @@ mod tests {
     #[test]
     fn publish_with_blocks_and_resumes_after_consume() {
         // 4-slot ring with one consumer — producer is gated on that consumer.
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
 
         for i in 0..4u64 {
             producer.publish_with(|slot| *slot = i);
@@ -1305,7 +1388,9 @@ mod tests {
 
     #[test]
     fn peek_batch_returns_contiguous_slice_when_no_wrap() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
         for i in 0..5u64 {
             producer.publish(i * 10);
         }
@@ -1327,7 +1412,9 @@ mod tests {
 
     #[test]
     fn peek_batch_splits_across_wrap() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
         // Fill, drain 3, then publish 3 more so the live window crosses
         // the wrap boundary [3, 6) -> indices [3, 0, 1].
         for i in 0..4u64 {
@@ -1354,7 +1441,9 @@ mod tests {
 
     #[test]
     fn peek_batch_respects_max() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(16).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(16)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
         for i in 0..10u64 {
             producer.publish(i);
         }
@@ -1370,7 +1459,9 @@ mod tests {
 
     #[test]
     fn read_contiguous_returns_entries_and_advances_next_read() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
         for i in 0..5u64 {
             producer.publish(i * 10);
         }
@@ -1389,7 +1480,9 @@ mod tests {
     /// the persisted-ack gate — durability publishes it, never the read.
     #[test]
     fn read_contiguous_never_publishes_progress() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
         for i in 0..4u64 {
             producer.publish(i);
         }
@@ -1417,7 +1510,9 @@ mod tests {
 
     #[test]
     fn read_contiguous_truncates_at_the_wrap_and_resumes() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
         // Fill, drain 3, publish 3 more so the live window [3, 7)
         // crosses the wrap boundary: index 3, then indices 0..3.
         for i in 0..4u64 {
@@ -1445,7 +1540,9 @@ mod tests {
 
     #[test]
     fn peek_batch_advances_processed_only_on_commit() {
-        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
         for i in 0..4u64 {
             producer.publish(i);
         }

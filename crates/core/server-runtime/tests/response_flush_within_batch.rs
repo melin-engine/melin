@@ -24,6 +24,7 @@ use std::time::Duration;
 use melin_app::encoder::ResponseEncoder;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
 use melin_pipeline::ring::DisruptorBuilder;
+use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::ControlEvent;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::response::{self, Response};
@@ -155,7 +156,7 @@ fn large_frame_batch_is_delivered_not_disconnected() {
     let (mut producer, mut consumers) =
         DisruptorBuilder::<OutputSlot<PadReport, PadReport>>::new(1024)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().expect("one consumer was requested");
 
     let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
@@ -175,7 +176,7 @@ fn large_frame_batch_is_delivered_not_disconnected() {
         replication_metrics: None,
         replica_active: None,
         heartbeat_interval: None,
-        busy_spin: true,
+        wait: WaitStrategy::SpinThenYield,
         utilization: Arc::new(StageUtilization::default()),
         encoder: Arc::new(PadEncoder),
         fence_state: Arc::new(FenceState::new(0)),

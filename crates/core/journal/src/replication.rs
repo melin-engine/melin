@@ -14,6 +14,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use melin_pipeline::padding::Sequence;
+use melin_pipeline::wait::WaitStrategy;
 
 /// Maximum batch buffer size. Matches `BATCH_BUF_CAPACITY` in writer.rs.
 /// Each ring slot has one pre-allocated chunk of this size.
@@ -88,8 +89,8 @@ impl ReplicationProducer {
     /// Publish a batch of encoded journal bytes to the ring.
     ///
     /// Copies `data` into a pre-allocated buffer (no heap allocation), then
-    /// publishes the metadata. Spins if the ring is full (backpressure from
-    /// the slowest consumer).
+    /// publishes the metadata. Waits, per the ring's [`WaitStrategy`], if
+    /// the ring is full (backpressure from the slowest consumer).
     ///
     /// # Panics
     /// Panics if `data.len() > CHUNK_SIZE` (512 KiB).
@@ -106,7 +107,7 @@ impl ReplicationProducer {
         // we can peek at the current cursor to know which slot we'll write to.
         //
         // However, try_publish may fail (Full) if the ring is backpressured.
-        // In that case, we spin and retry. Writing the buffer before each
+        // In that case, we wait and retry. Writing the buffer before each
         // attempt is harmless — the slot is not yet visible to consumers
         // (the old data at that position has already been consumed due to
         // the backpressure check), and we'll overwrite it on the next attempt
@@ -126,6 +127,7 @@ impl ReplicationProducer {
         // Two-phase publish: claim a slot (backpressure check), write the
         // byte buffer, then publish metadata with a Release fence that makes
         // both the buffer and metadata visible to consumers atomically.
+        let mut waiter = self.inner.wait_strategy().waiter();
         loop {
             match self.inner.try_claim() {
                 Ok(seq) => {
@@ -147,7 +149,7 @@ impl ReplicationProducer {
                     );
                     return;
                 }
-                Err(_) => std::hint::spin_loop(),
+                Err(_) => waiter.idle(),
             }
         }
     }
@@ -196,8 +198,9 @@ impl ReplicationProducer {
             return Ok(());
         }
 
-        // Slow path: ring is full, spin with timeout.
+        // Slow path: ring is full, wait with timeout.
         let deadline = std::time::Instant::now() + timeout;
+        let mut waiter = self.inner.wait_strategy().waiter();
         loop {
             match self.inner.try_claim() {
                 Ok(seq) => {
@@ -208,7 +211,7 @@ impl ReplicationProducer {
                     if std::time::Instant::now() >= deadline {
                         return Err(BackpressureTimeout);
                     }
-                    std::hint::spin_loop();
+                    waiter.idle();
                 }
             }
         }
@@ -322,10 +325,12 @@ impl ReplicationConsumer {
 /// Build a replication ring with one producer and `num_consumers` consumers.
 ///
 /// Returns the producer (for the journal stage) and a Vec of consumers
-/// (one per replica sender thread).
+/// (one per replica sender thread). `producer_wait` is how the producer's
+/// blocking publish paths wait on a full ring.
 pub fn build_replication_ring(
     num_consumers: usize,
     capacity: usize,
+    producer_wait: WaitStrategy,
 ) -> (ReplicationProducer, Vec<ReplicationConsumer>) {
     assert!(num_consumers > 0, "need at least one consumer");
     assert!(
@@ -337,7 +342,7 @@ pub fn build_replication_ring(
     for _ in 0..num_consumers {
         builder = builder.add_consumer();
     }
-    let (inner_producer, inner_consumers) = builder.build();
+    let (inner_producer, inner_consumers) = builder.build(producer_wait);
 
     // Pre-allocate byte buffers — one [`CHUNK_SIZE`] chunk per ring slot.
     let buffers = Arc::new(SharedBuffers {
@@ -369,7 +374,8 @@ mod tests {
 
     #[test]
     fn single_batch_round_trip() {
-        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
+        let (mut producer, mut consumers) =
+            build_replication_ring(1, REPLICATION_RING_CAPACITY, WaitStrategy::SpinThenYield);
         let consumer = &mut consumers[0];
 
         let data = b"hello replication ring";
@@ -383,7 +389,8 @@ mod tests {
 
     #[test]
     fn multiple_batches() {
-        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
+        let (mut producer, mut consumers) =
+            build_replication_ring(1, REPLICATION_RING_CAPACITY, WaitStrategy::SpinThenYield);
         let consumer = &mut consumers[0];
 
         for i in 0..10u64 {
@@ -404,7 +411,8 @@ mod tests {
 
     #[test]
     fn two_consumers_independent_progress() {
-        let (mut producer, mut consumers) = build_replication_ring(2, REPLICATION_RING_CAPACITY);
+        let (mut producer, mut consumers) =
+            build_replication_ring(2, REPLICATION_RING_CAPACITY, WaitStrategy::SpinThenYield);
         let mut c1 = consumers.pop().unwrap();
         let mut c0 = consumers.pop().unwrap();
 
@@ -435,7 +443,8 @@ mod tests {
 
     #[test]
     fn large_batch_fills_chunk() {
-        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
+        let (mut producer, mut consumers) =
+            build_replication_ring(1, REPLICATION_RING_CAPACITY, WaitStrategy::SpinThenYield);
         let consumer = &mut consumers[0];
 
         let data = vec![0xFFu8; CHUNK_SIZE];
@@ -451,7 +460,8 @@ mod tests {
 
     #[test]
     fn wrap_around() {
-        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
+        let (mut producer, mut consumers) =
+            build_replication_ring(1, REPLICATION_RING_CAPACITY, WaitStrategy::SpinThenYield);
         let consumer = &mut consumers[0];
 
         for i in 0..REPLICATION_RING_CAPACITY as u64 * 3 {
@@ -466,7 +476,8 @@ mod tests {
 
     #[test]
     fn concurrent_producer_consumer() {
-        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
+        let (mut producer, mut consumers) =
+            build_replication_ring(1, REPLICATION_RING_CAPACITY, WaitStrategy::SpinThenYield);
         let mut consumer = consumers.pop().unwrap();
 
         let count = 10_000u64;
@@ -502,7 +513,8 @@ mod tests {
 
     #[test]
     fn try_publish_timeout_succeeds_when_ring_has_space() {
-        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
+        let (mut producer, mut consumers) =
+            build_replication_ring(1, REPLICATION_RING_CAPACITY, WaitStrategy::SpinThenYield);
         let consumer = &mut consumers[0];
 
         let result = producer.try_publish_timeout(b"data", 1, std::time::Duration::from_millis(10));
@@ -517,7 +529,7 @@ mod tests {
     #[test]
     fn try_publish_timeout_fails_when_ring_full() {
         // Capacity 2: fill both slots without consuming → ring is full.
-        let (mut producer, _consumers) = build_replication_ring(1, 2);
+        let (mut producer, _consumers) = build_replication_ring(1, 2, WaitStrategy::SpinThenYield);
 
         producer.publish(b"a", 1);
         producer.publish(b"b", 2);

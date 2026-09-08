@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::padding::CachePadded;
+use crate::wait::WaitStrategy;
 
 /// Error returned when the SPSC queue is full.
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +58,9 @@ pub struct Producer<T> {
     /// dependency chain ahead of the Release store on every flush.
     // u64 — mirrors `local_head`, same never-wraps reasoning.
     committed_head: u64,
+    /// How the blocking push waits for the consumer to free a slot.
+    /// See [`crate::ring::Producer`] for why this is a ring property.
+    wait: WaitStrategy,
 }
 
 /// Consumer end of the SPSC queue.
@@ -69,7 +73,12 @@ pub struct Consumer<T> {
 /// Create a new SPSC queue with the given capacity (must be power of two).
 ///
 /// Returns `(Producer, Consumer)` to be moved to separate threads.
-pub fn channel<T: Copy + Default>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+/// `producer_wait` is how the producer's blocking push waits on a full
+/// queue; the consumer's polling loop chooses its own strategy.
+pub fn channel<T: Copy + Default>(
+    capacity: usize,
+    producer_wait: WaitStrategy,
+) -> (Producer<T>, Consumer<T>) {
     assert!(
         capacity.is_power_of_two(),
         "capacity must be a power of two"
@@ -94,6 +103,7 @@ pub fn channel<T: Copy + Default>(capacity: usize) -> (Producer<T>, Consumer<T>)
         // Matches the `head` atomic's initial value — the mirror starts
         // in sync and stays in sync because only `flush` writes `head`.
         committed_head: 0,
+        wait: producer_wait,
     };
 
     let consumer = Consumer {
@@ -134,11 +144,12 @@ impl<T: Copy + Default> Producer<T> {
         Ok(seq)
     }
 
-    /// Blocking variant of [`Self::try_push_with`]. Spins until space is
-    /// available, flushing pending writes mid-spin so the consumer can drain
-    /// when the ring is saturated.
+    /// Blocking variant of [`Self::try_push_with`]. Waits until space is
+    /// available, flushing pending writes mid-wait so the consumer can
+    /// drain when the ring is saturated.
     pub fn push_with<F: FnOnce(&mut T)>(&mut self, f: F) -> u64 {
         let capacity = self.shared.mask + 1;
+        let mut waiter = self.wait.waiter();
         loop {
             let seq = self.local_head;
             if seq - self.cached_tail < capacity {
@@ -156,7 +167,7 @@ impl<T: Copy + Default> Producer<T> {
             // advance the tail. Without this we'd deadlock against a
             // consumer that has already drained everything we've Released.
             self.flush();
-            std::hint::spin_loop();
+            waiter.idle();
         }
     }
 
@@ -189,7 +200,7 @@ impl<T: Copy + Default> Producer<T> {
         Ok(seq)
     }
 
-    /// Publish a value, spinning until space is available.
+    /// Publish a value, waiting until space is available.
     pub fn publish(&mut self, value: T) -> u64 {
         let seq = self.push_with(|slot| *slot = value);
         self.flush();
@@ -250,7 +261,7 @@ mod tests {
 
     #[test]
     fn basic_publish_consume() {
-        let (mut producer, mut consumer) = channel::<u64>(4);
+        let (mut producer, mut consumer) = channel::<u64>(4, WaitStrategy::SpinThenYield);
 
         producer.try_publish(10).unwrap();
         producer.try_publish(20).unwrap();
@@ -262,7 +273,7 @@ mod tests {
 
     #[test]
     fn full_buffer() {
-        let (mut producer, mut consumer) = channel::<u64>(4);
+        let (mut producer, mut consumer) = channel::<u64>(4, WaitStrategy::SpinThenYield);
 
         for i in 0..4 {
             assert!(producer.try_publish(i).is_ok());
@@ -275,7 +286,7 @@ mod tests {
 
     #[test]
     fn wrap_around() {
-        let (mut producer, mut consumer) = channel::<u64>(4);
+        let (mut producer, mut consumer) = channel::<u64>(4, WaitStrategy::SpinThenYield);
 
         for i in 0..20u64 {
             producer.publish(i);
@@ -287,7 +298,7 @@ mod tests {
 
     #[test]
     fn batch_consume() {
-        let (mut producer, mut consumer) = channel::<u64>(16);
+        let (mut producer, mut consumer) = channel::<u64>(16, WaitStrategy::SpinThenYield);
 
         for i in 0..8u64 {
             producer.publish(i * 10);
@@ -303,7 +314,7 @@ mod tests {
 
     #[test]
     fn concurrent_spsc() {
-        let (mut producer, mut consumer) = channel::<u64>(1024);
+        let (mut producer, mut consumer) = channel::<u64>(1024, WaitStrategy::SpinThenYield);
         let count = 100_000u64;
 
         let consumer_thread = std::thread::spawn(move || {
@@ -334,7 +345,7 @@ mod tests {
 
     #[test]
     fn publish_returns_correct_sequence() {
-        let (mut producer, _consumer) = channel::<u64>(8);
+        let (mut producer, _consumer) = channel::<u64>(8, WaitStrategy::SpinThenYield);
         assert_eq!(producer.publish(1), 0);
         assert_eq!(producer.publish(2), 1);
         assert_eq!(producer.publish(3), 2);
@@ -343,7 +354,7 @@ mod tests {
     #[test]
     fn in_place_batch_invisible_until_flush() {
         // Pending writes must not leak to the consumer before flush.
-        let (mut producer, mut consumer) = channel::<u64>(8);
+        let (mut producer, mut consumer) = channel::<u64>(8, WaitStrategy::SpinThenYield);
         producer.try_push_with(|s| *s = 1).unwrap();
         producer.try_push_with(|s| *s = 2).unwrap();
         producer.try_push_with(|s| *s = 3).unwrap();
@@ -358,7 +369,7 @@ mod tests {
 
     #[test]
     fn try_push_with_full_does_not_invoke_closure() {
-        let (mut producer, _consumer) = channel::<u64>(4);
+        let (mut producer, _consumer) = channel::<u64>(4, WaitStrategy::SpinThenYield);
         for _ in 0..4 {
             producer.try_push_with(|s| *s = 7).unwrap();
         }
@@ -374,7 +385,7 @@ mod tests {
 
     #[test]
     fn flush_is_idempotent_and_zero_pending_is_noop() {
-        let (mut producer, mut consumer) = channel::<u64>(4);
+        let (mut producer, mut consumer) = channel::<u64>(4, WaitStrategy::SpinThenYield);
         producer.flush(); // no-op, no writes pending
         producer.try_push_with(|s| *s = 42).unwrap();
         producer.flush();
@@ -390,7 +401,7 @@ mod tests {
         // correctly: without it, the producer would write 8 slots, find
         // the ring full on the 9th, and spin forever because nothing
         // was Released for the consumer to drain.
-        let (mut producer, mut consumer) = channel::<u64>(8);
+        let (mut producer, mut consumer) = channel::<u64>(8, WaitStrategy::SpinThenYield);
         let consumer_thread = std::thread::spawn(move || {
             let mut received = Vec::with_capacity(20);
             loop {
@@ -424,7 +435,7 @@ mod tests {
         // Release store would be skipped and the consumer would stall
         // with items already written into slots. Runs well past the ring
         // capacity so wrap-around is covered.
-        let (mut producer, mut consumer) = channel::<u64>(4);
+        let (mut producer, mut consumer) = channel::<u64>(4, WaitStrategy::SpinThenYield);
         for i in 0..100u64 {
             producer.try_push_with(|s| *s = i).unwrap();
             producer.flush();
@@ -440,7 +451,7 @@ mod tests {
         // Multi-item batches across several flush rounds: each flush must
         // advance the head to exactly `local_head`, no more and no less,
         // with the consumer draining in between.
-        let (mut producer, mut consumer) = channel::<u64>(8);
+        let (mut producer, mut consumer) = channel::<u64>(8, WaitStrategy::SpinThenYield);
         let mut expected = 0u64;
         for round in 0..10u64 {
             for j in 0..3u64 {
@@ -462,7 +473,7 @@ mod tests {
         // skip the partial slot and the consumer would observe stale data.
         // The slot itself contains junk after a panic; correctness relies
         // on the next write reusing the same index and overwriting it.
-        let (mut producer, mut consumer) = channel::<u64>(8);
+        let (mut producer, mut consumer) = channel::<u64>(8, WaitStrategy::SpinThenYield);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = producer.try_push_with(|_| panic!("synthetic"));
         }));
@@ -477,7 +488,7 @@ mod tests {
         // try_publish does write + flush. If there are pending in-place
         // writes from earlier try_push_with calls, they must be flushed
         // along with the new value.
-        let (mut producer, mut consumer) = channel::<u64>(8);
+        let (mut producer, mut consumer) = channel::<u64>(8, WaitStrategy::SpinThenYield);
         producer.try_push_with(|s| *s = 10).unwrap();
         producer.try_push_with(|s| *s = 20).unwrap();
         producer.try_publish(30).unwrap();

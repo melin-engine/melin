@@ -57,7 +57,8 @@ use melin_pipeline::padding::Sequence;
 use melin_pipeline::seqlock::SeqLockWriter;
 
 use crate::cursors::{AdvertisedJournalTip, DurableWireSeqCursor, RingPos, WireSeq};
-use crate::pipeline::{FsyncState, idle_wait};
+use crate::pipeline::FsyncState;
+use melin_pipeline::wait::WaitStrategy;
 
 /// Iovecs per vectored write. Comfortably under every supported
 /// kernel's `IOV_MAX` (1024 on Linux) and at least the write ring's
@@ -314,9 +315,9 @@ pub struct JournalDisk {
     batches: JournalWriteConsumer,
     cursors: DurabilityCursors,
     control: Arc<DiskControl>,
-    /// When true, never yield to the OS scheduler — spin with PAUSE.
+    /// How this thread waits for the sequencer to hand over a batch.
     /// Same discipline as the other pipeline stages.
-    busy_spin: bool,
+    wait: WaitStrategy,
     /// Test-only failure injection. The failures this path exists for
     /// (EIO, ENOSPC) cannot be provoked portably from a unit test, and
     /// the branch they drive — freeze durability, latch the cause — is
@@ -337,14 +338,14 @@ impl JournalDisk {
         batches: JournalWriteConsumer,
         cursors: DurabilityCursors,
         control: Arc<DiskControl>,
-        busy_spin: bool,
+        wait: WaitStrategy,
     ) -> Self {
         Self {
             segment,
             batches,
             cursors,
             control,
-            busy_spin,
+            wait,
             #[cfg(test)]
             fail_next_sync: None,
             #[cfg(test)]
@@ -383,7 +384,7 @@ impl JournalDisk {
     /// path through it — including the ones that are not supposed to
     /// exist.
     fn run_loop(&mut self) {
-        let mut idle_spins: u32 = 0;
+        let mut waiter = self.wait.waiter();
         loop {
             // Sampled *before* the drain: a halting sequencer publishes
             // its final batches and then stores the flag, so a stop
@@ -396,7 +397,7 @@ impl JournalDisk {
             let stop_requested = self.control.stop.load(Ordering::Acquire);
             match self.drain_and_sync() {
                 Ok(true) => {
-                    idle_spins = 0;
+                    waiter.reset();
                     // More may have arrived while we were syncing.
                     continue;
                 }
@@ -413,7 +414,7 @@ impl JournalDisk {
             // here cannot reorder against pending batches.
             if let Some(request) = self.control.take_rotation_request() {
                 self.rotate(request);
-                idle_spins = 0;
+                waiter.reset();
                 continue;
             }
 
@@ -421,7 +422,7 @@ impl JournalDisk {
                 return;
             }
 
-            idle_wait(&mut idle_spins, self.busy_spin);
+            waiter.idle();
         }
     }
 
@@ -569,7 +570,7 @@ mod tests {
             consumer,
             cursors,
             Arc::clone(&control),
-            false,
+            WaitStrategy::SpinThenYield,
         );
 
         submit(&mut producer, b"alpha", meta(5, 11, 100));
@@ -610,7 +611,7 @@ mod tests {
             consumer,
             cursors,
             Arc::new(DiskControl::new()),
-            false,
+            WaitStrategy::SpinThenYield,
         );
 
         // Distinct, order-revealing payloads: a reordering or a drop at
@@ -657,7 +658,7 @@ mod tests {
             consumer,
             cursors,
             Arc::new(DiskControl::new()),
-            false,
+            WaitStrategy::SpinThenYield,
         );
 
         assert!(!disk.drain_and_sync().unwrap(), "nothing to write");
@@ -680,7 +681,7 @@ mod tests {
             consumer,
             cursors,
             Arc::clone(&control),
-            false,
+            WaitStrategy::SpinThenYield,
         );
 
         submit(&mut producer, b"sealed", meta(6, 1, 10));
@@ -728,7 +729,7 @@ mod tests {
             consumer,
             cursors,
             Arc::clone(&control),
-            false,
+            WaitStrategy::SpinThenYield,
         );
         disk.inject_sync_failure(JournalError::Io(std::io::Error::new(
             std::io::ErrorKind::StorageFull,
@@ -776,7 +777,7 @@ mod tests {
             consumer,
             cursors,
             Arc::clone(&control),
-            false,
+            WaitStrategy::SpinThenYield,
         );
         disk.inject_panic();
 
@@ -816,7 +817,7 @@ mod tests {
             consumer,
             cursors,
             Arc::clone(&control),
-            false,
+            WaitStrategy::SpinThenYield,
         );
 
         control.stop();
@@ -841,7 +842,7 @@ mod tests {
             consumer,
             cursors,
             Arc::new(DiskControl::new()),
-            false,
+            WaitStrategy::SpinThenYield,
         );
         // A sync failure injected but never consumed proves the sync
         // was skipped; the drain still has to do everything else.
@@ -879,7 +880,7 @@ mod tests {
             consumer,
             cursors,
             Arc::clone(&control),
-            false,
+            WaitStrategy::SpinThenYield,
         );
 
         // A prepared segment whose staging file is gone: the rename
@@ -925,7 +926,7 @@ mod tests {
             consumer,
             cursors,
             Arc::clone(&control),
-            false,
+            WaitStrategy::SpinThenYield,
         );
 
         submit(&mut producer, b"last words", meta(10, 42, 4242));

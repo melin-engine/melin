@@ -44,6 +44,7 @@ use melin_app::auth::Permission;
 use melin_app::decoder::RequestDecoder;
 use melin_app::encoder::ResponseEncoder;
 use melin_pipeline::ring::Consumer;
+use melin_pipeline::wait::WaitStrategy;
 
 /// Output-slot sugar parameterised on the application — saves spelling
 /// `<A::Report, A::QueryResponse>` at every pipeline-facing signature
@@ -67,7 +68,7 @@ pub type EventPublisherFn<A> = fn(
     bind_addr: SocketAddr,
     authorized_keys: Arc<AuthorizedKeys>,
     shutdown: &AtomicBool,
-    busy_spin: bool,
+    wait: WaitStrategy,
 );
 
 use melin_wire_protocol::blocking::BlockingFrameWriter;
@@ -308,8 +309,12 @@ pub struct ServerConfig {
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
     /// of busy-spinning. Use on shared machines without isolated cores to
-    /// avoid starving other processes. Default (no flag) is busy-spin,
-    /// which gives lowest latency on isolated cores (isolcpus).
+    /// avoid starving other processes — or each other, when two pipeline
+    /// threads share a core. Covers every wait in the pipeline: consumers
+    /// polling an empty ring, producers blocked on a full one, and the
+    /// response stage's durability gate. Default (no flag) is busy-spin,
+    /// which gives lowest latency on isolated cores (isolcpus). See
+    /// [`ServerConfig::wait_strategy`].
     #[arg(long, default_value_t = false)]
     pub yield_idle: bool,
 
@@ -607,6 +612,19 @@ impl ServerConfig {
             None
         } else {
             Some(std::time::Duration::from_millis(self.tick_interval_ms))
+        }
+    }
+
+    /// How every pipeline thread waits on the thread it depends on —
+    /// the one place `--yield-idle` is turned into a policy. Every ring
+    /// producer, every stage loop, and every startup drain takes its
+    /// strategy from here, so there is no wait in the process that the
+    /// flag does not reach.
+    pub fn wait_strategy(&self) -> WaitStrategy {
+        if self.yield_idle {
+            WaitStrategy::SpinThenYield
+        } else {
+            WaitStrategy::BusySpin
         }
     }
 }
@@ -1084,7 +1102,7 @@ where
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
-            !config.yield_idle,
+            config.wait_strategy(),
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
@@ -1474,7 +1492,7 @@ where
         enable_replication,
         config.max_journal_batch,
         config.replication_ring_size,
-        !config.yield_idle,
+        config.wait_strategy(),
         enable_event_publisher,
         enable_shadow,
         Arc::clone(&fence_state),
@@ -1609,7 +1627,7 @@ where
     let ack_policy_response = Arc::clone(&ack_policy_atomic);
     let s3 = Arc::clone(&shutdown);
     let shutdown_for_response = Arc::clone(&shutdown);
-    let busy_spin = !config.yield_idle;
+    let wait = config.wait_strategy();
     let response_utilization_thread = Arc::clone(&response_utilization);
     let response_fence = Arc::clone(&fence_state);
     let active_connections_response = Arc::clone(&active_connections);
@@ -1626,7 +1644,7 @@ where
                     replication_metrics: replication_metrics_response,
                     replica_active: replica_active_response,
                     heartbeat_interval,
-                    busy_spin,
+                    wait,
                     utilization: response_utilization_thread,
                     encoder,
                     fence_state: response_fence,
@@ -1744,7 +1762,7 @@ where
                         handler_cores,
                         batch_size,
                         heartbeat_secs,
-                        busy_spin,
+                        wait,
                         fence_state: sender_fence,
                         ack_policy: sender_ack_policy,
                     },
@@ -1775,7 +1793,7 @@ where
         &cores,
         &authorized_keys,
         &shutdown,
-        busy_spin,
+        wait,
     )?;
 
     let shadow_handle = spawn_shadow_stage::<A>(
@@ -1785,7 +1803,7 @@ where
         config,
         &cores,
         &shutdown,
-        busy_spin,
+        wait,
         fence_state.epoch(),
     )?;
 
@@ -1895,18 +1913,20 @@ where
                 "seed drain: waiting for pipeline cursors"
             );
 
-            while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                && (journal_cursor
-                    .get()
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    < last_seed_seq
-                    || matching_cursor
+            // Waits on the stage threads, which may share this thread's
+            // core on a small box — so through the wait strategy, never
+            // a bare spin.
+            wait.wait_until(|| {
+                shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                    || (journal_cursor
                         .get()
                         .load(std::sync::atomic::Ordering::Acquire)
-                        < last_seed_seq)
-            {
-                std::hint::spin_loop();
-            }
+                        >= last_seed_seq
+                        && matching_cursor
+                            .get()
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            >= last_seed_seq)
+            });
 
             info!("seed drain: pipeline cursors reached target");
 
@@ -1920,14 +1940,13 @@ where
                         continue;
                     }
                     let target = ring_progress.producer_cursors[i].load();
-                    while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                        && ring_progress.consumer_cursors[i]
-                            .get()
-                            .load(std::sync::atomic::Ordering::Acquire)
-                            < target
-                    {
-                        std::hint::spin_loop();
-                    }
+                    wait.wait_until(|| {
+                        shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                            || ring_progress.consumer_cursors[i]
+                                .get()
+                                .load(std::sync::atomic::Ordering::Acquire)
+                                >= target
+                    });
                 }
             }
 
@@ -2001,15 +2020,10 @@ where
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
         });
-        // Spin until the matching stage observes the bump (epoch raised) so
+        // Wait until the matching stage observes the bump (epoch raised) so
         // the node advertises `new_epoch` on the very first handshake. Bounded
         // by the shutdown flag so a stuck pipeline can't wedge startup.
-        while fence_state.epoch() < new_epoch {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            std::hint::spin_loop();
-        }
+        wait.wait_until(|| fence_state.epoch() >= new_epoch || shutdown.load(Ordering::Relaxed));
     }
 
     // Now that seeding is fully drained, spawn the reader thread. From here
@@ -2501,7 +2515,7 @@ where
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
-            !config.yield_idle,
+            config.wait_strategy(),
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
@@ -2682,7 +2696,7 @@ where
         enable_replication,
         config.max_journal_batch,
         config.replication_ring_size,
-        !config.yield_idle,
+        config.wait_strategy(),
         enable_event_publisher,
         enable_shadow,
         Arc::clone(&fence_state),
@@ -2719,8 +2733,10 @@ where
     // connection_id bits 56..63.
     let mut tx_producers = Vec::with_capacity(num_dpdk_threads);
     let mut tx_consumers = Vec::with_capacity(num_dpdk_threads);
+    let wait = config.wait_strategy();
     for _ in 0..num_dpdk_threads {
-        let (tx_out, tx_rx) = melin_pipeline::spsc::channel::<crate::dpdk_response::TxFrame>(4096);
+        let (tx_out, tx_rx) =
+            melin_pipeline::spsc::channel::<crate::dpdk_response::TxFrame>(4096, wait);
         tx_producers.push(tx_out);
         tx_consumers.push(tx_rx);
     }
@@ -2809,7 +2825,6 @@ where
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
-    let busy_spin = !config.yield_idle;
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -2826,7 +2841,7 @@ where
                 active_connections_response,
                 tx_producers,
                 response_utilization_thread,
-                busy_spin,
+                wait,
                 encoder,
             );
         })
@@ -2839,7 +2854,7 @@ where
         &config,
         &cores,
         &shutdown,
-        busy_spin,
+        wait,
         fence_state.epoch(),
     )?;
 
@@ -2996,32 +3011,30 @@ where
         // Skip when the factory produced no seed events — nothing on the ring.
         if seed_count > 0 {
             let last_seed_seq = last_published_seq + 1;
-            while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                && (journal_cursor
-                    .get()
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    < last_seed_seq
-                    || matching_cursor
+            wait.wait_until(|| {
+                shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                    || (journal_cursor
                         .get()
                         .load(std::sync::atomic::Ordering::Acquire)
-                        < last_seed_seq)
-            {
-                std::hint::spin_loop();
-            }
+                        >= last_seed_seq
+                        && matching_cursor
+                            .get()
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            >= last_seed_seq)
+            });
             if let Some(ref ring_progress) = replication_ring_progress {
                 for i in 0..ring_progress.producer_cursors.len() {
                     if !ring_progress.active_flags[i].load(std::sync::atomic::Ordering::Relaxed) {
                         continue;
                     }
                     let target = ring_progress.producer_cursors[i].load();
-                    while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                        && ring_progress.consumer_cursors[i]
-                            .get()
-                            .load(std::sync::atomic::Ordering::Acquire)
-                            < target
-                    {
-                        std::hint::spin_loop();
-                    }
+                    wait.wait_until(|| {
+                        shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                            || ring_progress.consumer_cursors[i]
+                                .get()
+                                .load(std::sync::atomic::Ordering::Acquire)
+                                >= target
+                    });
                 }
             }
         }
@@ -3326,7 +3339,7 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
     config: &ServerConfig,
     cores: &PipelineCores,
     shutdown: &Arc<AtomicBool>,
-    busy_spin: bool,
+    wait: WaitStrategy,
     initial_epoch: u64,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>>
 where
@@ -3354,7 +3367,7 @@ where
                 interval,
                 chain_hash,
                 &s_shadow,
-                busy_spin,
+                wait,
                 shadow_initial_epoch,
             );
         })
@@ -3443,7 +3456,7 @@ fn spawn_event_publisher<A: Application>(
     cores: &PipelineCores,
     authorized_keys: &Arc<AuthorizedKeys>,
     shutdown: &Arc<AtomicBool>,
-    busy_spin: bool,
+    wait: WaitStrategy,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>>
 where
     A::Report: Send + 'static,
@@ -3462,7 +3475,7 @@ where
         .name("event-publisher".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("event-publisher", event_core);
-            run_fn(event_consumer, event_bind, event_keys, &s_event, busy_spin);
+            run_fn(event_consumer, event_bind, event_keys, &s_event, wait);
         })
         .map_err(|e| format!("spawn event publisher thread: {e}"))?;
     info!(addr = %event_bind, "event publisher started");
