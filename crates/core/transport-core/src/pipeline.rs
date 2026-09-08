@@ -928,7 +928,7 @@ impl<E: AppEvent> JournalStage<E> {
     fn into_sequencer(self) -> Result<Sequencer<E>, JournalError> {
         let (encoder, segment) = self.writer.into_halves()?;
         let (batches, batch_consumer) =
-            build_journal_write_ring(melin_journal::write_ring::DEFAULT_CAPACITY);
+            build_journal_write_ring(melin_journal::write_ring::DEFAULT_CAPACITY, self.wait);
         let control = Arc::new(DiskControl::new());
         let segment_bytes = segment.valid_end();
         // Decided once, here, because this is the only place that still
