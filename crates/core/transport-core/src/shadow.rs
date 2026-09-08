@@ -19,21 +19,11 @@ use melin_app::{Application, ApplyCtx, WireSeq};
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::SeqLockReader;
+use melin_pipeline::wait::WaitStrategy;
 
 /// Maximum events consumed per batch. Matches the journal stage batch size
 /// for consistent throughput characteristics.
 const SHADOW_BATCH_SIZE: usize = 4096;
-
-/// Spin-wait idle hint — same pattern as other pipeline stages.
-#[inline(always)]
-fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
-    if busy_spin || *idle_spins < 1000 {
-        *idle_spins = idle_spins.wrapping_add(1);
-        std::hint::spin_loop();
-    } else {
-        std::thread::yield_now();
-    }
-}
 
 /// Run the shadow snapshot stage.
 ///
@@ -50,7 +40,7 @@ pub fn run<A: Application>(
     snapshot_interval: Duration,
     fsync_state: SeqLockReader<FsyncState>,
     shutdown: &AtomicBool,
-    busy_spin: bool,
+    wait: WaitStrategy,
     initial_epoch: u64,
 ) {
     // Scratch buffer for app methods that require a reports Vec.
@@ -71,7 +61,7 @@ pub fn run<A: Application>(
     // defers the clock read to roughly 1 Hz, collapsing the overhead
     // to a single `AND` + predictable branch per iteration.
     let mut snapshot_timer = AmortizedTimer::new();
-    let mut idle_spins: u32 = 0;
+    let mut waiter = wait.waiter();
     // Track whether any events have been consumed. Prevents snapshotting
     // empty state before the first event arrives.
     let mut has_events = false;
@@ -99,15 +89,15 @@ pub fn run<A: Application>(
             // will arrive to trigger the post-consume check.
             if has_events
                 && snapshot_timer
-                    .tick(snapshot_interval, busy_spin || idle_spins < 1000)
+                    .tick(snapshot_interval, waiter.spinning())
                     .is_some()
             {
                 try_save_snapshot::<A>(&app, &consumer, &fsync_state, &snapshot_path, shadow_epoch);
             }
-            idle_wait(&mut idle_spins, busy_spin);
+            waiter.idle();
             continue;
         }
-        idle_spins = 0;
+        waiter.reset();
         has_events = true;
 
         // Replay each event on the shadow app. last_drain_ns lives
@@ -264,7 +254,7 @@ mod tests {
     fn shadow_shutdown_exits_promptly() {
         let (_, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
@@ -285,7 +275,7 @@ mod tests {
                     Duration::from_secs(3600), // won't fire during test
                     fsync_state,
                     &shutdown2,
-                    false,
+                    WaitStrategy::SpinThenYield,
                     0, // initial_epoch
                 );
             })
@@ -303,7 +293,7 @@ mod tests {
     fn shadow_takes_snapshot_at_interval() {
         let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
@@ -332,7 +322,7 @@ mod tests {
                     Duration::from_millis(50),
                     fsync_state,
                     &shutdown2,
-                    false,
+                    WaitStrategy::SpinThenYield,
                     0, // initial_epoch
                 );
             })
@@ -637,7 +627,7 @@ mod tests {
         // operator with a zero-state recovery target.
         let (_producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
@@ -659,7 +649,7 @@ mod tests {
                     Duration::from_millis(20),
                     fsync_state,
                     &shutdown2,
-                    false,
+                    WaitStrategy::SpinThenYield,
                     0, // initial_epoch
                 );
             })
@@ -686,7 +676,7 @@ mod tests {
         // very next snapshot the shadow writes.
         let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
@@ -712,7 +702,7 @@ mod tests {
                     Duration::from_millis(30),
                     fsync_state,
                     &shutdown2,
-                    false,
+                    WaitStrategy::SpinThenYield,
                     0, // initial_epoch
                 );
             })
@@ -783,7 +773,7 @@ mod tests {
         // load-bearing and easy to assert.
         let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
@@ -811,7 +801,7 @@ mod tests {
                     Duration::from_millis(20),
                     fsync_state,
                     &shutdown2,
-                    false,
+                    WaitStrategy::SpinThenYield,
                     0, // initial_epoch
                 );
             })

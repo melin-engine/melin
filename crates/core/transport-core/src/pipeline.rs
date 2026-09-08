@@ -47,6 +47,7 @@ use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
 use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::{NoPadding, SeqLockReader, SeqLockWriter};
+use melin_pipeline::wait::WaitStrategy;
 
 use crate::cursors::{
     AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, RingPos, WireSeq,
@@ -267,20 +268,6 @@ pub const fn max_journal_batch<E: AppEvent>() -> usize {
         by_chunk
     } else {
         MAX_JOURNAL_BATCH
-    }
-}
-
-/// Spin-wait idle hint. When `busy_spin` is false (default), falls back to
-/// `sched_yield` after 1000 spins — courteous on shared cores but expensive
-/// on EPYC (~1-5µs per yield). When true, spins indefinitely with PAUSE —
-/// the thread owns the core (requires `isolcpus`).
-#[inline(always)]
-pub(crate) fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
-    if busy_spin || *idle_spins < 1000 {
-        *idle_spins = idle_spins.wrapping_add(1);
-        std::hint::spin_loop();
-    } else {
-        std::thread::yield_now();
     }
 }
 
@@ -551,9 +538,9 @@ pub struct JournalStage<E: AppEvent> {
     /// accepted position instead (see [`AdvertisedJournalTip`]). Advanced
     /// once per fsync batch alongside `last_seq`, with the same value.
     advertised_tip: Option<AdvertisedJournalTip>,
-    /// When true, never yield to the OS scheduler — spin indefinitely with
-    /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
-    busy_spin: bool,
+    /// How the sequencing thread waits on an empty input ring, and on
+    /// the disk thread (slot claims, drains, rotation results).
+    wait: WaitStrategy,
     /// Shared busy/idle counters for health endpoint monitoring.
     utilization: Arc<StageUtilization>,
     /// Live-segment size threshold (bytes). When > 0, the journal stage
@@ -679,7 +666,7 @@ struct SequencerCore<E: AppEvent> {
     /// thread has caught up.
     segment_bytes: u64,
     repl: Box<ReplicationState>,
-    busy_spin: bool,
+    wait: WaitStrategy,
     utilization: Arc<StageUtilization>,
     max_journal_bytes: u64,
     rotate_requested: Option<Arc<AtomicBool>>,
@@ -823,7 +810,7 @@ impl<E: AppEvent> JournalStage<E> {
         consumer: ring::Consumer<InputSlot<E>>,
         group_commit_delay: Duration,
         max_batch: usize,
-        busy_spin: bool,
+        wait: WaitStrategy,
     ) -> Self {
         Self {
             writer,
@@ -835,7 +822,7 @@ impl<E: AppEvent> JournalStage<E> {
             chain_hash: None,
             last_seq: None,
             advertised_tip: None,
-            busy_spin,
+            wait,
             utilization: Arc::new(StageUtilization::new()),
             max_journal_bytes: 0,
             rotate_requested: None,
@@ -941,7 +928,7 @@ impl<E: AppEvent> JournalStage<E> {
     fn into_sequencer(self) -> Result<Sequencer<E>, JournalError> {
         let (encoder, segment) = self.writer.into_halves()?;
         let (batches, batch_consumer) =
-            build_journal_write_ring(melin_journal::write_ring::DEFAULT_CAPACITY);
+            build_journal_write_ring(melin_journal::write_ring::DEFAULT_CAPACITY, self.wait);
         let control = Arc::new(DiskControl::new());
         let segment_bytes = segment.valid_end();
         // Decided once, here, because this is the only place that still
@@ -962,7 +949,7 @@ impl<E: AppEvent> JournalStage<E> {
             batch_consumer,
             cursors,
             Arc::clone(&control),
-            self.busy_spin,
+            self.wait,
         );
         let disk_core = self.disk_core;
 
@@ -1024,7 +1011,7 @@ impl<E: AppEvent> JournalStage<E> {
                 chain_hash_observed,
                 segment_bytes,
                 repl: self.repl,
-                busy_spin: self.busy_spin,
+                wait: self.wait,
                 utilization: self.utilization,
                 max_journal_bytes: self.max_journal_bytes,
                 rotate_requested: self.rotate_requested,
@@ -1095,7 +1082,7 @@ impl<E: AppEvent> Sequencer<E> {
         use std::time::Instant;
 
         let delay = self.group_commit_delay;
-        let mut idle_spins: u32 = 0;
+        let mut waiter = self.core.wait.waiter();
 
         // Total events encoded since last sync/commit.
         let mut pending: usize = 0;
@@ -1178,7 +1165,7 @@ impl<E: AppEvent> Sequencer<E> {
             let mut saw_shutdown = false;
 
             if count > 0 {
-                idle_spins = 0;
+                waiter.reset();
                 busy_count += 1;
 
                 #[cfg(feature = "latency-trace")]
@@ -1386,16 +1373,13 @@ impl<E: AppEvent> Sequencer<E> {
                 // the spin path.
                 #[cfg(feature = "latency-trace")]
                 if stats_flush_timer
-                    .tick(
-                        crate::trace::IDLE_FLUSH_INTERVAL,
-                        self.core.busy_spin || idle_spins < 1000,
-                    )
+                    .tick(crate::trace::IDLE_FLUSH_INTERVAL, waiter.spinning())
                     .is_some()
                 {
                     wakeup_rec.flush();
                     batch_rec.flush();
                 }
-                idle_wait(&mut idle_spins, self.core.busy_spin);
+                waiter.idle();
             }
 
             if saw_shutdown {
@@ -1692,7 +1676,7 @@ impl<E: AppEvent> SequencerCore<E> {
         if self.claim.is_some() {
             return Ok(());
         }
-        let mut idle_spins: u32 = 0;
+        let mut waiter = self.wait.waiter();
         loop {
             match self.batches.try_claim() {
                 Ok(claim) => {
@@ -1701,11 +1685,11 @@ impl<E: AppEvent> SequencerCore<E> {
                 }
                 Err(_) => {
                     // A poisoned disk thread never drains again — the
-                    // spin would be forever.
+                    // wait would be forever.
                     if self.disk.poisoned() {
                         return Err(self.take_poison());
                     }
-                    idle_wait(&mut idle_spins, self.busy_spin);
+                    waiter.idle();
                 }
             }
         }
@@ -1787,12 +1771,12 @@ impl<E: AppEvent> SequencerCore<E> {
     /// thread must have nothing in flight before the segment is swapped
     /// or the thread is stopped.
     fn drain_disk(&mut self) -> Result<(), JournalError> {
-        let mut idle_spins: u32 = 0;
+        let mut waiter = self.wait.waiter();
         while !self.batches.drained() {
             if self.disk.poisoned() {
                 return Err(self.take_poison());
             }
-            idle_wait(&mut idle_spins, self.busy_spin);
+            waiter.idle();
         }
         Ok(())
     }
@@ -1905,7 +1889,7 @@ impl<E: AppEvent> SequencerCore<E> {
 
     /// Wait for the disk thread's rotation outcome.
     fn await_rotation(&mut self) -> Result<std::path::PathBuf, JournalError> {
-        let mut idle_spins: u32 = 0;
+        let mut waiter = self.wait.waiter();
         loop {
             if let Some(result) = self.disk.take_rotation_result() {
                 return result;
@@ -1914,7 +1898,7 @@ impl<E: AppEvent> SequencerCore<E> {
             if self.disk.poisoned() {
                 return Err(self.take_poison());
             }
-            idle_wait(&mut idle_spins, self.busy_spin);
+            waiter.idle();
         }
     }
 
@@ -2426,8 +2410,8 @@ pub struct MatchingStage<A: Application> {
     /// load per disruptor batch (hoisted alongside the replica-count
     /// load), shared with the response stage and replication threads.
     fence_state: Arc<crate::fence::FenceState>,
-    /// When true, never yield — spin indefinitely. See [`idle_wait`].
-    busy_spin: bool,
+    /// How this thread waits on an empty input ring.
+    wait: WaitStrategy,
     /// Shared busy/idle counters for health endpoint monitoring.
     utilization: Arc<StageUtilization>,
     /// Highest event timestamp the scheduler has drained against. Each event
@@ -2461,7 +2445,7 @@ impl<A: Application> MatchingStage<A> {
         active_connections: Arc<AtomicU64>,
         replicas_connected: Option<Arc<AtomicU32>>,
         fence_state: Arc<crate::fence::FenceState>,
-        busy_spin: bool,
+        wait: WaitStrategy,
         starting_wire_seq: u64,
     ) -> Self {
         Self {
@@ -2473,7 +2457,7 @@ impl<A: Application> MatchingStage<A> {
             active_connections,
             replicas_connected,
             fence_state,
-            busy_spin,
+            wait,
             utilization: Arc::new(StageUtilization::new()),
             last_drain_ns: 0,
             next_wire_seq: starting_wire_seq,
@@ -2527,11 +2511,7 @@ impl<A: Application> MatchingStage<A> {
         // price levels can produce one Fill per level + Placed/Cancelled. 256
         // avoids mid-hot-path reallocation for all but extreme scenarios.
         let mut reports: Vec<A::Report> = Vec::with_capacity(256);
-        // Spin count for adaptive wait: spin first (fast wakeup), then yield
-        // to the OS scheduler (prevents the kernel from aggressively preempting
-        // this thread during busy periods). 1000 spins ≈ 1µs at ~1ns/spin,
-        // which is well under the inter-event arrival time at peak throughput.
-        let mut idle_spins: u32 = 0;
+        let mut waiter = self.wait.waiter();
         // Thread-local events counter — plain u64 increment (~0.3ns) instead
         // of atomic fetch_add (~5-8ns). Flushed to the shared Arc<AtomicU64>
         // once per batch and on shutdown.
@@ -2587,19 +2567,16 @@ impl<A: Application> MatchingStage<A> {
                 // while idle — see the journal stage for why.
                 #[cfg(feature = "latency-trace")]
                 if stats_flush_timer
-                    .tick(
-                        crate::trace::IDLE_FLUSH_INTERVAL,
-                        self.busy_spin || idle_spins < 1000,
-                    )
+                    .tick(crate::trace::IDLE_FLUSH_INTERVAL, waiter.spinning())
                     .is_some()
                 {
                     wakeup_rec.flush();
                     execute_rec.flush();
                 }
-                idle_wait(&mut idle_spins, self.busy_spin);
+                waiter.idle();
                 continue;
             }
-            idle_spins = 0;
+            waiter.reset();
 
             // Build ApplyCtx once per batch — the counters are advisory
             // (stats queries, health endpoint) so batch-stale values are
@@ -3197,9 +3174,11 @@ struct InputDisruptorParts<E: AppEvent> {
 /// Single producer: the ingress thread on primaries (which also emits
 /// ticks) or the replication receiver on replicas. The seed loop reuses
 /// the same producer before handing it off to the ingress thread, so the
-/// ring is single-producer at every moment of operation.
+/// ring is single-producer at every moment of operation. `producer_wait`
+/// is how that producer waits when the ring is full.
 fn build_input_disruptor<E: AppEvent + Send + 'static>(
     enable_shadow: bool,
+    producer_wait: WaitStrategy,
 ) -> InputDisruptorParts<E> {
     let mut builder = ring::DisruptorBuilder::<InputSlot<E>>::new(INPUT_RING_CAPACITY)
         .add_consumer() // consumer 0: journal, gated on producer
@@ -3207,7 +3186,7 @@ fn build_input_disruptor<E: AppEvent + Send + 'static>(
     if enable_shadow {
         builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
     }
-    let (input_producer, mut consumers) = builder.build();
+    let (input_producer, mut consumers) = builder.build(producer_wait);
 
     let input_cursor = input_producer.cursor_reader();
 
@@ -3277,7 +3256,7 @@ pub fn build_pipeline_with_replication<A>(
     enable_replication: bool,
     max_journal_batch: usize,
     replication_ring_size: usize,
-    busy_spin: bool,
+    wait: WaitStrategy,
     enable_event_publisher: bool,
     enable_shadow: bool,
     fence_state: Arc<crate::fence::FenceState>,
@@ -3295,7 +3274,7 @@ where
         shadow_consumer,
         journal_cursor,
         matching_cursor,
-    } = build_input_disruptor::<A::Event>(enable_shadow);
+    } = build_input_disruptor::<A::Event>(enable_shadow, wait);
 
     // Output disruptor ring: matching → response (+ optional event publisher).
     // Single producer, N consumers (1 = response only, 2 = response + event publisher).
@@ -3308,7 +3287,7 @@ where
     if enable_event_publisher {
         output_builder = output_builder.add_consumer(); // consumer 1: event publisher
     }
-    let (output_producer, output_consumers) = output_builder.build();
+    let (output_producer, output_consumers) = output_builder.build(wait);
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
@@ -3340,7 +3319,7 @@ where
         journal_consumer,
         group_commit_delay,
         max_journal_batch,
-        busy_spin,
+        wait,
     );
     journal_stage.set_last_seq_publisher(cursors.durable_wire_seq());
 
@@ -3351,9 +3330,9 @@ where
     // flag and stops publishing to the stalled ring.
     let (replication_consumers, replication_ring_progress) = if enable_replication {
         let (producer_0, mut consumers_0) =
-            melin_journal::replication::build_replication_ring(1, replication_ring_size);
+            melin_journal::replication::build_replication_ring(1, replication_ring_size, wait);
         let (producer_1, mut consumers_1) =
-            melin_journal::replication::build_replication_ring(1, replication_ring_size);
+            melin_journal::replication::build_replication_ring(1, replication_ring_size, wait);
 
         let evict_flags = [
             Arc::new(AtomicBool::new(false)),
@@ -3412,7 +3391,7 @@ where
         active_connections,
         replicas_connected.clone(),
         fence_state,
-        busy_spin,
+        wait,
         starting_wire_seq,
     );
 
@@ -3450,7 +3429,7 @@ pub fn build_replica_pipeline<A>(
     writer: BufferedWriter<A::Event>,
     max_journal_batch: usize,
     group_commit_delay: Duration,
-    busy_spin: bool,
+    wait: WaitStrategy,
     enable_shadow: bool,
     fence_state: Arc<crate::fence::FenceState>,
 ) -> ReplicaPipeline<A>
@@ -3467,14 +3446,14 @@ where
         shadow_consumer,
         journal_cursor,
         matching_cursor,
-    } = build_input_disruptor::<A::Event>(enable_shadow);
+    } = build_input_disruptor::<A::Event>(enable_shadow, wait);
 
     // Output disruptor: single drain consumer (no response stage on replica).
     let output_builder = ring::DisruptorBuilder::<OutputSlot<A::Report, A::QueryResponse>>::new(
         OUTPUT_RING_CAPACITY,
     )
     .add_consumer();
-    let (output_producer, mut output_consumers) = output_builder.build();
+    let (output_producer, mut output_consumers) = output_builder.build(wait);
     let drain_consumer = output_consumers.pop().expect("drain consumer");
 
     let events_processed = Arc::new(AtomicU64::new(0));
@@ -3495,7 +3474,7 @@ where
         journal_consumer,
         group_commit_delay,
         max_journal_batch,
-        busy_spin,
+        wait,
     );
 
     // Unconditional on replicas (not gated on shadow snapshots): the
@@ -3536,7 +3515,7 @@ where
         active_connections,
         None, // no replicas_connected halt check on replica
         fence_state,
-        busy_spin,
+        wait,
         starting_wire_seq,
     );
 

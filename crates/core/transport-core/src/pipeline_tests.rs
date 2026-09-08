@@ -23,6 +23,7 @@ use melin_journal::replication::REPLICATION_RING_CAPACITY;
 use melin_journal::JournalReader;
 use melin_journal::{BufferedWriter, JournalEvent};
 use melin_pipeline::ring;
+use melin_pipeline::wait::WaitStrategy;
 
 #[cfg(not(feature = "no-persist"))]
 use crate::cursors::SlotAcked;
@@ -132,10 +133,16 @@ fn journal_stage_allocates_primary_sequences() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
 
     let consumer = consumers.pop().unwrap();
-    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown2 = Arc::clone(&shutdown);
@@ -174,12 +181,12 @@ fn matching_stage_processes_events() {
 
     let (mut input_producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
     let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<TestOutput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let mut output_consumer = output_consumers.pop().unwrap();
 
     // Durable cursor and counters not used in this test — create dummies.
@@ -195,7 +202,7 @@ fn matching_stage_processes_events() {
         active_conns,
         None, // standalone — no halt check
         Arc::new(crate::fence::FenceState::new(0)),
-        false,
+        WaitStrategy::SpinThenYield,
         1, // starting_wire_seq (test does not exercise the gate)
     );
 
@@ -248,12 +255,12 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     // without backpressure stalling the producer mid-publish.
     let (mut input_producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
     let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<TestOutput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let mut output_consumer = output_consumers.pop().unwrap();
 
     let dummy_cursor = dummy_durable_cursor();
@@ -277,7 +284,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         active_conns,
         None,
         Arc::clone(&fence),
-        false,
+        WaitStrategy::SpinThenYield,
         STARTING_WIRE_SEQ,
     );
 
@@ -425,7 +432,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
@@ -609,7 +616,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
             false,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
-            false,
+            WaitStrategy::SpinThenYield,
             false,
             false,
             Arc::new(crate::fence::FenceState::new(0)),
@@ -667,7 +674,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
@@ -771,7 +778,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
         writer,
         MAX_JOURNAL_BATCH,
         Duration::ZERO,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
     );
@@ -854,10 +861,16 @@ fn journal_stage_uses_preassigned_sequences() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
 
     let consumer = consumers.pop().unwrap();
-    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown2 = Arc::clone(&shutdown);
@@ -910,7 +923,7 @@ fn full_pipeline_journal_and_matching_parallel() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
@@ -982,7 +995,7 @@ fn journal_stage_sends_replication_batches() {
         true,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
@@ -1106,7 +1119,7 @@ fn replica_quorum_always_starts_disengaged() {
             false,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
-            false,
+            WaitStrategy::SpinThenYield,
             false,
             false,
             Arc::new(crate::fence::FenceState::new(0)),
@@ -1129,7 +1142,7 @@ fn replica_quorum_always_starts_disengaged() {
             true,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
-            false,
+            WaitStrategy::SpinThenYield,
             false,
             false,
             Arc::new(crate::fence::FenceState::new(0)),
@@ -1160,10 +1173,16 @@ fn primary_journal_sequences_contiguous_across_many_batches() {
     let cap = ((total as usize) + MAX_JOURNAL_BATCH).next_power_of_two();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(cap)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
-    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown2 = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -1253,7 +1272,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         true,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
@@ -1266,7 +1285,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         replica_writer,
         MAX_JOURNAL_BATCH,
         Duration::ZERO,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
     );
@@ -1460,10 +1479,16 @@ fn journal_stage_rotates_on_manual_request() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     let rotate_flag = Arc::new(AtomicBool::new(false));
     stage.set_rotation(
         /* max_journal_bytes */ 0,
@@ -1582,9 +1607,15 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
     let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
 
     let rotations: crate::pipeline::StreamMarkQueue =
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
@@ -1668,13 +1699,19 @@ fn mid_batch_barrier_commits_only_the_encoded_prefix() {
     let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
     // The cursor the ack path reads. Captured before the stage takes
     // the consumer — the disk thread publishes into this same counter.
     let progress = consumer.progress_counter();
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     let marks: crate::pipeline::StreamMarkQueue =
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     marks
@@ -1773,7 +1810,7 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .add_consumer_after(0)
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let shadow_consumer = consumers.pop().unwrap();
     let journal_consumer = consumers.pop().unwrap();
     let progress = journal_consumer.progress_counter();
@@ -1785,7 +1822,7 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
         journal_consumer,
         Duration::ZERO,
         MAX_JOURNAL_BATCH,
-        false,
+        WaitStrategy::SpinThenYield,
     );
     let (fsync_writer, fsync_reader) = melin_pipeline::seqlock::split(FsyncState::default());
     stage.set_chain_hash_lock(fsync_writer);
@@ -1845,7 +1882,7 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
                 Duration::from_millis(20),
                 fsync_reader,
                 &shutdown2,
-                false,
+                WaitStrategy::SpinThenYield,
                 0,
             );
         })
@@ -1962,7 +1999,7 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .add_consumer_after(0)
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let shadow_consumer = consumers.pop().unwrap();
     let journal_consumer = consumers.pop().unwrap();
     let shadow_progress = shadow_consumer.progress_counter();
@@ -1972,7 +2009,7 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
         journal_consumer,
         Duration::ZERO,
         MAX_JOURNAL_BATCH,
-        false,
+        WaitStrategy::SpinThenYield,
     );
     let (fsync_writer, fsync_reader) = melin_pipeline::seqlock::split(FsyncState::default());
     stage.set_chain_hash_lock(fsync_writer);
@@ -2024,7 +2061,7 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
                     Duration::ZERO,
                     fsync_reader,
                     &shutdown,
-                    false,
+                    WaitStrategy::SpinThenYield,
                     0,
                 );
             })
@@ -2173,9 +2210,15 @@ fn adopted_rotation_honors_second_mark_in_same_batch() {
     let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
 
     let marks: crate::pipeline::StreamMarkQueue =
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
@@ -2236,9 +2279,15 @@ fn adopted_rotation_with_zero_tail_skips_chain_comparison() {
     let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32]).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
 
     let rotations: crate::pipeline::StreamMarkQueue =
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
@@ -2281,9 +2330,15 @@ fn adopted_rotation_with_wrong_tail_hash_is_divergence() {
     let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32]).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
 
     let rotations: crate::pipeline::StreamMarkQueue =
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
@@ -2362,10 +2417,15 @@ fn chain_check_mark_verifies_at_exact_position() {
         let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().unwrap();
-        let mut stage =
-            JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+        let mut stage = JournalStage::new(
+            writer,
+            consumer,
+            Duration::ZERO,
+            MAX_JOURNAL_BATCH,
+            WaitStrategy::SpinThenYield,
+        );
         let marks: crate::pipeline::StreamMarkQueue =
             Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         marks.lock().unwrap().push_back(StreamMark::ChainCheck {
@@ -2421,14 +2481,27 @@ fn primary_emits_chain_check_every_interval() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(256)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
 
     let (repl_producer_0, mut repl_consumers_0) =
-        melin_journal::replication::build_replication_ring(1, REPLICATION_RING_CAPACITY);
-    let (repl_producer_1, _repl_consumers_1) =
-        melin_journal::replication::build_replication_ring(1, REPLICATION_RING_CAPACITY);
+        melin_journal::replication::build_replication_ring(
+            1,
+            REPLICATION_RING_CAPACITY,
+            WaitStrategy::SpinThenYield,
+        );
+    let (repl_producer_1, _repl_consumers_1) = melin_journal::replication::build_replication_ring(
+        1,
+        REPLICATION_RING_CAPACITY,
+        WaitStrategy::SpinThenYield,
+    );
     let evict = [
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
@@ -2525,7 +2598,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         true,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
@@ -2547,7 +2620,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         replica_writer,
         MAX_JOURNAL_BATCH,
         Duration::ZERO,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
     );
@@ -2843,10 +2916,16 @@ fn journal_stage_rotates_on_size_threshold() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     // Tiny threshold — any non-empty fsync will cross it.
     stage.set_rotation(/* max_journal_bytes */ 1, None);
 
@@ -2904,10 +2983,16 @@ fn size_rotation_uses_prepared_fast_path_after_warmup() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     // Tiny threshold — every non-empty fsync rotates.
     stage.set_rotation(/* max_journal_bytes */ 1, None);
     let util = stage.utilization();
@@ -2950,13 +3035,13 @@ fn preparer_arms_for_size_and_replica_modes_only() {
         let writer = Writer::create(&dir.path().join(name)).unwrap();
         let (_p, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         JournalStage::new(
             writer,
             consumers.pop().unwrap(),
             Duration::ZERO,
             MAX_JOURNAL_BATCH,
-            false,
+            WaitStrategy::SpinThenYield,
         )
     };
 
@@ -3012,10 +3097,16 @@ fn size_trigger_tracks_the_segments_real_size() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     stage.set_rotation(THRESHOLD, None);
     // One event per batch: publish, wait for it to become durable, then
     // publish the next. Free-running publication would batch hundreds
@@ -3089,10 +3180,16 @@ fn fsync_state_carries_the_real_chain_hash_when_a_publisher_is_attached() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     let (fsync_writer, fsync_state) = seqlock::split(crate::pipeline::FsyncState::default());
     stage.set_chain_hash_lock(fsync_writer);
 
@@ -3159,11 +3256,17 @@ fn cursor_only_batches_still_release_their_input_slots() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
     let progress = consumer.progress_counter();
 
-    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let s = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&s));
@@ -3219,12 +3322,18 @@ fn disk_lag_gauge_returns_to_zero_once_the_journal_quiesces() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
     const EVENTS: u64 = 512;
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     let utilization = stage.utilization();
     // Durability of the last event is the "the stage has quiesced"
     // signal. Without it the gauge would be read before the stage ever
@@ -3283,10 +3392,16 @@ fn rotate_storm_collapses_to_single_rotation() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     let rotate_flag = Arc::new(AtomicBool::new(false));
     stage.set_rotation(
         /* max_journal_bytes */ 0,
@@ -3358,10 +3473,16 @@ fn post_rotation_events_land_in_live_not_archive() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
-    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
     let rotate_flag = Arc::new(AtomicBool::new(false));
     stage.set_rotation(
         /* max_journal_bytes */ 0,
@@ -3465,9 +3586,15 @@ fn pipeline_journals_every_event_in_order() {
 
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
-    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    let stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown2 = Arc::clone(&shutdown);
@@ -3561,7 +3688,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
             false,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
-            false,
+            WaitStrategy::SpinThenYield,
             false,
             false,
             Arc::new(crate::fence::FenceState::new(0)),
@@ -3615,7 +3742,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
         false,
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_CAPACITY,
-        false,
+        WaitStrategy::SpinThenYield,
         false,
         false,
         Arc::new(crate::fence::FenceState::new(0)),
@@ -3766,17 +3893,29 @@ fn a_wide_event_app_survives_a_full_batch_with_a_replica_attached() {
     // Room for every event plus the sentinel while nothing is consuming.
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot<WideEvent>>::new(16384)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
 
     // The default `ServerConfig::max_journal_batch`, to show it is not
     // what bounds the span.
-    let mut stage = JournalStage::new(writer, consumer, Duration::from_micros(50), 1024, false);
+    let mut stage = JournalStage::new(
+        writer,
+        consumer,
+        Duration::from_micros(50),
+        1024,
+        WaitStrategy::SpinThenYield,
+    );
 
-    let (repl_producer_0, _consumers_0) =
-        melin_journal::replication::build_replication_ring(1, REPLICATION_RING_CAPACITY);
-    let (repl_producer_1, _consumers_1) =
-        melin_journal::replication::build_replication_ring(1, REPLICATION_RING_CAPACITY);
+    let (repl_producer_0, _consumers_0) = melin_journal::replication::build_replication_ring(
+        1,
+        REPLICATION_RING_CAPACITY,
+        WaitStrategy::SpinThenYield,
+    );
+    let (repl_producer_1, _consumers_1) = melin_journal::replication::build_replication_ring(
+        1,
+        REPLICATION_RING_CAPACITY,
+        WaitStrategy::SpinThenYield,
+    );
     stage.set_replication_producers(
         [repl_producer_0, repl_producer_1],
         [

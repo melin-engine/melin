@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use melin_pipeline::padding::Sequence;
+use melin_pipeline::wait::WaitStrategy;
 
 use super::protocol::Ack;
 
@@ -168,12 +169,12 @@ impl PendingAckQueue {
     pub fn pop_oldest_blocking(
         &mut self,
         journal_cursor: &Sequence,
-        busy_spin: bool,
+        wait: WaitStrategy,
         abort: &AtomicBool,
     ) -> Option<u64> {
         debug_assert!(!self.is_empty());
         let target = self.buf[self.head].journal_target;
-        if !wait_for_journal_cursor(journal_cursor, target, busy_spin, abort) {
+        if !wait_for_journal_cursor(journal_cursor, target, wait, abort) {
             return None;
         }
         // The cursor advanced — pop this entry plus any others that
@@ -190,12 +191,12 @@ impl PendingAckQueue {
     pub fn pop_all_blocking(
         &mut self,
         journal_cursor: &Sequence,
-        busy_spin: bool,
+        wait: WaitStrategy,
         abort: &AtomicBool,
     ) -> Option<u64> {
         let mut last = None;
         while !self.is_empty() {
-            match self.pop_oldest_blocking(journal_cursor, busy_spin, abort) {
+            match self.pop_oldest_blocking(journal_cursor, wait, abort) {
                 Some(seq) => last = Some(seq),
                 None => break,
             }
@@ -206,31 +207,25 @@ impl PendingAckQueue {
 
 /// Wait until the journal cursor crosses `target`, or `abort` flips
 /// (returns `false` — the cursor's owner has died and the wait would
-/// never complete). `busy_spin=true` keeps the wait on the CPU
-/// (production default — ack RTT is on the primary's response-gate
-/// critical path, where a `yield_now` scheduler tick adds ~1ms to
-/// client p99). `busy_spin=false` yields after a short spin so a
-/// stalled cursor doesn't peg a core under `--yield-idle` (tests / CI /
-/// shared boxes).
+/// never complete). Under `BusySpin` the wait stays on the CPU: ack RTT
+/// is on the primary's response-gate critical path, where a scheduler
+/// tick adds ~1ms to client p99. Under `SpinThenYield` a stalled cursor
+/// doesn't peg a core (tests / CI / shared boxes).
 pub fn wait_for_journal_cursor(
     journal_cursor: &Sequence,
     target: u64,
-    busy_spin: bool,
+    wait: WaitStrategy,
     abort: &AtomicBool,
 ) -> bool {
-    let mut spins: u32 = 0;
-    while journal_cursor.get().load(Ordering::Acquire) < target {
-        if abort.load(Ordering::Relaxed) {
-            return false;
+    let mut aborted = false;
+    wait.wait_until(|| {
+        if journal_cursor.get().load(Ordering::Acquire) >= target {
+            return true;
         }
-        if busy_spin || spins < 1000 {
-            spins = spins.wrapping_add(1);
-            std::hint::spin_loop();
-        } else {
-            std::thread::yield_now();
-        }
-    }
-    true
+        aborted = abort.load(Ordering::Relaxed);
+        aborted
+    });
+    !aborted
 }
 
 /// Build the next replica → primary [`Ack`] to fire under the

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tracing::{debug, error, info, warn};
 
 use melin_journal::replication::ReplicationConsumer;
+use melin_pipeline::wait::WaitStrategy;
 
 use super::auth::authenticate_replica;
 use super::{ReplicaCursors, ReplicaGate, ReplicationMetrics, SentHighWater};
@@ -67,7 +68,8 @@ pub struct Sender {
     pub handler_cores: [usize; 2],
     pub batch_size: usize,
     pub heartbeat_secs: u64,
-    pub busy_spin: bool,
+    /// How each replica handler thread waits on its replication ring.
+    pub wait: WaitStrategy,
     /// Node fencing state. Read to stamp the primary's epoch onto each
     /// `StreamStart`, and to self-demote when a replica handshakes with a
     /// higher epoch (this primary has been superseded). See `crate::fence`.
@@ -103,7 +105,7 @@ pub fn run_sender<A: Application>(
         handler_cores,
         batch_size,
         heartbeat_secs,
-        busy_spin,
+        wait,
         fence_state,
         ack_policy,
     } = config;
@@ -363,7 +365,7 @@ pub fn run_sender<A: Application>(
                                 slot_idx,
                                 batch_size,
                                 heartbeat_secs,
-                                busy_spin,
+                                wait,
                                 replicas_connected: connected_ref,
                                 authenticated: &slot_authenticated,
                             };
@@ -413,7 +415,7 @@ struct SlotContext<'a> {
     slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
-    busy_spin: bool,
+    wait: WaitStrategy,
     /// Trading-halt gate. The handler lifts it (`fetch_add`) only after auth
     /// succeeds; the main loop lowers it on teardown, gated by `authenticated`.
     replicas_connected: &'a AtomicU32,
@@ -455,7 +457,7 @@ fn handle_replica_connection<A: Application>(
         slot_idx,
         batch_size: _,
         heartbeat_secs,
-        busy_spin: _,
+        wait: _,
         replicas_connected,
         authenticated,
     } = ctx;
@@ -802,7 +804,7 @@ fn live_stream_uring(
         metrics,
         slot_idx,
         batch_size,
-        busy_spin,
+        wait,
         ack_policy,
         // Only used during handshake/catch-up (handle_replica_connection).
         journal_path: _,
@@ -816,7 +818,7 @@ fn live_stream_uring(
     } = ctx;
     let slot_idx = *slot_idx;
     let batch_size = *batch_size;
-    let busy_spin = *busy_spin;
+    let wait = *wait;
 
     use io_uring::{IoUring, opcode, types};
     use std::os::unix::io::AsRawFd;
@@ -861,7 +863,7 @@ fn live_stream_uring(
     // tracking needed. The io_uring kernel guarantees ordering.
     let mut send_in_flight = false;
     let mut send_offset: usize = 0;
-    let mut idle_spins: u32 = 0;
+    let mut waiter = wait.waiter();
     let mut heartbeat_timer = melin_app::amortized_timer::AmortizedTimer::new();
 
     // Diagnostic (RUST_LOG=debug): per-slot TCP_INFO snapshot once a
@@ -938,15 +940,17 @@ fn live_stream_uring(
                 send_offset = 0;
                 *last_send = std::time::Instant::now();
                 send_submit_ts = Some(*last_send);
-                idle_spins = 0;
+                waiter.reset();
                 heartbeat_timer = melin_app::amortized_timer::AmortizedTimer::new();
             } else {
                 // Heartbeat check: amortized when spinning (mask keeps the
                 // clock read at ~10/s at 10M iter/s). In yield mode the loop
                 // already pays a syscall per iteration, so the clock read is
                 // free and must not be skipped — see AmortizedTimer docs.
-                let spinning = busy_spin || idle_spins < 1000;
-                if heartbeat_timer.tick(heartbeat_interval, spinning).is_some() {
+                if heartbeat_timer
+                    .tick(heartbeat_interval, waiter.spinning())
+                    .is_some()
+                {
                     encode_heartbeat(sent.get(), ack_policy.load(Ordering::Relaxed), send_buf);
                     let sqe = opcode::Send::new(
                         types::Fixed(0),
@@ -972,10 +976,7 @@ fn live_stream_uring(
         // Periodic TCP_INFO dump — debug level. Amortized so the
         // per-iteration cost is a single `AND` + predictable branch.
         if info_log_timer
-            .tick(
-                std::time::Duration::from_secs(1),
-                busy_spin || idle_spins < 1000,
-            )
+            .tick(std::time::Duration::from_secs(1), waiter.spinning())
             .is_some()
         {
             super::log_tcp_info(tcp_fd, "live_stream", slot_idx);
@@ -1016,7 +1017,7 @@ fn live_stream_uring(
 
         let any_cqe = cqe_count > 0;
         for &(token, result) in &cqes[..cqe_count] {
-            idle_spins = 0;
+            waiter.reset();
             match token {
                 TOKEN_RECV => {
                     if result <= 0 {
@@ -1131,12 +1132,7 @@ fn live_stream_uring(
 
         // --- Idle wait ---
         if !any_cqe && send_buf.is_empty() {
-            if busy_spin || idle_spins < 1000 {
-                idle_spins = idle_spins.wrapping_add(1);
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
+            waiter.idle();
         }
     }
 }

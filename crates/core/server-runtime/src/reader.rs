@@ -1501,7 +1501,7 @@ mod tests {
         let (producer, mut consumers) =
             DisruptorBuilder::<InputSlot<TestEvent>>::new(ring_capacity)
                 .add_consumer()
-                .build();
+                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().expect("consumer present");
 
         Fixture {
@@ -2027,7 +2027,7 @@ mod tests {
         // CI hiccup into a false failure).
         let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(65536)
             .add_consumer()
-            .build();
+            .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let mut consumer = consumers.pop().expect("consumer");
         let (control_tx, control_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2140,7 +2140,7 @@ mod tests {
         const CONNS: u64 = 3;
         let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(1024)
             .add_consumer()
-            .build();
+            .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let mut consumer = consumers.pop().expect("consumer");
         let (control_tx, _control_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2214,7 +2214,7 @@ mod tests {
 
         let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(65536)
             .add_consumer()
-            .build();
+            .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let mut consumer = consumers.pop().expect("consumer");
         let (control_tx, control_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));

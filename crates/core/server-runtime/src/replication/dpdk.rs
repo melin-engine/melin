@@ -1124,7 +1124,7 @@ pub fn run_receiver_dpdk<A>(
     staging_mode: melin_journal::StagingMode,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
-    busy_spin: bool,
+    wait: melin_pipeline::wait::WaitStrategy,
     // Application factory: see the kernel-TCP `run_receiver` for the
     // shape and rationale. Carries operator policy (rate limits, caps,
     // ...) alongside the empty-app constructor.
@@ -1556,7 +1556,7 @@ where
                 snapshot_interval_ms,
                 snapshot_path.clone(),
                 group_commit_delay,
-                busy_spin,
+                wait,
                 Arc::clone(&fence_state),
                 Arc::clone(pipeline_healthy),
             )?);
@@ -1590,7 +1590,7 @@ where
                 shutdown,
                 control,
                 pipeline_depth,
-                busy_spin,
+                wait,
                 last_sequence,
                 std::mem::take(&mut recv_buf),
                 None,

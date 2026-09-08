@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
 use melin_pipeline::ring::DisruptorBuilder;
+use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::ControlEvent;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::response::{self, Response};
@@ -78,7 +79,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         replication_metrics: None,
         replica_active: None,
         heartbeat_interval: None,
-        busy_spin: true,
+        wait: WaitStrategy::SpinThenYield,
         utilization: Arc::new(StageUtilization::default()),
         encoder: Arc::new(ResponseEncoder),
         fence_state: Arc::new(FenceState::new(0)),
@@ -91,7 +92,7 @@ fn durable_response_is_released_before_blocking_on_a_later_gate() {
     let (mut producer, mut consumers) =
         DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(1024)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().expect("one consumer was requested");
 
     let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
@@ -174,7 +175,7 @@ fn earlier_slot_in_a_batch_is_not_held_by_a_later_one() {
     let (mut producer, mut consumers) =
         DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(1024)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().expect("one consumer was requested");
 
     let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
@@ -243,7 +244,7 @@ fn open_gate_delivers_the_whole_batch_in_order() {
     let (mut producer, mut consumers) =
         DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(1024)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().expect("one consumer was requested");
 
     let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
@@ -312,7 +313,7 @@ fn sustained_busy_stream_is_delivered_not_disconnected() {
     let (mut producer, mut consumers) =
         DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(SLOTS as usize)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().expect("one consumer was requested");
 
     let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
