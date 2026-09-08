@@ -798,18 +798,27 @@ impl PipelineCores {
     }
 
     /// Refuse a layout in which threads would starve each other: two
-    /// threads pinned to the same core where either one busy-spins.
+    /// threads pinned to the same core where either one busy-spins, or
+    /// a busy-spinner with no core at all.
     ///
     /// Checked over every entry, whether or not today's flags spawn that
     /// thread — a layout is meant to be right independent of which
     /// features are on, and the message names the threads and the core
     /// so the fix is obvious. Two yielding threads on one core is the
-    /// supported way to run on a small box and passes. Unpinned threads
-    /// (`core == 0`) always yield by construction and are not compared.
+    /// supported way to run on a small box and passes. The parser and
+    /// the [`Placement`] constructors never produce an unpinned spinner,
+    /// but the fields are public, so the check does not rely on that.
     pub fn validate(&self) -> Result<(), String> {
         let named = self.named();
         for (i, (name_a, a)) in named.iter().enumerate() {
             if !a.is_pinned() {
+                if a.wait == WaitStrategy::BusySpin {
+                    return Err(format!(
+                        "--cores: {name_a} is unpinned but busy-spins; a thread without a \
+                         core of its own would spin wherever the scheduler puts it, \
+                         starving whatever shares that core. Give it a core, or let it yield"
+                    ));
+                }
                 continue;
             }
             for (name_b, b) in &named[i + 1..] {
@@ -4142,6 +4151,23 @@ mod tests {
             .expect_err("6 and 6y is still a spinner sharing a core");
     }
 
+    /// The fields are public, so a layout built in code (not parsed)
+    /// can hold what the parser refuses: an unpinned busy-spinner. The
+    /// check catches it rather than trusting the constructors.
+    #[test]
+    fn validate_refuses_an_unpinned_busy_spinner_built_by_hand() {
+        let mut cores = super::ServerConfig::default().cores;
+        cores.shadow = Placement {
+            core: 0,
+            wait: WaitStrategy::BusySpin,
+        };
+        let err = cores
+            .validate()
+            .expect_err("unpinned spinner must be refused");
+        assert!(err.contains("shadow"), "{err}");
+        assert!(err.contains("unpinned"), "{err}");
+    }
+
     /// The layouts the runtime ships must pass their own check.
     #[test]
     fn shipped_layouts_validate() {
@@ -4202,22 +4228,23 @@ mod tests {
         );
     }
 
-    /// A mixed layout through the CLI: the hot stages spin on their own
-    /// cores, everything else shares one core and yields.
+    /// A mixed layout through the CLI — the one the operator docs show:
+    /// the hot stages spin on their own cores, everything else shares
+    /// one core and yields.
     #[test]
     fn mixed_layout_parses_and_resolves() {
         let config = super::ServerConfig::try_parse_from([
             "melin-server",
             "--cores",
-            "1,2,3,4,0,5y,5y,5y,5y,5,5y",
+            "1,2,3,4,0,6y,6y,6y,6y,6,5",
         ])
         .expect("parses");
         let cores = config.resolved_cores().expect("a legal mixed layout");
         assert_eq!(cores.journal, Placement::spinning(1));
         assert_eq!(cores.reader, Placement::spinning(4));
-        assert_eq!(cores.shadow, Placement::yielding(5));
-        assert_eq!(cores.journal_prep, Placement::yielding(5));
-        assert_eq!(cores.journal_disk, Placement::yielding(5));
+        assert_eq!(cores.journal_disk, Placement::spinning(5));
+        assert_eq!(cores.shadow, Placement::yielding(6));
+        assert_eq!(cores.journal_prep, Placement::yielding(6));
         assert_eq!(
             cores.stage_waits(),
             StageWaits {

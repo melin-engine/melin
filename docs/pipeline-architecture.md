@@ -291,10 +291,10 @@ Every wait in the pipeline goes through a wait strategy chosen at startup, per t
 
 The policy is stated per thread in `--cores`, as a suffix on the entry: `7` (or `7s`) busy-spins on core 7, `7y` spins then yields there. An entry of `0` leaves the thread unpinned, and an unpinned thread always yields — a spinner with no core of its own is the shared-core problem with the victim chosen by the scheduler, so `0s` is refused. `--yield-idle` is the shorthand for a `y` on every entry and takes precedence over any suffix. `journal-prep` never busy-waits (it blocks in file I/O) and takes no suffix.
 
-This is what lets one node mix the two: the hot stages each spinning on an isolated core, and the auxiliary threads packed onto one shared core, yielding:
+This is what lets one node mix the two: the hot stages (journal, matching, response, reader, journal-disk) each spinning on a core of their own, and the auxiliary threads packed onto one shared core, yielding:
 
 ```
---cores 1,2,3,4,0,5y,5y,5y,5y,5,5y
+--cores 1,2,3,4,0,6y,6y,6y,6y,6,5
 ```
 
 The node refuses to start with a layout in which threads would starve each other: two entries on the same core where either one busy-spins. The error names both threads and the core. Two yielding threads on one core is the supported way to run on a small box. Busy-spin on a shared core is never a deadlock under the default scheduler (the kernel still timeslices), but it is slow and it starves its neighbour; on an isolated core with real-time priority it *would* be a deadlock, which is why real-time priority is only ever granted on isolated cores.
