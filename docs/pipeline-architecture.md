@@ -293,11 +293,13 @@ The policy is stated per thread in `--cores`, as a suffix on the entry: `7` (or 
 
 One thread cannot take a policy: in DPDK mode the `reader` entry pins the NIC poll thread, which polls the device flat out whether or not it has work. A `y` on that entry is refused as a contradiction, so give it a core of its own. Leaving it unpinned is accepted as written, but the thread still polls flat out wherever the scheduler places it. On kernel TCP the reader blocks in the kernel between completions, and its entry's policy governs only the input ring it produces into.
 
-This is what lets one node mix the two: the hot stages (journal, matching, response, reader, journal-disk) each spinning on a core of their own, and the auxiliary threads packed onto one shared core, yielding:
+This is what lets one node mix the two: every thread on the acknowledgement path spinning on a core of its own, and the truly auxiliary threads packed onto one shared core, yielding:
 
 ```
---cores 1,2,3,4,0,6y,6y,6y,6y,6,5
+--cores 1,2,3,4,0,8y,8y,6,7,8,5
 ```
+
+Here journal, matching, response, the reader and journal-disk take cores 1 to 5, the two replication handlers take 6 and 7, and the event publisher, the shadow and the segment preparer share core 8. The replication handlers are on the acknowledgement path whenever the ack policy waits on a replica (`ram`, `disk+ram`, `two-disks`): the response gate releases a reply only once the replica's acknowledgement has arrived, and it arrives through the handler thread, so a yielding handler adds a scheduler wakeup to every reply. Only a standalone node can treat them as auxiliary.
 
 The node refuses to start with a layout in which threads would starve each other: two entries on the same core where either one busy-spins. The error names both threads and the core. Two yielding threads on one core is the supported way to run on a small box. Busy-spin on a shared core is never a deadlock under the default scheduler (the kernel still timeslices), but it is slow and it starves its neighbour; on an isolated core with real-time priority it *would* be a deadlock, which is why real-time priority is only ever granted on isolated cores.
 

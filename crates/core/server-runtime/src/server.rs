@@ -1425,10 +1425,8 @@ where
     let mut journal_stage = journal_stage;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
-    journal_stage.set_preparer_core(config.cores.journal_prep.core);
+    config.cores.place_journal_children(&mut journal_stage);
     journal_stage.set_staging_mode(config.journal_staging_mode.into());
-    journal_stage.set_disk_core(config.cores.journal_disk.core);
-    journal_stage.set_disk_wait(config.cores.journal_disk.wait);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.
@@ -2239,6 +2237,17 @@ where
         ..config
     };
     info!(cores = %config.cores, "pipeline layout");
+    // The one placement the layout check cannot make honest: the poll
+    // thread polls flat out whatever its entry says, and unpinned it
+    // does so wherever the scheduler puts it — next to whatever else is
+    // there. Accepted (test hosts run this way), but said out loud.
+    if !config.cores.reader.is_pinned() {
+        warn!(
+            "--cores: the reader is unpinned, but on DPDK it is the NIC poll thread and \
+             busy-polls regardless; it will take a full core wherever the scheduler places \
+             it. Give it a core of its own"
+        );
+    }
 
     // Mirrors the kernel-TCP `run` path: one atomic per
     // process, threaded into both replica (pre-staging for promotion)
@@ -2650,10 +2659,8 @@ where
         .transpose()?;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
-    journal_stage.set_preparer_core(config.cores.journal_prep.core);
+    config.cores.place_journal_children(&mut journal_stage);
     journal_stage.set_staging_mode(config.journal_staging_mode.into());
-    journal_stage.set_disk_core(config.cores.journal_disk.core);
-    journal_stage.set_disk_wait(config.cores.journal_disk.wait);
     // On a primary the journal stage owns the control-plane advertised
     // tip (durable cursor after each fsync batch). On the promotion path
     // this takes over the handle the receiver was advancing.

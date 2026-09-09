@@ -14,8 +14,9 @@
 //! layout that breaks that rule rather than running slowly and
 //! unpredictably.
 
+use melin_app::AppEvent;
 use melin_pipeline::wait::WaitStrategy;
-use melin_transport_core::pipeline::StageWaits;
+use melin_transport_core::pipeline::{JournalStage, StageWaits};
 
 /// Where one pipeline thread runs and how it waits there.
 ///
@@ -161,6 +162,19 @@ impl PipelineCores {
             journal: self.journal.wait,
             matching: self.matching.wait,
         }
+    }
+
+    /// Hand the journal stage the placements of the two threads it spawns
+    /// itself: the segment preparer and the disk thread. The sequencing
+    /// thread's own placement is applied where that thread is spawned,
+    /// like every other stage's; these two are the stage's children, so
+    /// their placement has to reach it before it runs. One function so
+    /// the primary, the DPDK primary and the replica cannot drift apart
+    /// on which fields they forward.
+    pub fn place_journal_children<E: AppEvent>(&self, stage: &mut JournalStage<E>) {
+        stage.set_preparer_core(self.journal_prep.core);
+        stage.set_disk_core(self.journal_disk.core);
+        stage.set_disk_wait(self.journal_disk.wait);
     }
 
     /// The same layout with every thread yielding: a `y` on every entry.
@@ -668,6 +682,45 @@ mod tests {
         assert_eq!(cores.reader, Placement::unpinned());
     }
 
+    /// The eleventh entry's suffix has to reach the disk thread, and the
+    /// tenth's core the preparer — through the one seam all three spawn
+    /// paths share. Without this the hop from `journal_disk.wait` to the
+    /// stage is correct by inspection only.
+    #[test]
+    fn place_journal_children_forwards_the_disk_and_preparer_placements() {
+        use counter_server::CounterEvent;
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_transport_core::pipeline::InputSlot;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = melin_journal::BufferedWriter::<CounterEvent>::create(&dir.path().join("j"))
+            .expect("create journal");
+        let (_producer, mut consumers) = DisruptorBuilder::<InputSlot<CounterEvent>>::new(4)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        // The sequencing thread spins; the disk thread must not inherit
+        // that once the layout says otherwise.
+        let mut stage = JournalStage::new(
+            writer,
+            consumers.pop().expect("one consumer"),
+            Duration::ZERO,
+            64,
+            WaitStrategy::BusySpin,
+        );
+        assert_eq!(
+            stage.disk_wait(),
+            WaitStrategy::BusySpin,
+            "before placement the disk thread inherits the sequencer's strategy"
+        );
+
+        let cores = parse_cores("1,2,3,4,0,8y,8y,6,7,8,5y").expect("parses");
+        cores.place_journal_children(&mut stage);
+        assert_eq!(stage.disk_core(), 5);
+        assert_eq!(stage.disk_wait(), WaitStrategy::SpinThenYield);
+        assert_eq!(stage.preparer_core(), 8);
+    }
+
     /// What the node logs at boot is the layout in `--cores` syntax, so
     /// an operator can copy it back verbatim — which holds only if the
     /// rendering round-trips through the parser, suffixes and all.
@@ -675,7 +728,7 @@ mod tests {
     fn layout_display_round_trips_through_parse_cores() {
         for input in [
             "1,2,3,4,0,6,7,8,9,10,11",
-            "1,2,3,4,0,6y,6y,6y,6y,6,5",
+            "1,2,3,4,0,8y,8y,6,7,8,5",
             "0,0,0,0,0,0,0,0,0",
             "1y,2y,3y,4y,0,0,0,0,0,0,7y",
         ] {
@@ -691,20 +744,25 @@ mod tests {
     }
 
     /// A mixed layout through the CLI — the one the operator docs show:
-    /// the hot stages spin on their own cores, everything else shares
-    /// one core and yields.
+    /// everything on the acknowledgement path (the four stages, the disk
+    /// thread, the two replication handlers) spins on a core of its own;
+    /// the event publisher, the shadow and the preparer share one core
+    /// and yield.
     #[test]
     fn mixed_layout_parses_and_resolves() {
         let config =
-            ServerConfig::try_parse_from(["melin-server", "--cores", "1,2,3,4,0,6y,6y,6y,6y,6,5"])
+            ServerConfig::try_parse_from(["melin-server", "--cores", "1,2,3,4,0,8y,8y,6,7,8,5"])
                 .expect("parses");
         for reader in [ReaderThread::IoUring, ReaderThread::DpdkPoll] {
             let cores = config.resolved_cores(reader).expect("a legal mixed layout");
             assert_eq!(cores.journal, Placement::spinning(1));
             assert_eq!(cores.reader, Placement::spinning(4));
             assert_eq!(cores.journal_disk, Placement::spinning(5));
-            assert_eq!(cores.shadow, Placement::yielding(6));
-            assert_eq!(cores.journal_prep, Placement::yielding(6));
+            assert_eq!(cores.repl_handler_0, Placement::spinning(6));
+            assert_eq!(cores.repl_handler_1, Placement::spinning(7));
+            assert_eq!(cores.event_publisher, Placement::yielding(8));
+            assert_eq!(cores.shadow, Placement::yielding(8));
+            assert_eq!(cores.journal_prep, Placement::yielding(8));
             assert_eq!(
                 cores.stage_waits(),
                 StageWaits {
