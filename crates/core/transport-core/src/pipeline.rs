@@ -932,6 +932,19 @@ impl<E: AppEvent> JournalStage<E> {
         self.disk_wait = wait;
     }
 
+    /// The core the disk thread will pin itself to when the stage runs
+    /// (`0` = unpinned). What [`set_disk_core`](Self::set_disk_core) set.
+    pub fn disk_core(&self) -> usize {
+        self.disk_core
+    }
+
+    /// How the disk thread will wait when the stage runs. What
+    /// [`set_disk_wait`](Self::set_disk_wait) set, or the sequencing
+    /// thread's own strategy if nothing did.
+    pub fn disk_wait(&self) -> WaitStrategy {
+        self.disk_wait
+    }
+
     /// Split the writer, start the disk thread on the file half, and
     /// build the sequencer over the stream half.
     ///
@@ -2368,6 +2381,12 @@ impl<E: AppEvent> JournalStage<E> {
     /// already-running worker.
     pub fn set_preparer_core(&mut self, core: usize) {
         self.preparer_core = core;
+    }
+
+    /// The core the preparer worker will pin itself to (`0` =
+    /// unpinned). What [`set_preparer_core`](Self::set_preparer_core) set.
+    pub fn preparer_core(&self) -> usize {
+        self.preparer_core
     }
 
     /// Set how the preparer materialises staged segments. Call before

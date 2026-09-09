@@ -486,10 +486,8 @@ where
     let stream_marks: melin_transport_core::pipeline::StreamMarkQueue =
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     journal_stage.set_stream_marks(Arc::clone(&stream_marks));
-    journal_stage.set_preparer_core(cores.journal_prep.core);
+    cores.place_journal_children(&mut journal_stage);
     journal_stage.set_staging_mode(staging_mode);
-    journal_stage.set_disk_core(cores.journal_disk.core);
-    journal_stage.set_disk_wait(cores.journal_disk.wait);
     let journal_failed = Arc::new(AtomicBool::new(false));
     let journal_failed_latch = Arc::clone(&journal_failed);
     // A fresh pipeline is healthy — this also clears the latch after a
