@@ -710,8 +710,8 @@ pub fn run<A: Application>(
             // is nearly saturated reaches this path a handful of times
             // between batches — there the read is already rare, and
             // masking it would stretch the one-second heartbeat scan
-            // into minutes. `--yield-idle` never masks either: the yield
-            // syscall dwarfs a vDSO read.
+            // into minutes. A yielding thread never masks either: the
+            // yield syscall dwarfs a vDSO read.
             //
             // "Busy-spinning, and has been for a while": under
             // spin-then-yield a loop past its budget is no longer

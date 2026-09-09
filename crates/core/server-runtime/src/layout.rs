@@ -2,9 +2,11 @@
 //! layout.
 //!
 //! A layout is one [`Placement`] per pipeline thread — a core and a
-//! [`WaitStrategy`] — parsed from `--cores`, resolved against
-//! `--yield-idle` and the transport, and checked before any thread is
-//! spawned. The check exists because the two halves of a placement
+//! [`WaitStrategy`] — parsed from `--cores`, resolved against the
+//! transport, and checked before any thread is spawned. `--cores` is the
+//! only place a wait policy is stated, so there is one spelling of every
+//! layout and nothing for a second flag to override. The check exists
+//! because the two halves of a placement
 //! constrain each other across threads: a busy-spinning thread needs its
 //! core to itself, and two threads that share a core must both yield, or
 //! the one waiting sits queued behind the one spinning for a full
@@ -161,8 +163,11 @@ impl PipelineCores {
         }
     }
 
-    /// The same layout with every thread yielding — what `--yield-idle`
-    /// means.
+    /// The same layout with every thread yielding: a `y` on every entry.
+    /// For code that builds a layout for a shared machine — the test
+    /// harnesses, an embedded bench — without spelling the list out.
+    /// Not valid for a DPDK reader, which cannot yield; see
+    /// [`resolve`](Self::resolve).
     pub fn all_yielding(self) -> Self {
         let y = |p: Placement| Placement::yielding(p.core);
         Self {
@@ -179,42 +184,34 @@ impl PipelineCores {
         }
     }
 
-    /// The layout the node actually runs: `--yield-idle` folded in, the
-    /// reader entry corrected for what the transport's reader thread can
-    /// do, and the whole thing checked with [`validate`](Self::validate).
-    /// The one place those inputs are combined — every spawn site reads
-    /// the result, so no thread waits under a policy the operator did
-    /// not ask for.
+    /// The layout the node actually runs: the reader entry checked
+    /// against what the transport's reader thread can do, then the whole
+    /// thing checked with [`validate`](Self::validate). Every spawn site
+    /// reads the result, so no thread waits under a policy the operator
+    /// did not ask for.
     ///
     /// On DPDK the reader is the NIC poll thread, which busy-polls
-    /// whatever its entry says. An explicit `y` there is a contradiction
-    /// and is refused. Under `--yield-idle` — shorthand for "every thread
-    /// that can" — the entry is quietly kept spinning instead, and the
-    /// check then refuses any core it shares. An unpinned DPDK reader
-    /// stays unpinned: it polls flat out wherever the scheduler puts it,
-    /// which is the one placement this module cannot make honest, and
-    /// the operator docs say so.
+    /// whatever its entry says, so a `y` there is a contradiction and is
+    /// refused. An unpinned DPDK reader is accepted as written: it polls
+    /// flat out wherever the scheduler puts it, which is the one
+    /// placement this module cannot make honest, and the operator docs
+    /// say so.
     ///
     /// An `Err` is a configuration the node refuses to start with.
-    pub fn resolve(self, yield_idle: bool, reader: ReaderThread) -> Result<Self, String> {
-        let mut cores = if yield_idle {
-            self.all_yielding()
-        } else {
-            self
-        };
-        if reader == ReaderThread::DpdkPoll && cores.reader.is_pinned() {
-            if !yield_idle && cores.reader.wait == WaitStrategy::SpinThenYield {
-                return Err(format!(
-                    "--cores: the reader entry is `{core}y`, but on DPDK the reader is the NIC \
-                     poll thread, which busy-polls whatever its entry says. Drop the suffix and \
-                     give it core {core} to itself",
-                    core = cores.reader.core
-                ));
-            }
-            cores.reader = Placement::spinning(cores.reader.core);
+    pub fn resolve(self, reader: ReaderThread) -> Result<Self, String> {
+        if reader == ReaderThread::DpdkPoll
+            && self.reader.is_pinned()
+            && self.reader.wait == WaitStrategy::SpinThenYield
+        {
+            return Err(format!(
+                "--cores: the reader entry is `{core}y`, but on DPDK the reader is the NIC \
+                 poll thread, which busy-polls whatever its entry says. Drop the suffix and \
+                 give it core {core} to itself",
+                core = self.reader.core
+            ));
         }
-        cores.validate()?;
-        Ok(cores)
+        self.validate()?;
+        Ok(self)
     }
 
     /// Refuse a layout in which threads would starve each other: two
@@ -605,14 +602,11 @@ mod tests {
     fn shipped_layouts_validate() {
         let default = ServerConfig::default().cores;
         for reader in [ReaderThread::IoUring, ReaderThread::DpdkPoll] {
-            default.resolve(false, reader).expect("default layout");
-            default
-                .resolve(true, reader)
-                .expect("default layout under --yield-idle");
+            default.resolve(reader).expect("default layout");
         }
         let (compact, _) = PipelineCores::compact(16).expect("compact fits 16 cores");
         compact
-            .resolve(false, ReaderThread::DpdkPoll)
+            .resolve(ReaderThread::DpdkPoll)
             .expect("compact layout");
         assert_eq!(
             compact.journal_disk,
@@ -621,65 +615,55 @@ mod tests {
         );
     }
 
-    /// `--yield-idle` is shorthand for a `y` on every entry, and it is
-    /// applied before the check — so the packed layouts the test suite
-    /// runs with keep working under the flag alone.
+    /// `all_yielding` is the programmatic "`y` on every entry": it turns
+    /// a packed layout the check would refuse into one it accepts, and
+    /// leaves the cores where they were.
     #[test]
-    fn resolve_folds_in_yield_idle_before_checking() {
+    fn all_yielding_makes_a_packed_layout_legal() {
         let packed = parse_cores("1,1,1,1,0,1,1,1,1").expect("parses");
         assert!(
-            packed.resolve(false, ReaderThread::IoUring).is_err(),
+            packed.resolve(ReaderThread::IoUring).is_err(),
             "nine spinners on core 1 must be refused"
         );
         let cores = packed
-            .resolve(true, ReaderThread::IoUring)
-            .expect("--yield-idle makes the packed layout legal");
+            .all_yielding()
+            .resolve(ReaderThread::IoUring)
+            .expect("the same cores, all yielding, are legal");
         assert_eq!(cores.journal, Placement::yielding(1));
         assert_eq!(cores.journal_disk, Placement::unpinned());
-        assert_eq!(cores, cores.all_yielding(), "every thread yields");
+        assert_eq!(
+            cores.to_string(),
+            "1y,1y,1y,1y,0,1y,1y,1y,1y,0,0",
+            "every pinned entry carries the suffix"
+        );
     }
 
-    /// The DPDK poll thread busy-polls whatever its entry says, so the
-    /// reader's resolved placement must say what the thread will do:
-    /// an explicit `y` is a contradiction and is refused; under the
-    /// `--yield-idle` shorthand the reader stays a spinner, and a core
-    /// it shares is refused on that basis; an unpinned reader is left
-    /// as the operator wrote it.
+    /// The DPDK poll thread busy-polls whatever its entry says, so a
+    /// `y` on the reader is a contradiction and is refused there, while
+    /// the io_uring reader accepts it. A spinning reader sharing a core
+    /// is refused by the ordinary check. An unpinned reader is left as
+    /// the operator wrote it.
     #[test]
     fn dpdk_reader_never_yields() {
         let explicit = parse_cores("1,2,3,4y,0,6,7,8,9").expect("parses");
         let err = explicit
-            .resolve(false, ReaderThread::DpdkPoll)
+            .resolve(ReaderThread::DpdkPoll)
             .expect_err("`4y` on the DPDK reader must be refused");
         assert!(err.contains("reader"), "{err}");
         assert!(err.contains("poll"), "{err}");
         explicit
-            .resolve(false, ReaderThread::IoUring)
+            .resolve(ReaderThread::IoUring)
             .expect("the io_uring reader may yield");
 
-        let alone = parse_cores("1,2,3,4,0,6,7,8,9").expect("parses");
-        let cores = alone
-            .resolve(true, ReaderThread::DpdkPoll)
-            .expect("--yield-idle with the reader on its own core");
-        assert_eq!(
-            cores.reader,
-            Placement::spinning(4),
-            "the shorthand leaves the poll thread spinning"
-        );
-        assert_eq!(cores.journal, Placement::yielding(1));
-
-        let shared = parse_cores("1,2,3,4,0,4,7,8,9").expect("parses");
+        let shared = parse_cores("1,2,3,4,0,4y,7,8,9").expect("parses");
         let err = shared
-            .resolve(true, ReaderThread::DpdkPoll)
-            .expect_err("a core shared with the poll thread is refused even under --yield-idle");
+            .resolve(ReaderThread::DpdkPoll)
+            .expect_err("a core shared with the poll thread is refused");
         assert!(err.contains("reader busy-spins"), "{err}");
-        shared
-            .resolve(true, ReaderThread::IoUring)
-            .expect("the same layout is fine when the reader can yield");
 
         let unpinned = parse_cores("1,2,3,0,0,6,7,8,9").expect("parses");
         let cores = unpinned
-            .resolve(true, ReaderThread::DpdkPoll)
+            .resolve(ReaderThread::DpdkPoll)
             .expect("an unpinned reader is accepted as written");
         assert_eq!(cores.reader, Placement::unpinned());
     }
