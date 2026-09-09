@@ -327,19 +327,6 @@ pub struct ServerConfig {
     #[arg(long, value_enum, default_value_t = crate::ack_policy::AckPolicy::DiskAndRam)]
     pub ack_policy: crate::ack_policy::AckPolicy,
 
-    /// Make every pipeline thread yield to the OS scheduler when idle
-    /// instead of busy-spinning — shorthand for a `y` suffix on every
-    /// `--cores` entry, and it wins over any suffix given. Use on shared
-    /// machines without isolated cores to avoid starving other processes,
-    /// or each other. Covers every wait in the pipeline: consumers
-    /// polling an empty ring, producers blocked on a full one, and the
-    /// response stage's durability gate. Default (no flag) is busy-spin,
-    /// which gives lowest latency on isolated cores (isolcpus). To mix
-    /// the two, leave this off and suffix the sharing threads in
-    /// `--cores` instead.
-    #[arg(long, default_value_t = false)]
-    pub yield_idle: bool,
-
     // --- DPDK configuration (only used with --features dpdk) ---
     /// DPDK EAL arguments (space-separated). Example: --dpdk-eal-args="-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
@@ -568,7 +555,6 @@ impl Default for ServerConfig {
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
             ack_policy: crate::ack_policy::AckPolicy::DiskAndRam,
-            yield_idle: false,
             dpdk_eal_args: String::new(),
             dpdk_peer_ip: None,
             dpdk_gateway_mac: None,
@@ -643,7 +629,7 @@ impl ServerConfig {
     ///
     /// An `Err` is a configuration the node refuses to start with.
     pub fn resolved_cores(&self, reader: ReaderThread) -> Result<PipelineCores, String> {
-        self.cores.resolve(self.yield_idle, reader)
+        self.cores.resolve(reader)
     }
 }
 
@@ -814,8 +800,8 @@ where
 {
     warn_if_chain_disabled();
 
-    // The layout every spawn site below reads: `--yield-idle` folded in,
-    // and refused outright if two threads would starve each other.
+    // The layout every spawn site below reads, refused outright if two
+    // threads would starve each other.
     let config = ServerConfig {
         cores: config.resolved_cores(ReaderThread::IoUring)?,
         ..config
@@ -3646,11 +3632,8 @@ mod tests {
             super::ServerConfig::try_parse_from(["melin-server", "--dpdk-eal-args", "-l 0-7"]);
         assert!(space_form.is_err(), "space-separated form must be rejected");
 
-        let forgotten_value = super::ServerConfig::try_parse_from([
-            "melin-server",
-            "--dpdk-eal-args",
-            "--yield-idle",
-        ]);
+        let forgotten_value =
+            super::ServerConfig::try_parse_from(["melin-server", "--dpdk-eal-args", "--no-mlock"]);
         assert!(
             forgotten_value.is_err(),
             "a forgotten value must error, not swallow the next flag"
