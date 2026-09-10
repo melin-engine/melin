@@ -130,7 +130,7 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         // Test servers share the machine with the rest of the suite; a
         // busy-spinning pipeline per node starves the clients (and the
         // other nodes) of CPU time under full-suite load.
-        yield_idle: true,
+        cores: ServerConfig::default().cores.all_yielding(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,

@@ -435,7 +435,7 @@ pub(super) type ReplicaHandles<A> =
 pub(super) fn build_replica_pipeline_with_threads<A>(
     exchange: A,
     writer: BufferedWriter<A::Event>,
-    cores: crate::server::PipelineCores,
+    cores: crate::layout::PipelineCores,
     // How the replica's segment preparer materialises staged extents.
     // A replica's rotation stall sits on the ack path — under
     // `disk+ram`/`two-disks` it delays the primary's ack gate — so this
@@ -444,7 +444,6 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,
-    wait: melin_pipeline::wait::WaitStrategy,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     // Process-lifetime health mirror for the replica health endpoint —
     // see `ReplicaControlPlane::pipeline_healthy`. Reset `true` here (a
@@ -470,7 +469,7 @@ where
         writer,
         4096, // max_journal_batch
         group_commit_delay,
-        wait,
+        cores.stage_waits(),
         enable_shadow,
         fence_state,
     );
@@ -478,7 +477,7 @@ where
     let pipeline_shutdown = Arc::new(AtomicBool::new(false));
 
     let ps = Arc::clone(&pipeline_shutdown);
-    let journal_core = cores.journal;
+    let journal_core = cores.journal.core;
     let mut journal_stage = pipeline.journal_stage;
     // Replicas never rotate on local triggers (size or operator
     // command) — they adopt the boundaries the primary announces over
@@ -487,9 +486,8 @@ where
     let stream_marks: melin_transport_core::pipeline::StreamMarkQueue =
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     journal_stage.set_stream_marks(Arc::clone(&stream_marks));
-    journal_stage.set_preparer_core(cores.journal_prep);
+    cores.place_journal_children(&mut journal_stage);
     journal_stage.set_staging_mode(staging_mode);
-    journal_stage.set_disk_core(cores.journal_disk);
     let journal_failed = Arc::new(AtomicBool::new(false));
     let journal_failed_latch = Arc::clone(&journal_failed);
     // A fresh pipeline is healthy — this also clears the latch after a
@@ -518,7 +516,7 @@ where
         .expect("spawn journal thread");
 
     let ps = Arc::clone(&pipeline_shutdown);
-    let matching_core = cores.matching;
+    let matching_core = cores.matching.core;
     let matching_stage = pipeline.matching_stage;
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
@@ -531,15 +529,15 @@ where
     // Drain thread uses the response core — replicas have no response stage,
     // but the consumer needs to be drained so the output ring doesn't fill.
     let ps = Arc::clone(&pipeline_shutdown);
-    let drain_core = cores.response;
+    let drain = cores.response;
     let drain_consumer = pipeline.drain_consumer;
     let drain_handle = std::thread::Builder::new()
         .name("drain".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("drain", drain_core);
+            melin_app::affinity::pin_thread("drain", drain.core);
             let mut consumer = drain_consumer;
             let mut batch = vec![OutputSlot::<A::Report, A::QueryResponse>::default(); 256];
-            let mut waiter = wait.waiter();
+            let mut waiter = drain.wait.waiter();
             loop {
                 if ps.load(Ordering::Relaxed) {
                     return;
@@ -562,12 +560,12 @@ where
             .expect("chain hash lock with shadow")
             .clone();
         let ps = Arc::clone(&pipeline_shutdown);
-        let shadow_core = cores.shadow;
+        let shadow = cores.shadow;
         Some(
             std::thread::Builder::new()
                 .name("replica-shadow".into())
                 .spawn(move || {
-                    melin_app::affinity::pin_thread("replica-shadow", shadow_core);
+                    melin_app::affinity::pin_thread("replica-shadow", shadow.core);
                     melin_transport_core::shadow::run(
                         shadow_cons,
                         shadow_exchange,
@@ -575,7 +573,7 @@ where
                         std::time::Duration::from_millis(snapshot_interval_ms),
                         chain_lock,
                         &ps,
-                        wait,
+                        shadow.wait,
                         shadow_initial_epoch,
                     );
                 })

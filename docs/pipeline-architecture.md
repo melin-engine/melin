@@ -247,7 +247,7 @@ The `group_commit_delay` parameter (configurable via `--group-commit-us`) allows
 
 ### Idle behavior
 
-When no events are available, the journal stage waits according to the node's wait strategy — see [Waiting](#waiting) below. The same strategy governs its waits on the disk thread: claiming a hand-off slot, draining before a rotation, and collecting the rotation result.
+When no events are available, the journal stage waits according to its thread's wait strategy — see [Waiting](#waiting) below. The same strategy governs its waits on the disk thread: claiming a hand-off slot, draining before a rotation, and collecting the rotation result.
 
 ### Shutdown
 
@@ -280,16 +280,28 @@ The matching stage does **not** wait for the journal stage. Both consumers are g
 
 ### Idle behavior
 
-Waits according to the node's wait strategy, like every other stage — see [Waiting](#waiting).
+Waits according to its thread's wait strategy, like every other stage — see [Waiting](#waiting).
 
 ## Waiting
 
-Every wait in the pipeline goes through one wait strategy, chosen at startup for the whole node: a stage polling an empty ring, a producer blocked on a full one, the journal stage waiting on its disk thread, the response stage's durability gate waiting on the journal and the replicas, and the startup drains that wait for seed events to clear the pipeline. There is no wait that the choice does not reach.
+Every wait in the pipeline goes through a wait strategy chosen at startup, per thread: a stage polling an empty ring, a producer blocked on a full one, the journal stage waiting on its disk thread, the response stage's durability gate waiting on the journal and the replicas, and the startup drains that wait for seed events to clear the pipeline. There is no wait that the choice does not reach. A ring waits the way the thread that produces into it does, since a full ring blocks the producer on the producer's core.
 
-- **Busy-spin** (default): the waiting thread spins with `PAUSE` and never yields. The lowest-latency choice, and the right one whenever each pipeline thread has an isolated core to itself (`isolcpus`), where a yield would only be a wasted syscall on the critical path.
-- **Spin, then yield** (`--yield-idle`): the thread spins for about a microsecond, then hands the CPU back to the scheduler on every further idle iteration until work arrives. For machines where pipeline threads share cores with each other or with other processes — development boxes, CI, a test run that packs several nodes onto a laptop. Without it, a thread spinning on a shared core can hold the CPU for a full scheduler slice while the very thread it is waiting for sits queued behind it, turning each hand-off between stages into milliseconds.
+- **Busy-spin** (default): the waiting thread spins with `PAUSE` and never yields. The lowest-latency choice, and the right one whenever the thread has an isolated core to itself (`isolcpus`), where a yield would only be a wasted syscall on the critical path.
+- **Spin, then yield**: the thread spins for about a microsecond, then hands the CPU back to the scheduler on every further idle iteration until work arrives. For threads that share a core with each other or with other processes. Without it, a thread spinning on a shared core can hold the CPU for a full scheduler slice while the very thread it is waiting for sits queued behind it, turning each hand-off between stages into milliseconds.
 
-Busy-spin on a shared core is never a deadlock under the default scheduler (the kernel still timeslices), but it is slow and it starves neighbours; on an isolated core with real-time priority it *would* be a deadlock, which is why real-time priority is only ever granted on isolated cores.
+The policy is stated per thread in `--cores`, as a suffix on the entry: `7` (or `7s`) busy-spins on core 7, `7y` spins then yields there. An entry of `0` leaves the thread unpinned, and an unpinned thread always yields — a spinner with no core of its own is the shared-core problem with the victim chosen by the scheduler, so `0s` is refused. `journal-prep` never busy-waits (it blocks in file I/O) and takes no suffix. On a shared machine where every thread should yield, suffix every entry: `--cores 1y,2y,3y,4y,0,6y,7y,8y,9y,10,11y`.
+
+One thread cannot take a policy: in DPDK mode the `reader` entry pins the NIC poll thread, which polls the device flat out whether or not it has work. A `y` on that entry is refused as a contradiction, so give it a core of its own. Leaving it unpinned is accepted as written, but the thread still polls flat out wherever the scheduler places it. On kernel TCP the reader blocks in the kernel between completions, and its entry's policy governs only the input ring it produces into.
+
+This is what lets one node mix the two: every thread on the acknowledgement path spinning on a core of its own, and the truly auxiliary threads packed onto one shared core, yielding:
+
+```
+--cores 1,2,3,4,0,8y,8y,6,7,8,5
+```
+
+Here journal, matching, response, the reader and journal-disk take cores 1 to 5, the two replication handlers take 6 and 7, and the event publisher, the shadow and the segment preparer share core 8. The replication handlers are on the acknowledgement path whenever the ack policy waits on a replica (`ram`, `disk+ram`, `two-disks`): the response gate releases a reply only once the replica's acknowledgement has arrived, and it arrives through the handler thread, so a yielding handler adds a scheduler wakeup to every reply. Only a standalone node can treat them as auxiliary.
+
+The node refuses to start with a layout in which threads would starve each other: two entries on the same core where either one busy-spins. The error names both threads and the core. Two yielding threads on one core is the supported way to run on a small box. Busy-spin on a shared core is never a deadlock under the default scheduler (the kernel still timeslices), but it is slow and it starves its neighbour; on an isolated core with real-time priority it *would* be a deadlock, which is why real-time priority is only ever granted on isolated cores.
 
 ## Response Stage
 
@@ -382,7 +394,7 @@ The server spawns four always-on pipeline threads plus one reader thread, and up
 | Repl Handler 0/1 | 8, 9 | Per-replica connection handling | Yes (one per connected replica) |
 | Segment Preparer | 10 | Pre-stage the next journal segment off the rotation path | Yes (recurring rotation only) |
 
-Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core, or be left unpinned with `0`; only the five mandatory threads need a core to themselves.
+Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core — suffixed with `y` so they yield to each other, see [Waiting](#waiting) — or be left unpinned with `0`; only the five mandatory threads need a core to themselves.
 
 ### The journal's two threads
 
@@ -409,7 +421,7 @@ In **DPDK mode**, a single poll thread handles all client connections (one NIC q
 
 ### Why not async
 
-The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader thread uses io_uring with multishot RECV for connection multiplexing, and the pipeline threads poll their rings under the node's wait strategy (see [Waiting](#waiting)).
+The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader thread uses io_uring with multishot RECV for connection multiplexing, and the pipeline threads poll their rings under their own wait strategies (see [Waiting](#waiting)).
 
 ## Persist-Before-Ack Invariant
 
@@ -435,7 +447,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: journal, matching, response, reader, *(unused)*, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep, journal-disk (comma-separated). 0 = unpinned. The fifth entry is ignored — it once pinned the thread that accepts replica connections, which does no work worth a core; the replica data path is pinned by repl-handler-0/1. Set it to 0 to hand that core back. The last two entries are optional — a 9- or 10-entry value still parses, leaving the omitted threads unpinned, so a configuration written before either existed keeps working. Place journal-disk on the same CCD as journal. |
+| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: journal, matching, response, reader, *(unused)*, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep, journal-disk (comma-separated). 0 = unpinned. The fifth entry is ignored — it once pinned the thread that accepts replica connections, which does no work worth a core; the replica data path is pinned by repl-handler-0/1. Set it to 0 to hand that core back. The last two entries are optional — a 9- or 10-entry value still parses, leaving the omitted threads unpinned, so a configuration written before either existed keeps working. Place journal-disk on the same CCD as journal. Each entry takes an optional wait suffix, `7y` to yield when idle and share the core; see [Waiting](#waiting). |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |

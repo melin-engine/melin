@@ -593,6 +593,12 @@ pub struct JournalStage<E: AppEvent> {
     /// Core the disk thread pins itself to; `0` = unpinned. Set via
     /// [`set_disk_core`](Self::set_disk_core) before the stage runs.
     disk_core: usize,
+    /// How the disk thread waits for the sequencer's hand-offs. Its own
+    /// policy, not the sequencer's: the two are separate threads on
+    /// separate cores, and a layout may give one a core to itself and
+    /// have the other share. Defaults to the sequencer's; set via
+    /// [`set_disk_wait`](Self::set_disk_wait) before the stage runs.
+    disk_wait: WaitStrategy,
 }
 
 /// The running half of the journal stage: everything the sequencing
@@ -833,6 +839,7 @@ impl<E: AppEvent> JournalStage<E> {
             stream_marks: None,
             pending_mark: None,
             disk_core: 0,
+            disk_wait: wait,
         }
     }
 
@@ -919,6 +926,25 @@ impl<E: AppEvent> JournalStage<E> {
         self.disk_core = core;
     }
 
+    /// Set how the disk thread waits for hand-offs. Call before the
+    /// stage runs; defaults to the sequencing thread's own strategy.
+    pub fn set_disk_wait(&mut self, wait: WaitStrategy) {
+        self.disk_wait = wait;
+    }
+
+    /// The core the disk thread will pin itself to when the stage runs
+    /// (`0` = unpinned). What [`set_disk_core`](Self::set_disk_core) set.
+    pub fn disk_core(&self) -> usize {
+        self.disk_core
+    }
+
+    /// How the disk thread will wait when the stage runs. What
+    /// [`set_disk_wait`](Self::set_disk_wait) set, or the sequencing
+    /// thread's own strategy if nothing did.
+    pub fn disk_wait(&self) -> WaitStrategy {
+        self.disk_wait
+    }
+
     /// Split the writer, start the disk thread on the file half, and
     /// build the sequencer over the stream half.
     ///
@@ -949,7 +975,7 @@ impl<E: AppEvent> JournalStage<E> {
             batch_consumer,
             cursors,
             Arc::clone(&control),
-            self.wait,
+            self.disk_wait,
         );
         let disk_core = self.disk_core;
 
@@ -2357,6 +2383,12 @@ impl<E: AppEvent> JournalStage<E> {
         self.preparer_core = core;
     }
 
+    /// The core the preparer worker will pin itself to (`0` =
+    /// unpinned). What [`set_preparer_core`](Self::set_preparer_core) set.
+    pub fn preparer_core(&self) -> usize {
+        self.preparer_core
+    }
+
     /// Set how the preparer materialises staged segments. Call before
     /// the stage runs — like [`set_preparer_core`](Self::set_preparer_core),
     /// `enable_preparer` reads it at spawn time and an already-running
@@ -3236,6 +3268,39 @@ fn setup_chain_hash_publisher<E: AppEvent>(
     }
 }
 
+/// How each thread the pipeline builders wire up waits on the thread it
+/// depends on. One value per thread rather than one per pipeline: a
+/// layout may give the hot stages isolated cores to spin on and pack
+/// the rest onto a shared core that must yield.
+///
+/// The rings take the policy of the thread that *produces* into them —
+/// a full ring blocks the producer, on the producer's core. The journal
+/// thread's policy therefore also governs the write ring and the
+/// replication rings it feeds; the disk thread's own policy is set on
+/// the journal stage afterwards, via [`JournalStage::set_disk_wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageWaits {
+    /// The thread that produces into the input ring: the reader on a
+    /// primary, the replication receiver on a replica.
+    pub ingress: WaitStrategy,
+    /// The journal sequencing thread.
+    pub journal: WaitStrategy,
+    /// The matching thread, which also produces into the output ring.
+    pub matching: WaitStrategy,
+}
+
+impl StageWaits {
+    /// The same strategy for every thread — what a node without a
+    /// per-thread layout wants, and what tests use.
+    pub fn uniform(wait: WaitStrategy) -> Self {
+        Self {
+            ingress: wait,
+            journal: wait,
+            matching: wait,
+        }
+    }
+}
+
 /// Build the pipeline with optional replication support.
 ///
 /// When `enable_replication` is true, builds a replication ring (pre-allocated,
@@ -3256,7 +3321,7 @@ pub fn build_pipeline_with_replication<A>(
     enable_replication: bool,
     max_journal_batch: usize,
     replication_ring_size: usize,
-    wait: WaitStrategy,
+    waits: StageWaits,
     enable_event_publisher: bool,
     enable_shadow: bool,
     fence_state: Arc<crate::fence::FenceState>,
@@ -3274,7 +3339,7 @@ where
         shadow_consumer,
         journal_cursor,
         matching_cursor,
-    } = build_input_disruptor::<A::Event>(enable_shadow, wait);
+    } = build_input_disruptor::<A::Event>(enable_shadow, waits.ingress);
 
     // Output disruptor ring: matching → response (+ optional event publisher).
     // Single producer, N consumers (1 = response only, 2 = response + event publisher).
@@ -3287,7 +3352,7 @@ where
     if enable_event_publisher {
         output_builder = output_builder.add_consumer(); // consumer 1: event publisher
     }
-    let (output_producer, output_consumers) = output_builder.build(wait);
+    let (output_producer, output_consumers) = output_builder.build(waits.matching);
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
@@ -3319,7 +3384,7 @@ where
         journal_consumer,
         group_commit_delay,
         max_journal_batch,
-        wait,
+        waits.journal,
     );
     journal_stage.set_last_seq_publisher(cursors.durable_wire_seq());
 
@@ -3329,10 +3394,16 @@ where
     // publishes to both rings sequentially; on timeout, sets an eviction
     // flag and stops publishing to the stalled ring.
     let (replication_consumers, replication_ring_progress) = if enable_replication {
-        let (producer_0, mut consumers_0) =
-            melin_journal::replication::build_replication_ring(1, replication_ring_size, wait);
-        let (producer_1, mut consumers_1) =
-            melin_journal::replication::build_replication_ring(1, replication_ring_size, wait);
+        let (producer_0, mut consumers_0) = melin_journal::replication::build_replication_ring(
+            1,
+            replication_ring_size,
+            waits.journal,
+        );
+        let (producer_1, mut consumers_1) = melin_journal::replication::build_replication_ring(
+            1,
+            replication_ring_size,
+            waits.journal,
+        );
 
         let evict_flags = [
             Arc::new(AtomicBool::new(false)),
@@ -3391,7 +3462,7 @@ where
         active_connections,
         replicas_connected.clone(),
         fence_state,
-        wait,
+        waits.matching,
         starting_wire_seq,
     );
 
@@ -3429,7 +3500,7 @@ pub fn build_replica_pipeline<A>(
     writer: BufferedWriter<A::Event>,
     max_journal_batch: usize,
     group_commit_delay: Duration,
-    wait: WaitStrategy,
+    waits: StageWaits,
     enable_shadow: bool,
     fence_state: Arc<crate::fence::FenceState>,
 ) -> ReplicaPipeline<A>
@@ -3446,14 +3517,14 @@ where
         shadow_consumer,
         journal_cursor,
         matching_cursor,
-    } = build_input_disruptor::<A::Event>(enable_shadow, wait);
+    } = build_input_disruptor::<A::Event>(enable_shadow, waits.ingress);
 
     // Output disruptor: single drain consumer (no response stage on replica).
     let output_builder = ring::DisruptorBuilder::<OutputSlot<A::Report, A::QueryResponse>>::new(
         OUTPUT_RING_CAPACITY,
     )
     .add_consumer();
-    let (output_producer, mut output_consumers) = output_builder.build(wait);
+    let (output_producer, mut output_consumers) = output_builder.build(waits.matching);
     let drain_consumer = output_consumers.pop().expect("drain consumer");
 
     let events_processed = Arc::new(AtomicU64::new(0));
@@ -3474,7 +3545,7 @@ where
         journal_consumer,
         group_commit_delay,
         max_journal_batch,
-        wait,
+        waits.journal,
     );
 
     // Unconditional on replicas (not gated on shadow snapshots): the
@@ -3515,7 +3586,7 @@ where
         active_connections,
         None, // no replicas_connected halt check on replica
         fence_state,
-        wait,
+        waits.matching,
         starting_wire_seq,
     );
 
