@@ -45,8 +45,50 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - `melin-wire-protocol`: `encode_challenge_response` and
   `CHALLENGE_RESPONSE_LEN` beside the decoder, so the handshake frame has one
   home; `BlockingFrameReader::frame` returns the last frame read.
+- **A wait policy per pipeline thread, in `--cores`.** Each entry takes a
+  suffix: `7` (or `7s`) busy-spins and needs core 7 to itself, `7y` spins
+  briefly then yields and may share it. One node can therefore spin its hot
+  stages on isolated cores and pack the auxiliary threads onto a shared
+  core that yields — previously the choice was one policy for the whole
+  process. `0` (unpinned) always yields, so `0s` is refused; `journal-prep`
+  blocks in I/O rather than polling and takes no suffix. The node refuses to
+  start when two threads share a core and either busy-spins, naming both
+  threads and the core: a spinner on a shared core holds the CPU for a full
+  scheduler slice while the thread it is waiting for sits queued behind it,
+  which is how co-scheduled pipeline threads starved each other. The boot
+  log prints the resolved layout in `--cores` syntax. Every wait in the
+  pipeline — consumers polling an empty ring, producers blocked on a full
+  one, the journal stage waiting on its disk thread, the response stage's
+  durability gate, the startup drains — goes through the thread's policy;
+  the producer-side waits and the gate previously spun unconditionally,
+  whatever `--yield-idle` said. Source-breaking for direct users of the
+  runtime: `PipelineCores` fields are `Placement { core, wait }`
+  instead of bare core numbers; `EventPublisherFn` takes a
+  `melin_pipeline::wait::WaitStrategy` where it took a `bool`; the pipeline
+  builders take a `StageWaits`; the replication `Sender` takes `handlers:
+  [Placement; 2]`; `run_receiver` / `run_receiver_dpdk` no longer take a
+  wait flag; and `melin_pipeline`'s `DisruptorBuilder::build`,
+  `spsc::channel` and `melin_journal::replication::build_replication_ring`
+  take the producer's `WaitStrategy`.
 
 ### Changed
+
+- **An existing `--cores` value that puts two threads on one core no
+  longer starts the node.** Previously such threads busy-spun against each
+  other; the optional threads were even documented as able to share an
+  auxiliary core. Now the node refuses at boot unless both entries carry a
+  `y` suffix, and it refuses for every entry in the list, including
+  threads no flag enables. To migrate, suffix the sharing entries:
+  `1,2,3,4,0,6,6,6,6` becomes `1,2,3,4,0,6y,6y,6y,6y`. On DPDK the
+  `reader` entry cannot take `y` — it pins the NIC poll thread, which
+  never yields — so give it a core of its own.
+- **A replica's shadow stage now busy-spins by default**, like the
+  primary's, instead of always yielding: it is pinned to the `shadow` core
+  the same way. A replica whose `--cores` puts the shadow on a shared core
+  now has a spinner there where it had a yielder, and the startup check
+  above says so; suffix the entry with `y`. The compact layout the embedded
+  bench uses leaves `journal-disk` unpinned, so it now yields rather than
+  spinning wherever the scheduler places it.
 
 - **Journal replay readers hint sequential access** to the kernel
   (`POSIX_FADV_SEQUENTIAL`), so readahead runs further ahead of the recovery,
@@ -66,6 +108,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the parser silently take the next flag as the EAL string; now either mistake
   is a startup error that names the fix. Launch scripts using the space form
   must add the `=`.
+
+### Removed
+
+- **`--yield-idle`.** It was shorthand for a `y` on every `--cores` entry,
+  and a second spelling of the same layout needed rules of its own: it won
+  over explicit suffixes, and on DPDK it had to treat the reader
+  differently from what its entry said. `--cores` is now the only place a
+  wait policy is stated. To migrate, suffix every pinned entry:
+  `--yield-idle` with the default layout becomes
+  `--cores 1y,2y,3y,4y,0,6y,7y,8y,9y,10,11y`; on DPDK leave the `reader`
+  entry bare, since the NIC poll thread cannot yield. `ServerConfig` loses
+  the `yield_idle` field; code that built a shared-machine configuration
+  sets `cores` to `PipelineCores::all_yielding()` of its layout instead.
 
 ## [0.15.0] - 2026-08-27
 

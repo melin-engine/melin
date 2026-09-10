@@ -554,13 +554,12 @@ pub fn run_receiver<A>(
     control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
-    cores: crate::server::PipelineCores,
+    cores: crate::layout::PipelineCores,
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
     staging_mode: melin_journal::StagingMode,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
-    wait: melin_pipeline::wait::WaitStrategy,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
 ) -> ReceiverResult<A, BufferedWriter<A::Event>>
@@ -844,7 +843,6 @@ where
                 snapshot_interval_ms,
                 snapshot_path.clone(),
                 group_commit_delay,
-                wait,
                 Arc::clone(&fence_state),
                 Arc::clone(pipeline_healthy),
             )?);
@@ -861,7 +859,7 @@ where
                 let handle = std::thread::Builder::new()
                     .name("replica-receiver".into())
                     .spawn_scoped(s, || {
-                        melin_app::affinity::pin_thread("replica-receiver", cores.reader);
+                        melin_app::affinity::pin_thread("replica-receiver", cores.reader.core);
                         let mut transport = match UringTransport::new(&tcp_writer) {
                             Ok(t) => t,
                             Err(e) => {
@@ -884,7 +882,7 @@ where
                             shutdown,
                             control,
                             pipeline_depth,
-                            wait,
+                            cores.reader.wait,
                             session_start,
                             Vec::with_capacity(MAX_DATA_FRAME + 4),
                             None,
@@ -1218,19 +1216,21 @@ mod tests {
                 .expect("parse keys")
         }
 
-        /// All-zero (unpinned sentinel) core assignment for every stage.
-        pub(super) fn unpinned_cores() -> crate::server::PipelineCores {
-            crate::server::PipelineCores {
-                journal: 0,
-                matching: 0,
-                response: 0,
-                reader: 0,
-                event_publisher: 0,
-                shadow: 0,
-                repl_handler_0: 0,
-                repl_handler_1: 0,
-                journal_prep: 0,
-                journal_disk: 0,
+        /// Every stage unpinned (and therefore yielding) — the layout
+        /// for a test host, which is oversubscribed by design.
+        pub(super) fn unpinned_cores() -> crate::layout::PipelineCores {
+            use crate::layout::Placement;
+            crate::layout::PipelineCores {
+                journal: Placement::unpinned(),
+                matching: Placement::unpinned(),
+                response: Placement::unpinned(),
+                reader: Placement::unpinned(),
+                event_publisher: Placement::unpinned(),
+                shadow: Placement::unpinned(),
+                repl_handler_0: Placement::unpinned(),
+                repl_handler_1: Placement::unpinned(),
+                journal_prep: Placement::unpinned(),
+                journal_disk: Placement::unpinned(),
             }
         }
 
@@ -1364,7 +1364,6 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
@@ -1536,7 +1535,6 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
@@ -1706,7 +1704,6 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
@@ -1949,7 +1946,6 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
@@ -2129,7 +2125,6 @@ mod tests {
                         mode,
                         Duration::ZERO,
                         64,
-                        melin_pipeline::wait::WaitStrategy::SpinThenYield,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )

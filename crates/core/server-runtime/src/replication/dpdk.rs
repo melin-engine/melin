@@ -1118,13 +1118,12 @@ pub fn run_receiver_dpdk<A>(
     control: &super::ReplicaControlPlane,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
-    cores: crate::server::PipelineCores,
+    cores: crate::layout::PipelineCores,
     // Passed straight to the replica's journal stage; see
     // `build_replica_pipeline_with_threads`.
     staging_mode: melin_journal::StagingMode,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
-    wait: melin_pipeline::wait::WaitStrategy,
     // Application factory: see the kernel-TCP `run_receiver` for the
     // shape and rationale. Carries operator policy (rate limits, caps,
     // ...) alongside the empty-app constructor.
@@ -1556,7 +1555,6 @@ where
                 snapshot_interval_ms,
                 snapshot_path.clone(),
                 group_commit_delay,
-                wait,
                 Arc::clone(&fence_state),
                 Arc::clone(pipeline_healthy),
             )?);
@@ -1565,7 +1563,7 @@ where
             // pin the receive thread — mirrors the primary's reader pin
             // so the thread producing input-ring entries from the network
             // isn't migrated across L3s mid-batch.
-            melin_app::affinity::pin_thread("receiver", cores.reader);
+            melin_app::affinity::pin_thread("receiver", cores.reader.core);
         }
 
         // --- Streaming session (transport-agnostic) ---
@@ -1590,7 +1588,7 @@ where
                 shutdown,
                 control,
                 pipeline_depth,
-                wait,
+                cores.reader.wait,
                 last_sequence,
                 std::mem::take(&mut recv_buf),
                 None,
