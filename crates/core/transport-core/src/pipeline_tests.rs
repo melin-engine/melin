@@ -3979,6 +3979,9 @@ fn dropping_the_disk_thread_handle_stops_and_joins_the_thread() {
             while !control.stop_requested() {
                 std::thread::yield_now();
             }
+            // Linger past the stop request, so a handle that only asks the
+            // thread to stop returns before this lands and fails the test.
+            std::thread::sleep(Duration::from_millis(50));
             exited.store(true, Ordering::Release);
             segment
         })

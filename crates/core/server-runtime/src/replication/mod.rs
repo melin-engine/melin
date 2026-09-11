@@ -490,12 +490,13 @@ where
     journal_stage.set_staging_mode(staging_mode);
     let journal_failed = Arc::new(AtomicBool::new(false));
     let journal_failed_latch = Arc::clone(&journal_failed);
+    // Start the journal's disk and preparer threads here rather than on
+    // journal-seq — see `JournalStage::start`. Before the health latch
+    // below, so a failed start never reports a healthy pipeline.
+    let sequencer = journal_stage.start()?;
     // A fresh pipeline is healthy — this also clears the latch after a
     // successful in-process resync rebuild.
     pipeline_healthy.store(true, Ordering::Release);
-    // Start the journal's disk and preparer threads here rather than on
-    // journal-seq — see `JournalStage::start`.
-    let sequencer = journal_stage.start()?;
     let journal_handle = std::thread::Builder::new()
         .name("journal-seq".into())
         .spawn(move || {

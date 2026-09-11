@@ -418,6 +418,7 @@ A thread given `0` in `--cores` is not pinned, and where it runs depends on the 
 
 - **Without isolated cores**, the scheduler places it on any core and moves it as load changes, including onto cores other threads are pinned to. Pinned threads have no real-time priority on such a host, so the two share that core by timeslice.
 - **With isolated cores** (`isolcpus`), it runs only on the cores outside the isolated set — core 0 and any other core not listed — alongside the kernel, interrupt handling and every other unpinned thread. The scheduler never moves work onto an isolated core, even an idle one: a spare isolated core stays idle rather than absorbing unpinned threads.
+
 In **kernel TCP mode**, the reader thread is pinned to the core `--cores` gives `reader` (default 4). io_uring with multishot RECV multiplexes every client connection on this single thread.
 
 In **DPDK mode**, a single poll thread handles all client connections (one NIC queue, no RSS). It is also pinned to the `reader` core in `--cores`.

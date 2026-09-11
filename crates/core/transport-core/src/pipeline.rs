@@ -989,9 +989,10 @@ impl<E: AppEvent> JournalStage<E> {
         //
         // A child inherits its creator's CPU mask and scheduling policy
         // at creation. `start` runs on the thread that spawns the
-        // sequencing thread — normally unpinned, but a replica rebuilding
-        // its pipeline calls it from its receiver thread, which may still
-        // sit on the receiver's isolated core. A child left to fix its own
+        // sequencing thread — normally unpinned, but a DPDK replica
+        // rebuilding its pipeline after a snapshot transfer calls it from
+        // its receiver thread, which still sits on the receiver's isolated
+        // core. A child left to fix its own
         // placement would first have to run beside its parent, which on a
         // real-time core may never happen: it never executes its first
         // instruction, not even the one that sets its name. Doing the
@@ -1067,7 +1068,7 @@ impl<E: AppEvent> JournalStage<E> {
 /// sequencer that never runs — its own thread failed to spawn, or it
 /// unwound — cannot leak a spinning thread holding the live segment open.
 /// The window exists because [`JournalStage::start`] launches the disk
-/// thread before the sequencing thread does.
+/// thread before the sequencing thread exists.
 pub(crate) struct DiskThread {
     control: Arc<DiskControl>,
     handle: Option<std::thread::JoinHandle<SegmentFile>>,
@@ -2377,9 +2378,9 @@ impl<E: AppEvent> JournalStage<E> {
         }
     }
 
-    /// Start the stage and run it on the calling thread. For tests, which
-    /// pin nothing, so starting the helpers on the sequencing thread
-    /// passes nothing on that matters.
+    /// Start the stage and run it on the calling thread, for tests. They
+    /// pin no threads, so it makes no difference that the helpers start
+    /// on the sequencing thread.
     #[cfg(test)]
     pub(crate) fn run(
         self,
