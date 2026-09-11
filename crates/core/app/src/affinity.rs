@@ -13,7 +13,7 @@
 //! thread. Requires `CAP_SYS_NICE` or root; degrades gracefully to
 //! `SCHED_OTHER` if unavailable.
 //!
-//! **Pipeline `--cores 0` means "do not pin"**. The pipeline-thread
+//! **A pipeline core of `0` means "do not pin"**. The pipeline-thread
 //! wrapper [`pin_thread`](crate::affinity::pin_thread) treats `0` as a
 //! sentinel and skips affinity
 //! entirely, leaving the thread on the default OS scheduler across all
