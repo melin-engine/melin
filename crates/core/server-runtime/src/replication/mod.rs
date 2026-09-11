@@ -346,7 +346,7 @@ pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
     // already published by `teardown_replica_pipeline` before this call,
     // so no further events can arrive in the input ring — setting the
     // flag here cannot race with new publishes. The flag is the fallback
-    // exit signal for paths that don't observe the sentinel: `run_sync`
+    // exit signal for paths that don't observe the sentinel: the sequencer
     // in `no-persist` builds, the drain consumer, the shadow stage, and
     // any case where the receiver thread panicked before publishing the
     // sentinel.
@@ -493,11 +493,14 @@ where
     // A fresh pipeline is healthy — this also clears the latch after a
     // successful in-process resync rebuild.
     pipeline_healthy.store(true, Ordering::Release);
+    // Start the journal's disk and preparer threads here rather than on
+    // journal-seq — see `JournalStage::start`.
+    let sequencer = journal_stage.start()?;
     let journal_handle = std::thread::Builder::new()
         .name("journal-seq".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("journal-seq", journal_core);
-            let result = journal_stage.run(&ps);
+            let result = sequencer.run(&ps);
             if let Err(ref e) = result {
                 // Latch before logging so the receiver reacts even if
                 // logging stalls. A dead journal stage freezes the
