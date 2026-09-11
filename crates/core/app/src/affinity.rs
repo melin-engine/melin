@@ -13,14 +13,22 @@
 //! thread. Requires `CAP_SYS_NICE` or root; degrades gracefully to
 //! `SCHED_OTHER` if unavailable.
 //!
-//! **Pipeline `--cores 0` means "do not pin"**. The pipeline-thread
+//! **A pipeline core of `0` means "do not pin"**. The pipeline-thread
 //! wrapper [`pin_thread`](crate::affinity::pin_thread) treats `0` as a
 //! sentinel and skips affinity
-//! entirely, leaving the thread on the default OS scheduler across all
-//! CPUs. Production deployments never run pipeline threads on core 0
+//! entirely, leaving the thread on the mask it inherited under the
+//! default OS scheduler. That mask is not "all CPUs" on a tuned host:
+//! `isolcpus` confines pid 1, and so every process, to the non-isolated
+//! CPUs, and the scheduler never moves a thread onto an isolated one. A
+//! thread spawned *from* an isolated CPU is the opposite case — it starts
+//! there and nothing moves it off, whatever its mask — which is why an
+//! unpinned child of a pinned thread is not the same as an unpinned
+//! thread (see [`prepare_child_context`](crate::affinity::prepare_child_context)).
+//! Production deployments never
+//! run pipeline threads on core 0
 //! (it is reserved for the kernel, IRQ handlers, and other system
 //! processes), so the value is free to repurpose. This lets the
-//! integration tests pass `--cores 0,0,0,...` without cramming every
+//! integration tests pass `--cores none` without cramming every
 //! pipeline thread of every spawned server onto a single physical CPU
 //! — which previously caused the io_uring reader to starve under
 //! contention and the failover suite to time out.
@@ -271,7 +279,10 @@ pub fn prepare_child_context(core: usize) -> Result<(), String> {
         libc::CPU_ZERO(&mut set);
         if core == 0 {
             // The `0` sentinel means "do not pin" — hand over the full
-            // mask so the child floats, rather than the parent's core.
+            // mask rather than the parent's core. That lets the child
+            // float; it does not guarantee it. A child created on an
+            // isolated core can start and stay there — see the module
+            // docs.
             for i in 0..libc::CPU_SETSIZE as usize {
                 libc::CPU_SET(i, &mut set);
             }

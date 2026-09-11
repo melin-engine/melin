@@ -45,13 +45,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - `melin-wire-protocol`: `encode_challenge_response` and
   `CHALLENGE_RESPONSE_LEN` beside the decoder, so the handshake frame has one
   home; `BlockingFrameReader::frame` returns the last frame read.
-- **A wait policy per pipeline thread, in `--cores`.** Each entry takes a
-  suffix: `7` (or `7s`) busy-spins and needs core 7 to itself, `7y` spins
-  briefly then yields and may share it. One node can therefore spin its hot
-  stages on isolated cores and pack the auxiliary threads onto a shared
-  core that yields — previously the choice was one policy for the whole
-  process. `0` (unpinned) always yields, so `0s` is refused; `journal-prep`
-  blocks in I/O rather than polling and takes no suffix. The node refuses to
+- **A wait policy per pipeline thread, in `--cores`.** Each thread's core
+  takes a suffix: `matching=7` (or `matching=7s`) busy-spins and needs
+  core 7 to itself, `matching=7y` spins briefly then yields and may share
+  it. One node can therefore spin its hot stages on isolated cores and
+  pack the auxiliary threads onto a shared core that yields — previously
+  the choice was one policy for the whole process. `0` (unpinned) always
+  yields, so `0s` is refused; `journal-prep` blocks in I/O rather than
+  polling and takes no suffix. The node refuses to
   start when two threads share a core and either busy-spins, naming both
   threads and the core: a spinner on a shared core holds the CPU for a full
   scheduler slice while the thread it is waiting for sits queued behind it,
@@ -70,18 +71,52 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   wait flag; and `melin_pipeline`'s `DisruptorBuilder::build`,
   `spsc::channel` and `melin_journal::replication::build_replication_ring`
   take the producer's `WaitStrategy`.
+- **A boot warning when a mandatory pipeline thread has no core.**
+  journal-seq, matching, response, reader and journal-disk carry every
+  request, so one of them left to the scheduler shares its core with
+  whatever else runs there and pays for it on every acknowledgement. The
+  warning names the threads. The auxiliary threads draw none: leaving them
+  unpinned is a documented layout. `--cores none` gets its own line, as the
+  development layout whose latency figures say nothing about the node.
 
 ### Changed
 
-- **An existing `--cores` value that puts two threads on one core no
-  longer starts the node.** Previously such threads busy-spun against each
-  other; the optional threads were even documented as able to share an
-  auxiliary core. Now the node refuses at boot unless both entries carry a
-  `y` suffix, and it refuses for every entry in the list, including
-  threads no flag enables. To migrate, suffix the sharing entries:
-  `1,2,3,4,0,6,6,6,6` becomes `1,2,3,4,0,6y,6y,6y,6y`. On DPDK the
-  `reader` entry cannot take `y` — it pins the NIC poll thread, which
-  never yields — so give it a core of its own.
+- **`--cores` names its threads.** A layout is now written
+  `journal-seq=1,matching=2,response=3,reader=4,journal-disk=5,…`, in any
+  order, instead of as a list read by position. Every thread must be
+  named, `journal-prep` and `journal-disk` included, although a nine- or
+  ten-entry list used to leave them unpinned: running a thread unpinned is
+  now a stated choice (`journal-disk=0`) rather than an omission. A core
+  of `0` still unpins any thread, and `none` unpins every thread. The
+  positional list could not shed its retired fifth entry (the replication
+  accept thread, unpinned since 0.15) without reading every later core as
+  its neighbour's, in most cases with no error, and each new thread could
+  only be appended as another optional position. A positional value is
+  now refused at startup with a message naming the threads, as are
+  missing, unknown and repeated names, and the boot log prints the layout
+  in the named form. The default layout is unchanged. To migrate, name the
+  positions and drop the fifth: `1,2,3,4,0,6,7,8,9,10,11` is
+  `journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11`;
+  a nine- or ten-entry list adds `journal-prep=0` and `journal-disk=0` for
+  the threads it left out; and an all-`0` list is `none`.
+  `PipelineCores::unpinned()` builds the latter in code.
+- **The journal's sequencing thread is named `journal-seq`**, where it was
+  `journal`: in `--cores`, in the thread name `top -H`, `ps` and `perf`
+  show, and in log lines. The journal stage runs three threads —
+  `journal-seq` orders, encodes and hash-chains events, `journal-disk`
+  writes and syncs them, `journal-prep` stages the next segment — and the
+  bare name did not say which one it was. Stage-level labels (utilization
+  and latency statistics) still say `journal`. Source-breaking for direct
+  users of the runtime: `PipelineCores::journal` is `journal_seq`.
+- **A `--cores` layout that puts two threads on one core no longer starts
+  the node.** Previously such threads busy-spun against each other; the
+  optional threads were even documented as able to share an auxiliary
+  core. Now the node refuses at boot unless both entries carry a `y`
+  suffix, and it refuses for every thread, including threads no flag
+  enables. To migrate, suffix the sharing entries:
+  `event-publisher=6,shadow=6` becomes `event-publisher=6y,shadow=6y`. On
+  DPDK the `reader` entry cannot take `y` — it pins the NIC poll thread,
+  which never yields — so give it a core of its own.
 - **A replica's shadow stage now busy-spins by default**, like the
   primary's, instead of always yielding: it is pinned to the `shadow` core
   the same way. A replica whose `--cores` puts the shadow on a shared core
@@ -89,7 +124,6 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   above says so; suffix the entry with `y`. The compact layout the embedded
   bench uses leaves `journal-disk` unpinned, so it now yields rather than
   spinning wherever the scheduler places it.
-
 - **Journal replay readers hint sequential access** to the kernel
   (`POSIX_FADV_SEQUENTIAL`), so readahead runs further ahead of the recovery,
   catch-up and chain-rebuild scans. Invisible on local NVMe; on
@@ -117,10 +151,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   differently from what its entry said. `--cores` is now the only place a
   wait policy is stated. To migrate, suffix every pinned entry:
   `--yield-idle` with the default layout becomes
-  `--cores 1y,2y,3y,4y,0,6y,7y,8y,9y,10,11y`; on DPDK leave the `reader`
-  entry bare, since the NIC poll thread cannot yield. `ServerConfig` loses
-  the `yield_idle` field; code that built a shared-machine configuration
-  sets `cores` to `PipelineCores::all_yielding()` of its layout instead.
+  `--cores journal-seq=1y,matching=2y,response=3y,reader=4y,event-publisher=6y,shadow=7y,repl-handler-0=8y,repl-handler-1=9y,journal-prep=10,journal-disk=11y`;
+  on DPDK leave the `reader` entry bare, since the NIC poll thread cannot
+  yield. `ServerConfig` loses the `yield_idle` field; code that built a
+  shared-machine configuration sets `cores` to
+  `PipelineCores::all_yielding()` of its layout instead.
 
 ## [0.15.0] - 2026-08-27
 
