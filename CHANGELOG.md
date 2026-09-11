@@ -71,6 +71,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   wait flag; and `melin_pipeline`'s `DisruptorBuilder::build`,
   `spsc::channel` and `melin_journal::replication::build_replication_ring`
   take the producer's `WaitStrategy`.
+- **A boot warning when a mandatory pipeline thread has no core.**
+  journal-seq, matching, response, reader and journal-disk carry every
+  request, so one of them left to the scheduler shares its core with
+  whatever else runs there and pays for it on every acknowledgement. The
+  warning names the threads. The auxiliary threads draw none: leaving them
+  unpinned is a documented layout. `--cores none` gets its own line, as the
+  development layout whose latency figures say nothing about the node.
 
 ### Changed
 

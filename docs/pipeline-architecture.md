@@ -393,7 +393,7 @@ The server spawns four always-on pipeline threads plus one reader thread, and th
 | Repl Handler 0/1 | 8, 9 | Per-replica connection handling | Yes (one per connected replica) |
 | Segment Preparer | 10 | Pre-stage the next journal segment off the rotation path | Yes (recurring rotation only) |
 
-Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core — suffixed with `y` so they yield to each other, see [Waiting](#waiting) — or be left unpinned with `0`, which puts them on the cores the operating system and interrupts use (see [CPU core pinning](#cpu-core-pinning)); only the five mandatory threads need a core to themselves.
+Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core — suffixed with `y` so they yield to each other, see [Waiting](#waiting) — or be left unpinned with `0`, which puts them on the cores the operating system and interrupts use (see [CPU core pinning](#cpu-core-pinning)); only the five mandatory threads need a core to themselves. The node warns at boot when any of the five has no core, and calls out `--cores none` as what it is: a development layout with nothing pinned, under which latency figures say nothing about the node.
 
 ### The journal's two threads
 
@@ -453,7 +453,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11` | Where each pipeline thread runs, as comma-separated `thread=core` entries in any order. The threads are journal-seq, matching, response, reader, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep and journal-disk. Every thread must be named; `0` leaves a thread unpinned, and `none` unpins every thread. A missing, unknown or repeated name is refused at startup, and so is the positional list earlier releases took. Place journal-disk on the same CCD as journal-seq. Each core takes an optional wait suffix, `journal-seq=7y` to yield when idle and share the core; see [Waiting](#waiting). |
+| `--cores` | `journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11` | Where each pipeline thread runs, as comma-separated `thread=core` entries in any order. The threads are journal-seq, matching, response, reader, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep and journal-disk. Every thread must be named; `0` leaves a thread unpinned, and `none` unpins every thread. The node warns at boot when one of the five mandatory threads has no core, and calls `none` out as a development layout. A missing, unknown or repeated name is refused at startup, and so is the positional list earlier releases took. Place journal-disk on the same CCD as journal-seq. Each core takes an optional wait suffix, `journal-seq=7y` to yield when idle and share the core; see [Waiting](#waiting). |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |
