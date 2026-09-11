@@ -660,6 +660,10 @@ where
     D: RequestDecoder<Event = A::Event> + 'static,
     E: ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
 {
+    // Before anything pins a thread or initialises DPDK, whose EAL can
+    // narrow this thread to one lcore: the CPU set captured here is what
+    // every unpinned thread runs on.
+    melin_app::affinity::capture_home_mask();
     let shutdown = Arc::new(AtomicBool::new(false));
     crate::process::install_shutdown_handler(&shutdown);
 
@@ -721,6 +725,9 @@ where
     D: RequestDecoder<Event = A::Event> + 'static,
     E: ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
 {
+    // As in `run`: the CPU set unpinned threads run on, captured before
+    // anything pins a thread.
+    melin_app::affinity::capture_home_mask();
     run_tcp(
         listener,
         config,
