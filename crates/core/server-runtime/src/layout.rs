@@ -132,7 +132,10 @@ pub struct PipelineCores {
     /// segment).
     ///
     /// Its wait policy is always yielding: the preparer blocks in file
-    /// I/O and sleeps between attempts, it never polls a ring. It is
+    /// I/O and sleeps between attempts, it never polls a ring. The parser
+    /// only produces a yielding preparer, and the layout check and the
+    /// rendering read it as yielding whatever this field holds, so a
+    /// busy-spin value set in code is ignored rather than refused. It is
     /// carried here so the layout check knows it is harmless to share a
     /// core with.
     pub journal_prep: Placement,
@@ -197,9 +200,14 @@ impl PipelineCores {
         ]
     }
 
-    /// [`named_mut`](Self::named_mut) by value.
+    /// [`named_mut`](Self::named_mut) by value, with the preparer read as
+    /// yielding whatever its field holds. It blocks in I/O and never waits
+    /// in a loop, so a busy-spin policy on it describes nothing; the
+    /// layout check and the rendering both come through here, so neither
+    /// refuses a layout nor logs one over a policy the thread cannot have.
     fn named(&self) -> [(&'static str, Placement); THREAD_COUNT] {
         let mut layout = *self;
+        layout.journal_prep = Placement::yielding(layout.journal_prep.core);
         layout
             .named_mut()
             .map(|(name, placement)| (name, *placement))
@@ -757,6 +765,31 @@ mod tests {
             .expect_err("unpinned spinner must be refused");
         assert!(err.contains("shadow"), "{err}");
         assert!(err.contains("unpinned"), "{err}");
+    }
+
+    /// The preparer never waits in a loop, so a busy-spin policy set on it
+    /// in code describes nothing. The layout check must not refuse it for
+    /// sharing a core with yielding threads, or for spinning unpinned, and
+    /// the layout the boot log shows must parse back to one the check
+    /// reads the same way.
+    #[test]
+    fn a_spinning_preparer_built_by_hand_is_read_as_yielding() {
+        let mut cores = parse_cores(&complete("event-publisher=8y,shadow=8y")).expect("parses");
+        cores.journal_prep = Placement::spinning(8);
+        cores
+            .validate()
+            .expect("the preparer never spins, so it may share core 8 with yielders");
+        let reparsed = parse_cores(&cores.to_string()).expect("the rendering parses");
+        assert_eq!(reparsed.journal_prep, Placement::yielding(8));
+        assert_eq!(reparsed.named(), cores.named(), "log and check agree");
+
+        cores.journal_prep = Placement {
+            core: 0,
+            wait: WaitStrategy::BusySpin,
+        };
+        cores
+            .validate()
+            .expect("nor is an unpinned preparer an unpinned spinner");
     }
 
     /// The layouts the runtime ships must pass their own check, on both
