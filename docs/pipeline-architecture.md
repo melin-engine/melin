@@ -414,7 +414,7 @@ Give the disk thread a core on the same CCD as `journal-seq`: the two exchange a
 
 Each pipeline thread calls `sched_setaffinity` (via `crate::affinity::pin_to_core`) immediately after spawning, before entering its main loop. Pinning eliminates involuntary context switches and keeps hot data in L1/L2 cache, reducing p99/p99.9 latency jitter from approximately 5-20 us per core migration to near zero.
 
-A thread given `0` in `--cores` is not pinned, and where it runs depends on the host:
+A thread given `0` in `--cores` is not pinned. It runs on the CPUs the node process was started with — the set it inherited from whatever launched it, which `taskset`, systemd's `CPUAffinity=` or a container's cpuset narrow — and that holds for every unpinned thread, including the ones the runtime starts from pinned threads. What that set is depends on the host:
 
 - **Without isolated cores**, the scheduler places it on any core and moves it as load changes, including onto cores other threads are pinned to. Pinned threads have no real-time priority on such a host, so the two share that core by timeslice.
 - **With isolated cores** (`isolcpus`), it runs only on the cores outside the isolated set — core 0 and any other core not listed — alongside the kernel, interrupt handling and every other unpinned thread. The scheduler never moves work onto an isolated core, even an idle one: a spare isolated core stays idle rather than absorbing unpinned threads.

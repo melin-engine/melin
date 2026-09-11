@@ -168,6 +168,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   shared-machine configuration sets `cores` to
   `PipelineCores::all_yielding()` of its layout instead.
 
+### Fixed
+
+- **An unpinned thread could run on a pinned thread's isolated core.**
+  Threads the runtime starts unpinned from a pinned thread were handed
+  every CPU, so on a host with isolated cores they began on their
+  creator's isolated core and the scheduler never moved them off — beside
+  a thread that may busy-spin there at real-time priority. The case that
+  remained was a DPDK replica rebuilding its pipeline after a snapshot
+  transfer, which starts every pipeline thread from its receiver thread.
+  Unpinned threads now get the CPU set the process was started with,
+  which excludes isolated cores and respects `taskset`, systemd's
+  `CPUAffinity=` and container cpusets. For direct users of `melin-app`:
+  `affinity::pin_thread` with core `0` now applies that set, and resets a
+  real-time policy, where it used to leave the thread untouched;
+  `affinity::capture_home_mask` records the set and belongs at the top of
+  `main`, before anything pins a thread or initialises DPDK (the server
+  runtime's entry points call it).
+
 ## [0.15.0] - 2026-08-27
 
 ### Added

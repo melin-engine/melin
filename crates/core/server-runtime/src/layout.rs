@@ -87,8 +87,8 @@ impl Placement {
         }
     }
 
-    /// No core of its own, left to the OS scheduler — and therefore
-    /// yielding.
+    /// No core of its own: the OS scheduler places it within the CPU set
+    /// the process was started with — and therefore it yields.
     pub const fn unpinned() -> Self {
         Self::yielding(0)
     }
