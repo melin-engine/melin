@@ -48,10 +48,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **A wait policy per pipeline thread, in `--cores`.** Each thread's core
   takes a suffix: `matching=7` (or `matching=7s`) busy-spins and needs
   core 7 to itself, `matching=7y` spins briefly then yields and may share
-  it. One node can therefore spin its hot stages on isolated cores and pack the
-  auxiliary threads onto a shared core that yields — previously the choice
-  was one policy for the whole process. `0` (unpinned) always yields, so `0s` is refused; `journal-prep`
-  blocks in I/O rather than polling and takes no suffix. The node refuses to
+  it. One node can therefore spin its hot stages on isolated cores and
+  pack the auxiliary threads onto a shared core that yields — previously
+  the choice was one policy for the whole process. `0` (unpinned) always
+  yields, so `0s` is refused; `journal-prep` blocks in I/O rather than
+  polling and takes no suffix. The node refuses to
   start when two threads share a core and either busy-spins, naming both
   threads and the core: a spinner on a shared core holds the CPU for a full
   scheduler slice while the thread it is waiting for sits queued behind it,
@@ -80,20 +81,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   ten-entry list used to leave them unpinned: running a thread unpinned is
   now a stated choice (`journal-disk=0`) rather than an omission. A core
   of `0` still unpins any thread, and `none` unpins every thread. The
-  positional list
-  could not shed its retired fifth entry (the replication accept thread,
-  unpinned since 0.15) without reading every later core as its
-  neighbour's, in most cases with no error, and each new thread could only
-  be appended as another optional position. A positional value is now
-  refused at startup with a message naming the threads, as are missing,
-  unknown and repeated names, and the boot log prints the layout in the
-  named form. The
-  default layout is unchanged. To migrate, name the positions and drop the
-  fifth: `1,2,3,4,0,6,7,8,9,10,11` is
+  positional list could not shed its retired fifth entry (the replication
+  accept thread, unpinned since 0.15) without reading every later core as
+  its neighbour's, in most cases with no error, and each new thread could
+  only be appended as another optional position. A positional value is
+  now refused at startup with a message naming the threads, as are
+  missing, unknown and repeated names, and the boot log prints the layout
+  in the named form. The default layout is unchanged. To migrate, name the
+  positions and drop the fifth: `1,2,3,4,0,6,7,8,9,10,11` is
   `journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11`;
   a nine- or ten-entry list adds `journal-prep=0` and `journal-disk=0` for
-  the threads it left out; and an all-`0` list is `none`. `PipelineCores::unpinned()` builds the
-  latter in code.
+  the threads it left out; and an all-`0` list is `none`.
+  `PipelineCores::unpinned()` builds the latter in code.
 - **The journal's sequencing thread is named `journal-seq`**, where it was
   `journal`: in `--cores`, in the thread name `top -H`, `ps` and `perf`
   show, and in log lines. The journal stage runs three threads —

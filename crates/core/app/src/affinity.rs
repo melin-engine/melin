@@ -279,7 +279,10 @@ pub fn prepare_child_context(core: usize) -> Result<(), String> {
         libc::CPU_ZERO(&mut set);
         if core == 0 {
             // The `0` sentinel means "do not pin" — hand over the full
-            // mask so the child floats, rather than the parent's core.
+            // mask rather than the parent's core. That lets the child
+            // float; it does not guarantee it. A child created on an
+            // isolated core can start and stay there — see the module
+            // docs.
             for i in 0..libc::CPU_SETSIZE as usize {
                 libc::CPU_SET(i, &mut set);
             }
