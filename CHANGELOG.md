@@ -75,10 +75,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 - **`--cores` names its threads.** A layout is now written
   `journal=1,matching=2,response=3,reader=4,journal-disk=5,…`, in any
-  order, instead of as a list read by position. The threads the list
-  required must still be named; `journal-prep` and `journal-disk` stay
-  optional and are unpinned when left out, a core of `0` still unpins a
-  thread, and `none` unpins every thread. The positional list
+  order, instead of as a list read by position. Every thread must be
+  named except `journal-prep`, which stays optional and is unpinned when
+  left out. That includes `journal-disk`, which a nine- or ten-entry list
+  used to leave unpinned: every acknowledgement waits on the durability
+  it publishes, so running it unpinned is now a stated choice
+  (`journal-disk=0`). A core of `0` still unpins any thread, and `none`
+  unpins every thread. The positional list
   could not shed its retired fifth entry (the replication accept thread,
   unpinned since 0.15) without reading every later core as its
   neighbour's, in most cases with no error, and each new thread could only
