@@ -18,9 +18,9 @@
 //! listing cores by position. A positional list can only ever grow at its
 //! end and can never lose an entry: dropping one re-reads every later core
 //! as its neighbour's, and the result usually still parses. A named entry
-//! says which thread it places, so a misspelt or repeated name is refused,
-//! a retired thread is simply an unknown one, and a thread added later is
-//! one more name rather than one more position.
+//! says which thread it places, so a misspelt, repeated or missing name is
+//! refused, a retired thread is simply an unknown one, and a thread added
+//! later is one more name rather than one more position.
 
 use melin_app::AppEvent;
 use melin_pipeline::wait::WaitStrategy;
@@ -33,6 +33,14 @@ pub(crate) const DEFAULT_CORES: &str = "journal=1,matching=2,response=3,reader=4
 /// How many threads a layout places. `usize` because it is an array
 /// length: every per-thread list here is a fixed array of this size.
 const THREAD_COUNT: usize = 10;
+
+/// The threads `--cores` may leave out, which are then unpinned. Every
+/// other thread must be named, as it had to be in the positional list, so
+/// forgetting one is a refused value rather than a thread left wherever
+/// the scheduler puts it. These two joined that list as optional trailing
+/// entries and stay optional. A fixed array searched linearly: it has two
+/// entries and is read once per parse.
+const OPTIONAL_THREADS: [&str; 2] = ["journal-prep", "journal-disk"];
 
 /// Where one pipeline thread runs and how it waits there.
 ///
@@ -107,8 +115,7 @@ pub enum ReaderThread {
 /// All fields are always stored; event-publisher is only used when
 /// `--event-bind` is set, and shadow only when `--snapshot-interval-ms` > 0.
 /// repl-handler-0/1 are spawned on replica connect, not at startup.
-/// A `core` of 0 = unpinned (OS scheduled) for any field, and a thread
-/// `--cores` does not name is unpinned.
+/// A `core` of 0 = unpinned (OS scheduled) for any field.
 ///
 /// The thread that accepts replica connections (`repl-accept`) has no
 /// field: it accepts, reaps finished handlers and sleeps, and it must stay
@@ -128,7 +135,7 @@ pub struct PipelineCores {
     /// Replication handler thread 1.
     pub repl_handler_1: Placement,
     /// The journal segment preparer (background staging of the next
-    /// segment).
+    /// segment). Optional in `--cores`: unpinned when left out.
     ///
     /// Its wait policy is always yielding: the preparer blocks in file
     /// I/O and sleeps between attempts, it never polls a ring. It is
@@ -136,7 +143,7 @@ pub struct PipelineCores {
     /// core with.
     pub journal_prep: Placement,
     /// The journal disk thread — the half that writes, syncs, and
-    /// publishes durability.
+    /// publishes durability. Optional in `--cores`: unpinned when left out.
     ///
     /// Unlike the preparer this is a hot-path thread: it polls for
     /// batches, and the durability cursors every ack gates on are
@@ -165,21 +172,34 @@ impl PipelineCores {
     }
 
     /// Every thread with its `--cores` name, in the order the layout is
-    /// rendered — the one list the parser, the layout check and its error
-    /// messages go through, so a thread cannot be known to one and not
-    /// the others.
+    /// rendered — the one list the parser, the layout check, the rendering
+    /// and [`all_yielding`](Self::all_yielding) go through. The
+    /// destructuring binds every field, so a thread added to the struct
+    /// does not build until it is named here too.
     fn named_mut(&mut self) -> [(&'static str, &mut Placement); THREAD_COUNT] {
+        let Self {
+            journal,
+            matching,
+            response,
+            reader,
+            event_publisher,
+            shadow,
+            repl_handler_0,
+            repl_handler_1,
+            journal_prep,
+            journal_disk,
+        } = self;
         [
-            ("journal", &mut self.journal),
-            ("matching", &mut self.matching),
-            ("response", &mut self.response),
-            ("reader", &mut self.reader),
-            ("event-publisher", &mut self.event_publisher),
-            ("shadow", &mut self.shadow),
-            ("repl-handler-0", &mut self.repl_handler_0),
-            ("repl-handler-1", &mut self.repl_handler_1),
-            ("journal-prep", &mut self.journal_prep),
-            ("journal-disk", &mut self.journal_disk),
+            ("journal", journal),
+            ("matching", matching),
+            ("response", response),
+            ("reader", reader),
+            ("event-publisher", event_publisher),
+            ("shadow", shadow),
+            ("repl-handler-0", repl_handler_0),
+            ("repl-handler-1", repl_handler_1),
+            ("journal-prep", journal_prep),
+            ("journal-disk", journal_disk),
         ]
     }
 
@@ -377,7 +397,8 @@ impl std::fmt::Display for PipelineCores {
     }
 }
 
-/// Parse one `--cores` entry: a core ID with an optional wait suffix.
+/// Parse the core of one `--cores` entry, the part after `=`: a core ID
+/// with an optional wait suffix.
 ///
 /// `7` and `7s` busy-spin, `7y` spins then yields, `0`/`0y` is unpinned
 /// (and yields — see [`Placement`]). `0s` is refused: it asks for a
@@ -411,9 +432,10 @@ fn thread_names() -> String {
 }
 
 /// Parse a `--cores` value into `PipelineCores`: comma-separated
-/// `thread=entry` pairs in any order, each entry a core with the suffix
-/// described at [`parse_placement`]. A thread the value does not name is
-/// unpinned, and `none` leaves every thread unpinned.
+/// `thread=core` entries in any order, each core with the suffix
+/// described at [`parse_placement`]. Every thread must be named except
+/// the optional ones (`OPTIONAL_THREADS`), which are unpinned when left
+/// out; `none` leaves every thread unpinned.
 pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let mut cores = PipelineCores::unpinned();
     if s.trim() == "none" {
@@ -426,8 +448,8 @@ pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         .all(|entry| parse_placement(entry.trim()).is_ok())
     {
         return Err(format!(
-            "expected named entries such as `journal=1,matching=2`, got `{s}`, the positional \
-             list earlier releases took. Name each thread to pin; the threads are {}",
+            "expected named entries such as `journal=1,matching=2`; bare cores are the \
+             positional form earlier releases took. Name each thread; the threads are {}",
             thread_names()
         ));
     }
@@ -453,23 +475,40 @@ pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         if std::mem::replace(&mut seen[index], true) {
             return Err(format!("{name} is named twice"));
         }
-        *slots[index].1 = match name {
-            // The preparer never busy-waits (it blocks in I/O), so its
-            // entry is a core and nothing else: a `y` is redundant and an
-            // `s` asks for something the thread cannot do.
-            "journal-prep" if value.ends_with('s') => {
-                return Err(format!(
-                    "invalid journal-prep entry `{value}`: the preparer never busy-waits and \
-                     takes no `s` suffix"
-                ));
-            }
-            "journal-prep" => Placement::yielding(
-                parse_placement(value)
-                    .map_err(|e| format!("{name}: {e}"))?
-                    .core,
-            ),
-            _ => parse_placement(value).map_err(|e| format!("{name}: {e}"))?,
+        // The preparer never busy-waits (it blocks in I/O), so its entry is
+        // a core and nothing else: a `y` is redundant and an `s` asks for
+        // something the thread cannot do.
+        let is_prep = name == "journal-prep";
+        if is_prep && value.ends_with('s') {
+            return Err(format!(
+                "invalid journal-prep entry `{value}`: the preparer never busy-waits and \
+                 takes no `s` suffix"
+            ));
+        }
+        let placement = parse_placement(value).map_err(|e| format!("{name}: {e}"))?;
+        *slots[index].1 = if is_prep {
+            Placement::yielding(placement.core)
+        } else {
+            placement
         };
+    }
+    // A thread left out would run wherever the scheduler puts it, so only
+    // the optional ones may be. A `Vec` only to join the names into the
+    // message; this runs once, at startup.
+    let missing: Vec<&str> = cores
+        .named()
+        .into_iter()
+        .zip(seen)
+        .filter(|((name, _), was_named)| !was_named && !OPTIONAL_THREADS.contains(name))
+        .map(|((name, _), _)| name)
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "missing {}: every thread but {} must be named (`0` leaves one unpinned, and \
+             `none` unpins them all)",
+            missing.join(", "),
+            OPTIONAL_THREADS.join(" and ")
+        ));
     }
     Ok(cores)
 }
@@ -487,21 +526,86 @@ mod tests {
     const MIXED: &str = "journal=1,matching=2,response=3,reader=4,journal-disk=5,\
          repl-handler-0=6,repl-handler-1=7,event-publisher=8y,shadow=8y,journal-prep=8";
 
+    /// `entries` completed with `=0` for each required thread it does not
+    /// name, so a test spells out only the threads it is about.
+    fn complete(entries: &str) -> String {
+        let mut value = entries.to_owned();
+        for (name, _) in PipelineCores::unpinned().named() {
+            let named = entries
+                .split(',')
+                .any(|entry| entry.split_once('=').is_some_and(|(n, _)| n.trim() == name));
+            if !named && !OPTIONAL_THREADS.contains(&name) {
+                value.push_str(&format!(",{name}=0"));
+            }
+        }
+        value
+    }
+
+    /// The threads the positional list required are still required:
+    /// leaving one out is refused, with every missing thread named at
+    /// once, rather than leaving it wherever the scheduler puts it. Only
+    /// journal-prep and journal-disk, optional in the positional list too,
+    /// may be left out. The required set is spelled out here rather than
+    /// derived from `OPTIONAL_THREADS`, so a change to either is a test
+    /// failure.
+    #[test]
+    fn parse_cores_requires_every_thread_but_journal_prep_and_journal_disk() {
+        const REQUIRED: [&str; 8] = [
+            "journal",
+            "matching",
+            "response",
+            "reader",
+            "event-publisher",
+            "shadow",
+            "repl-handler-0",
+            "repl-handler-1",
+        ];
+        for missing in REQUIRED {
+            let prefix = format!("{missing}=");
+            let value = DEFAULT_CORES
+                .split(',')
+                .filter(|entry| !entry.starts_with(&prefix))
+                .collect::<Vec<_>>()
+                .join(",");
+            let err = parse_cores(&value).expect_err(missing);
+            assert!(err.starts_with(&format!("missing {missing}:")), "{err}");
+        }
+
+        let err = parse_cores("journal=1,matching=2").expect_err("six threads missing");
+        assert!(
+            err.starts_with(
+                "missing response, reader, event-publisher, shadow, repl-handler-0, \
+                 repl-handler-1:"
+            ),
+            "{err}"
+        );
+
+        let without_optional = parse_cores(
+            "journal=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,\
+             repl-handler-0=8,repl-handler-1=9",
+        )
+        .expect("journal-prep and journal-disk may be left out");
+        assert_eq!(without_optional.journal_prep, Placement::unpinned());
+        assert_eq!(without_optional.journal_disk, Placement::unpinned());
+    }
+
     /// Entries are named, so their order carries no meaning, whitespace
-    /// around them is tolerated, and a thread the value leaves out is
+    /// around them is tolerated, and an optional thread left out is
     /// unpinned.
     #[test]
     fn parse_cores_reads_named_entries_in_any_order() {
-        let forward = parse_cores("journal=1,matching=2,journal-disk=3").expect("parses");
-        let reversed = parse_cores("journal-disk=3, matching=2 ,journal = 1").expect("parses");
+        let forward =
+            parse_cores(&complete("journal=1,matching=2,journal-disk=3")).expect("parses");
+        let reversed =
+            parse_cores(&complete("journal-disk=3, matching=2 ,journal = 1")).expect("parses");
         assert_eq!(forward, reversed);
         assert_eq!(forward.journal, Placement::spinning(1));
         assert_eq!(forward.matching, Placement::spinning(2));
         assert_eq!(forward.journal_disk, Placement::spinning(3));
         assert_eq!(
-            forward.reader,
+            forward.journal_prep,
             Placement::unpinned(),
-            "a thread the value does not name is unpinned"
+            "an optional thread left out is unpinned"
         );
 
         let every = parse_cores(DEFAULT_CORES).expect("the default parses");
@@ -515,7 +619,10 @@ mod tests {
     #[test]
     fn parse_cores_none_unpins_every_thread() {
         assert_eq!(parse_cores("none"), Ok(PipelineCores::unpinned()));
-        assert_eq!(parse_cores("journal=0"), Ok(PipelineCores::unpinned()));
+        assert_eq!(
+            parse_cores(&complete("journal=0")),
+            Ok(PipelineCores::unpinned())
+        );
         assert!(
             parse_cores("none,journal=1").is_err(),
             "none is the whole value, not an entry"
@@ -565,9 +672,9 @@ mod tests {
         assert!(parse_cores("").is_err());
     }
 
-    /// A bare core busy-spins (the production default, and what every
-    /// existing `--cores` value means), `y` yields, `s` spells the
-    /// default out, and `0` is unpinned — which can only yield.
+    /// A bare core busy-spins (the production default, and what an entry
+    /// without a suffix means), `y` yields, `s` spells the default out,
+    /// and `0` is unpinned — which can only yield.
     #[test]
     fn parse_placement_reads_the_wait_suffix() {
         assert_eq!(parse_placement("7"), Ok(Placement::spinning(7)));
@@ -589,11 +696,11 @@ mod tests {
     /// rather than silently ignored.
     #[test]
     fn journal_prep_always_yields() {
-        let cores = parse_cores("journal-prep=10").expect("parses");
+        let cores = parse_cores(&complete("journal-prep=10")).expect("parses");
         assert_eq!(cores.journal_prep, Placement::yielding(10));
-        let explicit = parse_cores("journal-prep=10y").expect("parses");
+        let explicit = parse_cores(&complete("journal-prep=10y")).expect("parses");
         assert_eq!(explicit.journal_prep, Placement::yielding(10));
-        let err = parse_cores("journal-prep=10s").expect_err("must refuse");
+        let err = parse_cores(&complete("journal-prep=10s")).expect_err("must refuse");
         assert!(err.contains("journal-prep"), "{err}");
     }
 
@@ -604,7 +711,7 @@ mod tests {
     #[test]
     fn validate_refuses_a_busy_spinner_sharing_a_core() {
         // Two spinners.
-        let err = parse_cores("journal=1,matching=1")
+        let err = parse_cores(&complete("journal=1,matching=1"))
             .expect("parses")
             .validate()
             .expect_err("two spinners on core 1 must be refused");
@@ -613,7 +720,7 @@ mod tests {
         assert!(err.contains("core 1"), "{err}");
 
         // A spinner next to a yielder: the yielder would still starve.
-        let err = parse_cores("event-publisher=7,shadow=7y")
+        let err = parse_cores(&complete("event-publisher=7,shadow=7y"))
             .expect("parses")
             .validate()
             .expect_err("a spinner sharing with a yielder must be refused");
@@ -622,14 +729,14 @@ mod tests {
         assert!(err.contains("event-publisher busy-spins"), "{err}");
 
         // Which of the two spins does not matter.
-        let err = parse_cores("event-publisher=6y,shadow=6")
+        let err = parse_cores(&complete("event-publisher=6y,shadow=6"))
             .expect("parses")
             .validate()
             .expect_err("6y and 6 is still a spinner sharing a core");
         assert!(err.contains("shadow busy-spins"), "{err}");
 
         // The disk thread sharing the journal's core is the same mistake.
-        let err = parse_cores("journal=1,journal-disk=1")
+        let err = parse_cores(&complete("journal=1,journal-disk=1"))
             .expect("parses")
             .validate()
             .expect_err("journal-disk on the journal's core must be refused");
@@ -725,7 +832,7 @@ mod tests {
     /// the operator wrote it.
     #[test]
     fn dpdk_reader_never_yields() {
-        let explicit = parse_cores("reader=4y").expect("parses");
+        let explicit = parse_cores(&complete("reader=4y")).expect("parses");
         let err = explicit
             .resolve(ReaderThread::DpdkPoll)
             .expect_err("`4y` on the DPDK reader must be refused");
@@ -735,13 +842,14 @@ mod tests {
             .resolve(ReaderThread::IoUring)
             .expect("the io_uring reader may yield");
 
-        let shared = parse_cores("reader=4,event-publisher=4y").expect("parses");
+        let shared = parse_cores(&complete("reader=4,event-publisher=4y")).expect("parses");
         let err = shared
             .resolve(ReaderThread::DpdkPoll)
             .expect_err("a core shared with the poll thread is refused");
         assert!(err.contains("reader busy-spins"), "{err}");
 
-        let unpinned = parse_cores("journal=1,matching=2,response=3").expect("parses");
+        let unpinned =
+            parse_cores(&complete("journal=1,matching=2,response=3,reader=0")).expect("parses");
         let cores = unpinned
             .resolve(ReaderThread::DpdkPoll)
             .expect("an unpinned reader is accepted as written");
@@ -780,7 +888,8 @@ mod tests {
             "before placement the disk thread inherits the sequencer's strategy"
         );
 
-        let cores = parse_cores("journal=1,journal-prep=8,journal-disk=5y").expect("parses");
+        let cores =
+            parse_cores(&complete("journal=1,journal-prep=8,journal-disk=5y")).expect("parses");
         cores.place_journal_children(&mut stage);
         assert_eq!(stage.disk_core(), 5);
         assert_eq!(stage.disk_wait(), WaitStrategy::SpinThenYield);
@@ -793,12 +902,12 @@ mod tests {
     #[test]
     fn layout_display_round_trips_through_parse_cores() {
         for input in [
-            DEFAULT_CORES,
-            MIXED,
-            "none",
-            "journal=1y,matching=2y,response=3y,reader=4y,journal-disk=7y",
+            DEFAULT_CORES.to_owned(),
+            MIXED.to_owned(),
+            "none".to_owned(),
+            complete("journal=1y,matching=2y,response=3y,reader=4y,journal-disk=7y"),
         ] {
-            let cores = parse_cores(input).expect("parses");
+            let cores = parse_cores(&input).expect("parses");
             let rendered = cores.to_string();
             let reparsed = parse_cores(&rendered).expect("rendering parses");
             assert_eq!(reparsed, cores, "{input} -> {rendered}");
@@ -807,7 +916,14 @@ mod tests {
         assert_eq!(
             ServerConfig::default().cores.to_string(),
             DEFAULT_CORES,
-            "the hand-written default and the CLI default agree"
+            "the hand-written default renders as the CLI default"
+        );
+        assert_eq!(
+            ServerConfig::try_parse_from(["melin-server"])
+                .expect("parses")
+                .cores,
+            ServerConfig::default().cores,
+            "a node started without --cores runs the hand-written default"
         );
     }
 
