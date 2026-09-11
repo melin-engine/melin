@@ -477,7 +477,7 @@ where
     let pipeline_shutdown = Arc::new(AtomicBool::new(false));
 
     let ps = Arc::clone(&pipeline_shutdown);
-    let journal_core = cores.journal.core;
+    let journal_core = cores.journal_seq.core;
     let mut journal_stage = pipeline.journal_stage;
     // Replicas never rotate on local triggers (size or operator
     // command) — they adopt the boundaries the primary announces over
@@ -494,9 +494,9 @@ where
     // successful in-process resync rebuild.
     pipeline_healthy.store(true, Ordering::Release);
     let journal_handle = std::thread::Builder::new()
-        .name("journal".into())
+        .name("journal-seq".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("journal", journal_core);
+            melin_app::affinity::pin_thread("journal-seq", journal_core);
             let result = journal_stage.run(&ps);
             if let Err(ref e) = result {
                 // Latch before logging so the receiver reacts even if

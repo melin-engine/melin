@@ -289,14 +289,14 @@ Every wait in the pipeline goes through a wait strategy chosen at startup, per t
 - **Busy-spin** (default): the waiting thread spins with `PAUSE` and never yields. The lowest-latency choice, and the right one whenever the thread has an isolated core to itself (`isolcpus`), where a yield would only be a wasted syscall on the critical path.
 - **Spin, then yield**: the thread spins for about a microsecond, then hands the CPU back to the scheduler on every further idle iteration until work arrives. For threads that share a core with each other or with other processes. Without it, a thread spinning on a shared core can hold the CPU for a full scheduler slice while the very thread it is waiting for sits queued behind it, turning each hand-off between stages into milliseconds.
 
-The policy is stated per thread in `--cores`, as a suffix on the thread's core: `journal=7` (or `journal=7s`) busy-spins on core 7, `journal=7y` spins then yields there. A core of `0` leaves the thread unpinned (every thread must be named, so unpinned is always stated), and an unpinned thread always yields — a spinner with no core of its own is the shared-core problem with the victim chosen by the scheduler, so `0s` is refused. `journal-prep` never busy-waits (it blocks in file I/O) and takes no suffix. On a shared machine where every thread should yield, suffix every pinned entry: `--cores journal=1y,matching=2y,response=3y,reader=4y,event-publisher=6y,shadow=7y,repl-handler-0=8y,repl-handler-1=9y,journal-prep=10,journal-disk=11y`.
+The policy is stated per thread in `--cores`, as a suffix on the thread's core: `journal-seq=7` (or `journal-seq=7s`) busy-spins on core 7, `journal-seq=7y` spins then yields there. A core of `0` leaves the thread unpinned (every thread must be named, so unpinned is always stated), and an unpinned thread always yields — a spinner with no core of its own is the shared-core problem with the victim chosen by the scheduler, so `0s` is refused. `journal-prep` never busy-waits (it blocks in file I/O) and takes no suffix. On a shared machine where every thread should yield, suffix every pinned entry: `--cores journal-seq=1y,matching=2y,response=3y,reader=4y,event-publisher=6y,shadow=7y,repl-handler-0=8y,repl-handler-1=9y,journal-prep=10,journal-disk=11y`.
 
 One thread cannot take a policy: in DPDK mode the `reader` entry pins the NIC poll thread, which polls the device flat out whether or not it has work. A `y` on that entry is refused as a contradiction, so give it a core of its own. Leaving it unpinned is accepted as written, but the thread still polls flat out, on a core it shares with everything else that is unpinned (see [CPU core pinning](#cpu-core-pinning)). On kernel TCP the reader blocks in the kernel between completions, and its entry's policy governs only the input ring it produces into.
 
 This is what lets one node mix the two: every thread on the acknowledgement path spinning on a core of its own, and the truly auxiliary threads packed onto one shared core, yielding:
 
 ```
---cores journal=1,matching=2,response=3,reader=4,journal-disk=5,repl-handler-0=6,repl-handler-1=7,event-publisher=8y,shadow=8y,journal-prep=8
+--cores journal-seq=1,matching=2,response=3,reader=4,journal-disk=5,repl-handler-0=6,repl-handler-1=7,event-publisher=8y,shadow=8y,journal-prep=8
 ```
 
 Here journal, matching, response, the reader and journal-disk take cores 1 to 5, the two replication handlers take 6 and 7, and the event publisher, the shadow and the segment preparer share core 8. The replication handlers are on the acknowledgement path whenever the ack policy waits on a replica (`ram`, `disk+ram`, `two-disks`): the response gate releases a reply only once the replica's acknowledgement has arrived, and it arrives through the handler thread, so a yielding handler adds a scheduler wakeup to every reply. Only a standalone node can treat them as auxiliary.
@@ -383,7 +383,7 @@ The server spawns four always-on pipeline threads plus one reader thread, and th
 
 | Thread | Default Core | Role | Optional? |
 |--------|-------------|------|-----------|
-| Journal | 1 | Sequencing, encoding, hash chain, replica feed | No |
+| Journal Seq | 1 | Sequencing, encoding, hash chain, replica feed | No |
 | Journal Disk | 11 | Writes and syncs the journal; publishes durability | No |
 | Matching | 2 | Order execution (single-writer) | No |
 | Response | 3 | Client socket writes | No |
@@ -399,7 +399,7 @@ Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle an
 
 The journal stage runs on two threads, and the division decides what a disk stall can and cannot stop:
 
-- **Journal** orders events, assigns sequence numbers, encodes entries, extends the hash chain, and hands batches to replicas. All in memory — it issues no device call.
+- **Journal Seq** orders events, assigns sequence numbers, encodes entries, extends the hash chain, and hands batches to replicas. All in memory — it issues no device call.
 - **Journal Disk** writes each batch (`pwrite`), syncs it (`fdatasync`), and then publishes the cursors that mean *durable*: the durable wire sequence the response gate reads, the input-ring progress a replica's acks are gated on, and the post-fsync state snapshots and handshakes consume.
 
 Publication happens on the disk thread because only it knows when a batch became durable. Publishing at hand-off time would let a replica acknowledge entries its disk had not taken.
@@ -408,7 +408,7 @@ The practical consequence: while the device is slow, the sequencer keeps orderin
 
 Absorption is bounded by the hand-off ring (64 batches). Past that the sequencer stalls at its next batch, the input ring fills, and producers backpressure — the same chain as before, with a deeper buffer in front of it. Watch `melin_journal_disk_lag_batches`.
 
-Give the disk thread a core on the same CCD as the journal thread: the two exchange a cache line per batch, and a cross-CCD transfer adds roughly 100 ns to each. On a box that cannot spare the core, set `journal-disk=0` — the thread then runs at default scheduling and yields when idle, like every unpinned thread; it still makes progress, but it competes with everything else on the core it lands on. That is for boxes without isolated cores: on a host that has them, give it a core (see [CPU core pinning](#cpu-core-pinning)).
+Give the disk thread a core on the same CCD as `journal-seq`: the two exchange a cache line per batch, and a cross-CCD transfer adds roughly 100 ns to each. On a box that cannot spare the core, set `journal-disk=0` — the thread then runs at default scheduling and yields when idle, like every unpinned thread; it still makes progress, but it competes with everything else on the core it lands on. That is for boxes without isolated cores: on a host that has them, give it a core (see [CPU core pinning](#cpu-core-pinning)).
 
 ### CPU core pinning
 
@@ -419,7 +419,7 @@ A thread given `0` in `--cores` is not pinned, and where it runs depends on the 
 - **Without isolated cores**, the scheduler places it on any core and moves it as load changes, including onto cores other threads are pinned to. Pinned threads have no real-time priority on such a host, so the two share that core by timeslice.
 - **With isolated cores** (`isolcpus`), it runs only on the cores outside the isolated set — core 0 and any other core not listed — alongside the kernel, interrupt handling and every other unpinned thread. The scheduler never moves work onto an isolated core, even an idle one: a spare isolated core stays idle rather than absorbing unpinned threads.
 
-`journal-disk` and `journal-prep` are the exception on a host with isolated cores. The journal thread starts both, and a thread started from an isolated core can stay on that core — beside the journal thread, which busy-spins there at real-time priority and leaves it almost no time to run. On such a host, give both of them a core.
+`journal-disk` and `journal-prep` are the exception on a host with isolated cores. `journal-seq` starts both, and a thread started from an isolated core can stay on that core — beside `journal-seq`, which busy-spins there at real-time priority and leaves it almost no time to run. On such a host, give both of them a core.
 
 In **kernel TCP mode**, the reader thread is pinned to the core `--cores` gives `reader` (default 4). io_uring with multishot RECV multiplexes every client connection on this single thread.
 
@@ -453,7 +453,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `journal=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11` | Where each pipeline thread runs, as comma-separated `thread=core` entries in any order. The threads are journal, matching, response, reader, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep and journal-disk. Every thread must be named; `0` leaves a thread unpinned, and `none` unpins every thread. A missing, unknown or repeated name is refused at startup, and so is the positional list earlier releases took. Place journal-disk on the same CCD as journal. Each core takes an optional wait suffix, `journal=7y` to yield when idle and share the core; see [Waiting](#waiting). |
+| `--cores` | `journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11` | Where each pipeline thread runs, as comma-separated `thread=core` entries in any order. The threads are journal-seq, matching, response, reader, event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep and journal-disk. Every thread must be named; `0` leaves a thread unpinned, and `none` unpins every thread. A missing, unknown or repeated name is refused at startup, and so is the positional list earlier releases took. Place journal-disk on the same CCD as journal-seq. Each core takes an optional wait suffix, `journal-seq=7y` to yield when idle and share the core; see [Waiting](#waiting). |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |
