@@ -34,6 +34,18 @@ pub(crate) const DEFAULT_CORES: &str = "journal-seq=1,matching=2,response=3,read
 /// length: every per-thread list here is a fixed array of this size.
 const THREAD_COUNT: usize = 10;
 
+/// The threads every node runs, whatever its flags, and that the operator
+/// docs say need a core to themselves: a request passes through each of
+/// them on its way to an acknowledgement. Named as in `--cores`; a subset
+/// of the list in [`PipelineCores::named_mut`], which the tests hold it to.
+const MANDATORY_THREADS: [&str; 5] = [
+    "journal-seq",
+    "matching",
+    "response",
+    "reader",
+    "journal-disk",
+];
+
 /// Where one pipeline thread runs and how it waits there.
 ///
 /// The two are one value because they constrain each other: a thread
@@ -250,6 +262,28 @@ impl PipelineCores {
         self
     }
 
+    /// The mandatory threads with no core of their own, in `--cores`
+    /// order: what the boot log warns about. A thread without a core runs
+    /// wherever the scheduler puts it and shares that core with whatever
+    /// else is there. On an auxiliary thread that is the documented trade
+    /// for a small box; on one of these five it is paid on every request,
+    /// so it should be a choice the operator made knowingly. A `Vec` only
+    /// to carry the names into one log line; this runs once, at startup.
+    pub fn unpinned_mandatory(&self) -> Vec<&'static str> {
+        self.named()
+            .into_iter()
+            .filter(|(name, placement)| MANDATORY_THREADS.contains(name) && !placement.is_pinned())
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Whether no thread at all has a core: the `--cores none` layout.
+    pub fn pins_nothing(&self) -> bool {
+        self.named()
+            .iter()
+            .all(|(_, placement)| !placement.is_pinned())
+    }
+
     /// The layout the node actually runs: the reader entry checked
     /// against what the transport's reader thread can do, then the whole
     /// thing checked with [`validate`](Self::validate). Every spawn site
@@ -379,11 +413,10 @@ impl PipelineCores {
 /// nothing pinned renders as `none`.
 impl std::fmt::Display for PipelineCores {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let named = self.named();
-        if named.iter().all(|(_, placement)| !placement.is_pinned()) {
+        if self.pins_nothing() {
             return f.write_str("none");
         }
-        for (i, (name, placement)) in named.into_iter().enumerate() {
+        for (i, (name, placement)) in self.named().into_iter().enumerate() {
             if i > 0 {
                 f.write_str(",")?;
             }
@@ -413,7 +446,7 @@ fn parse_placement(entry: &str) -> Result<Placement, String> {
     };
     let core = digits
         .parse::<usize>()
-        .map_err(|_| format!("invalid core ID: {entry}"))?;
+        .map_err(|_| format!("invalid core ID `{entry}`"))?;
     match (core, suffix) {
         (0, Some(WaitStrategy::BusySpin)) => Err(format!(
             "invalid core entry `{entry}`: 0 means unpinned, and a thread without a core \
@@ -450,7 +483,8 @@ pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     {
         return Err(format!(
             "expected named entries such as `journal-seq=1,matching=2`; bare cores are the \
-             positional form earlier releases took. Name each thread; the threads are {}",
+             positional form earlier releases took. Name each thread; the threads are {}. \
+             An all-`0` list is `none`, which unpins every thread",
             thread_names()
         ));
     }
@@ -458,6 +492,7 @@ pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     // A fixed array rather than a set: the threads are a closed list known
     // at compile time.
     let mut seen = [false; THREAD_COUNT];
+    let slots = cores.named_mut();
     for entry in s.split(',') {
         let entry = entry.trim();
         let Some((name, value)) = entry.split_once('=') else {
@@ -466,7 +501,6 @@ pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
             ));
         };
         let (name, value) = (name.trim(), value.trim());
-        let slots = cores.named_mut();
         let Some(index) = slots.iter().position(|(slot, _)| *slot == name) else {
             return Err(format!(
                 "unknown thread `{name}`; the threads are {}",
@@ -496,12 +530,11 @@ pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     // Every thread must be named: one left out would run somewhere the
     // operator did not choose. A `Vec` only to join the names into the
     // message; this runs once, at startup.
-    let missing: Vec<&str> = cores
-        .named()
-        .into_iter()
+    let missing: Vec<&str> = slots
+        .iter()
         .zip(seen)
         .filter(|(_, was_named)| !was_named)
-        .map(|((name, _), _)| name)
+        .map(|((name, _), _)| *name)
         .collect();
     if !missing.is_empty() {
         return Err(format!(
@@ -615,13 +648,17 @@ mod tests {
             parse_cores("none,journal-seq=1").is_err(),
             "none is the whole value, not an entry"
         );
+        assert!(PipelineCores::unpinned().pins_nothing());
+        assert!(!ServerConfig::default().cores.pins_nothing());
     }
 
     /// The reason the syntax is named. A positional value from an earlier
     /// release must not parse under any length: read by name it would
     /// mean nothing, and read by position with its retired fifth entry
     /// gone it would put every later thread on its neighbour's core
-    /// without a word. The message has to say what replaced it.
+    /// without a word. The message has to say what replaced it, `none`
+    /// included: the all-`0` list is the positional value a test harness
+    /// or a container entrypoint is most likely to still carry.
     #[test]
     fn parse_cores_refuses_a_positional_list() {
         for positional in [
@@ -634,6 +671,7 @@ mod tests {
             let err = parse_cores(positional).expect_err(positional);
             assert!(err.contains("named entries"), "{positional}: {err}");
             assert!(err.contains("journal-disk"), "lists the threads: {err}");
+            assert!(err.contains("`none`"), "points at the shorthand: {err}");
         }
     }
 
@@ -653,7 +691,12 @@ mod tests {
         assert!(err.contains("journal-seq is named twice"), "{err}");
 
         let err = parse_cores("journal-seq=x").expect_err("bad core");
-        assert!(err.contains("journal"), "names the thread: {err}");
+        assert!(err.contains("journal-seq: invalid core ID `x`"), "{err}");
+        let err = parse_cores("journal-seq=").expect_err("empty core");
+        assert!(
+            err.contains("invalid core ID ``"),
+            "an empty core is shown as such, not as a message trailing off: {err}"
+        );
         assert!(parse_cores("journal-seq=0s").is_err());
         assert!(parse_cores("journal").is_err());
         assert!(parse_cores("journal-seq=1,").is_err(), "trailing comma");
@@ -809,6 +852,56 @@ mod tests {
             Placement::unpinned(),
             "compact leaves the disk thread unpinned, hence yielding"
         );
+    }
+
+    /// The threads the boot log warns about when they have no core are
+    /// the five every node runs, and only those: an unpinned auxiliary
+    /// thread is a documented layout, an unpinned mandatory one a cost on
+    /// every request. The five are spelled out here rather than read from
+    /// the module, so a thread that silently stops counting is a test
+    /// failure, and each must be a name the parser knows.
+    #[test]
+    fn unpinned_mandatory_names_the_hot_path_threads_without_a_core() {
+        const MANDATORY: [&str; 5] = [
+            "journal-seq",
+            "matching",
+            "response",
+            "reader",
+            "journal-disk",
+        ];
+        let known = PipelineCores::unpinned().named().map(|(name, _)| name);
+        for name in MANDATORY {
+            assert!(known.contains(&name), "{name} is not a --cores thread");
+        }
+
+        assert_eq!(PipelineCores::unpinned().unpinned_mandatory(), MANDATORY);
+        assert!(
+            ServerConfig::default()
+                .cores
+                .unpinned_mandatory()
+                .is_empty()
+        );
+
+        // The auxiliary threads unpinned and the five pinned: nothing to
+        // warn about.
+        let hot_pinned = parse_cores(&complete(
+            "journal-seq=1,matching=2,response=3,reader=4,journal-disk=5",
+        ))
+        .expect("parses");
+        assert!(hot_pinned.unpinned_mandatory().is_empty());
+
+        // One of the five unpinned among pinned auxiliaries: it is named,
+        // and nothing else is.
+        let disk_unpinned = parse_cores(
+            "journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,\
+             repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=0",
+        )
+        .expect("parses");
+        assert_eq!(disk_unpinned.unpinned_mandatory(), ["journal-disk"]);
+
+        // The compact layout's documented small-box choice counts too.
+        let (compact, _) = PipelineCores::compact(16).expect("compact fits 16 cores");
+        assert_eq!(compact.unpinned_mandatory(), ["journal-disk"]);
     }
 
     /// `all_yielding` is the programmatic "`y` on every entry": it turns

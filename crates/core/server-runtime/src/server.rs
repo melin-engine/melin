@@ -141,7 +141,9 @@ pub struct ServerConfig {
     /// entries in any order. Threads: journal-seq, matching, response, reader,
     /// event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep,
     /// journal-disk. Every thread must be named: `0` leaves one unpinned,
-    /// and `none` unpins every thread. Core 0 is reserved for OS/IRQ
+    /// and `none` unpins every thread. The node warns at boot when
+    /// journal-seq, matching, response, reader or journal-disk has no core:
+    /// every request passes through them. Core 0 is reserved for OS/IRQ
     /// handling.
     /// reader pins the io_uring reader (TCP) or DPDK poll thread.
     /// event-publisher applies when `--event-bind` is set, shadow when
@@ -781,6 +783,39 @@ fn warn_if_chain_disabled() {
     );
 }
 
+/// Log the layout the node runs, and warn when it leaves a mandatory
+/// thread without a core. Every request passes through those threads, so
+/// a core shared with whatever else the scheduler puts there is paid for
+/// on every acknowledgement; the auxiliary threads' placement is the
+/// operator's documented trade and draws no warning. `none` is called
+/// out on its own: nothing pinned is the development layout, and figures
+/// measured under it say nothing about the node. One function for both
+/// transports, so the two paths cannot drift on what they warn about.
+///
+/// `warn!` rather than `error!`: a layout the operator chose, not a
+/// malfunction.
+fn log_layout(cores: &PipelineCores) {
+    info!(cores = %cores, "pipeline layout");
+    if cores.pins_nothing() {
+        warn!(
+            "--cores none: no pipeline thread is pinned. Every thread runs wherever the \
+             scheduler puts it and shares that core with everything else on the host. A \
+             development layout: latency measured under it is not representative. Name a \
+             core per thread in --cores"
+        );
+        return;
+    }
+    let unpinned = cores.unpinned_mandatory();
+    if !unpinned.is_empty() {
+        warn!(
+            threads = %unpinned.join(", "),
+            "--cores: mandatory pipeline threads have no core of their own. Every request \
+             passes through them, and each runs wherever the scheduler puts it, sharing \
+             that core with whatever else is there. Give them cores"
+        );
+    }
+}
+
 fn run_impl<A, L>(
     listener: L,
     config: ServerConfig,
@@ -805,7 +840,7 @@ where
         cores: config.resolved_cores(ReaderThread::IoUring)?,
         ..config
     };
-    info!(cores = %config.cores, "pipeline layout");
+    log_layout(&config.cores);
 
     // Shared ack-policy atomic, constructed once per process and
     // threaded through both roles. Wiring it on the replica path
@@ -2233,7 +2268,7 @@ where
         cores: config.resolved_cores(ReaderThread::DpdkPoll)?,
         ..config
     };
-    info!(cores = %config.cores, "pipeline layout");
+    log_layout(&config.cores);
     // The one placement the layout check cannot make honest: the poll
     // thread polls flat out whatever its entry says, and unpinned it
     // does so wherever the scheduler puts it — next to whatever else is
