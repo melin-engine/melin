@@ -73,13 +73,28 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
-- **An existing `--cores` value that puts two threads on one core no
-  longer starts the node.** Previously such threads busy-spun against each
+- **`--cores` names its threads.** A layout is now written
+  `journal=1,matching=2,response=3,reader=4,journal-disk=5,…`, in any
+  order, instead of as a list read by position. A thread the value does not
+  name is unpinned, and `none` unpins every thread. The positional list
+  could not shed its retired fifth entry (the replication accept thread,
+  unpinned since 0.15) without reading every later core as its
+  neighbour's, in most cases with no error, and each new thread could only
+  be appended as another optional position. A positional value is now
+  refused at startup with a message naming the threads, as are unknown and
+  repeated names, and the boot log prints the layout in the named form. The
+  default layout is unchanged. To migrate, name the positions and drop the
+  fifth: `1,2,3,4,0,6,7,8,9,10,11` is
+  `journal=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11`,
+  and an all-`0` list is `none`. `PipelineCores::unpinned()` builds the
+  latter in code.
+- **A `--cores` layout that puts two threads on one core no longer starts
+  the node.** Previously such threads busy-spun against each
   other; the optional threads were even documented as able to share an
   auxiliary core. Now the node refuses at boot unless both entries carry a
-  `y` suffix, and it refuses for every entry in the list, including
+  `y` suffix, and it refuses for every thread, including
   threads no flag enables. To migrate, suffix the sharing entries:
-  `1,2,3,4,0,6,6,6,6` becomes `1,2,3,4,0,6y,6y,6y,6y`. On DPDK the
+  `event-publisher=6,shadow=6` becomes `event-publisher=6y,shadow=6y`. On DPDK the
   `reader` entry cannot take `y` — it pins the NIC poll thread, which
   never yields — so give it a core of its own.
 - **A replica's shadow stage now busy-spins by default**, like the
@@ -117,7 +132,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   differently from what its entry said. `--cores` is now the only place a
   wait policy is stated. To migrate, suffix every pinned entry:
   `--yield-idle` with the default layout becomes
-  `--cores 1y,2y,3y,4y,0,6y,7y,8y,9y,10,11y`; on DPDK leave the `reader`
+  `--cores journal=1y,matching=2y,response=3y,reader=4y,event-publisher=6y,shadow=7y,repl-handler-0=8y,repl-handler-1=9y,journal-prep=10,journal-disk=11y`;
+  on DPDK leave the `reader`
   entry bare, since the NIC poll thread cannot yield. `ServerConfig` loses
   the `yield_idle` field; code that built a shared-machine configuration
   sets `cores` to `PipelineCores::all_yielding()` of its layout instead.
