@@ -1216,24 +1216,6 @@ mod tests {
                 .expect("parse keys")
         }
 
-        /// Every stage unpinned (and therefore yielding) — the layout
-        /// for a test host, which is oversubscribed by design.
-        pub(super) fn unpinned_cores() -> crate::layout::PipelineCores {
-            use crate::layout::Placement;
-            crate::layout::PipelineCores {
-                journal: Placement::unpinned(),
-                matching: Placement::unpinned(),
-                response: Placement::unpinned(),
-                reader: Placement::unpinned(),
-                event_publisher: Placement::unpinned(),
-                shadow: Placement::unpinned(),
-                repl_handler_0: Placement::unpinned(),
-                repl_handler_1: Placement::unpinned(),
-                journal_prep: Placement::unpinned(),
-                journal_disk: Placement::unpinned(),
-            }
-        }
-
         /// Read one length-prefixed `ReplicaMessage` frame.
         pub(super) fn read_replica_msg(stream: &mut TcpStream) -> ReplicaMessage {
             let mut len_buf = [0u8; 4];
@@ -1346,7 +1328,7 @@ mod tests {
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
             let control = crate::replication::ReplicaControlPlane::new();
-            let cores = unpinned_cores();
+            let cores = crate::layout::PipelineCores::unpinned();
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
@@ -1517,7 +1499,7 @@ mod tests {
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
             let control = crate::replication::ReplicaControlPlane::new();
-            let cores = unpinned_cores();
+            let cores = crate::layout::PipelineCores::unpinned();
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
@@ -1686,7 +1668,7 @@ mod tests {
             let replica_snapshot = dir.path().join("replica.snapshot");
             let shutdown = Arc::new(AtomicBool::new(false));
             let control = crate::replication::ReplicaControlPlane::new();
-            let cores = unpinned_cores();
+            let cores = crate::layout::PipelineCores::unpinned();
             let replica = {
                 let journal = replica_journal.clone();
                 let shutdown = Arc::clone(&shutdown);
@@ -1942,7 +1924,7 @@ mod tests {
                         &control,
                         3_600_000,
                         snapshot,
-                        unpinned_cores(),
+                        crate::layout::PipelineCores::unpinned(),
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
@@ -2021,7 +2003,7 @@ mod tests {
                 let names = live_thread_names();
                 if !names
                     .iter()
-                    .any(|n| n == "journal" || n == "matching" || n == "drain")
+                    .any(|n| n == "journal-seq" || n == "matching" || n == "drain")
                 {
                     break;
                 }
@@ -2121,7 +2103,7 @@ mod tests {
                         &control,
                         3_600_000,
                         snapshot,
-                        unpinned_cores(),
+                        crate::layout::PipelineCores::unpinned(),
                         mode,
                         Duration::ZERO,
                         64,
