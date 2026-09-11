@@ -485,9 +485,9 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 /// and hands the encoded bytes to the disk thread.
 ///
 /// This type is the stage before it runs: configuration, plus the
-/// composed writer. [`run`](Self::run) splits the writer, starts the
-/// disk thread on the file half, and drives a `Sequencer` over the
-/// stream half.
+/// composed writer. [`start`](Self::start) splits the writer and starts
+/// the disk thread on the file half; the [`Sequencer`] it returns runs
+/// over the stream half, on the sequencing thread.
 ///
 /// The sequencing thread never touches the device. It orders events,
 /// allocates sequences, encodes, chains, and feeds replicas; the disk
@@ -501,8 +501,9 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 /// channel. The bytes are identical to what is written to disk — same
 /// sequences, timestamps, CRC checksums, and checkpoint entries.
 pub struct JournalStage<E: AppEvent> {
-    /// Composed writer, split by `run` into the stream half (kept by
-    /// the sequencer) and the file half (moved to the disk thread).
+    /// Composed writer, split by [`start`](Self::start) into the stream
+    /// half (kept by the sequencer) and the file half (moved to the disk
+    /// thread).
     writer: BufferedWriter<E>,
     _marker: std::marker::PhantomData<fn() -> E>,
     consumer: ring::Consumer<InputSlot<E>>,
@@ -563,8 +564,8 @@ pub struct JournalStage<E: AppEvent> {
     /// a fresh error log on each command.
     rotation_backoff_until: Option<Instant>,
     /// Background preparer that pre-stages the next segment off the
-    /// rotation hot path. `Some` once `enable_preparer` arms it at run
-    /// startup (size-driven rotation or replica adoption); `None` when
+    /// rotation hot path. `Some` once `enable_preparer` arms it in
+    /// [`start`](Self::start) (size-driven rotation or replica adoption); `None` when
     /// rotation can't recur (no point spending disk + a thread on
     /// speculation that may never pay off). Survives every
     /// rotation — only the writer's file is swapped, the preparer
@@ -574,7 +575,7 @@ pub struct JournalStage<E: AppEvent> {
     preparer: Option<SegmentPreparer>,
     /// Core the preparer worker pins itself to; `0` = unpinned
     /// (default). Set via [`set_preparer_core`](Self::set_preparer_core)
-    /// before the stage runs — keeps staging I/O off the IRQ core and
+    /// before [`start`](Self::start) — keeps staging I/O off the IRQ core and
     /// pipeline cores deterministically, same convention as the shadow
     /// and event-publisher threads.
     preparer_core: usize,
@@ -591,32 +592,34 @@ pub struct JournalStage<E: AppEvent> {
     /// `Option` check, not a mutex lock.
     pending_mark: Option<StreamMark>,
     /// Core the disk thread pins itself to; `0` = unpinned. Set via
-    /// [`set_disk_core`](Self::set_disk_core) before the stage runs.
+    /// [`set_disk_core`](Self::set_disk_core) before [`start`](Self::start).
     disk_core: usize,
     /// How the disk thread waits for the sequencer's hand-offs. Its own
     /// policy, not the sequencer's: the two are separate threads on
     /// separate cores, and a layout may give one a core to itself and
     /// have the other share. Defaults to the sequencer's; set via
-    /// [`set_disk_wait`](Self::set_disk_wait) before the stage runs.
+    /// [`set_disk_wait`](Self::set_disk_wait) before [`start`](Self::start).
     disk_wait: WaitStrategy,
 }
 
 /// The running half of the journal stage: everything the sequencing
 /// thread owns while the pipeline is live.
 ///
-/// Built by [`JournalStage::run`] once the writer has been split. The
-/// file half is gone by then — it lives on the disk thread — so every
-/// field here is either in-memory stream state or a hand-off handle.
-/// That is the point: a field this type cannot reach is a device
-/// operation the sequencing thread cannot accidentally perform.
+/// Returned by [`JournalStage::start`], which has already split the
+/// writer and started the helper threads, and driven by
+/// [`run`](Self::run) on the sequencing thread. The file half is gone by
+/// then — it lives on the disk thread — so every field here is either
+/// in-memory stream state or a hand-off handle. That is the point: a
+/// field this type cannot reach is a device operation the sequencing
+/// thread cannot accidentally perform.
 ///
-/// Split into the input-ring consumer and [`SequencerCore`] so the
+/// Split into the input-ring consumer and `SequencerCore` so the
 /// encode loop can hold a batch borrowed **in place** from the ring
 /// ([`ring::Consumer::read_contiguous`] — no per-event copy out of the
 /// ring) while calling `&mut` methods on the core: the two borrows go
 /// through disjoint fields, which is what makes the copy-free read
 /// compile. Only the loop drivers live at this level.
-struct Sequencer<E: AppEvent> {
+pub struct Sequencer<E: AppEvent> {
     /// The input ring. Kept apart from the core so its borrowed slot
     /// slices and the core's `&mut` methods can coexist — and so the
     /// core structurally *cannot* touch the consumer's cursors: the
@@ -653,7 +656,7 @@ struct SequencerCore<E: AppEvent> {
     /// Shared control: poison, rotation rendezvous, stop, lag gauge.
     disk: Arc<DiskControl>,
     /// The disk thread, joined at shutdown to recover the file half.
-    disk_thread: Option<std::thread::JoinHandle<SegmentFile>>,
+    disk_thread: DiskThread,
     /// Whether anything downstream reads the per-batch chain value.
     ///
     /// `FsyncState.chain_hash` has exactly one consumer — the shadow
@@ -921,24 +924,26 @@ impl<E: AppEvent> JournalStage<E> {
     }
 
     /// Set the core the disk thread pins itself to (`0` = unpinned).
-    /// Call before the stage runs; `run` reads it when it spawns.
+    /// Call before [`start`](Self::start), which reads it when it spawns
+    /// the thread.
     pub fn set_disk_core(&mut self, core: usize) {
         self.disk_core = core;
     }
 
-    /// Set how the disk thread waits for hand-offs. Call before the
-    /// stage runs; defaults to the sequencing thread's own strategy.
+    /// Set how the disk thread waits for hand-offs. Call before
+    /// [`start`](Self::start); defaults to the sequencing thread's own
+    /// strategy.
     pub fn set_disk_wait(&mut self, wait: WaitStrategy) {
         self.disk_wait = wait;
     }
 
-    /// The core the disk thread will pin itself to when the stage runs
+    /// The core the disk thread will pin itself to when the stage starts
     /// (`0` = unpinned). What [`set_disk_core`](Self::set_disk_core) set.
     pub fn disk_core(&self) -> usize {
         self.disk_core
     }
 
-    /// How the disk thread will wait when the stage runs. What
+    /// How the disk thread will wait when the stage starts. What
     /// [`set_disk_wait`](Self::set_disk_wait) set, or the sequencing
     /// thread's own strategy if nothing did.
     pub fn disk_wait(&self) -> WaitStrategy {
@@ -982,19 +987,19 @@ impl<E: AppEvent> JournalStage<E> {
         // The child's scheduling context must be set HERE, by the
         // parent, before the thread exists.
         //
-        // This runs on the journal thread, which on a tuned deployment
-        // is pinned to an isolated core at SCHED_FIFO and busy-spins
-        // without ever yielding. A child inherits both the mask and the
-        // policy at creation, so a child left to fix itself would have
-        // to run first — on a core whose real-time occupant never
-        // yields it. It never executes its first instruction, not even
-        // the one that sets its name. Doing the reset child-side is the
-        // bug this codebase already fixed once, in "configure spawned
-        // threads from the parent, not the child".
+        // A child inherits its creator's CPU mask and scheduling policy
+        // at creation. `start` runs on the thread that spawns the
+        // sequencing thread — normally unpinned, but a replica rebuilding
+        // its pipeline calls it from its receiver thread, which may still
+        // sit on the receiver's isolated core. A child left to fix its own
+        // placement would first have to run beside its parent, which on a
+        // real-time core may never happen: it never executes its first
+        // instruction, not even the one that sets its name. Doing the
+        // reset child-side is the bug this codebase already fixed once, in
+        // "configure spawned threads from the parent, not the child".
         //
         // So: adopt the child's context, spawn, put ours back. The
-        // window is a few microseconds at startup, before this thread
-        // consumes anything.
+        // window is a few microseconds at startup.
         let saved = melin_app::affinity::take_context();
         if let Err(ref e) = saved {
             tracing::warn!(error = %e, "journal-disk: cannot snapshot scheduling context");
@@ -1012,17 +1017,23 @@ impl<E: AppEvent> JournalStage<E> {
                 disk.run()
             });
         // Restore before handling the spawn result: a failed spawn must
-        // not leave the journal thread on the disk core.
+        // not leave the calling thread on the disk core.
         if let Ok(ctx) = saved
             && let Err(e) = melin_app::affinity::restore_context(&ctx)
         {
-            tracing::error!(error = %e, "journal thread could not restore its own affinity");
+            tracing::error!(
+                error = %e,
+                "journal-disk: the starting thread could not restore its own affinity"
+            );
         }
-        let disk_thread = spawned.map_err(|e| {
-            JournalError::Io(std::io::Error::other(format!(
-                "spawn journal-disk thread: {e}"
-            )))
-        })?;
+        let disk_thread = DiskThread::new(
+            Arc::clone(&control),
+            spawned.map_err(|e| {
+                JournalError::Io(std::io::Error::other(format!(
+                    "spawn journal-disk thread: {e}"
+                )))
+            })?,
+        );
 
         Ok(Sequencer {
             consumer: self.consumer,
@@ -1033,7 +1044,7 @@ impl<E: AppEvent> JournalStage<E> {
                 batches,
                 claim: None,
                 disk: control,
-                disk_thread: Some(disk_thread),
+                disk_thread,
                 chain_hash_observed,
                 segment_bytes,
                 repl: self.repl,
@@ -1048,15 +1059,45 @@ impl<E: AppEvent> JournalStage<E> {
             },
         })
     }
+}
 
-    /// Drive the stage to completion on this (the sequencing) thread.
-    ///
-    /// Returns the writer, reassembled from both halves, on shutdown.
-    pub fn run_sync(
-        self,
-        shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<BufferedWriter<E>, JournalError> {
-        self.into_sequencer()?.run(shutdown)
+/// The disk thread's handle, owned by the sequencer.
+///
+/// Stopped and joined if dropped while the thread still runs, so a
+/// sequencer that never runs — its own thread failed to spawn, or it
+/// unwound — cannot leak a spinning thread holding the live segment open.
+/// The window exists because [`JournalStage::start`] launches the disk
+/// thread before the sequencing thread does.
+pub(crate) struct DiskThread {
+    control: Arc<DiskControl>,
+    handle: Option<std::thread::JoinHandle<SegmentFile>>,
+}
+
+impl DiskThread {
+    /// Wrap a running disk thread and the control block it stops on.
+    pub(crate) fn new(
+        control: Arc<DiskControl>,
+        handle: std::thread::JoinHandle<SegmentFile>,
+    ) -> Self {
+        Self {
+            control,
+            handle: Some(handle),
+        }
+    }
+
+    /// Ask the thread to stop once it has drained, and wait for its
+    /// segment. `None` if it was already joined.
+    fn join(&mut self) -> Option<std::thread::Result<SegmentFile>> {
+        self.control.stop();
+        self.handle.take().map(std::thread::JoinHandle::join)
+    }
+}
+
+impl Drop for DiskThread {
+    fn drop(&mut self) {
+        if let Some(Err(_)) = self.join() {
+            tracing::error!("journal-disk thread panicked");
+        }
     }
 }
 
@@ -1081,13 +1122,16 @@ impl<E: AppEvent> Sequencer<E> {
         n
     };
 
-    /// Drive the sequencing loop, then tear the disk thread down.
+    /// Drive the sequencing loop on the calling thread — the sequencing
+    /// thread, pinned before this is called — then tear the disk thread
+    /// down. Returns the writer, reassembled from both halves, on clean
+    /// shutdown.
     ///
     /// The wrapper exists so the thread is stopped and joined on *every*
     /// exit, including the fatal ones: a sequencer that returned an
     /// error without joining would leak a spinning thread holding the
     /// live segment's descriptor.
-    fn run(
+    pub fn run(
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<BufferedWriter<E>, JournalError> {
@@ -1516,9 +1560,8 @@ impl<E: AppEvent> Sequencer<E> {
             self.core.halt_disk_thread();
             return Err(e);
         }
-        self.core.disk.stop();
-        let segment = match self.core.disk_thread.take() {
-            Some(handle) => handle.join().map_err(|_| {
+        let segment = match self.core.disk_thread.join() {
+            Some(joined) => joined.map_err(|_| {
                 JournalError::Io(std::io::Error::other("journal-disk thread panicked"))
             })?,
             None => {
@@ -1827,10 +1870,7 @@ impl<E: AppEvent> SequencerCore<E> {
     /// entry up to the divergence boundary durable, which is what the
     /// reconnect handshake archives and resyncs from.
     fn halt_disk_thread(&mut self) {
-        self.disk.stop();
-        if let Some(handle) = self.disk_thread.take()
-            && handle.join().is_err()
-        {
+        if let Some(Err(_)) = self.disk_thread.join() {
             tracing::error!("journal-disk thread panicked");
         }
     }
@@ -2307,31 +2347,49 @@ impl<E: AppEvent> SequencerCore<E> {
 }
 
 impl<E: AppEvent> JournalStage<E> {
-    /// Drive the journal stage to completion, returning the writer on
-    /// clean shutdown.
-    #[inline]
-    pub fn run(
-        self,
-        shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<BufferedWriter<E>, JournalError> {
+    /// Start the stage's helper threads and hand back the sequencer.
+    ///
+    /// Arms the segment preparer when rotation recurs, then splits the
+    /// writer and starts the disk thread on the file half. Call it on the
+    /// thread that spawns the sequencing thread, then move the returned
+    /// [`Sequencer`] into that thread and [`run`](Sequencer::run) it
+    /// there — not on the sequencing thread itself. A new thread inherits
+    /// its creator's CPU mask and scheduling policy, and the sequencing
+    /// thread is pinned and busy-spinning by the time it could start
+    /// them; started from the spawner, the helpers begin where every
+    /// other pipeline thread does and pin themselves to their own cores.
+    ///
+    /// On error, neither helper is left running.
+    pub fn start(self) -> Result<Sequencer<E>, JournalError> {
         // Under `no-persist` the sync point discards batches instead of
         // writing, `valid_end` never advances, and the size trigger can
         // never fire — arming the preparer would zero-write a full
         // segment at boot for a staging file nothing ever adopts.
         #[cfg(feature = "no-persist")]
         {
-            self.run_sync(shutdown)
+            self.into_sequencer()
         }
         #[cfg(not(feature = "no-persist"))]
         {
             let mut stage = self;
             stage.enable_preparer();
-            stage.run_sync(shutdown)
+            stage.into_sequencer()
         }
     }
 
+    /// Start the stage and run it on the calling thread. For tests, which
+    /// pin nothing, so starting the helpers on the sequencing thread
+    /// passes nothing on that matters.
+    #[cfg(test)]
+    pub(crate) fn run(
+        self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<BufferedWriter<E>, JournalError> {
+        self.start()?.run(shutdown)
+    }
+
     /// Spawn the background segment preparer in the configured staging
-    /// mode. Called from the stage's `run` before entering `run_sync`;
+    /// mode. Called from [`start`](Self::start) before the writer is split;
     /// no-op if already spawned. Arming policy lives in
     /// `JournalStage::arm_preparer_if_recurring`.
     ///
@@ -2376,7 +2434,7 @@ impl<E: AppEvent> JournalStage<E> {
     }
 
     /// Set the core the preparer worker pins itself to (`0` =
-    /// unpinned). Call before the stage runs — `enable_preparer` reads
+    /// unpinned). Call before [`start`](Self::start) — `enable_preparer` reads
     /// it at spawn time; changing it afterwards has no effect on an
     /// already-running worker.
     pub fn set_preparer_core(&mut self, core: usize) {
@@ -2390,7 +2448,7 @@ impl<E: AppEvent> JournalStage<E> {
     }
 
     /// Set how the preparer materialises staged segments. Call before
-    /// the stage runs — like [`set_preparer_core`](Self::set_preparer_core),
+    /// [`start`](Self::start) — like [`set_preparer_core`](Self::set_preparer_core),
     /// `enable_preparer` reads it at spawn time and an already-running
     /// worker keeps the mode it was spawned with.
     pub fn set_staging_mode(&mut self, mode: StagingMode) {
@@ -2459,7 +2517,7 @@ pub struct MatchingStage<A: Application> {
     /// to the journal writer's `starting_sequence` and advanced for each
     /// event the journal would allocate (App non-query, Tick); held flat
     /// for events the journal skips (Query). The skip-rule mirrors
-    /// `JournalStage::run` exactly — any drift would re-introduce the
+    /// `Sequencer::run` exactly — any drift would re-introduce the
     /// off-by-one the wire-seq field exists to eliminate. Tests pin this
     /// invariant.
     next_wire_seq: u64,

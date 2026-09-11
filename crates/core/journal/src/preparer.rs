@@ -267,14 +267,13 @@ impl SegmentPreparer {
         });
 
         let worker_state = Arc::clone(&state);
-        // Hand the worker its scheduling context before it exists. This
-        // runs on the journal thread, which in a tuned deployment is
-        // pinned to an isolated core at SCHED_FIFO; a child inherits
-        // both at creation and cannot move itself off a core whose
-        // busy-spinning real-time occupant never yields, because moving
-        // itself requires running. Doing the reset inside the worker —
-        // as this did — could never work for exactly the reason its own
-        // comment gave.
+        // Hand the worker its scheduling context before it exists. A
+        // child inherits its creator's mask and policy at creation, and
+        // the caller's placement is not ours to assume: the journal stage
+        // starts this from whichever thread spawns its sequencing thread,
+        // which may be pinned. A child cannot move itself off a core
+        // whose real-time occupant never yields, because moving itself
+        // requires running — so the reset cannot happen inside the worker.
         let saved = melin_app::affinity::take_context();
         if let Err(ref e) = saved {
             tracing::warn!(error = %e, "journal-prep: cannot snapshot scheduling context");
@@ -286,11 +285,14 @@ impl SegmentPreparer {
             .name("journal-prep".into())
             .spawn(move || worker_loop(worker_state));
         // Restore before unwrapping: a failed spawn must not strand the
-        // journal thread on the preparer's core.
+        // calling thread on the preparer's core.
         if let Ok(ctx) = saved
             && let Err(e) = melin_app::affinity::restore_context(&ctx)
         {
-            tracing::error!(error = %e, "journal thread could not restore its own affinity");
+            tracing::error!(
+                error = %e,
+                "journal-prep: the starting thread could not restore its own affinity"
+            );
         }
         let handle = spawned.expect("failed to spawn journal-prep thread");
 

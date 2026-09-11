@@ -130,6 +130,11 @@ impl DiskControl {
         self.stop.store(true, Ordering::Release);
     }
 
+    /// Whether [`stop`](Self::stop) has been called.
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
     /// Whether the journal has failed. Checked once per sequencer loop.
     pub fn poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
@@ -394,7 +399,7 @@ impl JournalDisk {
             // a window — drain sees an empty ring, sequencer publishes
             // and stops, flag check exits — where a handed-over batch
             // was silently dropped on the error-path teardown.
-            let stop_requested = self.control.stop.load(Ordering::Acquire);
+            let stop_requested = self.control.stop_requested();
             match self.drain_and_sync() {
                 Ok(true) => {
                     waiter.reset();
