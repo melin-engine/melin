@@ -20,7 +20,7 @@
 //! CPUs. Production deployments never run pipeline threads on core 0
 //! (it is reserved for the kernel, IRQ handlers, and other system
 //! processes), so the value is free to repurpose. This lets the
-//! integration tests pass `--cores 0,0,0,...` without cramming every
+//! integration tests pass `--cores none` without cramming every
 //! pipeline thread of every spawned server onto a single physical CPU
 //! — which previously caused the io_uring reader to starve under
 //! contention and the failover suite to time out.

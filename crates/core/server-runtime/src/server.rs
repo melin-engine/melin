@@ -46,7 +46,7 @@ use melin_app::encoder::ResponseEncoder;
 use melin_pipeline::ring::Consumer;
 use melin_pipeline::wait::WaitStrategy;
 
-use crate::layout::parse_cores;
+use crate::layout::{DEFAULT_CORES, parse_cores};
 /// The layout types live in [`crate::layout`]; re-exported here because
 /// `ServerConfig::cores` is one of them and callers reach the config
 /// through this module.
@@ -137,27 +137,25 @@ pub struct ServerConfig {
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
-    /// Pipeline core IDs: journal,matching,response,reader,(unused),event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,journal-disk
-    /// (comma-separated; the last two entries are optional and default to
-    /// unpinned when omitted). Core 0 is reserved for OS/IRQ handling.
+    /// Where each pipeline thread runs, as comma-separated `thread=core`
+    /// entries in any order. Threads: journal, matching, response, reader,
+    /// event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep,
+    /// journal-disk. A thread not named is unpinned, as is one given `0`;
+    /// `none` unpins every thread. Core 0 is reserved for OS/IRQ handling.
     /// reader pins the io_uring reader (TCP) or DPDK poll thread.
-    /// The fifth entry once pinned the replication accept thread and is now
-    /// ignored — that thread does no work worth a core, and the replica data
-    /// path is pinned by repl-handler-0/1. The position is kept so existing
-    /// `--cores` values keep their meaning. event-publisher applies when
-    /// `--event-bind` is set, shadow when `--snapshot-interval-ms` > 0.
-    /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
-    /// journal-disk pins the thread that writes and syncs the journal; give it
-    /// a core on the same CCD as journal, since the two exchange a cache line
-    /// per batch.
+    /// event-publisher applies when `--event-bind` is set, shadow when
+    /// `--snapshot-interval-ms` > 0. repl-handler-0/1 are for the
+    /// per-replica TCP handler threads. journal-disk pins the thread that
+    /// writes and syncs the journal; give it a core on the same CCD as
+    /// journal, since the two exchange a cache line per batch.
     ///
-    /// Each entry may carry a suffix saying how that thread waits: `7`
+    /// Each core may carry a suffix saying how that thread waits: `7`
     /// (or `7s`) busy-spins and needs the core to itself, `7y` spins
     /// briefly then yields and may share the core with other `y`
     /// threads. `0` (unpinned) always yields. Two threads on one core
     /// where either busy-spins is refused at startup — they would starve
     /// each other. journal-prep never busy-waits and takes no suffix.
-    #[arg(long, default_value = "1,2,3,4,5,6,7,8,9,10,11", value_parser = parse_cores)]
+    #[arg(long, default_value = DEFAULT_CORES, value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
     #[arg(long, default_value_t = 0)]
@@ -1622,10 +1620,8 @@ where
                 // happened to yield the core. See
                 // `replication::validation_worker`.
                 //
-                // `PipelineCores` consequently has no field for it. The
-                // fifth `--cores` position stays, validated and discarded,
-                // so existing operator configurations keep every other
-                // entry's meaning.
+                // `PipelineCores` consequently has no field for it, and
+                // `--cores` no name.
                 crate::replication::run_sender::<A>(
                     crate::replication::Sender {
                         listener: repl_listener,
