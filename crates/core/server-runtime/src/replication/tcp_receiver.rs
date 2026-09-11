@@ -1221,7 +1221,7 @@ mod tests {
         pub(super) fn unpinned_cores() -> crate::layout::PipelineCores {
             use crate::layout::Placement;
             crate::layout::PipelineCores {
-                journal: Placement::unpinned(),
+                journal_seq: Placement::unpinned(),
                 matching: Placement::unpinned(),
                 response: Placement::unpinned(),
                 reader: Placement::unpinned(),
@@ -2021,7 +2021,7 @@ mod tests {
                 let names = live_thread_names();
                 if !names
                     .iter()
-                    .any(|n| n == "journal" || n == "matching" || n == "drain")
+                    .any(|n| n == "journal-seq" || n == "matching" || n == "drain")
                 {
                     break;
                 }

@@ -46,9 +46,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `CHALLENGE_RESPONSE_LEN` beside the decoder, so the handshake frame has one
   home; `BlockingFrameReader::frame` returns the last frame read.
 - **A wait policy per pipeline thread, in `--cores`.** Each thread's core
-  takes a suffix: `journal=7` (or `journal=7s`) busy-spins and needs core 7
-  to itself, `journal=7y` spins briefly then yields and may share it. One
-  node can therefore spin its hot stages on isolated cores and pack the
+  takes a suffix: `matching=7` (or `matching=7s`) busy-spins and needs
+  core 7 to itself, `matching=7y` spins briefly then yields and may share
+  it. One node can therefore spin its hot stages on isolated cores and pack the
   auxiliary threads onto a shared core that yields — previously the choice
   was one policy for the whole process. `0` (unpinned) always yields, so `0s` is refused; `journal-prep`
   blocks in I/O rather than polling and takes no suffix. The node refuses to
@@ -74,7 +74,7 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 ### Changed
 
 - **`--cores` names its threads.** A layout is now written
-  `journal=1,matching=2,response=3,reader=4,journal-disk=5,…`, in any
+  `journal-seq=1,matching=2,response=3,reader=4,journal-disk=5,…`, in any
   order, instead of as a list read by position. Every thread must be
   named, `journal-prep` and `journal-disk` included, although a nine- or
   ten-entry list used to leave them unpinned: running a thread unpinned is
@@ -90,10 +90,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   named form. The
   default layout is unchanged. To migrate, name the positions and drop the
   fifth: `1,2,3,4,0,6,7,8,9,10,11` is
-  `journal=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11`;
+  `journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11`;
   a nine- or ten-entry list adds `journal-prep=0` and `journal-disk=0` for
   the threads it left out; and an all-`0` list is `none`. `PipelineCores::unpinned()` builds the
   latter in code.
+- **The journal's sequencing thread is named `journal-seq`**, where it was
+  `journal`: in `--cores`, in the thread name `top -H`, `ps` and `perf`
+  show, and in log lines. The journal stage runs three threads —
+  `journal-seq` orders, encodes and hash-chains events, `journal-disk`
+  writes and syncs them, `journal-prep` stages the next segment — and the
+  bare name did not say which one it was. Stage-level labels (utilization
+  and latency statistics) still say `journal`. Source-breaking for direct
+  users of the runtime: `PipelineCores::journal` is `journal_seq`.
 - **A `--cores` layout that puts two threads on one core no longer starts
   the node.** Previously such threads busy-spun against each other; the
   optional threads were even documented as able to share an auxiliary
@@ -137,7 +145,7 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   differently from what its entry said. `--cores` is now the only place a
   wait policy is stated. To migrate, suffix every pinned entry:
   `--yield-idle` with the default layout becomes
-  `--cores journal=1y,matching=2y,response=3y,reader=4y,event-publisher=6y,shadow=7y,repl-handler-0=8y,repl-handler-1=9y,journal-prep=10,journal-disk=11y`;
+  `--cores journal-seq=1y,matching=2y,response=3y,reader=4y,event-publisher=6y,shadow=7y,repl-handler-0=8y,repl-handler-1=9y,journal-prep=10,journal-disk=11y`;
   on DPDK leave the `reader` entry bare, since the NIC poll thread cannot
   yield. `ServerConfig` loses the `yield_idle` field; code that built a
   shared-machine configuration sets `cores` to

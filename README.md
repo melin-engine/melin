@@ -88,7 +88,7 @@ A node runs a fixed set of pinned threads connected by lock-free disruptor rings
 ```
 
 - **Reader**: one thread multiplexing every client connection, over kernel TCP with io_uring or over DPDK in userspace. Sole producer into the input ring.
-- **Journal**: sequences, encodes, and hash-chains events and feeds encoded batches to the replication senders. A separate **Journal Disk** thread writes and syncs the batches and publishes the durability cursors. Because the two are split, a slow disk stalls neither ordering nor the replica feed.
+- **Journal**: its `journal-seq` thread sequences, encodes, and hash-chains events and feeds encoded batches to the replication senders. A separate `journal-disk` thread writes and syncs the batches and publishes the durability cursors. Because the two are split, a slow disk stalls neither ordering nor the replica feed.
 - **Application**: consumes the input ring in parallel with the journal. Runs your logic and publishes results to the output ring. Never waits on disk.
 - **Response**: drains the output ring but gates each response on the journal and replication cursors before sending it, so persist-before-ack is enforced without stalling the application.
 - **Event publisher**: broadcasts application output to subscribers (market data, audit, analytics).

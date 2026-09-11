@@ -138,7 +138,7 @@ pub struct ServerConfig {
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
     /// Where each pipeline thread runs, as comma-separated `thread=core`
-    /// entries in any order. Threads: journal, matching, response, reader,
+    /// entries in any order. Threads: journal-seq, matching, response, reader,
     /// event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep,
     /// journal-disk. Every thread must be named: `0` leaves one unpinned,
     /// and `none` unpins every thread. Core 0 is reserved for OS/IRQ
@@ -148,7 +148,7 @@ pub struct ServerConfig {
     /// `--snapshot-interval-ms` > 0. repl-handler-0/1 are for the
     /// per-replica TCP handler threads. journal-disk pins the thread that
     /// writes and syncs the journal; give it a core on the same CCD as
-    /// journal, since the two exchange a cache line per batch.
+    /// journal-seq, since the two exchange a cache line per batch.
     ///
     /// Each core may carry a suffix saying how that thread waits: `7`
     /// (or `7s`) busy-spins and needs the core to itself, `7y` spins
@@ -520,7 +520,7 @@ impl Default for ServerConfig {
             journal: PathBuf::from("melin.journal"),
             snapshot: None,
             cores: PipelineCores {
-                journal: Placement::spinning(1),
+                journal_seq: Placement::spinning(1),
                 matching: Placement::spinning(2),
                 response: Placement::spinning(3),
                 reader: Placement::spinning(4),
@@ -1229,9 +1229,9 @@ fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
     let journal_result = handles.journal.join();
     let journal_failed = matches!(&journal_result, Ok(Err(_)));
     if let Ok(Err(ref e)) = journal_result {
-        error!(thread = "journal", error = %e, "journal stage returned error");
+        error!(thread = "journal-seq", error = %e, "journal stage returned error");
     }
-    check_join("journal", journal_result.map(|_| ()));
+    check_join("journal-seq", journal_result.map(|_| ()));
     check_join("matching", handles.matching.join().map(|_| ()));
     check_join("response", handles.response.join());
     for (name, r) in extras {
@@ -1450,19 +1450,19 @@ where
     let s1 = Arc::clone(&shutdown);
     let shutdown_for_journal = Arc::clone(&shutdown);
     let journal_handle = std::thread::Builder::new()
-        .name("journal".into())
+        .name("journal-seq".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("journal", cores.journal.core);
+            melin_app::affinity::pin_thread("journal-seq", cores.journal_seq.core);
             let result = journal_stage.run(&s1);
             let was_shutdown = shutdown_for_journal.load(Ordering::Relaxed);
             match &result {
-                Ok(_) if was_shutdown => info!("journal thread exited cleanly on shutdown"),
-                Ok(_) => error!("journal thread returned without shutdown signal"),
-                Err(e) => error!(error = %e, "journal thread returned Err"),
+                Ok(_) if was_shutdown => info!("journal-seq thread exited cleanly on shutdown"),
+                Ok(_) => error!("journal-seq thread returned without shutdown signal"),
+                Err(e) => error!(error = %e, "journal-seq thread returned Err"),
             }
             result
         })
-        .map_err(|e| format!("spawn journal thread: {e}"))?;
+        .map_err(|e| format!("spawn journal-seq thread: {e}"))?;
 
     let s2 = Arc::clone(&shutdown);
     let shutdown_for_matching = Arc::clone(&shutdown);
@@ -2676,12 +2676,12 @@ where
 
     let s1 = Arc::clone(&shutdown);
     let journal_handle = std::thread::Builder::new()
-        .name("journal".into())
+        .name("journal-seq".into())
         .spawn(move || {
-            melin_app::affinity::pin_thread("journal", cores.journal.core);
+            melin_app::affinity::pin_thread("journal-seq", cores.journal_seq.core);
             journal_stage.run(&s1)
         })
-        .map_err(|e| format!("spawn journal thread: {e}"))?;
+        .map_err(|e| format!("spawn journal-seq thread: {e}"))?;
 
     let s2 = Arc::clone(&shutdown);
     let matching_handle = std::thread::Builder::new()
