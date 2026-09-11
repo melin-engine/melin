@@ -34,16 +34,6 @@ pub(crate) const DEFAULT_CORES: &str = "journal=1,matching=2,response=3,reader=4
 /// length: every per-thread list here is a fixed array of this size.
 const THREAD_COUNT: usize = 10;
 
-/// The threads `--cores` may leave out, which are then unpinned. Every
-/// other thread must be named, so forgetting one is a refused value
-/// rather than a thread running somewhere the operator did not choose.
-/// Only the preparer qualifies: it blocks in I/O, off the acknowledgement
-/// path. The disk thread, which shorter positional lists could leave out,
-/// is required — every acknowledgement waits on the durability it
-/// publishes. An array rather than a single name so a later optional
-/// thread is one more entry; searched linearly, once per parse.
-const OPTIONAL_THREADS: [&str; 1] = ["journal-prep"];
-
 /// Where one pipeline thread runs and how it waits there.
 ///
 /// The two are one value because they constrain each other: a thread
@@ -137,7 +127,7 @@ pub struct PipelineCores {
     /// Replication handler thread 1.
     pub repl_handler_1: Placement,
     /// The journal segment preparer (background staging of the next
-    /// segment). Optional in `--cores`: unpinned when left out.
+    /// segment).
     ///
     /// Its wait policy is always yielding: the preparer blocks in file
     /// I/O and sleeps between attempts, it never polls a ring. It is
@@ -145,8 +135,7 @@ pub struct PipelineCores {
     /// core with.
     pub journal_prep: Placement,
     /// The journal disk thread — the half that writes, syncs, and
-    /// publishes durability. Required in `--cores`; `journal-disk=0` unpins
-    /// it.
+    /// publishes durability.
     ///
     /// Unlike the preparer this is a hot-path thread: it polls for
     /// batches, and the durability cursors every ack gates on are
@@ -436,9 +425,8 @@ fn thread_names() -> String {
 
 /// Parse a `--cores` value into `PipelineCores`: comma-separated
 /// `thread=core` entries in any order, each core with the suffix
-/// described at [`parse_placement`]. Every thread must be named except
-/// the optional ones (`OPTIONAL_THREADS`), which are unpinned when left
-/// out; `none` leaves every thread unpinned.
+/// described at [`parse_placement`]. Every thread must be named; `none`
+/// leaves every thread unpinned.
 pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let mut cores = PipelineCores::unpinned();
     if s.trim() == "none" {
@@ -495,22 +483,21 @@ pub(crate) fn parse_cores(s: &str) -> Result<PipelineCores, String> {
             placement
         };
     }
-    // A thread left out would run wherever the scheduler puts it, so only
-    // the optional ones may be. A `Vec` only to join the names into the
+    // Every thread must be named: one left out would run somewhere the
+    // operator did not choose. A `Vec` only to join the names into the
     // message; this runs once, at startup.
     let missing: Vec<&str> = cores
         .named()
         .into_iter()
         .zip(seen)
-        .filter(|((name, _), was_named)| !was_named && !OPTIONAL_THREADS.contains(name))
+        .filter(|(_, was_named)| !was_named)
         .map(|((name, _), _)| name)
         .collect();
     if !missing.is_empty() {
         return Err(format!(
-            "missing {}: every thread but {} must be named (`0` leaves one unpinned, and \
-             `none` unpins them all)",
-            missing.join(", "),
-            OPTIONAL_THREADS.join(" and ")
+            "missing {}: every thread must be named (`0` leaves one unpinned, and `none` \
+             unpins them all)",
+            missing.join(", ")
         ));
     }
     Ok(cores)
@@ -529,30 +516,30 @@ mod tests {
     const MIXED: &str = "journal=1,matching=2,response=3,reader=4,journal-disk=5,\
          repl-handler-0=6,repl-handler-1=7,event-publisher=8y,shadow=8y,journal-prep=8";
 
-    /// `entries` completed with `=0` for each required thread it does not
-    /// name, so a test spells out only the threads it is about.
+    /// `entries` completed with `=0` for each thread it does not name, so
+    /// a test spells out only the threads it is about.
     fn complete(entries: &str) -> String {
         let mut value = entries.to_owned();
         for (name, _) in PipelineCores::unpinned().named() {
             let named = entries
                 .split(',')
                 .any(|entry| entry.split_once('=').is_some_and(|(n, _)| n.trim() == name));
-            if !named && !OPTIONAL_THREADS.contains(&name) {
+            if !named {
                 value.push_str(&format!(",{name}=0"));
             }
         }
         value
     }
 
-    /// Every thread but the preparer must be named: leaving one out is
-    /// refused, with every missing thread named at once, rather than
-    /// leaving it wherever the scheduler puts it. That includes
+    /// Every thread must be named: leaving one out is refused, with every
+    /// missing thread named at once, rather than leaving it somewhere the
+    /// operator did not choose. That includes journal-prep and
     /// journal-disk, which shorter positional lists could leave out. The
-    /// required set is spelled out here rather than derived from
-    /// `OPTIONAL_THREADS`, so a change to either is a test failure.
+    /// set is spelled out here rather than derived from the parser's own
+    /// list, so a thread that stops being required is a test failure.
     #[test]
-    fn parse_cores_requires_every_thread_but_journal_prep() {
-        const REQUIRED: [&str; 9] = [
+    fn parse_cores_requires_every_thread() {
+        const REQUIRED: [&str; 10] = [
             "journal",
             "matching",
             "response",
@@ -561,6 +548,7 @@ mod tests {
             "shadow",
             "repl-handler-0",
             "repl-handler-1",
+            "journal-prep",
             "journal-disk",
         ];
         for missing in REQUIRED {
@@ -574,27 +562,19 @@ mod tests {
             assert!(err.starts_with(&format!("missing {missing}:")), "{err}");
         }
 
-        let err = parse_cores("journal=1,matching=2").expect_err("seven threads missing");
+        let err = parse_cores("journal=1,matching=2").expect_err("eight threads missing");
         assert!(
             err.starts_with(
                 "missing response, reader, event-publisher, shadow, repl-handler-0, \
-                 repl-handler-1, journal-disk:"
+                 repl-handler-1, journal-prep, journal-disk:"
             ),
             "{err}"
         );
-
-        let without_prep = parse_cores(
-            "journal=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,\
-             repl-handler-0=8,repl-handler-1=9,journal-disk=11",
-        )
-        .expect("journal-prep may be left out");
-        assert_eq!(without_prep.journal_prep, Placement::unpinned());
-        assert_eq!(without_prep.journal_disk, Placement::spinning(11));
+        assert!(err.contains("`none`"), "points at the shorthand: {err}");
     }
 
-    /// Entries are named, so their order carries no meaning, whitespace
-    /// around them is tolerated, and an optional thread left out is
-    /// unpinned.
+    /// Entries are named, so their order carries no meaning and whitespace
+    /// around them is tolerated.
     #[test]
     fn parse_cores_reads_named_entries_in_any_order() {
         let forward =
@@ -605,11 +585,6 @@ mod tests {
         assert_eq!(forward.journal, Placement::spinning(1));
         assert_eq!(forward.matching, Placement::spinning(2));
         assert_eq!(forward.journal_disk, Placement::spinning(3));
-        assert_eq!(
-            forward.journal_prep,
-            Placement::unpinned(),
-            "an optional thread left out is unpinned"
-        );
 
         let every = parse_cores(DEFAULT_CORES).expect("the default parses");
         assert_eq!(every.event_publisher, Placement::spinning(6));
@@ -807,7 +782,7 @@ mod tests {
     fn all_yielding_makes_a_packed_layout_legal() {
         let packed = parse_cores(
             "journal=1,matching=1,response=1,reader=1,event-publisher=1,shadow=1,\
-             repl-handler-0=1,repl-handler-1=1,journal-disk=0",
+             repl-handler-0=1,repl-handler-1=1,journal-prep=0,journal-disk=0",
         )
         .expect("parses");
         assert!(
