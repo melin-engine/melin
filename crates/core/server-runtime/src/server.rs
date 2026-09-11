@@ -140,9 +140,9 @@ pub struct ServerConfig {
     /// Where each pipeline thread runs, as comma-separated `thread=core`
     /// entries in any order. Threads: journal, matching, response, reader,
     /// event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep,
-    /// journal-disk. Every thread must be named except journal-prep, which
-    /// is unpinned when left out. `0` leaves a thread unpinned, and `none`
-    /// unpins every thread. Core 0 is reserved for OS/IRQ handling.
+    /// journal-disk. Every thread must be named: `0` leaves one unpinned,
+    /// and `none` unpins every thread. Core 0 is reserved for OS/IRQ
+    /// handling.
     /// reader pins the io_uring reader (TCP) or DPDK poll thread.
     /// event-publisher applies when `--event-bind` is set, shadow when
     /// `--snapshot-interval-ms` > 0. repl-handler-0/1 are for the

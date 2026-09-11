@@ -76,12 +76,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`--cores` names its threads.** A layout is now written
   `journal=1,matching=2,response=3,reader=4,journal-disk=5,…`, in any
   order, instead of as a list read by position. Every thread must be
-  named except `journal-prep`, which stays optional and is unpinned when
-  left out. That includes `journal-disk`, which a nine- or ten-entry list
-  used to leave unpinned: every acknowledgement waits on the durability
-  it publishes, so running it unpinned is now a stated choice
-  (`journal-disk=0`). A core of `0` still unpins any thread, and `none`
-  unpins every thread. The positional list
+  named, `journal-prep` and `journal-disk` included, although a nine- or
+  ten-entry list used to leave them unpinned: running a thread unpinned is
+  now a stated choice (`journal-disk=0`) rather than an omission. A core
+  of `0` still unpins any thread, and `none` unpins every thread. The
+  positional list
   could not shed its retired fifth entry (the replication accept thread,
   unpinned since 0.15) without reading every later core as its
   neighbour's, in most cases with no error, and each new thread could only
@@ -91,8 +90,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   named form. The
   default layout is unchanged. To migrate, name the positions and drop the
   fifth: `1,2,3,4,0,6,7,8,9,10,11` is
-  `journal=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11`,
-  and an all-`0` list is `none`. `PipelineCores::unpinned()` builds the
+  `journal=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11`;
+  a nine- or ten-entry list adds `journal-prep=0` and `journal-disk=0` for
+  the threads it left out; and an all-`0` list is `none`. `PipelineCores::unpinned()` builds the
   latter in code.
 - **A `--cores` layout that puts two threads on one core no longer starts
   the node.** Previously such threads busy-spun against each other; the
