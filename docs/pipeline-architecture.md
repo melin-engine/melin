@@ -291,7 +291,7 @@ Every wait in the pipeline goes through a wait strategy chosen at startup, per t
 
 The policy is stated per thread in `--cores`, as a suffix on the thread's core: `journal=7` (or `journal=7s`) busy-spins on core 7, `journal=7y` spins then yields there. A core of `0` leaves the thread unpinned, as does leaving `journal-prep` or `journal-disk` out of `--cores` (every other thread must be named), and an unpinned thread always yields — a spinner with no core of its own is the shared-core problem with the victim chosen by the scheduler, so `0s` is refused. `journal-prep` never busy-waits (it blocks in file I/O) and takes no suffix. On a shared machine where every thread should yield, suffix every pinned entry: `--cores journal=1y,matching=2y,response=3y,reader=4y,event-publisher=6y,shadow=7y,repl-handler-0=8y,repl-handler-1=9y,journal-prep=10,journal-disk=11y`.
 
-One thread cannot take a policy: in DPDK mode the `reader` entry pins the NIC poll thread, which polls the device flat out whether or not it has work. A `y` on that entry is refused as a contradiction, so give it a core of its own. Leaving it unpinned is accepted as written, but the thread still polls flat out wherever the scheduler places it. On kernel TCP the reader blocks in the kernel between completions, and its entry's policy governs only the input ring it produces into.
+One thread cannot take a policy: in DPDK mode the `reader` entry pins the NIC poll thread, which polls the device flat out whether or not it has work. A `y` on that entry is refused as a contradiction, so give it a core of its own. Leaving it unpinned is accepted as written, but the thread still polls flat out, on a core it shares with everything else that is unpinned (see [CPU core pinning](#cpu-core-pinning)). On kernel TCP the reader blocks in the kernel between completions, and its entry's policy governs only the input ring it produces into.
 
 This is what lets one node mix the two: every thread on the acknowledgement path spinning on a core of its own, and the truly auxiliary threads packed onto one shared core, yielding:
 
@@ -393,7 +393,7 @@ The server spawns four always-on pipeline threads plus one reader thread, and th
 | Repl Handler 0/1 | 8, 9 | Per-replica connection handling | Yes (one per connected replica) |
 | Segment Preparer | 10 | Pre-stage the next journal segment off the rotation path | Yes (recurring rotation only) |
 
-Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core — suffixed with `y` so they yield to each other, see [Waiting](#waiting) — or be left unpinned with `0`; only the five mandatory threads need a core to themselves.
+Core 0 is reserved for OS/IRQ handling. The optional threads are largely idle and can share an auxiliary core — suffixed with `y` so they yield to each other, see [Waiting](#waiting) — or be left unpinned with `0`, which puts them on the cores the operating system and interrupts use (see [CPU core pinning](#cpu-core-pinning)); only the five mandatory threads need a core to themselves.
 
 ### The journal's two threads
 
@@ -408,11 +408,18 @@ The practical consequence: while the device is slow, the sequencer keeps orderin
 
 Absorption is bounded by the hand-off ring (64 batches). Past that the sequencer stalls at its next batch, the input ring fills, and producers backpressure — the same chain as before, with a deeper buffer in front of it. Watch `melin_journal_disk_lag_batches`.
 
-Give the disk thread a core on the same CCD as the journal thread: the two exchange a cache line per batch, and a cross-CCD transfer adds roughly 100 ns to each. On a box that cannot spare the core, leave `journal-disk` out of `--cores` (or set it to `0`) — the thread then floats on the shared mask at default scheduling and yields when idle, like every unpinned thread; it still makes progress, but it competes for whatever core it lands on.
+Give the disk thread a core on the same CCD as the journal thread: the two exchange a cache line per batch, and a cross-CCD transfer adds roughly 100 ns to each. On a box that cannot spare the core, leave `journal-disk` out of `--cores` (or set it to `0`) — the thread then runs at default scheduling and yields when idle, like every unpinned thread; it still makes progress, but it competes with everything else on the core it lands on. That is for boxes without isolated cores: on a host that has them, give it a core (see [CPU core pinning](#cpu-core-pinning)).
 
 ### CPU core pinning
 
 Each pipeline thread calls `sched_setaffinity` (via `crate::affinity::pin_to_core`) immediately after spawning, before entering its main loop. Pinning eliminates involuntary context switches and keeps hot data in L1/L2 cache, reducing p99/p99.9 latency jitter from approximately 5-20 us per core migration to near zero.
+
+A thread given `0` in `--cores`, or an optional thread left out of it, is not pinned, and where it runs depends on the host:
+
+- **Without isolated cores**, the scheduler places it on any core and moves it as load changes, including onto cores other threads are pinned to. Pinned threads have no real-time priority on such a host, so the two share that core by timeslice.
+- **With isolated cores** (`isolcpus`), it runs only on the cores outside the isolated set — core 0 and any other core not listed — alongside the kernel, interrupt handling and every other unpinned thread. The scheduler never moves work onto an isolated core, even an idle one: a spare isolated core stays idle rather than absorbing unpinned threads.
+
+`journal-disk` and `journal-prep` are the exception on a host with isolated cores. The journal thread starts both, and a thread started from an isolated core can stay on that core — beside the journal thread, which busy-spins there at real-time priority and leaves it almost no time to run. On such a host, give both of them a core.
 
 In **kernel TCP mode**, the reader thread is pinned to the core `--cores` gives `reader` (default 4). io_uring with multishot RECV multiplexes every client connection on this single thread.
 
