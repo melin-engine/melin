@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use melin_client::{Connection, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::ack_policy::AckPolicy;
+use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::tcp::BlockingTcpListener;
@@ -181,10 +182,11 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         standalone: true,
         ack_policy: AckPolicy::Disk,
         no_mlock: true,
-        // Test servers share the machine with the rest of the suite; a
-        // busy-spinning pipeline per node starves the clients (and the
-        // other nodes) of CPU time under full-suite load.
-        cores: ServerConfig::default().cores.all_yielding(),
+        // Unpinned, and therefore yielding: the suite runs many nodes at
+        // once, and the default layout would stack every node's same-role
+        // thread on one core while a spinner would starve whatever shares
+        // its core, the test's own client included.
+        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
@@ -932,8 +934,9 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
         authorized_keys: auth_path.clone(),
         ack_policy: AckPolicy::DiskAndRam,
         no_mlock: true,
-        // Two nodes share this machine with the test itself.
-        cores: ServerConfig::default().cores.all_yielding(),
+        // Two nodes share this machine with the test itself; unpinned and
+        // yielding, for the reason the round-trip harness gives.
+        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
