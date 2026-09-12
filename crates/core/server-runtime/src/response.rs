@@ -1155,6 +1155,16 @@ pub fn run<A: Application>(
                 }
 
                 flush.on_append(entry.send_buf.len());
+            } else {
+                // A reply for a connection this stage does not hold: the
+                // connection was dropped earlier in this batch, or its
+                // `Connected` has not been drained yet. Logged so a
+                // silently lost reply leaves a trace.
+                debug!(
+                    connection_id = slot.connection_id,
+                    wire_seq = slot.wire_seq,
+                    "reply dropped: connection not registered"
+                );
             }
 
             // Consumed-path flush — the still-open half of July-audit
