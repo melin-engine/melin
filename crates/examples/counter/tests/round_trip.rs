@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use melin_client::{Connection, SigningKey, key};
+use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
@@ -83,10 +84,11 @@ fn start_server() -> (
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         no_mlock: true,
-        // Test servers share the machine with the rest of the suite; a
-        // busy-spinning pipeline per node starves the clients (and the
-        // other nodes) of CPU time under full-suite load.
-        cores: ServerConfig::default().cores.all_yielding(),
+        // Unpinned, and therefore yielding: the suite runs many nodes at
+        // once, and the default layout would stack every node's same-role
+        // thread on one core while a spinner would starve whatever shares
+        // its core, the test's own client included.
+        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,

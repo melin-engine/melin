@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{CounterFactory, RequestDecoder, ResponseEncoder};
+use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::TAG_CHALLENGE;
@@ -130,6 +131,12 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
             journal: tmp.path().join(format!("node-{i}.journal")),
             authorized_keys: auth_path.clone(),
             no_mlock: true,
+            // Unpinned, and therefore yielding: three nodes run in this
+            // process alongside the rest of the suite, and the default
+            // layout would stack every node's same-role thread on one core
+            // while a spinner would starve whatever shares its core, the
+            // test's own client included.
+            cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: Some(nodes[i].health_addr),

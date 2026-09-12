@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{CounterFactory, RequestDecoder, ResponseEncoder};
+use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::tcp::BlockingTcpListener;
@@ -56,6 +57,11 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         no_mlock: true,
+        // Unpinned, and therefore yielding: the suite runs many nodes at
+        // once, and the default layout would stack every node's same-role
+        // thread on one core while a spinner would starve whatever shares
+        // its core, the test's own client included.
+        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: Some(health_addr),
