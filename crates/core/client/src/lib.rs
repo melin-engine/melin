@@ -23,7 +23,8 @@
 //! [`Connection::next_frame`], for callers that keep several requests in
 //! flight or want to time the reply frame itself. Blocking, one thread
 //! per connection, `std::net` only: the shape a gateway thread or a load
-//! generator wants, and a receive path that allocates nothing per frame.
+//! generator wants, with no allocation and no staging copy per frame in
+//! either direction.
 //!
 //! ## Silence
 //!
@@ -192,9 +193,6 @@ pub struct Connection {
     stream: TcpStream,
     read_timeout: Duration,
     public_key: VerifyingKey,
-    /// Reused across `send` calls: a request is the sequence, the tag and
-    /// the body in one frame, and the writer takes one slice.
-    scratch: Vec<u8>,
 }
 
 impl fmt::Debug for Connection {
@@ -233,7 +231,6 @@ impl Connection {
             stream,
             read_timeout: timeout,
             public_key: key.verifying_key(),
-            scratch: Vec::new(),
         };
         connection.authenticate(key)?;
         Ok(connection)
@@ -299,12 +296,12 @@ impl Connection {
     /// checks (see `Application::check_request_seq` in `melin-app`);
     /// applications that accept every request still want it monotonic
     /// per connection, which is what a counter gives.
+    ///
+    /// The body is copied once, into the socket's write buffer; there is
+    /// no staging buffer in between.
     pub fn send(&mut self, request_seq: u64, tag: u8, body: &[u8]) -> Result<(), Error> {
-        self.scratch.clear();
-        self.scratch.extend_from_slice(&request_seq.to_le_bytes());
-        self.scratch.push(tag);
-        self.scratch.extend_from_slice(body);
-        self.writer.write_frame(&self.scratch)?;
+        self.writer
+            .write_frame_parts(&[&request_seq.to_le_bytes(), &[tag], body])?;
         self.writer.flush()?;
         Ok(())
     }

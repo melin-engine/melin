@@ -97,9 +97,23 @@ impl<W: Write> BlockingFrameWriter<W> {
 
     /// Write a complete frame (prepends the 4-byte LE length prefix).
     pub fn write_frame(&mut self, data: &[u8]) -> io::Result<()> {
-        let len = data.len() as u32;
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(data)?;
+        self.write_frame_parts(&[data])
+    }
+
+    /// Write one frame whose payload is `parts` laid end to end, with
+    /// the length prefix of their total. Spares a caller that holds a
+    /// frame in pieces — a header it computes and a body it was given —
+    /// from assembling them in a buffer of its own: each part goes
+    /// straight into the write buffer, and the frame reaches the socket
+    /// whole at the next flush. A part that arrives while the buffer is
+    /// too full to take it still lands on the socket in order, only in a
+    /// separate write.
+    pub fn write_frame_parts(&mut self, parts: &[&[u8]]) -> io::Result<()> {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        self.writer.write_all(&(len as u32).to_le_bytes())?;
+        for part in parts {
+            self.writer.write_all(part)?;
+        }
         Ok(())
     }
 
@@ -131,6 +145,28 @@ mod tests {
 
         let received = reader.read_frame().unwrap().unwrap();
         assert_eq!(received, data);
+    }
+
+    #[test]
+    fn frame_parts_arrive_as_one_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let mut writer = BlockingFrameWriter::new(client);
+        let mut reader = BlockingFrameReader::new(server);
+
+        writer
+            .write_frame_parts(&[&7u64.to_le_bytes(), &[0x10], b"body"])
+            .unwrap();
+        writer.write_frame_parts(&[]).unwrap();
+        writer.flush().unwrap();
+
+        let expected = [&7u64.to_le_bytes()[..], &[0x10], b"body"].concat();
+        assert_eq!(reader.read_frame().unwrap().unwrap(), expected);
+        assert_eq!(reader.read_frame().unwrap().unwrap(), b"");
     }
 
     #[test]
