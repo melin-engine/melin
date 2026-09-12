@@ -24,7 +24,9 @@
 //! flight or want to time the reply frame itself. Blocking, one thread
 //! per connection, `std::net` only: the shape a gateway thread or a load
 //! generator wants, with no allocation and no staging copy per frame in
-//! either direction.
+//! either direction. A program that owns its socket — a Unix socket, or
+//! a descriptor its own I/O loop takes over — runs the handshake alone
+//! with [`authenticate`].
 //!
 //! ## Silence
 //!
@@ -48,7 +50,7 @@
 //! ```
 
 use std::fmt;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -219,21 +221,23 @@ impl Connection {
         key: &SigningKey,
         timeout: Duration,
     ) -> Result<Self, Error> {
-        let stream = TcpStream::connect_timeout(&addr, timeout)
+        let mut stream = TcpStream::connect_timeout(&addr, timeout)
             .map_err(|source| Error::Connect { addr, source })?;
         stream.set_read_timeout(Some(timeout))?;
         // A request is one small frame and the reply is what the caller is
         // waiting for: never hold it for coalescing.
         stream.set_nodelay(true)?;
-        let mut connection = Connection {
+        authenticate(&mut stream, key).map_err(|e| match e {
+            Error::Io(e) => io_error(e, timeout),
+            other => other,
+        })?;
+        Ok(Connection {
             reader: BlockingFrameReader::new(stream.try_clone()?),
             writer: BlockingFrameWriter::new(stream.try_clone()?),
             stream,
             read_timeout: timeout,
             public_key: key.verifying_key(),
-        };
-        connection.authenticate(key)?;
-        Ok(connection)
+        })
     }
 
     /// Keep trying to connect until `deadline`, for a node that is still
@@ -392,48 +396,11 @@ impl Connection {
     /// Give up the framed protocol and hand over the authenticated
     /// socket — for the node's admin listener, which authenticates the
     /// same way and then speaks text lines. Call it straight after
-    /// connecting: anything the connection had already read past the
-    /// handshake is discarded with it.
+    /// connecting: the handshake reads nothing past the node's answer,
+    /// but anything a [`next_frame`](Self::next_frame) since buffered is
+    /// discarded with the reader.
     pub fn into_stream(self) -> TcpStream {
         self.stream
-    }
-
-    /// Answer the node's challenge: sign its nonce, send the signature
-    /// with the public key, and wait for it to say it is ready.
-    fn authenticate(&mut self, key: &SigningKey) -> Result<(), Error> {
-        // `[tag][nonce: 32]`
-        let nonce: [u8; 32] = match self.raw_frame()? {
-            [TAG_CHALLENGE, nonce @ ..] if nonce.len() == 32 => {
-                nonce.try_into().expect("length checked")
-            }
-            other => {
-                return Err(Error::Protocol(format!(
-                    "expected an auth challenge, got a {}-byte frame with tag {:?}",
-                    other.len(),
-                    other.first()
-                )));
-            }
-        };
-        let response = ChallengeResponse {
-            signature: key.sign(&nonce).to_bytes(),
-            public_key: self.public_key.to_bytes(),
-        };
-        let mut frame = [0u8; CHALLENGE_RESPONSE_LEN];
-        // The handshake is not a request, so it carries sequence 0.
-        encode_challenge_response(0, &response, &mut frame)
-            .map_err(|e| Error::Protocol(format!("cannot encode the challenge response: {e}")))?;
-        self.writer.write_frame(&frame)?;
-        self.writer.flush()?;
-
-        match self.raw_frame()?.first() {
-            Some(&TAG_SERVER_READY) => Ok(()),
-            Some(&TAG_AUTH_FAILED) => Err(Error::AuthFailed {
-                public_key: self.public_key.to_bytes(),
-            }),
-            other => Err(Error::Protocol(format!(
-                "expected the node to be ready or to refuse the key, got tag {other:?}"
-            ))),
-        }
     }
 
     /// One frame's payload, with the transport's outcomes mapped: a clean
@@ -444,17 +411,98 @@ impl Connection {
         match self.reader.read_frame() {
             Ok(Some(frame)) => Ok(frame),
             Ok(None) => Err(Error::Disconnected),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Err(Error::NoReply { timeout })
-            }
-            Err(e) => Err(Error::Io(e)),
+            Err(e) => Err(io_error(e, timeout)),
         }
     }
+}
+
+/// A read that failed under a socket timeout of `timeout` is the node's
+/// silence, [`Error::NoReply`]; anything else is the socket failing.
+fn io_error(e: io::Error, timeout: Duration) -> Error {
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::NoReply { timeout },
+        _ => Error::Io(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The handshake on its own
+// ---------------------------------------------------------------------------
+
+/// Answer a node's challenge on a bare stream: read the nonce, sign it,
+/// send the signature with the public key, and wait for the node to say
+/// it is ready. [`Connection::connect`] does this on the socket it
+/// dials; the function is for a program that owns its own — a load
+/// generator whose I/O loop takes the descriptor over once the
+/// handshake is done, a client on a Unix socket — so it need not carry
+/// a copy of the handshake.
+///
+/// The reads are unbuffered: nothing past the node's answer is taken
+/// from the stream, so whatever arrives next (a heartbeat, say) is
+/// there for the caller's own reader. A read that times out under the
+/// stream's own timeout comes back as [`Error::Io`]; the stream is not
+/// this function's to configure.
+pub fn authenticate(stream: &mut (impl Read + Write), key: &SigningKey) -> Result<(), Error> {
+    // The node's two frames are a tag and a 32-byte nonce, then a tag: a
+    // frame that does not fit here is not a handshake.
+    let mut buf = [0u8; 64];
+
+    // `[tag][nonce: 32]`
+    let nonce: [u8; 32] = match read_unbuffered_frame(stream, &mut buf)? {
+        [TAG_CHALLENGE, nonce @ ..] if nonce.len() == 32 => {
+            nonce.try_into().expect("length checked")
+        }
+        other => {
+            return Err(Error::Protocol(format!(
+                "expected an auth challenge, got a {}-byte frame with tag {:?}",
+                other.len(),
+                other.first()
+            )));
+        }
+    };
+
+    let public_key = key.verifying_key().to_bytes();
+    let response = ChallengeResponse {
+        signature: key.sign(&nonce).to_bytes(),
+        public_key,
+    };
+    // There is no write buffer in front of a bare stream, so the length
+    // prefix and the frame go out together, as one write.
+    let mut frame = [0u8; 4 + CHALLENGE_RESPONSE_LEN];
+    frame[..4].copy_from_slice(&(CHALLENGE_RESPONSE_LEN as u32).to_le_bytes());
+    // The handshake is not a request, so it carries sequence 0.
+    encode_challenge_response(0, &response, &mut frame[4..])
+        .map_err(|e| Error::Protocol(format!("cannot encode the challenge response: {e}")))?;
+    stream.write_all(&frame)?;
+    stream.flush()?;
+
+    match read_unbuffered_frame(stream, &mut buf)?.first() {
+        Some(&TAG_SERVER_READY) => Ok(()),
+        Some(&TAG_AUTH_FAILED) => Err(Error::AuthFailed { public_key }),
+        other => Err(Error::Protocol(format!(
+            "expected the node to be ready or to refuse the key, got tag {other:?}"
+        ))),
+    }
+}
+
+/// One frame read straight off `stream` into `buf`, with the node's
+/// close reported as [`Error::Disconnected`] and a frame `buf` cannot
+/// hold refused before any of it is read.
+fn read_unbuffered_frame<'a>(stream: &mut impl Read, buf: &'a mut [u8]) -> Result<&'a [u8], Error> {
+    let closed = |e: io::Error| match e.kind() {
+        io::ErrorKind::UnexpectedEof => Error::Disconnected,
+        _ => Error::Io(e),
+    };
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).map_err(closed)?;
+    let len = u32::from_le_bytes(prefix) as usize;
+    let Some(frame) = buf.get_mut(..len) else {
+        return Err(Error::Protocol(format!(
+            "a {len}-byte frame where a handshake frame was expected"
+        )));
+    };
+    stream.read_exact(frame).map_err(closed)?;
+    Ok(frame)
 }
 
 // ---------------------------------------------------------------------------
@@ -463,8 +511,9 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
+    use std::os::unix::net::UnixStream;
 
     use ed25519_dalek::{Signature, Verifier};
     use melin_wire_protocol::control::TransportResponse;
@@ -491,6 +540,9 @@ mod tests {
         /// Never answer, but heartbeat steadily — the idle-connection
         /// heartbeats a real node sends.
         HeartbeatingSilent,
+        /// A heartbeat on the heels of `ServerReady`, before any request,
+        /// then `Echo`.
+        EagerHeartbeat,
         /// Answer every request with a zero-tagged frame — what a
         /// zeroed or corrupt buffer looks like on the wire.
         ZeroTag,
@@ -517,28 +569,45 @@ mod tests {
         frame
     }
 
-    /// Serve one client on `stream` the way a node does: challenge,
-    /// verify, then `behaviour`.
-    fn serve(mut stream: TcpStream, allowed: VerifyingKey, behaviour: Behaviour) {
+    /// The node's half of the handshake on `stream`, any kind of stream:
+    /// challenge, verify, then ready or refused. Whether the key was
+    /// accepted.
+    fn challenge<S>(stream: &S, allowed: VerifyingKey) -> bool
+    where
+        for<'a> &'a S: Read + Write,
+    {
         let nonce = [0x5A; 32];
-        stream
+        let mut writer = stream;
+        writer
             .write_all(&control(TransportResponse::Challenge { nonce }))
             .unwrap();
-        let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+        let mut reader = BlockingFrameReader::new(stream);
         let (seq, response) =
             decode_challenge_response(reader.read_frame().unwrap().unwrap()).unwrap();
         assert_eq!(seq, 0, "the handshake carries sequence 0");
         let presented = VerifyingKey::from_bytes(&response.public_key).unwrap();
         let signature = Signature::from_bytes(&response.signature);
         if presented != allowed || presented.verify(&nonce, &signature).is_err() {
-            stream
+            writer
                 .write_all(&control(TransportResponse::AuthFailed))
                 .unwrap();
-            return;
+            return false;
         }
-        stream
+        writer
             .write_all(&control(TransportResponse::ServerReady))
             .unwrap();
+        true
+    }
+
+    /// Serve one client on `stream` the way a node does: challenge,
+    /// verify, then `behaviour`.
+    fn serve(mut stream: TcpStream, allowed: VerifyingKey, behaviour: Behaviour) {
+        if !challenge(&stream, allowed) {
+            return;
+        }
+        // A client sends nothing before it is told the node is ready, so
+        // the handshake's reader cannot have buffered a request.
+        let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
 
         match behaviour {
             Behaviour::Hangup => return,
@@ -550,6 +619,11 @@ mod tests {
                 stream.write_all(b"OK\n").unwrap();
                 return;
             }
+            Behaviour::EagerHeartbeat => {
+                stream
+                    .write_all(&control(TransportResponse::Heartbeat))
+                    .unwrap();
+            }
             _ => {}
         }
         while let Ok(Some(request)) = reader.read_frame() {
@@ -557,7 +631,7 @@ mod tests {
             assert_eq!(request[8], TAG_REQUEST);
             let body = request[9..].to_vec();
             let reply: Vec<u8> = match behaviour {
-                Behaviour::Echo => [
+                Behaviour::Echo | Behaviour::EagerHeartbeat => [
                     app_frame(TAG_REPLY, &body),
                     control(TransportResponse::BatchEnd),
                 ]
@@ -793,6 +867,119 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::AuthFailed { .. }));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A socket to `addr` with no protocol on it, bounded so a fake that
+    /// does not answer fails the test rather than hanging it.
+    fn bare_stream(addr: SocketAddr) -> TcpStream {
+        let stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+    }
+
+    /// One frame read by hand off a bare stream: `[len: u32][payload]`.
+    fn read_raw_frame(stream: &mut impl Read) -> Vec<u8> {
+        let mut prefix = [0u8; 4];
+        stream.read_exact(&mut prefix).unwrap();
+        let mut payload = vec![0u8; u32::from_le_bytes(prefix) as usize];
+        stream.read_exact(&mut payload).unwrap();
+        payload
+    }
+
+    #[test]
+    fn authenticate_serves_a_bare_stream() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::Echo);
+        let mut stream = bare_stream(addr);
+        authenticate(&mut stream, &key).unwrap();
+
+        // The stream is the caller's from here: a request framed by hand
+        // gets its reply batch.
+        let request = [&5u64.to_le_bytes()[..], &[TAG_REQUEST], b"raw"].concat();
+        stream
+            .write_all(&(request.len() as u32).to_le_bytes())
+            .unwrap();
+        stream.write_all(&request).unwrap();
+        assert_eq!(
+            read_raw_frame(&mut stream),
+            [&[TAG_REPLY][..], b"raw"].concat()
+        );
+        assert_eq!(read_raw_frame(&mut stream), [TAG_BATCH_END]);
+    }
+
+    #[test]
+    fn authenticate_leaves_what_follows_in_the_stream() {
+        // The node heartbeats as soon as the client is authenticated. The
+        // handshake must not have swallowed it into a buffer of its own:
+        // the caller's reader gets it, and then the reply to a request.
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::EagerHeartbeat);
+        let mut stream = bare_stream(addr);
+        authenticate(&mut stream, &key).unwrap();
+        assert_eq!(read_raw_frame(&mut stream), [TAG_RESPONSE_HEARTBEAT]);
+
+        let request = [&1u64.to_le_bytes()[..], &[TAG_REQUEST], b"after"].concat();
+        stream
+            .write_all(&(request.len() as u32).to_le_bytes())
+            .unwrap();
+        stream.write_all(&request).unwrap();
+        assert_eq!(
+            read_raw_frame(&mut stream),
+            [&[TAG_REPLY][..], b"after"].concat()
+        );
+    }
+
+    #[test]
+    fn authenticate_works_over_a_unix_socket() {
+        let key = client_key();
+        let allowed = key.verifying_key();
+
+        let (mut client, node) = UnixStream::pair().unwrap();
+        let accepted = std::thread::spawn(move || challenge(&node, allowed));
+        authenticate(&mut client, &key).unwrap();
+        assert!(accepted.join().unwrap());
+
+        let (mut client, node) = UnixStream::pair().unwrap();
+        let other = SigningKey::from_bytes(&[0x22; 32]).verifying_key();
+        let accepted = std::thread::spawn(move || challenge(&node, other));
+        assert!(matches!(
+            authenticate(&mut client, &key),
+            Err(Error::AuthFailed { public_key }) if public_key == allowed.to_bytes()
+        ));
+        assert!(!accepted.join().unwrap());
+    }
+
+    #[test]
+    fn authenticate_reports_a_stream_that_is_not_a_node() {
+        let key = client_key();
+
+        // Accepted and closed without a word.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || drop(listener.accept().unwrap()));
+        let mut stream = bare_stream(addr);
+        assert!(matches!(
+            authenticate(&mut stream, &key),
+            Err(Error::Disconnected)
+        ));
+
+        // A frame far larger than any handshake frame, refused before it
+        // is read.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&512u32.to_le_bytes()).unwrap();
+            // Keep the socket open until the client has answered.
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut stream = bare_stream(addr);
+        assert!(matches!(
+            authenticate(&mut stream, &key),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]
