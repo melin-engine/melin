@@ -989,15 +989,15 @@ impl<E: AppEvent> JournalStage<E> {
         //
         // A child inherits its creator's CPU mask and scheduling policy
         // at creation. `start` runs on the thread that spawns the
-        // sequencing thread — normally unpinned, but a DPDK replica
-        // rebuilding its pipeline after a snapshot transfer calls it from
-        // its receiver thread, which still sits on the receiver's isolated
-        // core. A child left to fix its own
-        // placement would first have to run beside its parent, which on a
-        // real-time core may never happen: it never executes its first
-        // instruction, not even the one that sets its name. Doing the
-        // reset child-side is the bug this codebase already fixed once, in
-        // "configure spawned threads from the parent, not the child".
+        // sequencing thread, which every caller keeps unpinned (the DPDK
+        // receiver clears its own affinity before a rebuild); this makes
+        // the placement right even for a caller that does not. A child
+        // left to fix its own placement would first have to run beside
+        // its parent, which on a real-time core may never happen: it
+        // never executes its first instruction, not even the one that
+        // sets its name. Doing the reset child-side is the bug this
+        // codebase already fixed once, in "configure spawned threads from
+        // the parent, not the child".
         //
         // So: adopt the child's context, spawn, put ours back. The
         // window is a few microseconds at startup.
@@ -1089,8 +1089,9 @@ impl DiskThread {
     /// Ask the thread to stop once it has drained, and wait for its
     /// segment. `None` if it was already joined.
     fn join(&mut self) -> Option<std::thread::Result<SegmentFile>> {
+        let handle = self.handle.take()?;
         self.control.stop();
-        self.handle.take().map(std::thread::JoinHandle::join)
+        Some(handle.join())
     }
 }
 
