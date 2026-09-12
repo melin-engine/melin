@@ -1254,6 +1254,7 @@ dependencies = [
  "proptest",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
  "zerocopy",
 ]
 
