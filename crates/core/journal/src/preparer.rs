@@ -384,11 +384,11 @@ impl Drop for SegmentPreparer {
 /// (interrupted by shutdown) so transient ENOSPC / RO-FS conditions
 /// don't busy-loop the thread.
 fn worker_loop(state: Arc<State>) {
-    // Affinity and policy are already correct: `spawn` set
-    // them on the journal thread before creating this one, because a
-    // child of a pinned SCHED_FIFO parent cannot reconfigure itself —
-    // it would have to run first, on a core whose occupant never
-    // yields. Nothing to reset here.
+    // Affinity and policy are already correct: `spawn` set them on the
+    // starting thread before creating this one, because a child of a
+    // pinned SCHED_FIFO parent cannot reconfigure itself — it would have
+    // to run first, on a core whose occupant never yields. Nothing to
+    // reset here.
     melin_app::affinity::pin_thread("journal-prep", state.pin_core);
     loop {
         // Wait for arm or shutdown.
