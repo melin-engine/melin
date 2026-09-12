@@ -59,6 +59,9 @@ melin-journal = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+# The pipeline tests capture the stages' tracing output so a timed-out
+# wait reports what the stage logged, a failed rotation's cause included.
+tracing-subscriber = { workspace = true }
 # Re-pull melin-journal with `test-utils` so the byte-sweep crash test
 # can shrink the journal prealloc chunk to keep per-iteration cost bounded.
 melin-journal = { workspace = true, features = ["test-utils"] }
