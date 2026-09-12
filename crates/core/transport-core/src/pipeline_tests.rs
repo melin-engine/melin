@@ -2587,6 +2587,12 @@ fn primary_emits_chain_check_every_interval() {
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 #[test]
 fn primary_driven_rotation_mirrors_segmentation_on_replica() {
+    // The stages log every adoption, and a failed one with its cause, at
+    // info level and up; captured, so a timeout below explains itself.
+    // Deliberately ignored: another test in this process may have
+    // installed the subscriber already.
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
     let dir = tempfile::tempdir().unwrap();
     let primary_path = dir.path().join("primary.journal");
     let replica_path = dir.path().join("replica.journal");
@@ -2768,17 +2774,20 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     // queued writes the tail into the wrong segment. A fixed sleep is
     // exactly that race: with the rest of the suite alongside on four
     // CPUs the replica lost it often enough to fail CI.
-    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    /// Poll `done` for up to 30 s: `true` once it held, `false` on the
+    /// deadline. The caller asserts, so its message can carry the state
+    /// it was waiting on.
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !done() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
             // Yield rather than spin: seven stage/relay threads are
             // already spinning, and this one has nothing to add.
             std::thread::sleep(Duration::from_millis(1));
         }
+        true
     }
     let primary_durable = |seq: u64| p_fsync.load().journal_seq.get() >= seq;
     let primary_rotations = || p_util.rotations_sync_fallback.load(Ordering::Relaxed);
@@ -2798,14 +2807,26 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         }
     };
     publish_phase(2_000, &mut primary.input_producer);
-    wait_until("phase 1 durable on the primary", || primary_durable(2_000));
+    assert!(
+        wait_until(|| primary_durable(2_000)),
+        "timed out waiting for phase 1 durable on the primary"
+    );
     rotate_flag.store(true, Ordering::Release);
     publish_phase(2_000, &mut primary.input_producer);
-    wait_until("the first primary rotation", || primary_rotations() == 1);
+    assert!(
+        wait_until(|| primary_rotations() == 1),
+        "timed out waiting for the first primary rotation"
+    );
     rotate_flag.store(true, Ordering::Release);
     publish_phase(1_000, &mut primary.input_producer);
-    wait_until("the second primary rotation", || primary_rotations() == 2);
-    wait_until("phase 3 durable on the primary", || primary_durable(5_000));
+    assert!(
+        wait_until(|| primary_rotations() == 2),
+        "timed out waiting for the second primary rotation"
+    );
+    assert!(
+        wait_until(|| primary_durable(5_000)),
+        "timed out waiting for phase 3 durable on the primary"
+    );
 
     primary_shutdown.store(true, Ordering::Relaxed);
     let primary_journal_result = t_p_journal.join().unwrap();
@@ -2820,9 +2841,18 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
             == 2
             && r_fsync.load().journal_seq.get() >= 5_000
     };
-    wait_until(
-        "the replica to adopt both rotations and sync the tail",
-        replica_caught_up,
+    // A failed adoption backs the replica off for as long as this wait
+    // lasts, so the message says what the replica had reached — and a
+    // failure's cause is in the captured log.
+    assert!(
+        wait_until(replica_caught_up),
+        "timed out waiting for the replica to adopt both rotations and sync the tail: \
+         adoptions fast={} sync={} failed={}, synced through seq {} (need two adoptions \
+         and seq 5000)",
+        r_util.rotations_fast_path.load(Ordering::Relaxed),
+        r_util.rotations_sync_fallback.load(Ordering::Relaxed),
+        r_util.rotations_failed.load(Ordering::Relaxed),
+        r_fsync.load().journal_seq.get(),
     );
     replica_shutdown.store(true, Ordering::Relaxed);
     let replica_journal_result = t_r_journal.join().unwrap();
