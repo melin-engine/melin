@@ -228,7 +228,7 @@ impl SegmentPreparer {
     /// first adoption regardless of configuration mismatch.
     ///
     /// `pin_core`: core to pin the worker to, `0` = unpinned (the
-    /// worker floats on the default mask at `SCHED_OTHER`). Pinning
+    /// worker runs on the process's home CPU mask at `SCHED_OTHER`). Pinning
     /// keeps staging I/O bursts off the IRQ core and the pipeline
     /// cores deterministically — same convention as the shadow and
     /// event-publisher threads.
