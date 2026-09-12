@@ -84,9 +84,9 @@ impl ValidationWorker {
         let (jobs_tx, jobs_rx) = channel::<ValidationJob>();
 
         // Hand the worker its scheduling context before it exists — see
-        // the module docs. `0` is the "do not pin" sentinel: this thread
+        // the module docs. `0` is the unpinned sentinel: this thread
         // sleeps between retries and does blocking file I/O, so it wants
-        // the whole machine to float on, not a reserved core.
+        // the process's home CPU mask, not a reserved core.
         let saved = melin_app::affinity::take_context();
         if let Err(ref e) = saved {
             tracing::warn!(worker = %name, error = %e, "cannot snapshot scheduling context");
