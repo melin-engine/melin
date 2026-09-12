@@ -536,10 +536,34 @@ pub fn run<A: Application>(
                 replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
             }
 
-            // One lookup, not two: the entry decides whether the connection is
-            // still known, and the same borrow stamps its heartbeat clock once
-            // the frame is queued.
-            let Some(conn_state) = connections.get_mut(&slot.connection_id) else {
+            // One lookup, not two: the entry decides whether the
+            // connection is still known, and the same borrow stamps its
+            // heartbeat clock once the frame is queued. A miss is a
+            // connection that went away — or one whose `Connected`
+            // landed after this iteration's drain: the poll thread
+            // queues that event before it parses a request, so by the
+            // time a reply exists the event is in the channel. Drain
+            // once more and look again; only a miss pays for it.
+            let conn_state = match connections.get_mut(&slot.connection_id) {
+                Some(conn_state) => Some(conn_state),
+                None => {
+                    process_control_events(
+                        &control_rx,
+                        &mut connections,
+                        &active_connections,
+                        batch_now,
+                    );
+                    connections.get_mut(&slot.connection_id)
+                }
+            };
+            let Some(conn_state) = conn_state else {
+                // Still unknown after the retry: the connection is gone.
+                // Logged so a lost reply leaves a trace.
+                tracing::debug!(
+                    connection_id = slot.connection_id,
+                    wire_seq = slot.wire_seq,
+                    "reply dropped: connection not registered"
+                );
                 continue;
             };
 

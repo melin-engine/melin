@@ -1574,6 +1574,8 @@ where
                     encoder,
                     fence_state: response_fence,
                     active_connections: active_connections_response,
+                    #[cfg(test)]
+                    pause_after_control_drain: None,
                 },
                 &s3,
             );
