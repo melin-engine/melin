@@ -768,11 +768,17 @@ mod tests {
     #[test]
     fn connect_by_gives_up_at_the_deadline() {
         let key = client_key();
-        // A port that was free a moment ago and has no listener now.
-        let addr = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
+        // A port bound but never listened on refuses every connect, and
+        // stays this test's for as long as `refusing` lives. A port
+        // merely freed could be taken by another test process before
+        // the connect, and the handshake timeout, not the refusal, would
+        // then be what the client reports.
+        let refusing =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        refusing
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
             .unwrap();
+        let addr = refusing.local_addr().unwrap().as_socket().unwrap();
         let started = Instant::now();
         let err = Connection::connect_by(addr, &key, Instant::now() + Duration::from_millis(400))
             .unwrap_err();
