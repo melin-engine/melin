@@ -1574,6 +1574,8 @@ where
                     encoder,
                     fence_state: response_fence,
                     active_connections: active_connections_response,
+                    #[cfg(test)]
+                    pause_after_control_drain: None,
                 },
                 &s3,
             );
@@ -2114,9 +2116,13 @@ where
             debug!(connection_id = connection_id.0, error = %e, "failed to set write timeout");
         }
 
-        // Register the writer with the response thread before the reader.
-        // This ensures the response stage has the writer before any
-        // requests arrive from this connection.
+        // Register the writer with the response thread before the
+        // reader, and keep it that way: the response stage reads its
+        // output ring before it drains this channel, and relies on
+        // `Connected` being queued before any request of the connection
+        // can be read — see the drain in `response::run`. Queued, not
+        // yet applied: the stage picks the event up on its next
+        // iteration, which that order makes early enough.
         let fd = std_write.as_raw_fd();
         let boxed_writer: Box<dyn std::io::Write + Send> = Box::new(std_write);
         let control_event = ControlEvent::Connected {

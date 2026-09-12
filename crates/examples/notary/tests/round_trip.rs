@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use melin_client::{Connection, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::ack_policy::AckPolicy;
+use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::tcp::BlockingTcpListener;
@@ -159,8 +160,25 @@ fn start_server_in(dir: &Path) -> Server {
     start_server_with(dir, |_| {})
 }
 
+/// Send the nodes' logs to stderr, which the harness only shows for a
+/// failing test: what a node did is then in the report. Every test that
+/// starts a node calls this first.
+fn capture_node_logs() {
+    // Deliberately ignored: only the first test in the process installs
+    // the subscriber, the rest reuse it.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 /// [`start_server_in`], with `configure` applied to the config first.
 fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> Server {
+    capture_node_logs();
+
     let auth_path = dir.join("authorized_keys");
     std::fs::write(
         &auth_path,
@@ -181,10 +199,11 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         standalone: true,
         ack_policy: AckPolicy::Disk,
         no_mlock: true,
-        // Test servers share the machine with the rest of the suite; a
-        // busy-spinning pipeline per node starves the clients (and the
-        // other nodes) of CPU time under full-suite load.
-        cores: ServerConfig::default().cores.all_yielding(),
+        // Unpinned, and therefore yielding: the suite runs many nodes at
+        // once, and the default layout would stack every node's same-role
+        // thread on one core while a spinner would starve whatever shares
+        // its core, the test's own client included.
+        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
@@ -901,6 +920,7 @@ fn admin_until_ok(addr: SocketAddr, key: &SigningKey, command: &str) {
 /// the head, and the replica never took a clock reading of its own.
 #[test]
 fn a_promoted_replica_reports_the_head_the_primary_receipted() {
+    capture_node_logs();
     let tmp = tempfile::tempdir().expect("tempdir");
 
     // Three roles: the trader submits, the replica authenticates its
@@ -932,8 +952,9 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
         authorized_keys: auth_path.clone(),
         ack_policy: AckPolicy::DiskAndRam,
         no_mlock: true,
-        // Two nodes share this machine with the test itself.
-        cores: ServerConfig::default().cores.all_yielding(),
+        // Two nodes share this machine with the test itself; unpinned and
+        // yielding, for the reason the round-trip harness gives.
+        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,

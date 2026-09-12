@@ -208,6 +208,18 @@ pub struct Response<A: Application> {
     /// exactly once, whichever side (reader disconnect or a drop
     /// decision here) initiated it.
     pub active_connections: Arc<AtomicU64>,
+    /// Test seam: called once per iteration right after the control
+    /// channel has been drained, so a test can hold the stage there and
+    /// choose what lands while it waits. The drain runs after the
+    /// output ring is read, and the seam guards that order: were the
+    /// drain moved back in front of the read, the seam would sit
+    /// between the two, and a `Connected` landing there would be
+    /// missed by the read that follows — which `registration_race`
+    /// checks. `None` runs the stage as production does; the field
+    /// itself is compiled out of non-test builds, so the loop pays
+    /// nothing.
+    #[cfg(test)]
+    pub pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
 }
 
 /// Per-connection state for batched io_uring sends.
@@ -269,6 +281,8 @@ pub fn run<A: Application>(
         encoder,
         fence_state,
         active_connections,
+        #[cfg(test)]
+        mut pause_after_control_drain,
     } = config;
     // Resolve the starting policy from the shared atomic and derive the
     // local Policy. The atomic is the single source of truth across the
@@ -594,7 +608,36 @@ pub fn run<A: Application>(
             return;
         }
 
-        // Poll control channel (non-blocking) for connect/disconnect.
+        // Borrow output slots from the matching stage in place.
+        //
+        // `read_contiguous` rather than `consume_batch`: the latter
+        // memcpy'd every ready slot into a stack array before the first
+        // one was touched, and `OutputSlot` embeds the application's
+        // largest query response (~330 B for the exchange), so the head
+        // slot of a deep batch paid for the whole copy before it could
+        // be encoded. Borrowing costs nothing and the loop below reads
+        // each slot exactly once anyway.
+        //
+        // The progress counter now moves *after* the batch instead of
+        // before it (`consume_batch` committed up front), so the
+        // matching stage cannot reclaim these slots until the loop —
+        // durability gate waits included — is done with them. That is
+        // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
+        // the same rate either way.
+        let slots = consumer.read_contiguous(MAX_BATCH);
+
+        // Poll the control channel (non-blocking) for connect and
+        // disconnect — after the ring is read, never before. A reply
+        // always trails its connection's `Connected`: the accept loop
+        // queues that event before it registers the socket with the
+        // reader, so no request can be read, let alone answered, until
+        // the event is in the channel. Every slot in `slots` was
+        // published before the read above, so its `Connected` was queued
+        // before that, and this drain sees it. Drained first, the stage
+        // could read the ring after a `Connected` it had not seen and
+        // drop the reply — which it did, now and then, on a fresh node
+        // under load. `registration_race` in the tests holds the stage
+        // right after this drain to pin the order.
         while let Ok(event) = control_rx.try_recv() {
             match event {
                 ControlEvent::Connected {
@@ -650,23 +693,13 @@ pub fn run<A: Application>(
             }
         }
 
-        // Borrow output slots from the matching stage in place.
-        //
-        // `read_contiguous` rather than `consume_batch`: the latter
-        // memcpy'd every ready slot into a stack array before the first
-        // one was touched, and `OutputSlot` embeds the application's
-        // largest query response (~330 B for the exchange), so the head
-        // slot of a deep batch paid for the whole copy before it could
-        // be encoded. Borrowing costs nothing and the loop below reads
-        // each slot exactly once anyway.
-        //
-        // The progress counter now moves *after* the batch instead of
-        // before it (`consume_batch` committed up front), so the
-        // matching stage cannot reclaim these slots until the loop —
-        // durability gate waits included — is done with them. That is
-        // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
-        // the same rate either way.
-        let slots = consumer.read_contiguous(MAX_BATCH);
+        // Test seam: hold the stage right after the drain — see
+        // `Response::pause_after_control_drain`.
+        #[cfg(test)]
+        if let Some(pause) = pause_after_control_drain.as_mut() {
+            pause();
+        }
+
         if slots.is_empty() {
             // SPSC is empty — flush all dirty connections via io_uring.
             // This is the response-data egress path; heartbeat flushes
@@ -1155,6 +1188,20 @@ pub fn run<A: Application>(
                 }
 
                 flush.on_append(entry.send_buf.len());
+            } else if slot.connection_id != 0 {
+                // A reply for a connection this stage does not hold: it
+                // was dropped earlier in this batch, or went away before
+                // its reply was encoded. The drain above runs after the
+                // ring is read, so a connection that is merely new is
+                // never a miss. Logged so a lost reply leaves a trace.
+                // Connection 0 is a server-originated event — a seed, a
+                // tick — whose reports have no client to go to, and is
+                // skipped without a word.
+                debug!(
+                    connection_id = slot.connection_id,
+                    wire_seq = slot.wire_seq,
+                    "reply dropped: connection not registered"
+                );
             }
 
             // Consumed-path flush — the still-open half of July-audit
@@ -3711,6 +3758,137 @@ mod tests {
                 "peer observes EOF even though another dup is still open"
             );
             drop(reader_dup);
+        }
+    }
+
+    /// The stage learns of a connection from its control channel and of
+    /// that connection's replies from the output ring. A reply always
+    /// trails its `Connected`, so reading the ring before draining the
+    /// channel is enough for every slot read to find its connection.
+    /// Drained first, the stage could read the ring after a `Connected`
+    /// it had not seen — the accept loop queues that event only after
+    /// the client holds `ServerReady`, so a first request is often on
+    /// the wire before the stage has heard of its connection — and drop
+    /// the reply. Seen as a first reply lost on a fresh node under
+    /// full-suite load. The seam sits right
+    /// after the drain: with the drain after the read that is harmless,
+    /// with the drain before it the seam is the gap, and a `Connected`
+    /// landing there is missed by the read that follows. Holding the
+    /// stage at the seam makes the interleaving the test's rather than
+    /// the scheduler's.
+    mod registration_race {
+        use std::io::{Read, Write};
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+        use std::time::Duration;
+
+        use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_pipeline::wait::WaitStrategy;
+        use melin_transport_core::fence::FenceState;
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+        use melin_wire_protocol::blocking::BlockingFrameWriter;
+
+        use crate::ControlEvent;
+        use crate::ack_policy::AckPolicy;
+        use crate::response::{Response, run};
+
+        /// `CounterReport::Ack` on the wire: len(4) + tag(1) + value(8).
+        const FRAME_LEN: usize = 13;
+        /// Long enough that a genuine loss is distinguishable from
+        /// scheduler noise on a loaded box, short enough to fail in
+        /// bounded time.
+        const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+        #[test]
+        fn a_reply_that_lands_with_its_connection_is_delivered() {
+            let (mut producer, mut consumers) =
+                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                    .add_consumer()
+                    .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+
+            let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
+            let server_fd = server_sock.as_raw_fd();
+            let writer = BlockingFrameWriter::new(Box::new(server_sock) as Box<dyn Write + Send>);
+            client_sock
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .expect("set read timeout");
+
+            // The stage reports reaching the gap on `parked` and waits on
+            // `resume` — once, on its first iteration.
+            let (parked_tx, parked_rx) = mpsc::channel::<()>();
+            let (resume_tx, resume_rx) = mpsc::channel::<()>();
+            let mut held = false;
+            let pause = move || {
+                if !held {
+                    held = true;
+                    parked_tx.send(()).expect("the test is waiting");
+                    resume_rx.recv().expect("the test resumes the stage");
+                }
+            };
+
+            let (control_tx, control_rx) = mpsc::channel();
+            let shutdown = AtomicBool::new(false);
+            let config = Response::<Counter> {
+                // The journal is already past the one event, so the gate
+                // is open and delivery hinges on registration alone.
+                journal_persisted_wire_seq: DurableWireSeqCursor::detached(WireSeq::new(1)),
+                ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
+                replication_metrics: None,
+                replica_active: None,
+                heartbeat_interval: None,
+                wait: WaitStrategy::SpinThenYield,
+                utilization: Arc::new(StageUtilization::default()),
+                encoder: Arc::new(ResponseEncoder),
+                fence_state: Arc::new(FenceState::new(0)),
+                active_connections: Arc::new(AtomicU64::new(0)),
+                pause_after_control_drain: Some(Box::new(pause)),
+            };
+
+            thread::scope(|scope| {
+                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
+
+                // The stage has drained an empty control channel and is
+                // held at the seam. Now both arrive: read after drain,
+                // the next iteration finds the slot and then its
+                // connection; drain after read, the read would find the
+                // slot and the connection would still be in the channel.
+                parked_rx.recv().expect("the stage reaches the seam");
+                control_tx
+                    .send(ControlEvent::Connected {
+                        connection_id: 1,
+                        fd: server_fd,
+                        writer,
+                    })
+                    .expect("stage is running");
+                producer.publish(OutputSlot {
+                    connection_id: 1,
+                    wire_seq: 1,
+                    payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
+                    // No trailing `BatchEnd`: one frame on the wire.
+                    is_last_in_request: false,
+                    ..Default::default()
+                });
+                resume_tx.send(()).expect("the stage is parked");
+
+                let mut frame = [0u8; FRAME_LEN];
+                let delivered = client_sock.read_exact(&mut frame);
+                shutdown.store(true, Ordering::Relaxed);
+                stage.join().expect("stage panicked");
+                delivered.expect(
+                    "the reply was dropped: the control channel was drained before the ring was read",
+                );
+                assert_eq!(
+                    u64::from_le_bytes(frame[5..].try_into().expect("8 bytes")),
+                    7,
+                    "the ack carries the counter's value"
+                );
+            });
         }
     }
 }

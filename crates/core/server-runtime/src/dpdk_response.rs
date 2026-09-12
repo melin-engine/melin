@@ -285,7 +285,18 @@ pub fn run<A: Application>(
             return;
         }
 
-        // Poll control channel for connect/disconnect.
+        // Borrow output slots from the matching stage in place — see
+        // `response::run` for why this is a borrow and not a copy, and
+        // for the consequence of publishing progress after the batch
+        // instead of before it.
+        let slots = consumer.read_contiguous(MAX_BATCH);
+
+        // Poll control channel for connect/disconnect — after the ring
+        // is read, never before: the poll thread queues `Connected` on
+        // authentication and parses that connection's requests only
+        // afterwards, so every slot read above has its `Connected`
+        // already queued, and this drain sees it. See `response::run`
+        // for the reply this order protects.
         // Counter accounting: the response stage is the sole owner of
         // active_connections decrements. The poll thread increments on
         // auth success and sends ControlEvent::Disconnected on close.
@@ -296,11 +307,6 @@ pub fn run<A: Application>(
             last_heartbeat_scan,
         );
 
-        // Borrow output slots from the matching stage in place — see
-        // `response::run` for why this is a borrow and not a copy, and
-        // for the consequence of publishing progress after the batch
-        // instead of before it.
-        let slots = consumer.read_contiguous(MAX_BATCH);
         if slots.is_empty() {
             idle_count += 1;
             if idle_count.is_multiple_of(1024) {
@@ -536,10 +542,24 @@ pub fn run<A: Application>(
                 replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
             }
 
-            // One lookup, not two: the entry decides whether the connection is
-            // still known, and the same borrow stamps its heartbeat clock once
-            // the frame is queued.
+            // One lookup, not two: the entry decides whether the
+            // connection is still known, and the same borrow stamps its
+            // heartbeat clock once the frame is queued.
             let Some(conn_state) = connections.get_mut(&slot.connection_id) else {
+                // A reply for a connection this stage does not hold: it
+                // is gone. The drain runs after the ring is read, so a
+                // connection that is merely new is never a miss. Logged
+                // so a lost reply leaves a trace. Connection 0 is a
+                // server-originated event — a seed, a tick — whose
+                // reports have no client to go to, and is skipped
+                // without a word.
+                if slot.connection_id != 0 {
+                    tracing::debug!(
+                        connection_id = slot.connection_id,
+                        wire_seq = slot.wire_seq,
+                        "reply dropped: connection not registered"
+                    );
+                }
                 continue;
             };
 
