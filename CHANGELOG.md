@@ -185,6 +185,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `affinity::capture_home_mask` records the set and belongs at the top of
   `main`, before anything pins a thread or initialises DPDK (the server
   runtime's entry points call it).
+- **A node could drop a client's first reply.** The response stage learns
+  of a new connection and of that connection's replies through two
+  separate channels, and read them in the wrong order: a reply that
+  arrived while the connection's registration was still queued was
+  discarded, and the client waited out its read timeout while the node's
+  heartbeats kept the socket alive. It took the stage's thread being
+  descheduled across a narrow gap, so it showed on a fresh node under a
+  loaded host — a shared or non-isolated response core — as an
+  occasional lost first request, on both the kernel TCP and the DPDK
+  transports. The stage now reads its replies before it applies
+  registrations, which makes the order safe by construction, and a reply
+  that still finds no connection is logged at debug level.
 
 ## [0.15.0] - 2026-08-27
 
