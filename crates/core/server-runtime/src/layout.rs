@@ -237,13 +237,13 @@ impl PipelineCores {
         }
     }
 
-    /// Hand the journal stage the placements of the two threads it spawns
-    /// itself: the segment preparer and the disk thread. The sequencing
-    /// thread's own placement is applied where that thread is spawned,
-    /// like every other stage's; these two are the stage's children, so
-    /// their placement has to reach it before it runs. One function so
-    /// the primary, the DPDK primary and the replica cannot drift apart
-    /// on which fields they forward.
+    /// Hand the journal stage the placements of the two helper threads its
+    /// `start` launches: the segment preparer and the disk thread.
+    /// journal-seq's own placement is applied where that thread is
+    /// spawned, like every other stage's; the helpers are launched by the
+    /// stage, so their placement has to reach it before `start`. One
+    /// function so the primary, the DPDK primary and the replica cannot
+    /// drift apart on which fields they forward.
     pub fn place_journal_children<E: AppEvent>(&self, stage: &mut JournalStage<E>) {
         stage.set_preparer_core(self.journal_prep.core);
         stage.set_disk_core(self.journal_disk.core);
