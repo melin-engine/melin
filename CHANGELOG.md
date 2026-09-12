@@ -108,6 +108,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   bare name did not say which one it was. Stage-level labels (utilization
   and latency statistics) still say `journal`. Source-breaking for direct
   users of the runtime: `PipelineCores::journal` is `journal_seq`.
+- **`journal-disk` and `journal-prep` are started by the thread that
+  starts `journal-seq`, instead of by `journal-seq` itself.** A thread
+  inherits its creator's placement, and on a host with isolated cores
+  `journal-seq` busy-spins on one at real-time priority: an unpinned
+  helper it started could stay on that core and barely run. Started
+  beside the other pipeline threads, an unpinned helper now runs on the
+  non-isolated cores like every other unpinned thread. Source-breaking
+  for direct users of the runtime: `JournalStage::run` is replaced by
+  `JournalStage::start`, called on the thread that spawns the sequencing
+  thread, and `Sequencer::run`, called on the sequencing thread;
+  `JournalStage::run_sync` is gone.
 - **A `--cores` layout that puts two threads on one core no longer starts
   the node.** Previously such threads busy-spun against each other; the
   optional threads were even documented as able to share an auxiliary

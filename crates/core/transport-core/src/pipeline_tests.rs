@@ -151,7 +151,11 @@ fn journal_stage_allocates_primary_sequences() {
     producer.publish(add_slot(7, 1_000_000_000));
     producer.publish(add_slot(11, 1_000_000_001));
 
-    let handle = std::thread::spawn(move || stage.run(&shutdown2));
+    // Started here and run on another thread, the way the server does it:
+    // the helper threads belong to whoever spawns the sequencing thread,
+    // and the started sequencer has to cross over to it.
+    let sequencer = stage.start().unwrap();
+    let handle = std::thread::spawn(move || sequencer.run(&shutdown2));
 
     std::thread::sleep(Duration::from_millis(50));
     shutdown.store(true, Ordering::Relaxed);
@@ -3956,4 +3960,46 @@ fn a_wide_event_app_survives_a_full_batch_with_a_replica_attached() {
     // Every event reached the journal — the batch was bounded, not
     // truncated.
     assert_eq!(writer.next_sequence(), total + 1);
+}
+
+/// A started sequencer can exist without ever running — the thread meant
+/// to run it may fail to spawn — so dropping the disk thread's handle has
+/// to stop and join the thread, not leak it with the live segment open.
+#[test]
+fn dropping_the_disk_thread_handle_stops_and_joins_the_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let segment =
+        melin_journal::SegmentFile::create_continuing(&dir.path().join("j.journal"), 1, [0u8; 32])
+            .unwrap();
+    let control = Arc::new(crate::journal_disk::DiskControl::new());
+    let exited = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let (control, exited) = (Arc::clone(&control), Arc::clone(&exited));
+        std::thread::spawn(move || {
+            while !control.stop_requested() {
+                std::thread::yield_now();
+            }
+            // Linger past the stop request, so a handle that only asks the
+            // thread to stop returns before this lands and fails the test.
+            std::thread::sleep(Duration::from_millis(50));
+            exited.store(true, Ordering::Release);
+            segment
+        })
+    };
+    let handle = crate::pipeline::DiskThread::new(control, thread);
+
+    // Dropped on a helper thread with a deadline, so a handle that joins
+    // without asking the thread to stop fails the test instead of hanging.
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(handle);
+        dropped_tx.send(()).expect("the test is still waiting");
+    });
+    dropped_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("dropping the handle must stop the thread, not wait on it forever");
+    assert!(
+        exited.load(Ordering::Acquire),
+        "dropping the handle must join the thread, not just ask it to stop"
+    );
 }

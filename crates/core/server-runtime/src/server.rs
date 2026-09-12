@@ -1484,11 +1484,17 @@ where
     // up to 100ms and races with the listener teardown.
     let s1 = Arc::clone(&shutdown);
     let shutdown_for_journal = Arc::clone(&shutdown);
+    // Start the journal's disk and preparer threads here rather than on
+    // journal-seq, which is pinned by the time it runs: a thread inherits
+    // its creator's placement. See `JournalStage::start`.
+    let sequencer = journal_stage
+        .start()
+        .map_err(|e| format!("start the journal stage: {e}"))?;
     let journal_handle = std::thread::Builder::new()
         .name("journal-seq".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("journal-seq", cores.journal_seq.core);
-            let result = journal_stage.run(&s1);
+            let result = sequencer.run(&s1);
             let was_shutdown = shutdown_for_journal.load(Ordering::Relaxed);
             match &result {
                 Ok(_) if was_shutdown => info!("journal-seq thread exited cleanly on shutdown"),
@@ -2710,11 +2716,16 @@ where
     let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
 
     let s1 = Arc::clone(&shutdown);
+    // As on kernel TCP: start the journal's helper threads here, not on
+    // journal-seq. See `JournalStage::start`.
+    let sequencer = journal_stage
+        .start()
+        .map_err(|e| format!("start the journal stage: {e}"))?;
     let journal_handle = std::thread::Builder::new()
         .name("journal-seq".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("journal-seq", cores.journal_seq.core);
-            journal_stage.run(&s1)
+            sequencer.run(&s1)
         })
         .map_err(|e| format!("spawn journal-seq thread: {e}"))?;
 

@@ -408,7 +408,7 @@ The practical consequence: while the device is slow, the sequencer keeps orderin
 
 Absorption is bounded by the hand-off ring (64 batches). Past that the sequencer stalls at its next batch, the input ring fills, and producers backpressure — the same chain as before, with a deeper buffer in front of it. Watch `melin_journal_disk_lag_batches`.
 
-Give the disk thread a core on the same CCD as `journal-seq`: the two exchange a cache line per batch, and a cross-CCD transfer adds roughly 100 ns to each. On a box that cannot spare the core, set `journal-disk=0` — the thread then runs at default scheduling and yields when idle, like every unpinned thread; it still makes progress, but it competes with everything else on the core it lands on. That is for boxes without isolated cores: on a host that has them, give it a core (see [CPU core pinning](#cpu-core-pinning)).
+Give the disk thread a core on the same CCD as `journal-seq`: the two exchange a cache line per batch, and a cross-CCD transfer adds roughly 100 ns to each. On a box that cannot spare the core, set `journal-disk=0` — the thread then runs at default scheduling and yields when idle, like every unpinned thread; it still makes progress, but it competes with everything else on the core it lands on. On a host with isolated cores, that is one of the non-isolated cores, shared with the kernel and interrupt handling (see [CPU core pinning](#cpu-core-pinning)).
 
 ### CPU core pinning
 
@@ -418,8 +418,6 @@ A thread given `0` in `--cores` is not pinned, and where it runs depends on the 
 
 - **Without isolated cores**, the scheduler places it on any core and moves it as load changes, including onto cores other threads are pinned to. Pinned threads have no real-time priority on such a host, so the two share that core by timeslice.
 - **With isolated cores** (`isolcpus`), it runs only on the cores outside the isolated set — core 0 and any other core not listed — alongside the kernel, interrupt handling and every other unpinned thread. The scheduler never moves work onto an isolated core, even an idle one: a spare isolated core stays idle rather than absorbing unpinned threads.
-
-`journal-disk` and `journal-prep` are the exception on a host with isolated cores. `journal-seq` starts both, and a thread started from an isolated core can stay on that core — beside `journal-seq`, which busy-spins there at real-time priority and leaves it almost no time to run. On such a host, give both of them a core.
 
 In **kernel TCP mode**, the reader thread is pinned to the core `--cores` gives `reader` (default 4). io_uring with multishot RECV multiplexes every client connection on this single thread.
 
