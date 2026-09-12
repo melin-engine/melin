@@ -120,10 +120,6 @@ fn durable_response_is_released_before_blocking_on_a_later_gate() {
                 writer,
             })
             .expect("stage is running");
-        // The stage polls the control channel before consuming output
-        // slots, but only once per iteration — publishing before it has
-        // registered the connection would drop the slot on an unknown id.
-        thread::sleep(SETTLE);
 
         // Event A enters the ring and the stage blocks on its gate.
         producer.publish(ack_slot(1, 111));

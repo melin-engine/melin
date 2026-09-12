@@ -208,11 +208,16 @@ pub struct Response<A: Application> {
     /// exactly once, whichever side (reader disconnect or a drop
     /// decision here) initiated it.
     pub active_connections: Arc<AtomicU64>,
-    /// Test seam: called once per iteration after the control channel
-    /// has been drained and before the output ring is read, so a test
-    /// can hold the stage in that gap and choose what lands in it.
-    /// `None` runs the stage as production does; the field itself is
-    /// compiled out of non-test builds, so the loop pays nothing.
+    /// Test seam: called once per iteration right after the control
+    /// channel has been drained, so a test can hold the stage there and
+    /// choose what lands while it waits. The drain runs after the
+    /// output ring is read, and the seam guards that order: were the
+    /// drain moved back in front of the read, the seam would sit
+    /// between the two, and a `Connected` landing there would be
+    /// missed by the read that follows — which `registration_race`
+    /// checks. `None` runs the stage as production does; the field
+    /// itself is compiled out of non-test builds, so the loop pays
+    /// nothing.
     #[cfg(test)]
     pub pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
 }
@@ -603,24 +608,6 @@ pub fn run<A: Application>(
             return;
         }
 
-        // Poll control channel (non-blocking) for connect/disconnect.
-        drain_control(
-            &control_rx,
-            &mut connections,
-            &mut dirty_connections,
-            &active_connections,
-            &server_busy_wire_frame,
-            #[cfg(feature = "latency-trace")]
-            &mut pending_e2e,
-        );
-
-        // Test seam: hold the stage between the drain and the read — see
-        // `Response::pause_after_control_drain`.
-        #[cfg(test)]
-        if let Some(pause) = pause_after_control_drain.as_mut() {
-            pause();
-        }
-
         // Borrow output slots from the matching stage in place.
         //
         // `read_contiguous` rather than `consume_batch`: the latter
@@ -638,6 +625,81 @@ pub fn run<A: Application>(
         // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
         // the same rate either way.
         let slots = consumer.read_contiguous(MAX_BATCH);
+
+        // Poll the control channel (non-blocking) for connect and
+        // disconnect — after the ring is read, never before. A reply
+        // always trails its connection's `Connected`: the accept loop
+        // queues that event before it registers the socket with the
+        // reader, so no request can be read, let alone answered, until
+        // the event is in the channel. Every slot in `slots` was
+        // published before the read above, so its `Connected` was queued
+        // before that, and this drain sees it. Drained first, the stage
+        // could read the ring after a `Connected` it had not seen and
+        // drop the reply — which it did, about one node start in fifty
+        // under full-suite load. `registration_race` in the tests holds
+        // the stage right after this drain to pin the order.
+        while let Ok(event) = control_rx.try_recv() {
+            match event {
+                ControlEvent::Connected {
+                    connection_id,
+                    fd,
+                    writer,
+                } => {
+                    // The writer keeps the fd alive — store it as the owner.
+                    let owner: Box<dyn Send> = Box::new(writer);
+                    connections.insert(
+                        connection_id,
+                        ConnectionEntry {
+                            fd,
+                            _owner: owner,
+                            send_buf: Vec::with_capacity(4096),
+                            last_send: Instant::now(),
+                            blocked_since: None,
+                            last_send_attempt: Instant::now(),
+                            dirty: false,
+                        },
+                    );
+                }
+                ControlEvent::Disconnected { connection_id } => {
+                    // Reader-initiated teardown: the reader already
+                    // closed its half. Decrement only if the entry was
+                    // actually present — a response-initiated drop
+                    // already removed it (and paid the decrement), and
+                    // this event is its echo.
+                    if connections.remove(&connection_id).is_some() {
+                        active_connections.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    unmark_dirty(connection_id, &mut dirty_connections);
+                    // Anything this connection had buffered goes with
+                    // it, so its queued samples measure bytes that will
+                    // never be sent.
+                    #[cfg(feature = "latency-trace")]
+                    discard_e2e_samples(&mut pending_e2e, &[connection_id]);
+                }
+                ControlEvent::PipelineBusy { connection_id } => {
+                    if let Some(entry) = connections.get_mut(&connection_id) {
+                        // Overflow discipline: a busy notice to a peer
+                        // already at its buffer cap is not worth more
+                        // memory — skip it; the cap (or the blocked
+                        // timeout) is about to drop the connection
+                        // anyway. Missing entry likewise: best-effort.
+                        if entry.send_buf.len() + server_busy_wire_frame.len() <= MAX_SEND_BUF {
+                            entry.send_buf.extend_from_slice(&server_busy_wire_frame);
+                            entry.last_send = Instant::now();
+                            mark_dirty(entry, connection_id, &mut dirty_connections);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Test seam: hold the stage right after the drain — see
+        // `Response::pause_after_control_drain`.
+        #[cfg(test)]
+        if let Some(pause) = pause_after_control_drain.as_mut() {
+            pause();
+        }
+
         if slots.is_empty() {
             // SPSC is empty — flush all dirty connections via io_uring.
             // This is the response-data egress path; heartbeat flushes
@@ -1065,28 +1127,7 @@ pub fn run<A: Application>(
             // payloads go through the encoder; transport-shaped
             // frames (EngineError, BatchEnd) are encoded by the
             // runtime directly.
-            // A miss is a connection dropped earlier in this batch — or
-            // one whose `Connected` landed after this iteration's drain.
-            // The accept loop queues that event before the reader can
-            // read a request, so by the time a reply exists the event is
-            // in the channel: drain once more and look again. Only a
-            // miss pays for the retry; a hit is the one lookup it was.
-            let entry = match connections.get_mut(&slot.connection_id) {
-                Some(entry) => Some(entry),
-                None => {
-                    drain_control(
-                        &control_rx,
-                        &mut connections,
-                        &mut dirty_connections,
-                        &active_connections,
-                        &server_busy_wire_frame,
-                        #[cfg(feature = "latency-trace")]
-                        &mut pending_e2e,
-                    );
-                    connections.get_mut(&slot.connection_id)
-                }
-            };
-            if let Some(entry) = entry {
+            if let Some(entry) = connections.get_mut(&slot.connection_id) {
                 // Frame 1: application payload (if any). BatchEnd
                 // payloads carry no body — the terminator below
                 // handles them via `is_last_in_request`.
@@ -1148,10 +1189,11 @@ pub fn run<A: Application>(
 
                 flush.on_append(entry.send_buf.len());
             } else {
-                // Still unknown after the retry: the connection was
-                // dropped earlier in this batch, or went away before its
-                // reply was encoded. Logged so a lost reply leaves a
-                // trace.
+                // A reply for a connection this stage does not hold: it
+                // was dropped earlier in this batch, or went away before
+                // its reply was encoded. The drain above runs after the
+                // ring is read, so a connection that is merely new is
+                // never a miss. Logged so a lost reply leaves a trace.
                 debug!(
                     connection_id = slot.connection_id,
                     wire_seq = slot.wire_seq,
@@ -1402,73 +1444,6 @@ fn mark_dirty(entry: &mut ConnectionEntry, connection_id: u64, dirty: &mut Vec<u
 /// Take a connection off the dirty list — teardown paths only. `retain`
 /// rather than a swap-remove scan because the ordering is cheap to keep
 /// and this runs once per dropped connection, never per frame.
-/// Apply every queued control event: a connection that arrived, one that
-/// left, or one owed a busy notice. Runs once per iteration before the
-/// output ring is read, and again from the slot loop when a reply names
-/// a connection the stage does not hold — see the miss path there.
-fn drain_control(
-    control_rx: &mpsc::Receiver<ControlEvent>,
-    connections: &mut FxHashMap<u64, ConnectionEntry>,
-    dirty_connections: &mut Vec<u64>,
-    active_connections: &AtomicU64,
-    server_busy_wire_frame: &[u8],
-    #[cfg(feature = "latency-trace")] pending_e2e: &mut Vec<(u64, trace::MonoTraceInstant)>,
-) {
-    while let Ok(event) = control_rx.try_recv() {
-        match event {
-            ControlEvent::Connected {
-                connection_id,
-                fd,
-                writer,
-            } => {
-                // The writer keeps the fd alive — store it as the owner.
-                let owner: Box<dyn Send> = Box::new(writer);
-                connections.insert(
-                    connection_id,
-                    ConnectionEntry {
-                        fd,
-                        _owner: owner,
-                        send_buf: Vec::with_capacity(4096),
-                        last_send: Instant::now(),
-                        blocked_since: None,
-                        last_send_attempt: Instant::now(),
-                        dirty: false,
-                    },
-                );
-            }
-            ControlEvent::Disconnected { connection_id } => {
-                // Reader-initiated teardown: the reader already closed
-                // its half. Decrement only if the entry was actually
-                // present — a response-initiated drop already removed it
-                // (and paid the decrement), and this event is its echo.
-                if connections.remove(&connection_id).is_some() {
-                    active_connections.fetch_sub(1, Ordering::Relaxed);
-                }
-                unmark_dirty(connection_id, dirty_connections);
-                // Anything this connection had buffered goes with it, so
-                // its queued samples measure bytes that will never be
-                // sent.
-                #[cfg(feature = "latency-trace")]
-                discard_e2e_samples(pending_e2e, &[connection_id]);
-            }
-            ControlEvent::PipelineBusy { connection_id } => {
-                if let Some(entry) = connections.get_mut(&connection_id) {
-                    // Overflow discipline: a busy notice to a peer
-                    // already at its buffer cap is not worth more memory
-                    // — skip it; the cap (or the blocked timeout) is
-                    // about to drop the connection anyway. Missing entry
-                    // likewise: best-effort.
-                    if entry.send_buf.len() + server_busy_wire_frame.len() <= MAX_SEND_BUF {
-                        entry.send_buf.extend_from_slice(server_busy_wire_frame);
-                        entry.last_send = Instant::now();
-                        mark_dirty(entry, connection_id, dirty_connections);
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn unmark_dirty(connection_id: u64, dirty: &mut Vec<u64>) {
     dirty.retain(|&id| id != connection_id);
 }
@@ -3784,16 +3759,20 @@ mod tests {
     }
 
     /// The stage learns of a connection from its control channel and of
-    /// that connection's replies from the output ring, and reads the two
-    /// in that order once per iteration. Both can land between the drain
-    /// and the read: the accept loop queues `Connected` only after the
-    /// client holds `ServerReady`, so a first request is often on the
-    /// wire before the stage has heard of its connection, and if the
-    /// thread is off-CPU across that gap the reply arrives for a
-    /// connection the stage does not hold. Seen as a first reply lost on
-    /// a fresh node, roughly one node start in fifty under full-suite
-    /// load. The seam holds the stage in the gap, so the interleaving is
-    /// the test's rather than the scheduler's.
+    /// that connection's replies from the output ring. A reply always
+    /// trails its `Connected`, so reading the ring before draining the
+    /// channel is enough for every slot read to find its connection.
+    /// Drained first, the stage could read the ring after a `Connected`
+    /// it had not seen — the accept loop queues that event only after
+    /// the client holds `ServerReady`, so a first request is often on
+    /// the wire before the stage has heard of its connection — and drop
+    /// the reply. Seen as a first reply lost on a fresh node, roughly one
+    /// node start in fifty under full-suite load. The seam sits right
+    /// after the drain: with the drain after the read that is harmless,
+    /// with the drain before it the seam is the gap, and a `Connected`
+    /// landing there is missed by the read that follows. Holding the
+    /// stage at the seam makes the interleaving the test's rather than
+    /// the scheduler's.
     mod registration_race {
         use std::io::{Read, Write};
         use std::os::unix::io::AsRawFd;
@@ -3872,8 +3851,11 @@ mod tests {
                 let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
 
                 // The stage has drained an empty control channel and is
-                // held before it reads the ring. Now both arrive.
-                parked_rx.recv().expect("the stage reaches the gap");
+                // held at the seam. Now both arrive: read after drain,
+                // the next iteration finds the slot and then its
+                // connection; drain after read, the read would find the
+                // slot and the connection would still be in the channel.
+                parked_rx.recv().expect("the stage reaches the seam");
                 control_tx
                     .send(ControlEvent::Connected {
                         connection_id: 1,
@@ -3896,7 +3878,7 @@ mod tests {
                 shutdown.store(true, Ordering::Relaxed);
                 stage.join().expect("stage panicked");
                 delivered.expect(
-                    "the reply was dropped: the ring was read before the connection was registered",
+                    "the reply was dropped: the control channel was drained before the ring was read",
                 );
                 assert_eq!(
                     u64::from_le_bytes(frame[5..].try_into().expect("8 bytes")),
