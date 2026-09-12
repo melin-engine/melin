@@ -107,6 +107,18 @@ fn start_server_in(dir: &Path) -> Server {
 
 /// [`start_server_in`], with `configure` applied to the config first.
 fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> Server {
+    // Server logs go to stderr, which the harness only shows for a
+    // failing test: what the node did is then in the report.
+    // Deliberately ignored: only the first test in the process installs
+    // the subscriber, the rest reuse it.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+        )
+        .with_test_writer()
+        .try_init();
+
     let auth_path = dir.join("authorized_keys");
     std::fs::write(
         &auth_path,

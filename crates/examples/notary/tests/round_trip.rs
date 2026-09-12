@@ -161,7 +161,24 @@ fn start_server_in(dir: &Path) -> Server {
 }
 
 /// [`start_server_in`], with `configure` applied to the config first.
+/// Send the nodes' logs to stderr, which the harness only shows for a
+/// failing test: what a node did is then in the report. Every test that
+/// starts a node calls this first.
+fn capture_node_logs() {
+    // Deliberately ignored: only the first test in the process installs
+    // the subscriber, the rest reuse it.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> Server {
+    capture_node_logs();
+
     let auth_path = dir.join("authorized_keys");
     std::fs::write(
         &auth_path,
@@ -903,6 +920,7 @@ fn admin_until_ok(addr: SocketAddr, key: &SigningKey, command: &str) {
 /// the head, and the replica never took a clock reading of its own.
 #[test]
 fn a_promoted_replica_reports_the_head_the_primary_receipted() {
+    capture_node_logs();
     let tmp = tempfile::tempdir().expect("tempdir");
 
     // Three roles: the trader submits, the replica authenticates its
