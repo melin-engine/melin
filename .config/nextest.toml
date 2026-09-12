@@ -16,6 +16,16 @@
 # config error, so renaming or deleting one of these fails loudly
 # instead of silently emptying the group again. Adding a new
 # cluster-spawning test binary means adding it here.
+#
+# A test that hangs — a fake peer that never answers, a read with no
+# deadline — would otherwise hang the pre-commit hook, and CI with it.
+# The slowest tests in the suite finish in seconds even under full-suite
+# load, and the longest wait any test allows itself is well under the
+# period, so a test still running after two periods is stuck: nextest
+# kills it and reports it by name.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [[profile.default.overrides]]
 filter = 'binary(raft_failover) + binary(raft_smoke) + binary(empty_seed)'
 test-group = 'cluster-serial'
