@@ -46,7 +46,6 @@ const FRAME_LEN: usize = 4 + PAYLOAD_LEN;
 const SLOTS: u64 = 400;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-const SETTLE: Duration = Duration::from_millis(50);
 
 /// Response-stage-only stub: everything the matching stage would call
 /// is unreachable, because only `response::run` executes in this test.
@@ -195,7 +194,6 @@ fn large_frame_batch_is_delivered_not_disconnected() {
                 writer,
             })
             .expect("stage is running");
-        thread::sleep(SETTLE);
 
         // Fill the ring behind the shut gate: the stage spins on slot
         // 1's gate while the rest accumulate, so they arrive in as few

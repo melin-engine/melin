@@ -198,7 +198,6 @@ fn earlier_slot_in_a_batch_is_not_held_by_a_later_one() {
                 writer,
             })
             .expect("stage is running");
-        thread::sleep(SETTLE);
 
         // Hold the stage in a gate wait.
         producer.publish(ack_slot(1, 111));
@@ -268,7 +267,6 @@ fn open_gate_delivers_the_whole_batch_in_order() {
                 writer,
             })
             .expect("stage is running");
-        thread::sleep(SETTLE);
 
         for (seq, value) in [(1u64, 11u64), (2, 22), (3, 33)] {
             producer.publish(ack_slot(seq, value));
@@ -337,7 +335,6 @@ fn sustained_busy_stream_is_delivered_not_disconnected() {
                 writer,
             })
             .expect("stage is running");
-        thread::sleep(SETTLE);
 
         // Fill the ring behind the shut gate. The stage consumes the
         // first batch into its local array and spins on slot 1's gate;
