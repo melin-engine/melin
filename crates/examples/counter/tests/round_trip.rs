@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use melin_client::{Connection, SigningKey, key};
+use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
@@ -47,6 +48,18 @@ fn start_server() -> (
     SocketAddr,
     std::thread::JoinHandle<Result<(), String>>,
 ) {
+    // Server logs go to stderr, which the harness only shows for a
+    // failing test: what the node did is then in the report.
+    // Deliberately ignored: only the first test in the process installs
+    // the subscriber, the rest reuse it.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+        )
+        .with_test_writer()
+        .try_init();
+
     let key = SigningKey::from_bytes(&[0xAA; 32]);
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -71,6 +84,11 @@ fn start_server() -> (
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         no_mlock: true,
+        // Unpinned, and therefore yielding: the suite runs many nodes at
+        // once, and the default layout would stack every node's same-role
+        // thread on one core while a spinner would starve whatever shares
+        // its core, the test's own client included.
+        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,

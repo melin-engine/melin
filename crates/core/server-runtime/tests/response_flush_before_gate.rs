@@ -120,10 +120,6 @@ fn durable_response_is_released_before_blocking_on_a_later_gate() {
                 writer,
             })
             .expect("stage is running");
-        // The stage polls the control channel before consuming output
-        // slots, but only once per iteration — publishing before it has
-        // registered the connection would drop the slot on an unknown id.
-        thread::sleep(SETTLE);
 
         // Event A enters the ring and the stage blocks on its gate.
         producer.publish(ack_slot(1, 111));
@@ -202,7 +198,6 @@ fn earlier_slot_in_a_batch_is_not_held_by_a_later_one() {
                 writer,
             })
             .expect("stage is running");
-        thread::sleep(SETTLE);
 
         // Hold the stage in a gate wait.
         producer.publish(ack_slot(1, 111));
@@ -272,7 +267,6 @@ fn open_gate_delivers_the_whole_batch_in_order() {
                 writer,
             })
             .expect("stage is running");
-        thread::sleep(SETTLE);
 
         for (seq, value) in [(1u64, 11u64), (2, 22), (3, 33)] {
             producer.publish(ack_slot(seq, value));
@@ -341,7 +335,6 @@ fn sustained_busy_stream_is_delivered_not_disconnected() {
                 writer,
             })
             .expect("stage is running");
-        thread::sleep(SETTLE);
 
         // Fill the ring behind the shut gate. The stage consumes the
         // first batch into its local array and spins on slot 1's gate;

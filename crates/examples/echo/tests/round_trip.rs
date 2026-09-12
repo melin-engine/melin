@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use melin_client::{Connection, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::ack_policy::AckPolicy;
+use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
@@ -106,6 +107,18 @@ fn start_server_in(dir: &Path) -> Server {
 
 /// [`start_server_in`], with `configure` applied to the config first.
 fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> Server {
+    // Server logs go to stderr, which the harness only shows for a
+    // failing test: what the node did is then in the report.
+    // Deliberately ignored: only the first test in the process installs
+    // the subscriber, the rest reuse it.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+        )
+        .with_test_writer()
+        .try_init();
+
     let auth_path = dir.join("authorized_keys");
     std::fs::write(
         &auth_path,
@@ -127,10 +140,11 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         standalone: true,
         ack_policy: AckPolicy::Disk,
         no_mlock: true,
-        // Test servers share the machine with the rest of the suite; a
-        // busy-spinning pipeline per node starves the clients (and the
-        // other nodes) of CPU time under full-suite load.
-        cores: ServerConfig::default().cores.all_yielding(),
+        // Unpinned, and therefore yielding: the suite runs many nodes at
+        // once, and the default layout would stack every node's same-role
+        // thread on one core while a spinner would starve whatever shares
+        // its core, the test's own client included.
+        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,

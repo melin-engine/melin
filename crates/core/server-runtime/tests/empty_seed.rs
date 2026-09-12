@@ -14,6 +14,7 @@ use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
 use melin_app::encoder::ResponseEncoder;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::control_codec::TAG_CHALLENGE;
 use melin_wire_protocol::tcp::BlockingTcpListener;
@@ -141,6 +142,11 @@ fn server_starts_with_empty_seed_events() {
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         no_mlock: true,
+        // Unpinned, and therefore yielding: the suite runs many nodes at
+        // once, and the default layout would stack every node's same-role
+        // thread on one core while a spinner would starve whatever shares
+        // its core, the test's own client included.
+        cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
