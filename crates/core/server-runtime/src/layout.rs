@@ -250,10 +250,9 @@ impl PipelineCores {
         stage.set_disk_wait(self.journal_disk.wait);
     }
 
-    /// The same layout with every thread yielding: a `y` on every entry.
-    /// For code that keeps a layout's cores but must share them — an
-    /// embedded bench, say — without spelling the list out. Code that
-    /// only needs the node out of everyone's way wants
+    /// The same layout with every thread yielding: a `y` on every entry,
+    /// for code that keeps a layout's cores but must share them. Code
+    /// that only needs the node out of everyone's way wants
     /// [`unpinned`](Self::unpinned) instead, which spreads the threads
     /// rather than stacking them on the layout's cores. Not valid for a
     /// DPDK reader, which cannot yield; see [`resolve`](Self::resolve).

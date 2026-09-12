@@ -160,7 +160,6 @@ fn start_server_in(dir: &Path) -> Server {
     start_server_with(dir, |_| {})
 }
 
-/// [`start_server_in`], with `configure` applied to the config first.
 /// Send the nodes' logs to stderr, which the harness only shows for a
 /// failing test: what a node did is then in the report. Every test that
 /// starts a node calls this first.
@@ -176,6 +175,7 @@ fn capture_node_logs() {
         .try_init();
 }
 
+/// [`start_server_in`], with `configure` applied to the config first.
 fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> Server {
     capture_node_logs();
 

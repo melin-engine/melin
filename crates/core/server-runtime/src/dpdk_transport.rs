@@ -794,7 +794,11 @@ fn process_auth_frame(
     conn.key_hash = key_hash;
     conn.auth = AuthState::Authenticated { permission };
 
-    // Register with the response stage and ID map.
+    // Register with the response stage and ID map — before this thread
+    // parses a single request of the connection, and keep it that way:
+    // the response stage reads its output ring before it drains this
+    // channel, and relies on `Connected` being queued first. See the
+    // drain in `dpdk_response::run`.
     id_to_handle.insert(conn.connection_id.0, handle);
     let _ = control_tx.send(ControlEvent::Connected {
         connection_id: conn.connection_id.0,

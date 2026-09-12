@@ -635,9 +635,9 @@ pub fn run<A: Application>(
         // published before the read above, so its `Connected` was queued
         // before that, and this drain sees it. Drained first, the stage
         // could read the ring after a `Connected` it had not seen and
-        // drop the reply — which it did, about one node start in fifty
-        // under full-suite load. `registration_race` in the tests holds
-        // the stage right after this drain to pin the order.
+        // drop the reply — which it did, now and then, on a fresh node
+        // under load. `registration_race` in the tests holds the stage
+        // right after this drain to pin the order.
         while let Ok(event) = control_rx.try_recv() {
             match event {
                 ControlEvent::Connected {
@@ -1188,12 +1188,15 @@ pub fn run<A: Application>(
                 }
 
                 flush.on_append(entry.send_buf.len());
-            } else {
+            } else if slot.connection_id != 0 {
                 // A reply for a connection this stage does not hold: it
                 // was dropped earlier in this batch, or went away before
                 // its reply was encoded. The drain above runs after the
                 // ring is read, so a connection that is merely new is
                 // never a miss. Logged so a lost reply leaves a trace.
+                // Connection 0 is a server-originated event — a seed, a
+                // tick — whose reports have no client to go to, and is
+                // skipped without a word.
                 debug!(
                     connection_id = slot.connection_id,
                     wire_seq = slot.wire_seq,
@@ -3766,8 +3769,8 @@ mod tests {
     /// it had not seen — the accept loop queues that event only after
     /// the client holds `ServerReady`, so a first request is often on
     /// the wire before the stage has heard of its connection — and drop
-    /// the reply. Seen as a first reply lost on a fresh node, roughly one
-    /// node start in fifty under full-suite load. The seam sits right
+    /// the reply. Seen as a first reply lost on a fresh node under
+    /// full-suite load. The seam sits right
     /// after the drain: with the drain after the read that is harmless,
     /// with the drain before it the seam is the gap, and a `Connected`
     /// landing there is missed by the read that follows. Holding the

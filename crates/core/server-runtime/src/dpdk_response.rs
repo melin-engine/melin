@@ -549,12 +549,17 @@ pub fn run<A: Application>(
                 // A reply for a connection this stage does not hold: it
                 // is gone. The drain runs after the ring is read, so a
                 // connection that is merely new is never a miss. Logged
-                // so a lost reply leaves a trace.
-                tracing::debug!(
-                    connection_id = slot.connection_id,
-                    wire_seq = slot.wire_seq,
-                    "reply dropped: connection not registered"
-                );
+                // so a lost reply leaves a trace. Connection 0 is a
+                // server-originated event — a seed, a tick — whose
+                // reports have no client to go to, and is skipped
+                // without a word.
+                if slot.connection_id != 0 {
+                    tracing::debug!(
+                        connection_id = slot.connection_id,
+                        wire_seq = slot.wire_seq,
+                        "reply dropped: connection not registered"
+                    );
+                }
                 continue;
             };
 
