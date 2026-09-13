@@ -456,8 +456,11 @@ fn io_error(e: io::Error, timeout: Duration) -> Error {
 /// The node sends a challenge, the client answers with the nonce signed
 /// and its public key, and the node says it is ready or refuses the key.
 /// [`feed`](Self::feed) takes each of the node's frames in turn.
-pub struct Handshake<'k> {
-    key: &'k SigningKey,
+///
+/// Owns a copy of the key, so it can sit in the struct that owns the
+/// original across the two frames; the copy is dropped, and zeroed, as
+/// soon as it has signed, since the verdict needs only the public key.
+pub struct Handshake {
     /// Raw rather than a [`VerifyingKey`], as in [`Error::AuthFailed`]:
     /// it goes on the wire and into that error, and nothing verifies
     /// with it.
@@ -469,10 +472,32 @@ pub struct Handshake<'k> {
     response: [u8; 4 + CHALLENGE_RESPONSE_LEN],
 }
 
-/// Which of the node's frames [`Handshake`] is waiting for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl fmt::Debug for Handshake {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let awaiting = match self.state {
+            HandshakeState::Challenge { .. } => "challenge",
+            HandshakeState::Verdict => "verdict",
+            HandshakeState::Done => "nothing",
+        };
+        f.debug_struct("Handshake")
+            .field(
+                "public_key",
+                &base64::engine::general_purpose::STANDARD.encode(self.public_key),
+            )
+            .field("awaiting", &awaiting)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Which of the node's frames [`Handshake`] is waiting for, carrying
+/// what that step needs: the key lives in the state that signs, and
+/// leaving that state drops it.
+// The key is what makes the signing state wide; there is one handshake
+// per connection, never a table of them, and boxing the key would put
+// secret material on the heap for no size that matters.
+#[expect(clippy::large_enum_variant)]
 enum HandshakeState {
-    Challenge,
+    Challenge { key: SigningKey },
     Verdict,
     Done,
 }
@@ -487,15 +512,20 @@ pub enum Step<'a> {
     Ready,
 }
 
-impl<'k> Handshake<'k> {
-    /// A handshake that will prove `key`.
-    pub fn new(key: &'k SigningKey) -> Self {
+impl Handshake {
+    /// A handshake that will prove `key`, from a copy of it.
+    pub fn new(key: &SigningKey) -> Self {
         Handshake {
-            key,
             public_key: key.verifying_key().to_bytes(),
-            state: HandshakeState::Challenge,
+            state: HandshakeState::Challenge { key: key.clone() },
             response: [0u8; 4 + CHALLENGE_RESPONSE_LEN],
         }
+    }
+
+    /// Whether the node has said it is ready: there is nothing more to
+    /// feed, and the stream is the caller's.
+    pub fn is_done(&self) -> bool {
+        matches!(self.state, HandshakeState::Done)
     }
 
     /// One frame from the node, its payload after the length prefix.
@@ -504,8 +534,8 @@ impl<'k> Handshake<'k> {
     /// or [`Error::AuthFailed`]. Anything else, in either place, is
     /// [`Error::Protocol`], as is a frame after the handshake is done.
     pub fn feed(&mut self, payload: &[u8]) -> Result<Step<'_>, Error> {
-        match self.state {
-            HandshakeState::Challenge => {
+        match &self.state {
+            HandshakeState::Challenge { key } => {
                 // `[tag][nonce: 32]`
                 let nonce: [u8; 32] = match payload {
                     [TAG_CHALLENGE, nonce @ ..] if nonce.len() == 32 => {
@@ -520,7 +550,7 @@ impl<'k> Handshake<'k> {
                     }
                 };
                 let response = ChallengeResponse {
-                    signature: self.key.sign(&nonce).to_bytes(),
+                    signature: key.sign(&nonce).to_bytes(),
                     public_key: self.public_key,
                 };
                 self.response[..4].copy_from_slice(&(CHALLENGE_RESPONSE_LEN as u32).to_le_bytes());
@@ -1145,6 +1175,14 @@ mod tests {
         let key = client_key();
         let nonce = [0x5A; 32];
         let mut handshake = Handshake::new(&key);
+        assert!(!handshake.is_done());
+        // Debug says which key and where it stands, never the secret.
+        let shown = format!("{handshake:?}");
+        assert!(
+            shown.contains(&key::public_key_base64(&key.verifying_key())),
+            "{shown}"
+        );
+        assert!(shown.contains("challenge"), "{shown}");
 
         let Step::Send(frame) = handshake
             .feed(&payload(TransportResponse::Challenge { nonce }))
@@ -1173,10 +1211,39 @@ mod tests {
             Step::Ready
         );
         // Done is done: a heartbeat that follows is the caller's.
+        assert!(handshake.is_done());
         assert!(matches!(
             handshake.feed(&payload(TransportResponse::Heartbeat)),
             Err(Error::Protocol(_))
         ));
+        assert!(handshake.is_done());
+    }
+
+    #[test]
+    fn handshake_outlives_the_key_it_was_given() {
+        // The shape a session wants: the key it owns goes away, or moves,
+        // while the handshake it started waits for the node's next frame.
+        let allowed = client_key().verifying_key();
+        let mut handshake = {
+            let key = client_key();
+            Handshake::new(&key)
+        };
+        let Step::Send(frame) = handshake
+            .feed(&payload(TransportResponse::Challenge { nonce: [7; 32] }))
+            .unwrap()
+        else {
+            panic!("a challenge wants an answer");
+        };
+        let (_, response) = decode_challenge_response(&frame[4..]).unwrap();
+        allowed
+            .verify(&[7; 32], &Signature::from_bytes(&response.signature))
+            .unwrap();
+        assert_eq!(
+            handshake
+                .feed(&payload(TransportResponse::ServerReady))
+                .unwrap(),
+            Step::Ready
+        );
     }
 
     #[test]
