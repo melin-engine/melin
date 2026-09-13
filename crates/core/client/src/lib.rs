@@ -26,7 +26,8 @@
 //! generator wants, with no allocation and no staging copy per frame in
 //! either direction. A program that owns its socket — a Unix socket, or
 //! a descriptor its own I/O loop takes over — runs the handshake alone
-//! with [`authenticate`].
+//! with [`authenticate`]; one that reads its own frames drives a
+//! [`Handshake`], which does no I/O at all.
 //!
 //! ## Silence
 //!
@@ -445,13 +446,118 @@ fn io_error(e: io::Error, timeout: Duration) -> Error {
 // The handshake on its own
 // ---------------------------------------------------------------------------
 
+/// The client's half of the handshake with no I/O in it: feed it the
+/// node's frames, send what it hands back. For a program whose frames
+/// arrive through an I/O loop of its own — a gateway session, a load
+/// generator on a user-space TCP stack — so it need not carry the
+/// handshake's layout; [`authenticate`] drives it over a blocking
+/// stream, and [`Connection::connect`] goes through that.
+///
+/// The node sends a challenge, the client answers with the nonce signed
+/// and its public key, and the node says it is ready or refuses the key.
+/// [`feed`](Self::feed) takes each of the node's frames in turn.
+pub struct Handshake<'k> {
+    key: &'k SigningKey,
+    /// Raw rather than a [`VerifyingKey`], as in [`Error::AuthFailed`]:
+    /// it goes on the wire and into that error, and nothing verifies
+    /// with it.
+    public_key: [u8; 32],
+    state: HandshakeState,
+    /// The challenge response with its length prefix, once the nonce is
+    /// known: held here so [`Step::Send`] can borrow it, and a caller
+    /// writes it as one piece.
+    response: [u8; 4 + CHALLENGE_RESPONSE_LEN],
+}
+
+/// Which of the node's frames [`Handshake`] is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeState {
+    Challenge,
+    Verdict,
+    Done,
+}
+
+/// What a [`Handshake`] wants done after a frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Step<'a> {
+    /// Send these bytes to the node as they are, length prefix included,
+    /// then feed the node's next frame.
+    Send(&'a [u8]),
+    /// The node accepted the key: the stream is the caller's from here.
+    Ready,
+}
+
+impl<'k> Handshake<'k> {
+    /// A handshake that will prove `key`.
+    pub fn new(key: &'k SigningKey) -> Self {
+        Handshake {
+            key,
+            public_key: key.verifying_key().to_bytes(),
+            state: HandshakeState::Challenge,
+            response: [0u8; 4 + CHALLENGE_RESPONSE_LEN],
+        }
+    }
+
+    /// One frame from the node, its payload after the length prefix.
+    /// The first must be the challenge and the answer is
+    /// [`Step::Send`]; the second is the node's verdict, [`Step::Ready`]
+    /// or [`Error::AuthFailed`]. Anything else, in either place, is
+    /// [`Error::Protocol`], as is a frame after the handshake is done.
+    pub fn feed(&mut self, payload: &[u8]) -> Result<Step<'_>, Error> {
+        match self.state {
+            HandshakeState::Challenge => {
+                // `[tag][nonce: 32]`
+                let nonce: [u8; 32] = match payload {
+                    [TAG_CHALLENGE, nonce @ ..] if nonce.len() == 32 => {
+                        nonce.try_into().expect("length checked")
+                    }
+                    other => {
+                        return Err(Error::Protocol(format!(
+                            "expected an auth challenge, got a {}-byte frame with tag {:?}",
+                            other.len(),
+                            other.first()
+                        )));
+                    }
+                };
+                let response = ChallengeResponse {
+                    signature: self.key.sign(&nonce).to_bytes(),
+                    public_key: self.public_key,
+                };
+                self.response[..4].copy_from_slice(&(CHALLENGE_RESPONSE_LEN as u32).to_le_bytes());
+                // The handshake is not a request, so it carries sequence 0.
+                encode_challenge_response(0, &response, &mut self.response[4..]).map_err(|e| {
+                    Error::Protocol(format!("cannot encode the challenge response: {e}"))
+                })?;
+                self.state = HandshakeState::Verdict;
+                Ok(Step::Send(&self.response))
+            }
+            HandshakeState::Verdict => match payload.first() {
+                Some(&TAG_SERVER_READY) => {
+                    self.state = HandshakeState::Done;
+                    Ok(Step::Ready)
+                }
+                Some(&TAG_AUTH_FAILED) => Err(Error::AuthFailed {
+                    public_key: self.public_key,
+                }),
+                other => Err(Error::Protocol(format!(
+                    "expected the node to be ready or to refuse the key, got tag {other:?}"
+                ))),
+            },
+            HandshakeState::Done => Err(Error::Protocol(
+                "a frame fed to a handshake that is complete".to_string(),
+            )),
+        }
+    }
+}
+
 /// Answer a node's challenge on a bare stream: read the nonce, sign it,
 /// send the signature with the public key, and wait for the node to say
 /// it is ready. [`Connection::connect`] does this on the socket it
 /// dials; the function is for a program that owns its own — a load
 /// generator whose I/O loop takes the descriptor over once the
 /// handshake is done, a client on a Unix socket — so it need not carry
-/// a copy of the handshake.
+/// a copy of the handshake. A program that reads its frames itself
+/// drives a [`Handshake`] directly, as this function does.
 ///
 /// The reads are unbuffered: nothing past the node's answer is taken
 /// from the stream, so whatever arrives next (a heartbeat, say) is
@@ -463,42 +569,18 @@ pub fn authenticate(stream: &mut (impl Read + Write), key: &SigningKey) -> Resul
     // The node's two frames are a tag and a 32-byte nonce, then a tag: a
     // frame that does not fit here is not a handshake.
     let mut buf = [0u8; 64];
-
-    // `[tag][nonce: 32]`
-    let nonce: [u8; 32] = match read_unbuffered_frame(stream, &mut buf)? {
-        [TAG_CHALLENGE, nonce @ ..] if nonce.len() == 32 => {
-            nonce.try_into().expect("length checked")
+    let mut handshake = Handshake::new(key);
+    loop {
+        let payload = read_unbuffered_frame(stream, &mut buf)?;
+        match handshake.feed(payload)? {
+            Step::Send(frame) => {
+                // There is no write buffer in front of a bare stream, so
+                // the frame goes out as one write.
+                stream.write_all(frame)?;
+                stream.flush()?;
+            }
+            Step::Ready => return Ok(()),
         }
-        other => {
-            return Err(Error::Protocol(format!(
-                "expected an auth challenge, got a {}-byte frame with tag {:?}",
-                other.len(),
-                other.first()
-            )));
-        }
-    };
-
-    let public_key = key.verifying_key().to_bytes();
-    let response = ChallengeResponse {
-        signature: key.sign(&nonce).to_bytes(),
-        public_key,
-    };
-    // There is no write buffer in front of a bare stream, so the length
-    // prefix and the frame go out together, as one write.
-    let mut frame = [0u8; 4 + CHALLENGE_RESPONSE_LEN];
-    frame[..4].copy_from_slice(&(CHALLENGE_RESPONSE_LEN as u32).to_le_bytes());
-    // The handshake is not a request, so it carries sequence 0.
-    encode_challenge_response(0, &response, &mut frame[4..])
-        .map_err(|e| Error::Protocol(format!("cannot encode the challenge response: {e}")))?;
-    stream.write_all(&frame)?;
-    stream.flush()?;
-
-    match read_unbuffered_frame(stream, &mut buf)?.first() {
-        Some(&TAG_SERVER_READY) => Ok(()),
-        Some(&TAG_AUTH_FAILED) => Err(Error::AuthFailed { public_key }),
-        other => Err(Error::Protocol(format!(
-            "expected the node to be ready or to refuse the key, got tag {other:?}"
-        ))),
     }
 }
 
@@ -1048,6 +1130,98 @@ mod tests {
         let mut stream = bare_stream(addr);
         assert!(matches!(
             authenticate(&mut stream, &key),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    /// A node's control frame as a `Handshake` is fed it: the payload
+    /// after the length prefix.
+    fn payload(response: TransportResponse) -> Vec<u8> {
+        control(response)[4..].to_vec()
+    }
+
+    #[test]
+    fn handshake_answers_the_challenge_and_finishes() {
+        let key = client_key();
+        let nonce = [0x5A; 32];
+        let mut handshake = Handshake::new(&key);
+
+        let Step::Send(frame) = handshake
+            .feed(&payload(TransportResponse::Challenge { nonce }))
+            .unwrap()
+        else {
+            panic!("a challenge wants an answer");
+        };
+        // Prefixed, and the frame a node decodes: sequence 0, the nonce
+        // signed by the key, the key.
+        assert_eq!(frame.len(), 4 + CHALLENGE_RESPONSE_LEN);
+        assert_eq!(
+            u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize,
+            CHALLENGE_RESPONSE_LEN
+        );
+        let (seq, response) = decode_challenge_response(&frame[4..]).unwrap();
+        assert_eq!(seq, 0, "the handshake carries sequence 0");
+        assert_eq!(response.public_key, key.verifying_key().to_bytes());
+        key.verifying_key()
+            .verify(&nonce, &Signature::from_bytes(&response.signature))
+            .unwrap();
+
+        assert_eq!(
+            handshake
+                .feed(&payload(TransportResponse::ServerReady))
+                .unwrap(),
+            Step::Ready
+        );
+        // Done is done: a heartbeat that follows is the caller's.
+        assert!(matches!(
+            handshake.feed(&payload(TransportResponse::Heartbeat)),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn handshake_reports_a_refused_key() {
+        let key = client_key();
+        let mut handshake = Handshake::new(&key);
+        handshake
+            .feed(&payload(TransportResponse::Challenge { nonce: [0; 32] }))
+            .unwrap();
+        assert!(matches!(
+            handshake.feed(&payload(TransportResponse::AuthFailed)),
+            Err(Error::AuthFailed { public_key }) if public_key == key.verifying_key().to_bytes()
+        ));
+    }
+
+    #[test]
+    fn handshake_refuses_a_frame_out_of_place() {
+        let key = client_key();
+
+        // Anything but a challenge first: a verdict, a heartbeat, a
+        // challenge with a short nonce, nothing.
+        for wrong in [
+            payload(TransportResponse::ServerReady),
+            payload(TransportResponse::Heartbeat),
+            vec![TAG_CHALLENGE; 32],
+            Vec::new(),
+        ] {
+            let mut handshake = Handshake::new(&key);
+            assert!(
+                matches!(handshake.feed(&wrong), Err(Error::Protocol(_))),
+                "{wrong:?}"
+            );
+        }
+
+        // Anything but a verdict second.
+        let mut handshake = Handshake::new(&key);
+        handshake
+            .feed(&payload(TransportResponse::Challenge { nonce: [0; 32] }))
+            .unwrap();
+        assert!(matches!(
+            handshake.feed(&payload(TransportResponse::Heartbeat)),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            handshake.feed(&payload(TransportResponse::Challenge { nonce: [1; 32] })),
             Err(Error::Protocol(_))
         ));
     }

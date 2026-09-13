@@ -41,8 +41,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   is its own codec and nothing else. The handshake is also a function of its
   own over any `Read + Write` stream, with unbuffered reads, for a program
   that owns its socket: a Unix socket, or a descriptor its own I/O loop
-  takes over once the node is ready. Every example client and test harness
-  now uses the crate instead of a private copy of the framing and handshake.
+  takes over once the node is ready. Under that is a state machine with no
+  I/O in it, fed the node's frames and handing back what to send, for a
+  program whose frames arrive through an I/O loop of its own: a gateway
+  session, a load generator on a user-space TCP stack. Every example client
+  and test harness now uses the crate instead of a private copy of the
+  framing and handshake.
   Apache-2.0, like the examples: it is the code a customer links into their
   own client binaries.
 - `melin-wire-protocol`: `encode_challenge_response` and
