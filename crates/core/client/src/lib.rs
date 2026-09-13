@@ -27,7 +27,8 @@
 //! either direction. A program that owns its socket — a Unix socket, or
 //! a descriptor its own I/O loop takes over — runs the handshake alone
 //! with [`authenticate`]; one that reads its own frames drives a
-//! [`Handshake`], which does no I/O at all.
+//! [`Handshake`] and tells each reply apart with [`classify`], neither
+//! of which does any I/O.
 //!
 //! ## Silence
 //!
@@ -189,11 +190,71 @@ pub enum Frame<'a> {
     EngineError,
 }
 
+/// One frame from the node as [`classify`] sees it: a [`Frame`], or the
+/// heartbeat that [`Connection::next_frame`] skips. A type of its own
+/// rather than a variant of `Frame`, so that `next_frame`'s promise —
+/// heartbeats never surface — is in its type, and no caller of it
+/// matches an arm that cannot come.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reply<'a> {
+    /// As [`Frame::Response`]: the response's bytes, tag first, borrowed
+    /// from the payload.
+    Response(&'a [u8]),
+    /// The node is alive and has nothing to say. Not an answer: a caller
+    /// waiting on a reply keeps its own deadline, as `next_frame` does.
+    Heartbeat,
+    /// As [`Frame::BatchEnd`].
+    BatchEnd,
+    /// As [`Frame::ServerBusy`].
+    ServerBusy,
+    /// As [`Frame::EngineError`].
+    EngineError,
+}
+
+/// One frame's payload from the node, told apart without I/O: the
+/// decision [`Connection::next_frame`] makes on each frame it reads, for
+/// a program that reads its own — a gateway session on `io_uring`, a
+/// load generator on a user-space TCP stack — so it need not know the
+/// protocol's tags.
+///
+/// Application tags start at `0x10`; the range below is the protocol's.
+/// A tag from it that is not one of the four a reply may carry — the
+/// handshake's tags, which are over before any reply, and reserved
+/// headroom — is [`Error::Protocol`]. So is an empty frame, and `0x00`
+/// with it: a zeroed buffer on the wire is a loud error, not an
+/// application response.
+pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
+    match payload.first() {
+        None => Err(Error::Protocol("empty frame".into())),
+        Some(&TAG_RESPONSE_HEARTBEAT) => Ok(Reply::Heartbeat),
+        Some(&TAG_BATCH_END) => Ok(Reply::BatchEnd),
+        Some(&TAG_SERVER_BUSY) => Ok(Reply::ServerBusy),
+        Some(&TAG_ENGINE_ERROR) => Ok(Reply::EngineError),
+        Some(tag @ 0x00..=0x0F) => Err(Error::Protocol(format!(
+            "reserved tag {tag:#04x} in a response frame (application tags start at 0x10)"
+        ))),
+        Some(_) => Ok(Reply::Response(payload)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
 
 /// An authenticated connection to a node.
+///
+/// Every read is bounded by the read timeout; there is no unbounded
+/// read. A node drops a request it refuses without a word (see the
+/// crate docs), so a read with no deadline could wait forever on a reply
+/// that is never coming. The timeout bounds a wait for a reply, nothing
+/// else: a connection that sends nothing reads nothing, and is not timed
+/// out by this crate.
+///
+/// The node has a timeout of its own: it closes a connection that has
+/// sent it nothing for longer than its configured connection timeout,
+/// and its heartbeats to the client do not count. A client kept for
+/// longer than that sends something within the window, or finds
+/// [`Error::Disconnected`] on its next request.
 ///
 /// After any error the connection's framing can no longer be trusted
 /// (a timeout may have cut a frame in half); drop it and connect again.
@@ -289,6 +350,14 @@ impl Connection {
     }
 
     /// Change how long a read waits before reporting [`Error::NoReply`].
+    ///
+    /// For a request the node may legitimately hold past
+    /// [`DEFAULT_TIMEOUT`] — one waiting on the node's durability policy,
+    /// say — raise the timeout rather than work around it. When it does
+    /// fire the connection is to be dropped, and the request's sequence
+    /// (see [`send`](Self::send)) is what lets an application that checks
+    /// it take the same request again, on a new connection, without
+    /// applying it twice.
     pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), Error> {
         self.stream.set_read_timeout(Some(timeout))?;
         self.read_timeout = timeout;
@@ -339,13 +408,12 @@ impl Connection {
         // the deadline is only checked when a frame arrives.
         let deadline = Instant::now() + self.read_timeout;
         loop {
-            // Decide on the tag alone, then borrow the frame back for the
-            // one arm that returns it: a borrow that lives across the
-            // loop and is conditionally returned is what the borrow
-            // checker cannot follow.
-            match self.raw_frame()?.first().copied() {
-                None => return Err(Error::Protocol("empty frame".into())),
-                Some(TAG_RESPONSE_HEARTBEAT) => {
+            // Decide on the classification alone, then borrow the frame
+            // back for the one arm that returns it: a borrow that lives
+            // across the loop and is conditionally returned is what the
+            // borrow checker cannot follow.
+            match classify(self.raw_frame()?)? {
+                Reply::Heartbeat => {
                     if Instant::now() >= deadline {
                         return Err(Error::NoReply {
                             timeout: self.read_timeout,
@@ -353,21 +421,10 @@ impl Connection {
                     }
                     continue;
                 }
-                Some(TAG_BATCH_END) => return Ok(Frame::BatchEnd),
-                Some(TAG_SERVER_BUSY) => return Ok(Frame::ServerBusy),
-                Some(TAG_ENGINE_ERROR) => return Ok(Frame::EngineError),
-                // The rest of the low range is the protocol's: the
-                // handshake tags (over by now) and reserved headroom.
-                // `0x00` is reserved with them so a zeroed frame is a
-                // loud error, not an application response — application
-                // tags start at `0x10`.
-                Some(tag @ 0x00..=0x0F) => {
-                    return Err(Error::Protocol(format!(
-                        "reserved tag {tag:#04x} in a response frame (application \
-                         tags start at 0x10)"
-                    )));
-                }
-                Some(_) => return Ok(Frame::Response(self.reader.frame())),
+                Reply::BatchEnd => return Ok(Frame::BatchEnd),
+                Reply::ServerBusy => return Ok(Frame::ServerBusy),
+                Reply::EngineError => return Ok(Frame::EngineError),
+                Reply::Response(_) => return Ok(Frame::Response(self.reader.frame())),
             }
         }
     }
@@ -1306,6 +1363,53 @@ mod tests {
             handshake.feed(&payload(TransportResponse::Challenge { nonce: [1; 32] })),
             Err(Error::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn classify_tells_each_reply_apart() {
+        assert_eq!(
+            classify(&payload(TransportResponse::Heartbeat)).unwrap(),
+            Reply::Heartbeat
+        );
+        assert_eq!(
+            classify(&payload(TransportResponse::BatchEnd)).unwrap(),
+            Reply::BatchEnd
+        );
+        assert_eq!(
+            classify(&payload(TransportResponse::ServerBusy)).unwrap(),
+            Reply::ServerBusy
+        );
+        assert_eq!(
+            classify(&payload(TransportResponse::EngineError)).unwrap(),
+            Reply::EngineError
+        );
+
+        // A response is handed back whole, tag first, from the first
+        // application tag to the last.
+        let response = [&[TAG_REPLY][..], b"body"].concat();
+        assert_eq!(classify(&response).unwrap(), Reply::Response(&response));
+        for tag in [0x10, 0xFF] {
+            assert_eq!(classify(&[tag]).unwrap(), Reply::Response(&[tag]));
+        }
+    }
+
+    #[test]
+    fn classify_refuses_what_a_reply_never_carries() {
+        // Nothing, a zeroed frame, the handshake's frames, and the rest
+        // of the protocol's range.
+        assert!(matches!(classify(&[]), Err(Error::Protocol(_))));
+        for wrong in [
+            vec![0x00],
+            [&[0x00][..], b"looks zeroed"].concat(),
+            payload(TransportResponse::Challenge { nonce: [0x5A; 32] }),
+            payload(TransportResponse::AuthFailed),
+            payload(TransportResponse::ServerReady),
+            vec![0x0F],
+        ] {
+            let err = classify(&wrong).unwrap_err();
+            assert!(matches!(err, Error::Protocol(_)), "{wrong:?}: {err}");
+            assert!(err.to_string().contains("reserved tag"), "{wrong:?}: {err}");
+        }
     }
 
     #[test]
