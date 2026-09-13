@@ -68,6 +68,9 @@ pub mod key;
 // The key types a caller needs to hold, so that depending on this crate
 // is enough to authenticate.
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
+// The bound on a frame, so a caller can size its widest request: the
+// body of a request is this less the 8-byte sequence and the tag.
+pub use melin_wire_protocol::blocking::MAX_FRAME_SIZE;
 
 /// Read and connect timeout used by [`Connection::connect`] and
 /// [`Connection::connect_by`]. Generous for a round trip anywhere on a
@@ -103,6 +106,9 @@ pub enum Error {
     Disconnected,
     /// The node sent something the protocol does not allow here.
     Protocol(String),
+    /// The request, sequence and tag included, would not fit in one
+    /// frame of [`MAX_FRAME_SIZE`] bytes; nothing was sent.
+    RequestTooLarge { len: usize },
     /// The node is shedding load; retry later, on a new connection.
     ServerBusy,
     /// The node's application failed on the request; do not retry.
@@ -135,6 +141,10 @@ impl fmt::Display for Error {
             ),
             Error::Disconnected => f.write_str("the node closed the connection"),
             Error::Protocol(what) => write!(f, "protocol violation: {what}"),
+            Error::RequestTooLarge { len } => write!(
+                f,
+                "request too large: {len} bytes with its header, the frame limit is {MAX_FRAME_SIZE}"
+            ),
             Error::ServerBusy => f.write_str("the node is busy: retry later on a new connection"),
             Error::EngineError => f.write_str("the node reported an engine error; do not retry"),
         }
@@ -302,10 +312,16 @@ impl Connection {
     /// per connection, which is what a counter gives.
     ///
     /// The body is copied once in user space, into the writer's buffer;
-    /// there is no staging buffer in between.
+    /// there is no staging buffer in between. A body that would take the
+    /// frame over [`MAX_FRAME_SIZE`] is [`Error::RequestTooLarge`], and
+    /// nothing is written: the node would drop the connection on it.
     pub fn send(&mut self, request_seq: u64, tag: u8, body: &[u8]) -> Result<(), Error> {
-        self.writer
-            .write_frame_parts(&[&request_seq.to_le_bytes(), &[tag], body])?;
+        let seq = request_seq.to_le_bytes();
+        let len = seq.len() + 1 + body.len();
+        if len > MAX_FRAME_SIZE {
+            return Err(Error::RequestTooLarge { len });
+        }
+        self.writer.write_frame_parts(&[&seq, &[tag], body])?;
         self.writer.flush()?;
         Ok(())
     }
@@ -439,9 +455,10 @@ fn io_error(e: io::Error, timeout: Duration) -> Error {
 ///
 /// The reads are unbuffered: nothing past the node's answer is taken
 /// from the stream, so whatever arrives next (a heartbeat, say) is
-/// there for the caller's own reader. A read that times out under the
-/// stream's own timeout comes back as [`Error::Io`]; the stream is not
-/// this function's to configure.
+/// there for the caller's own reader. The stream is not this function's
+/// to configure: without a read timeout of the caller's own (a socket's
+/// `set_read_timeout`) a peer that never answers hangs the handshake,
+/// and a read that times out under one comes back as [`Error::Io`].
 pub fn authenticate(stream: &mut (impl Read + Write), key: &SigningKey) -> Result<(), Error> {
     // The node's two frames are a tag and a 32-byte nonce, then a tag: a
     // frame that does not fit here is not a handshake.
@@ -773,6 +790,31 @@ mod tests {
         let err = Connection::connect_timeout(addr, &key, timeout).unwrap_err();
         assert!(started.elapsed() >= timeout);
         assert!(matches!(err, Error::NoReply { timeout: t } if t == timeout));
+    }
+
+    #[test]
+    fn an_oversized_request_is_refused_and_the_connection_kept() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::Echo);
+        let mut node = Connection::connect(addr, &key).unwrap();
+
+        // One byte over the widest body a frame takes once the sequence
+        // and the tag are counted.
+        let body = vec![0xAB; MAX_FRAME_SIZE - 8];
+        let err = node.send(1, TAG_REQUEST, &body).unwrap_err();
+        assert!(matches!(err, Error::RequestTooLarge { len } if len == MAX_FRAME_SIZE + 1));
+        assert!(err.to_string().contains("request too large"), "{err}");
+
+        // Nothing reached the node, so the connection is as good as new,
+        // and the widest body that fits goes through it.
+        assert_eq!(
+            node.request_one(2, TAG_REQUEST, b"still here").unwrap(),
+            [&[TAG_REPLY][..], b"still here"].concat()
+        );
+        assert_eq!(
+            node.request_one(3, TAG_REQUEST, &body[1..]).unwrap(),
+            [&[TAG_REPLY][..], &body[1..]].concat()
+        );
     }
 
     #[test]

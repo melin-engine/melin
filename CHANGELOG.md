@@ -49,7 +49,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `CHALLENGE_RESPONSE_LEN` beside the decoder, so the handshake frame has one
   home; `BlockingFrameReader::frame` returns the last frame read;
   `BlockingFrameWriter::write_frame_parts` writes a frame held in pieces
-  without a staging copy, which is how the client sends a request.
+  without a staging copy, which is how the client sends a request; the
+  writer refuses a frame over the 1 KiB cap before any of it is written,
+  and the cap is public (`MAX_FRAME_SIZE`, also re-exported by
+  `melin-client`, whose `send` reports a request over it as
+  `RequestTooLarge` without sending it).
 - **A wait policy per pipeline thread, in `--cores`.** Each thread's core
   takes a suffix: `matching=7` (or `matching=7s`) busy-spins and needs
   core 7 to itself, `matching=7y` spins briefly then yields and may share
