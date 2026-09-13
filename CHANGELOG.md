@@ -44,7 +44,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   takes over once the node is ready. Under that is a state machine with no
   I/O in it, fed the node's frames and handing back what to send, for a
   program whose frames arrive through an I/O loop of its own: a gateway
-  session, a load generator on a user-space TCP stack. Every example client
+  session, a load generator on a user-space TCP stack. The same program
+  tells a node's frames apart with `classify`, the decision `next_frame`
+  makes on each frame it reads — response, heartbeat, batch end, busy,
+  engine error, or a protocol error for an empty frame or a reserved tag —
+  as a function of the payload alone. Every example client
   and test harness now uses the crate instead of a private copy of the
   framing and handshake.
   Apache-2.0, like the examples: it is the code a customer links into their
