@@ -215,12 +215,14 @@ pub enum Reply<'a> {
 /// decision [`Connection::next_frame`] makes on each frame it reads, for
 /// a program that reads its own — a gateway session on `io_uring`, a
 /// load generator on a user-space TCP stack — so it need not know the
-/// protocol's tags. Application tags start at `0x10`; the range below
-/// is the protocol's, and a tag from it that is not one of the four a
-/// reply may carry — the handshake's tags, which are over before any
-/// reply, and reserved headroom — is [`Error::Protocol`]. So is an
-/// empty frame, and `0x00` with it: a zeroed buffer on the wire is a
-/// loud error, not an application response.
+/// protocol's tags.
+///
+/// Application tags start at `0x10`; the range below is the protocol's.
+/// A tag from it that is not one of the four a reply may carry — the
+/// handshake's tags, which are over before any reply, and reserved
+/// headroom — is [`Error::Protocol`]. So is an empty frame, and `0x00`
+/// with it: a zeroed buffer on the wire is a loud error, not an
+/// application response.
 pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
     match payload.first() {
         None => Err(Error::Protocol("empty frame".into())),
@@ -244,9 +246,15 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
 /// Every read is bounded by the read timeout; there is no unbounded
 /// read. A node drops a request it refuses without a word (see the
 /// crate docs), so a read with no deadline could wait forever on a reply
-/// that is never coming. The timeout bounds a wait for a reply, not the
-/// connection: one that sends nothing reads nothing, and stays open,
-/// idle, for as long as the caller keeps it.
+/// that is never coming. The timeout bounds a wait for a reply, nothing
+/// else: a connection that sends nothing reads nothing, and is not timed
+/// out by this crate.
+///
+/// The node has a timeout of its own: it closes a connection that has
+/// sent it nothing for longer than its configured connection timeout,
+/// and its heartbeats to the client do not count. A client kept for
+/// longer than that sends something within the window, or finds
+/// [`Error::Disconnected`] on its next request.
 ///
 /// After any error the connection's framing can no longer be trusted
 /// (a timeout may have cut a frame in half); drop it and connect again.
