@@ -1147,6 +1147,21 @@ mod tests {
             Err(Error::Disconnected)
         ));
 
+        // Closed in the middle of a frame: a challenge's prefix and half
+        // its payload, then nothing.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let challenge = control(TransportResponse::Challenge { nonce: [0x5A; 32] });
+            stream.write_all(&challenge[..challenge.len() / 2]).unwrap();
+        });
+        let mut stream = bare_stream(addr);
+        assert!(matches!(
+            authenticate(&mut stream, &key),
+            Err(Error::Disconnected)
+        ));
+
         // A frame far larger than any handshake frame, refused before it
         // is read.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
