@@ -38,13 +38,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   requests, read reply batches with heartbeats skipped, and a node's silence
   reported as an error that says what it usually means. Blocking, `std::net`
   only, and generic over the application's tags — a client of an application
-  is its own codec and nothing else. Every example client and test harness
-  now uses it instead of a private copy of the framing and handshake.
+  is its own codec and nothing else. The handshake is also a function of its
+  own over any `Read + Write` stream, with unbuffered reads, for a program
+  that owns its socket: a Unix socket, or a descriptor its own I/O loop
+  takes over once the node is ready. Every example client and test harness
+  now uses the crate instead of a private copy of the framing and handshake.
   Apache-2.0, like the examples: it is the code a customer links into their
   own client binaries.
 - `melin-wire-protocol`: `encode_challenge_response` and
   `CHALLENGE_RESPONSE_LEN` beside the decoder, so the handshake frame has one
-  home; `BlockingFrameReader::frame` returns the last frame read.
+  home; `BlockingFrameReader::frame` returns the last frame read;
+  `BlockingFrameWriter::write_frame_parts` writes a frame held in pieces
+  without a staging copy, which is how the client sends a request; the
+  writer refuses a frame over the 1 KiB cap before any of it is written,
+  and the cap is public (`MAX_FRAME_SIZE`, also re-exported by
+  `melin-client`, whose `send` reports a request over it as
+  `RequestTooLarge` without sending it).
 - **A wait policy per pipeline thread, in `--cores`.** Each thread's core
   takes a suffix: `matching=7` (or `matching=7s`) busy-spins and needs
   core 7 to itself, `matching=7y` spins briefly then yields and may share

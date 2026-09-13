@@ -6,8 +6,12 @@
 
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-/// Maximum frame payload size (1 KiB). Same limit as the async transports.
-const MAX_FRAME_SIZE: usize = 1024;
+/// Bound on one frame's payload, after the 4-byte length prefix: the
+/// same limit on every transport. A reader refuses a frame declaring
+/// more, and [`BlockingFrameWriter`] refuses to write one, so an
+/// oversized frame is an error at its source rather than a dropped
+/// connection at the far end.
+pub const MAX_FRAME_SIZE: usize = 1024;
 
 /// Blocking frame reader. Reads length-prefixed frames from any `Read` source.
 ///
@@ -97,9 +101,34 @@ impl<W: Write> BlockingFrameWriter<W> {
 
     /// Write a complete frame (prepends the 4-byte LE length prefix).
     pub fn write_frame(&mut self, data: &[u8]) -> io::Result<()> {
-        let len = data.len() as u32;
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(data)?;
+        self.write_frame_parts(&[data])
+    }
+
+    /// Write one frame whose payload is `parts` laid end to end, with
+    /// the length prefix of their total. Spares a caller that holds a
+    /// frame in pieces — a header it computes and a body it was given —
+    /// from assembling them in a buffer of its own: each part goes
+    /// straight into the write buffer, and the frame reaches the socket
+    /// whole at the next flush. A part that arrives while the buffer is
+    /// too full to take it still lands on the socket in order, only in a
+    /// separate write.
+    ///
+    /// A frame over [`MAX_FRAME_SIZE`] is refused with
+    /// [`io::ErrorKind::InvalidInput`] before any of it is written: the
+    /// far end would drop the connection on it, and this is the error
+    /// that says why.
+    pub fn write_frame_parts(&mut self, parts: &[&[u8]]) -> io::Result<()> {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        if len > MAX_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("frame too large: {len} bytes (max {MAX_FRAME_SIZE})"),
+            ));
+        }
+        self.writer.write_all(&(len as u32).to_le_bytes())?;
+        for part in parts {
+            self.writer.write_all(part)?;
+        }
         Ok(())
     }
 
@@ -131,6 +160,52 @@ mod tests {
 
         let received = reader.read_frame().unwrap().unwrap();
         assert_eq!(received, data);
+    }
+
+    #[test]
+    fn frame_parts_arrive_as_one_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let mut writer = BlockingFrameWriter::new(client);
+        let mut reader = BlockingFrameReader::new(server);
+
+        writer
+            .write_frame_parts(&[&7u64.to_le_bytes(), &[0x10], b"body"])
+            .unwrap();
+        writer.write_frame_parts(&[]).unwrap();
+        writer.flush().unwrap();
+
+        let expected = [&7u64.to_le_bytes()[..], &[0x10], b"body"].concat();
+        assert_eq!(reader.read_frame().unwrap().unwrap(), expected);
+        assert_eq!(reader.read_frame().unwrap().unwrap(), b"");
+    }
+
+    #[test]
+    fn an_oversized_frame_is_refused_before_anything_is_written() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let mut writer = BlockingFrameWriter::new(client);
+        let mut reader = BlockingFrameReader::new(server);
+
+        // One byte over the cap, split across parts: the total is what
+        // counts.
+        let body = vec![0xAB; MAX_FRAME_SIZE];
+        let err = writer.write_frame_parts(&[&[0x01], &body]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Nothing of it went out: the frame at the cap that follows is the
+        // first thing the reader sees, and it is whole.
+        writer.write_frame(&body).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(reader.read_frame().unwrap().unwrap(), &body[..]);
     }
 
     #[test]
