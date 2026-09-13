@@ -301,8 +301,8 @@ impl Connection {
     /// applications that accept every request still want it monotonic
     /// per connection, which is what a counter gives.
     ///
-    /// The body is copied once, into the socket's write buffer; there is
-    /// no staging buffer in between.
+    /// The body is copied once in user space, into the writer's buffer;
+    /// there is no staging buffer in between.
     pub fn send(&mut self, request_seq: u64, tag: u8, body: &[u8]) -> Result<(), Error> {
         self.writer
             .write_frame_parts(&[&request_seq.to_le_bytes(), &[tag], body])?;
@@ -751,6 +751,28 @@ mod tests {
         assert!(started.elapsed() >= timeout);
         assert!(matches!(err, Error::NoReply { timeout: t } if t == timeout));
         assert!(err.to_string().contains("authorized_keys"), "{err}");
+    }
+
+    #[test]
+    fn silence_during_the_handshake_is_no_reply_too() {
+        // A listener whose backlog took the connection before anything
+        // serves it: the socket is open, the challenge never comes. The
+        // handshake's timeout is the node's silence, the same error a
+        // dropped request gives — which is what `connect_by` retries.
+        let key = client_key();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let timeout = Duration::from_millis(200);
+        std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            // Hold the socket open past the client's timeout.
+            std::thread::sleep(timeout * 4);
+        });
+
+        let started = Instant::now();
+        let err = Connection::connect_timeout(addr, &key, timeout).unwrap_err();
+        assert!(started.elapsed() >= timeout);
+        assert!(matches!(err, Error::NoReply { timeout: t } if t == timeout));
     }
 
     #[test]
