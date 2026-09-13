@@ -241,6 +241,13 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
 
 /// An authenticated connection to a node.
 ///
+/// Every read is bounded by the read timeout; there is no unbounded
+/// read. A node drops a request it refuses without a word (see the
+/// crate docs), so a read with no deadline could wait forever on a reply
+/// that is never coming. The timeout bounds a wait for a reply, not the
+/// connection: one that sends nothing reads nothing, and stays open,
+/// idle, for as long as the caller keeps it.
+///
 /// After any error the connection's framing can no longer be trusted
 /// (a timeout may have cut a frame in half); drop it and connect again.
 pub struct Connection {
@@ -335,6 +342,14 @@ impl Connection {
     }
 
     /// Change how long a read waits before reporting [`Error::NoReply`].
+    ///
+    /// For a request the node may legitimately hold past
+    /// [`DEFAULT_TIMEOUT`] — one waiting on the node's durability policy,
+    /// say — raise the timeout rather than work around it. When it does
+    /// fire the connection is to be dropped, and the request's sequence
+    /// (see [`send`](Self::send)) is what lets an application that checks
+    /// it take the same request again, on a new connection, without
+    /// applying it twice.
     pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), Error> {
         self.stream.set_read_timeout(Some(timeout))?;
         self.read_timeout = timeout;
