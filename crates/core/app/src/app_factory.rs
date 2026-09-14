@@ -15,9 +15,10 @@
 //! Operator-controlled policy (rate limits, caps, ...) is kept
 //! separate from journaled state.
 //! [`AppFactory::apply_operator_policy`](crate::app_factory::AppFactory::apply_operator_policy)
-//! reapplies these knobs after snapshot restore so primary and
-//! replica converge on matching values even though the journal
-//! carries no record of them.
+//! applies these knobs to every app the runtime builds or restores,
+//! before any entry is applied to it, so primary and replica converge
+//! on matching values even though the journal carries no record of
+//! them.
 
 use crate::Application;
 
@@ -45,13 +46,14 @@ pub trait AppFactory: Send + Sync {
     /// stalls as collections grow.
     fn prefault(&self, app: &mut Self::App);
 
-    /// Reapply operator-controlled policy (rate limits, caps, ...)
-    /// to an existing app. The policy is NOT journaled — primary
-    /// and replica must apply matching values independently — so
-    /// this is called after every snapshot restore (which
-    /// reconstructs state but not policy) and after every replica
-    /// reconnect that reuses an existing pipeline. Default impl is
-    /// a no-op for applications that have no operator policy.
+    /// Apply operator-controlled policy (rate limits, caps, ...) to
+    /// an app. The policy is NOT journaled — primary and replica must
+    /// apply matching values independently — so this is called on
+    /// every app the runtime builds, restores from a snapshot, or
+    /// copies for the shadow stage, before any journal entry is
+    /// applied to it: entries replay under the policy they were first
+    /// applied under. Default impl is a no-op for applications that
+    /// have no operator policy.
     fn apply_operator_policy(&self, _app: &mut Self::App) {}
 
     /// Yield the bulk-seed events the runtime should journal at

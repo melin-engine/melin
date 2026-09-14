@@ -435,6 +435,7 @@ pub(super) type ReplicaHandles<A> =
 pub(super) fn build_replica_pipeline_with_threads<A>(
     exchange: A,
     writer: BufferedWriter<A::Event>,
+    factory: &dyn melin_app::app_factory::AppFactory<App = A>,
     cores: crate::layout::PipelineCores,
     // How the replica's segment preparer materialises staged extents.
     // A replica's rotation stall sits on the ack path — under
@@ -458,7 +459,7 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
 {
-    let shadow_exchange = <A as Application>::clone_via_snapshot(&exchange)?;
+    let shadow_exchange = crate::server::shadow_copy(&exchange, factory)?;
 
     let enable_shadow = snapshot_interval_ms > 0;
     // Shadow snapshot seeds its epoch from the fence state's current value
@@ -688,14 +689,18 @@ where
     if !lineage_exists {
         return Ok((None, None, 0u64, [0u8; 32]));
     }
+    // Operator policy goes in before any entry replays — see `init_engine`.
     let engine = if snapshot_path.exists() {
         tracing::info!("recovering replica from snapshot + journal");
-        melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
+        melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot_with(
             snapshot_path,
             journal_path,
+            |app| factory.apply_operator_policy(app),
         )?
     } else {
-        melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
+        let mut app = factory.empty();
+        factory.apply_operator_policy(&mut app);
+        melin_transport_core::JournaledApp::<A, W>::recover(app, journal_path)?
     };
     let next = engine.next_sequence();
     let last = next.saturating_sub(1);
@@ -703,8 +708,7 @@ where
     // Seed the observed epoch from the replica's own recovered journal.
     // Streaming `EpochBump`s and the snapshot-resync path raise it later.
     fence_state.observe_epoch(engine.recovered_epoch());
-    let (mut exchange, writer) = engine.into_parts();
-    factory.apply_operator_policy(&mut exchange);
+    let (exchange, writer) = engine.into_parts();
     Ok((Some(exchange), Some(writer), last, hash))
 }
 
@@ -964,6 +968,7 @@ fn receive_resync_transfer<A, S>(
     source: &mut S,
     snapshot_path: &std::path::Path,
     journal_path: &std::path::Path,
+    factory: &dyn melin_app::app_factory::AppFactory<App = A>,
     fence_state: &melin_transport_core::fence::FenceState,
 ) -> Result<ResyncTransfer<A>, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -986,8 +991,12 @@ where
     std::fs::rename(&tmp_path, snapshot_path)?;
     tracing::info!(snap_sequence, snap_len, "snapshot received and verified");
 
-    let (snap_exchange, _snap_seq, snap_hash, snap_epoch) =
+    let (mut snap_exchange, _snap_seq, snap_hash, snap_epoch) =
         melin_transport_core::snapshot::load::<A>(snapshot_path)?;
+    // The snapshot carries no operator policy: without this the replica
+    // applies every streamed entry under the application's defaults, and
+    // its state drifts from the primary's.
+    factory.apply_operator_policy(&mut snap_exchange);
     if snap_hash != snap_chain_hash {
         return Err(format!(
             "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
@@ -1048,6 +1057,7 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     journal_writer: &mut Option<W>,
     journal_path: &std::path::Path,
     snapshot_path: &std::path::Path,
+    factory: &dyn melin_app::app_factory::AppFactory<App = A>,
     fence_state: &melin_transport_core::fence::FenceState,
     control: &ReplicaControlPlane,
     last_sequence: &mut u64,
@@ -1105,7 +1115,13 @@ where
         .reset(melin_transport_core::WireSeq::new(0));
 
     let (snap_exchange, snap_sequence, snap_chain_hash, seed_len) =
-        match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path, fence_state) {
+        match receive_resync_transfer::<A, S>(
+            source,
+            snapshot_path,
+            journal_path,
+            factory,
+            fence_state,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "snapshot transfer failed — retrying");
@@ -3107,5 +3123,112 @@ mod tests {
             .is_none(),
             "post-resume idle → no further ack",
         );
+    }
+}
+
+/// Every way a replica comes by its app must leave it carrying the
+/// operator policy — and, where entries replay, replay them under it. A
+/// replica that applies the stream under the application's defaults
+/// drifts from the primary, and promotes into the wrong state.
+#[cfg(all(test, not(feature = "no-persist")))]
+mod operator_policy_tests {
+    use super::*;
+    use crate::policy_test_app::{
+        Add, CAP, CAPPED_SUM, CapFactory, CappedSum, HISTORY, record_history,
+    };
+    use melin_journal::BufferedWriter;
+    use melin_transport_core::fence::FenceState;
+    use std::collections::VecDeque;
+
+    fn recover(journal: &std::path::Path) -> CappedSum {
+        let (app, _writer, _last, _hash) = recover_replica_state::<CappedSum, BufferedWriter<Add>>(
+            journal,
+            &journal.with_extension("snapshot"),
+            &CapFactory(CAP),
+            &FenceState::new(0),
+        )
+        .expect("recover_replica_state");
+        app.expect("a surviving lineage recovers an app")
+    }
+
+    #[test]
+    fn journal_only_recovery_replays_under_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("r.journal");
+        record_history(&journal);
+        std::fs::remove_file(journal.with_extension("snapshot")).expect("drop snapshot");
+
+        let app = recover(&journal);
+        assert_eq!(app.sum, CAPPED_SUM, "history must replay capped");
+        assert_eq!(app.cap, CAP);
+    }
+
+    #[test]
+    fn snapshot_recovery_replays_the_tail_under_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("r.journal");
+        record_history(&journal);
+
+        let app = recover(&journal);
+        assert_eq!(app.sum, CAPPED_SUM, "post-snapshot tail must replay capped");
+        assert_eq!(app.cap, CAP);
+    }
+
+    /// Replays the bytes a primary published, one frame payload at a time.
+    struct Recorded {
+        frames: VecDeque<Vec<u8>>,
+    }
+
+    impl ControlFrameSource for Recorded {
+        fn next_frame(
+            &mut self,
+            _max_size: usize,
+        ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+            self.frames
+                .pop_front()
+                .ok_or_else(|| "recorded transfer exhausted".into())
+        }
+    }
+
+    /// The snapshot a primary ships is the one it restores from: no
+    /// policy. The streamed entries that follow are applied to the app
+    /// this transfer yields, so that app must carry the policy.
+    #[test]
+    fn snapshot_transfer_carries_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("p.journal");
+        record_history(&primary);
+
+        let mut published = Vec::new();
+        let mut publish = |bytes: &[u8]| -> std::io::Result<()> {
+            published.extend_from_slice(bytes);
+            Ok(())
+        };
+        melin_transport_core::replication::catchup::snapshot_transfer_with::<Add>(
+            &primary,
+            &mut publish,
+            &AtomicBool::new(false),
+            0,
+        )
+        .expect("snapshot transfer");
+        let mut frames = VecDeque::new();
+        let mut rest = published.as_slice();
+        while let Some((len, tail)) = rest.split_first_chunk::<4>() {
+            let (payload, tail) = tail.split_at(u32::from_le_bytes(*len) as usize);
+            frames.push_back(payload.to_vec());
+            rest = tail;
+        }
+
+        let replica = dir.path().join("r.journal");
+        let (app, _seq, _hash, _seed_len) = receive_resync_transfer::<CappedSum, _>(
+            &mut Recorded { frames },
+            &replica.with_extension("snapshot"),
+            &replica,
+            &CapFactory(CAP),
+            &FenceState::new(0),
+        )
+        .expect("receive transfer");
+        assert_eq!(app.sum, HISTORY[0]);
+        assert_eq!(app.cap, CAP, "the transferred app must carry the policy");
     }
 }

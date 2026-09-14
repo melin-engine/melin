@@ -201,7 +201,22 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         snapshot_path: &Path,
         journal_path: &Path,
     ) -> Result<Self, JournaledAppError> {
-        let (app, snap_sequence, snap_chain_hash, snap_epoch) = snapshot::load::<A>(snapshot_path)?;
+        Self::recover_from_snapshot_with(snapshot_path, journal_path, |_| {})
+    }
+
+    /// [`recover_from_snapshot`](Self::recover_from_snapshot), running
+    /// `prepare` on the restored app before the post-snapshot entries
+    /// replay. For configuration the snapshot does not carry but `apply`
+    /// reads: the tail must replay under the same values the entries
+    /// were first applied under, not under the restored defaults.
+    pub fn recover_from_snapshot_with(
+        snapshot_path: &Path,
+        journal_path: &Path,
+        prepare: impl FnOnce(&mut A),
+    ) -> Result<Self, JournaledAppError> {
+        let (mut app, snap_sequence, snap_chain_hash, snap_epoch) =
+            snapshot::load::<A>(snapshot_path)?;
+        prepare(&mut app);
         Self::recover_inner(
             app,
             journal_path,

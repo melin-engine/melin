@@ -791,6 +791,7 @@ where
                     &mut journal_writer,
                     journal_path,
                     &snapshot_path,
+                    factory.as_ref(),
                     &fence_state,
                     control,
                     &mut last_sequence,
@@ -838,6 +839,7 @@ where
             pipeline = Some(build_replica_pipeline_with_threads::<A>(
                 cur_exchange,
                 cur_writer,
+                factory.as_ref(),
                 cores,
                 staging_mode,
                 snapshot_interval_ms,

@@ -1379,7 +1379,7 @@ where
     // `A` doesn't implement Clone (internal data structures are complex).
     let enable_shadow = config.snapshot_interval_ms > 0;
     let shadow_exchange = if enable_shadow {
-        Some(<A as Application>::clone_via_snapshot(&exchange)?)
+        Some(shadow_copy(&exchange, factory)?)
     } else {
         None
     };
@@ -2588,7 +2588,7 @@ where
     // exchange into the pipeline (same as the kernel TCP path).
     let enable_shadow = config.snapshot_interval_ms > 0;
     let shadow_exchange = if enable_shadow {
-        Some(<A as Application>::clone_via_snapshot(&exchange)?)
+        Some(shadow_copy(&exchange, &*factory)?)
     } else {
         None
     };
@@ -3131,6 +3131,20 @@ fn choose_bootstrap(
     }
 }
 
+/// The shadow snapshot stage's copy of `app`, carrying the operator
+/// policy. `clone_via_snapshot` round-trips through the snapshot, which
+/// holds no policy: a shadow left without it applies entries under the
+/// application's defaults and writes snapshots of state the pipeline
+/// never had.
+pub(crate) fn shadow_copy<A: Application>(
+    app: &A,
+    factory: &dyn AppFactory<App = A>,
+) -> std::io::Result<A> {
+    let mut shadow = app.clone_via_snapshot()?;
+    factory.apply_operator_policy(&mut shadow);
+    Ok(shadow)
+}
+
 /// Initialize or recover the journaled application from disk.
 ///
 /// Returns `(app, writer, needs_seeding, recovered_epoch)`. `needs_seeding`
@@ -3171,12 +3185,23 @@ where
     let journal_exists = config.journal.exists();
     let archives_exist = !melin_journal::segment::list_archives(&config.journal)?.is_empty();
     let snapshot_exists = snap_path.is_some_and(|p| p.exists());
+    // Operator policy (rate limits, caps, ...) is neither journaled nor in
+    // the snapshot, yet `apply` may read it: every app is given it BEFORE
+    // any entry replays, so replay makes the accept/reject decisions the
+    // entries were first applied under. Applied after replay, the history
+    // re-runs under the application's defaults and the recovered state
+    // silently diverges from the replicas'. Primary and replica must run
+    // with matching values.
     let mut engine: JournaledApp<A, W> =
         match choose_bootstrap(snapshot_exists, journal_exists, archives_exist) {
             BootstrapSource::SnapshotAndJournal => {
                 let snap_path = snap_path.expect("snapshot_exists implies snap_path");
                 info!(snapshot = %snap_path.display(), "recovering from snapshot + journal");
-                JournaledApp::<A, W>::recover_from_snapshot(snap_path, &config.journal)?
+                JournaledApp::<A, W>::recover_from_snapshot_with(
+                    snap_path,
+                    &config.journal,
+                    |app| factory.apply_operator_policy(app),
+                )?
             }
             BootstrapSource::SnapshotOnly => {
                 // Snapshot exists but no journal segment survives at all —
@@ -3187,8 +3212,9 @@ where
                     snapshot = %snap_path.display(),
                     "recovering from snapshot only (no journal segments on disk)"
                 );
-                let (app, snap_sequence, snap_chain_hash, snap_epoch) =
+                let (mut app, snap_sequence, snap_chain_hash, snap_epoch) =
                     melin_transport_core::snapshot::load::<A>(snap_path)?;
+                factory.apply_operator_policy(&mut app);
                 let writer =
                     W::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
                 JournaledApp::<A, W>::from_parts(app, writer, snap_epoch)
@@ -3197,12 +3223,14 @@ where
                 info!("recovering from journal");
                 let mut app = factory.empty();
                 factory.prefault(&mut app);
+                factory.apply_operator_policy(&mut app);
                 JournaledApp::<A, W>::recover(app, &config.journal)?
             }
             BootstrapSource::Fresh => {
                 info!("creating new journal");
                 let mut app = factory.empty();
                 factory.prefault(&mut app);
+                factory.apply_operator_policy(&mut app);
                 JournaledApp::<A, W>::create(app, &config.journal)?
             }
         };
@@ -3210,23 +3238,6 @@ where
     // Seed only on a genuinely fresh start — any surviving lineage
     // (live or archived) already contains the seed events.
     let needs_seeding = !journal_exists && !archives_exist;
-
-    // Apply runtime config knobs that the snapshot doesn't carry. The
-    // SEC-03 cap and the SEC-04 rate-limit `(rate, burst)` pair are
-    // operator policy — replica and primary converge on them via
-    // `ServerConfig`, not replay. Two notes specific to SEC-04 (v18+):
-    //   * Per-account bucket *state* (`tokens` / `last_refill_ns`) IS
-    //     journaled in the snapshot and was already restored above; this
-    //     call only re-applies the *configuration*.
-    //   * `set_max_orders_per_second` clears buckets only when the new
-    //     `(rate, burst)` differs from the existing values. A snapshot
-    //     restore leaves the engine with whatever rate-limit config the
-    //     primary had at snapshot time, so reapplying the operator's
-    //     matching config here is a no-op for buckets — the freshly
-    //     restored state is preserved. An operator mis-set that differs
-    //     from the primary's config will silently clear those buckets;
-    //     primary and replica must run with matching values.
-    factory.apply_operator_policy(engine.app_mut());
 
     // Archive the live journal segment if it exceeds the configured
     // size threshold. The shadow exchange owns snapshot writes; here we
@@ -4026,6 +4037,85 @@ mod tests {
         let perm = handle.join().unwrap().unwrap();
         assert_eq!(perm, Permission::ReadOnly);
         assert!(!perm.can_trade());
+    }
+}
+
+/// Every bootstrap source must hand the pipeline an app carrying the
+/// operator policy, and must replay the journal under it: replayed under
+/// the application's defaults, a history the policy once filtered
+/// recovers to a different state than the replicas hold.
+#[cfg(all(test, not(feature = "no-persist")))]
+mod operator_policy_tests {
+    use super::{ServerConfig, init_engine, shadow_copy};
+    use crate::policy_test_app::{
+        Add, CAP, CAPPED_SUM, CapFactory, CappedSum, HISTORY, record_history,
+    };
+    use melin_journal::BufferedWriter;
+    use std::path::Path;
+
+    fn boot(journal: &Path) -> (CappedSum, bool) {
+        let config = ServerConfig {
+            journal: journal.to_path_buf(),
+            max_journal_mib: 0,
+            ..Default::default()
+        };
+        let (app, _writer, needs_seeding, _epoch) =
+            init_engine::<CappedSum, BufferedWriter<Add>>(&config, &CapFactory(CAP))
+                .expect("init_engine");
+        (app, needs_seeding)
+    }
+
+    #[test]
+    fn journal_only_recovery_replays_under_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("p.journal");
+        record_history(&journal);
+        std::fs::remove_file(journal.with_extension("snapshot")).expect("drop snapshot");
+
+        let (app, _) = boot(&journal);
+        assert_eq!(app.sum, CAPPED_SUM, "history must replay capped");
+        assert_eq!(app.cap, CAP);
+    }
+
+    #[test]
+    fn snapshot_recovery_replays_the_tail_under_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("p.journal");
+        record_history(&journal);
+
+        let (app, _) = boot(&journal);
+        assert_eq!(app.sum, CAPPED_SUM, "post-snapshot tail must replay capped");
+        assert_eq!(app.cap, CAP);
+    }
+
+    #[test]
+    fn snapshot_only_recovery_carries_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = dir.path().join("p.journal");
+        record_history(&journal);
+        std::fs::remove_file(&journal).expect("drop journal");
+
+        let (app, _) = boot(&journal);
+        assert_eq!(app.sum, HISTORY[0]);
+        assert_eq!(app.cap, CAP);
+    }
+
+    #[test]
+    fn fresh_start_carries_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, needs_seeding) = boot(&dir.path().join("p.journal"));
+        assert!(needs_seeding);
+        assert_eq!(app.sum, 0);
+        assert_eq!(app.cap, CAP);
+    }
+
+    /// The shadow applies the same entries as the pipeline and snapshots
+    /// what it gets: its copy must be capped like the original.
+    #[test]
+    fn shadow_copy_carries_the_policy() {
+        let app = CappedSum { sum: 5, cap: CAP };
+        let shadow = shadow_copy(&app, &CapFactory(CAP)).expect("shadow copy");
+        assert_eq!(shadow, app);
     }
 }
 

@@ -17,6 +17,8 @@ pub mod admin;
 mod buf_ring;
 mod client_frames;
 pub mod layout;
+#[cfg(all(test, not(feature = "no-persist")))]
+mod policy_test_app;
 pub mod process;
 pub mod promotion;
 mod raft;
