@@ -22,7 +22,7 @@ use std::thread;
 use std::time::Duration;
 
 use melin_app::encoder::{Encoded, ResponseEncoder};
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 use melin_pipeline::padding::CachePadded;
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_pipeline::wait::WaitStrategy;
@@ -93,12 +93,10 @@ impl Application for PadApp {
     type QueryResponse = PadReport;
     type Sizing = ();
 
-    fn apply(
-        &mut self,
-        _event: Self::Event,
-        _ctx: &ApplyCtx,
-        _out: &mut Vec<Self::Report>,
-    ) -> Option<Self::QueryResponse> {
+    fn apply(&mut self, _event: Self::Event, _ctx: &ApplyCtx, _out: &mut Vec<Self::Report>) {
+        unreachable!("response-stage-only test")
+    }
+    fn query(&self, _event: Self::Event, _ctx: &QueryCtx) -> Option<Self::QueryResponse> {
         unreachable!("response-stage-only test")
     }
     fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}

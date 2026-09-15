@@ -19,7 +19,7 @@ use std::io::{self, Read, Write};
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 
 // ---------------------------------------------------------------------------
 // Wire tags — application tags start at 0x10; everything below is the
@@ -106,7 +106,7 @@ pub enum CounterReport {
     Rejected,
 }
 
-/// 1:1 query response returned directly from `apply`.
+/// 1:1 query response returned by `query`.
 #[derive(Debug, Clone, Copy)]
 pub struct CounterQuery {
     pub value: u64,
@@ -129,12 +129,7 @@ impl Application for Counter {
     // A single integer has nothing to reserve for.
     type Sizing = ();
 
-    fn apply(
-        &mut self,
-        event: Self::Event,
-        _ctx: &ApplyCtx,
-        out: &mut Vec<Self::Report>,
-    ) -> Option<Self::QueryResponse> {
+    fn apply(&mut self, event: Self::Event, _ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
         match event {
             CounterEvent::Increment { amount } => {
                 // Wraps on overflow — a deliberate simplification for this example.
@@ -147,9 +142,16 @@ impl Application for Counter {
                 out.push(CounterReport::Ack {
                     new_value: self.value,
                 });
-                None
             }
+            // A query: answered by `query`, never applied.
+            CounterEvent::GetValue => {}
+        }
+    }
+
+    fn query(&self, event: Self::Event, _ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        match event {
             CounterEvent::GetValue => Some(CounterQuery { value: self.value }),
+            CounterEvent::Increment { .. } => None,
         }
     }
 
@@ -273,9 +275,6 @@ mod tests {
         let mut counter = Counter { value: 0 };
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
             key_hash: 0,
         };
         let mut reports = Vec::new();
@@ -290,20 +289,23 @@ mod tests {
     }
 
     #[test]
-    fn apply_get_value() {
-        let mut counter = Counter { value: 99 };
-        let ctx = ApplyCtx {
-            now_ns: 0,
+    fn query_get_value() {
+        let counter = Counter { value: 99 };
+        let ctx = QueryCtx {
             journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,
         };
-        let mut reports = Vec::new();
 
-        let query = counter.apply(CounterEvent::GetValue, &ctx, &mut reports);
-        assert!(reports.is_empty());
+        let query = counter.query(CounterEvent::GetValue, &ctx);
         assert_eq!(query.unwrap().value, 99);
+        assert!(
+            counter
+                .query(CounterEvent::Increment { amount: 1 }, &ctx)
+                .is_none(),
+            "an increment is not a query"
+        );
     }
 
     #[test]

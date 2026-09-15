@@ -23,10 +23,10 @@
 
 use std::path::Path;
 
-use melin_app::Application;
+use melin_app::{Application, ApplyCtx};
 use melin_journal::{JournalError, JournalReader, JournalWrite};
 
-use crate::dispatch::{dispatch, offline_ctx};
+use crate::dispatch::dispatch;
 use crate::snapshot;
 
 /// Error surfaced by every [`JournaledApp`] method — wraps journal I/O errors and
@@ -505,18 +505,15 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         &mut self,
         event: A::Event,
         out: &mut Vec<A::Report>,
-    ) -> Result<Option<A::QueryResponse>, JournalError> {
-        let seq = self
-            .writer
+    ) -> Result<(), JournalError> {
+        self.writer
             .append(&melin_journal::JournalEvent::App(event))?;
         let ctx = melin_app::ApplyCtx {
             now_ns: melin_app::unix_epoch_nanos(),
-            journal_sequence: melin_app::WireSeq::new(seq),
-            active_connections: 0,
-            events_processed: 0,
             key_hash: 0,
         };
-        Ok(self.app.apply(event, &ctx, out))
+        self.app.apply(event, &ctx, out);
+        Ok(())
     }
 
     /// Journal a tick event and dispatch it to the inner application.
@@ -583,12 +580,15 @@ fn replay_segment<A: Application>(
                 }
                 if entry.sequence > snap_sequence {
                     // Replay produces no output: the client got its reply
-                    // when the event was live, and a query is never
-                    // journaled.
-                    let _ = dispatch(
+                    // when the event was live. A query is never journaled,
+                    // so every entry here is one `apply` handled live.
+                    dispatch(
                         app,
                         entry.event,
-                        &offline_ctx(entry.timestamp_ns, entry.key_hash),
+                        &ApplyCtx {
+                            now_ns: entry.timestamp_ns,
+                            key_hash: entry.key_hash,
+                        },
                         last_drain_ns,
                         |epoch| crate::fence::observe_into(recovered_epoch, epoch),
                         reports,
@@ -698,7 +698,6 @@ fn verify_boundary_snapshot_anchor<E: melin_app::AppEvent>(
 mod tests {
     use super::*;
     use crate::test_support::{TestApp, TestEvent};
-    use melin_app::ApplyCtx;
     use melin_journal::{BufferedWriter, JournalEvent, JournalReader};
     use std::collections::HashMap;
 
@@ -733,15 +732,12 @@ mod tests {
         let mut reports = Vec::new();
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
             key_hash: 1,
         };
         for (i, e) in events.iter().enumerate() {
             let ts = 1_000 * (i as u64 + 1);
             app.tick(ts, &mut reports);
-            let _ = app.apply(*e, &ctx, &mut reports);
+            app.apply(*e, &ctx, &mut reports);
         }
         app
     }

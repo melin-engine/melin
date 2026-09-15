@@ -1333,7 +1333,7 @@ mod tests {
     use super::*;
     use melin_app::auth::Permission;
     use melin_app::decoder::{Decoded, RequestDecoder};
-    use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+    use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_wire_protocol::control_codec::REQUEST_HEADER_LEN;
@@ -1415,12 +1415,10 @@ mod tests {
         type QueryResponse = ();
         type Sizing = ();
         const APP_VERSION: u16 = 0;
-        fn apply(
-            &mut self,
-            _event: TestEvent,
-            _ctx: &ApplyCtx,
-            _out: &mut Vec<TestReport>,
-        ) -> Option<()> {
+        fn apply(&mut self, _event: TestEvent, _ctx: &ApplyCtx, _out: &mut Vec<TestReport>) {
+            unreachable!()
+        }
+        fn query(&self, _event: TestEvent, _ctx: &QueryCtx) -> Option<()> {
             unreachable!()
         }
         fn tick(&mut self, _now_ns: u64, _out: &mut Vec<TestReport>) {

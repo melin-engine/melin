@@ -81,7 +81,7 @@ use std::io::{self, Read, Write};
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 
 // ---------------------------------------------------------------------------
 // Wire tags — application tags start at 0x10; everything below is the
@@ -255,13 +255,17 @@ impl Application for Echo {
     type Event = Payload;
     type Report = EchoReport;
     // No queries, so no query response. `()` is `Copy`, which is all the
-    // transport asks of the type; `apply` never returns `Some`.
+    // transport asks of the type; `query` never returns `Some`.
     type QueryResponse = ();
     // No state, so nothing to size.
     type Sizing = ();
 
-    fn apply(&mut self, event: Payload, _ctx: &ApplyCtx, out: &mut Vec<EchoReport>) -> Option<()> {
+    fn apply(&mut self, event: Payload, _ctx: &ApplyCtx, out: &mut Vec<EchoReport>) {
         out.push(EchoReport::Echoed(event));
+    }
+
+    // Unreachable: no payload is a query, so the runtime never calls this.
+    fn query(&self, _event: Payload, _ctx: &QueryCtx) -> Option<()> {
         None
     }
 
@@ -372,9 +376,6 @@ mod tests {
     fn ctx() -> ApplyCtx {
         ApplyCtx {
             now_ns: 0,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
             key_hash: 0,
         }
     }
@@ -460,8 +461,7 @@ mod tests {
     fn an_echo_is_reported() {
         let mut app = Echo;
         let mut reports = Vec::new();
-        let query = app.apply(payload(b"durable"), &ctx(), &mut reports);
-        assert!(query.is_none());
+        app.apply(payload(b"durable"), &ctx(), &mut reports);
         assert_eq!(reports, [EchoReport::Echoed(payload(b"durable"))]);
     }
 

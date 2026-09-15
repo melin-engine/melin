@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use tracing::{error, info};
 
-use crate::dispatch::{dispatch, offline_ctx};
+use crate::dispatch::dispatch;
 use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
-use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
+use melin_app::{Application, ApplyCtx};
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::SeqLockReader;
 use melin_pipeline::wait::WaitStrategy;
@@ -104,12 +104,24 @@ pub fn run<A: Application>(
         // outside the loop so the per-event drain stays monotonic across
         // batches.
         for slot in &batch[..count] {
+            // The shadow reads the input ring before the journal stage
+            // drops queries, so it sees them. The matching stage answers
+            // a query through `Application::query`, which changes
+            // nothing — no clock advance, no state change — so the
+            // shadow skips it, whatever its slot's timestamp says, or its
+            // snapshot would hold state the primary never had.
+            if slot.event.is_query() {
+                continue;
+            }
             // The shadow produces no output: the matching stage replies
-            // for every event, queries included.
-            let _ = dispatch(
+            // for every event.
+            dispatch(
                 &mut app,
                 slot.event,
-                &offline_ctx(slot.timestamp_ns, slot.key_hash),
+                &ApplyCtx {
+                    now_ns: slot.timestamp_ns,
+                    key_hash: slot.key_hash,
+                },
                 &mut last_drain_ns,
                 |epoch| crate::fence::observe_into(&mut shadow_epoch, epoch),
                 &mut reports,
@@ -294,6 +306,88 @@ mod tests {
         let (restored, _seq, chain, _epoch) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(chain, [0xAB; 32]); // chain hash from the seqlock
         assert_eq!(restored.total, 1500);
+    }
+
+    /// The shadow sees queries, which the matching stage answers through
+    /// `Application::query` without changing anything — not per-key
+    /// state, not the clock. A query slot must therefore leave the
+    /// shadow's state untouched too, whatever timestamp it carries, or a
+    /// restore would hold state the primary never had: a clock run ahead,
+    /// per-key state the application never saw a write for.
+    #[test]
+    fn query_slot_changes_nothing() {
+        const KEY: u64 = 0xDEAD_BEEF;
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let consumer = consumers.pop().unwrap();
+
+        // The ring cursor after both slots below; the shadow saves only
+        // when aligned with it.
+        let (_writer, fsync_state) = seqlock::split(FsyncState {
+            journal_seq: WireSeq::new(1),
+            chain_hash: [0; 32],
+            input_ring_seq: RingPos::new(2),
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("test.snapshot");
+        let snap_path2 = snap_path.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("test-shadow".into())
+            .spawn(move || {
+                run(
+                    consumer,
+                    TestApp::new(),
+                    snap_path2,
+                    Duration::from_millis(50),
+                    fsync_state,
+                    &shutdown2,
+                    WaitStrategy::SpinThenYield,
+                    0, // initial_epoch
+                );
+            })
+            .unwrap();
+
+        // A query under a client key, with a timestamp that would drain
+        // the clock, then a write no client submitted.
+        producer.publish(InputSlot {
+            connection_id: 1,
+            key_hash: KEY,
+            sequence: 0,
+            timestamp_ns: 1_000,
+            event: JournalEvent::App(TestEvent::Query),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        });
+        producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event: JournalEvent::App(TestEvent::Add(7)),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !snap_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let (restored, _seq, _chain, _epoch) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_eq!(restored.total, 7, "the write after the query is applied");
+        assert_eq!(restored.ticks, 0, "a query must not advance the clock");
+        assert!(
+            restored.per_key_total.is_empty(),
+            "a query must not reach apply under its key"
+        );
     }
 
     #[test]
