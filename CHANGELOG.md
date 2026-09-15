@@ -19,9 +19,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   chosen point, and **`ring::Batch::next_sequence`**, the sequence the next
   entry in a batch takes.
 - **`melin_writes_refused_total` on `/metrics`**, a counter of client
-  writes turned away while the node was halted, labelled
-  `reason="replica_disconnected"` or `reason="superseded"`. A refused write
-  is never journaled, so until now it left no trace at all.
+  writes turned away while the node was halted. A refused write is never
+  journaled, so until now it left no trace at all.
 
 ### Changed
 
@@ -33,6 +32,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `melin_server_runtime::halt`. Application traits are unchanged, but
   `Application::build_reject` now runs on the request-reading thread for a
   halt rejection, rather than on the matching thread.
+- **A superseded node closes client connections instead of answering.** A
+  node fenced by a newer primary is stopping; a connection that sends
+  anything while it winds down is closed at once, and the rest close when
+  the process exits. Clients reconnect to the new primary, as after a
+  crash. Previously the node queued a `Superseded` rejection that, in
+  practice, never went out before the stage stopped.
+
+### Removed
+
+- **`RejectReason::Superseded`.** Nothing produces it any more (see
+  Changed). Applications that mapped it to a wire code or a display string
+  drop that arm.
 
 ### Fixed
 

@@ -17,7 +17,7 @@ use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::{MonoTraceInstant, mono_trace_ns};
 
-use crate::halt::{HaltGate, Refusal, RefusalSender};
+use crate::halt::{HaltGate, Refusal, RefusalSender, Verdict};
 
 /// Bound on one client request frame, after the 4-byte length prefix:
 /// the wire protocol's, so a client library and a node agree on it by
@@ -36,7 +36,8 @@ pub(crate) enum FrameAction {
     /// All complete frames processed. Any partial trailing bytes remain
     /// in `parse_buf` for the next recv cycle.
     Continue,
-    /// An oversized frame was encountered. Prior frames were committed.
+    /// An oversized frame was encountered (prior frames were committed),
+    /// or the node is superseded and takes nothing more from anyone.
     /// Caller should drop the connection.
     Disconnect,
     /// The pipeline ring — or, while halted, the refusal queue — is full.
@@ -57,7 +58,9 @@ pub(crate) enum FrameAction {
 /// rejection goes to `refusals`, stamped with the input sequence it would
 /// have taken (see [`crate::halt`]). Queries are published either way.
 /// The halt is sampled once per call, so one receive is judged as a whole,
-/// and the writes it refused are counted into `halt` once, at the end.
+/// and the writes it refused are counted into `halt` once, at the end. On
+/// a superseded node nothing is read: the call returns
+/// [`FrameAction::Disconnect`] before the first frame.
 ///
 /// Returns [`FrameAction`] so the caller can handle transport-specific
 /// side effects (ServerBusy write, transport close, control events).
@@ -92,8 +95,15 @@ pub(crate) fn process_client_frames<A: Application>(
     // producer cursor. Bounded at COMMIT_EVERY to cap consumer-
     // visibility delay (see reader.rs for the measured rationale).
     const COMMIT_EVERY: u64 = 16;
+    let refusal_reason = match halt.verdict() {
+        Verdict::Take => None,
+        Verdict::Refuse(reason) => Some(reason),
+        Verdict::Close => {
+            debug!(connection_id, "node superseded, closing connection");
+            return FrameAction::Disconnect;
+        }
+    };
     let mut batch = producer.batch();
-    let refusal_reason = halt.refusal_reason();
     // Writes refused in this call, counted into the gate once at the end
     // rather than with an atomic add each. Includes one shed for a full
     // refusal queue: the halt is what turned it away.
@@ -196,10 +206,8 @@ pub(crate) fn process_client_frames<A: Application>(
     refusals.flush();
     batch.commit();
 
-    if let Some(reason) = refusal_reason
-        && refused > 0
-    {
-        halt.record_refused(reason, refused);
+    if refused > 0 {
+        halt.record_refused(refused);
     }
 
     // Compact: shift remaining bytes to the front.

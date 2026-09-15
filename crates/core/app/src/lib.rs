@@ -101,14 +101,12 @@ pub enum RejectReason {
     /// Replication is configured but no replica is currently connected;
     /// the transport refuses state-mutating events to preserve the
     /// persist-before-ack invariant. A refused event is not journaled.
+    ///
+    /// The other way a node stops taking writes — superseded by a
+    /// higher-epoch primary — has no reason code: such a node is stopping
+    /// and closes its client connections instead of answering, and the
+    /// client reconnects to the new primary.
     ReplicaDisconnected,
-    /// This node was superseded by a higher-epoch primary (fenced) and is
-    /// self-demoting. State-mutating events are refused because the node is
-    /// no longer the lineage's owner — the client should reconnect and will
-    /// land on the new primary. Distinct from [`Self::ReplicaDisconnected`]:
-    /// a superseded node may still have healthy replicas attached, so the
-    /// replica count is not what stopped it.
-    Superseded,
 }
 
 /// Wire-sequence space: the monotonic sequence the journal allocates per
@@ -340,10 +338,10 @@ pub trait Application: Sized {
     ///
     /// Where it runs depends on the reason. A duplicate is rejected on the
     /// matching thread, in sequence with every other event. A halted node
-    /// ([`ReplicaDisconnected`](RejectReason::ReplicaDisconnected),
-    /// [`Superseded`](RejectReason::Superseded)) rejects on the thread that
-    /// reads client requests, before the event is sequenced: the event is
-    /// never journaled and never reaches the application.
+    /// ([`ReplicaDisconnected`](RejectReason::ReplicaDisconnected)) rejects
+    /// on the thread that reads client requests, before the event is
+    /// sequenced: the event is never journaled and never reaches the
+    /// application.
     fn build_reject(event: &Self::Event, reason: RejectReason) -> Self::Report;
 
     /// Serialise the application's live state into `w`. The transport

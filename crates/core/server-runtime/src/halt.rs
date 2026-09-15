@@ -1,11 +1,12 @@
 //! Refusing client writes while a node cannot honour durability.
 //!
 //! A node halts when replication is configured and no replica is
-//! connected, or once a newer primary has fenced it. Either way it can no
-//! longer promise what the ack policy promises, so it takes no new writes:
-//! each is answered with the application's rejection for the reason
-//! ([`RejectReason::ReplicaDisconnected`] or [`RejectReason::Superseded`]).
-//! Queries still run.
+//! connected: it can no longer promise what the ack policy promises, so it
+//! takes no new writes. Each is answered with the application's rejection
+//! for [`RejectReason::ReplicaDisconnected`]; queries still run. A node a
+//! newer primary has fenced is stopping and answers nothing: a connection
+//! that sends anything while it winds down is closed, and the client
+//! reconnects to the new primary.
 //!
 //! # Refused at ingress
 //!
@@ -53,20 +54,19 @@
 //! # Counted
 //!
 //! A refused write leaves no other trace — nothing is journaled — so the
-//! reader counts them by reason ([`HaltGate::record_refused`]) and the
-//! health endpoint exports the counts as `melin_writes_refused_total`. A
-//! write shed for a full refusal queue is counted too: the halt is why it
-//! was turned away, whatever the client was told.
+//! reader counts them ([`HaltGate::record_refused`]) and the health
+//! endpoint exports the count as `melin_writes_refused_total`. A write
+//! shed for a full refusal queue is counted too: the halt is why it was
+//! turned away, whatever the client was told.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use melin_app::RejectReason;
 use melin_pipeline::padding::Sequence;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::fence::FenceState;
-use melin_transport_core::health::RefusedWrites;
 
 /// Refusals the response stage can hold before a reader has to shed load.
 ///
@@ -78,6 +78,17 @@ use melin_transport_core::health::RefusedWrites;
 /// words.
 pub(crate) const REFUSAL_QUEUE_CAPACITY: usize = 4096;
 
+/// What a reader does with a client write right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Publish it.
+    Take,
+    /// Refuse it with this reason; the connection stays open.
+    Refuse(RejectReason),
+    /// Close the connection: the node is superseded and stopping.
+    Close,
+}
+
 /// A reader's view of whether this node takes client writes.
 pub struct HaltGate {
     /// Replicas currently streaming, maintained by the replication
@@ -86,8 +97,8 @@ pub struct HaltGate {
     replicas_connected: Option<Arc<AtomicU32>>,
     /// Latched once a newer primary is observed.
     fence_state: Arc<FenceState>,
-    /// Writes refused so far, by reason; shared with the health endpoint.
-    refused: Arc<RefusedWrites>,
+    /// Writes refused so far; shared with the health endpoint.
+    refused: Arc<AtomicU64>,
 }
 
 impl HaltGate {
@@ -97,7 +108,7 @@ impl HaltGate {
     pub fn new(
         replicas_connected: Option<Arc<AtomicU32>>,
         fence_state: Arc<FenceState>,
-        refused: Arc<RefusedWrites>,
+        refused: Arc<AtomicU64>,
     ) -> Self {
         Self {
             replicas_connected,
@@ -106,40 +117,32 @@ impl HaltGate {
         }
     }
 
-    /// Count `count` writes refused for `reason`. Meant for one call per
-    /// receive with the receive's tally, not one per write: the reader
-    /// samples the reason once per receive anyway, and a single relaxed
-    /// add is the whole cost.
+    /// Count `count` refused writes. Meant for one call per receive with
+    /// the receive's tally, not one per write: a single relaxed add is the
+    /// whole cost.
     #[inline]
-    pub fn record_refused(&self, reason: RejectReason, count: u64) {
-        let counter = match reason {
-            RejectReason::ReplicaDisconnected => &self.refused.replica_disconnected,
-            RejectReason::Superseded => &self.refused.superseded,
-            // Not a halt: `refusal_reason` never yields it.
-            RejectReason::DuplicateRequest => return,
-        };
-        counter.fetch_add(count, Ordering::Relaxed);
+    pub fn record_refused(&self, count: u64) {
+        self.refused.fetch_add(count, Ordering::Relaxed);
     }
 
-    /// Why a client write would be refused right now, or `None` when it
-    /// would be taken. Fencing wins: a superseded node is shutting down
-    /// whatever its replica count.
+    /// The verdict on a client write arriving now. Fencing wins: a
+    /// superseded node is shutting down whatever its replica count.
     ///
     /// Two relaxed loads. Relaxed is enough: a halt that starts between the
     /// check and the publish is the case a write published just before the
     /// halt already covers — see the module docs.
     #[inline]
-    pub fn refusal_reason(&self) -> Option<RejectReason> {
+    pub fn verdict(&self) -> Verdict {
         if self.fence_state.is_fenced() {
-            Some(RejectReason::Superseded)
+            Verdict::Close
         } else if self
             .replicas_connected
             .as_ref()
             .is_some_and(|count| count.load(Ordering::Relaxed) == 0)
         {
-            Some(RejectReason::ReplicaDisconnected)
+            Verdict::Refuse(RejectReason::ReplicaDisconnected)
         } else {
-            None
+            Verdict::Take
         }
     }
 }
@@ -285,7 +288,7 @@ impl<R: Copy> RefusalQueue<R> {
 mod tests {
     use super::*;
     use melin_pipeline::padding::CachePadded;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::AtomicBool;
 
     fn progress(value: u64) -> Arc<Sequence> {
         Arc::new(CachePadded::new(AtomicU64::new(value)))
@@ -300,13 +303,13 @@ mod tests {
     }
 
     fn gate(replicas_connected: Option<Arc<AtomicU32>>, fence: Arc<FenceState>) -> HaltGate {
-        HaltGate::new(replicas_connected, fence, Arc::new(RefusedWrites::new()))
+        HaltGate::new(replicas_connected, fence, Arc::new(AtomicU64::new(0)))
     }
 
     #[test]
     fn standalone_never_refuses() {
         let gate = gate(None, Arc::new(FenceState::new(0)));
-        assert_eq!(gate.refusal_reason(), None);
+        assert_eq!(gate.verdict(), Verdict::Take);
     }
 
     #[test]
@@ -314,35 +317,32 @@ mod tests {
         let count = Arc::new(AtomicU32::new(0));
         let gate = gate(Some(Arc::clone(&count)), Arc::new(FenceState::new(0)));
         assert_eq!(
-            gate.refusal_reason(),
-            Some(RejectReason::ReplicaDisconnected)
+            gate.verdict(),
+            Verdict::Refuse(RejectReason::ReplicaDisconnected)
         );
         count.store(1, Ordering::Relaxed);
-        assert_eq!(gate.refusal_reason(), None);
+        assert_eq!(gate.verdict(), Verdict::Take);
     }
 
     #[test]
-    fn fencing_wins_over_a_connected_replica() {
+    fn a_fenced_node_closes_whatever_its_replica_count() {
         let fence = Arc::new(FenceState::new(1));
         let gate = gate(Some(Arc::new(AtomicU32::new(1))), Arc::clone(&fence));
-        assert_eq!(gate.refusal_reason(), None);
+        assert_eq!(gate.verdict(), Verdict::Take);
         assert_eq!(
             fence.fence_if_superseded(2, &AtomicBool::new(false)),
             Some(true)
         );
-        assert_eq!(gate.refusal_reason(), Some(RejectReason::Superseded));
+        assert_eq!(gate.verdict(), Verdict::Close);
     }
 
     #[test]
-    fn refusals_are_counted_by_reason() {
-        let refused = Arc::new(RefusedWrites::new());
+    fn refusals_are_counted() {
+        let refused = Arc::new(AtomicU64::new(0));
         let gate = HaltGate::new(None, Arc::new(FenceState::new(0)), Arc::clone(&refused));
-        gate.record_refused(RejectReason::ReplicaDisconnected, 3);
-        gate.record_refused(RejectReason::Superseded, 1);
-        gate.record_refused(RejectReason::ReplicaDisconnected, 2);
-        gate.record_refused(RejectReason::DuplicateRequest, 7);
-        assert_eq!(refused.replica_disconnected.load(Ordering::Relaxed), 5);
-        assert_eq!(refused.superseded.load(Ordering::Relaxed), 1);
+        gate.record_refused(3);
+        gate.record_refused(2);
+        assert_eq!(refused.load(Ordering::Relaxed), 5);
     }
 
     #[test]
