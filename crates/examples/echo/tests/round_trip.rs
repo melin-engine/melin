@@ -21,8 +21,9 @@ use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use echo_server::{
-    EchoFactory, MAX_PAYLOAD, Payload, RequestDecoder, ResponseEncoder, TAG_ECHO, TAG_RESP_ECHO,
+    Echo, MAX_PAYLOAD, Payload, RequestDecoder, ResponseEncoder, TAG_ECHO, TAG_RESP_ECHO,
 };
+use melin_server_runtime::StartupEvents;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -158,10 +159,10 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
     let handle = std::thread::spawn(move || -> Result<(), String> {
-        server::run_with_listener(
+        server::run_with_listener::<Echo>(
             listener,
             config,
-            EchoFactory,
+            StartupEvents::none(),
             RequestDecoder,
             ResponseEncoder,
             None,

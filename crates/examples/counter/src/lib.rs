@@ -2,14 +2,13 @@
 
 //! Minimal application built on the Melin core runtime.
 //!
-//! Demonstrates the five traits needed to plug a custom state machine into
+//! Demonstrates the four traits needed to plug a custom state machine into
 //! Melin's durable, replicated pipeline:
 //!
 //!   1. [`AppEvent`]        — the event type (journal codec)
-//!   2. [`Application`]     — the state machine
-//!   3. [`AppFactory`]      — construction + seeding
-//!   4. [`RequestDecoder`]  — wire bytes → event
-//!   5. [`ResponseEncoder`] — report → wire bytes
+//!   2. [`Application`]     — the state machine, starting from `Default`
+//!   3. [`RequestDecoder`]  — wire bytes → event
+//!   4. [`ResponseEncoder`] — report → wire bytes
 //!
 //! The application is a simple counter: clients send `Increment(amount)`
 //! commands and receive the new total. A `GetValue` query returns the
@@ -17,7 +16,6 @@
 
 use std::io::{self, Read, Write};
 
-use melin_app::app_factory::AppFactory;
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
@@ -118,7 +116,8 @@ pub struct CounterQuery {
 // Application
 // ---------------------------------------------------------------------------
 
-/// The counter state machine: a single `u64` value.
+/// The counter state machine: a single `u64` value, zero at genesis.
+#[derive(Default)]
 pub struct Counter {
     value: u64,
 }
@@ -173,23 +172,6 @@ impl Application for Counter {
     }
 
     const APP_VERSION: u16 = 1;
-}
-
-// ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
-
-/// Constructs `Counter` instances for the runtime.
-pub struct CounterFactory;
-
-impl AppFactory for CounterFactory {
-    type App = Counter;
-
-    fn empty(&self) -> Counter {
-        Counter { value: 0 }
-    }
-
-    fn prefault(&self, _app: &mut Counter) {}
 }
 
 // ---------------------------------------------------------------------------

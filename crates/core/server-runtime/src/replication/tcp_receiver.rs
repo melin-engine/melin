@@ -560,7 +560,6 @@ pub fn run_receiver<A>(
     staging_mode: melin_journal::StagingMode,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
-    factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
 ) -> ReceiverResult<A, BufferedWriter<A::Event>>
 where
@@ -584,7 +583,6 @@ where
         recover_replica_state::<A, BufferedWriter<A::Event>>(
             journal_path,
             &snapshot_path,
-            factory.as_ref(),
             &fence_state,
         )?;
     // The fence epoch now reflects the recovered journal (a fresh replica
@@ -791,7 +789,6 @@ where
                     &mut journal_writer,
                     journal_path,
                     &snapshot_path,
-                    factory.as_ref(),
                     &fence_state,
                     control,
                     &mut last_sequence,
@@ -826,9 +823,7 @@ where
             let (lineage_start, lineage_anchor) = stream_lineage;
             let writer =
                 BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
-            let mut fresh = factory.empty();
-            factory.apply_operator_policy(&mut fresh);
-            exchange = Some(fresh);
+            exchange = Some(A::default());
             journal_writer = Some(writer);
         }
 
@@ -839,7 +834,6 @@ where
             pipeline = Some(build_replica_pipeline_with_threads::<A>(
                 cur_exchange,
                 cur_writer,
-                factory.as_ref(),
                 cores,
                 staging_mode,
                 snapshot_interval_ms,
@@ -906,7 +900,6 @@ where
             last_sequence,
             journal_path,
             &snapshot_path,
-            factory.as_ref(),
             &fence_state,
             shutdown,
             promote,
@@ -1132,7 +1125,6 @@ mod tests {
     #[cfg(not(feature = "no-persist"))]
     mod scripted {
         use super::*;
-        use melin_app::app_factory::AppFactory;
         use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
 
         // Re-export so the sibling test modules can name the generic
@@ -1166,6 +1158,7 @@ mod tests {
         #[derive(Debug, Clone, Copy)]
         pub(super) struct Rpt;
 
+        #[derive(Default)]
         pub(super) struct App;
 
         impl Application for App {
@@ -1190,16 +1183,6 @@ mod tests {
             fn restore<R: std::io::Read>(_r: &mut R) -> std::io::Result<Self> {
                 Ok(App)
             }
-        }
-
-        pub(super) struct Factory;
-
-        impl AppFactory for Factory {
-            type App = App;
-            fn empty(&self) -> App {
-                App
-            }
-            fn prefault(&self, _app: &mut App) {}
         }
 
         /// Deterministic replica signing-key bytes; [`replica_auth`]
@@ -1348,7 +1331,6 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
                     // ReceiverResult's error is !Send — stringify for join().
@@ -1519,7 +1501,6 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
                     .map(|state| state.is_none())
@@ -1688,7 +1669,6 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
                     .map(|state| state.is_none())
@@ -1930,7 +1910,6 @@ mod tests {
                         melin_journal::StagingMode::ZeroFill,
                         Duration::ZERO,
                         64,
-                        Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
                     // ReceiverResult's error is !Send — stringify for join().
@@ -2109,7 +2088,6 @@ mod tests {
                         mode,
                         Duration::ZERO,
                         64,
-                        Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
                     )
                     // ReceiverResult's error is !Send — stringify for join().

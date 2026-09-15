@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use counter_server::{CounterFactory, RequestDecoder, ResponseEncoder};
+use counter_server::{Counter, RequestDecoder, ResponseEncoder};
+use melin_server_runtime::StartupEvents;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
@@ -79,10 +80,10 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
     let sd = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || -> Result<(), String> {
         let _tmp = tmp;
-        server::run_with_listener(
+        server::run_with_listener::<Counter>(
             listener,
             config,
-            CounterFactory,
+            StartupEvents::none(),
             RequestDecoder,
             ResponseEncoder,
             None,

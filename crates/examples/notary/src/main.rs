@@ -33,8 +33,9 @@
 //! round trip in `tests/round_trip.rs` for a worked example.
 
 use clap::Parser;
+use melin_server_runtime::StartupEvents;
 use melin_server_runtime::server::{self, ServerConfig};
-use notary_server::{NotaryFactory, RequestDecoder, ResponseEncoder};
+use notary_server::{Notary, RequestDecoder, ResponseEncoder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -45,5 +46,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse();
 
-    server::run(config, NotaryFactory, RequestDecoder, ResponseEncoder, None)
+    server::run::<Notary>(
+        config,
+        StartupEvents::none(),
+        RequestDecoder,
+        ResponseEncoder,
+        None,
+    )
 }

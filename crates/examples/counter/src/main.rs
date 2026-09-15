@@ -16,7 +16,8 @@
 //! ```
 
 use clap::Parser;
-use counter_server::{CounterFactory, RequestDecoder, ResponseEncoder};
+use counter_server::{Counter, RequestDecoder, ResponseEncoder};
+use melin_server_runtime::StartupEvents;
 use melin_server_runtime::server::{self, ServerConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,9 +29,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse();
 
-    server::run(
+    server::run::<Counter>(
         config,
-        CounterFactory,
+        StartupEvents::none(),
         RequestDecoder,
         ResponseEncoder,
         None,

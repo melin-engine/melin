@@ -172,10 +172,9 @@ pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
 }
 
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
-    /// Create a new journaled app with a fresh journal file. The caller
-    /// supplies the app so production builds can pick an appropriately
-    /// pre-sized constructor (e.g. `Exchange::with_capacity()`) rather
-    /// than relying on `Default`.
+    /// Create a new journaled app with a fresh journal file, starting
+    /// from `app` — the runtime passes the application's genesis state,
+    /// `A::default()`.
     pub fn create(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
         let writer = W::create(journal_path)?;
         // Genesis node — no prior promotion, so epoch starts at 0.
@@ -202,22 +201,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         snapshot_path: &Path,
         journal_path: &Path,
     ) -> Result<Self, JournaledAppError> {
-        Self::recover_from_snapshot_with(snapshot_path, journal_path, |_| {})
-    }
-
-    /// [`recover_from_snapshot`](Self::recover_from_snapshot), running
-    /// `prepare` on the restored app before the post-snapshot entries
-    /// replay. For configuration the snapshot does not carry but `apply`
-    /// reads: the tail must replay under the same values the entries
-    /// were first applied under, not under the restored defaults.
-    pub fn recover_from_snapshot_with(
-        snapshot_path: &Path,
-        journal_path: &Path,
-        prepare: impl FnOnce(&mut A),
-    ) -> Result<Self, JournaledAppError> {
-        let (mut app, snap_sequence, snap_chain_hash, snap_epoch) =
-            snapshot::load::<A>(snapshot_path)?;
-        prepare(&mut app);
+        let (app, snap_sequence, snap_chain_hash, snap_epoch) = snapshot::load::<A>(snapshot_path)?;
         Self::recover_inner(
             app,
             journal_path,
