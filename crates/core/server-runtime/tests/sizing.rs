@@ -111,10 +111,6 @@ impl Application for SizedCounter {
         self.0.tick(now_ns, out)
     }
 
-    fn check_request_seq(&mut self, key_hash: u64, seq: u64) -> bool {
-        self.0.check_request_seq(key_hash, seq)
-    }
-
     fn build_reject(event: &Self::Event, reason: RejectReason) -> Self::Report {
         Counter::build_reject(event, reason)
     }

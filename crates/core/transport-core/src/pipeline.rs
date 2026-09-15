@@ -30,9 +30,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::dispatch::{Dispatched, dispatch, offline_ctx};
+use crate::dispatch::{dispatch, offline_ctx};
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
-use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::encoder::JournalEncoder;
@@ -299,11 +299,12 @@ const MAX_MATCHING_BATCH: usize = 16;
 pub struct InputSlot<E: AppEvent> {
     /// Which client connection submitted this command.
     pub connection_id: u64,
-    /// FxHash of the client's Ed25519 public key. Used with `request_seq`
-    /// for per-key idempotency dedup. 0 for seed/internal events.
+    /// FxHash of the client's Ed25519 public key, journaled with the
+    /// event and handed to the application as `ApplyCtx::key_hash`.
+    /// 0 for seed/internal events.
     pub key_hash: u64,
-    /// Per-key monotonic request sequence number from the wire protocol.
-    /// Used with `key_hash` for idempotency dedup. 0 for seed/internal events.
+    /// Request sequence number from the wire protocol, journaled with
+    /// the event. Opaque to the transport. 0 for seed/internal events.
     pub request_seq: u64,
     /// Journal sequence number. **Always zero on primary-side input** —
     /// the journal stage allocates the sequence at encode time, in
@@ -2691,27 +2692,16 @@ impl<A: Application> MatchingStage<A> {
                 // (see the type's docs). A free function rather than a
                 // method, so it borrows only the fields it needs while
                 // `out_batch` holds `self.output`.
-                let query_report = match dispatch(
+                let query_report = dispatch(
                     &mut self.app,
                     slot.event,
-                    slot.request_seq,
                     &ctx,
                     &mut self.last_drain_ns,
                     |epoch| {
                         self.fence_state.observe_epoch(epoch);
                     },
                     &mut reports,
-                ) {
-                    Dispatched::Applied(query_report) => query_report,
-                    Dispatched::Refused => {
-                        // Only an app event has a client to tell; internal
-                        // events carry key_hash 0, which is never refused.
-                        if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                            reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
-                        }
-                        None
-                    }
-                };
+                );
 
                 #[cfg(feature = "latency-trace")]
                 {
@@ -2881,26 +2871,17 @@ impl<A: Application> MatchingStage<A> {
             // Shutdown path, so the advisory counters are left zero — but
             // the timestamp and key are the event's own, as on every other
             // path, since state may depend on them.
-            match dispatch(
+            let query_report = dispatch(
                 &mut self.app,
                 slot.event,
-                slot.request_seq,
                 &offline_ctx(slot.timestamp_ns, slot.key_hash),
                 &mut self.last_drain_ns,
                 |epoch| {
                     self.fence_state.observe_epoch(epoch);
                 },
                 reports,
-            ) {
-                Dispatched::Applied(query_report) => {
-                    debug_assert!(query_report.is_none(), "drain_remaining skips queries");
-                }
-                Dispatched::Refused => {
-                    if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                        reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
-                    }
-                }
-            }
+            );
+            debug_assert!(query_report.is_none(), "drain_remaining skips queries");
 
             #[allow(clippy::let_unit_value)]
             let match_complete_ts = mono_trace_ns();

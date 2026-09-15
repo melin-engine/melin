@@ -287,6 +287,15 @@ impl Application for Notary {
     ) -> Option<Self::QueryResponse> {
         match event {
             NotaryEvent::Notarize { leaf } => {
+                // Simplification, as in the counter example: every request
+                // is accepted, so a client retrying after losing its
+                // receipt lands a second entry. A production app decides
+                // its own policy for repeats, typically a per-client
+                // sequence carried in the event and checked here. Not to
+                // be confused with re-attesting the same digest under a
+                // new request, which is supported by design: a later
+                // position and a later time are a different commitment.
+                //
                 // `now_ns` is the sequencer's dispatch clock, journaled
                 // with the entry, so replay and replicas see the same
                 // value — which is what makes folding it deterministic.
@@ -314,16 +323,6 @@ impl Application for Notary {
     }
 
     fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
-
-    // Simplification, as in the counter example: always accepts, so a
-    // client retrying a request after losing its receipt lands a second
-    // entry. A production app decides its own dedup policy, typically a
-    // per-key high-water mark. Not to be confused with re-attesting the
-    // same digest under a new request, which is supported by design: a
-    // later position and a later time are a different commitment.
-    fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
-        true
-    }
 
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         NotaryReport::Rejected
@@ -705,7 +704,7 @@ mod tests {
     #[test]
     fn build_reject() {
         let event = NotaryEvent::Notarize { leaf: leaf(1) };
-        let report = Notary::build_reject(&event, RejectReason::DuplicateRequest);
+        let report = Notary::build_reject(&event, RejectReason::ReplicaDisconnected);
         assert_eq!(report, NotaryReport::Rejected);
     }
 

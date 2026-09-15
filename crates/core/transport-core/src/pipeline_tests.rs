@@ -588,9 +588,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gate_recovery_agreement.journal");
 
-    // Slot builder shared by both phases. `request_seq` increases
-    // monotonically across the recovery boundary so replayed dedup
-    // state can never collide with phase-2 traffic.
+    // Slot builder shared by both phases.
     let mut req_seq = 0u64;
     let mut make_slot = |event: JournalEvent<TestEvent>| {
         req_seq += 1;
@@ -1495,8 +1493,7 @@ fn journal_stage_rotates_on_manual_request() {
     let s = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&s));
 
-    // Publish an Add event with a unique request_seq so every event
-    // survives dedup at recovery time.
+    // Publish an Add event with a unique request_seq.
     let mut req_seq: u64 = 0;
     let mut publish_add = |amount: u64| {
         req_seq += 1;
@@ -4022,16 +4019,16 @@ fn dropping_the_disk_thread_handle_stops_and_joins_the_thread() {
     );
 }
 
-/// A request refused as a duplicate is still journaled (the journal stage
-/// writes before the matching stage decides), so every path that rebuilds
-/// state from the input stream must refuse it the same way the live
-/// matching stage did: no apply, and no clock advance. Three views of one
-/// history — the live engine, a replay of the journal it wrote, and the
-/// snapshot the shadow stage writes, which recovery restores from — must
-/// be the same state.
+/// The runtime refuses nothing on the application's behalf: a repeated
+/// submission reaches `apply` under its key every time, and what a repeat
+/// means is the application's decision. Three views of one history — the
+/// live engine, a replay of the journal it wrote, and the snapshot the
+/// shadow stage writes, which recovery restores from — must therefore
+/// hand `apply` the same events under the same keys, and be the same
+/// state.
 #[cfg(not(feature = "no-persist"))]
 #[test]
-fn a_refused_duplicate_is_invisible_to_live_replay_and_shadow() {
+fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     const KEY: u64 = 0xD0D0;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("duplicate.journal");
@@ -4096,14 +4093,19 @@ fn a_refused_duplicate_is_invisible_to_live_replay_and_shadow() {
     shutdown.store(true, Ordering::Relaxed);
     let _writer = t_journal.join().unwrap();
     let live = t_matching.join().unwrap();
-    assert_eq!(live.total, 12, "the live engine refused the duplicate");
+    assert_eq!(live.total, 17, "the live engine applied every submission");
+    assert_eq!(
+        live.per_key_total,
+        std::collections::HashMap::from([(KEY, 17)]),
+        "each one under the key that submitted it"
+    );
 
     let (replayed, _writer) = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path)
         .unwrap()
         .into_parts();
     assert_eq!(
         replayed, live,
-        "replay must refuse the duplicate as live did"
+        "replay must apply every submission as live did"
     );
 
     // The real shadow stage over the same slots, compared through the
@@ -4149,6 +4151,6 @@ fn a_refused_duplicate_is_invisible_to_live_replay_and_shadow() {
     let (shadow, _, _, _) = crate::snapshot::load::<TestApp>(&snap_path).unwrap();
     assert_eq!(
         shadow, live,
-        "the shadow's snapshot must refuse the duplicate as live did"
+        "the shadow's snapshot must apply every submission as live did"
     );
 }

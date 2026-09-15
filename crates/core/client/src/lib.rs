@@ -376,10 +376,8 @@ impl Connection {
 
     /// Send one request: `[request_seq: u64][tag][body]`, flushed.
     ///
-    /// `request_seq` is the per-key idempotency sequence the application
-    /// checks (see `Application::check_request_seq` in `melin-app`);
-    /// applications that accept every request still want it monotonic
-    /// per connection, which is what a counter gives.
+    /// `request_seq` is journaled with the request; what it means, if
+    /// anything, is the application's to decide.
     ///
     /// The body is copied once in user space, into the writer's buffer;
     /// there is no staging buffer in between. A body that would take the

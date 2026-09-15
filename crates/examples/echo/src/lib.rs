@@ -267,13 +267,6 @@ impl Application for Echo {
 
     fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
 
-    // Every request is accepted: an echo is idempotent by nature, so a
-    // repeated request sequence is not a fault worth refusing. See the
-    // trait docs for what an application with state would track here.
-    fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
-        true
-    }
-
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         EchoReport::Rejected
     }
@@ -502,7 +495,7 @@ mod tests {
     #[test]
     fn build_reject() {
         assert_eq!(
-            Echo::build_reject(&payload(b"x"), RejectReason::DuplicateRequest),
+            Echo::build_reject(&payload(b"x"), RejectReason::ReplicaDisconnected),
             EchoReport::Rejected
         );
     }

@@ -1178,9 +1178,6 @@ mod tests {
                 None
             }
             fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Rpt>) {}
-            fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
-                true
-            }
             fn build_reject(_e: &EvtAdd, _r: RejectReason) -> Rpt {
                 Rpt
             }

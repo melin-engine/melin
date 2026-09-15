@@ -408,8 +408,8 @@ mod tests {
         let mut a = TestApp::new();
         a.total = 12_345;
         a.ticks = 7;
-        a.key_hwm.insert(0xAA, 1);
-        a.key_hwm.insert(0xBB, 42);
+        a.per_key_total.insert(0xAA, 1);
+        a.per_key_total.insert(0xBB, 42);
         a
     }
 
@@ -483,7 +483,7 @@ mod tests {
             0,
             [0u8; 32],
             0,
-            &[0u8; 20], // arbitrary payload, matches restore requirements minus dedup map
+            &[0u8; 20], // arbitrary payload, matches restore requirements minus per-key map
         );
         std::fs::write(&path, &bytes).unwrap();
         match load::<TestApp>(&path) {
