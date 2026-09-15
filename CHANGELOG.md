@@ -12,6 +12,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`melin-pipeline`: `spsc::Consumer::refresh` and
+  `try_consume_visible`**, to consume only what was published before a
+  chosen point, and **`ring::Batch::next_sequence`**, the sequence the next
+  entry in a batch takes.
+
 ### Changed
 
 - **`MatchingStage::new` no longer takes the replica count, and
@@ -19,7 +26,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   every event it is given; halting is the readers' job (see Fixed).
   `spawn_reader`, `run_dpdk_poll`, `dpdk_response::run` and
   `response::Response` take the new halt gate and refusal queue from
-  `melin_server_runtime::halt`. Application traits are unchanged.
+  `melin_server_runtime::halt`. Application traits are unchanged, but
+  `Application::build_reject` now runs on the request-reading thread for a
+  halt rejection, rather than on the matching thread.
 
 ### Fixed
 

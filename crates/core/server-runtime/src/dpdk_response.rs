@@ -295,10 +295,12 @@ pub fn run<A: Application>(
         // Borrow output slots from the matching stage in place — see
         // `response::run` for why this is a borrow and not a copy, and
         // for the consequence of publishing progress after the batch
-        // instead of before it. The refusals' idle bound is taken before
-        // the read, which is what makes it sound.
+        // instead of before it. Refusals follow the order `RefusalQueue`
+        // documents: the idle bound before the read, the sync between the
+        // read and the control drain.
         let idle_refusal_bound = refusals.idle_bound();
         let slots = consumer.read_contiguous(MAX_BATCH);
+        let refusals_waiting = refusals.sync();
 
         // Poll control channel for connect/disconnect — after the ring
         // is read, never before: the poll thread queues `Connected` on
@@ -446,8 +448,9 @@ pub fn run<A: Application>(
 
             // First slot of an event: refusals stamped up to its sequence
             // go first, ahead of the gate. See `response::run`.
-            if slot.input_seq != last_input_seq {
-                last_input_seq = slot.input_seq;
+            let first_of_event = slot.input_seq != last_input_seq;
+            last_input_seq = slot.input_seq;
+            if refusals_waiting && first_of_event {
                 refusals.release(slot.input_seq, |refusal| {
                     push_refusal(
                         refusal,

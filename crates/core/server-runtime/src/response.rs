@@ -637,10 +637,12 @@ pub fn run<A: Application>(
         // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
         // the same rate either way.
         //
-        // The refusals' idle bound is taken first: it is only sound for a
-        // read that follows it (see `RefusalQueue::idle_bound`).
+        // Refusals follow the order `RefusalQueue` documents: the idle
+        // bound before the read, the sync between the read and the
+        // control drain.
         let idle_refusal_bound = refusals.idle_bound();
         let slots = consumer.read_contiguous(MAX_BATCH);
+        let refusals_waiting = refusals.sync();
 
         // Poll the control channel (non-blocking) for connect and
         // disconnect — after the ring is read, never before. A reply
@@ -964,9 +966,12 @@ pub fn run<A: Application>(
 
             // First slot of an event: every event before it has been
             // answered, so refusals stamped up to its sequence go first.
-            // Ahead of the gate, which holds this event, not them.
-            if slot.input_seq != last_input_seq {
-                last_input_seq = slot.input_seq;
+            // Ahead of the gate, which holds this event, not them. A
+            // refusal due here was visible before the read, so the
+            // iteration's sync decides for the whole batch.
+            let first_of_event = slot.input_seq != last_input_seq;
+            last_input_seq = slot.input_seq;
+            if refusals_waiting && first_of_event {
                 refusals.release(slot.input_seq, |refusal| {
                     append_refusal(
                         refusal,
@@ -4009,7 +4014,7 @@ mod tests {
 
         use crate::ControlEvent;
         use crate::ack_policy::AckPolicy;
-        use crate::halt::{Refusal, refusal_channel};
+        use crate::halt::{Refusal, RefusalQueue, refusal_channel};
         use crate::response::{Response, run};
 
         /// Bounds a read that must succeed; generous for a loaded box.
@@ -4045,12 +4050,7 @@ mod tests {
                     .build(WaitStrategy::SpinThenYield);
             let consumer = consumers.pop().expect("one consumer was requested");
 
-            let (server_sock, mut client_sock) = UnixStream::pair().expect("socketpair");
-            let server_fd = server_sock.as_raw_fd();
-            let writer = BlockingFrameWriter::new(Box::new(server_sock) as Box<dyn Write + Send>);
-            client_sock
-                .set_read_timeout(Some(READ_TIMEOUT))
-                .expect("set read timeout");
+            let (connected, mut client_sock) = connection(1);
 
             // The test plays the matching stage: it publishes the one
             // event's reply, then moves the progress past it.
@@ -4060,52 +4060,31 @@ mod tests {
             let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(0));
 
             let (control_tx, control_rx) = mpsc::channel();
-            control_tx
-                .send(ControlEvent::Connected {
-                    connection_id: 1,
-                    fd: server_fd,
-                    writer,
-                })
-                .expect("channel open");
+            control_tx.send(connected).expect("channel open");
             let shutdown = AtomicBool::new(false);
-            let config = Response::<Counter> {
-                journal_persisted_wire_seq: journal_cursor.clone(),
-                ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
-                replication_metrics: None,
-                replica_active: None,
-                heartbeat_interval: None,
-                wait: WaitStrategy::SpinThenYield,
-                utilization: Arc::new(StageUtilization::default()),
-                encoder: Arc::new(ResponseEncoder),
-                fence_state: Arc::new(FenceState::new(0)),
-                active_connections: Arc::new(AtomicU64::new(0)),
-                refusals: refusal_rx,
-                pause_after_control_drain: None,
-            };
+            let config = config(journal_cursor.clone(), refusal_rx, None);
+
+            // What a reader does for: refused write, accepted write,
+            // refused write — refusals visible before the event published
+            // after them. All in place before the stage starts, so its
+            // first iteration reads the event with both refusals behind
+            // it: the first goes out ahead of the event (the batch path),
+            // the second once the ring is empty (the idle path).
+            refusals.try_send(refusal(1, 0)).expect("queue has room");
+            refusals.try_send(refusal(1, 1)).expect("queue has room");
+            refusals.flush();
+            producer.publish(OutputSlot {
+                connection_id: 1,
+                input_seq: 0,
+                wire_seq: 1,
+                payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
+                is_last_in_request: true,
+                ..Default::default()
+            });
+            matching_progress.get().store(1, Ordering::Release);
 
             thread::scope(|scope| {
                 let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
-
-                // What a reader does for: refused write, accepted write,
-                // refused write. Refusals are visible before the event
-                // published after them.
-                let refusal = |input_seq| Refusal {
-                    connection_id: 1,
-                    input_seq,
-                    report: CounterReport::Rejected,
-                };
-                refusals.try_send(refusal(0)).expect("queue has room");
-                refusals.try_send(refusal(1)).expect("queue has room");
-                refusals.flush();
-                producer.publish(OutputSlot {
-                    connection_id: 1,
-                    input_seq: 0,
-                    wire_seq: 1,
-                    payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
-                    is_last_in_request: true,
-                    ..Default::default()
-                });
-                matching_progress.get().store(1, Ordering::Release);
 
                 let mut seen = Vec::new();
 
@@ -4157,6 +4136,128 @@ mod tests {
                     "replies out of request order"
                 );
             });
+        }
+
+        /// A refusal reaches the stage only with its connection registered.
+        /// The reader refuses a new connection's first request as soon as
+        /// that connection's `Connected` is queued, so a refusal made
+        /// visible while the stage is past its control drain can belong to
+        /// a connection the stage has not heard of. Released in that
+        /// iteration it would be dropped, and the client left without a
+        /// reply.
+        ///
+        /// The seam holds the stage after its drain twice. The first hold
+        /// lands connection 1's refusal, which the next iteration's idle
+        /// path is then due to release; the second hold, in that iteration,
+        /// lands connection 2 and its refusal just ahead of the release.
+        #[test]
+        fn a_refusal_is_not_released_ahead_of_its_connection() {
+            let (_producer, mut consumers) =
+                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                    .add_consumer()
+                    .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+            let (connected_1, mut client_1) = connection(1);
+            let (connected_2, mut client_2) = connection(2);
+
+            // Nothing is ever published, so no refusal waits on an event.
+            let progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
+            let (mut refusals, refusal_rx) = refusal_channel(progress);
+            let (control_tx, control_rx) = mpsc::channel();
+            control_tx.send(connected_1).expect("channel open");
+
+            let (parked_tx, parked_rx) = mpsc::channel::<()>();
+            let (resume_tx, resume_rx) = mpsc::channel::<()>();
+            let mut holds = 0;
+            let pause = move || {
+                if holds < 2 {
+                    holds += 1;
+                    parked_tx.send(()).expect("the test is waiting");
+                    resume_rx.recv().expect("the test resumes the stage");
+                }
+            };
+            let shutdown = AtomicBool::new(false);
+            let config = config(
+                DurableWireSeqCursor::detached(WireSeq::new(0)),
+                refusal_rx,
+                Some(Box::new(pause)),
+            );
+
+            thread::scope(|scope| {
+                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
+
+                parked_rx.recv().expect("the stage reaches the seam");
+                refusals.try_send(refusal(1, 0)).expect("queue has room");
+                refusals.flush();
+                resume_tx.send(()).expect("the stage is parked");
+
+                parked_rx.recv().expect("the stage reaches the seam again");
+                control_tx.send(connected_2).expect("stage is running");
+                refusals.try_send(refusal(2, 0)).expect("queue has room");
+                refusals.flush();
+                resume_tx.send(()).expect("the stage is parked");
+
+                let mut seen_1 = Vec::new();
+                let mut seen_2 = Vec::new();
+                let got_1 = (0..2).all(|_| read_into(&mut client_1, &mut seen_1));
+                let got_2 = (0..2).all(|_| read_into(&mut client_2, &mut seen_2));
+                shutdown.store(true, Ordering::Relaxed);
+                stage.join().expect("stage panicked");
+
+                assert!(got_1, "connection 1's refusal never arrived: {seen_1:x?}");
+                assert!(
+                    got_2,
+                    "connection 2's refusal was dropped: released before its connection registered"
+                );
+                for seen in [seen_1, seen_2] {
+                    assert_eq!(seen, [TAG_RESP_REJECTED, TAG_BATCH_END]);
+                }
+            });
+        }
+
+        /// A registered connection: its `Connected` event, and the client's
+        /// end of the socket.
+        fn connection(connection_id: u64) -> (ControlEvent, UnixStream) {
+            let (server_sock, client_sock) = UnixStream::pair().expect("socketpair");
+            client_sock
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .expect("set read timeout");
+            let event = ControlEvent::Connected {
+                connection_id,
+                fd: server_sock.as_raw_fd(),
+                writer: BlockingFrameWriter::new(Box::new(server_sock) as Box<dyn Write + Send>),
+            };
+            (event, client_sock)
+        }
+
+        fn refusal(connection_id: u64, input_seq: u64) -> Refusal<CounterReport> {
+            Refusal {
+                connection_id,
+                input_seq,
+                report: CounterReport::Rejected,
+            }
+        }
+
+        /// A stage gating on `journal_cursor` under `disk`, fed `refusals`.
+        fn config(
+            journal_cursor: DurableWireSeqCursor,
+            refusals: RefusalQueue<CounterReport>,
+            pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
+        ) -> Response<Counter> {
+            Response::<Counter> {
+                journal_persisted_wire_seq: journal_cursor,
+                ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
+                replication_metrics: None,
+                replica_active: None,
+                heartbeat_interval: None,
+                wait: WaitStrategy::SpinThenYield,
+                utilization: Arc::new(StageUtilization::default()),
+                encoder: Arc::new(ResponseEncoder),
+                fence_state: Arc::new(FenceState::new(0)),
+                active_connections: Arc::new(AtomicU64::new(0)),
+                refusals,
+                pause_after_control_drain,
+            }
         }
     }
 }
