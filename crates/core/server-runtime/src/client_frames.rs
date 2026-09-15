@@ -9,13 +9,15 @@
 
 use tracing::debug;
 
-use melin_app::AppEvent;
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
+use melin_app::{AppEvent, Application};
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::{MonoTraceInstant, mono_trace_ns};
+
+use crate::halt::{HaltGate, Refusal, RefusalSender};
 
 /// Bound on one client request frame, after the 4-byte length prefix:
 /// the wire protocol's, so a client library and a node agree on it by
@@ -37,9 +39,10 @@ pub(crate) enum FrameAction {
     /// An oversized frame was encountered. Prior frames were committed.
     /// Caller should drop the connection.
     Disconnect,
-    /// The pipeline ring is full. Prior frames were committed. The frame
-    /// that triggered full was consumed from `parse_buf` (bytes dropped).
-    /// Caller should signal backpressure (e.g. ServerBusy).
+    /// The pipeline ring — or, while halted, the refusal queue — is full.
+    /// Prior frames were committed. The frame that triggered full was
+    /// consumed from `parse_buf` (bytes dropped). Caller should signal
+    /// backpressure (e.g. ServerBusy).
     PipelineFull,
 }
 
@@ -49,6 +52,11 @@ pub(crate) enum FrameAction {
 /// `decoder`, and publishes permitted events to the input ring under
 /// batched commits (cap: 16 events per commit to bound consumer
 /// visibility delay). Compacts `parse_buf` on return.
+///
+/// While `halt` refuses writes, a permitted write is not published: its
+/// rejection goes to `refusals`, stamped with the input sequence it would
+/// have taken (see [`crate::halt`]). Queries are published either way.
+/// The halt is sampled once per call, so one receive is judged as a whole.
 ///
 /// Returns [`FrameAction`] so the caller can handle transport-specific
 /// side effects (ServerBusy write, transport close, control events).
@@ -62,13 +70,15 @@ pub(crate) enum FrameAction {
 /// forward for later frames in a multi-frame recv). `()` (zero-sized)
 /// when `latency-trace` is disabled.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn process_client_frames<E: AppEvent>(
+pub(crate) fn process_client_frames<A: Application>(
     parse_buf: &mut Vec<u8>,
     connection_id: u64,
     key_hash: u64,
     permission: Permission,
-    producer: &mut ring::Producer<InputSlot<E>>,
-    decoder: &dyn RequestDecoder<Event = E>,
+    producer: &mut ring::Producer<InputSlot<A::Event>>,
+    decoder: &dyn RequestDecoder<Event = A::Event>,
+    halt: &HaltGate,
+    refusals: &mut RefusalSender<A::Report>,
     batch_wall_ns: u64,
     recv_ts: MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
@@ -82,6 +92,7 @@ pub(crate) fn process_client_frames<E: AppEvent>(
     // visibility delay (see reader.rs for the measured rationale).
     const COMMIT_EVERY: u64 = 16;
     let mut batch = producer.batch();
+    let refusal_reason = halt.refusal_reason();
 
     while cursor + 4 <= parse_buf.len() {
         let len_bytes: [u8; 4] = parse_buf[cursor..cursor + 4]
@@ -118,6 +129,21 @@ pub(crate) fn process_client_frames<E: AppEvent>(
             Decoded::Permitted { request_seq, event } => (request_seq, event),
         };
 
+        if let Some(reason) = refusal_reason
+            && !event.is_query()
+        {
+            let refusal = Refusal {
+                connection_id,
+                input_seq: batch.next_sequence(),
+                report: A::build_reject(&event, reason),
+            };
+            if refusals.try_send(refusal).is_err() {
+                result = FrameAction::PipelineFull;
+                break;
+            }
+            continue;
+        }
+
         let ts = if event.is_query() { 0 } else { batch_wall_ns };
         let event = JournalEvent::App(event);
 
@@ -151,11 +177,17 @@ pub(crate) fn process_client_frames<E: AppEvent>(
         ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
 
         if batch.len() >= COMMIT_EVERY {
+            refusals.flush();
             batch.commit();
             batch = producer.batch();
         }
     }
 
+    // Refusals become visible before the events published after them, at
+    // every commit. The other way round, the response stage could answer
+    // such an event before it sees the refusal that came first, and send
+    // the two replies out of order.
+    refusals.flush();
     batch.commit();
 
     // Compact: shift remaining bytes to the front.

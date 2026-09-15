@@ -324,7 +324,7 @@ Before sending any response, the response stage verifies that the corresponding 
 
 The check is made **per response**, not once per batch. A response is released as soon as its own event satisfies the policy, so a request does not wait on unrelated requests that happened to be processed alongside it. Since the acked position is a high-water mark, a client that receives a response knows that event and every event before it satisfies the configured policy.
 
-Responses whose delivery does not depend on the policy are exempt from the wait entirely. The halt rejection sent when the matching engine has stopped is the case that matters in practice: it reports no engine state, so it is delivered immediately rather than blocking on a policy that a degraded cluster may not be able to satisfy.
+The one reply exempt from the wait is the refusal of a write while the node is halted. The write is refused before it enters the pipeline, so there is no event to wait on; the refusal is sent once the replies to everything received before it on that connection have gone out, keeping replies in request order.
 
 The acked position is cached across batches to avoid redundant atomic loads when the policy's cursors are running ahead of the response stage.
 

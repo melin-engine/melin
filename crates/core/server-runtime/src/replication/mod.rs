@@ -83,7 +83,7 @@ mod validation_worker;
 use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
 
 /// Writer-side view of the trading-halt gate (the `replicas_connected`
-/// counter). The matching stage refuses new orders while the count is zero, so
+/// counter). The readers refuse client writes while the count is zero, so
 /// the counter must reflect the number of replicas that have **authenticated**
 /// — a bare connection must not lift the halt. Both senders (kernel-TCP and
 /// DPDK) lift/lower the gate through this view so the policy, the memory

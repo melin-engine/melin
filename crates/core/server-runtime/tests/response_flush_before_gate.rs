@@ -15,16 +15,18 @@
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
+use melin_pipeline::padding::CachePadded;
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::ControlEvent;
 use melin_server_runtime::ack_policy::AckPolicy;
+use melin_server_runtime::halt;
 use melin_server_runtime::response::{self, Response};
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
@@ -84,6 +86,8 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         encoder: Arc::new(ResponseEncoder),
         fence_state: Arc::new(FenceState::new(0)),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // No reader: nothing is ever refused.
+        refusals: halt::refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1,
     }
 }
 

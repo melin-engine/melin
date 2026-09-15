@@ -17,7 +17,7 @@
 # instead of silently emptying the group again. Adding a new
 # cluster-spawning test binary means adding it here.
 [[profile.default.overrides]]
-filter = 'binary(raft_failover) + binary(raft_smoke) + binary(empty_seed)'
+filter = 'binary(raft_failover) + binary(raft_smoke) + binary(empty_seed) + binary(replicated_failover) + binary(halt_refusal)'
 test-group = 'cluster-serial'
 
 [test-groups]

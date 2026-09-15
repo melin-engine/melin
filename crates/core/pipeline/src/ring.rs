@@ -487,6 +487,12 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
         self.count
     }
 
+    /// Sequence the next entry written into this batch takes: the count of
+    /// entries published before it, committed or still in this batch.
+    pub fn next_sequence(&self) -> u64 {
+        self.start_seq + self.count
+    }
+
     /// True when no entries have been written yet.
     pub fn is_empty(&self) -> bool {
         self.count == 0
@@ -1230,6 +1236,30 @@ mod tests {
             assert_eq!(consumers[0].try_consume(), Some((i, i * 10)));
         }
         assert_eq!(consumers[0].try_consume(), None);
+    }
+
+    #[test]
+    fn batch_next_sequence_counts_committed_and_pending_entries() {
+        let (mut producer, _consumers) = DisruptorBuilder::<u64>::new(8)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        producer.publish_with(|slot| *slot = 1);
+
+        let mut batch = producer.batch();
+        assert_eq!(
+            batch.next_sequence(),
+            1,
+            "one entry committed before the batch"
+        );
+        let seq = batch.try_push_with(|slot| *slot = 2).unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(
+            batch.next_sequence(),
+            2,
+            "the pending entry counts before commit"
+        );
+        batch.commit();
+        assert_eq!(producer.batch().next_sequence(), 2);
     }
 
     #[test]

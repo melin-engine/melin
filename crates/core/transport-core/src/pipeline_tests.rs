@@ -6,9 +6,8 @@
 //! pipeline source was extracted from there; now that the pipeline lives
 //! here, the infrastructure-level tests do too.
 //!
-//! Business-flavoured pipeline tests (halt-gate behaviour, etc.) remain
-//! in the engine crate where the trading-specific reject shapes and
-//! event variants are natural.
+//! A halted node refuses client writes before they reach the pipeline;
+//! that behaviour is tested with the server runtime's readers.
 
 #![cfg(test)]
 
@@ -205,7 +204,6 @@ fn matching_stage_processes_events() {
         events_counter,
         dummy_cursor,
         active_conns,
-        None, // standalone — no halt check
         Arc::new(crate::fence::FenceState::new(0)),
         WaitStrategy::SpinThenYield,
         1, // starting_wire_seq (test does not exercise the gate)
@@ -287,7 +285,6 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         events_counter,
         dummy_cursor,
         active_conns,
-        None,
         Arc::clone(&fence),
         WaitStrategy::SpinThenYield,
         STARTING_WIRE_SEQ,
@@ -1011,11 +1008,8 @@ fn journal_stage_sends_replication_batches() {
         .replication_consumers
         .expect("replication should be enabled");
 
-    // Mark a replica connected so the matching stage doesn't halt and
-    // the journal stage publishes to replication rings.
-    if let Some(ref count) = out.replicas_connected {
-        count.store(1, Ordering::Relaxed);
-    }
+    // Mark a replica connected so the journal stage publishes to
+    // replication rings.
     if let Some(ref rp) = out.replication_ring_progress {
         rp.active_flags[0].store(true, Ordering::Relaxed);
     }
@@ -1295,11 +1289,8 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         Arc::new(crate::fence::FenceState::new(0)),
     );
 
-    // Mark a replica as connected so the primary doesn't halt and
-    // its journal stage actually publishes to the replication ring.
-    if let Some(ref count) = primary.replicas_connected {
-        count.store(1, Ordering::Relaxed);
-    }
+    // Mark a replica as connected so the primary's journal stage
+    // actually publishes to the replication ring.
     if let Some(ref rp) = primary.replication_ring_progress {
         rp.active_flags[0].store(true, Ordering::Relaxed);
     }
@@ -2645,9 +2636,6 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         melin_pipeline::seqlock::split(crate::pipeline::FsyncState::default());
     replica.journal_stage.set_chain_hash_lock(r_fsync_writer);
 
-    if let Some(ref count) = primary.replicas_connected {
-        count.store(1, Ordering::Relaxed);
-    }
     if let Some(ref rp) = primary.replication_ring_progress {
         rp.active_flags[0].store(true, Ordering::Relaxed);
     }
