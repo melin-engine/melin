@@ -18,6 +18,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `try_consume_visible`**, to consume only what was published before a
   chosen point, and **`ring::Batch::next_sequence`**, the sequence the next
   entry in a batch takes.
+- **`melin_writes_refused_total` on `/metrics`**, a counter of client
+  writes turned away while the node was halted, labelled
+  `reason="replica_disconnected"` or `reason="superseded"`. A refused write
+  is never journaled, so until now it left no trace at all.
 
 ### Changed
 

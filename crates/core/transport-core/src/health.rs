@@ -40,11 +40,45 @@ use tracing::{debug, error, info};
 use crate::cursors::{PipelineCursors, RingPos, WireSeq};
 use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};
 
+/// Client writes turned away at ingress while the node was halted, by
+/// halt reason.
+///
+/// A refused write is never journaled, so this is the only trace it
+/// leaves: the halt's duration says how long clients were turned away,
+/// these say how much. Written by the client reader (one add per receive
+/// that refused something, never on the steady-state path) and read by
+/// the health endpoint. Plain `AtomicU64`s, not cache-padded: a single
+/// writer, off the hot path, and monotonic counters that cannot wrap.
+pub struct RefusedWrites {
+    /// Replication configured and no replica connected.
+    pub replica_disconnected: AtomicU64,
+    /// A newer primary had superseded (fenced) this node.
+    pub superseded: AtomicU64,
+}
+
+impl RefusedWrites {
+    pub fn new() -> Self {
+        Self {
+            replica_disconnected: AtomicU64::new(0),
+            superseded: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for RefusedWrites {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared monitoring state passed to the health loop.
 /// Bundles all the atomics/cursors into one struct to avoid parameter explosion.
 pub struct HealthState {
     pub active_connections: Arc<AtomicU64>,
     pub events_processed: Arc<AtomicU64>,
+    /// Writes refused at ingress while halted. Stays at zero on a node
+    /// that never halts (standalone, or a replica).
+    pub refused_writes: Arc<RefusedWrites>,
     /// Journal-progress cursors, space-typed. The `journal_seq` gauge reads
     /// `durable_wire_seq` (wire-seq); the ring positions drive queue-depth, and
     /// the replica quorum cursor drives replication lag. See [`PipelineCursors`].
@@ -118,6 +152,7 @@ impl HealthState {
         Self {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             cursors: PipelineCursors::new(
                 WireSeq::new(0),
                 Arc::new(Sequence::new(AtomicU64::new(0))),
@@ -244,6 +279,10 @@ struct HealthSnapshot {
     replication_lag: u64,
     input_queue_depth: u64,
     trading: bool,
+    /// Writes refused at ingress while halted, by reason — see
+    /// [`RefusedWrites`].
+    refused_replica_disconnected: u64,
+    refused_superseded: u64,
     /// Number of replicas currently connected. 0 in standalone mode.
     replicas_connected: u32,
     /// Per-replica lag: journal_seq - acked_sequence (0 if no ack yet).
@@ -505,6 +544,11 @@ impl HealthSnapshot {
             replication_lag,
             input_queue_depth,
             trading,
+            refused_replica_disconnected: state
+                .refused_writes
+                .replica_disconnected
+                .load(Ordering::Relaxed),
+            refused_superseded: state.refused_writes.superseded.load(Ordering::Relaxed),
             replicas_connected: replicas_connected_val,
             per_replica_lag,
             per_replica_bytes_sent,
@@ -622,6 +666,10 @@ impl HealthSnapshot {
              # HELP melin_trading_active Whether the engine is accepting orders (1) or halted (0).\n\
              # TYPE melin_trading_active gauge\n\
              melin_trading_active {}\n\
+             # HELP melin_writes_refused_total Client writes turned away at ingress while the node was halted, by halt reason (replica_disconnected = replication configured and no replica connected; superseded = fenced by a newer primary). A refused write is never journaled; the client is told the reason, or ServerBusy when the refusal queue is full.\n\
+             # TYPE melin_writes_refused_total counter\n\
+             melin_writes_refused_total{{reason=\"replica_disconnected\"}} {}\n\
+             melin_writes_refused_total{{reason=\"superseded\"}} {}\n\
              # HELP melin_replicas_connected Number of replicas currently connected.\n\
              # TYPE melin_replicas_connected gauge\n\
              melin_replicas_connected {}\n\
@@ -708,6 +756,8 @@ impl HealthSnapshot {
             self.input_queue_depth,
             INPUT_RING_CAPACITY,
             trading_val,
+            self.refused_replica_disconnected,
+            self.refused_superseded,
             self.replicas_connected,
             self.per_replica_acked_sequence[0],
             self.per_replica_acked_sequence[1],
@@ -1256,6 +1306,7 @@ mod tests {
         let state = HealthState {
             active_connections: active,
             events_processed: Arc::clone(&events),
+            refused_writes: Arc::new(RefusedWrites::new()),
             // The gauge reads `durable_wire_seq`; the ring cursors only feed
             // queue depth. Seed all three from `journal_seq` so "fully caught
             // up, empty queue" holds for most tests (depth = input − matching
@@ -1387,6 +1438,7 @@ mod tests {
             HealthState {
                 active_connections: Arc::clone(&active),
                 events_processed: Arc::clone(&events),
+                refused_writes: Arc::new(RefusedWrites::new()),
                 cursors: test_cursors(99, 99, 99, u64::MAX),
                 input_cursor: Box::new(MockCursor(AtomicU64::new(99))),
                 pipeline_healthy: Arc::clone(&healthy),
@@ -1422,6 +1474,7 @@ mod tests {
             HealthState {
                 active_connections: Arc::new(AtomicU64::new(0)),
                 events_processed: Arc::new(AtomicU64::new(0)),
+                refused_writes: Arc::new(RefusedWrites::new()),
                 cursors: test_cursors(0, 0, 0, u64::MAX),
                 input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
                 pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1583,6 +1636,7 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             cursors: test_cursors(1_000_000, 3, 1, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(5))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1630,6 +1684,59 @@ mod tests {
         let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
         assert!(response.contains("melin_pipeline_healthy 0\n"));
         assert!(response.contains("melin_trading_active 0\n"));
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    /// The refusal counters are exported per reason, and a node that has
+    /// never halted exports them at zero rather than omitting the series.
+    #[test]
+    fn refused_writes_in_metrics() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+        let refused = Arc::new(RefusedWrites::new());
+
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::clone(&refused),
+            cursors: test_cursors(0, 0, 0, u64::MAX),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: None,
+            fence_state: None,
+            replication_metrics: None,
+            replica_active: None,
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
+        };
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            response.contains("melin_writes_refused_total{reason=\"replica_disconnected\"} 0\n"),
+            "series present at zero: {response}"
+        );
+        assert!(response.contains("melin_writes_refused_total{reason=\"superseded\"} 0\n"));
+
+        refused.replica_disconnected.store(12, Ordering::Relaxed);
+        refused.superseded.store(3, Ordering::Relaxed);
+        let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            response.contains("melin_writes_refused_total{reason=\"replica_disconnected\"} 12\n"),
+            "counter read live: {response}"
+        );
+        assert!(response.contains("melin_writes_refused_total{reason=\"superseded\"} 3\n"));
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -1685,6 +1792,7 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             cursors: test_cursors(1000, 1000, 900, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1752,6 +1860,7 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -1828,6 +1937,7 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             // The engaged slot at acked 4990 drives the fastest-replica
             // gauge, which must decode back to the acked wire seq.
             cursors: test_cursors(5000, 5000, 5000, 4990),
@@ -1882,6 +1992,7 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -2133,6 +2244,7 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             // Quorum cursor = slowest acked (slot 1's 800), consistent with
             // the per-slot metrics above.
             cursors: test_cursors(1000, 1000, 1000, 800),
@@ -2218,6 +2330,7 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             cursors: test_cursors(1_000, 1_000, 1_000, 0),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1_000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -2297,6 +2410,7 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             cursors: cursors.clone(),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
@@ -2461,6 +2575,7 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
+            refused_writes: Arc::new(RefusedWrites::new()),
             cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
