@@ -211,14 +211,34 @@ impl<T: Copy + Default> Producer<T> {
 impl<T: Copy + Default> Consumer<T> {
     /// Try to read the next entry. Returns `None` if empty.
     pub fn try_consume(&mut self) -> Option<(u64, T)> {
-        let tail = self.shared.tail.get().load(Ordering::Relaxed);
+        if let Some(entry) = self.try_consume_visible() {
+            return Some(entry);
+        }
+        // Re-read head in case producer has advanced.
+        self.refresh();
+        self.try_consume_visible()
+    }
 
+    /// Re-read the producer's cursor, making everything published up to
+    /// now visible to [`try_consume_visible`](Self::try_consume_visible).
+    #[inline]
+    pub fn refresh(&mut self) {
+        self.cached_head = self.shared.head.get().load(Ordering::Acquire);
+    }
+
+    /// Read the next entry among those visible at the last
+    /// [`refresh`](Self::refresh) (or the last cursor read of any consume
+    /// call), without reading the producer's cursor. Returns `None` once
+    /// they are consumed, even if the producer has published more since.
+    ///
+    /// For a consumer that must act only on what was published before a
+    /// point of its choosing, and for one that polls often and wants to
+    /// pay the cursor load once per round rather than per poll.
+    #[inline]
+    pub fn try_consume_visible(&mut self) -> Option<(u64, T)> {
+        let tail = self.shared.tail.get().load(Ordering::Relaxed);
         if self.cached_head <= tail {
-            // Re-read head in case producer has advanced.
-            self.cached_head = self.shared.head.get().load(Ordering::Acquire);
-            if self.cached_head <= tail {
-                return None;
-            }
+            return None;
         }
 
         let idx = (tail & self.shared.mask) as usize;
@@ -365,6 +385,29 @@ mod tests {
         assert_eq!(consumer.try_consume(), Some((1, 2)));
         assert_eq!(consumer.try_consume(), Some((2, 3)));
         assert_eq!(consumer.try_consume(), None);
+    }
+
+    #[test]
+    fn try_consume_visible_stops_at_the_last_refresh() {
+        let (mut producer, mut consumer) = channel::<u64>(8, WaitStrategy::SpinThenYield);
+        producer.publish(1);
+        assert_eq!(
+            consumer.try_consume_visible(),
+            None,
+            "published, but not yet seen"
+        );
+
+        consumer.refresh();
+        producer.publish(2);
+        assert_eq!(consumer.try_consume_visible(), Some((0, 1)));
+        assert_eq!(
+            consumer.try_consume_visible(),
+            None,
+            "published after the refresh"
+        );
+
+        consumer.refresh();
+        assert_eq!(consumer.try_consume_visible(), Some((1, 2)));
     }
 
     #[test]

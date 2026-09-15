@@ -278,6 +278,8 @@ This avoids adding any cross-thread synchronization cost on the trading hot path
 
 The matching stage does **not** wait for the journal stage. Both consumers are gated only on the producer, so matching proceeds as soon as events are published. The persist-before-ack check is deferred to the response stage. This means the matching stage may process events that are not yet durable -- but no client will see those results until the journal confirms durability.
 
+It also means the matching stage cannot refuse an event: by the time it sees one, the journal stage may already have recorded it, and replay would apply what was refused. A node that halts because it cannot honour its ack policy (see [replication.md](replication.md)) therefore refuses client writes at ingress, before they are published, and the matching stage applies everything it is given.
+
 ### Idle behavior
 
 Waits according to its thread's wait strategy, like every other stage — see [Waiting](#waiting).

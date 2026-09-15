@@ -32,6 +32,14 @@
 //! answered ([`RefusalQueue::release`]). The reader makes each refusal
 //! visible before it commits anything published after it, so the response
 //! stage cannot reach a later event without seeing the refusal first.
+//!
+//! The response stage works from a snapshot of the queue, taken once per
+//! iteration between reading the output ring and draining its control
+//! channel ([`RefusalQueue::sync`]). Before the drain, because a refusal
+//! must never reach the stage ahead of its connection's registration;
+//! after the read, because that is when every refusal due before an event
+//! in the batch is already visible. One snapshot per iteration is also
+//! all the steady state pays: no poll per event.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -53,7 +61,6 @@ use melin_transport_core::fence::FenceState;
 pub(crate) const REFUSAL_QUEUE_CAPACITY: usize = 4096;
 
 /// A reader's view of whether this node takes client writes.
-#[derive(Clone)]
 pub struct HaltGate {
     /// Replicas currently streaming, maintained by the replication
     /// senders. `None` in standalone mode, which never halts for want of
@@ -64,6 +71,9 @@ pub struct HaltGate {
 }
 
 impl HaltGate {
+    /// A gate over the node's replica count (`None` in standalone mode)
+    /// and its fence latch — the same two the health endpoint reports as
+    /// `trading` or `halted`.
     pub fn new(replicas_connected: Option<Arc<AtomicU32>>, fence_state: Arc<FenceState>) -> Self {
         Self {
             replicas_connected,
@@ -154,30 +164,52 @@ impl<R: Copy> RefusalSender<R> {
 }
 
 /// The response stage's end of the refusal queue.
+///
+/// Everything here works on the refusals taken in by the last
+/// [`sync`](Self::sync); those made visible since wait for the next one.
+/// A stage iteration goes:
+///
+/// 1. [`idle_bound`](Self::idle_bound), then read the output ring;
+/// 2. [`sync`](Self::sync), then drain the control channel;
+/// 3. [`release`](Self::release) — with the idle bound if the read came
+///    back empty, else before the first slot of each event in the batch.
 pub struct RefusalQueue<R> {
     rx: spsc::Consumer<Option<Refusal<R>>>,
-    /// The oldest refusal, taken off the ring but not yet released.
+    /// The oldest synced refusal, taken off the ring but not yet released.
     head: Option<Refusal<R>>,
     matching_progress: Arc<Sequence>,
 }
 
 impl<R: Copy> RefusalQueue<R> {
-    /// The release bound for a response stage that is about to read the
-    /// output ring, to use if that read comes back empty: the matching
-    /// stage's progress on the input ring. `None` when no refusal waits,
-    /// so the steady state leaves the matching stage's counter alone.
+    /// The release bound for an iteration whose output read comes back
+    /// empty: the matching stage's progress on the input ring. `None` when
+    /// no synced refusal waits, so the steady state leaves the matching
+    /// stage's counter alone.
     ///
-    /// Must be taken *before* the read. Every event below the progress
-    /// had all its output slots published before the progress moved, so a
-    /// read that finds the ring empty afterwards has seen all of them.
+    /// Must be taken *before* the read. Every event below the progress had
+    /// all its output slots published before the progress moved, so a read
+    /// that finds the ring empty afterwards has seen all of them.
     #[inline]
     pub fn idle_bound(&mut self) -> Option<u64> {
         self.peek()?;
         Some(self.matching_progress.get().load(Ordering::Acquire))
     }
 
-    /// Hand `emit` every waiting refusal whose request came before
-    /// `bound`, oldest first.
+    /// Take in the refusals the reader has made visible so far, and report
+    /// whether any waits. One load of the queue's cursor.
+    ///
+    /// Call after reading the output ring, so that every refusal due before
+    /// an event in that batch is taken in, and before draining the control
+    /// channel, so that every refusal taken in belongs to a connection the
+    /// drain registers.
+    #[inline]
+    pub fn sync(&mut self) -> bool {
+        self.rx.refresh();
+        self.peek().is_some()
+    }
+
+    /// Hand `emit` every synced refusal whose request came before `bound`,
+    /// oldest first.
     ///
     /// Call with the input sequence of an output slot before handling the
     /// first slot of that event — everything published before it has been
@@ -195,10 +227,15 @@ impl<R: Copy> RefusalQueue<R> {
         }
     }
 
+    /// The oldest synced refusal. Never reads the queue's cursor, so it
+    /// cannot see past the last [`sync`](Self::sync).
     fn peek(&mut self) -> Option<Refusal<R>> {
         if self.head.is_none() {
             // Only `try_send` writes the ring, and it never writes `None`.
-            self.head = self.rx.try_consume().and_then(|(_, refusal)| refusal);
+            self.head = self
+                .rx
+                .try_consume_visible()
+                .and_then(|(_, refusal)| refusal);
         }
         self.head
     }
@@ -253,12 +290,41 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_visible_before_flush() {
+    fn a_refusal_waits_for_both_the_flush_and_a_sync() {
         let (mut tx, mut rx) = refusal_channel::<u64>(progress(10));
         tx.try_send(refusal(1, 0)).unwrap();
-        assert_eq!(rx.idle_bound(), None);
+        assert!(!rx.sync(), "not flushed");
+
         tx.flush();
+        assert_eq!(rx.idle_bound(), None, "flushed, not yet synced");
+        let mut released = Vec::new();
+        rx.release(u64::MAX, |r| released.push(r.connection_id));
+        assert!(released.is_empty(), "release sees only synced refusals");
+
+        assert!(rx.sync());
         assert_eq!(rx.idle_bound(), Some(10));
+    }
+
+    /// The snapshot is what keeps a refusal behind its connection's
+    /// registration: one made visible after the sync — after the stage has
+    /// drained its control channel — waits for the next iteration.
+    #[test]
+    fn release_does_not_reach_past_the_sync() {
+        let (mut tx, mut rx) = refusal_channel::<u64>(progress(0));
+        tx.try_send(refusal(1, 0)).unwrap();
+        tx.flush();
+        assert!(rx.sync());
+        tx.try_send(refusal(2, 0)).unwrap();
+        tx.flush();
+
+        let mut released = Vec::new();
+        rx.release(u64::MAX, |r| released.push(r.connection_id));
+        assert_eq!(released, [1]);
+
+        assert!(rx.sync());
+        rx.release(u64::MAX, |r| released.push(r.connection_id));
+        assert_eq!(released, [1, 2]);
+        assert!(!rx.sync(), "queue drained");
     }
 
     #[test]
@@ -268,6 +334,7 @@ mod tests {
             tx.try_send(refusal(conn, seq)).unwrap();
         }
         tx.flush();
+        assert!(rx.sync());
 
         let mut released = Vec::new();
         rx.release(2, |r| released.push(r.connection_id));
@@ -285,7 +352,8 @@ mod tests {
 
         rx.release(9, |r| released.push(r.connection_id));
         assert_eq!(released, [1, 2, 3, 4]);
-        assert_eq!(rx.idle_bound(), None, "queue drained");
+        assert!(!rx.sync(), "queue drained");
+        assert_eq!(rx.idle_bound(), None);
     }
 
     #[test]

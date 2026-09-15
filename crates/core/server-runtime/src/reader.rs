@@ -1727,6 +1727,7 @@ mod tests {
         );
 
         let mut refused = Vec::new();
+        assert!(queue.sync(), "the refusals are flushed");
         queue.release(u64::MAX, |r| refused.push(r));
         let expect = |input_seq, byte| crate::halt::Refusal {
             connection_id: 7,
@@ -1761,6 +1762,7 @@ mod tests {
 
         assert!(drain(&mut consumer).is_empty());
         let mut reasons = Vec::new();
+        assert!(queue.sync(), "the refusal is flushed");
         queue.release(u64::MAX, |r| reasons.push(r.report.1));
         assert_eq!(reasons, [RejectReason::Superseded]);
     }

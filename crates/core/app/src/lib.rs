@@ -100,7 +100,7 @@ pub enum RejectReason {
     DuplicateRequest,
     /// Replication is configured but no replica is currently connected;
     /// the transport refuses state-mutating events to preserve the
-    /// persist-before-ack invariant.
+    /// persist-before-ack invariant. A refused event is not journaled.
     ReplicaDisconnected,
     /// This node was superseded by a higher-epoch primary (fenced) and is
     /// self-demoting. State-mutating events are refused because the node is
@@ -337,6 +337,13 @@ pub trait Application: Sized {
     /// Called by the transport before `apply` has observed the event.
     /// No access to `&self` — the reject must be constructible from the
     /// event alone (plus the transport's reason).
+    ///
+    /// Where it runs depends on the reason. A duplicate is rejected on the
+    /// matching thread, in sequence with every other event. A halted node
+    /// ([`ReplicaDisconnected`](RejectReason::ReplicaDisconnected),
+    /// [`Superseded`](RejectReason::Superseded)) rejects on the thread that
+    /// reads client requests, before the event is sequenced: the event is
+    /// never journaled and never reaches the application.
     fn build_reject(event: &Self::Event, reason: RejectReason) -> Self::Report;
 
     /// Serialise the application's live state into `w`. The transport
