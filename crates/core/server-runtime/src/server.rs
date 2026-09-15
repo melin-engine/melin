@@ -1441,7 +1441,7 @@ where
 
     // Client writes a halted node refuses at ingress, reader → response
     // stage, counted for the health endpoint. See `crate::halt`.
-    let refused_writes = Arc::new(melin_transport_core::health::RefusedWrites::new());
+    let refused_writes = Arc::new(AtomicU64::new(0));
     let halt_gate = crate::halt::HaltGate::new(
         replicas_connected.clone(),
         Arc::clone(&fence_state),
@@ -2686,7 +2686,7 @@ where
 
     // Client writes a halted node refuses at ingress, poll thread →
     // response stage, counted for the health endpoint. See `crate::halt`.
-    let refused_writes = Arc::new(melin_transport_core::health::RefusedWrites::new());
+    let refused_writes = Arc::new(AtomicU64::new(0));
     let halt_gate = crate::halt::HaltGate::new(
         replicas_connected.clone(),
         Arc::clone(&fence_state),
@@ -3364,7 +3364,7 @@ fn spawn_health_endpoint(
     config: &ServerConfig,
     active_connections: &Arc<AtomicU64>,
     events_processed: &Arc<AtomicU64>,
-    refused_writes: &Arc<melin_transport_core::health::RefusedWrites>,
+    refused_writes: &Arc<AtomicU64>,
     cursors: &melin_transport_core::PipelineCursors,
     input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
     pipeline_healthy: &Arc<AtomicBool>,

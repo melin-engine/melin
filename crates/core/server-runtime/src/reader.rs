@@ -1336,9 +1336,9 @@ mod tests {
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
-    use melin_transport_core::health::RefusedWrites;
     use std::io::{ErrorKind, Read};
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     /// The reader's enter policy. Each case is a syscall-per-drain
@@ -1553,14 +1553,14 @@ mod tests {
     /// A halt gate: `replicas` connected (`None` for standalone), fenced
     /// or not.
     fn gate(replicas: Option<u32>, fenced: bool) -> HaltGate {
-        gate_counting_into(replicas, fenced, Arc::new(RefusedWrites::new()))
+        gate_counting_into(replicas, fenced, Arc::new(AtomicU64::new(0)))
     }
 
     /// [`gate`], counting what it refuses into `refused`.
     fn gate_counting_into(
         replicas: Option<u32>,
         fenced: bool,
-        refused: Arc<RefusedWrites>,
+        refused: Arc<AtomicU64>,
     ) -> HaltGate {
         let fence = Arc::new(melin_transport_core::fence::FenceState::new(0));
         if fenced {
@@ -1573,12 +1573,8 @@ mod tests {
         )
     }
 
-    fn refused_counts(refused: &RefusedWrites) -> (u64, u64) {
-        use std::sync::atomic::Ordering;
-        (
-            refused.replica_disconnected.load(Ordering::Relaxed),
-            refused.superseded.load(Ordering::Relaxed),
-        )
+    fn refused_count(refused: &AtomicU64) -> u64 {
+        refused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A refusal queue whose idle bound is never consulted by these tests.
@@ -1721,7 +1717,7 @@ mod tests {
             conn.parse_buf.extend_from_slice(&frame(byte));
         }
         let (mut refusals, mut queue) = refusal_channel();
-        let counted = Arc::new(RefusedWrites::new());
+        let counted = Arc::new(AtomicU64::new(0));
 
         let (disconnect, control_rx) = run_process_frames_with(
             &mut conn,
@@ -1733,8 +1729,8 @@ mod tests {
         assert_eq!(busy_events(&control_rx), 0);
         assert!(conn.parse_buf.is_empty(), "every frame consumed");
         assert_eq!(
-            refused_counts(&counted),
-            (2, 0),
+            refused_count(&counted),
+            2,
             "the two writes are counted, the queries are not"
         );
 
@@ -1766,32 +1762,37 @@ mod tests {
         );
     }
 
-    /// A fenced node refuses with `Superseded`, whatever its replica count.
+    /// A fenced node closes the connection, whatever its replica count:
+    /// nothing is published, nothing is refused, nothing is counted.
     #[test]
-    fn a_fenced_reader_refuses_with_superseded() {
+    fn a_fenced_reader_closes_the_connection() {
         let Fixture {
             mut conn,
             mut producer,
             mut consumer,
             ..
         } = make_fixture(16);
-        conn.parse_buf.extend_from_slice(&frame(0x01));
+        for byte in [0x01, 0xFF] {
+            conn.parse_buf.extend_from_slice(&frame(byte));
+        }
         let (mut refusals, mut queue) = refusal_channel();
-        let counted = Arc::new(RefusedWrites::new());
+        let counted = Arc::new(AtomicU64::new(0));
 
-        run_process_frames_with(
+        let (disconnect, control_rx) = run_process_frames_with(
             &mut conn,
             &mut producer,
             &gate_counting_into(Some(1), true, Arc::clone(&counted)),
             &mut refusals,
         );
 
-        assert!(drain(&mut consumer).is_empty());
-        let mut reasons = Vec::new();
-        assert!(queue.sync(), "the refusal is flushed");
-        queue.release(u64::MAX, |r| reasons.push(r.report.1));
-        assert_eq!(reasons, [RejectReason::Superseded]);
-        assert_eq!(refused_counts(&counted), (0, 1));
+        assert!(disconnect, "the connection is dropped");
+        assert_eq!(busy_events(&control_rx), 0);
+        assert!(
+            drain(&mut consumer).is_empty(),
+            "not even the query is published"
+        );
+        assert!(!queue.sync(), "no refusal is queued");
+        assert_eq!(refused_count(&counted), 0);
     }
 
     /// Refusals that cannot be queued shed load the way a full input ring
@@ -1812,7 +1813,7 @@ mod tests {
             report: (TestEvent::Cmd(0), RejectReason::ReplicaDisconnected),
         };
         while refusals.try_send(filler).is_ok() {}
-        let counted = Arc::new(RefusedWrites::new());
+        let counted = Arc::new(AtomicU64::new(0));
 
         let (disconnect, control_rx) = run_process_frames_with(
             &mut conn,
@@ -1825,8 +1826,8 @@ mod tests {
         assert_eq!(busy_events(&control_rx), 1);
         assert!(drain(&mut consumer).is_empty());
         assert_eq!(
-            refused_counts(&counted),
-            (1, 0),
+            refused_count(&counted),
+            1,
             "a shed write still counts as refused by the halt"
         );
     }

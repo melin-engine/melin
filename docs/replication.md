@@ -168,8 +168,8 @@ replicated, so no replay or failover can bring it back. Its rejection does
 not wait on the ack policy, but it does keep its place on the connection:
 it goes out after the replies to the client's earlier requests. Because
 the journal never sees a refused write, the node counts them: the
-`melin_writes_refused_total` counter on `/metrics`, labelled by reason,
-says how many writes a halt cost.
+`melin_writes_refused_total` counter on `/metrics` says how many writes a
+halt cost.
 
 Writes the node accepted just before the halt are applied as usual, and
 their replies wait on the ack policy like any other — sent once a replica
@@ -178,8 +178,11 @@ superseded or stopped first. A node stopped while such a reply waits stops
 promptly and drops it; the write stays journaled and applied, so a retry
 after reconnect is answered as a duplicate.
 
-A node superseded by a newer primary refuses writes the same way, with the
-`Superseded` reason code.
+A node superseded by a newer primary does not refuse: it is stopping, and
+answers nothing. A connection that sends anything while it winds down is
+closed at once, and every connection is closed when the process exits.
+Clients see a reset, as they would on a crash, and reconnect to the new
+primary. No reject reason names this case.
 
 Standalone deployments (no replication configured) skip this halt
 entirely and run under `disk`.
@@ -712,13 +715,12 @@ normal-case post-recovery state.
   `melin_trading_active` gauge) reports `halted` on a fenced node even
   while replicas remain connected — point load-balancer probes and
   failover alerting at it.
-- `melin_writes_refused_total{reason="replica_disconnected"|"superseded"}`
-  (Prometheus counter) — client writes turned away at ingress while the
-  node was halted, by reason. A refused write is never journaled, so this
-  is its only trace; `increase()` over a halt says how many writes it
-  cost, which the gauge's duration cannot. Standalone nodes and replicas
-  export the series at zero. Resets on process restart, like every
-  counter here.
+- `melin_writes_refused_total` (Prometheus counter) — client writes
+  turned away at ingress while the node was halted. A refused write is
+  never journaled, so this is its only trace; `increase()` over a halt
+  says how many writes it cost, which the gauge's duration cannot.
+  Standalone nodes and replicas export the series at zero. Resets on
+  process restart, like every counter here.
 - `melin_ack_policy_degraded` (Prometheus gauge on the health
   endpoint) — `1` while the active policy can't be satisfied by the
   current cluster shape, `0` otherwise. Alert on sustained `1`.

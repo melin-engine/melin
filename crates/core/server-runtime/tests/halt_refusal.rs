@@ -189,11 +189,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
     );
     // The reader counts the refusal after committing the receive it came
     // in; the reply can beat it, hence the wait.
-    wait_for_gauge(
-        primary_health,
-        "melin_writes_refused_total{reason=\"replica_disconnected\"}",
-        1,
-    );
+    wait_for_gauge(primary_health, "melin_writes_refused_total", 1);
 
     // --- Taking writes again: a replica attaches, the refused write is resent. ---
     let mut replica_config = node_config("replica2", &replica_key);
