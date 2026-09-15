@@ -118,9 +118,9 @@ fn run(cli: Cli) -> Result<(), Error> {
 /// The clock stops at the reply frame, not at the batch end that follows
 /// it — the reply is what the caller waited for — which is why this
 /// reads frame by frame instead of asking the client for the batch.
-fn echo(node: &mut Connection, seq: u64, payload: &[u8]) -> Result<Duration, Error> {
+fn echo(node: &mut Connection, request: u64, payload: &[u8]) -> Result<Duration, Error> {
     let started = Instant::now();
-    node.send(seq, TAG_ECHO, payload)?;
+    node.send(TAG_ECHO, payload)?;
     let elapsed = match node.next_frame()? {
         Frame::Response(reply) => {
             let elapsed = started.elapsed();
@@ -128,7 +128,7 @@ fn echo(node: &mut Connection, seq: u64, payload: &[u8]) -> Result<Duration, Err
                 return Err("the server rejected the request".into());
             }
             if reply.first() != Some(&TAG_RESP_ECHO) || reply[1..] != payload[..] {
-                return Err(format!("the reply to request {seq} is not what was sent").into());
+                return Err(format!("the reply to request {request} is not what was sent").into());
             }
             elapsed
         }

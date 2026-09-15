@@ -61,7 +61,6 @@ pub trait JournalWrite<E: AppEvent>: Sized {
         timestamp_ns: u64,
         event: &JournalEvent<E>,
         key_hash: u64,
-        request_seq: u64,
     ) -> Result<(), JournalError>;
 
     /// Write the accumulated batch and force it to stable media.
@@ -133,7 +132,7 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Encode and durably flush a single event.
     #[inline]
     fn append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        let seq = self.batch_append_with_ts(event, unix_epoch_nanos(), 0, 0)?;
+        let seq = self.batch_append_with_ts(event, unix_epoch_nanos(), 0)?;
         self.flush_batch_sync()?;
         Ok(seq)
     }
@@ -147,10 +146,9 @@ pub trait JournalWrite<E: AppEvent>: Sized {
         event: &JournalEvent<E>,
         timestamp_ns: u64,
         key_hash: u64,
-        request_seq: u64,
     ) -> Result<u64, JournalError> {
         let seq = self.allocate_sequence();
-        self.encode_event(seq, timestamp_ns, event, key_hash, request_seq)?;
+        self.encode_event(seq, timestamp_ns, event, key_hash)?;
         Ok(seq)
     }
 }
@@ -187,9 +185,8 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
         timestamp_ns: u64,
         event: &JournalEvent<E>,
         key_hash: u64,
-        request_seq: u64,
     ) -> Result<(), JournalError> {
-        BufferedWriter::encode_event(self, seq, timestamp_ns, event, key_hash, request_seq)
+        BufferedWriter::encode_event(self, seq, timestamp_ns, event, key_hash)
     }
 
     #[inline]
@@ -309,7 +306,7 @@ mod tests {
         assert_eq!(seq + 1, writer.next_sequence());
         let ts = unix_epoch_nanos();
         writer
-            .encode_event(seq, ts, &JournalEvent::App(TestEvent(seq)), 0, 0)
+            .encode_event(seq, ts, &JournalEvent::App(TestEvent(seq)), 0)
             .unwrap();
 
         // Replication framing slice should now be populated.

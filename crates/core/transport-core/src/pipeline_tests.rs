@@ -102,7 +102,6 @@ fn add_slot(n: u64, timestamp_ns: u64) -> TestInput {
     InputSlot {
         connection_id: 1,
         key_hash: 0,
-        request_seq: 0,
         sequence: 0,
         timestamp_ns,
         event: JournalEvent::App(TestEvent::Add(n)),
@@ -321,7 +320,6 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         input_producer.publish(InputSlot {
             connection_id: conn_id,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event,
@@ -461,15 +459,14 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     // the report-less Tick — emits exactly one output slot (same
     // invariant as the lockstep test above), letting the drain below
     // count inputs 1:1.
-    let mut req_seq = 0u64;
+    let mut published = 0u64;
     let mut publish = |event: JournalEvent<TestEvent>| {
-        req_seq += 1;
+        published += 1;
         input_producer.publish(InputSlot {
             connection_id: 1,
             key_hash: 1,
-            request_seq: req_seq,
             sequence: 0,
-            timestamp_ns: 1_000_000_000 + req_seq,
+            timestamp_ns: 1_000_000_000 + published,
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -589,15 +586,14 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     let path = dir.path().join("gate_recovery_agreement.journal");
 
     // Slot builder shared by both phases.
-    let mut req_seq = 0u64;
+    let mut made = 0u64;
     let mut make_slot = |event: JournalEvent<TestEvent>| {
-        req_seq += 1;
+        made += 1;
         InputSlot {
             connection_id: 1,
             key_hash: 1,
-            request_seq: req_seq,
             sequence: 0,
-            timestamp_ns: 1_000_000_000 + req_seq,
+            timestamp_ns: 1_000_000_000 + made,
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -1317,7 +1313,6 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
                     replica_input.publish(InputSlot {
                         connection_id: 0,
                         key_hash: slot.key_hash,
-                        request_seq: slot.request_seq,
                         sequence: slot.sequence,
                         timestamp_ns: slot.timestamp_ns,
                         event: slot.event,
@@ -1493,16 +1488,15 @@ fn journal_stage_rotates_on_manual_request() {
     let s = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&s));
 
-    // Publish an Add event with a unique request_seq.
-    let mut req_seq: u64 = 0;
+    // Publish an Add event with a distinct timestamp.
+    let mut published: u64 = 0;
     let mut publish_add = |amount: u64| {
-        req_seq += 1;
+        published += 1;
         producer.publish(InputSlot {
             connection_id: 1,
             key_hash: 1,
-            request_seq: req_seq,
             sequence: 0,
-            timestamp_ns: 1_000_000_000 + req_seq,
+            timestamp_ns: 1_000_000_000 + published,
             event: JournalEvent::App(TestEvent::Add(amount)),
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -1588,7 +1582,6 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
                 seq,
                 1_000_000_000 + seq,
                 &JournalEvent::App(TestEvent::Add(seq)),
-                0,
                 0,
             )
             .unwrap();
@@ -1973,7 +1966,6 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
                 1_000_000_000 + seq,
                 &JournalEvent::App(TestEvent::Add(seq)),
                 0,
-                0,
             )
             .unwrap();
             if BOUNDARIES.contains(&seq) {
@@ -2187,7 +2179,6 @@ fn adopted_rotation_honors_second_mark_in_same_batch() {
                 1_000_000_000 + seq,
                 &JournalEvent::App(TestEvent::Add(seq)),
                 0,
-                0,
             )
             .unwrap();
             if seq == 2 {
@@ -2396,7 +2387,6 @@ fn chain_check_mark_verifies_at_exact_position() {
                 seq,
                 1_000_000_000 + seq,
                 &JournalEvent::App(TestEvent::Add(seq)),
-                0,
                 0,
             )
             .unwrap();
@@ -2668,7 +2658,6 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
                         replica_input.publish(InputSlot {
                             connection_id: 0,
                             key_hash: slot.key_hash,
-                            request_seq: slot.request_seq,
                             sequence: slot.sequence,
                             timestamp_ns: slot.timestamp_ns,
                             event: slot.event,
@@ -2956,7 +2945,6 @@ fn journal_stage_rotates_on_size_threshold() {
     producer.publish(InputSlot {
         connection_id: 1,
         key_hash: 1,
-        request_seq: 1,
         sequence: 0,
         timestamp_ns: 1_000_000_000,
         event: JournalEvent::App(TestEvent::Add(42)),
@@ -3107,7 +3095,7 @@ fn preparer_arms_for_size_and_replica_modes_only() {
 fn size_trigger_tracks_the_segments_real_size() {
     const THRESHOLD: u64 = 16 * 1024;
     /// Generous bound on one encoded entry for this test's event type
-    /// (framing is 41 bytes; `TestEvent::MAX_ENCODED_SIZE` is 9).
+    /// (`ENTRY_FRAMING_SIZE` plus `TestEvent::MAX_ENCODED_SIZE`).
     const ONE_ENTRY: u64 = 256;
 
     let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
@@ -3432,15 +3420,14 @@ fn rotate_storm_collapses_to_single_rotation() {
     let s = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&s));
 
-    let mut req_seq: u64 = 0;
+    let mut published: u64 = 0;
     let mut publish = |amount: u64| {
-        req_seq += 1;
+        published += 1;
         producer.publish(InputSlot {
             connection_id: 1,
             key_hash: 1,
-            request_seq: req_seq,
             sequence: 0,
-            timestamp_ns: 1_000_000 + req_seq,
+            timestamp_ns: 1_000_000 + published,
             event: JournalEvent::App(TestEvent::Add(amount)),
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -3513,15 +3500,14 @@ fn post_rotation_events_land_in_live_not_archive() {
     let s = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&s));
 
-    let mut req_seq: u64 = 0;
+    let mut published: u64 = 0;
     let mut publish = |producer: &mut ring::Producer<TestInput>, amount: u64| {
-        req_seq += 1;
+        published += 1;
         producer.publish(InputSlot {
             connection_id: 1,
             key_hash: 1,
-            request_seq: req_seq,
             sequence: 0,
-            timestamp_ns: 1_000_000 + req_seq,
+            timestamp_ns: 1_000_000 + published,
             event: JournalEvent::App(TestEvent::Add(amount)),
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -3623,7 +3609,6 @@ fn pipeline_journals_every_event_in_order() {
         producer.publish(InputSlot {
             connection_id: 1,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000 + amount,
             event: JournalEvent::App(TestEvent::Add(amount)),
@@ -3670,7 +3655,6 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
         InputSlot {
             connection_id: 1,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event,
@@ -4059,13 +4043,11 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
 
     // A request, its duplicate a millisecond later, then a new request.
-    let slots = [(5, 1, 1_000_000), (5, 1, 2_000_000), (7, 2, 3_000_000)].map(
-        |(n, request_seq, timestamp_ns)| TestInput {
+    let slots =
+        [(5, 1_000_000), (5, 2_000_000), (7, 3_000_000)].map(|(n, timestamp_ns)| TestInput {
             key_hash: KEY,
-            request_seq,
             ..add_slot(n, timestamp_ns)
-        },
-    );
+        });
     for slot in slots {
         input_producer.publish(slot);
     }

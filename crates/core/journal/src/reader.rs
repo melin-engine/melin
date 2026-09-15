@@ -67,8 +67,6 @@ pub struct JournalEntry<E: AppEvent> {
     pub timestamp_ns: u64,
     /// Hash of the client's Ed25519 public key. Zero for internal/seed events.
     pub key_hash: u64,
-    /// Per-key request sequence number.
-    pub request_seq: u64,
     /// The event that was journaled.
     pub event: JournalEvent<E>,
 }
@@ -169,15 +167,9 @@ impl<E: AppEvent> JournalReader<E> {
         let data = &self.buffer[self.pos..self.valid];
 
         match codec::decode(data) {
-            Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => self
-                .validate_and_advance(
-                    consumed,
-                    sequence,
-                    timestamp_ns,
-                    key_hash,
-                    request_seq,
-                    event,
-                ),
+            Ok((consumed, sequence, timestamp_ns, key_hash, event)) => {
+                self.validate_and_advance(consumed, sequence, timestamp_ns, key_hash, event)
+            }
             Err(JournalError::TruncatedEntry) => {
                 // Could be a partial entry at EOF or we need more data.
                 if self.try_extend_buffer()? {
@@ -191,16 +183,14 @@ impl<E: AppEvent> JournalReader<E> {
                     }
 
                     match codec::decode(data) {
-                        Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => {
-                            self.validate_and_advance(
+                        Ok((consumed, sequence, timestamp_ns, key_hash, event)) => self
+                            .validate_and_advance(
                                 consumed,
                                 sequence,
                                 timestamp_ns,
                                 key_hash,
-                                request_seq,
                                 event,
-                            )
-                        }
+                            ),
                         // Truly truncated — crash recovery case.
                         Err(JournalError::TruncatedEntry) => Ok(None),
                         Err(e) => self.classify_decode_error(e),
@@ -320,7 +310,6 @@ impl<E: AppEvent> JournalReader<E> {
         sequence: u64,
         timestamp_ns: u64,
         key_hash: u64,
-        request_seq: u64,
         event: JournalEvent<E>,
     ) -> Result<Option<JournalEntry<E>>, JournalError> {
         // The first entry must carry the header's starting_sequence —
@@ -370,7 +359,6 @@ impl<E: AppEvent> JournalReader<E> {
             sequence,
             timestamp_ns,
             key_hash,
-            request_seq,
             event,
         }))
     }
@@ -822,7 +810,7 @@ mod tests {
     /// buffer holds the entry header but not the payload, decode
     /// returns `TruncatedEntry`, `try_extend_buffer` compacts the
     /// consumed prefix and reads more, decode succeeds. With 100
-    /// entries and a 64-byte buffer (one entry ≈ 49 bytes), the seam
+    /// entries and a 32-byte buffer (one entry ≈ 41 bytes), the seam
     /// is crossed dozens of times within the same scan.
     #[test]
     fn entries_straddling_buffer_boundary_decode_correctly() {
@@ -839,7 +827,7 @@ mod tests {
         // Tiny buffer (< one entry) guarantees a refill straddles
         // every entry. The grow path also fires once when the buffer
         // is full of header bytes but still can't fit the payload.
-        let mut reader = JournalReader::<TestEvent>::open_with_buffer(&path, 64).unwrap();
+        let mut reader = JournalReader::<TestEvent>::open_with_buffer(&path, 32).unwrap();
         let mut decoded = Vec::new();
         while let Some(entry) = reader.next_entry().unwrap() {
             decoded.push(entry);
@@ -940,8 +928,7 @@ mod tests {
 
         // Forge a fully valid entry (correct CRC) that re-uses seq 2.
         let mut scratch = [0u8; 256];
-        let len =
-            codec::encode(2, 0, 0, 0, &JournalEvent::App(TestEvent(99)), &mut scratch).unwrap();
+        let len = codec::encode(2, 0, 0, &JournalEvent::App(TestEvent(99)), &mut scratch).unwrap();
         use std::io::{Seek, SeekFrom};
         let mut file = OpenOptions::new()
             .read(true)
@@ -1000,7 +987,7 @@ mod tests {
         let mut scratch = [0u8; 256];
         let entry_len = {
             let event: JournalEvent<TestEvent> = JournalEvent::App(TestEvent(99));
-            codec::encode(9_999, 0, 0, 0, &event, &mut scratch).unwrap()
+            codec::encode(9_999, 0, 0, &event, &mut scratch).unwrap()
         };
         scratch[entry_len - CRC_SIZE..entry_len].fill(0);
 
@@ -1040,7 +1027,7 @@ mod tests {
         let mut scratch = [0u8; 256];
         let entry_len = {
             let event: JournalEvent<TestEvent> = JournalEvent::App(TestEvent(1));
-            codec::encode(1, 0, 0, 0, &event, &mut scratch).unwrap()
+            codec::encode(1, 0, 0, &event, &mut scratch).unwrap()
         };
         scratch[entry_len - CRC_SIZE..entry_len].fill(0);
 
@@ -1094,14 +1081,12 @@ mod tests {
             9_999,
             0,
             0,
-            0,
             &JournalEvent::App(TestEvent(98)),
             &mut scratch1,
         )
         .unwrap();
         let len2 = codec::encode(
             10_000,
-            0,
             0,
             0,
             &JournalEvent::App(TestEvent(99)),
@@ -1149,11 +1134,11 @@ mod tests {
 
         // Overwrite the sequence number of the second user entry to a
         // skipped value. Layout: each entry = ENTRY_HEADER_SIZE(20) +
-        // payload_len + CRC_SIZE(4). For TestEvent, payload = 17
-        // (key_hash+request_seq+tag) + 8 (payload) = 25. Full = 49.
+        // payload_len + CRC_SIZE(4). For TestEvent, payload = 9
+        // (key_hash+tag) + 8 (payload) = 17. Full = 41.
         // The layout is identical under both feature configs — chain
         // metadata lives in the file header, not the entry stream.
-        const FIRST_ENTRY_SIZE: u64 = 20 + 25 + 4;
+        const FIRST_ENTRY_SIZE: u64 = 20 + 17 + 4;
         let second_seq_offset = ENTRY_OFFSET + FIRST_ENTRY_SIZE + 4;
         let mut file = OpenOptions::new()
             .read(true)
@@ -1197,8 +1182,7 @@ mod tests {
 
         // Forge: rewrite the first entry with sequence 200 (valid CRC).
         let mut scratch = [0u8; 256];
-        let len =
-            codec::encode(200, 0, 0, 0, &JournalEvent::App(TestEvent(1)), &mut scratch).unwrap();
+        let len = codec::encode(200, 0, 0, &JournalEvent::App(TestEvent(1)), &mut scratch).unwrap();
         use std::io::{Seek, SeekFrom};
         let mut file = OpenOptions::new()
             .read(true)

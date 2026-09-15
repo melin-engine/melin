@@ -149,7 +149,6 @@ impl<E: AppEvent> BufferedWriter<E> {
         timestamp_ns: u64,
         event: &JournalEvent<E>,
         key_hash: u64,
-        request_seq: u64,
     ) -> Result<(), JournalError> {
         // The encoder cannot grow a buffer it does not own, so keep a
         // whole entry's headroom ahead of it. `entry_size::<E>()` rather
@@ -170,14 +169,8 @@ impl<E: AppEvent> BufferedWriter<E> {
             );
             self.batch_buf.resize(grown, 0);
         }
-        self.encoder.encode_event(
-            &mut self.batch_buf,
-            seq,
-            timestamp_ns,
-            event,
-            key_hash,
-            request_seq,
-        )
+        self.encoder
+            .encode_event(&mut self.batch_buf, seq, timestamp_ns, event, key_hash)
     }
 
     /// Write the accumulated batch and force it to stable media.
@@ -482,17 +475,17 @@ mod tests {
         let tick = JournalEvent::Tick { now_ns: u64::MAX };
         let tick_len = {
             let mut probe = [0u8; crate::encoder::MAX_ENTRY_SIZE];
-            codec::encode(1, 0, 0, 0, &tick, &mut probe).unwrap()
+            codec::encode(1, 0, 0, &tick, &mut probe).unwrap()
         };
 
         while BATCH_BUF_CAPACITY - w.encoder.batch_len() >= tick_len {
             let seq = w.allocate_sequence();
-            w.encode_event(seq, 1_000, &JournalEvent::App(TinyEvent), 0, 0)
+            w.encode_event(seq, 1_000, &JournalEvent::App(TinyEvent), 0)
                 .expect("narrow entry");
         }
 
         let seq = w.allocate_sequence();
-        w.encode_event(seq, 2_000, &tick, 0, 0)
+        w.encode_event(seq, 2_000, &tick, 0)
             .expect("a tick must always fit the reserved headroom");
     }
 
@@ -533,7 +526,7 @@ mod tests {
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         for i in 1..=10u64 {
-            writer.batch_append_with_ts(&sample(i), 0, 0, 0).unwrap();
+            writer.batch_append_with_ts(&sample(i), 0, 0).unwrap();
         }
         // Before flush, no user data has reached disk past the header.
         // After flush, all ten entries land in one pwrite.
@@ -549,8 +542,8 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        writer.batch_append_with_ts(&sample(1), 0, 0, 0).unwrap();
-        writer.batch_append_with_ts(&sample(2), 0, 0, 0).unwrap();
+        writer.batch_append_with_ts(&sample(1), 0, 0).unwrap();
+        writer.batch_append_with_ts(&sample(2), 0, 0).unwrap();
         assert!(!writer.pending_batch_bytes().is_empty());
 
         writer.discard_batch_buf();
@@ -859,7 +852,7 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        writer.batch_append_with_ts(&sample(42), 0, 0, 0).unwrap();
+        writer.batch_append_with_ts(&sample(42), 0, 0).unwrap();
 
         // The full encoded entry is [magic(2) | header | payload | CRC(4)].
         // The replication slice strips the leading magic and trailing CRC.

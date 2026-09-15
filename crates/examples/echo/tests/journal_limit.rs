@@ -36,7 +36,7 @@ fn widest_event_encodes_to_exactly_the_reserved_entry_size() {
 
     let mut buf = [0u8; MAX_ENTRY_SIZE];
     let written =
-        codec::encode(1, 0, 0, 0, &JournalEvent::App(event), &mut buf).expect("encodes cleanly");
+        codec::encode(1, 0, 0, &JournalEvent::App(event), &mut buf).expect("encodes cleanly");
 
     println!(
         "MAX_ENCODED_SIZE={}  entry={written}B  reserved={}B  batch={} of {MAX_JOURNAL_BATCH}",
@@ -75,10 +75,10 @@ fn the_width_shortens_the_journal_batch() {
 #[test]
 fn an_entry_costs_the_bytes_it_carries() {
     let mut buf = [0u8; MAX_ENTRY_SIZE];
-    let empty = codec::encode(1, 0, 0, 0, &JournalEvent::App(echo_of(0)), &mut buf)
+    let empty = codec::encode(1, 0, 0, &JournalEvent::App(echo_of(0)), &mut buf)
         .expect("the empty payload encodes");
     for len in [1, 17, 255, 256, MAX_PAYLOAD] {
-        let written = codec::encode(1, 0, 0, 0, &JournalEvent::App(echo_of(len)), &mut buf)
+        let written = codec::encode(1, 0, 0, &JournalEvent::App(echo_of(len)), &mut buf)
             .expect("every size encodes");
         assert_eq!(written, empty + len, "a {len}-byte payload");
         assert!(written <= entry_size::<Payload>());

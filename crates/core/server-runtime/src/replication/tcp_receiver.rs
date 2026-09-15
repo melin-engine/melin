@@ -1363,7 +1363,6 @@ mod tests {
                 &[InputSlot::<EvtAdd> {
                     connection_id: 0,
                     key_hash: 0,
-                    request_seq: 0,
                     sequence: 1,
                     timestamp_ns: 1,
                     event: JournalEvent::App(EvtAdd(1)),
@@ -1525,7 +1524,6 @@ mod tests {
                     &[InputSlot::<EvtAdd> {
                         connection_id: 0,
                         key_hash: 0,
-                        request_seq: 0,
                         sequence: 1,
                         timestamp_ns: 1,
                         event: JournalEvent::App(EvtAdd(1)),
@@ -1699,7 +1697,6 @@ mod tests {
                 &[InputSlot::<EvtAdd> {
                     connection_id: 0,
                     key_hash: 0,
-                    request_seq: 0,
                     sequence: 1,
                     timestamp_ns: 1,
                     event: JournalEvent::App(EvtAdd(1)),
@@ -1745,7 +1742,6 @@ mod tests {
                 &[InputSlot::<EvtAdd> {
                     connection_id: 0,
                     key_hash: 0,
-                    request_seq: 0,
                     sequence: 6,
                     timestamp_ns: 6,
                     event: JournalEvent::App(EvtAdd(6)),
@@ -1946,7 +1942,6 @@ mod tests {
                 &[InputSlot::<EvtAdd> {
                     connection_id: 0,
                     key_hash: 0,
-                    request_seq: 0,
                     sequence: 1,
                     timestamp_ns: 1,
                     event: JournalEvent::App(EvtAdd(1)),
@@ -2061,7 +2056,7 @@ mod tests {
             let primary_journal = dir.path().join("primary.journal");
             let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
             for v in 1..=2u64 {
-                w.batch_append_with_ts(&JournalEvent::App(EvtAdd(v)), v, 0, 0)
+                w.batch_append_with_ts(&JournalEvent::App(EvtAdd(v)), v, 0)
                     .expect("append");
             }
             w.flush_batch_sync().expect("flush");
@@ -2123,7 +2118,6 @@ mod tests {
                     .map(|v| InputSlot {
                         connection_id: 0,
                         key_hash: 0,
-                        request_seq: 0,
                         sequence: v,
                         timestamp_ns: v,
                         event: JournalEvent::App(EvtAdd(v)),

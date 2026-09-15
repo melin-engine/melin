@@ -190,8 +190,8 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
     std::io::Read::read_exact(stream, &mut frame_buf[..frame_len])
         .map_err(|e| format!("read auth frame payload: {e}"))?;
 
-    let (_seq, cr) = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
-        Ok(pair) => pair,
+    let cr = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
+        Ok(cr) => cr,
         Err(e) => {
             send_auth_failed(stream);
             return Err(format!("decode ChallengeResponse: {e}"));
@@ -481,10 +481,9 @@ mod tests {
         let nonce = &frame_buf[1..33];
 
         // Reply with a ChallengeResponse:
-        // [len:u32][seq:u64][TAG_CHALLENGE_RESPONSE][sig:64][pubkey:32].
+        // [len:u32][TAG_CHALLENGE_RESPONSE][sig:64][pubkey:32].
         let signature = key.sign(nonce);
-        let mut frame = Vec::with_capacity(105);
-        frame.extend_from_slice(&0u64.to_le_bytes()); // request_seq
+        let mut frame = Vec::with_capacity(97);
         frame.push(TAG_CHALLENGE_RESPONSE);
         frame.extend_from_slice(&signature.to_bytes());
         frame.extend_from_slice(&key.verifying_key().to_bytes());

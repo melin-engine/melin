@@ -856,7 +856,6 @@ mod tests {
             gap_seq,
             0,
             0,
-            0,
             &JournalEvent::App(TestEvent(99)),
             &mut scratch,
         )

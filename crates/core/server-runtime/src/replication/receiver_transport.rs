@@ -1010,8 +1010,7 @@ mod tests {
     fn slot(primary_seq: u64, tag: u64) -> InputSlot<TestEvent> {
         InputSlot {
             connection_id: 0,
-            key_hash: 0,
-            request_seq: tag,
+            key_hash: tag,
             sequence: primary_seq,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent(tag as u8)),
@@ -1233,7 +1232,7 @@ mod tests {
         assert!(matches!(result.exit, SessionExit::Promote));
         let slots = drain(&mut consumer);
         assert_eq!(slots.len(), 1, "promote drain should publish pending data");
-        assert_eq!(slots[0].request_seq, 0x01);
+        assert_eq!(slots[0].key_hash, 0x01);
     }
 
     #[test]
@@ -1339,7 +1338,7 @@ mod tests {
         assert!(result.heard_from_primary);
         let slots = drain(&mut consumer);
         assert_eq!(slots.len(), 1);
-        assert_eq!(slots[0].request_seq, 0x42);
+        assert_eq!(slots[0].key_hash, 0x42);
     }
 
     #[test]
@@ -1667,7 +1666,7 @@ mod tests {
 
         let slots = drain(&mut consumer);
         assert_eq!(slots.len(), 4);
-        let ids: Vec<u64> = slots.iter().map(|s| s.request_seq).collect();
+        let ids: Vec<u64> = slots.iter().map(|s| s.key_hash).collect();
         assert_eq!(ids, vec![0xA0, 0xA1, 0xA2, 0xA3]);
     }
 
@@ -2437,7 +2436,7 @@ mod tests {
         assert_eq!(outcome.consumed, buf.len());
         assert_eq!(outcome.accum_end_sequence, 22);
         let slots = drain(&mut consumer);
-        let ids: Vec<u64> = slots.iter().map(|s| s.request_seq).collect();
+        let ids: Vec<u64> = slots.iter().map(|s| s.key_hash).collect();
         assert_eq!(ids, vec![0xE0, 0xE1, 0xE2]);
     }
 

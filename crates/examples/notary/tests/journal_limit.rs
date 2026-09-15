@@ -29,7 +29,7 @@ fn widest_event_encodes_to_exactly_the_reserved_entry_size() {
 
     let mut buf = [0u8; MAX_ENTRY_SIZE];
     let written =
-        codec::encode(1, 0, 0, 0, &JournalEvent::App(event), &mut buf).expect("encodes cleanly");
+        codec::encode(1, 0, 0, &JournalEvent::App(event), &mut buf).expect("encodes cleanly");
 
     println!(
         "MAX_ENCODED_SIZE={}  entry={written}B  reserved={}B  batch={} of {MAX_JOURNAL_BATCH}",
@@ -51,7 +51,7 @@ fn every_variant_fits_the_reserved_entry_size() {
         NotaryEvent::GetHead,
     ] {
         let mut buf = [0u8; MAX_ENTRY_SIZE];
-        let written = codec::encode(1, 0, 0, 0, &JournalEvent::App(event), &mut buf)
+        let written = codec::encode(1, 0, 0, &JournalEvent::App(event), &mut buf)
             .expect("every variant encodes");
         assert!(
             written <= entry_size::<NotaryEvent>(),

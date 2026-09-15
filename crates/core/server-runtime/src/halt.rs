@@ -27,9 +27,8 @@
 //! are applied whether or not a replica is attached: they have no client
 //! to answer, and a primary that seeds before its first replica connects
 //! (the DPDK start-up order) must not lose its seeds to the halt. A
-//! request refused for the halt does not count as the request sequence
-//! it carried, so a client may resend it under the same sequence once the
-//! node takes writes again.
+//! request refused for the halt never reached the application, so a
+//! client may resend it as it was once the node takes writes again.
 //!
 //! # Delivered in order
 //!
