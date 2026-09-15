@@ -47,6 +47,25 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     version fails it against an earlier node; either way the client sees
     its key refused. Upgrade clients with the nodes.
 
+### Changed
+
+- **The runtime reads and writes the protocol's framing; application codecs
+  see only tags and bodies.** A `RequestDecoder` is called as
+  `decode(tag, body, permission)` and returns `Decoded::Permitted(event)`:
+  the runtime reads the tag, drops an empty frame, and drops a frame whose
+  tag is in the protocol's reserved range (below `0x10`) before any decoder
+  sees it. A `ResponseEncoder` writes only the body and returns
+  `Encoded { tag, len }`; the runtime writes the length prefix and the tag,
+  and refuses — logging at `error!` and dropping the response — a reserved
+  tag, which a client would otherwise read as a protocol frame. The wire
+  format is unchanged. Source-breaking for application codecs: remove the
+  tag parsing, the reserved-tag filter arm, and the length prefix and tag
+  writes. `melin_server_runtime::MAX_RESPONSE_BUF` is replaced by
+  `MAX_RESPONSE_BODY`, a bound on the body alone, and `MAX_REQUEST_BODY`
+  gives the matching request bound; `MAX_FRAME_SIZE` remains for programs
+  that read client frames themselves. `melin-wire-protocol` gains
+  `FIRST_APP_TAG` and `REQUEST_HEADER_LEN`.
+
 ## [0.17.0] - 2026-09-22
 
 ### Added

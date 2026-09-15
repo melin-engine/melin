@@ -7,8 +7,8 @@
 //!
 //!   1. [`AppEvent`]        — the event type (journal codec)
 //!   2. [`Application`]     — the state machine, starting from `Default`
-//!   3. [`RequestDecoder`]  — wire bytes → event
-//!   4. [`ResponseEncoder`] — report → wire bytes
+//!   3. [`RequestDecoder`]  — request tag and body → event
+//!   4. [`ResponseEncoder`] — report → response tag and body
 //!
 //! The application is a simple counter: clients send `Increment(amount)`
 //! commands and receive the new total. A `GetValue` query returns the
@@ -18,12 +18,12 @@ use std::io::{self, Read, Write};
 
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
-use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
+use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
 
 // ---------------------------------------------------------------------------
-// Wire tags — domain tags start at 0x10 to avoid colliding with transport-
-// level control tags (0x01–0x0F) reserved by melin-wire-protocol.
+// Wire tags — application tags start at 0x10; everything below is the
+// protocol's, and the runtime keeps it away from the codecs.
 // ---------------------------------------------------------------------------
 
 pub const TAG_INCREMENT: u8 = 0x10;
@@ -178,31 +178,25 @@ impl Application for Counter {
 // Request decoder
 // ---------------------------------------------------------------------------
 
-/// Decodes length-prefixed client frames into `CounterEvent`.
+/// Decodes client requests into `CounterEvent`.
 ///
-/// Wire format (after the 4-byte length prefix is stripped by the runtime):
-///   `[tag: u8][payload...]`
+/// The runtime has already read the tag; the bodies are:
+///   - increment: `[amount: u64 LE]`
+///   - get value: empty
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = CounterEvent;
 
-    fn decode(&self, bytes: &[u8], _permission: Permission) -> Decoded<CounterEvent> {
-        let Some((&tag, payload)) = bytes.split_first() else {
-            return Decoded::DecodeError("frame too short");
-        };
-
+    fn decode(&self, tag: u8, body: &[u8], _permission: Permission) -> Decoded<CounterEvent> {
         match tag {
-            TAG_INCREMENT => {
-                if payload.len() < 8 {
-                    return Decoded::DecodeError("increment payload too short");
-                }
-                let amount = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"));
-                Decoded::Permitted(CounterEvent::Increment { amount })
-            }
+            TAG_INCREMENT => match body.first_chunk::<8>() {
+                Some(amount) => Decoded::Permitted(CounterEvent::Increment {
+                    amount: u64::from_le_bytes(*amount),
+                }),
+                None => Decoded::DecodeError("increment body too short"),
+            },
             TAG_GET_VALUE => Decoded::Permitted(CounterEvent::GetValue),
-            // Transport-level heartbeats and auth frames — filter silently.
-            0x01..=0x0F => Decoded::Filter,
             _ => Decoded::DecodeError("unknown tag"),
         }
     }
@@ -212,51 +206,39 @@ impl RequestDecoderTrait for RequestDecoder {
 // Response encoder
 // ---------------------------------------------------------------------------
 
-/// Encodes `CounterReport` / `CounterQuery` into length-prefixed wire frames.
-///
-/// Wire format: `[length: u32 LE][tag: u8][payload...]`
+/// Encodes `CounterReport` / `CounterQuery` into response bodies; the
+/// runtime frames them. The bodies are:
+///   - ack, value: `[value: u64 LE]`
+///   - rejected: empty
 pub struct ResponseEncoder;
+
+/// Write `value` as a body under `tag`.
+fn value_body(buf: &mut [u8], tag: u8, value: u64) -> Result<Encoded, &'static str> {
+    let body = buf.first_chunk_mut::<8>().ok_or("buffer too small")?;
+    *body = value.to_le_bytes();
+    Ok(Encoded { tag, len: 8 })
+}
 
 impl ResponseEncoderTrait for ResponseEncoder {
     type Report = CounterReport;
     type Query = CounterQuery;
 
-    fn encode_report(&self, report: &CounterReport, buf: &mut [u8]) -> Result<usize, &'static str> {
+    fn encode_report(
+        &self,
+        report: &CounterReport,
+        buf: &mut [u8],
+    ) -> Result<Encoded, &'static str> {
         match *report {
-            CounterReport::Ack { new_value } => {
-                // len(4) + tag(1) + value(8) = 13
-                if buf.len() < 13 {
-                    return Err("buffer too small");
-                }
-                let payload_len: u32 = 9;
-                buf[..4].copy_from_slice(&payload_len.to_le_bytes());
-                buf[4] = TAG_RESP_ACK;
-                buf[5..13].copy_from_slice(&new_value.to_le_bytes());
-                Ok(13)
-            }
-            CounterReport::Rejected => {
-                // len(4) + tag(1) = 5
-                if buf.len() < 5 {
-                    return Err("buffer too small");
-                }
-                let payload_len: u32 = 1;
-                buf[..4].copy_from_slice(&payload_len.to_le_bytes());
-                buf[4] = TAG_RESP_REJECTED;
-                Ok(5)
-            }
+            CounterReport::Ack { new_value } => value_body(buf, TAG_RESP_ACK, new_value),
+            CounterReport::Rejected => Ok(Encoded {
+                tag: TAG_RESP_REJECTED,
+                len: 0,
+            }),
         }
     }
 
-    fn encode_query(&self, query: &CounterQuery, buf: &mut [u8]) -> Result<usize, &'static str> {
-        // len(4) + tag(1) + value(8) = 13
-        if buf.len() < 13 {
-            return Err("buffer too small");
-        }
-        let payload_len: u32 = 9;
-        buf[..4].copy_from_slice(&payload_len.to_le_bytes());
-        buf[4] = TAG_RESP_VALUE;
-        buf[5..13].copy_from_slice(&query.value.to_le_bytes());
-        Ok(13)
+    fn encode_query(&self, query: &CounterQuery, buf: &mut [u8]) -> Result<Encoded, &'static str> {
+        value_body(buf, TAG_RESP_VALUE, query.value)
     }
 }
 
@@ -343,10 +325,7 @@ mod tests {
 
     #[test]
     fn decoder_increment() {
-        let mut frame = vec![TAG_INCREMENT];
-        frame.extend_from_slice(&100u64.to_le_bytes());
-
-        match RequestDecoder.decode(&frame, Permission::Operator) {
+        match RequestDecoder.decode(TAG_INCREMENT, &100u64.to_le_bytes(), Permission::Operator) {
             Decoded::Permitted(event) => {
                 assert!(matches!(event, CounterEvent::Increment { amount: 100 }));
             }
@@ -356,9 +335,7 @@ mod tests {
 
     #[test]
     fn decoder_get_value() {
-        let frame = [TAG_GET_VALUE];
-
-        match RequestDecoder.decode(&frame, Permission::Operator) {
+        match RequestDecoder.decode(TAG_GET_VALUE, &[], Permission::Operator) {
             Decoded::Permitted(event) => {
                 assert!(matches!(event, CounterEvent::GetValue));
                 assert!(event.is_query());
@@ -368,46 +345,69 @@ mod tests {
     }
 
     #[test]
-    fn decoder_filters_transport_tags() {
-        let frame = [0x01]; // TAG_RESPONSE_HEARTBEAT
-
+    fn decoder_refuses_short_increment_and_unknown_tag() {
         assert!(matches!(
-            RequestDecoder.decode(&frame, Permission::Operator),
-            Decoded::Filter
+            RequestDecoder.decode(TAG_INCREMENT, &[0; 7], Permission::Operator),
+            Decoded::DecodeError(_)
+        ));
+        assert!(matches!(
+            RequestDecoder.decode(0x7F, &[], Permission::Operator),
+            Decoded::DecodeError("unknown tag")
         ));
     }
 
     #[test]
     fn encoder_report_ack() {
         let mut buf = [0u8; 64];
-        let n = ResponseEncoder
+        let encoded = ResponseEncoder
             .encode_report(&CounterReport::Ack { new_value: 42 }, &mut buf)
             .unwrap();
-        assert_eq!(n, 13);
-        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 9);
-        assert_eq!(buf[4], TAG_RESP_ACK);
-        assert_eq!(u64::from_le_bytes(buf[5..13].try_into().unwrap()), 42);
+        assert_eq!(
+            encoded,
+            Encoded {
+                tag: TAG_RESP_ACK,
+                len: 8
+            }
+        );
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 42);
     }
 
     #[test]
     fn encoder_report_rejected() {
         let mut buf = [0u8; 64];
-        let n = ResponseEncoder
+        let encoded = ResponseEncoder
             .encode_report(&CounterReport::Rejected, &mut buf)
             .unwrap();
-        assert_eq!(n, 5);
-        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 1);
-        assert_eq!(buf[4], TAG_RESP_REJECTED);
+        assert_eq!(
+            encoded,
+            Encoded {
+                tag: TAG_RESP_REJECTED,
+                len: 0
+            }
+        );
     }
 
     #[test]
     fn encoder_query() {
         let mut buf = [0u8; 64];
-        let n = ResponseEncoder
+        let encoded = ResponseEncoder
             .encode_query(&CounterQuery { value: 99 }, &mut buf)
             .unwrap();
-        assert_eq!(n, 13);
-        assert_eq!(buf[4], TAG_RESP_VALUE);
-        assert_eq!(u64::from_le_bytes(buf[5..13].try_into().unwrap()), 99);
+        assert_eq!(
+            encoded,
+            Encoded {
+                tag: TAG_RESP_VALUE,
+                len: 8
+            }
+        );
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 99);
+    }
+
+    #[test]
+    fn encoder_refuses_a_buffer_too_small() {
+        assert_eq!(
+            ResponseEncoder.encode_query(&CounterQuery { value: 1 }, &mut [0u8; 7]),
+            Err("buffer too small")
+        );
     }
 }
