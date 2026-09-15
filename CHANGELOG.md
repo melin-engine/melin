@@ -38,12 +38,35 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the process exits. Clients reconnect to the new primary, as after a
   crash. Previously the node queued a `Superseded` rejection that, in
   practice, never went out before the stage stopped.
+- **Operator configuration reaches the application as journaled events.**
+  `server::run` and `server::run_with_listener` take `StartupEvents { genesis,
+  on_primary }` where they took an `AppFactory`. `genesis` is journaled once,
+  when a node creates the journal as primary; `on_primary` every time a node
+  becomes primary — at boot, and on promotion right after the epoch bump. Both
+  are applied before the first client is served. The values in force are the
+  primary's: replicas apply them from the stream, and replay, from genesis or
+  from a snapshot, reproduces the decisions made under them. Operationally, a
+  node's own limits take effect only while it is primary; a replica started
+  with different values follows the primary's until it is promoted.
+- **`Application` requires `Default`**, the state before the first event on
+  every node. It must not depend on anything local to the node; capacity may
+  still be pre-allocated there.
 
 ### Removed
 
 - **`RejectReason::Superseded`.** Nothing produces it any more (see
   Changed). Applications that mapped it to a wire code or a display string
   drop that arm.
+- **`melin_app::app_factory::AppFactory`.** To migrate: implement `Default`
+  for the application from what `empty` built; return `seed_events` as
+  `StartupEvents::genesis`; turn what `apply_operator_policy` set into events
+  the application applies, passed as `StartupEvents::on_primary`, and keep
+  those values in the snapshot; size collections in `Default` or when the
+  genesis events arrive, instead of in `prefault`. The runtime entry points
+  now name the application type — `server::run::<MyApp>(config, startup,
+  decoder, encoder, None)` — and `replication::run_receiver` /
+  `run_receiver_dpdk` no longer take a factory. An application with nothing
+  to journal at startup passes `StartupEvents::none()`.
 
 ### Fixed
 
@@ -91,6 +114,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   events than a replay of the same journal. The live engine, replay and the
   snapshot stage now hand every event to the application through one shared
   path, so they cannot disagree on it.
+- **Recovery replayed the journal under the application's default limits.**
+  A primary restarting from its journal, with or without a snapshot, applied
+  operator policy only after replaying, so orders the policy had rejected were
+  accepted on replay and the node's state diverged from its replicas'. A
+  replica's restart did the same, and a replica bootstrapped by snapshot
+  transfer, and every shadow copy of an application that keeps the default
+  `clone_via_snapshot`, never received the policy at all. Superseded by the
+  change above, which removes out-of-journal policy altogether.
 
 ## [0.16.0] - 2026-09-14
 
