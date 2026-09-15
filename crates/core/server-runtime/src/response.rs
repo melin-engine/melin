@@ -22,6 +22,7 @@ use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::{AckPolicy, Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
+use crate::halt::{Refusal, RefusalQueue};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
@@ -208,6 +209,11 @@ pub struct Response<A: Application> {
     /// exactly once, whichever side (reader disconnect or a drop
     /// decision here) initiated it.
     pub active_connections: Arc<AtomicU64>,
+    /// Writes the reader refused while the node was halted. Each reply is
+    /// sent once everything published before the refused request has been
+    /// answered, so a client sees its replies in request order — see
+    /// [`crate::halt`].
+    pub refusals: RefusalQueue<A::Report>,
     /// Test seam: called once per iteration right after the control
     /// channel has been drained, so a test can hold the stage there and
     /// choose what lands while it waits. The drain runs after the
@@ -281,6 +287,7 @@ pub fn run<A: Application>(
         encoder,
         fence_state,
         active_connections,
+        mut refusals,
         #[cfg(test)]
         mut pause_after_control_drain,
     } = config;
@@ -539,7 +546,12 @@ pub fn run<A: Application>(
     // clock once per ~1 M cumulative spin iterations.
     let mut gate_accrual_timer = AmortizedTimer::new();
 
-    loop {
+    // Input sequence of the last output slot handled. Refused writes are
+    // released only where it changes — between two events' replies, never
+    // inside one. `u64::MAX` is no event's sequence.
+    let mut last_input_seq = u64::MAX;
+
+    'run: loop {
         // Observe runtime policy swaps from the admin `ACK-POLICY`
         // command. Relaxed load (single writer is the admin handler,
         // single reader is this thread). When the byte changes,
@@ -584,10 +596,11 @@ pub fn run<A: Application>(
             // further in-flight work — skip the best-effort flush so
             // responses buffered for orders on the old epoch are dropped
             // (the client sees a connection reset and reconciles on
-            // reconnect). Checked only here, not per iteration: fencing
-            // always co-sets `shutdown` (`FenceState::fence_if_superseded`
-            // owns that invariant), so this branch is the first one a
-            // fenced node reaches and the steady-state loop pays nothing.
+            // reconnect). Checked only here, not per slot: fencing always
+            // co-sets `shutdown` (`FenceState::fence_if_superseded` owns
+            // that invariant), and the gate wait comes straight back here
+            // on shutdown, so this branch is the first one a fenced node
+            // reaches and the steady-state loop pays nothing.
             let flush = !fence_state.is_fenced();
             // Best-effort flush before shutdown.
             if flush && !dirty_connections.is_empty() {
@@ -624,7 +637,13 @@ pub fn run<A: Application>(
         // durability gate waits included — is done with them. That is
         // at most `MAX_BATCH` of a 1 M-slot ring, and the ring fills at
         // the same rate either way.
+        //
+        // Refusals follow the order `RefusalQueue` documents: the idle
+        // bound before the read, the sync between the read and the
+        // control drain.
+        let idle_refusal_bound = refusals.idle_bound();
         let slots = consumer.read_contiguous(MAX_BATCH);
+        let refusals_waiting = refusals.sync();
 
         // Poll the control channel (non-blocking) for connect and
         // disconnect — after the ring is read, never before. A reply
@@ -701,6 +720,35 @@ pub fn run<A: Application>(
         }
 
         if slots.is_empty() {
+            // Every event published before a refusal up to the bound has
+            // been answered: send those refusals with this flush.
+            if let Some(bound) = idle_refusal_bound {
+                let now = Instant::now();
+                refusals.release(bound, |refusal| {
+                    append_refusal(
+                        refusal,
+                        &*encoder,
+                        &mut connections,
+                        &mut encode_buf,
+                        &batch_end_wire_frame,
+                        now,
+                        &mut dirty_connections,
+                        &mut to_remove,
+                        &mut flush,
+                    );
+                });
+                // A refusal can overflow its connection's buffer; drop
+                // those before the flush, as the batch end does.
+                #[cfg(feature = "latency-trace")]
+                discard_e2e_samples(&mut pending_e2e, &to_remove);
+                for conn_id in to_remove.drain(..) {
+                    if let Some(entry) = connections.remove(&conn_id) {
+                        teardown_dropped(entry, &active_connections);
+                    }
+                    unmark_dirty(conn_id, &mut dirty_connections);
+                }
+            }
+
             // SPSC is empty — flush all dirty connections via io_uring.
             // This is the response-data egress path; heartbeat flushes
             // below aren't sampled because they're admin traffic, not
@@ -917,6 +965,29 @@ pub fn run<A: Application>(
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
+            // First slot of an event: every event before it has been
+            // answered, so refusals stamped up to its sequence go first.
+            // Ahead of the gate, which holds this event, not them. A
+            // refusal due here was visible before the read, so the
+            // iteration's sync decides for the whole batch.
+            let first_of_event = slot.input_seq != last_input_seq;
+            last_input_seq = slot.input_seq;
+            if refusals_waiting && first_of_event {
+                refusals.release(slot.input_seq, |refusal| {
+                    append_refusal(
+                        refusal,
+                        &*encoder,
+                        &mut connections,
+                        &mut encode_buf,
+                        &batch_end_wire_frame,
+                        batch_now,
+                        &mut dirty_connections,
+                        &mut to_remove,
+                        &mut flush,
+                    );
+                });
+            }
+
             // Per-slot journal-wait / replica-wait tracker. See
             // `GateCrossTracker` for the rationale (only records cursors
             // that were actually on the critical path). Both the
@@ -1015,6 +1086,22 @@ pub fn run<A: Application>(
                         // Flush accrual before re-seeding so the wedged-
                         // degraded interval up to the swap isn't dropped.
                         degraded_logger.reseed(&utilization, Instant::now());
+                    }
+
+                    // Observe shutdown here too, for the same reason: a
+                    // gate that cannot open — every replica gone under a
+                    // policy that needs one — held this thread until a
+                    // replica returned, and the shutdown sequence joins
+                    // it without a timeout. An operator restarting the
+                    // degraded node, or a fence (which co-sets
+                    // `shutdown`), hung the process. Straight back to the
+                    // top of the loop, where the shutdown branch decides
+                    // what to flush: this slot's reply, which the policy
+                    // never confirmed, is not appended, and the rest of
+                    // the batch goes with it. Those clients see a reset,
+                    // as after a crash, and reconcile on reconnect.
+                    if shutdown.load(Ordering::Relaxed) {
+                        continue 'run;
                     }
 
                     let journal_pos = journal_persisted_wire_seq.load();
@@ -1358,33 +1445,20 @@ fn discard_e2e_samples(pending: &mut Vec<(u64, trace::MonoTraceInstant)>, droppe
 }
 
 /// Whether this slot must wait on the durability gate before its
-/// response is encoded.
+/// response is encoded: its own event is not yet known to be durable.
 ///
-/// Two reasons to skip the wait. First, the durability-gate carve-out
-/// for halt-state output: slots tagged `durability_bypass = true` at
-/// emission carry no engine state worth replicating before delivery —
-/// see [`OutputSlot::durability_bypass`] for the correctness argument —
-/// so clients receive the halt reason immediately rather than blocking
-/// on a structurally unsatisfiable policy (e.g. `DiskAndRam` with all
-/// replicas disconnected, which would otherwise stall the gate until
-/// peers return). Second, the slot's own event is already durable.
+/// Every slot is subject to it. The one reply a halted node sends without
+/// waiting — the refusal of a write — never enters the output ring (see
+/// [`crate::halt`]).
 ///
-/// Applied per slot rather than per batch, so a bypass slot is released
-/// as soon as the dispatch loop reaches it instead of riding behind a
-/// gated slot earlier in the same batch. Ordering is unaffected: the
-/// loop walks slots in ring order either way, so a bypass slot still
-/// leaves after everything sequenced before it.
-///
-/// Shared by both response stages. The matching stage that sets the flag
-/// is transport-agnostic, so the same slots reach the io_uring and DPDK
-/// paths and the two must agree; keeping the predicate in one place is
-/// what stops them drifting apart again.
+/// Shared by both response stages, so the io_uring and DPDK paths cannot
+/// drift apart on it.
 #[inline]
 pub(crate) fn slot_needs_gate<R: Copy, Q: Copy>(
     slot: &OutputSlot<R, Q>,
     cached_durable_pos: u64,
 ) -> bool {
-    !slot.durability_bypass && cached_durable_pos < slot.wire_seq
+    cached_durable_pos < slot.wire_seq
 }
 
 /// Tear down a connection the *response stage* decided to drop (send
@@ -1523,6 +1597,47 @@ fn append_frames(
     entry.last_send = batch_now;
     mark_dirty(entry, connection_id, dirty_connections);
     AppendOutcome::Continue
+}
+
+/// Append the reply to a write refused at ingress — the application's
+/// rejection, then the request terminator — to its connection's send
+/// buffer. A connection that has gone away loses nothing it can still
+/// receive.
+///
+/// No durability gate: nothing was published, so there is nothing to wait
+/// for. The caller has already waited for what comes before it on the
+/// connection (see [`crate::halt`]).
+#[allow(clippy::too_many_arguments)]
+fn append_refusal<R: Copy, Q: Copy>(
+    refusal: Refusal<R>,
+    encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
+    connections: &mut FxHashMap<u64, ConnectionEntry>,
+    encode_buf: &mut [u8],
+    batch_end_wire_frame: &[u8],
+    now: Instant,
+    dirty_connections: &mut Vec<u64>,
+    to_remove: &mut Vec<u64>,
+    flush: &mut FlushCadence,
+) {
+    let Some(entry) = connections.get_mut(&refusal.connection_id) else {
+        debug!(
+            connection_id = refusal.connection_id,
+            "refusal dropped: connection not registered"
+        );
+        return;
+    };
+    let payload = encoder.encode_report(&refusal.report, encode_buf);
+    append_frames(
+        Some(payload),
+        batch_end_wire_frame,
+        refusal.connection_id,
+        entry,
+        encode_buf,
+        now,
+        dirty_connections,
+        to_remove,
+    );
+    flush.on_append(entry.send_buf.len());
 }
 
 /// Each dirty connection's accumulated send buffer is sent in a single
@@ -2162,36 +2277,27 @@ mod tests {
     /// Output slot carrying only the fields the gate decision reads.
     /// `()` for the report/query types keeps the fixture independent of
     /// any concrete application.
-    fn slot(wire_seq: u64, durability_bypass: bool) -> OutputSlot<(), ()> {
+    fn slot(wire_seq: u64) -> OutputSlot<(), ()> {
         OutputSlot {
             wire_seq,
-            durability_bypass,
             ..Default::default()
         }
     }
 
     #[test]
-    fn bypass_slot_never_gates() {
-        // Halt-state output must not block on a policy that may be
-        // structurally unsatisfiable, however far behind the cursor is.
-        assert!(!slot_needs_gate(&slot(10, true), 0));
-        assert!(!slot_needs_gate(&slot(10, true), 9));
+    fn slot_gates_until_its_own_sequence_is_durable() {
+        assert!(slot_needs_gate(&slot(10), 0));
+        assert!(slot_needs_gate(&slot(10), 9));
     }
 
     #[test]
-    fn normal_slot_gates_until_its_own_sequence_is_durable() {
-        assert!(slot_needs_gate(&slot(10, false), 0));
-        assert!(slot_needs_gate(&slot(10, false), 9));
-    }
-
-    #[test]
-    fn normal_slot_clears_at_its_own_sequence_not_the_batch_maximum() {
+    fn slot_clears_at_its_own_sequence_not_the_batch_maximum() {
         // The cursor reaching exactly this slot's `wire_seq` is enough —
         // an off-by-one here would stall every response an extra
         // durability round-trip. A later slot in the same batch needing
         // more must not hold this one back.
-        assert!(!slot_needs_gate(&slot(10, false), 10));
-        assert!(!slot_needs_gate(&slot(10, false), 11));
+        assert!(!slot_needs_gate(&slot(10), 10));
+        assert!(!slot_needs_gate(&slot(10), 11));
     }
 
     /// Build a [`Policy`] from a mini DSL: one or more
@@ -2390,8 +2496,8 @@ mod tests {
         // With `persisted>=2` and both replicas down, the cursor view
         // collapses to {primary}: the clause's count (=2) exceeds the
         // view size, so the gate stays at 0 and the policy flags
-        // degraded. Note the matching stage's separate halt at
-        // `replicas_connected==0` rejects new orders before they reach
+        // degraded. Note the readers' separate halt at
+        // `replicas_connected==0` refuses new writes before they reach
         // the gate; this verifies the gate semantics in isolation.
         let p = parse("persisted>=2").unwrap();
         let m = metrics((999, 999), (999, 999));
@@ -2718,7 +2824,7 @@ mod tests {
         // Post-disconnect (active=false): view shrinks to {primary}.
         // `persisted>=2` is structurally unsatisfiable on a 1-node
         // view, so the gate stays at 0 AND surfaces degraded. The
-        // matching stage's `replicas_connected==0` halt is what stops
+        // readers' `replicas_connected==0` halt is what stops
         // accepting new orders; the gate side's job is just to keep
         // the existing in-flight orders stalled and the alert lit.
         let a_disconnected = flags(false, false);
@@ -3847,6 +3953,11 @@ mod tests {
                 encoder: Arc::new(ResponseEncoder),
                 fence_state: Arc::new(FenceState::new(0)),
                 active_connections: Arc::new(AtomicU64::new(0)),
+                // No reader: nothing is ever refused.
+                refusals: crate::halt::refusal_channel(Arc::new(
+                    melin_pipeline::padding::CachePadded::new(AtomicU64::new(0)),
+                ))
+                .1,
                 pause_after_control_drain: Some(Box::new(pause)),
             };
 
@@ -3889,6 +4000,395 @@ mod tests {
                     "the ack carries the counter's value"
                 );
             });
+        }
+    }
+
+    /// A write refused at ingress is answered in request order: after the
+    /// replies to everything published before it — even while one of
+    /// those is held by the durability gate — and before anything
+    /// published after it. Replies carry no request id, so a refusal sent
+    /// early would be paired with the wrong request.
+    mod refusal_order {
+        use std::io::{ErrorKind, Read, Write};
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+        use std::time::Duration;
+
+        use counter_server::{
+            Counter, CounterQuery, CounterReport, ResponseEncoder, TAG_RESP_ACK, TAG_RESP_REJECTED,
+        };
+        use melin_pipeline::padding::CachePadded;
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_pipeline::wait::WaitStrategy;
+        use melin_transport_core::fence::FenceState;
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+        use melin_wire_protocol::blocking::BlockingFrameWriter;
+        use melin_wire_protocol::control_codec::TAG_BATCH_END;
+
+        use crate::ControlEvent;
+        use crate::ack_policy::AckPolicy;
+        use crate::halt::{Refusal, RefusalQueue, refusal_channel};
+        use crate::response::{Response, run};
+
+        /// Bounds a read that must succeed; generous for a loaded box.
+        const READ_TIMEOUT: Duration = Duration::from_secs(5);
+        /// How long the test watches for a frame that must not arrive yet.
+        const QUIET: Duration = Duration::from_millis(100);
+
+        /// Read one frame and return its tag.
+        pub(super) fn read_tag(sock: &mut UnixStream) -> std::io::Result<u8> {
+            let mut len = [0u8; 4];
+            sock.read_exact(&mut len)?;
+            let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+            sock.read_exact(&mut body)?;
+            Ok(body[0])
+        }
+
+        /// Read one frame's tag into `seen`; false if none arrived.
+        fn read_into(sock: &mut UnixStream, seen: &mut Vec<u8>) -> bool {
+            match read_tag(sock) {
+                Ok(tag) => {
+                    seen.push(tag);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+
+        #[test]
+        fn a_refusal_waits_for_earlier_replies_and_precedes_later_ones() {
+            let (mut producer, mut consumers) =
+                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                    .add_consumer()
+                    .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+
+            let (connected, mut client_sock) = connection(1);
+
+            // The test plays the matching stage: it publishes the one
+            // event's reply, then moves the progress past it.
+            let matching_progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
+            let (mut refusals, refusal_rx) = refusal_channel(Arc::clone(&matching_progress));
+            // The event's gate is shut until the test opens it.
+            let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(0));
+
+            let (control_tx, control_rx) = mpsc::channel();
+            control_tx.send(connected).expect("channel open");
+            let shutdown = AtomicBool::new(false);
+            let config = config(
+                journal_cursor.clone(),
+                Arc::new(FenceState::new(0)),
+                refusal_rx,
+                None,
+            );
+
+            // What a reader does for: refused write, accepted write,
+            // refused write — refusals visible before the event published
+            // after them. All in place before the stage starts, so its
+            // first iteration reads the event with both refusals behind
+            // it: the first goes out ahead of the event (the batch path),
+            // the second once the ring is empty (the idle path).
+            refusals.try_send(refusal(1, 0)).expect("queue has room");
+            refusals.try_send(refusal(1, 1)).expect("queue has room");
+            refusals.flush();
+            producer.publish(OutputSlot {
+                connection_id: 1,
+                input_seq: 0,
+                wire_seq: 1,
+                payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
+                is_last_in_request: true,
+                ..Default::default()
+            });
+            matching_progress.get().store(1, Ordering::Release);
+
+            thread::scope(|scope| {
+                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
+
+                let mut seen = Vec::new();
+
+                // The first refusal came before the held event: it goes
+                // out while the gate is shut.
+                let first = read_into(&mut client_sock, &mut seen)
+                    && read_into(&mut client_sock, &mut seen);
+
+                // The second came after it: nothing more until the gate
+                // opens.
+                client_sock
+                    .set_read_timeout(Some(QUIET))
+                    .expect("set read timeout");
+                let mut probe = [0u8; 1];
+                // Anything but a timeout — bytes, or the stage closing the
+                // socket — means something went out early.
+                let early = !matches!(
+                    client_sock.read(&mut probe),
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+                );
+                client_sock
+                    .set_read_timeout(Some(READ_TIMEOUT))
+                    .expect("set read timeout");
+
+                journal_cursor.store(WireSeq::new(1));
+                let rest = !early && (0..4).all(|_| read_into(&mut client_sock, &mut seen));
+
+                // Stop the stage before asserting, so a failure cannot
+                // leave the scope waiting on a spinning thread.
+                shutdown.store(true, Ordering::Relaxed);
+                stage.join().expect("stage panicked");
+
+                assert!(first, "the refusal ahead of the held event never arrived");
+                assert!(
+                    !early,
+                    "the later refusal overtook the reply the gate was holding"
+                );
+                assert!(rest, "replies missing after the gate opened: {seen:x?}");
+                assert_eq!(
+                    seen,
+                    [
+                        TAG_RESP_REJECTED,
+                        TAG_BATCH_END,
+                        TAG_RESP_ACK,
+                        TAG_BATCH_END,
+                        TAG_RESP_REJECTED,
+                        TAG_BATCH_END,
+                    ],
+                    "replies out of request order"
+                );
+            });
+        }
+
+        /// A refusal reaches the stage only with its connection registered.
+        /// The reader refuses a new connection's first request as soon as
+        /// that connection's `Connected` is queued, so a refusal made
+        /// visible while the stage is past its control drain can belong to
+        /// a connection the stage has not heard of. Released in that
+        /// iteration it would be dropped, and the client left without a
+        /// reply.
+        ///
+        /// The seam holds the stage after its drain twice. The first hold
+        /// lands connection 1's refusal, which the next iteration's idle
+        /// path is then due to release; the second hold, in that iteration,
+        /// lands connection 2 and its refusal just ahead of the release.
+        #[test]
+        fn a_refusal_is_not_released_ahead_of_its_connection() {
+            let (_producer, mut consumers) =
+                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                    .add_consumer()
+                    .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+            let (connected_1, mut client_1) = connection(1);
+            let (connected_2, mut client_2) = connection(2);
+
+            // Nothing is ever published, so no refusal waits on an event.
+            let progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
+            let (mut refusals, refusal_rx) = refusal_channel(progress);
+            let (control_tx, control_rx) = mpsc::channel();
+            control_tx.send(connected_1).expect("channel open");
+
+            let (parked_tx, parked_rx) = mpsc::channel::<()>();
+            let (resume_tx, resume_rx) = mpsc::channel::<()>();
+            let mut holds = 0;
+            let pause = move || {
+                if holds < 2 {
+                    holds += 1;
+                    parked_tx.send(()).expect("the test is waiting");
+                    resume_rx.recv().expect("the test resumes the stage");
+                }
+            };
+            let shutdown = AtomicBool::new(false);
+            let config = config(
+                DurableWireSeqCursor::detached(WireSeq::new(0)),
+                Arc::new(FenceState::new(0)),
+                refusal_rx,
+                Some(Box::new(pause)),
+            );
+
+            thread::scope(|scope| {
+                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
+
+                parked_rx.recv().expect("the stage reaches the seam");
+                refusals.try_send(refusal(1, 0)).expect("queue has room");
+                refusals.flush();
+                resume_tx.send(()).expect("the stage is parked");
+
+                parked_rx.recv().expect("the stage reaches the seam again");
+                control_tx.send(connected_2).expect("stage is running");
+                refusals.try_send(refusal(2, 0)).expect("queue has room");
+                refusals.flush();
+                resume_tx.send(()).expect("the stage is parked");
+
+                let mut seen_1 = Vec::new();
+                let mut seen_2 = Vec::new();
+                let got_1 = (0..2).all(|_| read_into(&mut client_1, &mut seen_1));
+                let got_2 = (0..2).all(|_| read_into(&mut client_2, &mut seen_2));
+                shutdown.store(true, Ordering::Relaxed);
+                stage.join().expect("stage panicked");
+
+                assert!(got_1, "connection 1's refusal never arrived: {seen_1:x?}");
+                assert!(
+                    got_2,
+                    "connection 2's refusal was dropped: released before its connection registered"
+                );
+                for seen in [seen_1, seen_2] {
+                    assert_eq!(seen, [TAG_RESP_REJECTED, TAG_BATCH_END]);
+                }
+            });
+        }
+
+        /// A registered connection: its `Connected` event, and the client's
+        /// end of the socket.
+        pub(super) fn connection(connection_id: u64) -> (ControlEvent, UnixStream) {
+            let (server_sock, client_sock) = UnixStream::pair().expect("socketpair");
+            client_sock
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .expect("set read timeout");
+            let event = ControlEvent::Connected {
+                connection_id,
+                fd: server_sock.as_raw_fd(),
+                writer: BlockingFrameWriter::new(Box::new(server_sock) as Box<dyn Write + Send>),
+            };
+            (event, client_sock)
+        }
+
+        fn refusal(connection_id: u64, input_seq: u64) -> Refusal<CounterReport> {
+            Refusal {
+                connection_id,
+                input_seq,
+                report: CounterReport::Rejected,
+            }
+        }
+
+        /// A stage gating on `journal_cursor` under `disk`, fed `refusals`.
+        pub(super) fn config(
+            journal_cursor: DurableWireSeqCursor,
+            fence_state: Arc<FenceState>,
+            refusals: RefusalQueue<CounterReport>,
+            pause_after_control_drain: Option<Box<dyn FnMut() + Send>>,
+        ) -> Response<Counter> {
+            Response::<Counter> {
+                journal_persisted_wire_seq: journal_cursor,
+                ack_policy: Arc::new(AtomicU8::new(AckPolicy::Disk.as_u8())),
+                replication_metrics: None,
+                replica_active: None,
+                heartbeat_interval: None,
+                wait: WaitStrategy::SpinThenYield,
+                utilization: Arc::new(StageUtilization::default()),
+                encoder: Arc::new(ResponseEncoder),
+                fence_state,
+                active_connections: Arc::new(AtomicU64::new(0)),
+                refusals,
+                pause_after_control_drain,
+            }
+        }
+    }
+
+    /// A node stopped while a reply is held by the ack policy. The gate
+    /// may never open — every replica gone under a policy that needs one —
+    /// and the shutdown sequence joins the stage without a timeout, so the
+    /// stage must leave the gate on shutdown. It leaves without sending
+    /// the held reply, which the policy never confirmed. A fence co-sets
+    /// shutdown and takes the same exit.
+    mod stop_while_gated {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use counter_server::{Counter, CounterQuery, CounterReport, TAG_RESP_ACK};
+        use melin_pipeline::padding::CachePadded;
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_pipeline::wait::WaitStrategy;
+        use melin_transport_core::fence::FenceState;
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot};
+        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+        use melin_wire_protocol::control_codec::TAG_BATCH_END;
+
+        use super::refusal_order::{config, connection, read_tag};
+        use crate::halt::refusal_channel;
+        use crate::response::run;
+
+        /// How long the stage gets to exit once told to; generous for a
+        /// loaded box.
+        const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+        fn stop_while_gated(fenced: bool) {
+            let (mut producer, mut consumers) =
+                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                    .add_consumer()
+                    .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+            let (connected, mut client) = connection(1);
+            let (control_tx, control_rx) = mpsc::channel();
+            control_tx.send(connected).expect("channel open");
+
+            // The journal confirms the first event and never the second.
+            let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(1));
+            let fence = Arc::new(FenceState::new(0));
+            let refusals = refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+            let config = config(journal_cursor, Arc::clone(&fence), refusals, None);
+            for wire_seq in [1, 2] {
+                producer.publish(OutputSlot {
+                    connection_id: 1,
+                    input_seq: wire_seq - 1,
+                    wire_seq,
+                    payload: OutputPayload::Report(CounterReport::Ack {
+                        new_value: wire_seq,
+                    }),
+                    is_last_in_request: true,
+                    ..Default::default()
+                });
+            }
+
+            // Not a scoped thread: a stage that never leaves the gate
+            // would hang a scoped join, and that hang is the failure this
+            // test exists to catch. The flag is leaked for the same
+            // reason — the thread may outlive the test, and dies with the
+            // process.
+            let shutdown: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+            let stage =
+                thread::spawn(move || run::<Counter>(consumer, control_rx, config, shutdown));
+
+            // The confirmed reply goes out before the stage blocks on the
+            // gate.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                seen.push(read_tag(&mut client).expect("the confirmed reply arrives"));
+            }
+            assert_eq!(seen, [TAG_RESP_ACK, TAG_BATCH_END]);
+
+            if fenced {
+                assert!(fence.fence(), "first latch");
+            }
+            shutdown.store(true, Ordering::Relaxed);
+            let deadline = Instant::now() + EXIT_TIMEOUT;
+            while !stage.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the stage did not leave the gate on shutdown"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            stage.join().expect("stage panicked");
+
+            // The held reply never went out: the stage closed the
+            // connection with nothing more on it.
+            assert!(
+                read_tag(&mut client).is_err(),
+                "a reply the policy never confirmed was sent"
+            );
+        }
+
+        #[test]
+        fn a_stopped_stage_leaves_the_gate_and_drops_the_held_reply() {
+            stop_while_gated(false);
+        }
+
+        #[test]
+        fn a_fenced_stage_leaves_the_gate_and_drops_the_held_reply() {
+            stop_while_gated(true);
         }
     }
 }

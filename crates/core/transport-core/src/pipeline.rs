@@ -416,28 +416,6 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     /// `ResponseKind::BatchEnd` after the payload (skipped when the
     /// payload itself is `BatchEnd` — which is its own terminator).
     pub is_last_in_request: bool,
-    /// Exempt this slot from the response stage's durability gate.
-    ///
-    /// Set on every slot the matching stage emits while `halted` (all
-    /// replicas disconnected). Two kinds of slot reach the output ring
-    /// under halt: the explicit `Rejected{ReplicaDisconnected}` reports
-    /// produced for incoming client orders, and the empty `BatchEnd`
-    /// terminators emitted for transport-internal events (Tick).
-    /// Neither carries engine state worth
-    /// replicating before delivery — the rejection records no mutation,
-    /// and replicas deterministically reach the same halt decision when
-    /// they replay the same inputs. Gating either under a structurally
-    /// unsatisfiable policy (e.g. `disk+ram` with no replicas) would
-    /// stall the response gate forever, including for the rejection
-    /// itself, which is exactly what we want clients to see immediately.
-    /// The carve-out is therefore correctness-preserving and improves
-    /// operator visibility during outages.
-    ///
-    /// Every other output kind (Placed, Fill, Cancelled, non-halt
-    /// reject reasons, query responses) keeps the gate, since each
-    /// reflects engine state or a state-derived decision (rate-limiter
-    /// consumption, dedup) that must be durable before reply.
-    pub durability_bypass: bool,
 }
 
 /// Payload within an output slot.
@@ -476,7 +454,6 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
             match_complete_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
             is_last_in_request: true,
-            durability_bypass: false,
         }
     }
 }
@@ -2474,6 +2451,13 @@ impl<E: AppEvent> JournalStage<E> {
 ///
 /// Runs on a dedicated OS thread. Does NOT wait for journal sync —
 /// the persist-before-ack check happens in the response stage.
+///
+/// It applies every event the journal records, halted or not: a node
+/// that cannot honour durability refuses client writes at ingress,
+/// before they are published (see the server runtime's `halt` module).
+/// Refusing here instead would reject events the journal stage, running
+/// in parallel, has already recorded — and replay would then apply what
+/// the live engine refused.
 pub struct MatchingStage<A: Application> {
     app: A,
     consumer: ring::Consumer<InputSlot<A::Event>>,
@@ -2491,16 +2475,11 @@ pub struct MatchingStage<A: Application> {
     /// Active connection count, shared with the server accept loop.
     /// Read only when processing `QueryStats` (once per second at most).
     active_connections: Arc<AtomicU64>,
-    /// When `Some`, replication is enabled. One Relaxed load per event
-    /// (~1ns). `0` = no replicas connected → reject all mutations.
-    /// `None` = standalone mode → no halt check.
-    replicas_connected: Option<Arc<AtomicU32>>,
     /// Replication fencing state. Advanced when an `EpochBump` event is
     /// processed (recovery replay, live replication stream, or local
-    /// promotion injection); the halt check folds in its `is_fenced()`
-    /// latch so a fenced node stops accepting client writes. One Relaxed
-    /// load per disruptor batch (hoisted alongside the replica-count
-    /// load), shared with the response stage and replication threads.
+    /// promotion injection); shared with the readers, which refuse client
+    /// writes once it latches, and with the response stage and
+    /// replication threads.
     fence_state: Arc<crate::fence::FenceState>,
     /// How this thread waits on an empty input ring.
     wait: WaitStrategy,
@@ -2535,7 +2514,6 @@ impl<A: Application> MatchingStage<A> {
         events_processed: Arc<AtomicU64>,
         durable_wire_seq: DurableWireSeqCursor,
         active_connections: Arc<AtomicU64>,
-        replicas_connected: Option<Arc<AtomicU32>>,
         fence_state: Arc<crate::fence::FenceState>,
         wait: WaitStrategy,
         starting_wire_seq: u64,
@@ -2547,7 +2525,6 @@ impl<A: Application> MatchingStage<A> {
             events_processed,
             durable_wire_seq,
             active_connections,
-            replicas_connected,
             fence_state,
             wait,
             utilization: Arc::new(StageUtilization::new()),
@@ -2559,34 +2536,6 @@ impl<A: Application> MatchingStage<A> {
     /// Shared utilization counters for health endpoint monitoring.
     pub fn utilization(&self) -> Arc<StageUtilization> {
         Arc::clone(&self.utilization)
-    }
-
-    /// Returns true if trading is halted: either all replicas have
-    /// disconnected (durability can't be honoured) or the node has been
-    /// fenced by a higher epoch (superseded after a promotion). Always
-    /// false for the replica-disconnect cause in standalone mode
-    /// (`replicas_connected` is None); the fence latch is checked
-    /// unconditionally but can only be set when replication is active.
-    fn is_halted(&self) -> bool {
-        self.fence_state.is_fenced()
-            || self
-                .replicas_connected
-                .as_ref()
-                .is_some_and(|count| count.load(Ordering::Relaxed) == 0)
-    }
-
-    /// Reject reason a halted node returns to clients: `Superseded` when
-    /// the fence latched (a higher epoch demoted us), `ReplicaDisconnected`
-    /// otherwise. Fence takes priority — a fenced node is shutting down
-    /// regardless of replica count. The run loop inlines this same rule
-    /// (it can't borrow `self` while the peeked batch is live); keep the two
-    /// in sync.
-    fn halt_reject_reason(&self) -> RejectReason {
-        if self.fence_state.is_fenced() {
-            RejectReason::Superseded
-        } else {
-            RejectReason::ReplicaDisconnected
-        }
     }
 
     /// Run the matching stage loop. Blocks until shutdown.
@@ -2687,33 +2636,6 @@ impl<A: Application> MatchingStage<A> {
 
             let mut saw_shutdown = false;
 
-            // Halt status is constant for the duration of one disruptor
-            // batch (replica counts and the fence latch only change
-            // between batches in practice). Two Relaxed loads per batch,
-            // hoisted out of the per-event branch. Spelled as field
-            // accesses rather than `self.is_halted()` (the consumer's
-            // peeked batch keeps `self` mutably borrowed) — must stay in
-            // sync with that method: a fenced node must stop applying
-            // client writes on the *live* path too, or it keeps extending
-            // the superseded journal lineage until the shutdown sentinel
-            // arrives (the response stage only drops the acks).
-            let fenced = self.fence_state.is_fenced();
-            let halted = fenced
-                || self
-                    .replicas_connected
-                    .as_ref()
-                    .is_some_and(|count| count.load(Ordering::Relaxed) == 0);
-            // Reason a halted node hands back to clients: `Superseded` when
-            // the fence latched (a higher epoch demoted us), else
-            // `ReplicaDisconnected`. Fence wins — a fenced node is shutting
-            // down regardless of replica count. A `Copy` enum captured here
-            // so the per-event reject site needs no fresh `self` borrow.
-            let halt_reason = if fenced {
-                RejectReason::Superseded
-            } else {
-                RejectReason::ReplicaDisconnected
-            };
-
             // Open a single output batch for the entire disruptor batch:
             // all OutputSlots produced below share one Release store on
             // the output cursor at `out_batch.commit()`, instead of one
@@ -2763,55 +2685,13 @@ impl<A: Application> MatchingStage<A> {
                 ctx.key_hash = slot.key_hash;
                 local_events += 1;
 
-                // Halt check first: reject before advancing any HWMs so
-                // the client can safely retry the same seq after
-                // reconnect. Read-only queries bypass both halt and
-                // dedup — they never mutate durable state, so returning
-                // the current snapshot during a halt is safe (and
-                // actually useful for operators monitoring the outage).
+                // Read-only queries bypass dedup — they never mutate
+                // durable state. No halt check here: a halted node
+                // refuses client writes before publishing them, so every
+                // event reaching this point is one the journal records
+                // and replay will apply (see the type's docs).
                 let is_query = slot.event.is_query();
-                // Every output slot emitted while `halted` is exempt from
-                // the response stage's durability gate. Two kinds reach
-                // the output ring during halt: the explicit halt-state
-                // rejection below (`Rejected{ReplicaDisconnected}` —
-                // operator-visible refusal, no engine state changed) and
-                // the empty `BatchEnd` terminator that the transport
-                // variant (Tick) emits as its "I produced no client
-                // payload" marker. Neither carries
-                // engine state worth replicating before delivery; gating
-                // them under a structurally unsatisfiable policy
-                // (e.g. `disk+ram` with no replicas) would stall the gate
-                // forever — including for the rejection itself, which is
-                // exactly what we want clients to see immediately. See
-                // `OutputSlot::durability_bypass` for the correctness
-                // argument. Queries bypass halt entirely (they're
-                // read-only), so they keep the gate as usual.
-                // Transport-internal events carry `connection_id == 0`:
-                // the runtime emits them for startup seeds (AddInstrument /
-                // ProvisionAccount) and the journal-replay path on
-                // recovery. They are server-originated, predate any
-                // client traffic, and have no client to whom a
-                // `ReplicaDisconnected` rejection would be addressed. The
-                // halt check exists to refuse *client writes* while the
-                // replication policy can't honour the persist-before-ack
-                // invariant; applying transport-internal events to the
-                // local engine during halt doesn't violate that invariant
-                // (no ack to a client) and is required so a fresh primary
-                // can seed its instruments before any replica connects.
-                // Mirrors the existing dedup exemption a few lines below
-                // (`key_hash == 0` — same provenance, same reasoning).
-                let is_transport_internal = slot.connection_id == 0;
-                let halt_bypass = halted && !is_query;
-                if !is_query && halted && !is_transport_internal {
-                    // Only app events produce client-facing rejections;
-                    // transport variants (Tick)
-                    // have no client to reject to, so they silently
-                    // skip during halt.
-                    if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                        reports.push(A::build_reject(e, halt_reason));
-                    }
-                } else if !is_query && !self.app.check_request_seq(slot.key_hash, slot.request_seq)
-                {
+                if !is_query && !self.app.check_request_seq(slot.key_hash, slot.request_seq) {
                     // Duplicate request — produce a Rejected report for
                     // the app event; transport variants don't go through
                     // dedup (they use `key_hash == 0` which the app
@@ -2906,12 +2786,10 @@ impl<A: Application> MatchingStage<A> {
                     // (response, event publisher) just looked up
                     // connection 0, didn't find it, and dropped the
                     // slot. Skipping the publish is equivalent — and
-                    // critical during halt onset, where such a slot
-                    // would otherwise sit in the response ring with
-                    // `durability_bypass=false` (set pre-halt, before
-                    // the policy went unsatisfiable) and wedge the
-                    // response gate forever waiting for a replication
-                    // condition that can no longer be met.
+                    // critical during a halt, where such a slot would
+                    // sit in the response ring and wedge the response
+                    // gate waiting for a replication condition that can
+                    // no longer be met.
                     if slot.connection_id != 0 {
                         out_batch.push_with(|s| {
                             *s = OutputSlot {
@@ -2922,7 +2800,6 @@ impl<A: Application> MatchingStage<A> {
                                 match_complete_ts,
                                 recv_ts: slot.recv_ts,
                                 is_last_in_request: true,
-                                durability_bypass: halt_bypass,
                             };
                         });
                     }
@@ -2938,7 +2815,6 @@ impl<A: Application> MatchingStage<A> {
                                 match_complete_ts,
                                 recv_ts: slot.recv_ts,
                                 is_last_in_request: is_last,
-                                durability_bypass: halt_bypass,
                             };
                         });
                     }
@@ -2952,12 +2828,6 @@ impl<A: Application> MatchingStage<A> {
                                 match_complete_ts,
                                 recv_ts: slot.recv_ts,
                                 is_last_in_request: true,
-                                // Query responses are read-only snapshots
-                                // and already bypass the halt check (see
-                                // `is_query` above), but they still carry
-                                // state-derived data — keep the gate so
-                                // clients only observe replicated state.
-                                durability_bypass: false,
                             };
                         });
                     }
@@ -3032,18 +2902,9 @@ impl<A: Application> MatchingStage<A> {
             }
             reports.clear();
 
-            // Halt check first, then dedup (same order as the main run loop).
-            // `connection_id == 0` marks transport-internal events
-            // (startup seeds, journal replay) — mirror the main loop's
-            // exemption so a shutdown drain doesn't drop the very seed
-            // events the next startup will recover.
-            let is_transport_internal = slot.connection_id == 0;
-            let halt_bypass = self.is_halted();
-            if halt_bypass && !is_transport_internal {
-                if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                    reports.push(A::build_reject(e, self.halt_reject_reason()));
-                }
-            } else if !self.app.check_request_seq(slot.key_hash, slot.request_seq) {
+            // Dedup, as in the main run loop; no halt check, for the same
+            // reason.
+            if !self.app.check_request_seq(slot.key_hash, slot.request_seq) {
                 if let melin_journal::JournalEvent::App(ref e) = slot.event {
                     reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
                 }
@@ -3071,7 +2932,6 @@ impl<A: Application> MatchingStage<A> {
                     match_complete_ts,
                     recv_ts: slot.recv_ts,
                     is_last_in_request: true,
-                    durability_bypass: halt_bypass,
                 });
             } else {
                 for (j, report) in reports.iter().enumerate() {
@@ -3084,7 +2944,6 @@ impl<A: Application> MatchingStage<A> {
                         match_complete_ts,
                         recv_ts: slot.recv_ts,
                         is_last_in_request: is_last,
-                        durability_bypass: halt_bypass,
                     });
                 }
             }
@@ -3504,9 +3363,9 @@ where
 
     // Connected replica count: when replication is enabled, starts at 0
     // (no replicas yet). The replication sender increments on connect,
-    // decrements on disconnect. The matching stage checks it (one Relaxed
-    // load per event) and rejects all mutations when 0. In standalone
-    // mode, None — no halt check. u32 counter supports dual replication.
+    // decrements on disconnect. The server's readers check it once per
+    // receive and refuse client writes when 0. In standalone mode, None —
+    // no halt check. u32 counter supports dual replication.
     let replicas_connected = if enable_replication {
         Some(Arc::new(AtomicU32::new(0)))
     } else {
@@ -3520,7 +3379,6 @@ where
         Arc::clone(&events_processed),
         cursors.durable_wire_seq(),
         active_connections,
-        replicas_connected.clone(),
         fence_state,
         waits.matching,
         starting_wire_seq,
@@ -3545,7 +3403,6 @@ where
 /// Build a pipeline for replica mode. Same disruptor stages as the primary
 /// (journal → matching → shadow), but:
 /// - No replication ring (this IS the replica)
-/// - No `replicas_connected` halt check
 /// - Output disruptor has a single drain consumer (no response stage)
 ///
 /// The replica's journal stage encodes events from the disruptor using
@@ -3634,8 +3491,7 @@ where
     );
     journal_stage.set_last_seq_publisher(cursors.durable_wire_seq());
 
-    // Matching stage: same as primary but with no replicas_connected check
-    // (None = standalone mode, never halts on replica disconnect).
+    // Matching stage: same as primary.
     let active_connections = Arc::new(AtomicU64::new(0));
     let matching_stage = MatchingStage::<A>::new(
         app,
@@ -3644,7 +3500,6 @@ where
         Arc::clone(&events_processed),
         cursors.durable_wire_seq(),
         active_connections,
-        None, // no replicas_connected halt check on replica
         fence_state,
         waits.matching,
         starting_wire_seq,
