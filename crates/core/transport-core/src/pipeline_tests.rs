@@ -4021,3 +4021,109 @@ fn dropping_the_disk_thread_handle_stops_and_joins_the_thread() {
         "dropping the handle must join the thread, not just ask it to stop"
     );
 }
+
+/// A request refused as a duplicate is still journaled (the journal stage
+/// writes before the matching stage decides), so every path that rebuilds
+/// state from the input stream must refuse it the same way the live
+/// matching stage did: no apply, and no clock advance. Three views of one
+/// history — the live engine, a replay of the journal it wrote, and the
+/// shadow stage's copy, whose snapshots recovery restores from — must be
+/// the same state. The shadow once applied the duplicate anyway, so its
+/// snapshots held state the primary never had; replay advanced the clock
+/// for it.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn a_refused_duplicate_is_invisible_to_live_replay_and_shadow() {
+    const KEY: u64 = 0xD0D0;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("duplicate.journal");
+    let writer = Writer::create(&path).unwrap();
+    let mut out = build_pipeline_with_replication(
+        TestApp::new(),
+        writer,
+        Duration::ZERO,
+        Arc::new(AtomicU64::new(0)),
+        false,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let mut input_producer = out.input_producer;
+    let journal_stage = out.journal_stage;
+    let matching_stage = out.matching_stage;
+    let durable = out.cursors.durable_wire_seq();
+    let mut output_consumer = out.output_consumers.pop().unwrap();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s1 = Arc::clone(&shutdown);
+    let s2 = Arc::clone(&shutdown);
+    let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+    let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+    // A request, its duplicate a millisecond later, then a new request.
+    let slots = [(5, 1, 1_000_000), (5, 1, 2_000_000), (7, 2, 3_000_000)].map(
+        |(n, request_seq, timestamp_ns)| TestInput {
+            key_hash: KEY,
+            request_seq,
+            ..add_slot(n, timestamp_ns)
+        },
+    );
+    for slot in slots {
+        input_producer.publish(slot);
+    }
+
+    let mut received = 0;
+    let mut spins = 0u32;
+    let drain_start = std::time::Instant::now();
+    while received < slots.len() {
+        if output_consumer.try_consume().is_some() {
+            received += 1;
+        } else {
+            drain_backoff(&mut spins, drain_start, "draining outputs");
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while durable.load().get() < slots.len() as u64 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        durable.load().get(),
+        slots.len() as u64,
+        "the duplicate is journaled too"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = t_journal.join().unwrap();
+    let live = t_matching.join().unwrap();
+    assert_eq!(live.total, 12, "the live engine refused the duplicate");
+
+    let (replayed, _writer) = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path)
+        .unwrap()
+        .into_parts();
+    assert_eq!(
+        replayed, live,
+        "replay must refuse the duplicate as live did"
+    );
+
+    let mut shadow = TestApp::new();
+    let (mut last_drain_ns, mut epoch, mut reports) = (0, 0, Vec::new());
+    for slot in slots {
+        crate::shadow::dispatch_event(
+            &mut shadow,
+            &slot.event,
+            slot.timestamp_ns,
+            slot.key_hash,
+            slot.request_seq,
+            &mut last_drain_ns,
+            &mut epoch,
+            &mut reports,
+        );
+    }
+    assert_eq!(
+        shadow, live,
+        "the shadow must refuse the duplicate as live did"
+    );
+}

@@ -558,7 +558,15 @@ fn replay_entry<A: Application>(
     // state will diverge from the live primary (e.g. a retried deposit
     // applied twice). For `Tick` events `key_hash == 0`, which
     // `check_request_seq` exempts — `is_new` is always true there.
-    let is_new = app.check_request_seq(key_hash, request_seq);
+    //
+    // The refusal skips the clock drain too: the live matching stage
+    // refuses a duplicate before it advances the scheduler clock, so a
+    // replay that ticked for it would fire time-driven tasks at a point
+    // in the history the primary never did.
+    if !app.check_request_seq(key_hash, request_seq) {
+        // The client already received the rejection at live time.
+        return;
+    }
 
     if timestamp_ns > *last_drain_ns {
         *last_drain_ns = timestamp_ns;
@@ -567,12 +575,6 @@ fn replay_entry<A: Application>(
 
     match event {
         JournalEvent::App(e) => {
-            if !is_new {
-                // Primary produced a dedup rejection here; replay discards
-                // it because the client already received that reject at
-                // live time.
-                return;
-            }
             // Reports produced during replay are discarded — they already
             // went to the client at the time the event was accepted.
             // `key_hash` is the dedup identity threaded through this

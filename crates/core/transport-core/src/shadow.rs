@@ -164,14 +164,16 @@ fn try_save_snapshot<A: Application>(
 
 /// Dispatch a single journal event to the shadow app.
 ///
-/// Mirrors `JournaledApp::replay_entry`: rebuild per-key HWM via
-/// `check_request_seq`, drain the scheduler clock if `timestamp_ns`
-/// advanced, then hand the event to `apply` or `tick`. Without the
-/// `check_request_seq` call, the shadow snapshot's `key_hwm` would be
-/// empty and a restore would let previously-rejected duplicate
-/// `request_seq` values through. `last_drain_ns` is caller-tracked
+/// Mirrors the live matching stage and `JournaledApp::replay_entry`:
+/// rebuild the per-key HWM via `check_request_seq` and refuse a duplicate
+/// outright, drain the scheduler clock if `timestamp_ns` advanced, then
+/// hand the event to `apply` or `tick`. Without the `check_request_seq`
+/// call, the shadow snapshot's `key_hwm` would be empty and a restore
+/// would let previously-rejected duplicate `request_seq` values through;
+/// without the refusal, the snapshot would hold the duplicate's effect,
+/// which the primary never applied. `last_drain_ns` is caller-tracked
 /// across the consume loop so the drain stays monotonic.
-fn dispatch_event<A: Application>(
+pub(crate) fn dispatch_event<A: Application>(
     app: &mut A,
     event: &JournalEvent<A::Event>,
     timestamp_ns: u64,
@@ -189,10 +191,12 @@ fn dispatch_event<A: Application>(
     // non-queries because the journal stage drops queries — so advancing
     // HWM on queries here would push shadow's `key_hwm` above primary's and
     // cause post-restore to reject legitimate non-duplicate requests.
-    // Return discarded: shadow applies the event regardless of the dedup
-    // decision (matches `replay_entry` for non-queries).
-    if !event.is_query() {
-        let _ = app.check_request_seq(key_hash, request_seq);
+    //
+    // A refused duplicate goes no further — no clock drain, no apply —
+    // exactly as on the matching stage, which journals it but never
+    // applies it.
+    if !event.is_query() && !app.check_request_seq(key_hash, request_seq) {
+        return;
     }
 
     if timestamp_ns > *last_drain_ns {
@@ -566,25 +570,23 @@ mod tests {
         );
     }
 
+    /// The matching stage refuses a duplicate `request_seq` without
+    /// applying it or advancing the scheduler clock, and replay refuses it
+    /// the same way. The shadow must too: its snapshot is what recovery
+    /// restores, so a duplicate applied here would be state the primary
+    /// never had. (The end-to-end three-way comparison lives in
+    /// `pipeline_tests::a_refused_duplicate_is_invisible_to_live_replay_and_shadow`.)
     #[test]
-    fn duplicate_request_seq_still_applies_event() {
-        // dispatch_event discards check_request_seq's return value — even
-        // when the matching stage would have rejected the event as a
-        // duplicate, the shadow still applies it. This mirrors
-        // JournaledApp::replay_entry's non-query branch, and the
-        // shadow_vs_primary divergence assumes both paths apply the same
-        // bytes regardless of dedup outcome. Without this, a primary
-        // that re-replays the same journal segment would diverge from a
-        // shadow that skipped duplicates.
+    fn duplicate_request_seq_is_refused() {
         let mut app = TestApp::new();
         let mut reports = Vec::new();
         let mut drain = 0u64;
 
-        // First dispatch at seq=10 — advances HWM and applies.
+        // First dispatch at seq=10 — advances HWM, ticks, and applies.
         dispatch_event(
             &mut app,
             &JournalEvent::App(TestEvent::Add(5)),
-            0,
+            1_000,
             KEY,
             10,
             &mut drain,
@@ -592,24 +594,23 @@ mod tests {
             &mut reports,
         );
         assert_eq!(app.total, 5);
+        assert_eq!(app.ticks, 1);
         assert_eq!(app.key_hwm.get(&KEY).copied(), Some(10));
 
-        // Second dispatch at seq=10 — dedup gate would reject (seq not
-        // strictly greater than HWM), but apply still runs.
+        // Second dispatch at seq=10, later — a duplicate: no apply, no
+        // tick.
         dispatch_event(
             &mut app,
             &JournalEvent::App(TestEvent::Add(5)),
-            0,
+            2_000,
             KEY,
             10,
             &mut drain,
             &mut 0u64,
             &mut reports,
         );
-        assert_eq!(
-            app.total, 10,
-            "apply must run even when dedup would have rejected"
-        );
+        assert_eq!(app.total, 5, "a duplicate must not be applied");
+        assert_eq!(app.ticks, 1, "a duplicate must not advance the clock");
         assert_eq!(
             app.key_hwm.get(&KEY).copied(),
             Some(10),
