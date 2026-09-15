@@ -1223,6 +1223,7 @@ dependencies = [
  "io-uring",
  "libc",
  "melin-app",
+ "melin-client",
  "melin-dpdk",
  "melin-example-counter",
  "melin-journal",

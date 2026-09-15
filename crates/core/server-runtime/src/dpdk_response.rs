@@ -21,6 +21,7 @@ use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::Blocker;
+use crate::halt::RefusalQueue;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::DurableWireSeqCursor;
@@ -130,6 +131,9 @@ pub fn run<A: Application>(
     utilization: Arc<StageUtilization>,
     wait: WaitStrategy,
     encoder: crate::response::ResponseEncoderArc<A>,
+    // Writes the poll thread refused while halted, each sent once
+    // everything published before it is answered — see `crate::halt`.
+    mut refusals: RefusalQueue<A::Report>,
 ) {
     // Mirrors `response::run`: derive the local Policy from the shared
     // policy atomic and observe runtime swaps from the admin
@@ -218,6 +222,9 @@ pub fn run<A: Application>(
     // Paces accrual ticks inside the gate-wait spin. Function-scoped so
     // the normal gated path pays no extra clock read — see `response::run`.
     let mut gate_accrual_timer = AmortizedTimer::new();
+    // Input sequence of the last output slot handled — refusals are
+    // released only where it changes. See `response::run`.
+    let mut last_input_seq = u64::MAX;
 
     // Stage histograms — mirror the TCP response stage but without
     // an `egress` histogram. DPDK egress lives in the poll thread
@@ -245,7 +252,7 @@ pub fn run<A: Application>(
     #[cfg(feature = "latency-trace")]
     let mut last_stats_flush = Instant::now();
 
-    loop {
+    'run: loop {
         // Observe runtime policy swaps from the admin `ACK-POLICY`
         // command. See `response::run` for the design rationale.
         let observed_byte = ack_policy.load(Ordering::Relaxed);
@@ -288,8 +295,12 @@ pub fn run<A: Application>(
         // Borrow output slots from the matching stage in place — see
         // `response::run` for why this is a borrow and not a copy, and
         // for the consequence of publishing progress after the batch
-        // instead of before it.
+        // instead of before it. Refusals follow the order `RefusalQueue`
+        // documents: the idle bound before the read, the sync between the
+        // read and the control drain.
+        let idle_refusal_bound = refusals.idle_bound();
         let slots = consumer.read_contiguous(MAX_BATCH);
+        let refusals_waiting = refusals.sync();
 
         // Poll control channel for connect/disconnect — after the ring
         // is read, never before: the poll thread queues `Connected` on
@@ -308,6 +319,21 @@ pub fn run<A: Application>(
         );
 
         if slots.is_empty() {
+            if let Some(bound) = idle_refusal_bound {
+                let now = Instant::now();
+                refusals.release(bound, |refusal| {
+                    push_refusal(
+                        refusal,
+                        &*encoder,
+                        &mut connections,
+                        &mut tx_producers,
+                        &mut encode_buf,
+                        &batch_end_wire_frame,
+                        now,
+                    );
+                });
+            }
+
             idle_count += 1;
             if idle_count.is_multiple_of(1024) {
                 utilization.busy.store(busy_count, Ordering::Relaxed);
@@ -420,6 +446,24 @@ pub fn run<A: Application>(
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
+            // First slot of an event: refusals stamped up to its sequence
+            // go first, ahead of the gate. See `response::run`.
+            let first_of_event = slot.input_seq != last_input_seq;
+            last_input_seq = slot.input_seq;
+            if refusals_waiting && first_of_event {
+                refusals.release(slot.input_seq, |refusal| {
+                    push_refusal(
+                        refusal,
+                        &*encoder,
+                        &mut connections,
+                        &mut tx_producers,
+                        &mut encode_buf,
+                        &batch_end_wire_frame,
+                        batch_now,
+                    );
+                });
+            }
+
             // Per-slot journal-wait / replica-wait tracker. Same shape as
             // the TCP response — see `crate::response::GateCrossTracker`
             // for the rationale and edge cases.
@@ -434,11 +478,6 @@ pub fn run<A: Application>(
             // (the old `+1` compensated for the input-seq
             // off-by-(starting-1), which is gone now).
             //
-            // The halt-state carve-out rides inside `slot_needs_gate`.
-            // Without it a halted node on DPDK stalls the halt rejection
-            // itself on a structurally unsatisfiable policy (`DiskAndRam`
-            // with every replica gone), so the client never learns why
-            // it was refused.
             if crate::response::slot_needs_gate(slot, cached_durable_pos) {
                 let needed = slot.wire_seq;
                 // Fresh waiter per gate entry — see `response::run`.
@@ -462,6 +501,13 @@ pub fn run<A: Application>(
                         // Flush accrual before re-seeding so the wedged-
                         // degraded interval up to the swap isn't dropped.
                         degraded_logger.reseed(&utilization, Instant::now());
+                    }
+
+                    // And shutdown, so a gate that cannot open does not
+                    // hold the shutdown sequence — see `response::run`.
+                    // The reply the policy never confirmed is not queued.
+                    if shutdown.load(Ordering::Relaxed) {
+                        continue 'run;
                     }
 
                     let journal_pos = journal_persisted_wire_seq.load();
@@ -691,6 +737,40 @@ fn push_frame(
         frame.data[..written].copy_from_slice(&encode_buf[..written]);
         frame.data[written..total].copy_from_slice(trailer);
     });
+}
+
+/// Queue the reply to a write refused at ingress — the application's
+/// rejection and the request terminator, in one frame — for the poll
+/// thread. No durability gate: nothing was published. A connection that
+/// has gone away is skipped.
+fn push_refusal<R: Copy, Q: Copy>(
+    refusal: crate::halt::Refusal<R>,
+    encoder: &dyn melin_app::encoder::ResponseEncoder<Report = R, Query = Q>,
+    connections: &mut FxHashMap<u64, ConnectionHeartbeat>,
+    tx_producers: &mut [spsc::Producer<TxFrame>],
+    encode_buf: &mut [u8],
+    batch_end_wire_frame: &[u8],
+    now: Instant,
+) {
+    let conn_id = refusal.connection_id;
+    let Some(conn_state) = connections.get_mut(&conn_id) else {
+        tracing::debug!(
+            connection_id = conn_id,
+            "refusal dropped: connection not registered"
+        );
+        return;
+    };
+    let tid = (conn_id >> 56) as usize % tx_producers.len();
+    let payload = encoder.encode_report(&refusal.report, encode_buf);
+    push_frame(
+        Some(payload),
+        conn_id,
+        &mut tx_producers[tid],
+        encode_buf,
+        batch_end_wire_frame,
+    );
+    tx_producers[tid].flush();
+    conn_state.last_send = now;
 }
 
 /// Per-connection heartbeat state. No socket writer — the DPDK poll

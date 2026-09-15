@@ -278,6 +278,8 @@ This avoids adding any cross-thread synchronization cost on the trading hot path
 
 The matching stage does **not** wait for the journal stage. Both consumers are gated only on the producer, so matching proceeds as soon as events are published. The persist-before-ack check is deferred to the response stage. This means the matching stage may process events that are not yet durable -- but no client will see those results until the journal confirms durability.
 
+It also means the matching stage cannot refuse an event: by the time it sees one, the journal stage may already have recorded it, and replay would apply what was refused. A node that halts because it cannot honour its ack policy (see [replication.md](replication.md)) therefore refuses client writes at ingress, before they are published, and the matching stage applies everything it is given.
+
 ### Idle behavior
 
 Waits according to its thread's wait strategy, like every other stage — see [Waiting](#waiting).
@@ -324,7 +326,9 @@ Before sending any response, the response stage verifies that the corresponding 
 
 The check is made **per response**, not once per batch. A response is released as soon as its own event satisfies the policy, so a request does not wait on unrelated requests that happened to be processed alongside it. Since the acked position is a high-water mark, a client that receives a response knows that event and every event before it satisfies the configured policy.
 
-Responses whose delivery does not depend on the policy are exempt from the wait entirely. The halt rejection sent when the matching engine has stopped is the case that matters in practice: it reports no engine state, so it is delivered immediately rather than blocking on a policy that a degraded cluster may not be able to satisfy.
+The one reply exempt from the wait is the refusal of a write while the node is halted. The write is refused before it enters the pipeline, so there is no event to wait on; the refusal is sent once the replies to everything received before it on that connection have gone out, keeping replies in request order.
+
+A reply still waiting when the node stops, whether an operator stopped it or a newer primary superseded it, is dropped: the policy never confirmed the event, so the node cannot acknowledge it. The client sees the connection close, as it would on a crash, and reconciles on reconnect. The event itself is journaled and applied, so a retry of the same request is answered as a duplicate.
 
 The acked position is cached across batches to avoid redundant atomic loads when the policy's cursors are running ahead of the response stage.
 

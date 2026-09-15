@@ -16,6 +16,7 @@ pub mod ack_policy;
 pub mod admin;
 mod buf_ring;
 mod client_frames;
+pub mod halt;
 pub mod layout;
 pub mod process;
 pub mod promotion;

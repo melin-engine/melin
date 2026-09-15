@@ -1439,6 +1439,17 @@ where
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
+    // Client writes a halted node refuses at ingress, reader → response
+    // stage, counted for the health endpoint. See `crate::halt`.
+    let refused_writes = Arc::new(AtomicU64::new(0));
+    let halt_gate = crate::halt::HaltGate::new(
+        replicas_connected.clone(),
+        Arc::clone(&fence_state),
+        Arc::clone(&refused_writes),
+    );
+    let (refusal_tx, refusal_rx) =
+        crate::halt::refusal_channel::<A::Report>(Arc::clone(&matching_cursor));
+
     // Spawn the io_uring reader thread. A single reader uses multishot RECV
     // to multiplex every TCP connection on the server. Pinned to
     // cores.reader. The matching stage is the throughput limit, so a
@@ -1574,6 +1585,7 @@ where
                     encoder,
                     fence_state: response_fence,
                     active_connections: active_connections_response,
+                    refusals: refusal_rx,
                     #[cfg(test)]
                     pause_after_control_drain: None,
                 },
@@ -1753,6 +1765,7 @@ where
         config,
         &active_connections,
         &events_processed,
+        &refused_writes,
         &cursors,
         input_cursor,
         &pipeline_healthy,
@@ -1961,6 +1974,8 @@ where
     let mut reader_handle = crate::reader::spawn_reader::<A, _>(
         input_producer,
         decoder,
+        halt_gate,
+        refusal_tx,
         control_tx.clone(),
         config.cores.reader.core,
         connection_timeout,
@@ -2669,6 +2684,17 @@ where
     // Control channel: DPDK poll thread → response stage (connect/disconnect).
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
+    // Client writes a halted node refuses at ingress, poll thread →
+    // response stage, counted for the health endpoint. See `crate::halt`.
+    let refused_writes = Arc::new(AtomicU64::new(0));
+    let halt_gate = crate::halt::HaltGate::new(
+        replicas_connected.clone(),
+        Arc::clone(&fence_state),
+        Arc::clone(&refused_writes),
+    );
+    let (refusal_tx, refusal_rx) =
+        crate::halt::refusal_channel::<A::Report>(Arc::clone(&matching_cursor));
+
     // TX SPSC: response stage → DPDK poll thread (encoded frames).
     // Lock-free, fixed-size slots — no heap allocation per frame.
     // 4096 slots × ~140 bytes = ~560 KiB. Enough to buffer a burst
@@ -2793,6 +2819,7 @@ where
                 response_utilization_thread,
                 wait,
                 encoder,
+                refusal_rx,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
@@ -3005,6 +3032,7 @@ where
         &config,
         &active_connections,
         &events_processed,
+        &refused_writes,
         &cursors,
         input_cursor,
         &pipeline_healthy,
@@ -3046,6 +3074,8 @@ where
         transport_0,
         input_producer,
         decoder,
+        halt_gate,
+        refusal_tx,
         control_tx,
         tx_rx_0,
         &shutdown,
@@ -3334,6 +3364,7 @@ fn spawn_health_endpoint(
     config: &ServerConfig,
     active_connections: &Arc<AtomicU64>,
     events_processed: &Arc<AtomicU64>,
+    refused_writes: &Arc<AtomicU64>,
     cursors: &melin_transport_core::PipelineCursors,
     input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
     pipeline_healthy: &Arc<AtomicBool>,
@@ -3372,6 +3403,7 @@ fn spawn_health_endpoint(
         melin_transport_core::health::HealthState {
             active_connections: Arc::clone(active_connections),
             events_processed: Arc::clone(events_processed),
+            refused_writes: Arc::clone(refused_writes),
             cursors: cursors.clone(),
             input_cursor,
             pipeline_healthy: Arc::clone(pipeline_healthy),

@@ -29,6 +29,7 @@ use tracing::{debug, error};
 
 use crate::ControlEvent;
 use crate::buf_ring::BufRing;
+use crate::halt::{HaltGate, RefusalSender};
 use melin_app::Application;
 use melin_app::auth::Permission;
 use melin_app::decoder::RequestDecoder;
@@ -195,9 +196,15 @@ impl<R> UringReaderHandle<R> {
 /// `JournalEvent::Tick { now_ns }` onto the same input ring it uses for
 /// client requests. Pass `None` to disable the tick (useful for benchmarks
 /// that don't exercise time-driven features).
+///
+/// While `halt` refuses writes, the reader answers them through
+/// `refusals` instead of publishing them — see [`crate::halt`].
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
     producer: ring::Producer<InputSlot<A::Event>>,
     decoder: Arc<dyn RequestDecoder<Event = A::Event>>,
+    halt: HaltGate,
+    refusals: RefusalSender<A::Report>,
     control_tx: mpsc::Sender<ControlEvent>,
     core: usize,
     connection_timeout: Option<Duration>,
@@ -206,6 +213,7 @@ pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
 ) -> UringReaderHandle<R>
 where
     A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
 
@@ -232,6 +240,8 @@ where
                 wakeup_fd,
                 producer,
                 &*decoder,
+                &halt,
+                refusals,
                 &control_tx,
                 connection_timeout,
                 tick_cadence,
@@ -366,6 +376,7 @@ fn ring_entry(sq_pending: usize, cq_ready: bool) -> RingEntry {
 ///
 /// When `tick_cadence` is `Some`, the loop also generates the engine's
 /// scheduler ticks — see [`spawn_reader`] for the rationale.
+#[allow(clippy::too_many_arguments)]
 fn reader_loop<A: Application, R: AsRawFd>(
     command_rx: mpsc::Receiver<ReaderRegistration<R>>,
     // Shared with `UringReaderHandle`. Taken by value so this thread keeps
@@ -374,6 +385,8 @@ fn reader_loop<A: Application, R: AsRawFd>(
     wakeup_fd: Arc<OwnedFd>,
     mut producer: ring::Producer<InputSlot<A::Event>>,
     decoder: &dyn RequestDecoder<Event = A::Event>,
+    halt: &HaltGate,
+    mut refusals: RefusalSender<A::Report>,
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
     tick_cadence: Option<Duration>,
@@ -830,6 +843,8 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     entry,
                     &mut producer,
                     decoder,
+                    halt,
+                    &mut refusals,
                     control_tx,
                     batch_wall_ns,
                     recv_ts,
@@ -1246,10 +1261,13 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
 /// requests published in this call share it, sparing the reader a
 /// per-request `clock_gettime(CLOCK_REALTIME)` on the hot path. Returns
 /// `true` if the connection should be dropped.
+#[allow(clippy::too_many_arguments)]
 fn process_frames<A: Application, R>(
     conn: &mut ConnectionEntry<R>,
     producer: &mut ring::Producer<InputSlot<A::Event>>,
     decoder: &dyn RequestDecoder<Event = A::Event>,
+    halt: &HaltGate,
+    refusals: &mut RefusalSender<A::Report>,
     control_tx: &mpsc::Sender<ControlEvent>,
     batch_wall_ns: u64,
     recv_ts: melin_transport_core::trace::MonoTraceInstant,
@@ -1258,13 +1276,15 @@ fn process_frames<A: Application, R>(
 ) -> bool {
     use crate::client_frames::{FrameAction, process_client_frames};
 
-    let action = process_client_frames(
+    let action = process_client_frames::<A>(
         &mut conn.parse_buf,
         conn.connection_id,
         conn.key_hash,
         conn.permission,
         producer,
         decoder,
+        halt,
+        refusals,
         batch_wall_ns,
         recv_ts,
         #[cfg(feature = "latency-trace")]
@@ -1318,6 +1338,7 @@ mod tests {
     use melin_pipeline::ring::DisruptorBuilder;
     use std::io::{ErrorKind, Read};
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     /// The reader's enter policy. Each case is a syscall-per-drain
@@ -1377,27 +1398,36 @@ mod tests {
         }
     }
 
-    /// Placeholder `Application` impl. `process_frames` is generic over `A`
-    /// only to constrain `A::Event` — none of the trait methods are called
-    /// from the function under test, so they all `unreachable!`.
+    /// Placeholder `Application` impl. `process_frames` calls only
+    /// `build_reject`, for a write refused while halted; the rest
+    /// `unreachable!`.
     struct TestApp;
+
+    /// What [`TestApp::build_reject`] returns: the refused event and why,
+    /// so a test can tell refusals apart.
+    type TestReport = (TestEvent, RejectReason);
 
     impl Application for TestApp {
         type Event = TestEvent;
-        type Report = ();
+        type Report = TestReport;
         type QueryResponse = ();
         const APP_VERSION: u16 = 0;
-        fn apply(&mut self, _event: TestEvent, _ctx: &ApplyCtx, _out: &mut Vec<()>) -> Option<()> {
+        fn apply(
+            &mut self,
+            _event: TestEvent,
+            _ctx: &ApplyCtx,
+            _out: &mut Vec<TestReport>,
+        ) -> Option<()> {
             unreachable!()
         }
-        fn tick(&mut self, _now_ns: u64, _out: &mut Vec<()>) {
+        fn tick(&mut self, _now_ns: u64, _out: &mut Vec<TestReport>) {
             unreachable!()
         }
         fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
             unreachable!()
         }
-        fn build_reject(_event: &TestEvent, _reason: RejectReason) -> () {
-            unreachable!()
+        fn build_reject(event: &TestEvent, reason: RejectReason) -> TestReport {
+            (*event, reason)
         }
         fn snapshot<W: std::io::Write>(&self, _w: &mut W) -> std::io::Result<()> {
             unreachable!()
@@ -1516,6 +1546,54 @@ mod tests {
         conn: &mut ConnectionEntry<UnixStream>,
         producer: &mut ring::Producer<InputSlot<TestEvent>>,
     ) -> (bool, mpsc::Receiver<ControlEvent>) {
+        let (mut refusals, _queue) = refusal_channel();
+        run_process_frames_with(conn, producer, &gate(None, false), &mut refusals)
+    }
+
+    /// A halt gate: `replicas` connected (`None` for standalone), fenced
+    /// or not.
+    fn gate(replicas: Option<u32>, fenced: bool) -> HaltGate {
+        gate_counting_into(replicas, fenced, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// [`gate`], counting what it refuses into `refused`.
+    fn gate_counting_into(
+        replicas: Option<u32>,
+        fenced: bool,
+        refused: Arc<AtomicU64>,
+    ) -> HaltGate {
+        let fence = Arc::new(melin_transport_core::fence::FenceState::new(0));
+        if fenced {
+            fence.fence();
+        }
+        HaltGate::new(
+            replicas.map(|count| Arc::new(std::sync::atomic::AtomicU32::new(count))),
+            fence,
+            refused,
+        )
+    }
+
+    fn refused_count(refused: &AtomicU64) -> u64 {
+        refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A refusal queue whose idle bound is never consulted by these tests.
+    fn refusal_channel() -> (
+        RefusalSender<TestReport>,
+        crate::halt::RefusalQueue<TestReport>,
+    ) {
+        crate::halt::refusal_channel(Arc::new(melin_pipeline::padding::CachePadded::new(
+            std::sync::atomic::AtomicU64::new(0),
+        )))
+    }
+
+    /// [`run_process_frames`] against a given halt gate and refusal queue.
+    fn run_process_frames_with(
+        conn: &mut ConnectionEntry<UnixStream>,
+        producer: &mut ring::Producer<InputSlot<TestEvent>>,
+        halt: &HaltGate,
+        refusals: &mut RefusalSender<TestReport>,
+    ) -> (bool, mpsc::Receiver<ControlEvent>) {
         #[cfg(feature = "latency-trace")]
         let mut publish_rec = melin_transport_core::trace::register_stage("test: publish");
         #[cfg(feature = "tick-to-trade")]
@@ -1529,6 +1607,8 @@ mod tests {
             conn,
             producer,
             &TagDecoder,
+            halt,
+            refusals,
             &control_tx,
             0xDEAD_BEEF,
             recv_ts,
@@ -1620,6 +1700,138 @@ mod tests {
         );
     }
 
+    /// A halted reader publishes no write: each is refused, stamped with
+    /// the input sequence it would have taken, while queries still go
+    /// through. Nothing refused can reach the journal, so replay cannot
+    /// apply a write the client was told failed.
+    #[test]
+    fn a_halted_reader_refuses_writes_before_publishing_and_still_publishes_queries() {
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(16);
+        // Write, query, write, query.
+        for byte in [0x01, 0xFF, 0x02, 0xFF] {
+            conn.parse_buf.extend_from_slice(&frame(byte));
+        }
+        let (mut refusals, mut queue) = refusal_channel();
+        let counted = Arc::new(AtomicU64::new(0));
+
+        let (disconnect, control_rx) = run_process_frames_with(
+            &mut conn,
+            &mut producer,
+            &gate_counting_into(Some(0), false, Arc::clone(&counted)),
+            &mut refusals,
+        );
+        assert!(!disconnect);
+        assert_eq!(busy_events(&control_rx), 0);
+        assert!(conn.parse_buf.is_empty(), "every frame consumed");
+        assert_eq!(
+            refused_count(&counted),
+            2,
+            "the two writes are counted, the queries are not"
+        );
+
+        let published: Vec<_> = drain(&mut consumer)
+            .into_iter()
+            .map(|(seq, slot)| (seq, slot.event))
+            .collect();
+        assert_eq!(
+            published,
+            [
+                (0, JournalEvent::App(TestEvent::Query)),
+                (1, JournalEvent::App(TestEvent::Query)),
+            ],
+            "only the queries enter the pipeline"
+        );
+
+        let mut refused = Vec::new();
+        assert!(queue.sync(), "the refusals are flushed");
+        queue.release(u64::MAX, |r| refused.push(r));
+        let expect = |input_seq, byte| crate::halt::Refusal {
+            connection_id: 7,
+            input_seq,
+            report: (TestEvent::Cmd(byte), RejectReason::ReplicaDisconnected),
+        };
+        assert_eq!(
+            refused,
+            [expect(0, 0x01), expect(1, 0x02)],
+            "each write is stamped with the sequence of the query that followed it"
+        );
+    }
+
+    /// A fenced node closes the connection, whatever its replica count:
+    /// nothing is published, nothing is refused, nothing is counted.
+    #[test]
+    fn a_fenced_reader_closes_the_connection() {
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(16);
+        for byte in [0x01, 0xFF] {
+            conn.parse_buf.extend_from_slice(&frame(byte));
+        }
+        let (mut refusals, mut queue) = refusal_channel();
+        let counted = Arc::new(AtomicU64::new(0));
+
+        let (disconnect, control_rx) = run_process_frames_with(
+            &mut conn,
+            &mut producer,
+            &gate_counting_into(Some(1), true, Arc::clone(&counted)),
+            &mut refusals,
+        );
+
+        assert!(disconnect, "the connection is dropped");
+        assert_eq!(busy_events(&control_rx), 0);
+        assert!(
+            drain(&mut consumer).is_empty(),
+            "not even the query is published"
+        );
+        assert!(!queue.sync(), "no refusal is queued");
+        assert_eq!(refused_count(&counted), 0);
+    }
+
+    /// Refusals that cannot be queued shed load the way a full input ring
+    /// does, and the write is still not published.
+    #[test]
+    fn a_full_refusal_queue_is_pipeline_busy() {
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(16);
+        conn.parse_buf.extend_from_slice(&frame(0x01));
+        let (mut refusals, _queue) = refusal_channel();
+        let filler = crate::halt::Refusal {
+            connection_id: 1,
+            input_seq: 0,
+            report: (TestEvent::Cmd(0), RejectReason::ReplicaDisconnected),
+        };
+        while refusals.try_send(filler).is_ok() {}
+        let counted = Arc::new(AtomicU64::new(0));
+
+        let (disconnect, control_rx) = run_process_frames_with(
+            &mut conn,
+            &mut producer,
+            &gate_counting_into(Some(0), false, Arc::clone(&counted)),
+            &mut refusals,
+        );
+
+        assert!(!disconnect);
+        assert_eq!(busy_events(&control_rx), 1);
+        assert!(drain(&mut consumer).is_empty());
+        assert_eq!(
+            refused_count(&counted),
+            1,
+            "a shed write still counts as refused by the halt"
+        );
+    }
+
     /// The caller stamps `recv_ts` once per recv (at the kernel-return
     /// site) and every frame parsed from that buffer must carry that exact
     /// value. Guards against a regression to per-frame `recv_ts` capture,
@@ -1649,10 +1861,13 @@ mod tests {
         let mut ingest_rec = melin_transport_core::trace::register_stage("test: ingest recv_ts");
 
         let (control_tx, _control_rx) = mpsc::channel();
+        let (mut refusals, _queue) = refusal_channel();
         let disconnect = process_frames::<TestApp, UnixStream>(
             &mut conn,
             &mut producer,
             &TagDecoder,
+            &gate(None, false),
+            &mut refusals,
             &control_tx,
             0xDEAD_BEEF,
             RECV_TS,
@@ -2027,6 +2242,8 @@ mod tests {
         let mut handle = spawn_reader::<TestApp, UnixStream>(
             producer,
             Arc::new(TagDecoder),
+            gate(None, false),
+            refusal_channel().0,
             control_tx,
             0,    // "do not pin" sentinel
             None, // no idle timeout — a CI stall must not disconnect
@@ -2139,6 +2356,8 @@ mod tests {
         let mut handle = spawn_reader::<TestApp, UnixStream>(
             producer,
             Arc::new(TagDecoder),
+            gate(None, false),
+            refusal_channel().0,
             control_tx,
             0,    // "do not pin" sentinel
             None, // no idle timeout
@@ -2213,6 +2432,8 @@ mod tests {
         let mut handle = spawn_reader::<TestApp, UnixStream>(
             producer,
             Arc::new(TagDecoder),
+            gate(None, false),
+            refusal_channel().0,
             control_tx,
             0,
             None,

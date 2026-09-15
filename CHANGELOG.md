@@ -12,6 +12,58 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`melin-pipeline`: `spsc::Consumer::refresh` and
+  `try_consume_visible`**, to consume only what was published before a
+  chosen point, and **`ring::Batch::next_sequence`**, the sequence the next
+  entry in a batch takes.
+- **`melin_writes_refused_total` on `/metrics`**, a counter of client
+  writes turned away while the node was halted. A refused write is never
+  journaled, so until now it left no trace at all.
+
+### Changed
+
+- **`MatchingStage::new` no longer takes the replica count, and
+  `OutputSlot` loses `durability_bypass`.** The matching stage applies
+  every event it is given; halting is the readers' job (see Fixed).
+  `spawn_reader`, `run_dpdk_poll`, `dpdk_response::run` and
+  `response::Response` take the new halt gate and refusal queue from
+  `melin_server_runtime::halt`. Application traits are unchanged, but
+  `Application::build_reject` now runs on the request-reading thread for a
+  halt rejection, rather than on the matching thread.
+- **A superseded node closes client connections instead of answering.** A
+  node fenced by a newer primary is stopping; a connection that sends
+  anything while it winds down is closed at once, and the rest close when
+  the process exits. Clients reconnect to the new primary, as after a
+  crash. Previously the node queued a `Superseded` rejection that, in
+  practice, never went out before the stage stopped.
+
+### Removed
+
+- **`RejectReason::Superseded`.** Nothing produces it any more (see
+  Changed). Applications that mapped it to a wire code or a display string
+  drop that arm.
+
+### Fixed
+
+- **A write refused while halted was replayed.** A primary with no replica
+  attached, or superseded by a newer one, rejected client writes in the
+  matching stage — after the journal stage, running beside it, had already
+  recorded them. The client was told the write failed, yet the next replay,
+  a replica catching up, or a promoted node applied it. The node now
+  refuses writes before publishing them, so a refused write is never
+  journaled. The rejection is unchanged on the wire and still skips the ack
+  policy, but now waits for the replies to the client's earlier requests,
+  so replies stay in request order.
+- **A node held on its ack policy could not be stopped.** With every
+  replica gone under a policy that needs one, the response stage waited in
+  the durability gate for a replica to return and never observed shutdown,
+  so an operator restart, or a fence, hung the process. The gate wait now
+  exits on shutdown. The reply it was holding is dropped, as it would be
+  by a crash: the policy never confirmed it, and the client reconciles on
+  reconnect.
+
 ## [0.16.0] - 2026-09-14
 
 ### Added
