@@ -504,16 +504,14 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         &mut self,
         event: A::Event,
         out: &mut Vec<A::Report>,
-    ) -> Result<Option<A::QueryResponse>, JournalError> {
-        let seq = self.writer.append(&JournalEvent::App(event))?;
+    ) -> Result<(), JournalError> {
+        self.writer.append(&JournalEvent::App(event))?;
         let ctx = melin_app::ApplyCtx {
             now_ns: melin_app::unix_epoch_nanos(),
-            journal_sequence: melin_app::WireSeq::new(seq),
-            active_connections: 0,
-            events_processed: 0,
             key_hash: 0,
         };
-        Ok(self.app.apply(event, &ctx, out))
+        self.app.apply(event, &ctx, out);
+        Ok(())
     }
 
     /// Journal a tick event and dispatch it to the inner application.
@@ -574,19 +572,13 @@ fn replay_entry<A: Application>(
             }
             // Reports produced during replay are discarded — they already
             // went to the client at the time the event was accepted.
-            // `key_hash` is the dedup identity threaded through this
-            // event so self-introspecting queries see the correct
-            // per-key state under replay.
+            // Queries are never journaled, so every entry here is one
+            // `apply` handled live, with the same context.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
-                journal_sequence: melin_app::WireSeq::new(0),
-                active_connections: 0,
-                events_processed: 0,
                 key_hash,
             };
-            // Query response discarded during replay — these already
-            // went to the client when the event was first accepted.
-            let _ = app.apply(*e, &ctx, reports);
+            app.apply(*e, &ctx, reports);
         }
         JournalEvent::Tick { now_ns } => {
             app.tick(*now_ns, reports);
@@ -799,9 +791,6 @@ mod tests {
         let mut reports = Vec::new();
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
             key_hash: 1,
         };
         for (i, e) in events.iter().enumerate() {
@@ -809,7 +798,7 @@ mod tests {
             let ts = 1_000 * (i as u64 + 1);
             app.tick(ts, &mut reports);
             if is_new {
-                let _ = app.apply(*e, &ctx, &mut reports);
+                app.apply(*e, &ctx, &mut reports);
             }
         }
         app

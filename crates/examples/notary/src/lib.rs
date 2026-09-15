@@ -71,7 +71,7 @@ use std::io::{self, Read, Write};
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 
 /// The receipt as clients keep it — shared by the client and the auditor.
 pub mod receipt;
@@ -189,10 +189,9 @@ pub enum NotaryReport {
     Receipt {
         /// 1-based position in the chain.
         ///
-        /// The application's own counter, not `ApplyCtx::journal_sequence`
-        /// — that one is documented as advisory and fsync-timing
-        /// dependent, so deriving journaled state from it would break
-        /// determinism between primary and replica.
+        /// The application's own counter, not the journal's sequence —
+        /// that one is node-local and fsync-timing dependent, which is why
+        /// only a query can see it (`QueryCtx::journal_sequence`).
         entry: u64,
         /// When the sequencer dispatched the leaf, in nanoseconds since
         /// the Unix epoch. Folded into `head`, so it is attested, not
@@ -210,7 +209,7 @@ pub enum NotaryReport {
     Rejected,
 }
 
-/// 1:1 query response returned directly from `apply`.
+/// 1:1 query response returned by `query`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotaryHead {
     /// Leaves folded in so far — the position the next receipt will get,
@@ -277,12 +276,7 @@ impl Application for Notary {
     type Report = NotaryReport;
     type QueryResponse = NotaryHead;
 
-    fn apply(
-        &mut self,
-        event: Self::Event,
-        ctx: &ApplyCtx,
-        out: &mut Vec<Self::Report>,
-    ) -> Option<Self::QueryResponse> {
+    fn apply(&mut self, event: Self::Event, ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
         match event {
             NotaryEvent::Notarize { leaf } => {
                 // `now_ns` is the sequencer's dispatch clock, journaled
@@ -302,12 +296,19 @@ impl Application for Notary {
                     prev,
                     head: self.head,
                 });
-                None
             }
+            // A query: answered by `query`, never applied.
+            NotaryEvent::GetHead => {}
+        }
+    }
+
+    fn query(&self, event: Self::Event, _ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        match event {
             NotaryEvent::GetHead => Some(NotaryHead {
                 entries: self.entries,
                 head: self.head,
             }),
+            NotaryEvent::Notarize { .. } => None,
         }
     }
 
@@ -459,9 +460,6 @@ mod tests {
     fn ctx_at(now_ns: u64) -> ApplyCtx {
         ApplyCtx {
             now_ns,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
             key_hash: 0,
         }
     }
@@ -670,16 +668,25 @@ mod tests {
     }
 
     #[test]
-    fn get_head_reports_state_without_emitting_reports() {
+    fn get_head_reports_state() {
         let mut app = Notary::default();
         let mut out = Vec::new();
         app.apply(NotaryEvent::Notarize { leaf: leaf(7) }, &ctx(), &mut out);
-        out.clear();
 
-        let query = app.apply(NotaryEvent::GetHead, &ctx(), &mut out).unwrap();
-        assert!(out.is_empty());
+        let query_ctx = QueryCtx {
+            journal_sequence: melin_app::WireSeq::new(0),
+            active_connections: 0,
+            events_processed: 0,
+            key_hash: 0,
+        };
+        let query = app.query(NotaryEvent::GetHead, &query_ctx).unwrap();
         assert_eq!(query.entries, 1);
         assert_eq!(query.head, app.head());
+        assert!(
+            app.query(NotaryEvent::Notarize { leaf: leaf(8) }, &query_ctx)
+                .is_none(),
+            "a notarization is not a query"
+        );
     }
 
     #[test]

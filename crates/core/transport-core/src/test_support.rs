@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestEvent {
@@ -70,7 +70,7 @@ pub struct TestReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TestQuery {
     pub total: u64,
-    /// Echo of `ApplyCtx.journal_sequence` (durable wire seq) at apply
+    /// Echo of `QueryCtx::journal_sequence` (durable wire seq) at query
     /// time. Mirrors the exchange app's `QueryStats`, so pipeline tests
     /// can assert what the stats-style query surface reports.
     pub journal_sequence: u64,
@@ -99,24 +99,25 @@ impl Application for TestApp {
 
     const APP_VERSION: u16 = 42;
 
-    fn apply(
-        &mut self,
-        event: Self::Event,
-        ctx: &ApplyCtx,
-        out: &mut Vec<Self::Report>,
-    ) -> Option<Self::QueryResponse> {
+    fn apply(&mut self, event: Self::Event, _ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
         match event {
             TestEvent::Add(n) => {
                 self.total = self.total.wrapping_add(n);
                 out.push(TestReport {
                     total_after: self.total,
                 });
-                None
             }
+            TestEvent::Query => {}
+        }
+    }
+
+    fn query(&self, event: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        match event {
             TestEvent::Query => Some(TestQuery {
                 total: self.total,
                 journal_sequence: ctx.journal_sequence.get(),
             }),
+            TestEvent::Add(_) => None,
         }
     }
 

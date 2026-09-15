@@ -1125,7 +1125,7 @@ mod tests {
     #[cfg(not(feature = "no-persist"))]
     mod scripted {
         use super::*;
-        use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+        use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 
         // Re-export so the sibling test modules can name the generic
         // slot type without reaching into transport-core themselves.
@@ -1167,7 +1167,8 @@ mod tests {
             type QueryResponse = Rpt;
             const APP_VERSION: u16 = 1;
 
-            fn apply(&mut self, _e: EvtAdd, _ctx: &ApplyCtx, _out: &mut Vec<Rpt>) -> Option<Rpt> {
+            fn apply(&mut self, _e: EvtAdd, _ctx: &ApplyCtx, _out: &mut Vec<Rpt>) {}
+            fn query(&self, _e: EvtAdd, _ctx: &QueryCtx) -> Option<Rpt> {
                 None
             }
             fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Rpt>) {}

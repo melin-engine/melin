@@ -112,7 +112,7 @@ pub enum RejectReason {
 /// every process start — the newtype exists so the two spaces cannot be
 /// mixed (see `melin-transport-core`'s `cursors` module, which re-exports
 /// this and defines the sibling spaces). Defined here, in the trait crate,
-/// so [`ApplyCtx`] can carry it across the application boundary.
+/// so [`QueryCtx`] can carry it across the application boundary.
 ///
 /// A position, not a count; subtract two of them with
 /// [`WireSeq::saturating_sub`] to get a lag.
@@ -144,13 +144,13 @@ impl WireSeq {
     }
 }
 
-/// Transport state observable by the application during event application.
+/// What a journaled event is applied under, beside the event itself.
 ///
-/// Passed by reference into [`Application::apply`] so the app can synthesise
-/// query responses (stats snapshots, health-style reports) that reference
-/// counters the transport owns. The transport never pattern-matches on app
-/// event variants — all such concerns live on the app side, reading from
-/// this context.
+/// Every field is journaled with the event, so replay, a replica and the
+/// shadow stage hand [`Application::apply`] the same values the primary
+/// did: an application may derive state from any of them. Node-local
+/// facts — connection counts, durability progress — are deliberately
+/// absent; they reach [`Application::query`] through [`QueryCtx`] instead.
 ///
 /// Layout: plain `Copy` struct, eight-byte aligned fields. Zero-cost to pass
 /// by `&ApplyCtx` on the hot path.
@@ -160,25 +160,34 @@ pub struct ApplyCtx {
     /// nanoseconds since the Unix epoch. Identical across primary and
     /// replica for deterministic replay.
     pub now_ns: u64,
+    /// FxHash of the public key that authenticated the connection that
+    /// submitted this event. `0` for events the node journals on its own
+    /// behalf, which carry no client identity.
+    pub key_hash: u64,
+}
+
+/// Transport state a query may report, beside the query event itself.
+///
+/// Passed to [`Application::query`], which answers from the application's
+/// state without changing it. Unlike [`ApplyCtx`], these values are the
+/// node's own, read when the query runs, and appear in no journal — which
+/// is why only a query, whose answer is never replayed, may see them.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryCtx {
     /// Journal sequence of the last event durably persisted (same value as
     /// the health endpoint's `journal_seq` gauge — survives recovery and
-    /// does not count non-journaled queries). Advances on every fsynced
-    /// batch; batch-stale by up to one matching batch. Advisory only — apps
-    /// must not derive deterministic state from it (it depends on fsync
-    /// timing).
+    /// does not count queries). Advances on every fsynced batch;
+    /// batch-stale by up to one matching batch.
     pub journal_sequence: WireSeq,
     /// Count of client connections currently attached to this server.
     pub active_connections: u64,
-    /// Monotonic count of events the matching stage has applied since
-    /// this process started (includes the event currently being applied).
+    /// Monotonic count of events the matching stage has processed since
+    /// this process started.
     pub events_processed: u64,
-    /// FxHash of the public key that authenticated the connection
-    /// submitting this event. `0` for transport-internal events
-    /// (`Tick`) which carry no client
-    /// identity. Used by self-introspecting queries (e.g. "what is my
-    /// current request_seq HWM?") to look up per-key state without
-    /// embedding identity in the event payload — the transport already
-    /// knows it from the connection registration.
+    /// FxHash of the public key that authenticated the connection asking.
+    /// Lets a self-introspecting query ("what is my request-sequence
+    /// high-water mark?") look up per-key state without embedding identity
+    /// in the event — the transport already knows it from the connection.
     pub key_hash: u64,
 }
 
@@ -236,9 +245,10 @@ pub trait AppEvent: Copy {
     /// framing.
     fn decode(buf: &[u8]) -> Result<Self, CodecError>;
 
-    /// Read-only query events bypass the journal (no state change, no
-    /// durability requirement) but still flow through the matching stage
-    /// so the app can publish a synchronous response from its in-memory
+    /// Query events bypass the journal (no state change, no durability
+    /// requirement) but still flow through the matching stage, which hands
+    /// them to [`Application::query`] rather than
+    /// [`Application::apply`] so the app can answer from its in-memory
     /// state. All other events are journaled.
     fn is_query(&self) -> bool;
 }
@@ -265,6 +275,11 @@ pub trait EncodeReport: Copy {
 /// `(event, ApplyCtx)` pairs against a freshly [`restore`](Application::restore)-d
 /// instance produces byte-identical state.
 ///
+/// Queries take the other door: [`query`](Application::query), which
+/// borrows the application immutably. A query is never journaled, so a
+/// query that changed state would change it on one node and nowhere
+/// else; the signature makes that impossible rather than a rule to keep.
+///
 /// Implementors should keep [`apply`](Application::apply) free of
 /// allocation and I/O. Reports are pushed into the caller-provided buffer,
 /// reused across calls on the hot path.
@@ -289,33 +304,34 @@ pub trait Application: Sized + Default {
     /// buffer allocation-free.
     type Report: Copy;
 
-    /// 1:1 query responses returned directly from [`apply`](Self::apply),
-    /// bypassing the fan-out scratch `Vec`. Routed through
-    /// `OutputPayload::QueryResponse` on the output ring.
+    /// 1:1 query responses returned by [`query`](Self::query). Routed
+    /// through `OutputPayload::QueryResponse` on the output ring.
     ///
     /// Separated from `Report` so that large query payloads (e.g. a
     /// balance snapshot) don't inflate the per-element size of the
     /// scratch vec on the hot path.
     type QueryResponse: Copy;
 
-    /// Apply a single event to the application state. Must be
+    /// Apply a single journaled event to the application state. Must be
     /// deterministic given `(self, event, ctx)`: replay depends on it.
     ///
-    /// The implementation is free to read any field of `ctx`; the
-    /// transport guarantees those fields reflect its live state at
-    /// dispatch time.
+    /// The runtime never passes a query here (see
+    /// [`AppEvent::is_query`]); a match arm for a query variant can do
+    /// nothing. Every field of `ctx` is journaled with the event, so the
+    /// implementation may derive state from any of them.
     ///
-    /// Fan-out reports (fills, acks, cancels) go into `out`. Query
-    /// responses that are always 1:1 with the input event (e.g.
-    /// position snapshots, stats) should be returned directly — the
-    /// transport writes them to the output ring without touching the
-    /// scratch vec, keeping the per-element size of `out` small.
-    fn apply(
-        &mut self,
-        event: Self::Event,
-        ctx: &ApplyCtx,
-        out: &mut Vec<Self::Report>,
-    ) -> Option<Self::QueryResponse>;
+    /// Reports (fills, acks, cancels) go into `out`.
+    fn apply(&mut self, event: Self::Event, ctx: &ApplyCtx, out: &mut Vec<Self::Report>);
+
+    /// Answer a query from the application's current state, without
+    /// changing it. Called on the node serving the client only — never on
+    /// replay, a replica, or the shadow stage — and not journaled.
+    ///
+    /// The runtime passes only events whose [`AppEvent::is_query`] is
+    /// true. `None` is the answer for any other event, so an
+    /// implementation needs no unreachable arm; the client then gets an
+    /// empty reply batch.
+    fn query(&self, event: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse>;
 
     /// Advance the application's wall-clock without applying a business
     /// event. The transport calls [`tick`](Application::tick) once per

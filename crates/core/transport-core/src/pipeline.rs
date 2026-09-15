@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
-use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx, QueryCtx, RejectReason};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::encoder::JournalEncoder;
@@ -451,14 +451,14 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
 ///
 /// `Report(R)` carries fan-out reports (fills, acks, cancels) that
 /// flow through the matching stage's scratch vec. `QueryResponse(Q)`
-/// carries 1:1 query responses returned directly from
-/// `Application::apply`, bypassing the scratch vec entirely.
+/// carries 1:1 query responses returned by `Application::query`,
+/// bypassing the scratch vec entirely.
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::large_enum_variant)]
 pub enum OutputPayload<R: Copy, Q: Copy> {
     /// An application report from matching.
     Report(R),
-    /// A 1:1 query response returned directly from `Application::apply`.
+    /// A 1:1 query response returned by `Application::query`.
     QueryResponse(Q),
     /// Signals the end of reports for one request.
     BatchEnd,
@@ -2483,7 +2483,7 @@ pub struct MatchingStage<A: Application> {
     /// primitive. One `fetch_add(1, Relaxed)` per event (~1ns).
     events_processed: Arc<AtomicU64>,
     /// Durable-wire-seq cursor for reading the highest durably-persisted
-    /// sequence. Feeds `ApplyCtx.journal_sequence` (read by `QueryStats`),
+    /// sequence. Feeds `QueryCtx::journal_sequence` (read by `QueryStats`),
     /// in the same wire-seq space as the health endpoint's `journal_seq`
     /// gauge so the two operator surfaces agree. One `Acquire` load per
     /// batch — no extra cross-thread synchronization on the hot path.
@@ -2670,15 +2670,13 @@ impl<A: Application> MatchingStage<A> {
             }
             waiter.reset();
 
-            // Build ApplyCtx once per batch — the counters are advisory
-            // (stats queries, health endpoint) so batch-stale values are
-            // fine. `now_ns` and `key_hash` are overwritten per-event
-            // below (the latter from the slot's authenticated identity
-            // so self-introspecting queries can read it from `ctx`).
-            // Two Relaxed loads + one Acquire load per batch instead of
-            // per event.
-            let mut ctx = ApplyCtx {
-                now_ns: 0,
+            // Build the query context once per batch — the counters are
+            // advisory (stats queries) so batch-stale values are fine.
+            // `events_processed` and `key_hash` are overwritten per query
+            // below (the latter from the slot's authenticated identity so
+            // self-introspecting queries can read it). One Relaxed load +
+            // one Acquire load per batch instead of per event.
+            let mut query_ctx = QueryCtx {
                 journal_sequence: self.durable_wire_seq.load(),
                 active_connections: self.active_connections.load(Ordering::Relaxed),
                 events_processed: local_events,
@@ -2759,8 +2757,7 @@ impl<A: Application> MatchingStage<A> {
                 #[cfg(feature = "latency-trace")]
                 let exec_start = mono_trace_ns();
 
-                ctx.events_processed = local_events;
-                ctx.key_hash = slot.key_hash;
+                query_ctx.events_processed = local_events;
                 local_events += 1;
 
                 // Halt check first: reject before advancing any HWMs so
@@ -2802,7 +2799,16 @@ impl<A: Application> MatchingStage<A> {
                 // (`key_hash == 0` — same provenance, same reasoning).
                 let is_transport_internal = slot.connection_id == 0;
                 let halt_bypass = halted && !is_query;
-                if !is_query && halted && !is_transport_internal {
+                if is_query {
+                    // A query goes to `Application::query`, which borrows
+                    // the app immutably: no dedup mark, no clock advance,
+                    // no state change — none of which the journal (which
+                    // drops queries) could reproduce on replay.
+                    if let melin_journal::JournalEvent::App(event) = slot.event {
+                        query_ctx.key_hash = slot.key_hash;
+                        query_report = self.app.query(event, &query_ctx);
+                    }
+                } else if halted && !is_transport_internal {
                     // Only app events produce client-facing rejections;
                     // transport variants (Tick)
                     // have no client to reject to, so they silently
@@ -2810,8 +2816,7 @@ impl<A: Application> MatchingStage<A> {
                     if let melin_journal::JournalEvent::App(ref e) = slot.event {
                         reports.push(A::build_reject(e, halt_reason));
                     }
-                } else if !is_query && !self.app.check_request_seq(slot.key_hash, slot.request_seq)
-                {
+                } else if !self.app.check_request_seq(slot.key_hash, slot.request_seq) {
                     // Duplicate request — produce a Rejected report for
                     // the app event; transport variants don't go through
                     // dedup (they use `key_hash == 0` which the app
@@ -2831,9 +2836,9 @@ impl<A: Application> MatchingStage<A> {
                         melin_journal::JournalEvent::App(event) => {
                             let event_ctx = ApplyCtx {
                                 now_ns: slot.timestamp_ns,
-                                ..ctx
+                                key_hash: slot.key_hash,
                             };
-                            query_report = self.app.apply(event, &event_ctx, &mut reports);
+                            self.app.apply(event, &event_ctx, &mut reports);
                         }
                         melin_journal::JournalEvent::Tick { now_ns } => {
                             self.app.tick(now_ns, &mut reports);
@@ -2886,7 +2891,7 @@ impl<A: Application> MatchingStage<A> {
                 // input_seq so the response stage can gate on journal
                 // completion. Fan-out reports (fills, acks) come from
                 // the scratch vec; query responses (stats, position)
-                // are returned directly by the app and pushed here
+                // are returned by `Application::query` and pushed here
                 // without ever entering the vec.
                 //
                 // The terminating wire `BatchEnd` is signalled via
@@ -2996,15 +3001,6 @@ impl<A: Application> MatchingStage<A> {
     /// processing each and publishing responses. Ensures every journaled
     /// event gets a matching response sent to the client.
     fn drain_remaining(&mut self, reports: &mut Vec<A::Report>) {
-        // Shutdown path — not performance-critical. Build a single ctx
-        // with zeroed counters (no health endpoint cares at this point).
-        let ctx = ApplyCtx {
-            now_ns: 0,
-            journal_sequence: WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
-            key_hash: 0,
-        };
         loop {
             let entry = self.consumer.try_consume();
             let Some((input_seq, slot)) = entry else {
@@ -3048,10 +3044,7 @@ impl<A: Application> MatchingStage<A> {
                     reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
                 }
             } else {
-                // Queries are already skipped above, so process_event
-                // will not return a query response here.
-                let query_report = self.process_event(&slot, &ctx, reports);
-                debug_assert!(query_report.is_none(), "drain_remaining skips queries");
+                self.process_event(&slot, reports);
             }
 
             #[allow(clippy::let_unit_value)]
@@ -3099,12 +3092,7 @@ impl<A: Application> MatchingStage<A> {
     /// dispatch, freeing the pipeline from knowing anything about
     /// trading semantics. `#[inline]` on `Exchange::apply` + fat LTO
     /// keep the hot path zero-cost.
-    fn process_event(
-        &mut self,
-        slot: &InputSlot<A::Event>,
-        ctx: &ApplyCtx,
-        reports: &mut Vec<A::Report>,
-    ) -> Option<A::QueryResponse> {
+    fn process_event(&mut self, slot: &InputSlot<A::Event>, reports: &mut Vec<A::Report>) {
         // Hybrid scheduler clock: every event with a non-zero, monotonic
         // timestamp drives the scheduler forward. Under load this fires
         // due tasks at every-event resolution (microseconds) without
@@ -3118,14 +3106,13 @@ impl<A: Application> MatchingStage<A> {
 
         match slot.event {
             melin_journal::JournalEvent::App(event) => {
-                // `now_ns` is the only per-event field — stamp it from
-                // the slot. The remaining ctx fields were loaded once per
-                // batch by the caller.
+                // The same journaled context the live loop and replay
+                // apply under.
                 let ctx = ApplyCtx {
                     now_ns: slot.timestamp_ns,
-                    ..*ctx
+                    key_hash: slot.key_hash,
                 };
-                return self.app.apply(event, &ctx, reports);
+                self.app.apply(event, &ctx, reports);
             }
             melin_journal::JournalEvent::Tick { now_ns } => {
                 // Defensive: the head-of-event drain has already advanced
@@ -3148,7 +3135,6 @@ impl<A: Application> MatchingStage<A> {
                 // in practice; this arm is a safety net.
             }
         }
-        None
     }
 }
 

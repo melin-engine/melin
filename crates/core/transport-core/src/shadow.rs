@@ -15,7 +15,7 @@ use tracing::{error, info};
 use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
 use melin_app::amortized_timer::AmortizedTimer;
-use melin_app::{Application, ApplyCtx, WireSeq};
+use melin_app::{Application, ApplyCtx};
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::SeqLockReader;
@@ -183,17 +183,20 @@ fn dispatch_event<A: Application>(
 ) {
     reports.clear();
 
-    // Gate on `!is_query` to match the matching stage (`pipeline.rs`
-    // `check_request_seq` call site). The shadow reads from the pre-journal
-    // input ring — unlike `JournaledApp::replay_entry`, which sees only
-    // non-queries because the journal stage drops queries — so advancing
-    // HWM on queries here would push shadow's `key_hwm` above primary's and
-    // cause post-restore to reject legitimate non-duplicate requests.
-    // Return discarded: shadow applies the event regardless of the dedup
-    // decision (matches `replay_entry` for non-queries).
-    if !event.is_query() {
-        let _ = app.check_request_seq(key_hash, request_seq);
+    // The shadow reads from the pre-journal input ring, so it sees queries
+    // — unlike `JournaledApp::replay_entry`, which never does because the
+    // journal stage drops them. A query changes no state on the matching
+    // stage (it reaches only `Application::query`), so it changes none
+    // here: no request-sequence mark, no clock advance, no apply. Advancing
+    // the mark on a query would push the shadow's `key_hwm` above the
+    // primary's and make a restore reject legitimate requests.
+    if event.is_query() {
+        return;
     }
+
+    // Return discarded: shadow applies the event regardless of the dedup
+    // decision.
+    let _ = app.check_request_seq(key_hash, request_seq);
 
     if timestamp_ns > *last_drain_ns {
         *last_drain_ns = timestamp_ns;
@@ -203,22 +206,13 @@ fn dispatch_event<A: Application>(
     match *event {
         JournalEvent::App(e) => {
             // The shadow is strictly a secondary observer — the canonical
-            // answer (and journal sequence number) is produced by the
-            // matching stage. `ApplyCtx` is supplied with the fields the
-            // shadow can cheaply compute; `journal_sequence` / connection
-            // counts are live-pipeline-only. `key_hash` is threaded so
-            // that any self-introspecting query the app supports stays
-            // consistent between live and shadow paths.
+            // answer is produced by the matching stage. It applies the
+            // event under the same journaled context.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
-                journal_sequence: WireSeq::new(0),
-                active_connections: 0,
-                events_processed: 0,
                 key_hash,
             };
-            // Query response discarded — shadow is a secondary observer,
-            // it does not produce client-facing output.
-            let _ = app.apply(e, &ctx, reports);
+            app.apply(e, &ctx, reports);
         }
         JournalEvent::Tick { now_ns } => {
             // Defensive: the head-of-event drain typically already advanced
@@ -443,6 +437,18 @@ mod tests {
         // HWM unchanged, so a same-seq non-query still passes.
         assert!(app.key_hwm.get(&KEY).copied().unwrap_or(0) < 100);
         assert!(app.check_request_seq(KEY, 100));
+    }
+
+    /// A query changes no state on the matching stage, which hands it to
+    /// `Application::query` alone — so the shadow must not advance the
+    /// clock for one either, even when the slot carries a timestamp, or
+    /// its time-driven state (expiries) would run ahead of the primary's.
+    #[test]
+    fn query_event_does_not_tick() {
+        let mut app = TestApp::new();
+        dispatch(&mut app, &JournalEvent::App(TestEvent::Query), 1_000, 1);
+        assert_eq!(app.ticks, 0, "a query must not advance the clock");
+        assert_eq!(app.total, 0);
     }
 
     #[test]

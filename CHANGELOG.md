@@ -43,6 +43,21 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `MAX_REQUEST_BODY` gives the matching request bound; `MAX_FRAME_SIZE`
   remains for programs that read client frames themselves.
   `melin-wire-protocol` gains `FIRST_APP_TAG` and `REQUEST_HEADER_LEN`.
+- **Queries have a method of their own, which cannot change state.**
+  `Application::query(&self, event, &QueryCtx) -> Option<QueryResponse>`
+  answers queries; `Application::apply` now takes only journaled events and
+  returns nothing. A query was never journaled, so one that changed state
+  changed it on one node and nowhere else — now the compiler refuses it. A
+  query no longer advances the scheduler clock on the matching stage or the
+  shadow stage, whatever its slot's timestamp. The node-local counters
+  (`journal_sequence`, `active_connections`, `events_processed`) move from
+  `ApplyCtx` to `QueryCtx`: replay passed zeros for them, so an `apply` that
+  read them diverged from the live run. `ApplyCtx` keeps `now_ns` and
+  `key_hash`, both journaled with the event, and the shutdown drain now
+  passes the event's real `key_hash` where it passed zero. To migrate: move
+  query arms out of `apply` into `query` (returning `None` for any other
+  event), leave a no-op arm for query variants in `apply`, and read the
+  counters from `QueryCtx`.
 
 ### Removed
 
