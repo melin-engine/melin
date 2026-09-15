@@ -1,10 +1,12 @@
 //! Minimal `Application` implementation used by the transport-core test
 //! suite. Not part of the public API.
 //!
-//! `TestApp` tracks a running sum and a per-key HWM map so round-trip
-//! tests can assert state equality after snapshot/restore and after
-//! journal replay. Kept deliberately small — the transport doesn't care
-//! about semantics, only about byte-exact round-trips.
+//! `TestApp` tracks a running sum and a per-key running sum (keyed on
+//! `ApplyCtx::key_hash`) so round-trip tests can assert state equality
+//! after snapshot/restore and after journal replay, including that the
+//! submitting key reaches `apply` on every path. Kept deliberately small
+//! — the transport doesn't care about semantics, only about byte-exact
+//! round-trips.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -80,10 +82,12 @@ pub struct TestQuery {
 pub struct TestApp {
     pub total: u64,
     pub ticks: u64,
-    // HashMap for per-key dedup state, matching `Exchange::key_hwm`.
-    // BTreeMap would give deterministic snapshot iteration for free, but
-    // the snapshot() impl sorts explicitly so the choice doesn't matter.
-    pub key_hwm: HashMap<u64, u64>,
+    // Sum of `Add` amounts per submitting `key_hash` (key 0, events no
+    // client submitted, is not tracked). HashMap, the shape a real app's
+    // per-key state takes. BTreeMap would give deterministic snapshot
+    // iteration for free, but the snapshot() impl sorts explicitly so the
+    // choice doesn't matter.
+    pub per_key_total: HashMap<u64, u64>,
 }
 
 impl TestApp {
@@ -108,6 +112,10 @@ impl Application for TestApp {
         match event {
             TestEvent::Add(n) => {
                 self.total = self.total.wrapping_add(n);
+                if ctx.key_hash != 0 {
+                    let key_total = self.per_key_total.entry(ctx.key_hash).or_insert(0);
+                    *key_total = key_total.wrapping_add(n);
+                }
                 out.push(TestReport {
                     total_after: self.total,
                 });
@@ -124,21 +132,6 @@ impl Application for TestApp {
         self.ticks = self.ticks.wrapping_add(1);
     }
 
-    fn check_request_seq(&mut self, key_hash: u64, seq: u64) -> bool {
-        // Exempt internal/seed events (key_hash == 0) — same convention
-        // as Exchange::check_request_seq.
-        if key_hash == 0 {
-            return true;
-        }
-        let hwm = self.key_hwm.entry(key_hash).or_insert(0);
-        if seq > *hwm {
-            *hwm = seq;
-            true
-        } else {
-            false
-        }
-    }
-
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         TestReport {
             total_after: u64::MAX,
@@ -151,10 +144,10 @@ impl Application for TestApp {
         // Sort keys so the snapshot bytes are deterministic — HashMap
         // iteration order is nondeterministic and would break byte-eq
         // assertions across runs.
-        let mut entries: Vec<(&u64, &u64)> = self.key_hwm.iter().collect();
+        let mut entries: Vec<(&u64, &u64)> = self.per_key_total.iter().collect();
         entries.sort_by_key(|(k, _)| **k);
-        let len =
-            u32::try_from(entries.len()).map_err(|_| io::Error::other("too many HWM entries"))?;
+        let len = u32::try_from(entries.len())
+            .map_err(|_| io::Error::other("too many per-key entries"))?;
         w.write_all(&len.to_le_bytes())?;
         for (k, v) in entries {
             w.write_all(&k.to_le_bytes())?;
@@ -172,18 +165,18 @@ impl Application for TestApp {
         let mut u32_buf = [0u8; 4];
         r.read_exact(&mut u32_buf)?;
         let len = u32::from_le_bytes(u32_buf) as usize;
-        let mut key_hwm = HashMap::with_capacity(len);
+        let mut per_key_total = HashMap::with_capacity(len);
         for _ in 0..len {
             let mut kb = [0u8; 8];
             r.read_exact(&mut kb)?;
             let mut vb = [0u8; 8];
             r.read_exact(&mut vb)?;
-            key_hwm.insert(u64::from_le_bytes(kb), u64::from_le_bytes(vb));
+            per_key_total.insert(u64::from_le_bytes(kb), u64::from_le_bytes(vb));
         }
         Ok(Self {
             total,
             ticks,
-            key_hwm,
+            per_key_total,
         })
     }
 }

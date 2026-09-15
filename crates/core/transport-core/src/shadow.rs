@@ -109,7 +109,6 @@ pub fn run<A: Application>(
                 &slot.event,
                 slot.timestamp_ns,
                 slot.key_hash,
-                slot.request_seq,
                 &mut last_drain_ns,
                 &mut shadow_epoch,
                 &mut reports,
@@ -164,36 +163,23 @@ fn try_save_snapshot<A: Application>(
 
 /// Dispatch a single journal event to the shadow app.
 ///
-/// Mirrors `JournaledApp::replay_entry`: rebuild per-key HWM via
-/// `check_request_seq`, drain the scheduler clock if `timestamp_ns`
-/// advanced, then hand the event to `apply` or `tick`. Without the
-/// `check_request_seq` call, the shadow snapshot's `key_hwm` would be
-/// empty and a restore would let previously-rejected duplicate
-/// `request_seq` values through. `last_drain_ns` is caller-tracked
-/// across the consume loop so the drain stays monotonic.
+/// Mirrors `JournaledApp::replay_entry`: drain the scheduler clock if
+/// `timestamp_ns` advanced, then hand the event to `apply` or `tick`.
+/// Every app event reaches `apply` under the key that submitted it, as
+/// in the matching stage, so per-key application state (and whatever
+/// the application refuses from it) matches the primary's.
+/// `last_drain_ns` is caller-tracked across the consume loop so the
+/// drain stays monotonic.
 fn dispatch_event<A: Application>(
     app: &mut A,
     event: &JournalEvent<A::Event>,
     timestamp_ns: u64,
     key_hash: u64,
-    request_seq: u64,
     last_drain_ns: &mut u64,
     epoch: &mut u64,
     reports: &mut Vec<A::Report>,
 ) {
     reports.clear();
-
-    // Gate on `!is_query` to match the matching stage (`pipeline.rs`
-    // `check_request_seq` call site). The shadow reads from the pre-journal
-    // input ring — unlike `JournaledApp::replay_entry`, which sees only
-    // non-queries because the journal stage drops queries — so advancing
-    // HWM on queries here would push shadow's `key_hwm` above primary's and
-    // cause post-restore to reject legitimate non-duplicate requests.
-    // Return discarded: shadow applies the event regardless of the dedup
-    // decision (matches `replay_entry` for non-queries).
-    if !event.is_query() {
-        let _ = app.check_request_seq(key_hash, request_seq);
-    }
 
     if timestamp_ns > *last_drain_ns {
         *last_drain_ns = timestamp_ns;
@@ -207,8 +193,7 @@ fn dispatch_event<A: Application>(
             // matching stage. `ApplyCtx` is supplied with the fields the
             // shadow can cheaply compute; `journal_sequence` / connection
             // counts are live-pipeline-only. `key_hash` is threaded so
-            // that any self-introspecting query the app supports stays
-            // consistent between live and shadow paths.
+            // per-key application state builds as it does live.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
                 journal_sequence: WireSeq::new(0),
@@ -247,6 +232,7 @@ mod tests {
     use crate::test_support::{TestApp, TestEvent};
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_pipeline::seqlock;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -376,10 +362,9 @@ mod tests {
     // ------------------------------------------------------------------
     // dispatch_event contract tests
     //
-    // dispatch_event has four observable behaviours:
-    //   - App events advance per-key HWM (gated on !is_query) and reach
-    //     Application::apply
-    //   - Query events skip the HWM advance
+    // dispatch_event has three observable behaviours:
+    //   - Every app event reaches Application::apply under the key that
+    //     submitted it — the shadow filters nothing
     //   - `timestamp_ns` drives a monotonic Application::tick drain
     //   - Transport variants (Tick / Shutdown)
     //     are handled without touching app-event state
@@ -392,57 +377,39 @@ mod tests {
 
     const KEY: u64 = 0xDEAD_BEEF;
 
-    fn dispatch(app: &mut TestApp, event: &JournalEvent<TestEvent>, ts: u64, seq: u64) {
+    fn dispatch(app: &mut TestApp, event: &JournalEvent<TestEvent>, ts: u64) {
         let mut reports = Vec::new();
         let mut drain = 0u64;
         let mut epoch = 0u64;
-        dispatch_event(
-            app,
-            event,
-            ts,
-            KEY,
-            seq,
-            &mut drain,
-            &mut epoch,
-            &mut reports,
-        );
+        dispatch_event(app, event, ts, KEY, &mut drain, &mut epoch, &mut reports);
     }
 
     #[test]
-    fn app_event_advances_hwm_and_reaches_apply() {
+    fn app_event_reaches_apply_under_its_key() {
         let mut app = TestApp::new();
-        let mut reports = Vec::new();
-        let mut drain = 0u64;
-
-        // Non-query Add: HWM should bump to seq, total should bump by n.
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(42)),
-            0,
-            KEY,
-            10,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
+        dispatch(&mut app, &JournalEvent::App(TestEvent::Add(42)), 0);
 
         assert_eq!(app.total, 42, "apply must have run");
-        assert_eq!(app.key_hwm.get(&KEY).copied(), Some(10));
+        assert_eq!(
+            app.per_key_total,
+            HashMap::from([(KEY, 42)]),
+            "apply must see the submitting key"
+        );
     }
 
+    /// A repeated submission reaches `apply` every time, as it does in the
+    /// matching stage and on replay. The application decides what a
+    /// repeat means, and it decides it the same way on all three paths,
+    /// so the shadow's snapshot holds the state the primary holds.
     #[test]
-    fn query_event_does_not_advance_hwm() {
-        // Regression: the shadow reads from the pre-journal input ring so
-        // it sees queries (the matching stage filters them out at the
-        // !is_query gate). Advancing HWM on queries would push shadow's
-        // key_hwm above primary's and a post-restore could reject
-        // legitimate non-duplicate requests.
+    fn repeated_submission_reaches_apply_every_time() {
         let mut app = TestApp::new();
-        dispatch(&mut app, &JournalEvent::App(TestEvent::Query), 0, 100);
+        for _ in 0..2 {
+            dispatch(&mut app, &JournalEvent::App(TestEvent::Add(5)), 0);
+        }
 
-        // HWM unchanged, so a same-seq non-query still passes.
-        assert!(app.key_hwm.get(&KEY).copied().unwrap_or(0) < 100);
-        assert!(app.check_request_seq(KEY, 100));
+        assert_eq!(app.total, 10, "the shadow must not filter a repeat");
+        assert_eq!(app.per_key_total, HashMap::from([(KEY, 10)]));
     }
 
     #[test]
@@ -462,7 +429,6 @@ mod tests {
             &JournalEvent::App(TestEvent::Add(1)),
             100,
             KEY,
-            1,
             &mut drain,
             &mut 0u64,
             &mut reports,
@@ -476,7 +442,6 @@ mod tests {
             &JournalEvent::App(TestEvent::Add(1)),
             50,
             KEY,
-            2,
             &mut drain,
             &mut 0u64,
             &mut reports,
@@ -489,7 +454,6 @@ mod tests {
             &JournalEvent::App(TestEvent::Add(1)),
             100,
             KEY,
-            3,
             &mut drain,
             &mut 0u64,
             &mut reports,
@@ -502,7 +466,6 @@ mod tests {
             &JournalEvent::App(TestEvent::Add(1)),
             200,
             KEY,
-            4,
             &mut drain,
             &mut 0u64,
             &mut reports,
@@ -516,7 +479,7 @@ mod tests {
         // bumps TestApp::ticks) and never reaches apply (which would bump
         // TestApp::total).
         let mut app = TestApp::new();
-        dispatch(&mut app, &JournalEvent::Tick { now_ns: 1_000 }, 0, 1);
+        dispatch(&mut app, &JournalEvent::Tick { now_ns: 1_000 }, 0);
 
         assert_eq!(app.total, 0, "Tick variant must not call apply");
         assert!(app.ticks >= 1, "Tick variant must call Application::tick");
@@ -529,92 +492,10 @@ mod tests {
         // practice — the run loop exits on it — but the match arm exists
         // as defence in depth and is exercised here.)
         let mut app = TestApp::new();
-        dispatch(&mut app, &JournalEvent::Shutdown, 0, 3);
+        dispatch(&mut app, &JournalEvent::Shutdown, 0);
 
         assert_eq!(app.total, 0, "no app-event state change");
         assert_eq!(app.ticks, 0, "no clock drain (timestamp_ns was 0)");
-    }
-
-    #[test]
-    fn key_hash_zero_bypasses_hwm_dedup() {
-        // Transport-internal events (Tick) and
-        // any seed-time inserts use key_hash=0 to opt out of per-key
-        // dedup. dispatch_event must hand those events to apply
-        // regardless of the request_seq value — TestApp::check_request_seq
-        // mirrors Exchange::check_request_seq in returning true for
-        // key_hash=0 without consulting the HWM map.
-        let mut app = TestApp::new();
-        let mut reports = Vec::new();
-        let mut drain = 0u64;
-
-        for _ in 0..3 {
-            dispatch_event(
-                &mut app,
-                &JournalEvent::App(TestEvent::Add(7)),
-                0,
-                0, // key_hash sentinel
-                1, // same seq each time — would be a duplicate for any real key
-                &mut drain,
-                &mut 0u64,
-                &mut reports,
-            );
-        }
-        assert_eq!(app.total, 21, "every internal event must apply");
-        assert!(
-            app.key_hwm.is_empty(),
-            "key_hash=0 must not allocate an HWM entry"
-        );
-    }
-
-    #[test]
-    fn duplicate_request_seq_still_applies_event() {
-        // dispatch_event discards check_request_seq's return value — even
-        // when the matching stage would have rejected the event as a
-        // duplicate, the shadow still applies it. This mirrors
-        // JournaledApp::replay_entry's non-query branch, and the
-        // shadow_vs_primary divergence assumes both paths apply the same
-        // bytes regardless of dedup outcome. Without this, a primary
-        // that re-replays the same journal segment would diverge from a
-        // shadow that skipped duplicates.
-        let mut app = TestApp::new();
-        let mut reports = Vec::new();
-        let mut drain = 0u64;
-
-        // First dispatch at seq=10 — advances HWM and applies.
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(5)),
-            0,
-            KEY,
-            10,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
-        assert_eq!(app.total, 5);
-        assert_eq!(app.key_hwm.get(&KEY).copied(), Some(10));
-
-        // Second dispatch at seq=10 — dedup gate would reject (seq not
-        // strictly greater than HWM), but apply still runs.
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(5)),
-            0,
-            KEY,
-            10,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
-        assert_eq!(
-            app.total, 10,
-            "apply must run even when dedup would have rejected"
-        );
-        assert_eq!(
-            app.key_hwm.get(&KEY).copied(),
-            Some(10),
-            "HWM must not regress"
-        );
     }
 
     #[test]

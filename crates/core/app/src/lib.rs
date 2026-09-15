@@ -89,15 +89,12 @@ impl std::error::Error for CodecError {}
 
 /// Transport-originated rejection reasons. These are the rejections the
 /// transport itself synthesises before an event reaches the application
-/// (duplicate request on the dedup path, halted pipeline). App-originated
-/// rejections (insufficient balance, risk limits, unknown symbol) are
-/// modelled inside the app's own [`Application::Report`] type and do not
-/// appear here.
+/// (halted pipeline, superseded node). App-originated rejections
+/// (duplicate request, insufficient balance, risk limits, unknown symbol)
+/// are modelled inside the app's own [`Application::Report`] type and do
+/// not appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
-    /// Per-key request sequence was not strictly greater than the
-    /// recorded high-water mark for this authentication key.
-    DuplicateRequest,
     /// Replication is configured but no replica is currently connected;
     /// the transport refuses state-mutating events to preserve the
     /// persist-before-ack invariant.
@@ -178,12 +175,13 @@ pub struct ApplyCtx {
     /// this process started (includes the event currently being applied).
     pub events_processed: u64,
     /// FxHash of the public key that authenticated the connection
-    /// submitting this event. `0` for transport-internal events
-    /// (`Tick`) which carry no client
-    /// identity. Used by self-introspecting queries (e.g. "what is my
-    /// current request_seq HWM?") to look up per-key state without
-    /// embedding identity in the event payload — the transport already
-    /// knows it from the connection registration.
+    /// submitting this event. `0` for events no client submitted
+    /// (`Tick`, startup seeds). Journaled with the event, so replay hands
+    /// `apply` the same value the live dispatch did. Lets the application
+    /// keep per-key state (an idempotency sequence, a rate limit) or
+    /// answer a "my own state" query without embedding identity in the
+    /// event payload — the transport already knows it from the
+    /// connection registration.
     pub key_hash: u64,
 }
 
@@ -317,21 +315,6 @@ pub trait Application: Sized {
     /// time-driven tasks (expiries, session transitions) with
     /// monotonically increasing `now_ns`.
     fn tick(&mut self, now_ns: u64, out: &mut Vec<Self::Report>);
-
-    /// Per-key idempotency gate. Returns `true` if `seq` is strictly
-    /// greater than the previously seen sequence for `key_hash` (and
-    /// the high-water mark has been advanced), `false` on a duplicate.
-    ///
-    /// The application owns both the map and the policy: what counts as
-    /// a duplicate, and whether duplicates are refused at all, is its
-    /// decision — an application whose requests are idempotent by
-    /// nature may return `true` unconditionally, as the examples do. The
-    /// transport's part is only to turn `false` into a
-    /// [`DuplicateRequest`](RejectReason::DuplicateRequest) report built
-    /// by [`build_reject`](Application::build_reject) instead of a call
-    /// to [`apply`](Application::apply). Whether the map ever moves into
-    /// the transport is an open question, not a plan.
-    fn check_request_seq(&mut self, key_hash: u64, seq: u64) -> bool;
 
     /// Synthesise a rejection report for a transport-originated reject.
     /// Called by the transport before `apply` has observed the event.

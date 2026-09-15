@@ -539,27 +539,17 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
 /// Dispatch a single journaled entry back into the application during
 /// replay. Mirrors the live matching-stage dispatch: hybrid scheduler
-/// clock drain, `check_request_seq` rebuilds the per-key HWM, then the
-/// event flows to `apply` or `tick` depending on its kind.
+/// clock drain, then the event flows to `apply` or `tick` depending on
+/// its kind.
 fn replay_entry<A: Application>(
     app: &mut A,
     event: &JournalEvent<A::Event>,
     timestamp_ns: u64,
     key_hash: u64,
-    request_seq: u64,
     last_drain_ns: &mut u64,
     recovered_epoch: &mut u64,
     reports: &mut Vec<A::Report>,
 ) {
-    // Rebuild per-key HWM and capture whether this was a new request.
-    // The journal stage writes events before the matching stage dedups,
-    // so the journal can contain duplicates the primary rejected without
-    // calling `apply`. Replay must skip `apply` on those entries or
-    // state will diverge from the live primary (e.g. a retried deposit
-    // applied twice). For `Tick` events `key_hash == 0`, which
-    // `check_request_seq` exempts — `is_new` is always true there.
-    let is_new = app.check_request_seq(key_hash, request_seq);
-
     if timestamp_ns > *last_drain_ns {
         *last_drain_ns = timestamp_ns;
         app.tick(timestamp_ns, reports);
@@ -567,17 +557,13 @@ fn replay_entry<A: Application>(
 
     match event {
         JournalEvent::App(e) => {
-            if !is_new {
-                // Primary produced a dedup rejection here; replay discards
-                // it because the client already received that reject at
-                // live time.
-                return;
-            }
+            // Every journaled app event reaches `apply`, as it did live:
+            // whatever the application refused at live time (a duplicate
+            // request, say) it refuses again here from the same state.
             // Reports produced during replay are discarded — they already
             // went to the client at the time the event was accepted.
-            // `key_hash` is the dedup identity threaded through this
-            // event so self-introspecting queries see the correct
-            // per-key state under replay.
+            // `key_hash` is threaded so per-key application state
+            // rebuilds exactly as it was built live.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
                 journal_sequence: melin_app::WireSeq::new(0),
@@ -653,7 +639,6 @@ fn replay_segment<A: Application>(
                         &entry.event,
                         entry.timestamp_ns,
                         entry.key_hash,
-                        entry.request_seq,
                         last_drain_ns,
                         recovered_epoch,
                         reports,
@@ -764,15 +749,15 @@ mod tests {
     use super::*;
     use crate::test_support::{TestApp, TestEvent};
     use melin_journal::{BufferedWriter, JournalEvent, JournalReader};
+    use std::collections::HashMap;
 
     // Concrete writer used by every test. The buffered path covers
     // the same JournaledApp logic without needing PLP hardware.
     type TestApp_ = JournaledApp<TestApp, BufferedWriter<TestEvent>>;
 
-    /// Write events with auto-allocated sequences and fsync them to disk.
-    /// Each event is keyed on `(key_hash = 1, request_seq = first_seq + idx)`
-    /// so tests that append in multiple phases can offset `first_seq` to
-    /// avoid dedup collisions across calls.
+    /// Write events with auto-allocated sequences and fsync them to disk,
+    /// each submitted under `key_hash = 1` with
+    /// `request_seq = first_seq + idx`.
     fn append_events(ja: TestApp_, events: &[TestEvent], first_seq: u64) -> TestApp_ {
         let (app, mut writer) = ja.into_parts();
         for (i, e) in events.iter().enumerate() {
@@ -792,10 +777,9 @@ mod tests {
     }
 
     /// Compute the TestApp state that results from applying `events` in
-    /// order, using the same `(key_hash, request_seq)` scheme as
-    /// `append_events`. Mirrors `replay_entry`'s dedup gate (post-#7) so
-    /// the expected state matches what replay produces.
-    fn expected_state(events: &[TestEvent], first_seq: u64) -> TestApp {
+    /// order under `append_events`' `key_hash` and timestamps, so the
+    /// expected state matches what replay produces.
+    fn expected_state(events: &[TestEvent]) -> TestApp {
         let mut app = TestApp::new();
         let mut reports = Vec::new();
         let ctx = ApplyCtx {
@@ -806,12 +790,9 @@ mod tests {
             key_hash: 1,
         };
         for (i, e) in events.iter().enumerate() {
-            let is_new = app.check_request_seq(1, first_seq + i as u64);
             let ts = 1_000 * (i as u64 + 1);
             app.tick(ts, &mut reports);
-            if is_new {
-                let _ = app.apply(*e, &ctx, &mut reports);
-            }
+            let _ = app.apply(*e, &ctx, &mut reports);
         }
         app
     }
@@ -943,7 +924,7 @@ mod tests {
         drop(ja);
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
-        assert_eq!(*recovered.app(), expected_state(&events, 1));
+        assert_eq!(*recovered.app(), expected_state(&events));
     }
 
     #[test]
@@ -959,7 +940,7 @@ mod tests {
         ja.save_snapshot(&snap_path).unwrap();
 
         let (restored, seq, _chain, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        assert_eq!(restored, expected_state(&events, 1));
+        assert_eq!(restored, expected_state(&events));
         // Sequences are 1-indexed; after N events, next_sequence = N + 1
         // and save_snapshot records the last issued sequence (next - 1) = N.
         assert_eq!(seq, events.len() as u64);
@@ -974,15 +955,14 @@ mod tests {
         let pre = [TestEvent::Add(1), TestEvent::Add(2)];
         let post = [TestEvent::Add(40), TestEvent::Add(50)];
 
-        // Phase 1: create + pre events (request_seqs 1..=2) + snapshot.
+        // Phase 1: create + pre events + snapshot.
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let ja = append_events(ja, &pre, 1);
         drop(ja);
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
-        // Phase 2: append post events (request_seqs 3..=4 — disjoint from
-        // pre, so they pass dedup) to the same journal file; no rotation.
+        // Phase 2: append post events to the same journal file; no rotation.
         let ja = append_events(ja, &post, pre.len() as u64 + 1);
         drop(ja);
 
@@ -992,28 +972,33 @@ mod tests {
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
 
         let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
-        assert_eq!(recovered.app().total, expected_state(&all, 1).total);
+        assert_eq!(recovered.app().total, expected_state(&all).total);
     }
 
+    /// Replay hands every journaled app event to `apply` under the key
+    /// that submitted it. The transport filters nothing on the way: an
+    /// application that refuses repeats (a duplicate request) refuses
+    /// them in `apply`, from state rebuilt by exactly this stream, so
+    /// replay reaches the verdict the live dispatch did.
     #[test]
-    fn replay_skips_duplicate_app_events() {
-        // The journal stage writes before the matching stage dedups, so
-        // the journal can legitimately contain two entries sharing a
-        // `(key_hash, request_seq)`. Only the first reaches `apply` on
-        // the live primary; replay must mirror that or recovered state
-        // will double-apply the duplicate.
+    fn replay_applies_every_app_event_under_its_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.bin");
 
         let ja = TestApp_::create(TestApp::new(), &path).unwrap();
         let (_app, mut writer) = ja.into_parts();
 
-        let dup = JournalEvent::App(TestEvent::Add(100));
-        for _ in 0..2 {
+        // Two identical submissions under key 5, one under key 6.
+        let entries = [(5u64, 100u64), (5, 100), (6, 7)];
+        for (key_hash, n) in entries {
             let seq = writer.allocate_sequence();
             writer
                 .encode_event(
-                    seq, 1_000, &dup, /* key_hash */ 5, /* request_seq */ 10,
+                    seq,
+                    1_000,
+                    &JournalEvent::App(TestEvent::Add(n)),
+                    key_hash,
+                    /* request_seq */ 10,
                 )
                 .unwrap();
         }
@@ -1021,19 +1006,12 @@ mod tests {
         drop(writer);
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
-        // First Add(100) applied; second is a duplicate and must be
-        // skipped — total stays at 100, not 200.
-        assert_eq!(recovered.app().total, 100);
-        // HWM for key 5 should record seq 10 exactly once; a second
-        // check_request_seq at seq 10 must still be rejected as a
-        // duplicate after recovery.
-        let mut app = TestApp {
-            total: recovered.app().total,
-            ticks: recovered.app().ticks,
-            key_hwm: recovered.app().key_hwm.clone(),
-        };
-        assert!(!app.check_request_seq(5, 10));
-        assert!(app.check_request_seq(5, 11));
+        assert_eq!(recovered.app().total, 207);
+        assert_eq!(
+            recovered.app().per_key_total,
+            HashMap::from([(5, 200), (6, 7)]),
+            "each event must reach apply under the key that submitted it"
+        );
     }
 
     #[test]
@@ -1049,7 +1027,7 @@ mod tests {
         let pre_rotate_state = TestApp {
             total: ja.app().total,
             ticks: ja.app().ticks,
-            key_hwm: ja.app().key_hwm.clone(),
+            per_key_total: ja.app().per_key_total.clone(),
         };
 
         ja.save_snapshot(&snap_path).unwrap();
@@ -1079,7 +1057,7 @@ mod tests {
     /// the live segment and produce identical balances to a no-rotation
     /// run with the same events.
     ///
-    /// Compares `total` and `key_hwm` only; `ticks` is sensitive to the
+    /// Compares `total` and `per_key_total` only; `ticks` is sensitive to the
     /// per-phase timestamp restart in `append_events` and isn't part of
     /// the rotation behaviour under test.
     #[test]
@@ -1118,13 +1096,12 @@ mod tests {
         assert!(journal_path.exists(), "live journal should exist");
 
         let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
-        let total_events = phase_a.len() + phase_b.len() + phase_c.len() + phase_d.len();
-        assert_eq!(recovered.app().total, 1 + 2 + 10 + 20 + 100 + 200 + 1000);
-        // HWM is per (key_hash=1, request_seq) and append_events uses
-        // sequential request_seqs (1..=7).
+        let expected_total = 1 + 2 + 10 + 20 + 100 + 200 + 1000;
+        assert_eq!(recovered.app().total, expected_total);
+        // append_events submits every event under key_hash 1.
         assert_eq!(
-            recovered.app().key_hwm.get(&1).copied(),
-            Some(total_events as u64)
+            recovered.app().per_key_total,
+            HashMap::from([(1, expected_total)])
         );
     }
 
@@ -1159,7 +1136,7 @@ mod tests {
         let expected = TestApp {
             total: recovered.app().total,
             ticks: recovered.app().ticks,
-            key_hwm: recovered.app().key_hwm.clone(),
+            per_key_total: recovered.app().per_key_total.clone(),
         };
         let final_snap = dir.path().join("final.snap");
         recovered.save_snapshot(&final_snap).unwrap();
@@ -1551,7 +1528,7 @@ mod tests {
 
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
         let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
-        assert_eq!(recovered.app().total, expected_state(&all, 1).total);
+        assert_eq!(recovered.app().total, expected_state(&all).total);
     }
 
     /// Snapshot-less recovery on a journal whose oldest segment begins

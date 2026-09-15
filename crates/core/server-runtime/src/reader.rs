@@ -104,7 +104,7 @@ pub struct ReaderRegistration<R> {
     /// Permission level established during the auth handshake.
     pub permission: Permission,
     /// FxHash of the client's Ed25519 public key. Stored per-connection
-    /// and copied into every InputSlot for per-key idempotency dedup.
+    /// and copied into every InputSlot as the submitting key's identity.
     pub key_hash: u64,
 }
 
@@ -260,7 +260,7 @@ struct ConnectionEntry<R> {
     /// the reader thread (cold path), zero cost on the matching engine.
     permission: Permission,
     /// FxHash of the client's Ed25519 public key. Copied into every
-    /// InputSlot for per-key idempotency dedup.
+    /// InputSlot as the submitting key's identity.
     key_hash: u64,
     /// Owned reader — keeps the fd alive. Dropping closes the fd.
     _reader: R,
@@ -1391,9 +1391,6 @@ mod tests {
             unreachable!()
         }
         fn tick(&mut self, _now_ns: u64, _out: &mut Vec<()>) {
-            unreachable!()
-        }
-        fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
             unreachable!()
         }
         fn build_reject(_event: &TestEvent, _reason: RejectReason) -> () {

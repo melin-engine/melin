@@ -591,9 +591,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gate_recovery_agreement.journal");
 
-    // Slot builder shared by both phases. `request_seq` increases
-    // monotonically across the recovery boundary so replayed dedup
-    // state can never collide with phase-2 traffic.
+    // Slot builder shared by both phases.
     let mut req_seq = 0u64;
     let mut make_slot = |event: JournalEvent<TestEvent>| {
         req_seq += 1;
@@ -1504,8 +1502,7 @@ fn journal_stage_rotates_on_manual_request() {
     let s = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&s));
 
-    // Publish an Add event with a unique request_seq so every event
-    // survives dedup at recovery time.
+    // Publish an Add event with a unique request_seq.
     let mut req_seq: u64 = 0;
     let mut publish_add = |amount: u64| {
         req_seq += 1;

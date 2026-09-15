@@ -12,6 +12,29 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Removed
+
+- **The per-key duplicate-request gate: `Application::check_request_seq` and
+  `RejectReason::DuplicateRequest`.** Whether a repeated request is refused
+  was already the application's policy; the runtime's part was to ask
+  before `apply` and reject on its behalf. Every event now reaches `apply`
+  — live, on replay and in the shadow stage — and an application that
+  refuses repeats does so there: it decodes the sequence into its own
+  event, checks it keyed on `ApplyCtx::key_hash`, and builds its own
+  rejection report. Source-breaking for every `Application`
+  implementation: delete `check_request_seq`, move its check to the top of
+  `apply` (skipping queries, as the runtime did), and stop matching on
+  `DuplicateRequest`.
+
+### Fixed
+
+- **The shadow stage no longer applies a request the primary refused as a
+  duplicate.** It asked the application for its verdict and then applied
+  the event anyway, so a snapshot it wrote could hold a retried request
+  twice, and a node restored from it would diverge from the primary. The
+  shadow now hands every event to `apply`, as the matching stage and replay
+  do, and the application's own check reaches the same verdict on all three.
+
 ## [0.16.0] - 2026-09-14
 
 ### Added

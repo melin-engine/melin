@@ -45,7 +45,7 @@ pub fn clamp_monotonic(raw_now_ns: u64, last_now_ns: u64) -> u64 {
 /// Publish a `JournalEvent::Tick { now_ns }` onto the input ring.
 ///
 /// Internal/server-originated: no client connection, no auth key.
-/// `key_hash = 0` is exempt from idempotency dedup in the application.
+/// `key_hash = 0`, the identity of events no client submitted.
 ///
 /// `sequence: 0` because the journal stage is the authoritative sequence
 /// allocator on the primary — see `InputSlot::sequence`.

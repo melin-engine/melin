@@ -88,7 +88,7 @@ struct ConnectionState {
     handle: SocketHandle,
     auth: AuthState,
     /// FxHash of the client's Ed25519 public key. Set after auth,
-    /// copied into every InputSlot for per-key idempotency dedup.
+    /// copied into every InputSlot as the submitting key's identity.
     key_hash: u64,
     /// Incremental frame parsing state: accumulates bytes until a
     /// complete length-prefixed frame is available.
@@ -179,7 +179,7 @@ pub fn run_dpdk_poll<A: Application>(
     // dispatch + slot construction + push). DPDK has no separate
     // publish-call histogram because `batch.push_with` is a slot
     // assignment in a pre-allocated batch — the work is dominated by
-    // the surrounding decode + dedup, which is what `ingest` measures.
+    // the surrounding decode, which is what `ingest` measures.
     #[cfg(feature = "latency-trace")]
     let mut publish_rec =
         melin_transport_core::trace::register_stage("dpdk: publish (decode → disruptor publish)");
@@ -782,7 +782,7 @@ fn process_auth_frame(
         "DPDK: authenticated"
     );
 
-    // Compute key hash for per-key idempotency dedup.
+    // Compute the key hash the application sees as `ApplyCtx::key_hash`.
     use std::hash::{Hash, Hasher};
     let key_hash = {
         let mut hasher = rustc_hash::FxHasher::default();

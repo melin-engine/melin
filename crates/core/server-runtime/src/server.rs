@@ -2070,9 +2070,10 @@ where
             }
         };
 
-        // Hash the client's public key for per-key idempotency dedup.
-        // FxHash is fast and non-cryptographic — sufficient for dedup
-        // table keying (the public key itself is already authenticated).
+        // Hash the client's public key into the identity the application
+        // sees as `ApplyCtx::key_hash`. FxHash is fast and
+        // non-cryptographic — sufficient for keying per-key state (the
+        // public key itself is already authenticated).
         let key_hash = {
             let mut hasher = rustc_hash::FxHasher::default();
             public_key_bytes.hash(&mut hasher);

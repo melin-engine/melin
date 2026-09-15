@@ -138,6 +138,10 @@ impl Application for Counter {
             CounterEvent::Increment { amount } => {
                 // Wraps on overflow — a deliberate simplification for this example.
                 // A production app would saturate, reject, or use a wider type.
+                // Also a simplification: a client that retries an Increment
+                // adds twice. An application whose requests are not
+                // idempotent carries a per-client sequence in its events
+                // and refuses a repeat here, keyed on `ctx.key_hash`.
                 self.value = self.value.wrapping_add(amount);
                 out.push(CounterReport::Ack {
                     new_value: self.value,
@@ -149,12 +153,6 @@ impl Application for Counter {
     }
 
     fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
-
-    // Simplification: always accepts. A production app should track per-key
-    // high-water marks and reject duplicates.
-    fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
-        true
-    }
 
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         CounterReport::Rejected
@@ -356,7 +354,7 @@ mod tests {
     #[test]
     fn build_reject() {
         let event = CounterEvent::Increment { amount: 1 };
-        let report = Counter::build_reject(&event, RejectReason::DuplicateRequest);
+        let report = Counter::build_reject(&event, RejectReason::ReplicaDisconnected);
         assert!(matches!(report, CounterReport::Rejected));
     }
 

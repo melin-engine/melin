@@ -298,11 +298,12 @@ const MAX_MATCHING_BATCH: usize = 16;
 pub struct InputSlot<E: AppEvent> {
     /// Which client connection submitted this command.
     pub connection_id: u64,
-    /// FxHash of the client's Ed25519 public key. Used with `request_seq`
-    /// for per-key idempotency dedup. 0 for seed/internal events.
+    /// FxHash of the client's Ed25519 public key, journaled with the
+    /// event and handed to the application as `ApplyCtx::key_hash`.
+    /// 0 for seed/internal events.
     pub key_hash: u64,
-    /// Per-key monotonic request sequence number from the wire protocol.
-    /// Used with `key_hash` for idempotency dedup. 0 for seed/internal events.
+    /// Request sequence number from the wire protocol, journaled with
+    /// the event. Opaque to the transport. 0 for seed/internal events.
     pub request_seq: u64,
     /// Journal sequence number. **Always zero on primary-side input** —
     /// the journal stage allocates the sequence at encode time, in
@@ -436,7 +437,7 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     /// Every other output kind (Placed, Fill, Cancelled, non-halt
     /// reject reasons, query responses) keeps the gate, since each
     /// reflects engine state or a state-derived decision (rate-limiter
-    /// consumption, dedup) that must be durable before reply.
+    /// consumption, duplicate refusal) that must be durable before reply.
     pub durability_bypass: bool,
 }
 
@@ -2763,12 +2764,13 @@ impl<A: Application> MatchingStage<A> {
                 ctx.key_hash = slot.key_hash;
                 local_events += 1;
 
-                // Halt check first: reject before advancing any HWMs so
-                // the client can safely retry the same seq after
-                // reconnect. Read-only queries bypass both halt and
-                // dedup — they never mutate durable state, so returning
-                // the current snapshot during a halt is safe (and
-                // actually useful for operators monitoring the outage).
+                // Halt check: reject before the application sees the
+                // event, so its state is untouched and the client can
+                // safely retry the same request after reconnect.
+                // Read-only queries bypass the halt — they never mutate
+                // durable state, so returning the current snapshot
+                // during a halt is safe (and actually useful for
+                // operators monitoring the outage).
                 let is_query = slot.event.is_query();
                 // Every output slot emitted while `halted` is exempt from
                 // the response stage's durability gate. Two kinds reach
@@ -2798,8 +2800,6 @@ impl<A: Application> MatchingStage<A> {
                 // local engine during halt doesn't violate that invariant
                 // (no ack to a client) and is required so a fresh primary
                 // can seed its instruments before any replica connects.
-                // Mirrors the existing dedup exemption a few lines below
-                // (`key_hash == 0` — same provenance, same reasoning).
                 let is_transport_internal = slot.connection_id == 0;
                 let halt_bypass = halted && !is_query;
                 if !is_query && halted && !is_transport_internal {
@@ -2809,15 +2809,6 @@ impl<A: Application> MatchingStage<A> {
                     // skip during halt.
                     if let melin_journal::JournalEvent::App(ref e) = slot.event {
                         reports.push(A::build_reject(e, halt_reason));
-                    }
-                } else if !is_query && !self.app.check_request_seq(slot.key_hash, slot.request_seq)
-                {
-                    // Duplicate request — produce a Rejected report for
-                    // the app event; transport variants don't go through
-                    // dedup (they use `key_hash == 0` which the app
-                    // exempts).
-                    if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                        reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
                     }
                 } else {
                     // Inlined `process_event` so the run loop only borrows
@@ -3032,7 +3023,7 @@ impl<A: Application> MatchingStage<A> {
             }
             reports.clear();
 
-            // Halt check first, then dedup (same order as the main run loop).
+            // Halt check (same rule as the main run loop).
             // `connection_id == 0` marks transport-internal events
             // (startup seeds, journal replay) — mirror the main loop's
             // exemption so a shutdown drain doesn't drop the very seed
@@ -3042,10 +3033,6 @@ impl<A: Application> MatchingStage<A> {
             if halt_bypass && !is_transport_internal {
                 if let melin_journal::JournalEvent::App(ref e) = slot.event {
                     reports.push(A::build_reject(e, self.halt_reject_reason()));
-                }
-            } else if !self.app.check_request_seq(slot.key_hash, slot.request_seq) {
-                if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                    reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
                 }
             } else {
                 // Queries are already skipped above, so process_event

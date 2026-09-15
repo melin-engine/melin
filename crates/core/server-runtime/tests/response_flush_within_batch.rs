@@ -94,9 +94,6 @@ impl Application for PadApp {
         unreachable!("response-stage-only test")
     }
     fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
-    fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
-        unreachable!("response-stage-only test")
-    }
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         unreachable!("response-stage-only test")
     }
