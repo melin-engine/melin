@@ -166,7 +166,10 @@ than a TCP read timeout — while queries keep answering. A refused write
 never enters the pipeline: it is not applied, not journaled, and not
 replicated, so no replay or failover can bring it back. Its rejection does
 not wait on the ack policy, but it does keep its place on the connection:
-it goes out after the replies to the client's earlier requests.
+it goes out after the replies to the client's earlier requests. Because
+the journal never sees a refused write, the node counts them: the
+`melin_writes_refused_total` counter on `/metrics`, labelled by reason,
+says how many writes a halt cost.
 
 Writes the node accepted just before the halt are applied as usual, and
 their replies wait on the ack policy like any other — sent once a replica
@@ -709,6 +712,13 @@ normal-case post-recovery state.
   `melin_trading_active` gauge) reports `halted` on a fenced node even
   while replicas remain connected — point load-balancer probes and
   failover alerting at it.
+- `melin_writes_refused_total{reason="replica_disconnected"|"superseded"}`
+  (Prometheus counter) — client writes turned away at ingress while the
+  node was halted, by reason. A refused write is never journaled, so this
+  is its only trace; `increase()` over a halt says how many writes it
+  cost, which the gauge's duration cannot. Standalone nodes and replicas
+  export the series at zero. Resets on process restart, like every
+  counter here.
 - `melin_ack_policy_degraded` (Prometheus gauge on the health
   endpoint) — `1` while the active policy can't be satisfied by the
   current cluster shape, `0` otherwise. Alert on sustained `1`.

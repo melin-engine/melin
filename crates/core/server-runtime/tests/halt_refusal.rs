@@ -10,8 +10,11 @@
 //! A primary and one replica (counter app, `disk` ack policy) over real TCP.
 //! One increment is acked while the replica is attached; the replica is
 //! then stopped, and a second increment must be refused while a query
-//! still answers. The primary is restarted standalone on its own journal,
-//! and replay must reach the value the client was told.
+//! still answers, and counted on the health endpoint. A replica then
+//! attaches again, and the client resends the refused increment under the
+//! same request sequence: a refusal consumed nothing, so the resend is
+//! taken. The primary is restarted standalone on its own journal, and
+//! replay must reach the value the client was told.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -163,7 +166,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
     let replica_shutdown = Arc::new(AtomicBool::new(false));
     let replica = spawn_node(replica_config, &replica_shutdown);
 
-    // --- Trading: the replica is attached, the write is taken. ---
+    // --- Taking writes: the replica is attached, the write is taken. ---
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut conn = Connection::connect_by(primary_client, &client_key, deadline)
@@ -184,7 +187,29 @@ fn a_write_refused_while_halted_is_not_replayed() {
         1,
         "queries still answer, and the refused write is not applied"
     );
+    // The reader counts the refusal after committing the receive it came
+    // in; the reply can beat it, hence the wait.
+    wait_for_gauge(
+        primary_health,
+        "melin_writes_refused_total{reason=\"replica_disconnected\"}",
+        1,
+    );
+
+    // --- Taking writes again: a replica attaches, the refused write is resent. ---
+    let mut replica_config = node_config("replica2", &replica_key);
+    replica_config.replica_of = Some(replication_addr);
+    let replica_client = replica_config.bind;
+    let replica_shutdown = Arc::new(AtomicBool::new(false));
+    let replica = spawn_node(replica_config, &replica_shutdown);
+    wait_for_gauge(primary_health, "melin_replicas_connected", 1);
+    let ack = one_reply(&mut conn, 2, TAG_INCREMENT, &5u64.to_le_bytes());
+    assert_eq!(
+        ack[0], TAG_RESP_ACK,
+        "a refusal consumed no request sequence: the resend is taken"
+    );
+    assert_eq!(value_of(&mut conn, 4), 6);
     drop(conn);
+    stop_node(replica, &replica_shutdown, replica_client);
     stop_node(primary, &primary_shutdown, primary_client);
 
     // --- Replay: the journal holds only what the client was told. ---
@@ -209,12 +234,12 @@ fn a_write_refused_while_halted_is_not_replayed() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut conn = Connection::connect_by(restart_client, &client_key, deadline)
         .expect("client connects to the restarted primary");
-    let replayed = value_of(&mut conn, 4);
+    let replayed = value_of(&mut conn, 5);
     drop(conn);
     stop_node(restarted, &restart_shutdown, restart_client);
 
     assert_eq!(
-        replayed, 1,
+        replayed, 6,
         "replay applied a write the halted primary refused"
     );
 }

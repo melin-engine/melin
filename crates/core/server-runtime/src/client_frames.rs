@@ -56,7 +56,8 @@ pub(crate) enum FrameAction {
 /// While `halt` refuses writes, a permitted write is not published: its
 /// rejection goes to `refusals`, stamped with the input sequence it would
 /// have taken (see [`crate::halt`]). Queries are published either way.
-/// The halt is sampled once per call, so one receive is judged as a whole.
+/// The halt is sampled once per call, so one receive is judged as a whole,
+/// and the writes it refused are counted into `halt` once, at the end.
 ///
 /// Returns [`FrameAction`] so the caller can handle transport-specific
 /// side effects (ServerBusy write, transport close, control events).
@@ -93,6 +94,10 @@ pub(crate) fn process_client_frames<A: Application>(
     const COMMIT_EVERY: u64 = 16;
     let mut batch = producer.batch();
     let refusal_reason = halt.refusal_reason();
+    // Writes refused in this call, counted into the gate once at the end
+    // rather than with an atomic add each. Includes one shed for a full
+    // refusal queue: the halt is what turned it away.
+    let mut refused: u64 = 0;
 
     while cursor + 4 <= parse_buf.len() {
         let len_bytes: [u8; 4] = parse_buf[cursor..cursor + 4]
@@ -132,6 +137,7 @@ pub(crate) fn process_client_frames<A: Application>(
         if let Some(reason) = refusal_reason
             && !event.is_query()
         {
+            refused += 1;
             let refusal = Refusal {
                 connection_id,
                 input_seq: batch.next_sequence(),
@@ -189,6 +195,12 @@ pub(crate) fn process_client_frames<A: Application>(
     // the two replies out of order.
     refusals.flush();
     batch.commit();
+
+    if let Some(reason) = refusal_reason
+        && refused > 0
+    {
+        halt.record_refused(reason, refused);
+    }
 
     // Compact: shift remaining bytes to the front.
     if cursor > 0 {
