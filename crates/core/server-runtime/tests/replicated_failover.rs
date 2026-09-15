@@ -17,6 +17,12 @@
 //! full acked total: nothing the client was told about died with the
 //! primary.
 //!
+//! Every node is also given its own startup events (see
+//! [`startup_events`]), weighted so the final total says which node
+//! journaled what: the genesis primary's genesis and `on_primary` before
+//! the first client, no replica's own while it follows, and the promoted
+//! node's `on_primary` before it serves.
+//!
 //! The final assertion is the reproducer that surfaced the promotion
 //! peer-tip veto: without it, the election could land on the replica
 //! that *lacks* the last acked event (the ack quorum is the primary
@@ -35,8 +41,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use counter_server::{CounterFactory, RequestDecoder, ResponseEncoder};
+use counter_server::{Counter, CounterEvent, RequestDecoder, ResponseEncoder};
 use ed25519_dalek::{Signer, SigningKey};
+use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
@@ -58,6 +65,25 @@ const TAG_INCREMENT: u8 = 0x10;
 const TAG_GET_VALUE: u8 = 0x11;
 const TAG_RESP_ACK: u8 = 0x30;
 const TAG_RESP_VALUE: u8 = 0x31;
+
+/// Node `i`'s startup events: a genesis increment of `(i + 1) * GENESIS`
+/// and an `on_primary` increment of `(i + 1) * ON_PRIMARY`. The weights
+/// keep every contribution in its own decimal digits, apart from the
+/// client's increments, so a total names the node behind each part.
+fn startup_events(i: usize) -> StartupEvents<CounterEvent> {
+    let weight = i as u64 + 1;
+    StartupEvents {
+        genesis: vec![CounterEvent::Increment {
+            amount: weight * GENESIS,
+        }],
+        on_primary: vec![CounterEvent::Increment {
+            amount: weight * ON_PRIMARY,
+        }],
+    }
+}
+
+const GENESIS: u64 = 1_000_000;
+const ON_PRIMARY: u64 = 1_000;
 
 // ---------------------------------------------------------------------------
 // Wire helpers (client and admin share the challenge-response handshake)
@@ -311,10 +337,10 @@ fn acked_events_survive_primary_death_under_ram_policy() {
         let listener = BlockingTcpListener::bind(config.bind).expect("bind primary client port");
         let sd = Arc::clone(&primary_shutdown);
         std::thread::spawn(move || -> Result<(), String> {
-            server::run_with_listener(
+            server::run_with_listener::<Counter>(
                 listener,
                 config,
-                CounterFactory,
+                startup_events(0),
                 RequestDecoder,
                 ResponseEncoder,
                 None,
@@ -334,10 +360,10 @@ fn acked_events_survive_primary_death_under_ram_policy() {
                 BlockingTcpListener::bind(config.bind).expect("bind replica client port");
             let sd = Arc::clone(&replica_shutdown);
             std::thread::spawn(move || -> Result<(), String> {
-                server::run_with_listener(
+                server::run_with_listener::<Counter>(
                     listener,
                     config,
-                    CounterFactory,
+                    startup_events(i),
                     RequestDecoder,
                     ResponseEncoder,
                     None,
@@ -374,10 +400,13 @@ fn acked_events_survive_primary_death_under_ram_policy() {
 
     // --- Phase 2: acked client traffic. Each response returned only
     // after a replica confirmed in-memory receipt — the `ram` gate
-    // live, on real cursors. Total after 1 + 2 + 4 = 7.
+    // live, on real cursors. The first ack already carries node 0's
+    // genesis and `on_primary`, journaled before it served; the client
+    // adds 1 + 2 + 4 = 7.
+    let acked_total = GENESIS + ON_PRIMARY + 7;
     {
         let mut stream = connect_authenticated(nodes[0].client_addr, &client_key);
-        let mut expected_total = 0u64;
+        let mut expected_total = GENESIS + ON_PRIMARY;
         for (seq, amount) in [(1u64, 1u64), (2, 2), (3, 4)] {
             expected_total += amount;
             send_request(&mut stream, seq, TAG_INCREMENT, &amount.to_le_bytes());
@@ -448,7 +477,9 @@ fn acked_events_survive_primary_death_under_ram_policy() {
 
     // --- Phase 6: the acked total survived. A fresh client reads the
     // counter from the new primary; every event the old primary acked
-    // under the `ram` ack policy must be in it. ---
+    // under the `ram` ack policy must be in it — and on top of it the
+    // winner's own `on_primary`, journaled on promotion before it served,
+    // while neither replica's genesis ever was. ---
     {
         let mut stream = connect_authenticated(nodes[winner].client_addr, &client_key);
         send_request(&mut stream, 1, TAG_GET_VALUE, &[]);
@@ -472,9 +503,9 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             .collect();
         assert_eq!(
             value,
-            7,
-            "the promoted node must hold every event acked under `ram` \
-             (winner=node {}, leader at formation=node {:?}, {})",
+            acked_total + (winner as u64 + 1) * ON_PRIMARY,
+            "the promoted node must hold every event acked under `ram`, plus its own \
+             on_primary events (winner=node {}, leader at formation=node {:?}, {})",
             winner + 1,
             leader_at_formation.map(|i| i + 1),
             seqs.join("; ")

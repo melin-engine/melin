@@ -78,7 +78,6 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use melin_app::app_factory::AppFactory;
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
@@ -249,6 +248,7 @@ pub enum EchoReport {
 
 /// The state machine. There is no state: the reply is a function of the
 /// request alone, which is what makes this the floor.
+#[derive(Default)]
 pub struct Echo;
 
 impl Application for Echo {
@@ -288,23 +288,6 @@ impl Application for Echo {
     }
 
     const APP_VERSION: u16 = 1;
-}
-
-// ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
-
-/// Constructs `Echo` instances for the runtime.
-pub struct EchoFactory;
-
-impl AppFactory for EchoFactory {
-    type App = Echo;
-
-    fn empty(&self) -> Echo {
-        Echo
-    }
-
-    fn prefault(&self, _app: &mut Echo) {}
 }
 
 // ---------------------------------------------------------------------------

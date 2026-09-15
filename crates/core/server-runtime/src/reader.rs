@@ -1401,6 +1401,7 @@ mod tests {
     /// Placeholder `Application` impl. `process_frames` calls only
     /// `build_reject`, for a write refused while halted; the rest
     /// `unreachable!`.
+    #[derive(Default)]
     struct TestApp;
 
     /// What [`TestApp::build_reject`] returns: the refused event and why,

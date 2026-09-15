@@ -45,7 +45,8 @@
 //!   `docs/pipeline-architecture.md`.
 
 use clap::Parser;
-use echo_server::{EchoFactory, RequestDecoder, ResponseEncoder};
+use echo_server::{Echo, RequestDecoder, ResponseEncoder};
+use melin_server_runtime::StartupEvents;
 use melin_server_runtime::server::{self, ServerConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,5 +58,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse();
 
-    server::run(config, EchoFactory, RequestDecoder, ResponseEncoder, None)
+    server::run::<Echo>(
+        config,
+        StartupEvents::none(),
+        RequestDecoder,
+        ResponseEncoder,
+        None,
+    )
 }

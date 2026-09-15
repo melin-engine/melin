@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use counter_server::{CounterFactory, RequestDecoder, ResponseEncoder};
+use counter_server::{Counter, RequestDecoder, ResponseEncoder};
+use melin_server_runtime::StartupEvents;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
@@ -160,10 +161,10 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
         let listener = BlockingTcpListener::bind(config.bind).expect("bind primary client port");
         let sd = Arc::clone(&primary_shutdown);
         std::thread::spawn(move || -> Result<(), String> {
-            server::run_with_listener(
+            server::run_with_listener::<Counter>(
                 listener,
                 config,
-                CounterFactory,
+                StartupEvents::none(),
                 RequestDecoder,
                 ResponseEncoder,
                 None,
@@ -183,10 +184,10 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
                 BlockingTcpListener::bind(config.bind).expect("bind replica client port");
             let sd = Arc::clone(&replica_shutdown);
             std::thread::spawn(move || -> Result<(), String> {
-                server::run_with_listener(
+                server::run_with_listener::<Counter>(
                     listener,
                     config,
-                    CounterFactory,
+                    StartupEvents::none(),
                     RequestDecoder,
                     ResponseEncoder,
                     None,
@@ -308,10 +309,10 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
             BlockingTcpListener::bind(config.bind).expect("bind revived primary client port");
         let sd = Arc::clone(&revived_shutdown);
         std::thread::spawn(move || -> Result<(), String> {
-            server::run_with_listener(
+            server::run_with_listener::<Counter>(
                 listener,
                 config,
-                CounterFactory,
+                StartupEvents::none(),
                 RequestDecoder,
                 ResponseEncoder,
                 None,
