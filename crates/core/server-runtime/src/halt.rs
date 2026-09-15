@@ -19,7 +19,7 @@
 //!
 //! A write published just before the halt was observed is applied like any
 //! other, and its reply waits on the ack policy — sent once the policy is
-//! met again, never if the node was superseded.
+//! met again, never if the node is superseded or stopped first.
 //!
 //! # Delivered in order
 //!

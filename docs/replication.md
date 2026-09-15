@@ -171,7 +171,9 @@ it goes out after the replies to the client's earlier requests.
 Writes the node accepted just before the halt are applied as usual, and
 their replies wait on the ack policy like any other — sent once a replica
 is back (or an operator relaxes the policy), never if the node is
-superseded instead.
+superseded or stopped first. A node stopped while such a reply waits stops
+promptly and drops it; the write stays journaled and applied, so a retry
+after reconnect is answered as a duplicate.
 
 A node superseded by a newer primary refuses writes the same way, with the
 `Superseded` reason code.
