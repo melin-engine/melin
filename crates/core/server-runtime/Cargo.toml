@@ -85,6 +85,9 @@ melin-dpdk = { workspace = true, optional = true }
 # supplies the chain in every ordinary build; the counter's `hash-chain`
 # feature is a pure forward with no code of its own, so nothing is lost.
 melin-example-counter = { path = "../../examples/counter", default-features = false }
+# End-to-end tests talk to a node the way every client does, rather than
+# re-rolling the handshake.
+melin-client = { workspace = true }
 tempfile = "3"
 serial_test = "3"
 proptest = "1"

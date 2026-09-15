@@ -22,11 +22,6 @@ pub mod affinity;
 /// replication sender, and replica receiver all hit this on the hot
 /// path. Pure timing utility — no transport coupling.
 pub mod amortized_timer;
-/// Application-construction + bulk-seed seam consumed by the server
-/// runtime to produce fresh `Application` instances for replication
-/// recovery and to publish the initial-state events a fresh primary
-/// journals at startup.
-pub mod app_factory;
 /// Connection-level permission model — application-shaped access
 /// control (operator / trader / custodian / read-only / replication).
 /// Consumed by the wire-side auth handshake in `melin-protocol::auth`.
@@ -273,7 +268,18 @@ pub trait EncodeReport: Copy {
 /// Implementors should keep [`apply`](Application::apply) free of
 /// allocation and I/O. Reports are pushed into the caller-provided buffer,
 /// reused across calls on the hot path.
-pub trait Application: Sized {
+///
+/// # Genesis state
+///
+/// [`Default`] is the state before the first event, and every history
+/// replays from it: a fresh node, a replica catching up from sequence 1,
+/// a restart recovering a journal with no snapshot. It must therefore
+/// depend on nothing local to the node — no flags, no environment. What
+/// an operator configures (rate limits, caps, sizing) reaches the
+/// application as journaled events instead, so that replay reproduces
+/// the decisions made under it and every replica holds the primary's
+/// values. `Default` may still pre-allocate: capacity is not state.
+pub trait Application: Sized + Default {
     /// The application-defined event type. One variant per business
     /// operation (submit order, cancel, deposit, …).
     type Event: AppEvent;

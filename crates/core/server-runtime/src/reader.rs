@@ -1380,6 +1380,7 @@ mod tests {
     /// Placeholder `Application` impl. `process_frames` is generic over `A`
     /// only to constrain `A::Event` — none of the trait methods are called
     /// from the function under test, so they all `unreachable!`.
+    #[derive(Default)]
     struct TestApp;
 
     impl Application for TestApp {

@@ -49,6 +49,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Response-stage-only stub: everything the matching stage would call
 /// is unreachable, because only `response::run` executes in this test.
+#[derive(Default)]
 struct PadApp;
 
 #[derive(Debug, Clone, Copy)]

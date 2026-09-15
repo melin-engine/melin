@@ -14,8 +14,8 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
    via io_uring   |                           |         |
    timeout)       |                           |         | Output Disruptor
                   |                           |         | (multi-consumer)
-  Seeding --------+                           |         v
-  (startup only)                              |  +--> Response Stage --> Clients
+  Startup events -+                           |         v
+  (primary start)                             |  +--> Response Stage --> Clients
                                               |  |
                                               |  +--> Event Publisher --> Subscribers
                                               |       (optional, --event-bind)
@@ -44,8 +44,8 @@ The simplified diagram above shows the primary-side request path. The picture be
 |                           PRIMARY                              |
 +===============================================================+
 
- CLIENT TCP   +   WALL CLOCK            SEED LOOP
- (N conns)    |   (io_uring timeout)    (startup only)
+ CLIENT TCP   +   WALL CLOCK            STARTUP EVENTS
+ (N conns)    |   (io_uring timeout)    (primary start)
       |       |        ^                     |
       v       |        | TIMEOUT_TOKEN       |
  +----------------+    | CQE                 |
@@ -56,8 +56,8 @@ The simplified diagram above shows the primary-side request path. The picture be
  |  Ticks)        |  the deadline passes     |
  +-------+--------+                          |
          |                                   |
-         | client requests + Tick{now_ns}    |  AddInstrument /
-         |                                   |  ProvisionAccount
+         | client requests + Tick{now_ns}    |  genesis /
+         |                                   |  on-primary events
          v                                   v
  +---------------------------------------------+
  |  INPUT RING -- disruptor, 1M InputSlot      |
@@ -151,7 +151,7 @@ The simplified diagram above shows the primary-side request path. The picture be
 | Thread / stage              | Ingress                                 | Egress                                                |
 |----------------------------|-----------------------------------------|-------------------------------------------------------|
 | Reader (primary)           | Client TCP/DPDK + cadence wakeup (wall-clock-cadenced, monotonic-clamped) | Client requests AND `JournalEvent::Tick` into the same input ring |
-| Seed loop (primary, boot)  | Config (`--accounts`, `--instruments`)  | `AddInstrument` / `ProvisionAccount` into input ring  |
+| Startup events (primary, boot or promotion) | The application's genesis and on-primary events | Application events into the input ring, applied before the first client is served |
 | Journal stage              | Input ring                              | Journal file; batch bytes into each replication ring  |
 | Matching stage             | Input ring                              | Execution reports into output ring                    |
 | Shadow stage               | Input ring (gated on journal)           | Periodic `.snapshot` files                            |
@@ -162,7 +162,7 @@ The simplified diagram above shows the primary-side request path. The picture be
 
 ### Authoritative state, and how it flows
 
-- **Event payload**: produced at the ingress edge (client requests, the ingress thread's tick generator, seed loop). Flows unchanged through every stage and across the TCP boundary to replicas.
+- **Event payload**: produced at the ingress edge (client requests, the ingress thread's tick generator, startup events). Flows unchanged through every stage and across the TCP boundary to replicas.
 - **Sequence number**: on the primary, allocated by the journal stage at encode time, in disruptor ring-cursor order. Producers publish `InputSlot { sequence: 0, … }` and never coordinate across an external counter — eliminating the prior "claim then publish" leak window. On replicas the replication receiver decodes the primary's sequence from the wire bytes and stamps it onto `InputSlot.sequence` before publishing; the journal stage uses that value verbatim. Either way the on-disk journal sequence and the disruptor cursor advance in lock-step.
 - **Wall-clock timestamp**: stamped at ingress by each producer (e.g. `wall_clock_nanos()` in the reader). Embedded into the journal entry and shipped to replicas.
 - **Hash chain**: per journal segment, anchored in the segment's file header and computed over the raw entry bytes (`chain(S) = BLAKE3(entry bytes through S ‖ anchor)`). No chain metadata rides in the entry stream — see [Journal & Event Sourcing](journal.md) for the full model.
@@ -284,7 +284,7 @@ Waits according to its thread's wait strategy, like every other stage — see [W
 
 ## Waiting
 
-Every wait in the pipeline goes through a wait strategy chosen at startup, per thread: a stage polling an empty ring, a producer blocked on a full one, the journal stage waiting on its disk thread, the response stage's durability gate waiting on the journal and the replicas, and the startup drains that wait for seed events to clear the pipeline. There is no wait that the choice does not reach. A ring waits the way the thread that produces into it does, since a full ring blocks the producer on the producer's core.
+Every wait in the pipeline goes through a wait strategy chosen at startup, per thread: a stage polling an empty ring, a producer blocked on a full one, the journal stage waiting on its disk thread, the response stage's durability gate waiting on the journal and the replicas, and the startup drains that wait for startup events to clear the pipeline. There is no wait that the choice does not reach. A ring waits the way the thread that produces into it does, since a full ring blocks the producer on the producer's core.
 
 - **Busy-spin** (default): the waiting thread spins with `PAUSE` and never yields. The lowest-latency choice, and the right one whenever the thread has an isolated core to itself (`isolcpus`), where a yield would only be a wasted syscall on the critical path.
 - **Spin, then yield**: the thread spins for about a microsecond, then hands the CPU back to the scheduler on every further idle iteration until work arrives. For threads that share a core with each other or with other processes. Without it, a thread spinning on a shared core can hold the CPU for a full scheduler slice while the very thread it is waiting for sits queued behind it, turning each hand-off between stages into milliseconds.
