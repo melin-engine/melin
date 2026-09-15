@@ -7,10 +7,19 @@
 use crate::control::{ChallengeResponse, TransportResponse};
 use crate::error::ProtocolError;
 
-// Wire tags for transport-level control frames (0x01–0x0F reserved).
+// Wire tags for transport-level control frames (below `FIRST_APP_TAG`).
 // Public so the exchange-level codec imports them instead of redefining
 // its own copies — single source of truth prevents silent wire drift.
-// Domain-level tags start at 0x10 (requests) and 0x30 (responses).
+
+/// The first tag an application may use, in either direction. Every tag
+/// below it is the protocol's: its control frames, and headroom for
+/// more.
+pub const FIRST_APP_TAG: u8 = 0x10;
+
+/// Length of the header every client request frame starts with, after
+/// the length prefix: `[request_seq: u64 LE][tag: u8]`.
+pub const REQUEST_HEADER_LEN: usize = 8 + 1;
+
 pub const TAG_RESPONSE_HEARTBEAT: u8 = 0x01;
 pub const TAG_BATCH_END: u8 = 0x02;
 pub const TAG_ENGINE_ERROR: u8 = 0x03;

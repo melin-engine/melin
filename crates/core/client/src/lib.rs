@@ -61,8 +61,9 @@ use ed25519_dalek::Signer;
 use melin_wire_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use melin_wire_protocol::control::ChallengeResponse;
 use melin_wire_protocol::control_codec::{
-    CHALLENGE_RESPONSE_LEN, TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE, TAG_ENGINE_ERROR,
-    TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY, encode_challenge_response,
+    CHALLENGE_RESPONSE_LEN, FIRST_APP_TAG, TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE,
+    TAG_ENGINE_ERROR, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
+    encode_challenge_response,
 };
 
 pub mod key;
@@ -230,7 +231,7 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
         Some(&TAG_BATCH_END) => Ok(Reply::BatchEnd),
         Some(&TAG_SERVER_BUSY) => Ok(Reply::ServerBusy),
         Some(&TAG_ENGINE_ERROR) => Ok(Reply::EngineError),
-        Some(tag @ 0x00..=0x0F) => Err(Error::Protocol(format!(
+        Some(&tag) if tag < FIRST_APP_TAG => Err(Error::Protocol(format!(
             "reserved tag {tag:#04x} in a response frame (application tags start at 0x10)"
         ))),
         Some(_) => Ok(Reply::Response(payload)),

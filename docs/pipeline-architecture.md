@@ -474,5 +474,5 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_JOURNAL_BATCH` | `4096` (ceiling; the effective cap is the lesser of this and what fills one ring slot) | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_BATCH` (response) | `1024` | `crates/core/server-runtime/src/response.rs` |
-| `MAX_RESPONSE_BUF` | `512` bytes | `crates/core/server-runtime/src/response.rs` |
+| `MAX_RESPONSE_BODY` | `512` bytes (one response body, framing excluded) | `crates/core/server-runtime/src/response_frame.rs` |
 | `NUM_BUFFERS` | `2048` | `crates/core/server-runtime/src/reader.rs` (io_uring provided buffer pool) |

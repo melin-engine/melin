@@ -70,15 +70,15 @@ use std::io::{self, Read, Write};
 
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
-use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
+use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
 
 /// The receipt as clients keep it — shared by the client and the auditor.
 pub mod receipt;
 
 // ---------------------------------------------------------------------------
-// Wire tags — domain tags start at 0x10 to avoid colliding with transport-
-// level control tags (0x01–0x0F) reserved by melin-wire-protocol.
+// Wire tags — application tags start at 0x10; everything below is the
+// protocol's, and the runtime keeps it away from the codecs.
 // ---------------------------------------------------------------------------
 
 pub const TAG_NOTARIZE: u8 = 0x10;
@@ -350,25 +350,17 @@ impl Application for Notary {
 // Request decoder
 // ---------------------------------------------------------------------------
 
-/// Decodes length-prefixed client frames into `NotaryEvent`.
+/// Decodes client requests into `NotaryEvent`.
 ///
-/// Wire format (after the 4-byte length prefix is stripped by the runtime):
-///   `[request_seq: u64][tag: u8][leaf: 32 bytes, Notarize only]`
+/// The runtime has already read the request header; the bodies are:
+///   - notarize: `[leaf: 32 bytes]`
+///   - get head: empty
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = NotaryEvent;
 
-    fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<NotaryEvent> {
-        // seq(8) + tag(1) = minimum 9 bytes
-        if bytes.len() < 9 {
-            return Decoded::DecodeError("frame too short");
-        }
-
-        let request_seq = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
-        let tag = bytes[8];
-        let body = &bytes[9..];
-
+    fn decode(&self, tag: u8, body: &[u8], permission: Permission) -> Decoded<NotaryEvent> {
         match tag {
             TAG_NOTARIZE => {
                 // Unlike the counter example, this one gates on
@@ -378,20 +370,12 @@ impl RequestDecoderTrait for RequestDecoder {
                     return Decoded::PermissionDenied("notarizing requires a writing role");
                 }
                 match leaf_from(body) {
-                    Ok(leaf) => Decoded::Permitted {
-                        request_seq,
-                        event: NotaryEvent::Notarize { leaf },
-                    },
+                    Ok(leaf) => Decoded::Permitted(NotaryEvent::Notarize { leaf }),
                     Err(_) => Decoded::DecodeError("leaf must be exactly 32 bytes"),
                 }
             }
             // Queries are readable by every authenticated role.
-            TAG_GET_HEAD => Decoded::Permitted {
-                request_seq,
-                event: NotaryEvent::GetHead,
-            },
-            // Transport-level heartbeats and auth frames — filter silently.
-            0x01..=0x0F => Decoded::Filter,
+            TAG_GET_HEAD => Decoded::Permitted(NotaryEvent::GetHead),
             _ => Decoded::DecodeError("unknown tag"),
         }
     }
@@ -401,42 +385,34 @@ impl RequestDecoderTrait for RequestDecoder {
 // Response encoder
 // ---------------------------------------------------------------------------
 
-/// Encodes `NotaryReport` / `NotaryHead` into length-prefixed wire frames.
-///
-/// Wire format: `[length: u32 LE][tag: u8][payload...]`, where the payload is
+/// Encodes `NotaryReport` / `NotaryHead` into response bodies; the runtime
+/// frames them. The bodies are:
 ///   - receipt:  `[entry: u64][timestamp_ns: u64][prev: 32 bytes][head: 32 bytes]`
 ///   - head:     `[entries: u64][head: 32 bytes]`
 ///   - rejected: empty
 pub struct ResponseEncoder;
 
-/// Length prefix (4) + tag (1) + entry (8) + timestamp (8) + prev (32) +
-/// head (32).
-const RECEIPT_FRAME_LEN: usize = 4 + 1 + 8 + 8 + HEAD_LEN + HEAD_LEN;
+/// Entry (8) + timestamp (8) + prev (32) + head (32).
+const RECEIPT_BODY_LEN: usize = 8 + 8 + HEAD_LEN + HEAD_LEN;
 
-/// Length prefix (4) + tag (1) + entries (8) + head (32).
-const HEAD_FRAME_LEN: usize = 4 + 1 + 8 + HEAD_LEN;
+/// Entries (8) + head (32).
+const HEAD_BODY_LEN: usize = 8 + HEAD_LEN;
 
-/// Length prefix (4) + tag (1).
-const REJECTED_FRAME_LEN: usize = 4 + 1;
-
-/// Write the length prefix and tag of a `frame_len`-byte frame, checking
-/// `buf` can hold the whole frame first so the callers' fixed-offset
+/// The first `len` bytes of `buf`, checked so the callers' fixed-offset
 /// writes cannot panic.
-fn frame_header(buf: &mut [u8], frame_len: usize, tag: u8) -> Result<(), &'static str> {
-    if buf.len() < frame_len {
-        return Err("buffer too small");
-    }
-    let payload_len = (frame_len - 4) as u32;
-    buf[..4].copy_from_slice(&payload_len.to_le_bytes());
-    buf[4] = tag;
-    Ok(())
+fn body(buf: &mut [u8], len: usize) -> Result<&mut [u8], &'static str> {
+    buf.get_mut(..len).ok_or("buffer too small")
 }
 
 impl ResponseEncoderTrait for ResponseEncoder {
     type Report = NotaryReport;
     type Query = NotaryHead;
 
-    fn encode_report(&self, report: &NotaryReport, buf: &mut [u8]) -> Result<usize, &'static str> {
+    fn encode_report(
+        &self,
+        report: &NotaryReport,
+        buf: &mut [u8],
+    ) -> Result<Encoded, &'static str> {
         match report {
             NotaryReport::Receipt {
                 entry,
@@ -444,25 +420,31 @@ impl ResponseEncoderTrait for ResponseEncoder {
                 prev,
                 head,
             } => {
-                frame_header(buf, RECEIPT_FRAME_LEN, TAG_RESP_RECEIPT)?;
-                buf[5..13].copy_from_slice(&entry.to_le_bytes());
-                buf[13..21].copy_from_slice(&timestamp_ns.to_le_bytes());
-                buf[21..53].copy_from_slice(prev);
-                buf[53..RECEIPT_FRAME_LEN].copy_from_slice(head);
-                Ok(RECEIPT_FRAME_LEN)
+                let body = body(buf, RECEIPT_BODY_LEN)?;
+                body[..8].copy_from_slice(&entry.to_le_bytes());
+                body[8..16].copy_from_slice(&timestamp_ns.to_le_bytes());
+                body[16..48].copy_from_slice(prev);
+                body[48..].copy_from_slice(head);
+                Ok(Encoded {
+                    tag: TAG_RESP_RECEIPT,
+                    len: RECEIPT_BODY_LEN,
+                })
             }
-            NotaryReport::Rejected => {
-                frame_header(buf, REJECTED_FRAME_LEN, TAG_RESP_REJECTED)?;
-                Ok(REJECTED_FRAME_LEN)
-            }
+            NotaryReport::Rejected => Ok(Encoded {
+                tag: TAG_RESP_REJECTED,
+                len: 0,
+            }),
         }
     }
 
-    fn encode_query(&self, query: &NotaryHead, buf: &mut [u8]) -> Result<usize, &'static str> {
-        frame_header(buf, HEAD_FRAME_LEN, TAG_RESP_HEAD)?;
-        buf[5..13].copy_from_slice(&query.entries.to_le_bytes());
-        buf[13..HEAD_FRAME_LEN].copy_from_slice(&query.head);
-        Ok(HEAD_FRAME_LEN)
+    fn encode_query(&self, query: &NotaryHead, buf: &mut [u8]) -> Result<Encoded, &'static str> {
+        let body = body(buf, HEAD_BODY_LEN)?;
+        body[..8].copy_from_slice(&query.entries.to_le_bytes());
+        body[8..].copy_from_slice(&query.head);
+        Ok(Encoded {
+            tag: TAG_RESP_HEAD,
+            len: HEAD_BODY_LEN,
+        })
     }
 }
 
@@ -737,14 +719,6 @@ mod tests {
 
     // --- Decoder ---
 
-    fn frame(seq: u64, tag: u8, body: &[u8]) -> Vec<u8> {
-        let mut f = Vec::with_capacity(9 + body.len());
-        f.extend_from_slice(&seq.to_le_bytes());
-        f.push(tag);
-        f.extend_from_slice(body);
-        f
-    }
-
     #[test]
     fn decoder_accepts_notarize_from_writing_roles() {
         let l = leaf(0x5A);
@@ -753,11 +727,8 @@ mod tests {
             Permission::Trader,
             Permission::Custodian,
         ] {
-            match RequestDecoder.decode(&frame(9, TAG_NOTARIZE, &l), permission) {
-                Decoded::Permitted { request_seq, event } => {
-                    assert_eq!(request_seq, 9);
-                    assert_eq!(event, NotaryEvent::Notarize { leaf: l });
-                }
+            match RequestDecoder.decode(TAG_NOTARIZE, &l, permission) {
+                Decoded::Permitted(event) => assert_eq!(event, NotaryEvent::Notarize { leaf: l }),
                 _ => panic!("expected Permitted for {permission:?}"),
             }
         }
@@ -768,7 +739,7 @@ mod tests {
         for permission in [Permission::ReadOnly, Permission::Replication] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(&frame(1, TAG_NOTARIZE, &leaf(1)), permission),
+                    RequestDecoder.decode(TAG_NOTARIZE, &leaf(1), permission),
                     Decoded::PermissionDenied(_)
                 ),
                 "{permission:?} must not be able to notarize"
@@ -786,11 +757,8 @@ mod tests {
             Permission::Replication,
         ] {
             assert!(matches!(
-                RequestDecoder.decode(&frame(1, TAG_GET_HEAD, &[]), permission),
-                Decoded::Permitted {
-                    event: NotaryEvent::GetHead,
-                    ..
-                }
+                RequestDecoder.decode(TAG_GET_HEAD, &[], permission),
+                Decoded::Permitted(NotaryEvent::GetHead)
             ));
         }
     }
@@ -800,7 +768,7 @@ mod tests {
         for body in [vec![0u8; LEAF_LEN - 1], vec![0u8; LEAF_LEN + 1], Vec::new()] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(&frame(1, TAG_NOTARIZE, &body), Permission::Trader),
+                    RequestDecoder.decode(TAG_NOTARIZE, &body, Permission::Trader),
                     Decoded::DecodeError(_)
                 ),
                 "a {}-byte leaf must be refused",
@@ -810,25 +778,9 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_short_frame() {
-        assert!(matches!(
-            RequestDecoder.decode(&[0u8; 8], Permission::Trader),
-            Decoded::DecodeError(_)
-        ));
-    }
-
-    #[test]
-    fn decoder_filters_transport_tags() {
-        assert!(matches!(
-            RequestDecoder.decode(&frame(0, 0x01, &[]), Permission::Trader),
-            Decoded::Filter
-        ));
-    }
-
-    #[test]
     fn decoder_rejects_unknown_tag() {
         assert!(matches!(
-            RequestDecoder.decode(&frame(0, 0x7F, &[]), Permission::Trader),
+            RequestDecoder.decode(0x7F, &[], Permission::Trader),
             Decoded::DecodeError(_)
         ));
     }
@@ -840,7 +792,7 @@ mod tests {
         let mut buf = [0u8; 128];
         let prev = [0xCDu8; HEAD_LEN];
         let head = [0xABu8; HEAD_LEN];
-        let n = ResponseEncoder
+        let encoded = ResponseEncoder
             .encode_report(
                 &NotaryReport::Receipt {
                     entry: 7,
@@ -851,37 +803,50 @@ mod tests {
                 &mut buf,
             )
             .unwrap();
-        assert_eq!(n, 85);
-        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 81);
-        assert_eq!(buf[4], TAG_RESP_RECEIPT);
-        assert_eq!(u64::from_le_bytes(buf[5..13].try_into().unwrap()), 7);
-        assert_eq!(u64::from_le_bytes(buf[13..21].try_into().unwrap()), 9);
-        assert_eq!(&buf[21..53], &prev);
-        assert_eq!(&buf[53..85], &head);
+        assert_eq!(
+            encoded,
+            Encoded {
+                tag: TAG_RESP_RECEIPT,
+                len: 80
+            }
+        );
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 9);
+        assert_eq!(&buf[16..48], &prev);
+        assert_eq!(&buf[48..80], &head);
     }
 
     #[test]
     fn encoder_rejected() {
         let mut buf = [0u8; 64];
-        let n = ResponseEncoder
+        let encoded = ResponseEncoder
             .encode_report(&NotaryReport::Rejected, &mut buf)
             .unwrap();
-        assert_eq!(n, 5);
-        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 1);
-        assert_eq!(buf[4], TAG_RESP_REJECTED);
+        assert_eq!(
+            encoded,
+            Encoded {
+                tag: TAG_RESP_REJECTED,
+                len: 0
+            }
+        );
     }
 
     #[test]
     fn encoder_head_query() {
         let mut buf = [0u8; 64];
         let head = [0x5Au8; HEAD_LEN];
-        let n = ResponseEncoder
+        let encoded = ResponseEncoder
             .encode_query(&NotaryHead { entries: 3, head }, &mut buf)
             .unwrap();
-        assert_eq!(n, 45);
-        assert_eq!(buf[4], TAG_RESP_HEAD);
-        assert_eq!(u64::from_le_bytes(buf[5..13].try_into().unwrap()), 3);
-        assert_eq!(&buf[13..45], &head);
+        assert_eq!(
+            encoded,
+            Encoded {
+                tag: TAG_RESP_HEAD,
+                len: 40
+            }
+        );
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 3);
+        assert_eq!(&buf[8..40], &head);
     }
 
     #[test]
@@ -902,19 +867,20 @@ mod tests {
         );
         assert!(
             ResponseEncoder
-                .encode_report(&NotaryReport::Rejected, &mut small)
-                .is_err()
-        );
-        assert!(
-            ResponseEncoder
                 .encode_query(
                     &NotaryHead {
                         entries: 0,
                         head: GENESIS_HEAD
                     },
-                    &mut small
+                    &mut [0u8; HEAD_BODY_LEN - 1]
                 )
                 .is_err()
+        );
+        // A rejection has no body, so no buffer is too small for it.
+        assert!(
+            ResponseEncoder
+                .encode_report(&NotaryReport::Rejected, &mut [])
+                .is_ok()
         );
     }
 }

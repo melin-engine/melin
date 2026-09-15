@@ -33,19 +33,10 @@ use melin_transport_core::{DurableWireSeqCursor, WireSeq};
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
+use crate::response_frame::{EncodeBuf, MAX_APP_FRAME, frame_app_response};
+
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
-
-/// Bound on one encoded response frame, length prefix included.
-///
-/// The response stage encodes every report and query response into a
-/// stack buffer of this size. An application whose `ResponseEncoder`
-/// needs more does not get a larger buffer: the encode fails, the reply
-/// is dropped, and the failure is logged at `error!` — so an application
-/// should check its widest frame against this bound at compile time
-/// rather than discover it under load. Public for that reason; see the
-/// re-export in the crate root.
-pub const MAX_RESPONSE_BUF: usize = 512;
 
 /// io_uring submission queue depth for sends. Must be ≥ max concurrent
 /// connections to avoid SQ overflow when all connections are dirty.
@@ -321,7 +312,7 @@ pub fn run<A: Application>(
     let mut connections: FxHashMap<u64, ConnectionEntry> =
         FxHashMap::with_capacity_and_hasher(256, Default::default());
 
-    let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
+    let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
 
     // Cached durability position to avoid atomic reads on every slot.
     // Initialised below from the policy's startup evaluation; updated
@@ -1133,10 +1124,14 @@ pub fn run<A: Application>(
                 // handles them via `is_last_in_request`.
                 let payload_result: Option<Result<usize, &'static str>> = match slot.payload {
                     OutputPayload::Report(ref report) => {
-                        Some(encoder.encode_report(report, &mut encode_buf))
+                        Some(frame_app_response(&mut encode_buf, |body| {
+                            encoder.encode_report(report, body)
+                        }))
                     }
                     OutputPayload::QueryResponse(ref q) => {
-                        Some(encoder.encode_query(q, &mut encode_buf))
+                        Some(frame_app_response(&mut encode_buf, |body| {
+                            encoder.encode_query(q, body)
+                        }))
                     }
                     OutputPayload::EngineError => Some(
                         control_codec::encode_transport_response(
@@ -1516,8 +1511,9 @@ fn append_frames(
     }
 
     // Append the full wire frames to the connection's send buffer.
-    // The encoder writes [length(4) | payload], which is the complete
-    // wire format — no extra framing needed.
+    // `encode_buf` already holds a complete frame — header written by
+    // `frame_app_response`, or by the control codec — so no extra
+    // framing is needed.
     entry.send_buf.extend_from_slice(&encode_buf[..written]);
     entry.send_buf.extend_from_slice(trailer);
     entry.last_send = batch_now;

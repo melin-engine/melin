@@ -29,28 +29,22 @@ use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
+use crate::response_frame::{EncodeBuf, MAX_APP_FRAME, frame_app_response};
+
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
 
-/// Maximum encoded response size. PositionSnapshot is the largest variant
-/// at up to 330 bytes.
-const MAX_RESPONSE_BUF: usize = 512;
-
 /// Upper bound on the encoded `BatchEnd` terminator, which is a fixed byte
 /// string (a length prefix and a discriminant).
 const MAX_BATCH_END_FRAME: usize = 8;
 
-/// Maximum wire frame size: 4-byte length prefix + MAX_RESPONSE_BUF payload,
-/// plus room for the `BatchEnd` terminator carried in the same frame when the
+/// Maximum wire frame size: the largest framed application response, plus
+/// room for the `BatchEnd` terminator carried in the same frame when the
 /// slot closes a request.
-const MAX_TX_FRAME: usize = 4 + MAX_RESPONSE_BUF + MAX_BATCH_END_FRAME;
-
-// The buffer has to hold the largest response the encoder can produce *and*
-// the terminator, or folding the two would truncate the response.
-const _: () = assert!(MAX_TX_FRAME >= 4 + MAX_RESPONSE_BUF + MAX_BATCH_END_FRAME);
+const MAX_TX_FRAME: usize = MAX_APP_FRAME + MAX_BATCH_END_FRAME;
 
 /// An encoded frame destined for a specific connection.
 /// Sent from the response stage to the DPDK poll thread via lock-free SPSC.
@@ -150,7 +144,7 @@ pub fn run<A: Application>(
     let mut connections: FxHashMap<u64, ConnectionHeartbeat> =
         FxHashMap::with_capacity_and_hasher(256, Default::default());
 
-    let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
+    let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
 
     // The BatchEnd terminator is the same bytes on every request, so it is
     // encoded once here instead of per slot.
@@ -580,10 +574,14 @@ pub fn run<A: Application>(
             // the terminator below handles them via is_last_in_request.
             let payload_result: Option<Result<usize, &'static str>> = match slot.payload {
                 OutputPayload::Report(ref report) => {
-                    Some(encoder.encode_report(report, &mut encode_buf))
+                    Some(frame_app_response(&mut encode_buf, |body| {
+                        encoder.encode_report(report, body)
+                    }))
                 }
                 OutputPayload::QueryResponse(ref q) => {
-                    Some(encoder.encode_query(q, &mut encode_buf))
+                    Some(frame_app_response(&mut encode_buf, |body| {
+                        encoder.encode_query(q, body)
+                    }))
                 }
                 OutputPayload::EngineError => Some(
                     control_codec::encode_transport_response(
