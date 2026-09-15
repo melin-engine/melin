@@ -328,6 +328,8 @@ The check is made **per response**, not once per batch. A response is released a
 
 The one reply exempt from the wait is the refusal of a write while the node is halted. The write is refused before it enters the pipeline, so there is no event to wait on; the refusal is sent once the replies to everything received before it on that connection have gone out, keeping replies in request order.
 
+A reply still waiting when the node stops, whether an operator stopped it or a newer primary superseded it, is dropped: the policy never confirmed the event, so the node cannot acknowledge it. The client sees the connection close, as it would on a crash, and reconciles on reconnect. The event itself is journaled and applied, so a retry of the same request is answered as a duplicate.
+
 The acked position is cached across batches to avoid redundant atomic loads when the policy's cursors are running ahead of the response stage.
 
 ### Per-connection send buffers

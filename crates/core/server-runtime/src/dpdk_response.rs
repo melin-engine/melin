@@ -252,7 +252,7 @@ pub fn run<A: Application>(
     #[cfg(feature = "latency-trace")]
     let mut last_stats_flush = Instant::now();
 
-    loop {
+    'run: loop {
         // Observe runtime policy swaps from the admin `ACK-POLICY`
         // command. See `response::run` for the design rationale.
         let observed_byte = ack_policy.load(Ordering::Relaxed);
@@ -501,6 +501,13 @@ pub fn run<A: Application>(
                         // Flush accrual before re-seeding so the wedged-
                         // degraded interval up to the swap isn't dropped.
                         degraded_logger.reseed(&utilization, Instant::now());
+                    }
+
+                    // And shutdown, so a gate that cannot open does not
+                    // hold the shutdown sequence — see `response::run`.
+                    // The reply the policy never confirmed is not queued.
+                    if shutdown.load(Ordering::Relaxed) {
+                        continue 'run;
                     }
 
                     let journal_pos = journal_persisted_wire_seq.load();

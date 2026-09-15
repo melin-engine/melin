@@ -41,6 +41,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   journaled. The rejection is unchanged on the wire and still skips the ack
   policy, but now waits for the replies to the client's earlier requests,
   so replies stay in request order.
+- **A node held on its ack policy could not be stopped.** With every
+  replica gone under a policy that needs one, the response stage waited in
+  the durability gate for a replica to return and never observed shutdown,
+  so an operator restart, or a fence, hung the process. The gate wait now
+  exits on shutdown. The reply it was holding is dropped, as it would be
+  by a crash: the policy never confirmed it, and the client reconciles on
+  reconnect.
 
 ## [0.16.0] - 2026-09-14
 
