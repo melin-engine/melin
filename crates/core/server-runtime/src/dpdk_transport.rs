@@ -700,9 +700,9 @@ fn process_auth_frame(
     // Borrow the payload directly — no heap allocation. Compact after processing.
     let consumed = 4 + frame_len;
 
-    // Decode the ChallengeResponse (seq is ignored during auth).
-    let (_seq, cr) = match control_codec::decode_challenge_response(&conn.parse_buf[4..consumed]) {
-        Ok(pair) => pair,
+    // Decode the ChallengeResponse.
+    let cr = match control_codec::decode_challenge_response(&conn.parse_buf[4..consumed]) {
+        Ok(cr) => cr,
         Err(e) => {
             debug!(
                 connection_id = conn.connection_id.0,

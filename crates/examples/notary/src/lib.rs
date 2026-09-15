@@ -363,21 +363,16 @@ impl AppFactory for NotaryFactory {
 /// Decodes length-prefixed client frames into `NotaryEvent`.
 ///
 /// Wire format (after the 4-byte length prefix is stripped by the runtime):
-///   `[request_seq: u64][tag: u8][leaf: 32 bytes, Notarize only]`
+///   `[tag: u8][leaf: 32 bytes, Notarize only]`
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = NotaryEvent;
 
     fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<NotaryEvent> {
-        // seq(8) + tag(1) = minimum 9 bytes
-        if bytes.len() < 9 {
+        let Some((&tag, body)) = bytes.split_first() else {
             return Decoded::DecodeError("frame too short");
-        }
-
-        let request_seq = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
-        let tag = bytes[8];
-        let body = &bytes[9..];
+        };
 
         match tag {
             TAG_NOTARIZE => {
@@ -388,18 +383,12 @@ impl RequestDecoderTrait for RequestDecoder {
                     return Decoded::PermissionDenied("notarizing requires a writing role");
                 }
                 match leaf_from(body) {
-                    Ok(leaf) => Decoded::Permitted {
-                        request_seq,
-                        event: NotaryEvent::Notarize { leaf },
-                    },
+                    Ok(leaf) => Decoded::Permitted(NotaryEvent::Notarize { leaf }),
                     Err(_) => Decoded::DecodeError("leaf must be exactly 32 bytes"),
                 }
             }
             // Queries are readable by every authenticated role.
-            TAG_GET_HEAD => Decoded::Permitted {
-                request_seq,
-                event: NotaryEvent::GetHead,
-            },
+            TAG_GET_HEAD => Decoded::Permitted(NotaryEvent::GetHead),
             // Transport-level heartbeats and auth frames — filter silently.
             0x01..=0x0F => Decoded::Filter,
             _ => Decoded::DecodeError("unknown tag"),
@@ -747,9 +736,8 @@ mod tests {
 
     // --- Decoder ---
 
-    fn frame(seq: u64, tag: u8, body: &[u8]) -> Vec<u8> {
-        let mut f = Vec::with_capacity(9 + body.len());
-        f.extend_from_slice(&seq.to_le_bytes());
+    fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut f = Vec::with_capacity(1 + body.len());
         f.push(tag);
         f.extend_from_slice(body);
         f
@@ -763,11 +751,8 @@ mod tests {
             Permission::Trader,
             Permission::Custodian,
         ] {
-            match RequestDecoder.decode(&frame(9, TAG_NOTARIZE, &l), permission) {
-                Decoded::Permitted { request_seq, event } => {
-                    assert_eq!(request_seq, 9);
-                    assert_eq!(event, NotaryEvent::Notarize { leaf: l });
-                }
+            match RequestDecoder.decode(&frame(TAG_NOTARIZE, &l), permission) {
+                Decoded::Permitted(event) => assert_eq!(event, NotaryEvent::Notarize { leaf: l }),
                 _ => panic!("expected Permitted for {permission:?}"),
             }
         }
@@ -778,7 +763,7 @@ mod tests {
         for permission in [Permission::ReadOnly, Permission::Replication] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(&frame(1, TAG_NOTARIZE, &leaf(1)), permission),
+                    RequestDecoder.decode(&frame(TAG_NOTARIZE, &leaf(1)), permission),
                     Decoded::PermissionDenied(_)
                 ),
                 "{permission:?} must not be able to notarize"
@@ -796,11 +781,8 @@ mod tests {
             Permission::Replication,
         ] {
             assert!(matches!(
-                RequestDecoder.decode(&frame(1, TAG_GET_HEAD, &[]), permission),
-                Decoded::Permitted {
-                    event: NotaryEvent::GetHead,
-                    ..
-                }
+                RequestDecoder.decode(&frame(TAG_GET_HEAD, &[]), permission),
+                Decoded::Permitted(NotaryEvent::GetHead)
             ));
         }
     }
@@ -810,7 +792,7 @@ mod tests {
         for body in [vec![0u8; LEAF_LEN - 1], vec![0u8; LEAF_LEN + 1], Vec::new()] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(&frame(1, TAG_NOTARIZE, &body), Permission::Trader),
+                    RequestDecoder.decode(&frame(TAG_NOTARIZE, &body), Permission::Trader),
                     Decoded::DecodeError(_)
                 ),
                 "a {}-byte leaf must be refused",
@@ -822,7 +804,7 @@ mod tests {
     #[test]
     fn decoder_rejects_short_frame() {
         assert!(matches!(
-            RequestDecoder.decode(&[0u8; 8], Permission::Trader),
+            RequestDecoder.decode(&[], Permission::Trader),
             Decoded::DecodeError(_)
         ));
     }
@@ -830,7 +812,7 @@ mod tests {
     #[test]
     fn decoder_filters_transport_tags() {
         assert!(matches!(
-            RequestDecoder.decode(&frame(0, 0x01, &[]), Permission::Trader),
+            RequestDecoder.decode(&frame(0x01, &[]), Permission::Trader),
             Decoded::Filter
         ));
     }
@@ -838,7 +820,7 @@ mod tests {
     #[test]
     fn decoder_rejects_unknown_tag() {
         assert!(matches!(
-            RequestDecoder.decode(&frame(0, 0x7F, &[]), Permission::Trader),
+            RequestDecoder.decode(&frame(0x7F, &[]), Permission::Trader),
             Decoded::DecodeError(_)
         ));
     }

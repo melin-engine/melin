@@ -197,21 +197,16 @@ impl AppFactory for CounterFactory {
 /// Decodes length-prefixed client frames into `CounterEvent`.
 ///
 /// Wire format (after the 4-byte length prefix is stripped by the runtime):
-///   `[request_seq: u64][tag: u8][payload...]`
+///   `[tag: u8][payload...]`
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = CounterEvent;
 
     fn decode(&self, bytes: &[u8], _permission: Permission) -> Decoded<CounterEvent> {
-        // seq(8) + tag(1) = minimum 9 bytes
-        if bytes.len() < 9 {
+        let Some((&tag, payload)) = bytes.split_first() else {
             return Decoded::DecodeError("frame too short");
-        }
-
-        let request_seq = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
-        let tag = bytes[8];
-        let payload = &bytes[9..];
+        };
 
         match tag {
             TAG_INCREMENT => {
@@ -219,15 +214,9 @@ impl RequestDecoderTrait for RequestDecoder {
                     return Decoded::DecodeError("increment payload too short");
                 }
                 let amount = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"));
-                Decoded::Permitted {
-                    request_seq,
-                    event: CounterEvent::Increment { amount },
-                }
+                Decoded::Permitted(CounterEvent::Increment { amount })
             }
-            TAG_GET_VALUE => Decoded::Permitted {
-                request_seq,
-                event: CounterEvent::GetValue,
-            },
+            TAG_GET_VALUE => Decoded::Permitted(CounterEvent::GetValue),
             // Transport-level heartbeats and auth frames — filter silently.
             0x01..=0x0F => Decoded::Filter,
             _ => Decoded::DecodeError("unknown tag"),
@@ -370,14 +359,11 @@ mod tests {
 
     #[test]
     fn decoder_increment() {
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&7u64.to_le_bytes());
-        frame.push(TAG_INCREMENT);
+        let mut frame = vec![TAG_INCREMENT];
         frame.extend_from_slice(&100u64.to_le_bytes());
 
         match RequestDecoder.decode(&frame, Permission::Operator) {
-            Decoded::Permitted { request_seq, event } => {
-                assert_eq!(request_seq, 7);
+            Decoded::Permitted(event) => {
                 assert!(matches!(event, CounterEvent::Increment { amount: 100 }));
             }
             _ => panic!("expected Permitted"),
@@ -386,12 +372,10 @@ mod tests {
 
     #[test]
     fn decoder_get_value() {
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&1u64.to_le_bytes());
-        frame.push(TAG_GET_VALUE);
+        let frame = [TAG_GET_VALUE];
 
         match RequestDecoder.decode(&frame, Permission::Operator) {
-            Decoded::Permitted { event, .. } => {
+            Decoded::Permitted(event) => {
                 assert!(matches!(event, CounterEvent::GetValue));
                 assert!(event.is_query());
             }
@@ -401,9 +385,7 @@ mod tests {
 
     #[test]
     fn decoder_filters_transport_tags() {
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&0u64.to_le_bytes());
-        frame.push(0x01); // TAG_RESPONSE_HEARTBEAT
+        let frame = [0x01]; // TAG_RESPONSE_HEARTBEAT
 
         assert!(matches!(
             RequestDecoder.decode(&frame, Permission::Operator),

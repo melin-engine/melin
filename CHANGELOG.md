@@ -25,6 +25,25 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   implementation: delete `check_request_seq`, move its check to the top of
   `apply` (skipping queries, as the runtime did), and stop matching on
   `DuplicateRequest`.
+- **The request sequence, from the wire, the journal and replication.** With
+  the gate gone the runtime never read it, yet every request, journal entry
+  and replication slot carried its eight bytes for every application. A
+  client frame is now `[tag][body]`, the handshake's challenge response
+  included; `melin-client`'s `send`, `request` and `request_one` lose their
+  sequence argument; `Decoded::Permitted` is a tuple variant carrying only
+  the event; `InputSlot` and `JournalEntry` lose `request_seq`. An
+  application that sequences requests puts the sequence in its own request
+  body and event. Breaking on every surface it touched:
+  - **Journal format 15.** Entries are eight bytes shorter, and a node
+    refuses a format-14 journal with `UnsupportedVersion`. Upgrade through a
+    snapshot, as for any format change: snapshot on the old version, deploy,
+    start on a fresh journal.
+  - **Replication protocol 5.** A replica and primary on different versions
+    refuse each other at the handshake; upgrade the cluster together.
+  - **Client protocol.** A client built against an earlier `melin-client`
+    fails the handshake against this node, and one built against this
+    version fails it against an earlier node; either way the client sees
+    its key refused. Upgrade clients with the nodes.
 
 ### Fixed
 

@@ -90,8 +90,7 @@ fn answer_challenge(stream: &mut TcpStream, key: &SigningKey) -> Option<()> {
     }
     let nonce = &challenge[1..33];
     let signature = key.sign(nonce);
-    let mut frame = Vec::with_capacity(105);
-    frame.extend_from_slice(&0u64.to_le_bytes());
+    let mut frame = Vec::with_capacity(97);
     frame.push(TAG_CHALLENGE_RESPONSE);
     frame.extend_from_slice(&signature.to_bytes());
     frame.extend_from_slice(&key.verifying_key().to_bytes());
@@ -128,9 +127,8 @@ fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
     }
 }
 
-fn send_request(stream: &mut TcpStream, seq: u64, tag: u8, payload: &[u8]) {
-    let mut frame = Vec::with_capacity(9 + payload.len());
-    frame.extend_from_slice(&seq.to_le_bytes());
+fn send_request(stream: &mut TcpStream, tag: u8, payload: &[u8]) {
+    let mut frame = Vec::with_capacity(1 + payload.len());
     frame.push(tag);
     frame.extend_from_slice(payload);
     write_frame(stream, &frame);
@@ -378,9 +376,9 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     {
         let mut stream = connect_authenticated(nodes[0].client_addr, &client_key);
         let mut expected_total = 0u64;
-        for (seq, amount) in [(1u64, 1u64), (2, 2), (3, 4)] {
+        for amount in [1u64, 2, 4] {
             expected_total += amount;
-            send_request(&mut stream, seq, TAG_INCREMENT, &amount.to_le_bytes());
+            send_request(&mut stream, TAG_INCREMENT, &amount.to_le_bytes());
             let responses = read_until_batch_end(&mut stream);
             assert_eq!(responses.len(), 1);
             assert_eq!(responses[0][0], TAG_RESP_ACK, "increment must be acked");
@@ -451,7 +449,7 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     // under the `ram` ack policy must be in it. ---
     {
         let mut stream = connect_authenticated(nodes[winner].client_addr, &client_key);
-        send_request(&mut stream, 1, TAG_GET_VALUE, &[]);
+        send_request(&mut stream, TAG_GET_VALUE, &[]);
         let responses = read_until_batch_end(&mut stream);
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0][0], TAG_RESP_VALUE);

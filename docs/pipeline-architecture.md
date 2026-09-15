@@ -86,7 +86,7 @@ The simplified diagram above shows the primary-side request path. The picture be
    |  |   (reports)    SUBSCRIBERS
    |  |
    |  |  pwritev2 (RWF_DSYNC) -> JOURNAL FILE
-   |  |  journal bytes carry (sequence, timestamp, event, key_hash, request_seq)
+   |  |  journal bytes carry (sequence, timestamp, event, key_hash)
    |  |
    |  |  post-fsync: push encoded batch bytes
    |  v

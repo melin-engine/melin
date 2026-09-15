@@ -59,7 +59,6 @@ pub fn publish_tick<E: AppEvent>(producer: &mut ring::Producer<InputSlot<E>>, no
     let _ = producer.try_publish(InputSlot {
         connection_id: 0,
         key_hash: 0,
-        request_seq: 0,
         sequence: 0,
         timestamp_ns: now_ns,
         event: JournalEvent::Tick { now_ns },

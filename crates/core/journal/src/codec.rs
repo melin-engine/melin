@@ -12,7 +12,7 @@
 //! | Field             | Type     | Bytes | Purpose                             |
 //! |-------------------|----------|-------|-------------------------------------|
 //! | file_magic        | u32      | 4     | `0x4A4F5552` ("JOUR")               |
-//! | format_version    | u16      | 2     | Current version = 14                |
+//! | format_version    | u16      | 2     | Current version = 15                |
 //! | sector_size       | u16      | 2     | Always [`MAX_SECTOR_SIZE`] (4096)   |
 //! | starting_sequence | u64      | 8     | Sequence of this segment's first entry |
 //! | anchor_hash       | [u8; 32] | 32    | Chain anchor: random salt (fresh journal) or previous segment's tail hash (rotation) |
@@ -32,12 +32,11 @@
 //! | sequence     | u64    | 8     | Monotonically increasing, starts at 1 |
 //! | timestamp_ns | u64    | 8     | Wall-clock nanos since epoch           |
 //! | key_hash     | u64    | 8     | FxHash of client Ed25519 pubkey       |
-//! | request_seq  | u64    | 8     | Per-key request sequence               |
 //! | event_tag    | u8     | 1     | Transport variant discriminant        |
 //! | payload      | varies | ≤64K  | Transport-variant fields, or `E::encode` bytes for `App(e)` |
 //! | crc32c       | u32    | 4     | CRC32C of all preceding bytes         |
 //!
-//! `length` = size of (key_hash + request_seq + event_tag + payload).
+//! `length` = size of (key_hash + event_tag + payload).
 //! Total entry size = 20 + length + 4.
 //!
 //! ## Event tag space
@@ -86,7 +85,11 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// retired. The chain is anchored per segment and schedule-free —
 /// `chain(S) = BLAKE3(entry bytes ≤ S || anchor)` (see the crate's `chain`
 /// module).
-pub const FORMAT_VERSION: u16 = 14;
+///
+/// v14 → v15: per-entry `request_seq` removed from the metadata block
+/// (17 → 9 bytes). The runtime never read it; an application that needs
+/// a request sequence carries it in its own event payload.
+pub const FORMAT_VERSION: u16 = 15;
 
 /// Entry magic bytes for corruption/misalignment detection.
 const ENTRY_MAGIC: u16 = 0x4A45;
@@ -157,13 +160,12 @@ pub(crate) struct EntryHeader {
     pub(crate) timestamp_ns: U64,
 }
 
-/// Per-entry metadata (17 bytes) sitting inside the length-protected
+/// Per-entry metadata (9 bytes) sitting inside the length-protected
 /// region. The variable-length event payload follows.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct EntryMetadata {
     key_hash: U64,
-    request_seq: U64,
     event_tag: u8,
 }
 
@@ -196,7 +198,7 @@ const FILE_HEADER_FIELDS_SIZE: usize = core::mem::size_of::<FileHeader>();
 /// Entry header size: magic(2) + length(2) + sequence(8) + timestamp(8) = 20.
 pub(crate) const ENTRY_HEADER_SIZE: usize = core::mem::size_of::<EntryHeader>();
 
-/// Entry metadata size: key_hash(8) + request_seq(8) + tag(1) = 17.
+/// Entry metadata size: key_hash(8) + tag(1) = 9.
 /// The journal's `length` field covers `ENTRY_META_SIZE + payload_len`,
 /// so consumers that derive payload size from `length` (replication
 /// wire) need this constant.
@@ -206,7 +208,7 @@ pub const ENTRY_META_SIZE: usize = core::mem::size_of::<EntryMetadata>();
 pub(crate) const CRC_SIZE: usize = 4;
 
 /// Bytes every entry costs regardless of its payload: header (20) +
-/// metadata (17) + CRC (4) = 41.
+/// metadata (9) + CRC (4) = 33.
 ///
 /// Public because sizing an entry is an application-facing calculation:
 /// `ENTRY_FRAMING_SIZE + max(TRANSPORT_PAYLOAD_SIZE, E::MAX_ENCODED_SIZE)`
@@ -214,7 +216,7 @@ pub(crate) const CRC_SIZE: usize = 4;
 /// a hand-off chunk by to decide batch length.
 pub const ENTRY_FRAMING_SIZE: usize = ENTRY_HEADER_SIZE + ENTRY_META_SIZE + CRC_SIZE;
 
-const _: () = assert!(ENTRY_FRAMING_SIZE == 41);
+const _: () = assert!(ENTRY_FRAMING_SIZE == 33);
 
 /// Payload width of the transport-intrinsic variants — `Tick`'s `now_ns`
 /// and `EpochBump`'s `epoch`, both a `u64`.
@@ -228,7 +230,7 @@ pub const TRANSPORT_PAYLOAD_SIZE: usize = 8;
 const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 52);
 const _: () = assert!(FILE_HEADER_SIZE >= FILE_HEADER_FIELDS_SIZE);
 const _: () = assert!(ENTRY_HEADER_SIZE == 20);
-const _: () = assert!(ENTRY_META_SIZE == 17);
+const _: () = assert!(ENTRY_META_SIZE == 9);
 
 /// Event tag space — 0x01..0x7F reserved for transport-intrinsic
 /// variants, 0x80 and above for `App(E)` payloads. Tags 0x01
@@ -364,11 +366,10 @@ pub fn encode<E: AppEvent>(
     sequence: u64,
     timestamp_ns: u64,
     key_hash: u64,
-    request_seq: u64,
     event: &JournalEvent<E>,
     buf: &mut [u8],
 ) -> Result<usize, JournalError> {
-    // Layout: [EntryHeader: 20][EntryMetadata: 17][payload: var][CRC: 4].
+    // Layout: [EntryHeader: 20][EntryMetadata: 9][payload: var][CRC: 4].
     // Header back-filled at the end (length depends on payload size);
     // metadata back-filled in one block once the tag is known.
     let payload_start = ENTRY_HEADER_SIZE + ENTRY_META_SIZE;
@@ -440,7 +441,7 @@ pub fn encode<E: AppEvent>(
         }
     };
 
-    // `length` covers key_hash(8) + request_seq(8) + event_tag(1) + payload.
+    // `length` covers key_hash(8) + event_tag(1) + payload.
     let length = pos - ENTRY_HEADER_SIZE;
     let length_u16 = u16::try_from(length).map_err(|_| JournalError::CorruptEntry {
         sequence,
@@ -452,7 +453,6 @@ pub fn encode<E: AppEvent>(
     )
     .expect("ENTRY_META_SIZE slice matches struct size");
     meta.key_hash = U64::new(key_hash);
-    meta.request_seq = U64::new(request_seq);
     meta.event_tag = event_tag;
 
     let header = EntryHeader::mut_from_bytes(&mut buf[..ENTRY_HEADER_SIZE])
@@ -470,13 +470,13 @@ pub fn encode<E: AppEvent>(
     Ok(pos)
 }
 
-/// Tuple returned by [`decode`]: bytes consumed, the four per-entry
+/// Tuple returned by [`decode`]: bytes consumed, the three per-entry
 /// metadata fields, and the decoded event.
-pub type DecodedEntry<E> = (usize, u64, u64, u64, u64, JournalEvent<E>);
+pub type DecodedEntry<E> = (usize, u64, u64, u64, JournalEvent<E>);
 
 /// Decode a journal entry from `buf`.
 ///
-/// Returns `(bytes_consumed, sequence, timestamp_ns, key_hash, request_seq, event)`.
+/// Returns `(bytes_consumed, sequence, timestamp_ns, key_hash, event)`.
 /// Entry layout is versioned by the file header alone —
 /// [`decode_file_header`] rejects anything but [`FORMAT_VERSION`], so by
 /// the time entries are decoded the layout is known.
@@ -518,14 +518,13 @@ pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> 
     if payload_len < ENTRY_META_SIZE {
         return Err(JournalError::CorruptEntry {
             sequence,
-            reason: "entry too short for key_hash + request_seq + tag",
+            reason: "entry too short for key_hash + tag",
         });
     }
     let meta =
         EntryMetadata::ref_from_bytes(&buf[ENTRY_HEADER_SIZE..ENTRY_HEADER_SIZE + ENTRY_META_SIZE])
             .expect("ENTRY_META_SIZE slice matches struct size");
     let key_hash = meta.key_hash.get();
-    let request_seq = meta.request_seq.get();
     let event_tag = meta.event_tag;
 
     let event_payload = &buf[ENTRY_HEADER_SIZE + ENTRY_META_SIZE..data_end];
@@ -568,14 +567,7 @@ pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> 
         }
     };
 
-    Ok((
-        total_len,
-        sequence,
-        timestamp_ns,
-        key_hash,
-        request_seq,
-        event,
-    ))
+    Ok((total_len, sequence, timestamp_ns, key_hash, event))
 }
 
 /// Flatten a [`melin_app::CodecError`] into a static reason string so it
@@ -649,13 +641,12 @@ mod tests {
 
     fn round_trip(event: JournalEvent<TestEvent>) {
         let mut buf = [0u8; 256];
-        let n = encode(42, 123_456, 0xabcd, 7, &event, &mut buf).expect("encode");
-        let (consumed, seq, ts, kh, rs, decoded) = decode::<TestEvent>(&buf[..n]).expect("decode");
+        let n = encode(42, 123_456, 0xabcd, &event, &mut buf).expect("encode");
+        let (consumed, seq, ts, kh, decoded) = decode::<TestEvent>(&buf[..n]).expect("decode");
         assert_eq!(consumed, n);
         assert_eq!(seq, 42);
         assert_eq!(ts, 123_456);
         assert_eq!(kh, 0xabcd);
-        assert_eq!(rs, 7);
         assert_eq!(decoded, event);
     }
 
@@ -719,7 +710,7 @@ mod tests {
         // Sized for a modest application, as a caller reserving
         // `entry_size::<E>()` would be.
         let mut buf = [0u8; 144];
-        let err = encode(7, 0, 0, 0, &JournalEvent::App(FatEvent), &mut buf)
+        let err = encode(7, 0, 0, &JournalEvent::App(FatEvent), &mut buf)
             .expect_err("oversized app event must be refused, not panic");
         assert!(
             matches!(
@@ -766,7 +757,7 @@ mod tests {
     #[test]
     fn app_event_wider_than_its_declared_bound_is_refused() {
         let mut buf = [0u8; crate::encoder::MAX_ENTRY_SIZE];
-        let err = encode(9, 0, 0, 0, &JournalEvent::App(UnderDeclaredEvent), &mut buf)
+        let err = encode(9, 0, 0, &JournalEvent::App(UnderDeclaredEvent), &mut buf)
             .expect_err("an event past its declared bound must be refused");
         assert!(
             matches!(
@@ -783,7 +774,6 @@ mod tests {
         let mut buf = [0u8; 8];
         let err = encode(
             3,
-            0,
             0,
             0,
             &JournalEvent::App::<TestEvent>(TestEvent::Ping),
@@ -803,17 +793,17 @@ mod tests {
         // under it.
         let ev = JournalEvent::App::<TestEvent>(TestEvent::Payload(1));
         let mut probe = [0u8; 256];
-        let needed = encode(1, 0, 0, 0, &ev, &mut probe).expect("probe encode");
+        let needed = encode(1, 0, 0, &ev, &mut probe).expect("probe encode");
 
         let mut exact = vec![0u8; needed];
         assert_eq!(
-            encode(1, 0, 0, 0, &ev, &mut exact).expect("exact fit encodes"),
+            encode(1, 0, 0, &ev, &mut exact).expect("exact fit encodes"),
             needed
         );
 
         let mut short = vec![0u8; needed - 1];
         assert!(
-            encode(1, 0, 0, 0, &ev, &mut short).is_err(),
+            encode(1, 0, 0, &ev, &mut short).is_err(),
             "one byte short must be refused"
         );
     }
@@ -822,7 +812,7 @@ mod tests {
     fn bad_entry_magic_rejected() {
         let ev = JournalEvent::App::<TestEvent>(TestEvent::Ping);
         let mut buf = [0u8; 256];
-        let n = encode(1, 0, 0, 0, &ev, &mut buf).unwrap();
+        let n = encode(1, 0, 0, &ev, &mut buf).unwrap();
         // Corrupt the entry magic.
         buf[0] = 0;
         buf[1] = 0;
@@ -834,9 +824,9 @@ mod tests {
     fn crc_mismatch_rejected() {
         let ev = JournalEvent::App::<TestEvent>(TestEvent::Payload(123));
         let mut buf = [0u8; 256];
-        let n = encode(1, 0, 0, 0, &ev, &mut buf).unwrap();
+        let n = encode(1, 0, 0, &ev, &mut buf).unwrap();
         // Flip a byte inside the payload (post-header, pre-CRC).
-        buf[ENTRY_HEADER_SIZE + 16 + 1] ^= 0xff;
+        buf[ENTRY_HEADER_SIZE + ENTRY_META_SIZE + 1] ^= 0xff;
         let err = decode::<TestEvent>(&buf[..n]).unwrap_err();
         assert!(matches!(err, JournalError::ChecksumMismatch { .. }));
     }
@@ -854,7 +844,7 @@ mod tests {
         // filter, encode must surface a clear error rather than silently
         // writing a corrupt entry.
         let mut buf = [0u8; 256];
-        let err = encode(42, 0, 0, 0, &JournalEvent::Shutdown::<TestEvent>, &mut buf).unwrap_err();
+        let err = encode(42, 0, 0, &JournalEvent::Shutdown::<TestEvent>, &mut buf).unwrap_err();
         assert!(
             matches!(err, JournalError::CorruptEntry { sequence: 42, .. }),
             "expected CorruptEntry, got {err:?}"
@@ -865,10 +855,10 @@ mod tests {
     fn unknown_tag_rejected() {
         let ev = JournalEvent::App::<TestEvent>(TestEvent::Ping);
         let mut buf = [0u8; 256];
-        let n = encode(1, 0, 0, 0, &ev, &mut buf).unwrap();
+        let n = encode(1, 0, 0, &ev, &mut buf).unwrap();
         // Overwrite the event tag with an unknown value and recompute
         // the CRC so the frame parses past the CRC check.
-        let tag_offset = ENTRY_HEADER_SIZE + 16;
+        let tag_offset = ENTRY_HEADER_SIZE + 8;
         buf[tag_offset] = 0x7f;
         let data_end = n - CRC_SIZE;
         let new_crc = crc32c::crc32c(&buf[..data_end]);
@@ -942,23 +932,21 @@ mod tests {
             0x2827_2625_2423_2221, // sequence
             0x3837_3635_3433_3231, // timestamp_ns
             0x0807_0605_0403_0201, // key_hash
-            0x1817_1615_1413_1211, // request_seq
             &event,
             &mut buf,
         )
         .expect("encode");
 
-        // Body: EntryHeader(20) + EntryMetadata(17) + Tick payload(8) = 45.
-        // Total = 45 + CRC(4) = 49. length field = 17 + 8 = 25 = 0x19.
+        // Body: EntryHeader(20) + EntryMetadata(9) + Tick payload(8) = 37.
+        // Total = 37 + CRC(4) = 41. length field = 9 + 8 = 17 = 0x11.
         let mut expected: Vec<u8> = vec![
             // EntryHeader: magic(u16) + length(u16) + sequence(u64) + timestamp_ns(u64)
             0x45, 0x4A, // ENTRY_MAGIC = 0x4A45
-            0x19, 0x00, // length = 25
+            0x11, 0x00, // length = 17
             0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // sequence
             0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // timestamp_ns
-            // EntryMetadata: key_hash(u64) + request_seq(u64) + event_tag(u8)
+            // EntryMetadata: key_hash(u64) + event_tag(u8)
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // key_hash
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // request_seq
             0x03, // TAG_TICK
             // Tick payload: now_ns(u64)
             0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
@@ -966,7 +954,7 @@ mod tests {
         let crc = crc32c::crc32c(&expected);
         expected.extend_from_slice(&crc.to_le_bytes());
 
-        assert_eq!(n, 49);
+        assert_eq!(n, 41);
         assert_eq!(
             &buf[..n],
             expected.as_slice(),

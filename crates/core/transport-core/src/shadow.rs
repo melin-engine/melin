@@ -320,7 +320,6 @@ mod tests {
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent::Add(1000)),
@@ -330,7 +329,6 @@ mod tests {
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent::Add(500)),
@@ -593,7 +591,6 @@ mod tests {
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent::Add(1)),
@@ -619,7 +616,6 @@ mod tests {
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent::Add(1)),
@@ -696,7 +692,6 @@ mod tests {
                 producer.publish(InputSlot {
                     connection_id: 0,
                     key_hash: 0,
-                    request_seq: 0,
                     sequence: 0,
                     timestamp_ns: 0,
                     event: JournalEvent::App(TestEvent::Add(n)),

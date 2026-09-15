@@ -21,7 +21,7 @@ This document describes the write-ahead journal, snapshot system, crash recovery
 ```
 Offset  Size  Field              Value
 0       4     file_magic         0x4A4F5552 ("JOUR")
-4       2     format_version     14
+4       2     format_version     15
 6       2     sector_size        4096
 8       8     starting_sequence  sequence carried by this segment's first entry
 16      32    anchor_hash        chain anchor (random salt or previous segment's tail hash)
@@ -35,14 +35,13 @@ The header is written when the journal is created and never modified. Its CRC pr
 ```
 Offset  Size  Field           Description
 0       2     entry_magic     0x4A45 — misalignment / corruption detection
-2       2     length          byte count of (key_hash + request_seq + event_tag + payload)
+2       2     length          byte count of (key_hash + event_tag + payload)
 4       8     sequence        monotonically increasing, starts at 1, no gaps
 12      8     timestamp_ns    wall-clock nanoseconds since Unix epoch (informational only)
 20      8     key_hash        hash of the client's signing key (0 for server-internal events)
-28      8     request_seq     per-key request sequence (idempotency dedup)
-36      1     event_tag       discriminant (Tick, or App for exchange events)
-37      var   payload         event-specific fields (see below)
-37+len  4     crc32c          CRC32C of all preceding bytes in this entry
+28      1     event_tag       discriminant (Tick, or App for exchange events)
+29      var   payload         event-specific fields (see below)
+29+len  4     crc32c          CRC32C of all preceding bytes in this entry
 ```
 
 Total entry size: `20 + length + 4` bytes. Typical entries are 60-110 bytes. The first entry's `sequence` must equal the header's `starting_sequence` — a segment renamed into the wrong place in the lineage is rejected at the first read.
@@ -394,7 +393,7 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 
 ## Format Versioning
 
-Both the journal and snapshot have independent `format_version` fields. Current journal version: **14**. Current snapshot version: **12**.
+Both the journal and snapshot have independent `format_version` fields. Current journal version: **15**. Current snapshot version: **12**.
 
 ### Journal Version History
 
@@ -412,6 +411,7 @@ Both the journal and snapshot have independent `format_version` fields. Current 
 | 10-12 | Per-entry `key_hash` + `request_seq` metadata (idempotency dedup); transport/application event-tag split |
 | 13 | Entry offset fixed at 4096 regardless of device sector size. Journals stay interchangeable across devices, and across the writer change that followed — the since-retired O_DIRECT writer produced this same layout |
 | 14 | Chain metadata moved out of the entry stream: file header gained `starting_sequence`, `anchor_hash`, and a header CRC; `GenesisHash` and `Checkpoint` entry tags retired. The chain is anchored per segment and schedule-free; sequence numbers are dense over real events |
+| 15 | Per-entry `request_seq` removed; an application that sequences requests carries the sequence in its own event payload |
 
 ### Snapshot Version History
 

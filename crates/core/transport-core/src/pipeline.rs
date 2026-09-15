@@ -287,12 +287,12 @@ const MAX_MATCHING_BATCH: usize = 16;
 /// aliases this to `InputSlot<TradingEvent>`.
 ///
 /// `#[repr(align(64))]` forces 64-byte alignment and rounds the struct
-/// size up to a multiple of 64 — without padding the natural layout is
-/// 104 bytes (or 120 with `latency-trace`), which makes adjacent slots
-/// share cache lines and forces every slot access to touch 2–3 lines
-/// instead of 2. With this attribute both configurations occupy exactly
-/// 128 bytes (two cache lines), so the producer's writes to slot N never
-/// share a line with slot N±1 and per-slot line traffic is minimised.
+/// size up to a multiple of 64 — without padding a slot whose natural
+/// layout falls between two multiples of 64 makes adjacent slots share
+/// cache lines and forces every slot access to touch one line more than
+/// it needs. With this attribute a slot occupies whole cache lines, so
+/// the producer's writes to slot N never share a line with slot N±1 and
+/// per-slot line traffic is minimised.
 #[derive(Debug, Clone, Copy)]
 #[repr(align(64))]
 pub struct InputSlot<E: AppEvent> {
@@ -302,9 +302,6 @@ pub struct InputSlot<E: AppEvent> {
     /// event and handed to the application as `ApplyCtx::key_hash`.
     /// 0 for seed/internal events.
     pub key_hash: u64,
-    /// Request sequence number from the wire protocol, journaled with
-    /// the event. Opaque to the transport. 0 for seed/internal events.
-    pub request_seq: u64,
     /// Journal sequence number. **Always zero on primary-side input** —
     /// the journal stage allocates the sequence at encode time, in
     /// disruptor cursor order, so producers never have to coordinate
@@ -337,7 +334,6 @@ impl<E: AppEvent> Default for InputSlot<E> {
         Self {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: melin_journal::JournalEvent::Tick { now_ns: 0 },
@@ -1305,7 +1301,6 @@ impl<E: AppEvent> Sequencer<E> {
                                 slot.timestamp_ns,
                                 &slot.event,
                                 slot.key_hash,
-                                slot.request_seq,
                             )
                             .map_err(|e| {
                                 JournalError::Io(std::io::Error::other(format!(
@@ -1527,7 +1522,6 @@ impl<E: AppEvent> Sequencer<E> {
                     slot.timestamp_ns,
                     &slot.event,
                     slot.key_hash,
-                    slot.request_seq,
                 ) {
                     tracing::error!(error = %e, "journal encode error on drain");
                     continue;
@@ -2861,7 +2855,6 @@ impl<A: Application> MatchingStage<A> {
                             elapsed_us = elapsed_ns / 1000,
                             event_kind,
                             connection_id = slot.connection_id,
-                            request_seq = slot.request_seq,
                             input_seq,
                             "matching execute outlier"
                         );

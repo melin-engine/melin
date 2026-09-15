@@ -29,14 +29,14 @@ use echo_server::{
 // ---------------------------------------------------------------------------
 
 /// Echo `payload` and return the reply's `(tag, bytes)`.
-fn exchange(node: &mut Connection, seq: u64, payload: &[u8]) -> (u8, Vec<u8>) {
-    let reply = node.request_one(seq, TAG_ECHO, payload).expect("one reply");
+fn exchange(node: &mut Connection, payload: &[u8]) -> (u8, Vec<u8>) {
+    let reply = node.request_one(TAG_ECHO, payload).expect("one reply");
     (reply[0], reply[1..].to_vec())
 }
 
 /// Send a request the server is expected to drop: no reply is read.
-fn send(node: &mut Connection, seq: u64, payload: &[u8]) {
-    node.send(seq, TAG_ECHO, payload).expect("send");
+fn send(node: &mut Connection, payload: &[u8]) {
+    node.send(TAG_ECHO, payload).expect("send");
 }
 
 /// `len` bytes that no other length or seed produces, so a reply can only
@@ -211,7 +211,7 @@ fn an_echo_returns_the_bytes_it_was_sent() {
     // carried in two bytes, and 256 is where a one-byte length would wrap.
     for (i, len) in [0, 1, 7, 255, 256, MAX_PAYLOAD].into_iter().enumerate() {
         let sent = bytes(len, i as u8);
-        let (tag, back) = exchange(&mut stream, i as u64 + 1, &sent);
+        let (tag, back) = exchange(&mut stream, &sent);
         assert_eq!(tag, TAG_RESP_ECHO, "{len} bytes");
         assert_eq!(back, sent, "{len} bytes");
     }
@@ -229,10 +229,10 @@ fn an_oversized_payload_is_refused_without_dropping_the_connection() {
     // without a response and keeps the connection, so the refusal is
     // observable only as the next reply answering the next request rather
     // than this one.
-    send(&mut stream, 1, &bytes(MAX_PAYLOAD + 1, 1));
+    send(&mut stream, &bytes(MAX_PAYLOAD + 1, 1));
 
     let sent = bytes(MAX_PAYLOAD, 2);
-    let (tag, back) = exchange(&mut stream, 2, &sent);
+    let (tag, back) = exchange(&mut stream, &sent);
     assert_eq!((tag, back), (TAG_RESP_ECHO, sent));
 
     drop(stream);
@@ -247,11 +247,11 @@ fn a_read_only_key_cannot_echo() {
     // request a read-only key can make that would be answered, so the
     // refusal is observable only in the journal afterwards.
     let mut watcher = connect_authenticated(server.addr, &readonly_key());
-    send(&mut watcher, 1, b"not mine to journal");
+    send(&mut watcher, b"not mine to journal");
 
     let sent = bytes(MAX_PAYLOAD, 9);
     let mut stream = connect_authenticated(server.addr, &trader_key());
-    let (tag, back) = exchange(&mut stream, 1, &sent);
+    let (tag, back) = exchange(&mut stream, &sent);
     assert_eq!((tag, back), (TAG_RESP_ECHO, sent.clone()));
 
     drop(stream);
@@ -274,8 +274,8 @@ fn the_journal_holds_every_echo_in_order() {
     let echoes = [bytes(0, 0), bytes(MAX_PAYLOAD, 1), bytes(5, 2)];
     {
         let mut stream = connect_authenticated(server.addr, &trader_key());
-        for (i, sent) in echoes.iter().enumerate() {
-            exchange(&mut stream, i as u64 + 1, sent);
+        for sent in &echoes {
+            exchange(&mut stream, sent);
         }
     }
     server.stop();
@@ -299,8 +299,8 @@ fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
     let server = start_server_with(tmp.path(), |config| config.snapshot_interval_ms = 50);
     {
         let mut stream = connect_authenticated(server.addr, &trader_key());
-        for (i, sent) in before.iter().enumerate() {
-            exchange(&mut stream, i as u64 + 1, sent);
+        for sent in &before {
+            exchange(&mut stream, sent);
         }
         let deadline = Instant::now() + Duration::from_secs(10);
         while !snapshot.exists() {
@@ -309,7 +309,7 @@ fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
         }
         // Journaled after the snapshot's anchor, or at worst inside a
         // later one: either way, the tail replay has work to do.
-        exchange(&mut stream, 3, &after);
+        exchange(&mut stream, &after);
     }
     server.stop();
 
@@ -320,7 +320,7 @@ fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
     let server = start_server_in(tmp.path());
     let mut stream = connect_authenticated(server.addr, &trader_key());
     let sent = bytes(MAX_PAYLOAD, 4);
-    let (tag, back) = exchange(&mut stream, 1, &sent);
+    let (tag, back) = exchange(&mut stream, &sent);
     assert_eq!((tag, back), (TAG_RESP_ECHO, sent.clone()));
     drop(stream);
     server.stop();

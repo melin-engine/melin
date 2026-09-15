@@ -140,20 +140,20 @@ fn full_round_trip() {
 
     // --- Increment by 10 ---
     let ack = node
-        .request_one(1, TAG_INCREMENT, &10u64.to_le_bytes())
+        .request_one(TAG_INCREMENT, &10u64.to_le_bytes())
         .expect("increment");
     assert_eq!(ack[0], TAG_RESP_ACK);
     assert_eq!(value_of(&ack), 10);
 
     // --- Increment by 32 ---
     let ack = node
-        .request_one(2, TAG_INCREMENT, &32u64.to_le_bytes())
+        .request_one(TAG_INCREMENT, &32u64.to_le_bytes())
         .expect("increment");
     assert_eq!(ack[0], TAG_RESP_ACK);
     assert_eq!(value_of(&ack), 42);
 
     // --- GetValue query ---
-    let value = node.request_one(3, TAG_GET_VALUE, &[]).expect("query");
+    let value = node.request_one(TAG_GET_VALUE, &[]).expect("query");
     assert_eq!(value[0], TAG_RESP_VALUE);
     assert_eq!(value_of(&value), 42);
 
@@ -170,7 +170,7 @@ fn second_connection_sees_persisted_state() {
     {
         let mut node = connect_authenticated(addr, &key);
         let ack = node
-            .request_one(1, TAG_INCREMENT, &100u64.to_le_bytes())
+            .request_one(TAG_INCREMENT, &100u64.to_le_bytes())
             .expect("increment");
         assert_eq!(value_of(&ack), 100);
     }
@@ -178,7 +178,7 @@ fn second_connection_sees_persisted_state() {
     // Second connection: query — should see 100 (state survives connections).
     {
         let mut node = connect_authenticated(addr, &key);
-        let value = node.request_one(1, TAG_GET_VALUE, &[]).expect("query");
+        let value = node.request_one(TAG_GET_VALUE, &[]).expect("query");
         assert_eq!(value[0], TAG_RESP_VALUE);
         assert_eq!(value_of(&value), 100);
     }

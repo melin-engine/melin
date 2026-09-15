@@ -15,7 +15,6 @@
 //!   [sequence:u64]
 //!   [timestamp_ns:u64]
 //!   [key_hash:u64]
-//!   [request_seq:u64]
 //!   [event_tag:u8]
 //!   [event_payload: length - ENTRY_META_SIZE bytes]
 //! ```
@@ -89,7 +88,6 @@ struct SlotHeader {
     sequence: U64,
     timestamp_ns: U64,
     key_hash: U64,
-    request_seq: U64,
     event_tag: u8,
 }
 
@@ -103,7 +101,7 @@ const SLOT_HEADER_LEN: usize = core::mem::size_of::<SlotHeader>();
 // break compatibility with peers running the previous build, so we fail the
 // compile instead.
 const _: () = assert!(FRAME_HEADER_LEN == 7);
-const _: () = assert!(SLOT_HEADER_LEN == 35);
+const _: () = assert!(SLOT_HEADER_LEN == 27);
 const _: () = assert!(core::mem::size_of::<BatchPreamble>() == 3);
 
 // --- Streaming encode (used by the journal stage on the hot path) ---
@@ -177,7 +175,6 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
     header.sequence = U64::new(seq);
     header.timestamp_ns = U64::new(slot.timestamp_ns);
     header.key_hash = U64::new(slot.key_hash);
-    header.request_seq = U64::new(slot.request_seq);
     header.event_tag = tag;
 }
 
@@ -292,7 +289,6 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
         slots.push(InputSlot {
             connection_id: 0,
             key_hash: header.key_hash.get(),
-            request_seq: header.request_seq.get(),
             sequence: header.sequence.get(),
             timestamp_ns: header.timestamp_ns.get(),
             event,
@@ -391,7 +387,6 @@ mod tests {
         InputSlot {
             connection_id: 0,
             key_hash: 0xabcd_ef00_1234_5678,
-            request_seq: 9_999,
             sequence,
             timestamp_ns: 1_700_000_000_000_000_000,
             event,
@@ -420,7 +415,6 @@ mod tests {
             assert_eq!(dec.sequence, orig.sequence);
             assert_eq!(dec.timestamp_ns, orig.timestamp_ns);
             assert_eq!(dec.key_hash, orig.key_hash);
-            assert_eq!(dec.request_seq, orig.request_seq);
             assert_eq!(dec.connection_id, 0);
         }
 
@@ -507,10 +501,10 @@ mod tests {
 
         // Well-formed 7-byte header but wrong message type.
         let mut wrong_type = Vec::new();
-        wrong_type.extend_from_slice(&36u32.to_le_bytes()); // length
+        wrong_type.extend_from_slice(&28u32.to_le_bytes()); // length
         wrong_type.push(0xFF); // not MSG_INPUT_BATCH
         wrong_type.extend_from_slice(&1u16.to_le_bytes()); // count
-        wrong_type.extend_from_slice(&[0u8; 35]); // slot header
+        wrong_type.extend_from_slice(&[0u8; SLOT_HEADER_LEN]); // slot header
         assert!(peek_first_sequence(&wrong_type).is_err());
 
         // count=0 frame carries no first slot to peek.
@@ -520,7 +514,7 @@ mod tests {
 
         // Header claims a slot but the bytes are truncated before it.
         let mut truncated = Vec::new();
-        truncated.extend_from_slice(&36u32.to_le_bytes());
+        truncated.extend_from_slice(&28u32.to_le_bytes());
         truncated.push(MSG_INPUT_BATCH);
         truncated.extend_from_slice(&1u16.to_le_bytes());
         // no slot header bytes
@@ -617,7 +611,6 @@ mod tests {
         let slot = InputSlot::<TestEvent> {
             connection_id: 0,
             key_hash: 0x0807_0605_0403_0201,
-            request_seq: 0x1817_1615_1413_1211,
             sequence: 0x2827_2625_2423_2221,
             timestamp_ns: 0x3837_3635_3433_3231,
             event: JournalEvent::Tick {
@@ -630,26 +623,25 @@ mod tests {
         let mut buf = Vec::new();
         encode_input_batch(&[slot], &mut buf);
 
-        // Total = FrameHeader(7) + SlotHeader(35) + Tick payload(8) = 50.
-        // FrameHeader.length = total - 4 (the length field itself) = 46 = 0x2E.
-        // SlotHeader.length = ENTRY_META_SIZE(17) + payload(8) = 25 = 0x19.
+        // Total = FrameHeader(7) + SlotHeader(27) + Tick payload(8) = 42.
+        // FrameHeader.length = total - 4 (the length field itself) = 38 = 0x26.
+        // SlotHeader.length = ENTRY_META_SIZE(9) + payload(8) = 17 = 0x11.
         let expected: &[u8] = &[
             // FrameHeader: length(u32) + type(u8) + count(u16)
-            0x2E, 0x00, 0x00, 0x00, // length = 46
+            0x26, 0x00, 0x00, 0x00, // length = 38
             0x21, // MSG_INPUT_BATCH
             0x01, 0x00, // count = 1
             // SlotHeader: length(u16) + sequence(u64) + timestamp_ns(u64)
-            //           + key_hash(u64) + request_seq(u64) + event_tag(u8)
-            0x19, 0x00, // length = 25 (matches journal's length: 17 + 8)
+            //           + key_hash(u64) + event_tag(u8)
+            0x11, 0x00, // length = 17 (matches journal's length: 9 + 8)
             0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // sequence
             0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // timestamp_ns
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // key_hash
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // request_seq
             0x03, // SLOT_TAG_TICK
             // Tick payload: now_ns(u64)
             0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
         ];
         assert_eq!(buf, expected, "wire format byte layout must not change");
-        assert_eq!(buf.len(), 50);
+        assert_eq!(buf.len(), 42);
     }
 }

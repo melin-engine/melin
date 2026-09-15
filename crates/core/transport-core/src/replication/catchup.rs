@@ -1250,7 +1250,6 @@ mod drain_into_contiguity_tests {
         InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: seq,
             sequence: seq,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent::Add(seq)),

@@ -109,8 +109,9 @@ pub const MAX_PAYLOAD: usize = 288;
 // either is a compile error naming the reason. The journal's bound is
 // checked the same way by the journal itself, from `MAX_ENCODED_SIZE`.
 const _: () = assert!(
-    8 + 1 + MAX_PAYLOAD <= melin_server_runtime::MAX_FRAME_SIZE,
-    "a request (sequence, tag, payload) must fit one client frame"
+    // Strictly less: the tag byte takes the frame's remaining byte.
+    MAX_PAYLOAD < melin_server_runtime::MAX_FRAME_SIZE,
+    "a request (tag, payload) must fit one client frame"
 );
 const _: () = assert!(
     4 + 1 + MAX_PAYLOAD <= melin_server_runtime::MAX_RESPONSE_BUF,
@@ -307,7 +308,7 @@ impl AppFactory for EchoFactory {
 /// Decodes length-prefixed client frames into `Payload`.
 ///
 /// Wire format (after the 4-byte length prefix is stripped by the runtime):
-///   `[request_seq: u64][tag: u8][bytes: the rest of the frame]`
+///   `[tag: u8][bytes: the rest of the frame]`
 ///
 /// The payload needs no length of its own: the frame is already
 /// length-prefixed, so whatever follows the tag is the payload.
@@ -317,14 +318,9 @@ impl RequestDecoderTrait for RequestDecoder {
     type Event = Payload;
 
     fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<Payload> {
-        // seq(8) + tag(1) = minimum 9 bytes
-        if bytes.len() < 9 {
+        let Some((&tag, body)) = bytes.split_first() else {
             return Decoded::DecodeError("frame too short");
-        }
-
-        let request_seq = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
-        let tag = bytes[8];
-        let body = &bytes[9..];
+        };
 
         match tag {
             TAG_ECHO => {
@@ -335,7 +331,7 @@ impl RequestDecoderTrait for RequestDecoder {
                     return Decoded::PermissionDenied("echoing requires a writing role");
                 }
                 match Payload::new(body) {
-                    Some(event) => Decoded::Permitted { request_seq, event },
+                    Some(event) => Decoded::Permitted(event),
                     None => Decoded::DecodeError("payload longer than MAX_PAYLOAD"),
                 }
             }
@@ -412,10 +408,9 @@ mod tests {
         }
     }
 
-    /// `[request_seq][tag][body]` as a client would send it.
-    fn request(seq: u64, tag: u8, body: &[u8]) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(9 + body.len());
-        frame.extend_from_slice(&seq.to_le_bytes());
+    /// `[tag][body]` as a client would send it.
+    fn request(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(1 + body.len());
         frame.push(tag);
         frame.extend_from_slice(body);
         frame
@@ -532,11 +527,8 @@ mod tests {
             Permission::Trader,
             Permission::Custodian,
         ] {
-            match RequestDecoder.decode(&request(7, TAG_ECHO, b"hi"), permission) {
-                Decoded::Permitted { request_seq, event } => {
-                    assert_eq!(request_seq, 7);
-                    assert_eq!(event, payload(b"hi"));
-                }
+            match RequestDecoder.decode(&request(TAG_ECHO, b"hi"), permission) {
+                Decoded::Permitted(event) => assert_eq!(event, payload(b"hi")),
                 _ => panic!("expected Permitted for {permission:?}"),
             }
         }
@@ -547,7 +539,7 @@ mod tests {
         for permission in [Permission::ReadOnly, Permission::Replication] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(&request(1, TAG_ECHO, b"hi"), permission),
+                    RequestDecoder.decode(&request(TAG_ECHO, b"hi"), permission),
                     Decoded::PermissionDenied(_)
                 ),
                 "{permission:?} must not be able to echo"
@@ -559,8 +551,8 @@ mod tests {
     fn the_payload_is_the_rest_of_the_frame() {
         for len in [0, 3, MAX_PAYLOAD] {
             let bytes = vec![0x5A; len];
-            match RequestDecoder.decode(&request(1, TAG_ECHO, &bytes), Permission::Trader) {
-                Decoded::Permitted { event, .. } => assert_eq!(event.as_bytes(), bytes),
+            match RequestDecoder.decode(&request(TAG_ECHO, &bytes), Permission::Trader) {
+                Decoded::Permitted(event) => assert_eq!(event.as_bytes(), bytes),
                 _ => panic!("expected Permitted for {len} bytes"),
             }
         }
@@ -570,15 +562,15 @@ mod tests {
     fn decoder_refuses_what_it_cannot_carry() {
         let too_long = vec![0; MAX_PAYLOAD + 1];
         assert!(matches!(
-            RequestDecoder.decode(&request(1, TAG_ECHO, &too_long), Permission::Trader),
+            RequestDecoder.decode(&request(TAG_ECHO, &too_long), Permission::Trader),
             Decoded::DecodeError(_)
         ));
         assert!(matches!(
-            RequestDecoder.decode(&request(1, TAG_ECHO, b"")[..8], Permission::Trader),
+            RequestDecoder.decode(&[], Permission::Trader),
             Decoded::DecodeError("frame too short")
         ));
         assert!(matches!(
-            RequestDecoder.decode(&request(1, 0x7F, b""), Permission::Trader),
+            RequestDecoder.decode(&request(0x7F, b""), Permission::Trader),
             Decoded::DecodeError("unknown tag")
         ));
     }
@@ -587,7 +579,7 @@ mod tests {
     fn decoder_filters_transport_tags() {
         // TAG_RESPONSE_HEARTBEAT
         assert!(matches!(
-            RequestDecoder.decode(&request(0, 0x01, b""), Permission::Trader),
+            RequestDecoder.decode(&request(0x01, b""), Permission::Trader),
             Decoded::Filter
         ));
     }
