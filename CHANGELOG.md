@@ -12,6 +12,27 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Changed
+
+- **`MatchingStage::new` no longer takes the replica count, and
+  `OutputSlot` loses `durability_bypass`.** The matching stage applies
+  every event it is given; halting is the readers' job (see Fixed).
+  `spawn_reader`, `run_dpdk_poll`, `dpdk_response::run` and
+  `response::Response` take the new halt gate and refusal queue from
+  `melin_server_runtime::halt`. Application traits are unchanged.
+
+### Fixed
+
+- **A write refused while halted was replayed.** A primary with no replica
+  attached, or superseded by a newer one, rejected client writes in the
+  matching stage — after the journal stage, running beside it, had already
+  recorded them. The client was told the write failed, yet the next replay,
+  a replica catching up, or a promoted node applied it. The node now
+  refuses writes before publishing them, so a refused write is never
+  journaled. The rejection is unchanged on the wire and still skips the ack
+  policy, but now waits for the replies to the client's earlier requests,
+  so replies stay in request order.
+
 ## [0.16.0] - 2026-09-14
 
 ### Added

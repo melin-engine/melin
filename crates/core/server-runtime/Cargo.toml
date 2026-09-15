@@ -94,3 +94,6 @@ melin-journal = { workspace = true, features = ["test-utils"] }
 # metrics snapshot alone cannot show the vote traffic that led there.
 tracing-subscriber = { workspace = true }
 melin-transport-core = { workspace = true, features = ["test-utils"] }
+# The client side of the wire protocol, for integration tests that talk to
+# a node the way a customer's client does.
+melin-client = { workspace = true }

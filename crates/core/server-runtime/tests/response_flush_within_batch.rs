@@ -16,17 +16,19 @@
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use melin_app::encoder::ResponseEncoder;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_pipeline::padding::CachePadded;
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::ControlEvent;
 use melin_server_runtime::ack_policy::AckPolicy;
+use melin_server_runtime::halt;
 use melin_server_runtime::response::{self, Response};
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
@@ -180,6 +182,8 @@ fn large_frame_batch_is_delivered_not_disconnected() {
         encoder: Arc::new(PadEncoder),
         fence_state: Arc::new(FenceState::new(0)),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // No reader: nothing is ever refused.
+        refusals: halt::refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1,
     };
 
     thread::scope(|scope| {

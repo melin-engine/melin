@@ -59,6 +59,7 @@ use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};
 
 use crate::dpdk_response::{ControlEvent, TxFrame};
+use crate::halt::{HaltGate, RefusalSender};
 
 use crate::client_frames::MAX_FRAME_SIZE;
 
@@ -125,6 +126,10 @@ pub fn run_dpdk_poll<A: Application>(
     mut transport: DpdkTransport,
     mut producer: ring::Producer<InputSlot<A::Event>>,
     decoder: Arc<dyn RequestDecoder<Event = A::Event>>,
+    // While it refuses writes, they are answered through `refusals`
+    // instead of published — see `crate::halt`.
+    halt: HaltGate,
+    mut refusals: RefusalSender<A::Report>,
     control_tx: mpsc::Sender<ControlEvent>,
     mut tx_rx: melin_pipeline::spsc::Consumer<TxFrame>,
     shutdown: &AtomicBool,
@@ -579,13 +584,15 @@ pub fn run_dpdk_poll<A: Application>(
                 AuthState::Authenticated { permission } => {
                     use crate::client_frames::{FrameAction, process_client_frames};
                     let permission = *permission;
-                    let action = process_client_frames(
+                    let action = process_client_frames::<A>(
                         &mut conn.parse_buf,
                         conn.connection_id.0,
                         conn.key_hash,
                         permission,
                         &mut producer,
                         &*decoder,
+                        &halt,
+                        &mut refusals,
                         *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
                         recv_ts,
                         #[cfg(feature = "latency-trace")]

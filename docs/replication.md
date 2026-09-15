@@ -159,13 +159,22 @@ policy swap below.
 
 ### Trading halts when all replicas disconnect
 
-Independent of the ack gate, the matching engine halts when **every**
-configured replica disconnects. New client orders are rejected with a
-`ReplicaDisconnected` reason code immediately — clients see the halt
-reason rather than a TCP read timeout. The rejection bypasses the ack
-gate because no engine state changed: replicas will deterministically
-produce the same rejection when they replay the same input on
-reconnect.
+Independent of the ack gate, the node halts when **every** configured
+replica disconnects. New client writes are refused with a
+`ReplicaDisconnected` reason code — clients see the halt reason rather
+than a TCP read timeout — while queries keep answering. A refused write
+never enters the pipeline: it is not applied, not journaled, and not
+replicated, so no replay or failover can bring it back. Its rejection does
+not wait on the ack policy, but it does keep its place on the connection:
+it goes out after the replies to the client's earlier requests.
+
+Writes the node accepted just before the halt are applied as usual, and
+their replies wait on the ack policy like any other — sent once a replica
+is back (or an operator relaxes the policy), never if the node is
+superseded instead.
+
+A node superseded by a newer primary refuses writes the same way, with the
+`Superseded` reason code.
 
 Standalone deployments (no replication configured) skip this halt
 entirely and run under `disk`.

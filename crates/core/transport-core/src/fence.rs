@@ -13,8 +13,8 @@
 //! handshake, in either direction) has been superseded by a newer primary
 //! and must stop acting as one. That observation latches
 //! [`FenceState`](crate::fence::FenceState)
-//! into the *fenced* state, which the matching stage (halt) and response
-//! stage (ack gate) read to stop accepting and acknowledging client work.
+//! into the *fenced* state, which the readers (halt) and response stage
+//! (ack gate) read to stop accepting and acknowledging client work.
 //! The latch is one-way: once fenced, the node stays fenced until the
 //! process is restarted as a replica by the operator (the manual-failover
 //! "hard halt"; auto-rejoin is a separate roadmap item).
@@ -22,12 +22,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Shared, lock-free fencing state. One instance per node, wrapped in an
-/// `Arc` and handed to the matching stage, the response stage, and the
-/// replication sender/receiver threads.
+/// `Arc` and handed to the readers, the matching stage, the response
+/// stage, and the replication sender/receiver threads.
 ///
 /// `AtomicU64` + `AtomicBool` (rather than a `Mutex`) because the epoch is
 /// read on the replication handshake path and the fenced flag is folded
-/// into the matching stage's per-batch halt check — both want a single
+/// into the readers' per-receive halt check — both want a single
 /// relaxed load with no contention. `align(64)` keeps the (read-mostly)
 /// pair on its own cache line so an unrelated write-hot heap neighbour
 /// can't turn those polls into coherence misses — same insurance the
@@ -73,8 +73,8 @@ impl FenceState {
         prev.max(epoch)
     }
 
-    /// True once the node has been fenced. Folded into the matching
-    /// stage's per-batch halt check, so it must be a single relaxed load.
+    /// True once the node has been fenced. Folded into the readers'
+    /// per-receive halt check, so it must be a single relaxed load.
     #[inline]
     pub fn is_fenced(&self) -> bool {
         self.fenced.load(Ordering::Relaxed)

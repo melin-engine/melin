@@ -364,8 +364,9 @@ impl HealthSnapshot {
         // Trading state: "trading" when standalone or at least one replica
         // connected, "halted" when replication is enabled but all replicas
         // are disconnected — or when the node has been fenced (superseded
-        // by a higher-epoch primary). Mirrors the matching stage's
-        // `is_halted()` so probes agree with what the engine enforces.
+        // by a higher-epoch primary). Mirrors the readers' halt gate
+        // (`HaltGate` in the server runtime) so probes agree with what the
+        // node enforces.
         let fenced = state.fence_state.as_ref().is_some_and(|f| f.is_fenced());
         let trading = !fenced
             && state
