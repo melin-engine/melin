@@ -63,6 +63,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   exits on shutdown. The reply it was holding is dropped, as it would be
   by a crash: the policy never confirmed it, and the client reconciles on
   reconnect.
+- **A request refused as a duplicate could reach a snapshot.** A duplicate is
+  still journaled, and while the live engine refused it, the stage that keeps
+  the copy snapshots are written from applied it anyway. Recovering from such
+  a snapshot — on restart, or on a replica bootstrapped by snapshot transfer —
+  therefore held the effect of a request whose client was told it was
+  rejected. Replaying the journal refused the duplicate but still advanced the
+  application's clock for it, firing time-driven tasks at a point the primary
+  never did. Both now refuse a duplicate exactly as the live engine does. Only
+  an application that enforces request sequences is affected.
 
 ## [0.16.0] - 2026-09-14
 
