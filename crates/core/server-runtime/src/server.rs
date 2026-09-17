@@ -35,10 +35,10 @@ use melin_transport_core::pipeline::{
 /// through `melin_transport_core::pipeline`.
 type Pipeline<A> = GenericPipeline<A>;
 
+use crate::StartupEvents;
 use crate::reader::RequestDecoderArc;
 use crate::response::ResponseEncoderArc;
 use melin_app::Application;
-use melin_app::app_factory::AppFactory;
 use melin_app::auth::AuthorizedKeys;
 use melin_app::auth::Permission;
 use melin_app::decoder::RequestDecoder;
@@ -176,13 +176,6 @@ pub struct ServerConfig {
     /// reached. 0 means unlimited. Prevents fd/memory exhaustion (SEC-02).
     #[arg(long, default_value_t = 1024)]
     pub max_connections: u64,
-    /// Number of accounts to seed on first startup. Uses the
-    /// ProvisionAccount event for O(accounts) seeding (~0.5s for 1M).
-    #[arg(long, default_value_t = 100_000)]
-    pub accounts: u32,
-    /// Number of instruments to seed on first startup.
-    #[arg(long, default_value_t = 100)]
-    pub instruments: u32,
     /// Path to the authorized keys file for Ed25519 challenge-response
     /// authentication. Every connection must authenticate before trading.
     /// Required for primary mode; ignored in replica mode (--replica-of).
@@ -537,8 +530,6 @@ impl Default for ServerConfig {
             heartbeat_interval_secs: 10,
             connection_timeout_secs: 30,
             max_connections: 1024,
-            accounts: 2,
-            instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
             journal_staging_mode: JournalStagingMode::ZeroFill,
@@ -641,14 +632,18 @@ impl ServerConfig {
 /// and enters the pipeline loop. This is the main entry point for
 /// application binaries.
 ///
+/// The application starts from `A::default()` on every node; `startup`
+/// is what the node journals on top of that as it becomes primary — see
+/// [`StartupEvents`].
+///
 /// For callers that need a pre-bound listener or an externally
 /// controlled shutdown flag (e.g. benchmarks), use
 /// [`run_with_listener`] instead.
-pub fn run<A, F, D, E>(
+pub fn run<A>(
     config: ServerConfig,
-    factory: F,
-    decoder: D,
-    encoder: E,
+    startup: StartupEvents<A::Event>,
+    decoder: impl RequestDecoder<Event = A::Event> + 'static,
+    encoder: impl ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
     event_publisher: Option<EventPublisherFn<A>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -656,9 +651,6 @@ where
     A::Event: Send + Sync + 'static,
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
-    F: AppFactory<App = A> + 'static,
-    D: RequestDecoder<Event = A::Event> + 'static,
-    E: ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
 {
     // Before anything pins a thread or initialises DPDK, whose EAL can
     // narrow this thread to one lcore: the CPU set captured here is what
@@ -673,9 +665,9 @@ where
 
     #[cfg(feature = "dpdk")]
     {
-        run_dpdk(
+        run_dpdk::<A>(
             config,
-            Arc::new(factory),
+            startup,
             Arc::new(decoder),
             Arc::new(encoder),
             event_publisher,
@@ -686,10 +678,10 @@ where
     #[cfg(not(feature = "dpdk"))]
     {
         let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
-        run_tcp(
+        run_tcp::<A, _>(
             listener,
             config,
-            Arc::new(factory),
+            startup,
             Arc::new(decoder),
             Arc::new(encoder),
             event_publisher,
@@ -706,12 +698,12 @@ where
 ///
 /// Set `shutdown` to `true` to trigger a clean shutdown of all
 /// pipeline threads.
-pub fn run_with_listener<A, L, F, D, E>(
-    listener: L,
+pub fn run_with_listener<A>(
+    listener: impl BlockingTransportListener,
     config: ServerConfig,
-    factory: F,
-    decoder: D,
-    encoder: E,
+    startup: StartupEvents<A::Event>,
+    decoder: impl RequestDecoder<Event = A::Event> + 'static,
+    encoder: impl ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
     event_publisher: Option<EventPublisherFn<A>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -720,18 +712,14 @@ where
     A::Event: Send + Sync + 'static,
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
-    L: BlockingTransportListener,
-    F: AppFactory<App = A> + 'static,
-    D: RequestDecoder<Event = A::Event> + 'static,
-    E: ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
 {
     // As in `run`: the CPU set unpinned threads run on, captured before
     // anything pins a thread.
     melin_app::affinity::capture_home_mask();
-    run_tcp(
+    run_tcp::<A, _>(
         listener,
         config,
-        Arc::new(factory),
+        startup,
         Arc::new(decoder),
         Arc::new(encoder),
         event_publisher,
@@ -742,7 +730,7 @@ where
 fn run_tcp<A, L>(
     listener: L,
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = A>>,
+    startup: StartupEvents<A::Event>,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -758,7 +746,7 @@ where
     run_impl::<A, L>(
         listener,
         config,
-        factory,
+        startup,
         decoder,
         encoder,
         event_publisher,
@@ -826,7 +814,7 @@ fn log_layout(cores: &PipelineCores) {
 fn run_impl<A, L>(
     listener: L,
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = A>>,
+    mut startup: StartupEvents<A::Event>,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -883,6 +871,10 @@ where
     // the primary's segment lineage during the replication handshake.
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode");
+        // A replica receives the genesis events in the primary's history
+        // and never journals its own, promoted or not — nothing to hold
+        // them for, and a large genesis is worth freeing.
+        startup.genesis = Vec::new();
 
         // Load replication signing key.
         let replication_key_path = config.replication_key.as_ref().ok_or_else(|| {
@@ -1024,7 +1016,6 @@ where
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
-            Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
@@ -1057,7 +1048,7 @@ where
                     listener,
                     repl_listener,
                     &config,
-                    &*factory,
+                    startup,
                     decoder,
                     encoder,
                     event_publisher,
@@ -1102,9 +1093,9 @@ where
         .transpose()?;
 
     // Initialize or recover the app. `needs_seeding` is true on first
-    // startup — seed events will flow through the pipeline later.
+    // startup — the genesis events will flow through the pipeline later.
     let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, BufferedWriter<A::Event>>(&config, &*factory)?;
+        init_engine::<A, BufferedWriter<A::Event>>(&config)?;
 
     // Pre-fault any application-owned memory (slabs, indices) so page
     // faults happen now, not on the hot path. Default trait impl is a
@@ -1154,7 +1145,7 @@ where
         listener,
         repl_listener,
         &config,
-        &*factory,
+        startup,
         decoder,
         encoder,
         event_publisher,
@@ -1216,8 +1207,8 @@ fn load_replication_key(
 }
 
 /// Run the server as a primary: build the disruptor pipeline, spawn
-/// pipeline threads, optionally seed instruments/accounts, then accept
-/// client connections.
+/// pipeline threads, journal the application's startup events, then
+/// accept client connections.
 ///
 /// Control event for the response stage. The io_uring response path reads
 /// `fd` for I/O; the `writer` keeps the fd alive via ownership.
@@ -1325,7 +1316,7 @@ fn run_as_primary<A, L>(
     // and held from boot on replicas so a promotion cannot fail on it.
     repl_listener: Option<crate::replication::ReplicationListener>,
     config: &ServerConfig,
-    factory: &dyn AppFactory<App = A>,
+    startup: StartupEvents<A::Event>,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -1458,10 +1449,10 @@ where
     let connection_timeout = config.connection_timeout();
     let heartbeat_interval = config.heartbeat_interval();
 
-    // Seed events flow through the disruptor like regular events so they're
-    // journaled, replicated, and processed by the matching engine via the
-    // normal pipeline. The input ring is single-producer: main publishes
-    // seeds through `input_producer`, then moves it into the reader thread
+    // Startup events flow through the disruptor like regular events so
+    // they're journaled, replicated, and processed by the matching engine via
+    // the normal pipeline. The input ring is single-producer: main publishes
+    // them through `input_producer`, then moves it into the reader thread
     // which becomes the sole steady-state producer. No cloning required.
     let mut input_producer = input_producer;
 
@@ -1741,16 +1732,6 @@ where
         fence_state.epoch(),
     )?;
 
-    // Seed instruments and accounts through the pipeline on first startup.
-    // Events flow through journal + matching + replication like regular
-    // trading events. Must happen after pipeline threads start (they
-    // consume from the disruptor) but before accepting client connections.
-    //
-    // When replication is enabled, wait for the first replica to connect
-    // before publishing. replica_ready is set by the replica handler
-    // thread after catch-up completes and it enters the live streaming
-    // loop — this ensures the ring consumer is actively draining before
-    // seeds start flowing.
     // Spawn the health endpoint BEFORE the wait-for-replica gate so
     // operators (and the failover test harness) can probe `/healthz`
     // to confirm the server has bound its sockets and is ready to
@@ -1780,123 +1761,6 @@ where
         &shutdown,
         &raft_status,
     )?;
-
-    if enable_replication && needs_seeding {
-        info!("waiting for replica to connect before seeding...");
-        while !replica_ready.load(Ordering::Acquire) {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-    if needs_seeding {
-        use melin_app::unix_epoch_nanos;
-        use melin_journal::JournalEvent;
-        use melin_transport_core::trace::mono_trace_ns;
-
-        let seed_start = std::time::Instant::now();
-        let seed_events = factory.seed_events();
-        let seed_count = seed_events.len();
-
-        // `sequence: 0` — the journal stage allocates sequences in
-        // disruptor cursor order at encode time. The factory yields
-        // the application-shaped events; the runtime wraps each as
-        // `JournalEvent::App` and stamps transport-level metadata.
-        let mut last_published_seq = 0u64;
-        for event in seed_events {
-            last_published_seq = input_producer.publish(InputSlot {
-                connection_id: 0,
-                key_hash: 0,
-                request_seq: 0,
-                sequence: 0,
-                timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(event),
-                publish_ts: mono_trace_ns(),
-                recv_ts: mono_trace_ns(),
-            });
-        }
-        let publish_elapsed = seed_start.elapsed();
-
-        // Wait for all seed events to be fully processed by the pipeline
-        // before accepting clients. Without this, early client orders
-        // compete with seed events for pipeline time, contaminating
-        // benchmark results.
-        //
-        // Gates on journal + matching cursors (disruptor sequence space),
-        // then waits for the replication ring to be fully consumed. This
-        // confirms sender threads have read all seed batches from the ring
-        // (sent or being sent to replicas). Stronger than no gate, faster
-        // than waiting for replica TCP acks, and deadlock-free because the
-        // ring backpressures instead of dropping batches.
-        //
-        // Skip the drain entirely when the factory produced no seed events —
-        // `last_published_seq` is still 0 (no events on the ring) and the
-        // cursor will never advance past it.
-        let drain_start = std::time::Instant::now();
-        if seed_count > 0 {
-            let last_seed_seq = last_published_seq + 1; // cursor = next-to-consume
-
-            info!(
-                last_seed_seq,
-                journal = journal_cursor
-                    .get()
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                matching = matching_cursor
-                    .get()
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                "seed drain: waiting for pipeline cursors"
-            );
-
-            // Waits on the stage threads, which may share this thread's
-            // core on a small box — so through the wait strategy, never
-            // a bare spin.
-            ORCHESTRATOR_WAIT.wait_until(|| {
-                shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                    || (journal_cursor
-                        .get()
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        >= last_seed_seq
-                        && matching_cursor
-                            .get()
-                            .load(std::sync::atomic::Ordering::Acquire)
-                            >= last_seed_seq)
-            });
-
-            info!("seed drain: pipeline cursors reached target");
-
-            // After journal + matching are done, wait for each ACTIVE
-            // replication ring's consumer to have read all published batches.
-            // Inactive rings (no connected replica) were never published to,
-            // so their producer cursor is 0 — no wait needed.
-            if let Some(ref ring_progress) = replication_ring_progress {
-                for i in 0..ring_progress.producer_cursors.len() {
-                    if !ring_progress.active_flags[i].load(std::sync::atomic::Ordering::Relaxed) {
-                        continue;
-                    }
-                    let target = ring_progress.producer_cursors[i].load();
-                    ORCHESTRATOR_WAIT.wait_until(|| {
-                        shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                            || ring_progress.consumer_cursors[i]
-                                .get()
-                                .load(std::sync::atomic::Ordering::Acquire)
-                                >= target
-                    });
-                }
-            }
-
-            info!("seed drain: replication rings drained");
-        }
-        let drain_elapsed = drain_start.elapsed();
-
-        info!(
-            seed_events = seed_count,
-            publish_ms = publish_elapsed.as_millis(),
-            drain_ms = drain_elapsed.as_millis(),
-            total_ms = seed_start.elapsed().as_millis(),
-            "seeded application state through pipeline"
-        );
-    }
 
     // Promotion fencing: a node that reached primary via promotion injects
     // an `EpochBump` as the first journaled entry of its tenure, raising the
@@ -1961,6 +1825,41 @@ where
         ORCHESTRATOR_WAIT
             .wait_until(|| fence_state.epoch() >= new_epoch || shutdown.load(Ordering::Relaxed));
     }
+
+    // Startup events: genesis on a new journal, then `on_primary` — after
+    // the epoch bump on promotion, so the bump stays the first entry of
+    // the tenure. (Genesis and promotion never coincide: a promoted node
+    // has its history from the stream.)
+    //
+    // When replication is enabled, a new journal waits for the first
+    // replica to connect before publishing. replica_ready is set by the
+    // replica handler thread after catch-up completes and it enters the
+    // live streaming loop — this ensures the ring consumer is actively
+    // draining before a large genesis starts flowing. The health endpoint
+    // was spawned above so `/healthz` answers during the wait.
+    if enable_replication && needs_seeding {
+        info!("waiting for replica to connect before seeding...");
+        while !replica_ready.load(Ordering::Acquire) {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    let genesis = if needs_seeding {
+        startup.genesis
+    } else {
+        Vec::new()
+    };
+    journal_startup_events(
+        genesis,
+        startup.on_primary,
+        &mut input_producer,
+        &journal_cursor,
+        &matching_cursor,
+        &replication_ring_progress,
+        &shutdown,
+    );
 
     // Now that seeding is fully drained, spawn the reader thread. From here
     // on the reader is the sole producer on the input ring (the seed loop
@@ -2195,11 +2094,11 @@ where
 /// - Core 2:   Matching stage
 /// - Core 3:   Response stage (encodes to TX channel)
 ///
-/// See [`run`] for the role of `factory`.
+/// See [`run`] for the role of `startup`.
 #[cfg(feature = "dpdk")]
 fn run_dpdk<A>(
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = A>>,
+    startup: StartupEvents<A::Event>,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -2215,7 +2114,7 @@ where
 
     run_dpdk_impl::<A>(
         config,
-        factory,
+        startup,
         decoder,
         encoder,
         event_publisher,
@@ -2281,7 +2180,7 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String
 #[cfg(feature = "dpdk")]
 fn run_dpdk_impl<A>(
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = A>>,
+    mut startup: StartupEvents<A::Event>,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -2330,6 +2229,8 @@ where
     // outbound connection to the primary.
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode (DPDK)");
+        // As on the kernel-TCP path: a replica never journals genesis.
+        startup.genesis = Vec::new();
 
         // Load authorized keys early — the admin listener needs them for
         // Ed25519 challenge-response auth (operator keys only).
@@ -2476,7 +2377,6 @@ where
             config.journal_staging_mode.into(),
             config.group_commit_delay(),
             config.replication_pipeline_depth,
-            Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
@@ -2515,7 +2415,7 @@ where
                     listener,
                     repl_listener,
                     &config,
-                    &*factory,
+                    startup,
                     decoder,
                     encoder,
                     event_publisher,
@@ -2563,7 +2463,7 @@ where
 
     // Initialize or recover the exchange.
     let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, BufferedWriter<A::Event>>(&config, &*factory)?;
+        init_engine::<A, BufferedWriter<A::Event>>(&config)?;
     <A as Application>::prefault(&mut exchange);
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.
@@ -2957,70 +2857,24 @@ where
     // a meaningful operational cost). The kernel-TCP path still has its
     // own gate via the spawned `repl-accept` thread which can accept
     // replicas independently of seeding; this only changes DPDK behavior.
+    //
+    // A DPDK primary is never a promoted one (promotion falls back to the
+    // kernel-TCP primary), so there is no epoch bump to order against.
     let _ = (&enable_replication, &replica_ready); // suppress unused warnings on non-DPDK paths
-    if needs_seeding {
-        use melin_app::unix_epoch_nanos;
-        use melin_journal::JournalEvent;
-        use melin_transport_core::trace::mono_trace_ns;
-
-        let seed_events = factory.seed_events();
-        let seed_count = seed_events.len();
-
-        // `sequence: 0` — the journal stage allocates sequences in
-        // disruptor cursor order at encode time.
-        let mut last_published_seq = 0u64;
-        for event in seed_events {
-            last_published_seq = input_producer.publish(InputSlot {
-                connection_id: 0,
-                key_hash: 0,
-                request_seq: 0,
-                sequence: 0,
-                timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(event),
-                publish_ts: mono_trace_ns(),
-                recv_ts: mono_trace_ns(),
-            });
-        }
-
-        // Wait for seeding to complete through journal + matching stages,
-        // then wait for the replication ring to drain. See TCP path comment.
-        // Skip when the factory produced no seed events — nothing on the ring.
-        if seed_count > 0 {
-            let last_seed_seq = last_published_seq + 1;
-            ORCHESTRATOR_WAIT.wait_until(|| {
-                shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                    || (journal_cursor
-                        .get()
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        >= last_seed_seq
-                        && matching_cursor
-                            .get()
-                            .load(std::sync::atomic::Ordering::Acquire)
-                            >= last_seed_seq)
-            });
-            if let Some(ref ring_progress) = replication_ring_progress {
-                for i in 0..ring_progress.producer_cursors.len() {
-                    if !ring_progress.active_flags[i].load(std::sync::atomic::Ordering::Relaxed) {
-                        continue;
-                    }
-                    let target = ring_progress.producer_cursors[i].load();
-                    ORCHESTRATOR_WAIT.wait_until(|| {
-                        shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                            || ring_progress.consumer_cursors[i]
-                                .get()
-                                .load(std::sync::atomic::Ordering::Acquire)
-                                >= target
-                    });
-                }
-            }
-        }
-
-        info!(
-            accounts = config.accounts,
-            instruments = config.instruments,
-            "seeded test data through pipeline"
-        );
-    }
+    let genesis = if needs_seeding {
+        startup.genesis
+    } else {
+        Vec::new()
+    };
+    journal_startup_events(
+        genesis,
+        startup.on_primary,
+        &mut input_producer,
+        &journal_cursor,
+        &matching_cursor,
+        &replication_ring_progress,
+        &shutdown,
+    );
 
     // Note: the DPDK poll threads are spawned BELOW, after this seed-drain
     // block. That ordering is what keeps the input ring single-producer
@@ -3110,19 +2964,103 @@ where
     )
 }
 
-// The `apply_max_orders` / `empty_app` / `empty_app_for_seed` helpers
-// that used to live here have moved behind the `AppFactory` trait —
-// see `melin_server::ExchangeAppFactory`. The runtime
-// reaches them through the `factory: &dyn AppFactory<App = A>`
-// parameter threaded into [`init_engine`], [`run_as_primary`], and
-// the replication receivers; the binary passes a single
-// `Arc<dyn AppFactory<App = A>>` into [`run`] / [`run_dpdk`] at
-// startup and the runtime clones it on each call.
-//
-// SEC-03 (per-account open-order cap) and SEC-04 (order-submission
-// rate limit) live in `Exchange` state but are operator policy, not
-// journaled — primary and replicas must converge on them via
-// matching factory configuration rather than replay.
+/// Journal a primary's [`StartupEvents`] — `genesis` (empty unless the
+/// journal is new), then `on_primary` — and return once they are applied.
+///
+/// The events ride the input ring as the node's own (connection 0,
+/// exempt from the request-sequence gate), so the normal pipeline
+/// journals, replicates and applies them. The caller must still be the
+/// ring's only producer, and must not serve a client until this returns:
+/// a client request would otherwise run before the configuration in
+/// `on_primary` is in force, and would compete with a large genesis for
+/// pipeline time.
+///
+/// Gates on the journal + matching cursors (disruptor sequence space),
+/// then on every active replication ring being consumed — the sender
+/// threads have read every batch (sent or being sent to replicas).
+/// Stronger than no gate, faster than waiting for replica acks, and
+/// deadlock-free because the ring backpressures instead of dropping
+/// batches. Every wait yields to the shutdown flag, and goes through the
+/// orchestrator wait strategy, never a bare spin: the stage threads may
+/// share this thread's core on a small box.
+fn journal_startup_events<E: melin_app::AppEvent>(
+    genesis: Vec<E>,
+    on_primary: Vec<E>,
+    input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
+    journal_cursor: &melin_pipeline::padding::Sequence,
+    matching_cursor: &melin_pipeline::padding::Sequence,
+    replication_ring_progress: &Option<melin_transport_core::pipeline::ReplicationRingProgress>,
+    shutdown: &AtomicBool,
+) {
+    use melin_app::unix_epoch_nanos;
+    use melin_journal::JournalEvent;
+    use melin_transport_core::trace::mono_trace_ns;
+
+    let (genesis_count, on_primary_count) = (genesis.len(), on_primary.len());
+    // Nothing published: the cursors never advance past a target, so
+    // waiting for one would hang the boot.
+    if genesis_count + on_primary_count == 0 {
+        return;
+    }
+    let start = std::time::Instant::now();
+
+    // `sequence: 0` — the journal stage allocates sequences in disruptor
+    // cursor order at encode time. The runtime wraps each application
+    // event as `JournalEvent::App` and stamps transport-level metadata.
+    let mut last_published_seq = 0u64;
+    for event in genesis.into_iter().chain(on_primary) {
+        last_published_seq = input_producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: unix_epoch_nanos(),
+            event: JournalEvent::App(event),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        });
+    }
+    let publish_elapsed = start.elapsed();
+
+    let target = last_published_seq + 1; // cursor = next-to-consume
+    info!(
+        target,
+        journal = journal_cursor.get().load(Ordering::Relaxed),
+        matching = matching_cursor.get().load(Ordering::Relaxed),
+        "startup events: waiting for pipeline cursors"
+    );
+    ORCHESTRATOR_WAIT.wait_until(|| {
+        shutdown.load(Ordering::Relaxed)
+            || (journal_cursor.get().load(Ordering::Acquire) >= target
+                && matching_cursor.get().load(Ordering::Acquire) >= target)
+    });
+
+    // Inactive rings (no connected replica) were never published to, so
+    // their producer cursor is 0 — no wait needed.
+    if let Some(ring_progress) = replication_ring_progress {
+        for i in 0..ring_progress.producer_cursors.len() {
+            if !ring_progress.active_flags[i].load(Ordering::Relaxed) {
+                continue;
+            }
+            let ring_target = ring_progress.producer_cursors[i].load();
+            ORCHESTRATOR_WAIT.wait_until(|| {
+                shutdown.load(Ordering::Relaxed)
+                    || ring_progress.consumer_cursors[i]
+                        .get()
+                        .load(Ordering::Acquire)
+                        >= ring_target
+            });
+        }
+    }
+
+    info!(
+        genesis_events = genesis_count,
+        on_primary_events = on_primary_count,
+        publish_ms = publish_elapsed.as_millis(),
+        total_ms = start.elapsed().as_millis(),
+        "journaled startup events through pipeline"
+    );
+}
 
 /// Bootstrap source chosen by [`init_engine`] from the on-disk layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3173,7 +3111,6 @@ fn choose_bootstrap(
 /// via `JournaledApp<A>`. Same engine initialization the TCP / DPDK paths use.
 pub(crate) fn init_engine<A, W>(
     config: &ServerConfig,
-    factory: &dyn AppFactory<App = A>,
 ) -> Result<(A, W, bool, u64), Box<dyn std::error::Error>>
 where
     A: Application,
@@ -3225,38 +3162,17 @@ where
             }
             BootstrapSource::JournalOnly => {
                 info!("recovering from journal");
-                let mut app = factory.empty();
-                factory.prefault(&mut app);
-                JournaledApp::<A, W>::recover(app, &config.journal)?
+                JournaledApp::<A, W>::recover(A::default(), &config.journal)?
             }
             BootstrapSource::Fresh => {
                 info!("creating new journal");
-                let mut app = factory.empty();
-                factory.prefault(&mut app);
-                JournaledApp::<A, W>::create(app, &config.journal)?
+                JournaledApp::<A, W>::create(A::default(), &config.journal)?
             }
         };
 
-    // Seed only on a genuinely fresh start — any surviving lineage
-    // (live or archived) already contains the seed events.
+    // Genesis only on a genuinely fresh start — any surviving lineage
+    // (live or archived) already contains the genesis events.
     let needs_seeding = !journal_exists && !archives_exist;
-
-    // Apply runtime config knobs that the snapshot doesn't carry. The
-    // SEC-03 cap and the SEC-04 rate-limit `(rate, burst)` pair are
-    // operator policy — replica and primary converge on them via
-    // `ServerConfig`, not replay. Two notes specific to SEC-04 (v18+):
-    //   * Per-account bucket *state* (`tokens` / `last_refill_ns`) IS
-    //     journaled in the snapshot and was already restored above; this
-    //     call only re-applies the *configuration*.
-    //   * `set_max_orders_per_second` clears buckets only when the new
-    //     `(rate, burst)` differs from the existing values. A snapshot
-    //     restore leaves the engine with whatever rate-limit config the
-    //     primary had at snapshot time, so reapplying the operator's
-    //     matching config here is a no-op for buckets — the freshly
-    //     restored state is preserved. An operator mis-set that differs
-    //     from the primary's config will silently clear those buckets;
-    //     primary and replica must run with matching values.
-    factory.apply_operator_policy(engine.app_mut());
 
     // Archive the live journal segment if it exceeds the configured
     // size threshold. The shadow exchange owns snapshot writes; here we

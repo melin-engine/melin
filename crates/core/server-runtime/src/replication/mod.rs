@@ -676,7 +676,6 @@ pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
 pub(super) fn recover_replica_state<A, W>(
     journal_path: &std::path::Path,
     snapshot_path: &std::path::Path,
-    factory: &dyn melin_app::app_factory::AppFactory<App = A>,
     fence_state: &melin_transport_core::fence::FenceState,
 ) -> Result<(Option<A>, Option<W>, u64, [u8; 32]), Box<dyn std::error::Error>>
 where
@@ -695,7 +694,7 @@ where
             journal_path,
         )?
     } else {
-        melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
+        melin_transport_core::JournaledApp::<A, W>::recover(A::default(), journal_path)?
     };
     let next = engine.next_sequence();
     let last = next.saturating_sub(1);
@@ -703,8 +702,7 @@ where
     // Seed the observed epoch from the replica's own recovered journal.
     // Streaming `EpochBump`s and the snapshot-resync path raise it later.
     fence_state.observe_epoch(engine.recovered_epoch());
-    let (mut exchange, writer) = engine.into_parts();
-    factory.apply_operator_policy(&mut exchange);
+    let (exchange, writer) = engine.into_parts();
     Ok((Some(exchange), Some(writer), last, hash))
 }
 
@@ -768,7 +766,6 @@ pub(in crate::replication) fn handle_session_exit<A, W>(
     last_sequence: u64,
     journal_path: &std::path::Path,
     snapshot_path: &std::path::Path,
-    factory: &dyn melin_app::app_factory::AppFactory<App = A>,
     fence_state: &melin_transport_core::fence::FenceState,
     shutdown: &AtomicBool,
     promote: &crate::promotion::PromotionRequest,
@@ -841,7 +838,7 @@ where
             );
             // Transport-specific teardown before reconnecting.
             close();
-            match recover_replica_state::<A, W>(journal_path, snapshot_path, factory, fence_state) {
+            match recover_replica_state::<A, W>(journal_path, snapshot_path, fence_state) {
                 Ok((exchange, journal_writer, seq, hash)) => AfterSession::Resync {
                     exchange,
                     journal_writer,
@@ -2708,7 +2705,6 @@ mod tests {
         ReplicaPipelineHandles<counter_server::Counter, u32>,
         melin_pipeline::ring::Consumer<InputSlot>,
     ) {
-        use melin_app::app_factory::AppFactory;
         let (input_producer, mut consumers) =
             melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(capacity)
                 .add_consumer()
@@ -2727,7 +2723,7 @@ mod tests {
             journal_handle: std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> {
                 Ok(11)
             }),
-            matching_handle: std::thread::spawn(|| counter_server::CounterFactory.empty()),
+            matching_handle: std::thread::spawn(counter_server::Counter::default),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
         };
@@ -2758,8 +2754,8 @@ mod tests {
     /// the given liveness flag and a backoff pre-escalated to
     /// `MAX_BACKOFF`, returning the post-exit backoff. Shutdown is
     /// latched so the backoff sleep returns immediately (the receiver's
-    /// loop top would handle it on the next turn); the journal, factory
-    /// and fence arguments are inert on the `Disconnected` path.
+    /// loop top would handle it on the next turn); the journal and fence
+    /// arguments are inert on the `Disconnected` path.
     fn backoff_after_disconnect(heard_from_primary: bool) -> std::time::Duration {
         let dir = tempfile::tempdir().expect("tempdir");
         type Writer = melin_journal::BufferedWriter<CounterEvent>;
@@ -2779,7 +2775,6 @@ mod tests {
             0,
             &dir.path().join("r.journal"),
             &dir.path().join("r.snapshot"),
-            &counter_server::CounterFactory,
             &melin_transport_core::fence::FenceState::new(0),
             &shutdown,
             &promote,
@@ -2822,7 +2817,6 @@ mod tests {
     /// was evidently speaking.
     #[test]
     fn stream_gap_reconnects_and_keeps_pipeline() {
-        use melin_app::app_factory::AppFactory;
         let dir = tempfile::tempdir().expect("tempdir");
         type Writer = melin_journal::BufferedWriter<CounterEvent>;
         // Same shape as `teardown_fixture`, but with a real writer type:
@@ -2845,7 +2839,7 @@ mod tests {
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
             journal_handle: std::thread::spawn(move || Writer::create(&writer_path)),
-            matching_handle: std::thread::spawn(|| counter_server::CounterFactory.empty()),
+            matching_handle: std::thread::spawn(counter_server::Counter::default),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
         };
@@ -2867,7 +2861,6 @@ mod tests {
             2,
             &dir.path().join("r.journal"),
             &dir.path().join("r.snapshot"),
-            &counter_server::CounterFactory,
             &melin_transport_core::fence::FenceState::new(0),
             &shutdown,
             &promote,

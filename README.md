@@ -50,23 +50,25 @@ The benchmark harness and tuning guidance ship with the Melin Exchange Core.
 
 ## Building an application on Melin
 
-Melin's core crates form a generic sequencer. Your application plugs in via five traits:
+Melin's core crates form a generic sequencer. Your application plugs in via four traits:
 
 | Trait | Role |
 |-------|------|
 | `AppEvent` | Your journaled event type: its encoding, and the widest it can get, which the journal sizes itself from |
-| `Application` | Your business logic: receives events, produces output |
-| `AppFactory` | Constructs your application, deserializes snapshots, seeds initial state |
+| `Application` | Your business logic: receives events, produces output, snapshots and restores its state |
 | `RequestDecoder` | Deserializes wire bytes into your domain request type |
 | `ResponseEncoder` | Serializes your domain response type into wire bytes |
 
-The one rule: `Application` must be deterministic: no I/O, no clocks, no randomness. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and your binary becomes pure composition:
+The one rule: `Application` must be deterministic: no I/O, no clocks, no randomness. Its state before the first event is its `Default`, identical on every node. Anything an operator configures — initial reference data, rate limits, caps — reaches it as events the runtime journals on the node's behalf (`StartupEvents`): a genesis set when the journal is created, and a set each time a node becomes primary. So replicas apply the primary's values, and replaying the journal reproduces every decision made under them. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and your binary becomes pure composition:
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::parse();
-    let factory = MyAppFactory::new(/* ... */);
-    server::run(config, factory, MyDecoder, MyEncoder, None)
+    let startup = StartupEvents {
+        genesis: my_reference_data(/* ... */),
+        on_primary: my_limits(/* ... */),
+    };
+    server::run::<MyApp>(config, startup, MyDecoder, MyEncoder, None)
 }
 ```
 
