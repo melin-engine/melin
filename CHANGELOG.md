@@ -73,6 +73,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   never did. Both now refuse a duplicate exactly as the live engine does. Only
   an application that enforces request sequences is affected.
 
+  Upgrading does not repair a snapshot an earlier version already wrote, and
+  nothing in the file shows whether it holds a duplicate. Recovery restores
+  such a snapshot as-is, and the journal's hash chain cannot catch it: the
+  chain covers the journal, not application state. If your application
+  enforces request sequences, stop the node, move its snapshot and the
+  `.prev` beside it aside, and restart: with the journal intact from
+  sequence 1, recovery rebuilds state by replaying it, now refusing
+  duplicates. A node whose journal no longer reaches sequence 1 — a replica
+  bootstrapped by snapshot transfer, or one whose old segments were removed —
+  refuses to start without its snapshot rather than rebuild partial state;
+  re-bootstrap it from a node that has recovered this way.
+
 ## [0.16.0] - 2026-09-14
 
 ### Added
