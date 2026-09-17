@@ -141,8 +141,6 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: Some(nodes[i].health_addr),
-            accounts: 0,
-            instruments: 0,
             replication_key: Some(key_path),
             raft_bind: Some(nodes[i].raft_addr),
             raft_node_id: Some(i as u64 + 1),

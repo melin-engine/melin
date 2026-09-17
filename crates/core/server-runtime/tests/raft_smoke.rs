@@ -66,8 +66,6 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: Some(health_addr),
-        accounts: 0,
-        instruments: 0,
         replication_key: Some(key_path),
         raft_bind: Some(raft_addr),
         raft_node_id: Some(1),

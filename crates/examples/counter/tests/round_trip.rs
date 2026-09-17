@@ -93,8 +93,6 @@ fn start_server() -> (
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        accounts: 0,
-        instruments: 0,
         ..ServerConfig::default()
     };
 
