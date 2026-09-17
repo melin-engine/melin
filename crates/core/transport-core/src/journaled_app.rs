@@ -538,9 +538,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 }
 
 /// Dispatch a single journaled entry back into the application during
-/// replay. Mirrors the live matching-stage dispatch: hybrid scheduler
-/// clock drain, `check_request_seq` rebuilds the per-key HWM, then the
-/// event flows to `apply` or `tick` depending on its kind.
+/// replay. Mirrors the live matching-stage dispatch: `check_request_seq`
+/// rebuilds the per-key HWM and refuses a duplicate, the hybrid scheduler
+/// clock drains, then the event flows to `apply` or `tick` depending on
+/// its kind.
 fn replay_entry<A: Application>(
     app: &mut A,
     event: &JournalEvent<A::Event>,
@@ -551,13 +552,13 @@ fn replay_entry<A: Application>(
     recovered_epoch: &mut u64,
     reports: &mut Vec<A::Report>,
 ) {
-    // Rebuild per-key HWM and capture whether this was a new request.
-    // The journal stage writes events before the matching stage dedups,
-    // so the journal can contain duplicates the primary rejected without
-    // calling `apply`. Replay must skip `apply` on those entries or
-    // state will diverge from the live primary (e.g. a retried deposit
-    // applied twice). For `Tick` events `key_hash == 0`, which
-    // `check_request_seq` exempts — `is_new` is always true there.
+    // Rebuild the per-key HWM and refuse a duplicate. The journal stage
+    // writes events before the matching stage dedups, so the journal can
+    // contain duplicates the primary rejected without calling `apply`.
+    // Replay must skip `apply` on those entries or state will diverge
+    // from the live primary (e.g. a retried deposit applied twice).
+    // `Tick` events carry `key_hash == 0`, which `check_request_seq`
+    // exempts, so they are never refused.
     //
     // The refusal skips the clock drain too: the live matching stage
     // refuses a duplicate before it advances the scheduler clock, so a
