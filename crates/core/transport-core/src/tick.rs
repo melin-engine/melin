@@ -18,7 +18,7 @@
 //!
 //! There is no longer a standalone tick thread. The matching stage
 //! also advances its scheduler clock from `slot.timestamp_ns` on every
-//! event (see `MatchingStage::process_event`), so the tick is the safety
+//! event (see `dispatch::dispatch`), so the tick is the safety
 //! net that keeps time moving forward during quiet periods rather than
 //! the sole source of clock progress.
 

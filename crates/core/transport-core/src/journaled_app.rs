@@ -23,9 +23,10 @@
 
 use std::path::Path;
 
-use melin_app::{Application, ApplyCtx};
-use melin_journal::{JournalError, JournalEvent, JournalReader, JournalWrite};
+use melin_app::Application;
+use melin_journal::{JournalError, JournalReader, JournalWrite};
 
+use crate::dispatch::{dispatch, offline_ctx};
 use crate::snapshot;
 
 /// Error surfaced by every [`JournaledApp`] method — wraps journal I/O errors and
@@ -506,7 +507,9 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         event: A::Event,
         out: &mut Vec<A::Report>,
     ) -> Result<Option<A::QueryResponse>, JournalError> {
-        let seq = self.writer.append(&JournalEvent::App(event))?;
+        let seq = self
+            .writer
+            .append(&melin_journal::JournalEvent::App(event))?;
         let ctx = melin_app::ApplyCtx {
             now_ns: melin_app::unix_epoch_nanos(),
             journal_sequence: melin_app::WireSeq::new(seq),
@@ -524,7 +527,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         now_ns: u64,
         out: &mut Vec<A::Report>,
     ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::Tick { now_ns })?;
+        self.writer
+            .append(&melin_journal::JournalEvent::Tick { now_ns })?;
         self.app.tick(now_ns, out);
         Ok(())
     }
@@ -534,78 +538,6 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// with hand-picked sequences to exercise recovery edge cases).
     pub fn writer_mut(&mut self) -> &mut W {
         &mut self.writer
-    }
-}
-
-/// Dispatch a single journaled entry back into the application during
-/// replay. Mirrors the live matching-stage dispatch: `check_request_seq`
-/// rebuilds the per-key HWM and refuses a duplicate, the hybrid scheduler
-/// clock drains, then the event flows to `apply` or `tick` depending on
-/// its kind.
-fn replay_entry<A: Application>(
-    app: &mut A,
-    event: &JournalEvent<A::Event>,
-    timestamp_ns: u64,
-    key_hash: u64,
-    request_seq: u64,
-    last_drain_ns: &mut u64,
-    recovered_epoch: &mut u64,
-    reports: &mut Vec<A::Report>,
-) {
-    // Rebuild the per-key HWM and refuse a duplicate. The journal stage
-    // writes events before the matching stage dedups, so the journal can
-    // contain duplicates the primary rejected without calling `apply`.
-    // Replay must skip `apply` on those entries or state will diverge
-    // from the live primary (e.g. a retried deposit applied twice).
-    // `Tick` events carry `key_hash == 0`, which `check_request_seq`
-    // exempts, so they are never refused.
-    //
-    // The refusal skips the clock drain too: the live matching stage
-    // refuses a duplicate before it advances the scheduler clock, so a
-    // replay that ticked for it would fire time-driven tasks at a point
-    // in the history the primary never did.
-    if !app.check_request_seq(key_hash, request_seq) {
-        // The client already received the rejection at live time.
-        return;
-    }
-
-    if timestamp_ns > *last_drain_ns {
-        *last_drain_ns = timestamp_ns;
-        app.tick(timestamp_ns, reports);
-    }
-
-    match event {
-        JournalEvent::App(e) => {
-            // Reports produced during replay are discarded — they already
-            // went to the client at the time the event was accepted.
-            // `key_hash` is the dedup identity threaded through this
-            // event so self-introspecting queries see the correct
-            // per-key state under replay.
-            let ctx = ApplyCtx {
-                now_ns: timestamp_ns,
-                journal_sequence: melin_app::WireSeq::new(0),
-                active_connections: 0,
-                events_processed: 0,
-                key_hash,
-            };
-            // Query response discarded during replay — these already
-            // went to the client when the event was first accepted.
-            let _ = app.apply(*e, &ctx, reports);
-        }
-        JournalEvent::Tick { now_ns } => {
-            app.tick(*now_ns, reports);
-        }
-        JournalEvent::EpochBump { epoch } => {
-            // Lineage metadata — advance the recovered epoch, never touch
-            // application state. Mirrors the live matching-stage dispatch.
-            crate::fence::observe_into(recovered_epoch, *epoch);
-        }
-        JournalEvent::Shutdown => {
-            // Pipeline-only sentinel; never written to disk and so
-            // unreachable on the replay path. Treat defensively rather
-            // than panic — recovery can't recover from a corrupt journal
-            // with a shutdown entry, but it shouldn't crash the process.
-        }
     }
 }
 
@@ -651,14 +583,16 @@ fn replay_segment<A: Application>(
                     });
                 }
                 if entry.sequence > snap_sequence {
-                    replay_entry(
+                    // Replay produces no output, whatever the outcome: the
+                    // client got its reply — or its refusal — when the
+                    // event was live.
+                    let _ = dispatch(
                         app,
-                        &entry.event,
-                        entry.timestamp_ns,
-                        entry.key_hash,
+                        entry.event,
                         entry.request_seq,
+                        &offline_ctx(entry.timestamp_ns, entry.key_hash),
                         last_drain_ns,
-                        recovered_epoch,
+                        |epoch| crate::fence::observe_into(recovered_epoch, epoch),
                         reports,
                     );
                     reports.clear();
@@ -766,6 +700,7 @@ fn verify_boundary_snapshot_anchor<E: melin_app::AppEvent>(
 mod tests {
     use super::*;
     use crate::test_support::{TestApp, TestEvent};
+    use melin_app::ApplyCtx;
     use melin_journal::{BufferedWriter, JournalEvent, JournalReader};
 
     // Concrete writer used by every test. The buffered path covers

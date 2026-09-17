@@ -84,6 +84,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   bootstrapped by snapshot transfer, or one whose old segments were removed —
   refuses to start without its snapshot rather than rebuild partial state;
   re-bootstrap it from a node that has recovered this way.
+- **An event applied during shutdown lost its client identity.** Events
+  still queued when a node stopped were applied with no client key, where
+  the live engine and replay pass the submitting key. An application that
+  reads the key when applying a write could reach different state for those
+  events than a replay of the same journal. The live engine, replay and the
+  snapshot stage now hand every event to the application through one shared
+  path, so they cannot disagree on it.
 
 ## [0.16.0] - 2026-09-14
 
