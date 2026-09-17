@@ -4027,10 +4027,8 @@ fn dropping_the_disk_thread_handle_stops_and_joins_the_thread() {
 /// state from the input stream must refuse it the same way the live
 /// matching stage did: no apply, and no clock advance. Three views of one
 /// history — the live engine, a replay of the journal it wrote, and the
-/// shadow stage's copy, whose snapshots recovery restores from — must be
-/// the same state. The shadow once applied the duplicate anyway, so its
-/// snapshots held state the primary never had; replay advanced the clock
-/// for it.
+/// snapshot the shadow stage writes, which recovery restores from — must
+/// be the same state.
 #[cfg(not(feature = "no-persist"))]
 #[test]
 fn a_refused_duplicate_is_invisible_to_live_replay_and_shadow() {
@@ -4108,22 +4106,49 @@ fn a_refused_duplicate_is_invisible_to_live_replay_and_shadow() {
         "replay must refuse the duplicate as live did"
     );
 
-    let mut shadow = TestApp::new();
-    let (mut last_drain_ns, mut epoch, mut reports) = (0, 0, Vec::new());
+    // The real shadow stage over the same slots, compared through the
+    // snapshot it writes — the state recovery would restore. The fsync
+    // pair claims all three slots, so the only snapshot it can write is
+    // the one taken after consuming them.
+    let (mut shadow_producer, mut shadow_consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let shadow_consumer = shadow_consumers.pop().unwrap();
+    let (_fsync_writer, fsync_reader) =
+        melin_pipeline::seqlock::split(crate::pipeline::FsyncState {
+            journal_seq: WireSeq::new(slots.len() as u64),
+            chain_hash: [0; 32],
+            input_ring_seq: crate::cursors::RingPos::new(slots.len() as u64),
+        });
+    let snap_path = dir.path().join("duplicate.snapshot");
+    let shadow_shutdown = Arc::new(AtomicBool::new(false));
+    let t_shadow = {
+        let (snap_path, shutdown) = (snap_path.clone(), Arc::clone(&shadow_shutdown));
+        std::thread::spawn(move || {
+            crate::shadow::run(
+                shadow_consumer,
+                TestApp::new(),
+                snap_path,
+                Duration::from_millis(20),
+                fsync_reader,
+                &shutdown,
+                WaitStrategy::SpinThenYield,
+                0,
+            )
+        })
+    };
     for slot in slots {
-        crate::shadow::dispatch_event(
-            &mut shadow,
-            &slot.event,
-            slot.timestamp_ns,
-            slot.key_hash,
-            slot.request_seq,
-            &mut last_drain_ns,
-            &mut epoch,
-            &mut reports,
-        );
+        shadow_producer.publish(slot);
     }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !snap_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    shadow_shutdown.store(true, Ordering::Relaxed);
+    t_shadow.join().unwrap();
+    let (shadow, _, _, _) = crate::snapshot::load::<TestApp>(&snap_path).unwrap();
     assert_eq!(
         shadow, live,
-        "the shadow must refuse the duplicate as live did"
+        "the shadow's snapshot must refuse the duplicate as live did"
     );
 }
