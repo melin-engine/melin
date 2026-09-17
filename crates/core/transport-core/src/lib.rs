@@ -24,6 +24,10 @@ pub mod ack_policy;
 /// Bundles the journal-progress atomics behind space-typed accessors so the
 /// compiler rejects mixing wire-seq and ring-index values.
 pub mod cursors;
+/// The single event-dispatch sequence (duplicate check, scheduler clock,
+/// apply) shared by the live matching stage, journal replay and the shadow
+/// stage, so the three cannot rebuild different state from one stream.
+mod dispatch;
 /// Replication fencing: the node's observed epoch and the one-way fenced
 /// latch that closes the split-brain window after a promotion.
 pub mod fence;
