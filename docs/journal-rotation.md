@@ -105,7 +105,7 @@ If no archives exist *and* no live segment exists, recovery falls through to the
 
 ### 4. Neither snapshot nor any journal file exists
 
-**Recovery flow:** Create a fresh live journal at sequence 1; seed test instruments and accounts (configurable via `--accounts` / `--instruments`).
+**Recovery flow:** Create a fresh live journal at sequence 1; journal the application's genesis events (its initial reference data) ahead of any client request.
 
 **When:** First-ever startup.
 

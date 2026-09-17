@@ -25,11 +25,12 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{
-    CounterFactory, RequestDecoder, ResponseEncoder, TAG_GET_VALUE, TAG_INCREMENT, TAG_RESP_ACK,
+    Counter, RequestDecoder, ResponseEncoder, TAG_GET_VALUE, TAG_INCREMENT, TAG_RESP_ACK,
     TAG_RESP_REJECTED, TAG_RESP_VALUE,
 };
 use ed25519_dalek::SigningKey;
 use melin_client::Connection;
+use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
@@ -48,10 +49,10 @@ fn spawn_node(config: ServerConfig, shutdown: &Arc<AtomicBool>) -> Node {
     let listener = BlockingTcpListener::bind(config.bind).expect("bind client port");
     let shutdown = Arc::clone(shutdown);
     std::thread::spawn(move || {
-        server::run_with_listener(
+        server::run_with_listener::<Counter>(
             listener,
             config,
-            CounterFactory,
+            StartupEvents::none(),
             RequestDecoder,
             ResponseEncoder,
             None,
@@ -144,8 +145,6 @@ fn a_write_refused_while_halted_is_not_replayed() {
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: Some(free_addr(PORT_BASE)),
-            accounts: 0,
-            instruments: 0,
             replication_key: Some(key_path),
             ..ServerConfig::default()
         }
@@ -220,8 +219,6 @@ fn a_write_refused_while_halted_is_not_replayed() {
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        accounts: 0,
-        instruments: 0,
         ..ServerConfig::default()
     };
     let restart_client = restart_config.bind;

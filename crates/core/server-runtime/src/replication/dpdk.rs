@@ -1124,10 +1124,6 @@ pub fn run_receiver_dpdk<A>(
     staging_mode: melin_journal::StagingMode,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
-    // Application factory: see the kernel-TCP `run_receiver` for the
-    // shape and rationale. Carries operator policy (rate limits, caps,
-    // ...) alongside the empty-app constructor.
-    factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
 ) -> ReceiverResult<A, BufferedWriter<A::Event>>
 where
@@ -1143,7 +1139,6 @@ where
         recover_replica_state::<A, BufferedWriter<A::Event>>(
             journal_path,
             &snapshot_path,
-            factory.as_ref(),
             &fence_state,
         )?;
     // Fence epoch now reflects the recovered journal; seed the advertised
@@ -1518,9 +1513,7 @@ where
         if pipeline.is_none() && journal_writer.is_none() {
             let writer =
                 BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
-            let mut fresh = factory.empty();
-            factory.apply_operator_policy(&mut fresh);
-            exchange = Some(fresh);
+            exchange = Some(A::default());
             journal_writer = Some(writer);
         }
 
@@ -1608,7 +1601,6 @@ where
             last_sequence,
             journal_path,
             &snapshot_path,
-            factory.as_ref(),
             &fence_state,
             shutdown,
             promote,

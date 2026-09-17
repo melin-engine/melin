@@ -5,7 +5,7 @@
 //! endpoint, replication, and the optional DPDK transport. Generic
 //! over `A: Application` — the binary supplies a concrete app via
 //! [`server::run`] (or `server::run_dpdk` under `feature = "dpdk"`) along with caller-supplied
-//! `AppFactory`, `RequestDecoder`, `ResponseEncoder`, and event-
+//! [`StartupEvents`], `RequestDecoder`, `ResponseEncoder`, and event-
 //! publisher fn.
 //!
 //! The trading-side wiring (`ServerApp`, `ExchangeRequestDecoder`,
@@ -26,7 +26,10 @@ pub mod reader;
 pub mod replication;
 pub mod response;
 pub mod server;
+mod startup;
 mod uring_teardown;
+
+pub use startup::StartupEvents;
 
 #[cfg(feature = "dpdk")]
 pub mod dpdk_response;

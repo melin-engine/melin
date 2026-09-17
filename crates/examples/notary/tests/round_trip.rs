@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use melin_client::{Connection, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
+use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
@@ -28,7 +29,7 @@ use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use notary_server::receipt::Receipt as SavedReceipt;
 use notary_server::{
-    GENESIS_HEAD, HEAD_LEN, LEAF_LEN, NotaryEvent, NotaryFactory, RequestDecoder, ResponseEncoder,
+    GENESIS_HEAD, HEAD_LEN, LEAF_LEN, Notary, NotaryEvent, RequestDecoder, ResponseEncoder,
     TAG_GET_HEAD, TAG_NOTARIZE, TAG_RESP_HEAD, TAG_RESP_RECEIPT,
 };
 
@@ -207,8 +208,6 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        accounts: 0,
-        instruments: 0,
         ..ServerConfig::default()
     };
     configure(&mut config);
@@ -229,10 +228,10 @@ fn spawn_node(listener: BlockingTcpListener, config: ServerConfig) -> Server {
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
     let handle = std::thread::spawn(move || -> Result<(), String> {
-        server::run_with_listener(
+        server::run_with_listener::<Notary>(
             listener,
             config,
-            NotaryFactory,
+            StartupEvents::none(),
             RequestDecoder,
             ResponseEncoder,
             None,
@@ -958,8 +957,6 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        accounts: 0,
-        instruments: 0,
         ..ServerConfig::default()
     };
 

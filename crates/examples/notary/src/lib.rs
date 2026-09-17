@@ -68,7 +68,6 @@
 
 use std::io::{self, Read, Write};
 
-use melin_app::app_factory::AppFactory;
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
@@ -249,6 +248,16 @@ pub fn fold(prev: &[u8; HEAD_LEN], leaf: &[u8; LEAF_LEN], timestamp_ns: u64) -> 
     *hasher.finalize().as_bytes()
 }
 
+/// The genesis state every node's chain starts from: nothing folded in.
+impl Default for Notary {
+    fn default() -> Self {
+        Notary {
+            head: GENESIS_HEAD,
+            entries: 0,
+        }
+    }
+}
+
 impl Notary {
     /// Current commitment.
     #[inline]
@@ -335,26 +344,6 @@ impl Application for Notary {
     }
 
     const APP_VERSION: u16 = 1;
-}
-
-// ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
-
-/// Constructs `Notary` instances for the runtime.
-pub struct NotaryFactory;
-
-impl AppFactory for NotaryFactory {
-    type App = Notary;
-
-    fn empty(&self) -> Notary {
-        Notary {
-            head: GENESIS_HEAD,
-            entries: 0,
-        }
-    }
-
-    fn prefault(&self, _app: &mut Notary) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +495,7 @@ mod tests {
 
     /// Fold a sequence of leaves into a fresh notary and return the head.
     fn head_after(leaves: &[[u8; LEAF_LEN]]) -> [u8; HEAD_LEN] {
-        let mut app = NotaryFactory.empty();
+        let mut app = Notary::default();
         let mut out = Vec::new();
         for l in leaves {
             app.apply(NotaryEvent::Notarize { leaf: *l }, &ctx(), &mut out);
@@ -584,7 +573,7 @@ mod tests {
 
     #[test]
     fn notarize_advances_the_chain() {
-        let mut app = NotaryFactory.empty();
+        let mut app = Notary::default();
         let mut out = Vec::new();
 
         app.apply(NotaryEvent::Notarize { leaf: leaf(1) }, &ctx(), &mut out);
@@ -621,7 +610,7 @@ mod tests {
     fn a_receipt_verifies_on_its_own() {
         // Fold some history the verifier knows nothing about, then check
         // the next receipt with only the receipt and the leaf in hand.
-        let mut app = NotaryFactory.empty();
+        let mut app = Notary::default();
         let mut out = Vec::new();
         for n in 1..=5 {
             app.apply(NotaryEvent::Notarize { leaf: leaf(n) }, &ctx(), &mut out);
@@ -657,8 +646,8 @@ mod tests {
 
     #[test]
     fn the_time_is_part_of_the_commitment() {
-        let mut a = NotaryFactory.empty();
-        let mut b = NotaryFactory.empty();
+        let mut a = Notary::default();
+        let mut b = Notary::default();
         let mut out = Vec::new();
         a.apply(
             NotaryEvent::Notarize { leaf: leaf(1) },
@@ -700,7 +689,7 @@ mod tests {
 
     #[test]
     fn get_head_reports_state_without_emitting_reports() {
-        let mut app = NotaryFactory.empty();
+        let mut app = Notary::default();
         let mut out = Vec::new();
         app.apply(NotaryEvent::Notarize { leaf: leaf(7) }, &ctx(), &mut out);
         out.clear();
@@ -722,7 +711,7 @@ mod tests {
 
     #[test]
     fn snapshot_restore_round_trip() {
-        let mut app = NotaryFactory.empty();
+        let mut app = Notary::default();
         let mut out = Vec::new();
         for n in 1..=3 {
             app.apply(NotaryEvent::Notarize { leaf: leaf(n) }, &ctx(), &mut out);
@@ -739,7 +728,7 @@ mod tests {
 
     #[test]
     fn restore_rejects_truncated_snapshot() {
-        let app = NotaryFactory.empty();
+        let app = Notary::default();
         let mut buf = Vec::new();
         app.snapshot(&mut buf).unwrap();
         buf.truncate(buf.len() - 1);

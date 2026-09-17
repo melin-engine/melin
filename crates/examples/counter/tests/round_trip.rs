@@ -13,9 +13,10 @@ use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use counter_server::{
-    CounterFactory, RequestDecoder, ResponseEncoder, TAG_GET_VALUE, TAG_INCREMENT, TAG_RESP_ACK,
+    Counter, RequestDecoder, ResponseEncoder, TAG_GET_VALUE, TAG_INCREMENT, TAG_RESP_ACK,
     TAG_RESP_VALUE,
 };
+use melin_server_runtime::StartupEvents;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -92,8 +93,6 @@ fn start_server() -> (
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        accounts: 0,
-        instruments: 0,
         ..ServerConfig::default()
     };
 
@@ -103,10 +102,10 @@ fn start_server() -> (
     // tempdir must outlive the server thread (journal lives inside it).
     let handle = std::thread::spawn(move || -> Result<(), String> {
         let _tmp = tmp;
-        server::run_with_listener(
+        server::run_with_listener::<Counter>(
             listener,
             config,
-            CounterFactory,
+            StartupEvents::none(),
             RequestDecoder,
             ResponseEncoder,
             None,
