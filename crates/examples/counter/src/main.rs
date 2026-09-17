@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     server::run::<Counter>(
         config,
         StartupEvents::none(),
+        (),
         RequestDecoder,
         ResponseEncoder,
         None,

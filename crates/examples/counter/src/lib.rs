@@ -126,6 +126,8 @@ impl Application for Counter {
     type Event = CounterEvent;
     type Report = CounterReport;
     type QueryResponse = CounterQuery;
+    // A single integer has nothing to reserve for.
+    type Sizing = ();
 
     fn apply(
         &mut self,

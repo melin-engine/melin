@@ -257,6 +257,8 @@ impl Application for Echo {
     // No queries, so no query response. `()` is `Copy`, which is all the
     // transport asks of the type; `apply` never returns `Some`.
     type QueryResponse = ();
+    // No state, so nothing to size.
+    type Sizing = ();
 
     fn apply(&mut self, event: Payload, _ctx: &ApplyCtx, out: &mut Vec<EchoReport>) -> Option<()> {
         out.push(EchoReport::Echoed(event));

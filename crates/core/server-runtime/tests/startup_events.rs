@@ -72,6 +72,7 @@ fn boot(dir: &Path, startup: StartupEvents<CounterEvent>) -> Node {
             listener,
             config,
             startup,
+            (),
             RequestDecoder,
             ResponseEncoder,
             None,
