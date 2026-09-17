@@ -61,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     server::run::<Echo>(
         config,
         StartupEvents::none(),
+        (),
         RequestDecoder,
         ResponseEncoder,
         None,

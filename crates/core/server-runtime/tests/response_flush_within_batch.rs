@@ -87,6 +87,7 @@ impl Application for PadApp {
     type Event = PadEvent;
     type Report = PadReport;
     type QueryResponse = PadReport;
+    type Sizing = ();
 
     fn apply(
         &mut self,

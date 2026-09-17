@@ -161,6 +161,7 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
             listener,
             config,
             StartupEvents::none(),
+            (),
             RequestDecoder,
             ResponseEncoder,
             None,

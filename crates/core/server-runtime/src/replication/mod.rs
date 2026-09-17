@@ -433,7 +433,7 @@ pub(super) type ReplicaHandles<A> =
 /// `Disconnected` reconnects.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_replica_pipeline_with_threads<A>(
-    exchange: A,
+    mut exchange: A,
     writer: BufferedWriter<A::Event>,
     cores: crate::layout::PipelineCores,
     // How the replica's segment preparer materialises staged extents.
@@ -451,6 +451,9 @@ pub(super) fn build_replica_pipeline_with_threads<A>(
     // thread's failure wrapper, alongside the per-pipeline
     // `journal_failed` latch.
     pipeline_healthy: Arc<AtomicBool>,
+    // The node's sizing, applied to every instance a pipeline is built
+    // around — see `Application::prefault`.
+    sizing: &A::Sizing,
 ) -> Result<ReplicaHandles<A>, Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -458,6 +461,11 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
 {
+    // Before the shadow copy is taken, so that neither the stream's
+    // first events nor the copy's first snapshot grow the collections on
+    // the matching thread. A replica's apply sits on the primary's ack
+    // path under `disk+ram`, so its page faults are the primary's tail.
+    <A as Application>::prefault(&mut exchange, sizing);
     let shadow_exchange = <A as Application>::clone_via_snapshot(&exchange)?;
 
     let enable_shadow = snapshot_interval_ms > 0;

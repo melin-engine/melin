@@ -53,6 +53,7 @@ fn spawn_node(config: ServerConfig, shutdown: &Arc<AtomicBool>) -> Node {
             listener,
             config,
             StartupEvents::none(),
+            (),
             RequestDecoder,
             ResponseEncoder,
             None,
