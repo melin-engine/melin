@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::dispatch::{Dispatched, dispatch, offline_ctx};
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
 use melin_journal::BufferedWriter;
@@ -2569,7 +2570,7 @@ impl<A: Application> MatchingStage<A> {
         let mut wakeup_rec =
             crate::trace::register_stage("matching: disruptor wakeup (publish → matching consume)");
         #[cfg(feature = "latency-trace")]
-        let mut execute_rec = crate::trace::register_stage("matching: execute (process_event)");
+        let mut execute_rec = crate::trace::register_stage("matching: execute (dispatch)");
         // Paces the idle-path recorder flush. See `trace::StageRecorder::flush`.
         #[cfg(feature = "latency-trace")]
         let mut stats_flush_timer = melin_app::amortized_timer::AmortizedTimer::new();
@@ -2622,8 +2623,7 @@ impl<A: Application> MatchingStage<A> {
             // Build ApplyCtx once per batch — the counters are advisory
             // (stats queries, health endpoint) so batch-stale values are
             // fine. `now_ns` and `key_hash` are overwritten per-event
-            // below (the latter from the slot's authenticated identity
-            // so self-introspecting queries can read it from `ctx`).
+            // below from the slot's timestamp and authenticated identity.
             // Two Relaxed loads + one Acquire load per batch instead of
             // per event.
             let mut ctx = ApplyCtx {
@@ -2676,58 +2676,42 @@ impl<A: Application> MatchingStage<A> {
                 wakeup_rec.record_elapsed(slot.publish_ts, mono_trace_ns());
 
                 reports.clear();
-                let mut query_report: Option<A::QueryResponse> = None;
 
                 #[cfg(feature = "latency-trace")]
                 let exec_start = mono_trace_ns();
 
                 ctx.events_processed = local_events;
+                ctx.now_ns = slot.timestamp_ns;
                 ctx.key_hash = slot.key_hash;
                 local_events += 1;
 
-                // Read-only queries bypass dedup — they never mutate
-                // durable state. No halt check here: a halted node
-                // refuses client writes before publishing them, so every
-                // event reaching this point is one the journal records
-                // and replay will apply (see the type's docs).
-                let is_query = slot.event.is_query();
-                if !is_query && !self.app.check_request_seq(slot.key_hash, slot.request_seq) {
-                    // Duplicate request — produce a Rejected report for
-                    // the app event; transport variants don't go through
-                    // dedup (they use `key_hash == 0` which the app
-                    // exempts).
-                    if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                        reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
-                    }
-                } else {
-                    // Inlined `process_event` so the run loop only borrows
-                    // disjoint fields (`self.app`, `self.last_drain_ns`),
-                    // freeing `self.output` for the in-flight `out_batch`.
-                    if slot.timestamp_ns > self.last_drain_ns {
-                        self.last_drain_ns = slot.timestamp_ns;
-                        self.app.tick(slot.timestamp_ns, &mut reports);
-                    }
-                    match slot.event {
-                        melin_journal::JournalEvent::App(event) => {
-                            let event_ctx = ApplyCtx {
-                                now_ns: slot.timestamp_ns,
-                                ..ctx
-                            };
-                            query_report = self.app.apply(event, &event_ctx, &mut reports);
+                // No halt check here: a halted node refuses client writes
+                // before publishing them, so every event reaching this
+                // point is one the journal records and replay will apply
+                // (see the type's docs). A free function rather than a
+                // method, so it borrows only the fields it needs while
+                // `out_batch` holds `self.output`.
+                let query_report = match dispatch(
+                    &mut self.app,
+                    slot.event,
+                    slot.request_seq,
+                    &ctx,
+                    &mut self.last_drain_ns,
+                    |epoch| {
+                        self.fence_state.observe_epoch(epoch);
+                    },
+                    &mut reports,
+                ) {
+                    Dispatched::Applied(query_report) => query_report,
+                    Dispatched::Refused => {
+                        // Only an app event has a client to tell; internal
+                        // events carry key_hash 0, which is never refused.
+                        if let melin_journal::JournalEvent::App(ref e) = slot.event {
+                            reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
                         }
-                        melin_journal::JournalEvent::Tick { now_ns } => {
-                            self.app.tick(now_ns, &mut reports);
-                        }
-                        melin_journal::JournalEvent::EpochBump { epoch } => {
-                            // Lineage metadata, not application state: advance
-                            // the observed epoch and produce no report. Reaches
-                            // here on a replica replaying the stream and on the
-                            // new primary's own promotion injection.
-                            self.fence_state.observe_epoch(epoch);
-                        }
-                        melin_journal::JournalEvent::Shutdown => {}
+                        None
                     }
-                }
+                };
 
                 #[cfg(feature = "latency-trace")]
                 {
@@ -2866,15 +2850,6 @@ impl<A: Application> MatchingStage<A> {
     /// processing each and publishing responses. Ensures every journaled
     /// event gets a matching response sent to the client.
     fn drain_remaining(&mut self, reports: &mut Vec<A::Report>) {
-        // Shutdown path — not performance-critical. Build a single ctx
-        // with zeroed counters (no health endpoint cares at this point).
-        let ctx = ApplyCtx {
-            now_ns: 0,
-            journal_sequence: WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
-            key_hash: 0,
-        };
         loop {
             let entry = self.consumer.try_consume();
             let Some((input_seq, slot)) = entry else {
@@ -2902,17 +2877,29 @@ impl<A: Application> MatchingStage<A> {
             }
             reports.clear();
 
-            // Dedup, as in the main run loop; no halt check, for the same
-            // reason.
-            if !self.app.check_request_seq(slot.key_hash, slot.request_seq) {
-                if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                    reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
+            // As in the main run loop; no halt check, for the same reason.
+            // Shutdown path, so the advisory counters are left zero — but
+            // the timestamp and key are the event's own, as on every other
+            // path, since state may depend on them.
+            match dispatch(
+                &mut self.app,
+                slot.event,
+                slot.request_seq,
+                &offline_ctx(slot.timestamp_ns, slot.key_hash),
+                &mut self.last_drain_ns,
+                |epoch| {
+                    self.fence_state.observe_epoch(epoch);
+                },
+                reports,
+            ) {
+                Dispatched::Applied(query_report) => {
+                    debug_assert!(query_report.is_none(), "drain_remaining skips queries");
                 }
-            } else {
-                // Queries are already skipped above, so process_event
-                // will not return a query response here.
-                let query_report = self.process_event(&slot, &ctx, reports);
-                debug_assert!(query_report.is_none(), "drain_remaining skips queries");
+                Dispatched::Refused => {
+                    if let melin_journal::JournalEvent::App(ref e) = slot.event {
+                        reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
+                    }
+                }
             }
 
             #[allow(clippy::let_unit_value)]
@@ -2948,66 +2935,6 @@ impl<A: Application> MatchingStage<A> {
                 }
             }
         }
-    }
-
-    /// Dispatch a single event through the [`Application`] trait.
-    ///
-    /// The 17-arm trading match that used to live here now collapses
-    /// into a single `Application::apply` call — the trait impl on
-    /// `Exchange` (see `application_impl.rs`) owns the per-variant
-    /// dispatch, freeing the pipeline from knowing anything about
-    /// trading semantics. `#[inline]` on `Exchange::apply` + fat LTO
-    /// keep the hot path zero-cost.
-    fn process_event(
-        &mut self,
-        slot: &InputSlot<A::Event>,
-        ctx: &ApplyCtx,
-        reports: &mut Vec<A::Report>,
-    ) -> Option<A::QueryResponse> {
-        // Hybrid scheduler clock: every event with a non-zero, monotonic
-        // timestamp drives the scheduler forward. Under load this fires
-        // due tasks at every-event resolution (microseconds) without
-        // waiting for the next Tick. The non-monotonic guard tolerates
-        // the rare multi-producer ordering race in which a slot arrives
-        // with an earlier timestamp than its predecessor.
-        if slot.timestamp_ns > self.last_drain_ns {
-            self.last_drain_ns = slot.timestamp_ns;
-            self.app.tick(slot.timestamp_ns, reports);
-        }
-
-        match slot.event {
-            melin_journal::JournalEvent::App(event) => {
-                // `now_ns` is the only per-event field — stamp it from
-                // the slot. The remaining ctx fields were loaded once per
-                // batch by the caller.
-                let ctx = ApplyCtx {
-                    now_ns: slot.timestamp_ns,
-                    ..*ctx
-                };
-                return self.app.apply(event, &ctx, reports);
-            }
-            melin_journal::JournalEvent::Tick { now_ns } => {
-                // Defensive: the head-of-event drain has already advanced
-                // the clock to `slot.timestamp_ns`, which equals `now_ns`
-                // for tick-generator-published slots — so this call is
-                // typically a no-op. Kept for paths where
-                // `slot.timestamp_ns` is 0 (tests, manually constructed
-                // Ticks) so time still advances as documented on
-                // `JournalEvent::Tick`.
-                self.app.tick(now_ns, reports);
-            }
-            melin_journal::JournalEvent::EpochBump { epoch } => {
-                // Lineage metadata — advance the observed epoch, never
-                // touch application state (see the main run loop).
-                self.fence_state.observe_epoch(epoch);
-            }
-            melin_journal::JournalEvent::Shutdown => {
-                // Pipeline sentinel — handled at the run-loop level
-                // (stage exits on observing it). Never reaches process_event
-                // in practice; this arm is a safety net.
-            }
-        }
-        None
     }
 }
 

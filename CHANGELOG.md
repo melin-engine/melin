@@ -63,6 +63,34 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   exits on shutdown. The reply it was holding is dropped, as it would be
   by a crash: the policy never confirmed it, and the client reconciles on
   reconnect.
+- **A request refused as a duplicate could reach a snapshot.** A duplicate is
+  still journaled, and while the live engine refused it, the stage that keeps
+  the copy snapshots are written from applied it anyway. Recovering from such
+  a snapshot — on restart, or on a replica bootstrapped by snapshot transfer —
+  therefore held the effect of a request whose client was told it was
+  rejected. Replaying the journal refused the duplicate but still advanced the
+  application's clock for it, firing time-driven tasks at a point the primary
+  never did. Both now refuse a duplicate exactly as the live engine does. Only
+  an application that enforces request sequences is affected.
+
+  Upgrading does not repair a snapshot an earlier version already wrote, and
+  nothing in the file shows whether it holds a duplicate. Recovery restores
+  such a snapshot as-is, and the journal's hash chain cannot catch it: the
+  chain covers the journal, not application state. If your application
+  enforces request sequences, stop the node, move its snapshot and the
+  `.prev` beside it aside, and restart: with the journal intact from
+  sequence 1, recovery rebuilds state by replaying it, now refusing
+  duplicates. A node whose journal no longer reaches sequence 1 — a replica
+  bootstrapped by snapshot transfer, or one whose old segments were removed —
+  refuses to start without its snapshot rather than rebuild partial state;
+  re-bootstrap it from a node that has recovered this way.
+- **An event applied during shutdown lost its client identity.** Events
+  still queued when a node stopped were applied with no client key, where
+  the live engine and replay pass the submitting key. An application that
+  reads the key when applying a write could reach different state for those
+  events than a replay of the same journal. The live engine, replay and the
+  snapshot stage now hand every event to the application through one shared
+  path, so they cannot disagree on it.
 
 ## [0.16.0] - 2026-09-14
 

@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use tracing::{error, info};
 
+use crate::dispatch::{dispatch, offline_ctx};
 use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
+use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
-use melin_app::{Application, ApplyCtx, WireSeq};
-use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::SeqLockReader;
 use melin_pipeline::wait::WaitStrategy;
@@ -66,7 +66,7 @@ pub fn run<A: Application>(
     // empty state before the first event arrives.
     let mut has_events = false;
     // Highest event timestamp the shadow's scheduler has drained against.
-    // See `dispatch_event` for the per-event drain rationale.
+    // See `dispatch::dispatch` for the per-event drain rationale.
     let mut last_drain_ns: u64 = 0;
     // Fencing epoch as of the shadow's consumed position. Seeded from the
     // recovered epoch (the live pipeline's starting epoch) because the
@@ -104,16 +104,18 @@ pub fn run<A: Application>(
         // outside the loop so the per-event drain stays monotonic across
         // batches.
         for slot in &batch[..count] {
-            dispatch_event(
+            // The shadow produces no output, whatever the outcome: the
+            // matching stage replies, and refuses, for every event.
+            let _ = dispatch(
                 &mut app,
-                &slot.event,
-                slot.timestamp_ns,
-                slot.key_hash,
+                slot.event,
                 slot.request_seq,
+                &offline_ctx(slot.timestamp_ns, slot.key_hash),
                 &mut last_drain_ns,
-                &mut shadow_epoch,
+                |epoch| crate::fence::observe_into(&mut shadow_epoch, epoch),
                 &mut reports,
             );
+            reports.clear();
         }
 
         // Check if a snapshot is due.
@@ -162,89 +164,13 @@ fn try_save_snapshot<A: Application>(
     }
 }
 
-/// Dispatch a single journal event to the shadow app.
-///
-/// Mirrors `JournaledApp::replay_entry`: rebuild per-key HWM via
-/// `check_request_seq`, drain the scheduler clock if `timestamp_ns`
-/// advanced, then hand the event to `apply` or `tick`. Without the
-/// `check_request_seq` call, the shadow snapshot's `key_hwm` would be
-/// empty and a restore would let previously-rejected duplicate
-/// `request_seq` values through. `last_drain_ns` is caller-tracked
-/// across the consume loop so the drain stays monotonic.
-fn dispatch_event<A: Application>(
-    app: &mut A,
-    event: &JournalEvent<A::Event>,
-    timestamp_ns: u64,
-    key_hash: u64,
-    request_seq: u64,
-    last_drain_ns: &mut u64,
-    epoch: &mut u64,
-    reports: &mut Vec<A::Report>,
-) {
-    reports.clear();
-
-    // Gate on `!is_query` to match the matching stage (`pipeline.rs`
-    // `check_request_seq` call site). The shadow reads from the pre-journal
-    // input ring — unlike `JournaledApp::replay_entry`, which sees only
-    // non-queries because the journal stage drops queries — so advancing
-    // HWM on queries here would push shadow's `key_hwm` above primary's and
-    // cause post-restore to reject legitimate non-duplicate requests.
-    // Return discarded: shadow applies the event regardless of the dedup
-    // decision (matches `replay_entry` for non-queries).
-    if !event.is_query() {
-        let _ = app.check_request_seq(key_hash, request_seq);
-    }
-
-    if timestamp_ns > *last_drain_ns {
-        *last_drain_ns = timestamp_ns;
-        app.tick(timestamp_ns, reports);
-    }
-
-    match *event {
-        JournalEvent::App(e) => {
-            // The shadow is strictly a secondary observer — the canonical
-            // answer (and journal sequence number) is produced by the
-            // matching stage. `ApplyCtx` is supplied with the fields the
-            // shadow can cheaply compute; `journal_sequence` / connection
-            // counts are live-pipeline-only. `key_hash` is threaded so
-            // that any self-introspecting query the app supports stays
-            // consistent between live and shadow paths.
-            let ctx = ApplyCtx {
-                now_ns: timestamp_ns,
-                journal_sequence: WireSeq::new(0),
-                active_connections: 0,
-                events_processed: 0,
-                key_hash,
-            };
-            // Query response discarded — shadow is a secondary observer,
-            // it does not produce client-facing output.
-            let _ = app.apply(e, &ctx, reports);
-        }
-        JournalEvent::Tick { now_ns } => {
-            // Defensive: the head-of-event drain typically already advanced
-            // the clock to this point. Re-draining via `now_ns` keeps the
-            // contract consistent for callers that pass `timestamp_ns = 0`
-            // (tests, manually constructed events).
-            app.tick(now_ns, reports);
-        }
-        JournalEvent::EpochBump { epoch: bump } => {
-            // Lineage metadata — advance the shadow's tracked epoch so the
-            // next snapshot records it. Never touches application state.
-            crate::fence::observe_into(epoch, bump);
-        }
-        JournalEvent::Shutdown => {
-            // Pipeline-only sentinel — handled at the run-loop level by
-            // exiting; should never reach this dispatch.
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cursors::{RingPos, WireSeq};
     use crate::pipeline::InputSlot;
     use crate::test_support::{TestApp, TestEvent};
+    use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_pipeline::seqlock;
     use std::sync::Arc;
@@ -371,250 +297,6 @@ mod tests {
         let (restored, _seq, chain, _epoch) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(chain, [0xAB; 32]); // chain hash from the seqlock
         assert_eq!(restored.total, 1500);
-    }
-
-    // ------------------------------------------------------------------
-    // dispatch_event contract tests
-    //
-    // dispatch_event has four observable behaviours:
-    //   - App events advance per-key HWM (gated on !is_query) and reach
-    //     Application::apply
-    //   - Query events skip the HWM advance
-    //   - `timestamp_ns` drives a monotonic Application::tick drain
-    //   - Transport variants (Tick / Shutdown)
-    //     are handled without touching app-event state
-    //
-    // Each test below pins one of those behaviours. The fixture is the
-    // app-agnostic TestApp — we used to cross-check against a real
-    // trading Exchange + its direct method API, but that's the engine's
-    // job; here we only validate dispatch_event's control flow.
-    // ------------------------------------------------------------------
-
-    const KEY: u64 = 0xDEAD_BEEF;
-
-    fn dispatch(app: &mut TestApp, event: &JournalEvent<TestEvent>, ts: u64, seq: u64) {
-        let mut reports = Vec::new();
-        let mut drain = 0u64;
-        let mut epoch = 0u64;
-        dispatch_event(
-            app,
-            event,
-            ts,
-            KEY,
-            seq,
-            &mut drain,
-            &mut epoch,
-            &mut reports,
-        );
-    }
-
-    #[test]
-    fn app_event_advances_hwm_and_reaches_apply() {
-        let mut app = TestApp::new();
-        let mut reports = Vec::new();
-        let mut drain = 0u64;
-
-        // Non-query Add: HWM should bump to seq, total should bump by n.
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(42)),
-            0,
-            KEY,
-            10,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
-
-        assert_eq!(app.total, 42, "apply must have run");
-        assert_eq!(app.key_hwm.get(&KEY).copied(), Some(10));
-    }
-
-    #[test]
-    fn query_event_does_not_advance_hwm() {
-        // Regression: the shadow reads from the pre-journal input ring so
-        // it sees queries (the matching stage filters them out at the
-        // !is_query gate). Advancing HWM on queries would push shadow's
-        // key_hwm above primary's and a post-restore could reject
-        // legitimate non-duplicate requests.
-        let mut app = TestApp::new();
-        dispatch(&mut app, &JournalEvent::App(TestEvent::Query), 0, 100);
-
-        // HWM unchanged, so a same-seq non-query still passes.
-        assert!(app.key_hwm.get(&KEY).copied().unwrap_or(0) < 100);
-        assert!(app.check_request_seq(KEY, 100));
-    }
-
-    #[test]
-    fn timestamp_drives_monotonic_clock_drain() {
-        // The drain trips Application::tick when `timestamp_ns >
-        // last_drain_ns`. Across one dispatch_event call the local
-        // `last_drain_ns` is initialised to 0 so any positive timestamp
-        // fires exactly one tick. A second dispatch with a backward
-        // timestamp on the same caller-tracked drain must NOT re-tick.
-        let mut app = TestApp::new();
-        let mut reports = Vec::new();
-        let mut drain = 0u64;
-
-        // Forward timestamp: one tick.
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(1)),
-            100,
-            KEY,
-            1,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
-        assert_eq!(app.ticks, 1, "forward timestamp must drain clock once");
-        assert_eq!(drain, 100, "caller-tracked drain must advance to 100");
-
-        // Backward timestamp on the same caller-tracked drain: no new tick.
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(1)),
-            50,
-            KEY,
-            2,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
-        assert_eq!(app.ticks, 1, "backward timestamp must not re-drain");
-
-        // Equal timestamp: also no new tick (strict greater-than gate).
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(1)),
-            100,
-            KEY,
-            3,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
-        assert_eq!(app.ticks, 1, "equal timestamp must not re-drain");
-
-        // New forward timestamp resumes draining.
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(1)),
-            200,
-            KEY,
-            4,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
-        assert_eq!(app.ticks, 2);
-    }
-
-    #[test]
-    fn tick_variant_advances_clock_state_only() {
-        // JournalEvent::Tick { now_ns } reaches Application::tick (which
-        // bumps TestApp::ticks) and never reaches apply (which would bump
-        // TestApp::total).
-        let mut app = TestApp::new();
-        dispatch(&mut app, &JournalEvent::Tick { now_ns: 1_000 }, 0, 1);
-
-        assert_eq!(app.total, 0, "Tick variant must not call apply");
-        assert!(app.ticks >= 1, "Tick variant must call Application::tick");
-    }
-
-    #[test]
-    fn transport_variants_are_state_noops() {
-        // Shutdown carries pipeline-control metadata and must never
-        // mutate app state. (It shouldn't even reach dispatch_event in
-        // practice — the run loop exits on it — but the match arm exists
-        // as defence in depth and is exercised here.)
-        let mut app = TestApp::new();
-        dispatch(&mut app, &JournalEvent::Shutdown, 0, 3);
-
-        assert_eq!(app.total, 0, "no app-event state change");
-        assert_eq!(app.ticks, 0, "no clock drain (timestamp_ns was 0)");
-    }
-
-    #[test]
-    fn key_hash_zero_bypasses_hwm_dedup() {
-        // Transport-internal events (Tick) and
-        // any seed-time inserts use key_hash=0 to opt out of per-key
-        // dedup. dispatch_event must hand those events to apply
-        // regardless of the request_seq value — TestApp::check_request_seq
-        // mirrors Exchange::check_request_seq in returning true for
-        // key_hash=0 without consulting the HWM map.
-        let mut app = TestApp::new();
-        let mut reports = Vec::new();
-        let mut drain = 0u64;
-
-        for _ in 0..3 {
-            dispatch_event(
-                &mut app,
-                &JournalEvent::App(TestEvent::Add(7)),
-                0,
-                0, // key_hash sentinel
-                1, // same seq each time — would be a duplicate for any real key
-                &mut drain,
-                &mut 0u64,
-                &mut reports,
-            );
-        }
-        assert_eq!(app.total, 21, "every internal event must apply");
-        assert!(
-            app.key_hwm.is_empty(),
-            "key_hash=0 must not allocate an HWM entry"
-        );
-    }
-
-    #[test]
-    fn duplicate_request_seq_still_applies_event() {
-        // dispatch_event discards check_request_seq's return value — even
-        // when the matching stage would have rejected the event as a
-        // duplicate, the shadow still applies it. This mirrors
-        // JournaledApp::replay_entry's non-query branch, and the
-        // shadow_vs_primary divergence assumes both paths apply the same
-        // bytes regardless of dedup outcome. Without this, a primary
-        // that re-replays the same journal segment would diverge from a
-        // shadow that skipped duplicates.
-        let mut app = TestApp::new();
-        let mut reports = Vec::new();
-        let mut drain = 0u64;
-
-        // First dispatch at seq=10 — advances HWM and applies.
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(5)),
-            0,
-            KEY,
-            10,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
-        assert_eq!(app.total, 5);
-        assert_eq!(app.key_hwm.get(&KEY).copied(), Some(10));
-
-        // Second dispatch at seq=10 — dedup gate would reject (seq not
-        // strictly greater than HWM), but apply still runs.
-        dispatch_event(
-            &mut app,
-            &JournalEvent::App(TestEvent::Add(5)),
-            0,
-            KEY,
-            10,
-            &mut drain,
-            &mut 0u64,
-            &mut reports,
-        );
-        assert_eq!(
-            app.total, 10,
-            "apply must run even when dedup would have rejected"
-        );
-        assert_eq!(
-            app.key_hwm.get(&KEY).copied(),
-            Some(10),
-            "HWM must not regress"
-        );
     }
 
     #[test]
