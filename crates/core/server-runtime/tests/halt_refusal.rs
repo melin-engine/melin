@@ -145,8 +145,6 @@ fn a_write_refused_while_halted_is_not_replayed() {
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: Some(free_addr(PORT_BASE)),
-            accounts: 0,
-            instruments: 0,
             replication_key: Some(key_path),
             ..ServerConfig::default()
         }
@@ -221,8 +219,6 @@ fn a_write_refused_while_halted_is_not_replayed() {
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        accounts: 0,
-        instruments: 0,
         ..ServerConfig::default()
     };
     let restart_client = restart_config.bind;

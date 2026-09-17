@@ -62,8 +62,6 @@ fn boot(dir: &Path, startup: StartupEvents<CounterEvent>) -> Node {
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        accounts: 0,
-        instruments: 0,
         ..ServerConfig::default()
     };
 

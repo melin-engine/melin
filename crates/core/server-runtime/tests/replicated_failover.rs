@@ -317,8 +317,6 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             snapshot_interval_ms: 0,
             health_bind: Some(nodes[i].health_addr),
             admin_bind: Some(nodes[i].admin_addr),
-            accounts: 0,
-            instruments: 0,
             replication_key: Some(key_path),
             raft_bind: Some(nodes[i].raft_addr),
             raft_node_id: Some(i as u64 + 1),

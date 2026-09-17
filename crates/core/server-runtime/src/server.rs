@@ -176,13 +176,6 @@ pub struct ServerConfig {
     /// reached. 0 means unlimited. Prevents fd/memory exhaustion (SEC-02).
     #[arg(long, default_value_t = 1024)]
     pub max_connections: u64,
-    /// Number of accounts to seed on first startup. Uses the
-    /// ProvisionAccount event for O(accounts) seeding (~0.5s for 1M).
-    #[arg(long, default_value_t = 100_000)]
-    pub accounts: u32,
-    /// Number of instruments to seed on first startup.
-    #[arg(long, default_value_t = 100)]
-    pub instruments: u32,
     /// Path to the authorized keys file for Ed25519 challenge-response
     /// authentication. Every connection must authenticate before trading.
     /// Required for primary mode; ignored in replica mode (--replica-of).
@@ -537,8 +530,6 @@ impl Default for ServerConfig {
             heartbeat_interval_secs: 10,
             connection_timeout_secs: 30,
             max_connections: 1024,
-            accounts: 2,
-            instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
             journal_staging_mode: JournalStagingMode::ZeroFill,
@@ -883,7 +874,7 @@ where
         // A replica receives the genesis events in the primary's history
         // and never journals its own, promoted or not — nothing to hold
         // them for, and a large genesis is worth freeing.
-        drop(std::mem::take(&mut startup.genesis));
+        startup.genesis = Vec::new();
 
         // Load replication signing key.
         let replication_key_path = config.replication_key.as_ref().ok_or_else(|| {
@@ -2239,7 +2230,7 @@ where
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode (DPDK)");
         // As on the kernel-TCP path: a replica never journals genesis.
-        drop(std::mem::take(&mut startup.genesis));
+        startup.genesis = Vec::new();
 
         // Load authorized keys early — the admin listener needs them for
         // Ed25519 challenge-response auth (operator keys only).

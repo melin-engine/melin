@@ -62,11 +62,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `StartupEvents::genesis`; turn what `apply_operator_policy` set into events
   the application applies, passed as `StartupEvents::on_primary`, and keep
   those values in the snapshot; size collections in `Default` or when the
-  genesis events arrive, instead of in `prefault`. The runtime entry points
-  now name the application type — `server::run::<MyApp>(config, startup,
-  decoder, encoder, None)` — and `replication::run_receiver` /
+  genesis events arrive, instead of in `AppFactory::prefault`
+  (`Application::prefault`, which touches pages, stays). The runtime entry
+  points now name the application type — `server::run::<MyApp>(config,
+  startup, decoder, encoder, None)` — and `replication::run_receiver` /
   `run_receiver_dpdk` no longer take a factory. An application with nothing
   to journal at startup passes `StartupEvents::none()`.
+- **`--accounts` and `--instruments`**, and the `ServerConfig` fields behind
+  them. They were the counts the runtime seeded an exchange from, and nothing
+  read them any more. An application that sizes its genesis from the command
+  line defines those flags itself and builds `StartupEvents::genesis` from
+  them.
 
 ### Fixed
 
