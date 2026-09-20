@@ -587,6 +587,7 @@ where
             journal_path,
             &snapshot_path,
             &fence_state,
+            sizing,
         )?;
     // The fence epoch now reflects the recovered journal (a fresh replica
     // legitimately recovers epoch 0). Seed the advertised sequence from
@@ -911,6 +912,7 @@ where
             // dropped on the next loop turn when a fresh connection
             // replaces it.
             || {},
+            sizing,
         ) {
             AfterSession::Return(r) => return r,
             AfterSession::Resync {

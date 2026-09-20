@@ -60,10 +60,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   None)`; `replication::run_receiver` and `run_receiver_dpdk` take a
   reference to it. Sizing is local to the node and never journaled, so it
   must not influence what `apply` decides; `Default` stays the small,
-  parameterless genesis, and production capacity is reserved in `prefault`
-  on top of whatever state the node starts from — a fresh genesis, a
-  recovered journal or a restored snapshot alike. An implementation must
-  therefore reserve rather than replace, and be a no-op when called again.
+  parameterless genesis, and production capacity is reserved in `prefault`.
+  A genesis instance is sized before a journal is replayed into it, and
+  every instance is sized again before it serves — a restored snapshot only
+  then, since it has no genesis instance. An implementation must therefore
+  reserve on top of whatever state is there rather than replace it, and be
+  a no-op when called again.
 - **Replicas size their application too.** `prefault` now runs on a
   replica before its pipeline starts, and again on one rebuilt after a
   resync. Until now only a primary at boot, and a replica at promotion, ran

@@ -396,13 +396,16 @@ pub trait Application: Sized + Default {
     /// `sizing` describes, so that growth and first-touch page faults
     /// happen here and not on the hot path.
     ///
-    /// Called before the pipeline takes an instance: on a primary at
-    /// boot, on a replica before its pipeline starts (including one
-    /// rebuilt after a resync), and once more when a replica is
-    /// promoted. The instance may hold state already — recovered from a
-    /// snapshot or a journal, or applied from the primary's stream — so
-    /// an implementation reserves on top of what is there, never
-    /// replaces a populated collection, and is a no-op the second time.
+    /// Called on a genesis instance before a history is applied to it —
+    /// a journal replayed on a primary or a replica, a primary's stream
+    /// on a replica — and again before the pipeline takes an instance:
+    /// on a primary at boot, on a replica before its pipeline starts
+    /// (including one rebuilt after a resync), and once more when a
+    /// replica is promoted. A snapshot has no genesis instance, so a
+    /// restored one is sized only after. The instance may therefore hold
+    /// state already, and an implementation reserves on top of what is
+    /// there, never replaces a populated collection, and is a no-op the
+    /// second time.
     /// Default: no-op. An application that pre-allocates large indices
     /// or slab backing stores should override it to size them and touch
     /// every page.

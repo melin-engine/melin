@@ -1110,11 +1110,12 @@ where
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — the genesis events will flow through the pipeline later.
     let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, BufferedWriter<A::Event>>(&config)?;
+        init_engine::<A, BufferedWriter<A::Event>>(&config, &sizing)?;
 
     // Size and pre-fault application-owned memory (slabs, indices) so
     // growth and page faults happen now, not on the hot path. Runs on the
-    // recovered state too: a snapshot restores contents, not capacity.
+    // recovered state too: a snapshot restores contents, not capacity,
+    // and `init_engine` sizes a genesis instance before replay only.
     <A as Application>::prefault(&mut exchange, &sizing);
 
     // A primary booting directly (not via promotion) keeps whatever epoch
@@ -2484,7 +2485,7 @@ where
     // Initialize or recover the exchange, then size it — see the
     // kernel-TCP primary path.
     let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, BufferedWriter<A::Event>>(&config)?;
+        init_engine::<A, BufferedWriter<A::Event>>(&config, &sizing)?;
     <A as Application>::prefault(&mut exchange, &sizing);
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.
@@ -3130,8 +3131,13 @@ fn choose_bootstrap(
 /// (snapshot+journal, snapshot only, journal only, fresh) are
 /// transport-level concerns and work uniformly for any `A: Application`
 /// via `JournaledApp<A>`. Same engine initialization the TCP / DPDK paths use.
+///
+/// `sizing` is applied to a genesis instance before a journal is replayed
+/// into it, so the history lands in reserved collections; the caller
+/// sizes the result again afterwards, which covers the snapshot paths.
 pub(crate) fn init_engine<A, W>(
     config: &ServerConfig,
+    sizing: &A::Sizing,
 ) -> Result<(A, W, bool, u64), Box<dyn std::error::Error>>
 where
     A: Application,
@@ -3183,7 +3189,12 @@ where
             }
             BootstrapSource::JournalOnly => {
                 info!("recovering from journal");
-                JournaledApp::<A, W>::recover(A::default(), &config.journal)?
+                // Sized before the history is applied to it, as a replica
+                // is before it applies the stream: replay must not grow
+                // the collections the sizing would have reserved.
+                let mut app = A::default();
+                <A as Application>::prefault(&mut app, sizing);
+                JournaledApp::<A, W>::recover(app, &config.journal)?
             }
             BootstrapSource::Fresh => {
                 info!("creating new journal");

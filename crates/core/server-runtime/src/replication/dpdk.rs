@@ -1143,6 +1143,7 @@ where
             journal_path,
             &snapshot_path,
             &fence_state,
+            sizing,
         )?;
     // Fence epoch now reflects the recovered journal; seed the advertised
     // sequence from the same recovery, then let the raft driver trust
@@ -1617,6 +1618,7 @@ where
             // socket entry to the socket set; each reconnect allocates a
             // fresh one, so skipping it leaks one entry per disconnect.
             || transport.close(handle),
+            sizing,
         ) {
             AfterSession::Return(r) => return r,
             AfterSession::Resync {

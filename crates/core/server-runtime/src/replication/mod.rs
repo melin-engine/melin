@@ -685,6 +685,9 @@ pub(super) fn recover_replica_state<A, W>(
     journal_path: &std::path::Path,
     snapshot_path: &std::path::Path,
     fence_state: &melin_transport_core::fence::FenceState,
+    // Applied to a genesis instance before the journal is replayed into
+    // it — see `init_engine`. The pipeline build sizes the result again.
+    sizing: &A::Sizing,
 ) -> Result<(Option<A>, Option<W>, u64, [u8; 32]), Box<dyn std::error::Error>>
 where
     A: Application,
@@ -702,7 +705,9 @@ where
             journal_path,
         )?
     } else {
-        melin_transport_core::JournaledApp::<A, W>::recover(A::default(), journal_path)?
+        let mut app = A::default();
+        <A as Application>::prefault(&mut app, sizing);
+        melin_transport_core::JournaledApp::<A, W>::recover(app, journal_path)?
     };
     let next = engine.next_sequence();
     let last = next.saturating_sub(1);
@@ -778,6 +783,9 @@ pub(in crate::replication) fn handle_session_exit<A, W>(
     shutdown: &AtomicBool,
     promote: &crate::promotion::PromotionRequest,
     mut close: impl FnMut(),
+    // For the resync path, which recovers the local journal afresh — see
+    // `recover_replica_state`.
+    sizing: &A::Sizing,
 ) -> AfterSession<A, W>
 where
     A: Application + Send + 'static,
@@ -846,7 +854,7 @@ where
             );
             // Transport-specific teardown before reconnecting.
             close();
-            match recover_replica_state::<A, W>(journal_path, snapshot_path, fence_state) {
+            match recover_replica_state::<A, W>(journal_path, snapshot_path, fence_state, sizing) {
                 Ok((exchange, journal_writer, seq, hash)) => AfterSession::Resync {
                     exchange,
                     journal_writer,
@@ -2787,6 +2795,7 @@ mod tests {
             &shutdown,
             &promote,
             || {},
+            &(),
         );
         assert!(matches!(after, AfterSession::Reconnect));
         backoff
@@ -2873,6 +2882,7 @@ mod tests {
             &shutdown,
             &promote,
             || closed = true,
+            &(),
         );
         assert!(
             matches!(after, AfterSession::Reconnect),

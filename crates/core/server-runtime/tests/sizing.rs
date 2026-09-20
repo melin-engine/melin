@@ -4,8 +4,8 @@
 //! never anywhere else. A primary gets its own sizing once at boot, on
 //! the state it starts from; a replica gets its own, not the primary's,
 //! before the first streamed event is applied; a node recovering a
-//! journal gets it on the recovered state, so a restart is sized without
-//! anything being replayed into unsized collections.
+//! journal gets it before the replay, so nothing is replayed into
+//! unsized collections, and again on the recovered state.
 //!
 //! A primary and one replica (a counter wrapped to observe its sizing,
 //! `disk` ack policy) over real TCP, then the primary restarted standalone
@@ -334,9 +334,9 @@ fn every_node_sizes_its_own_instances_before_serving() {
         "nothing sizes the primary again while it serves"
     );
 
-    // --- The primary restarted on its journal: sized once, on the
-    // recovered state, so the replayed history landed in the collections
-    // the sizing is about to reserve. ---
+    // --- The primary restarted on its journal: sized before the replay,
+    // on the genesis state, so the history lands in reserved collections;
+    // then again on the recovered state, as a snapshot restart would be. ---
     let restart_config = ServerConfig {
         bind: free_addr(PORT_BASE),
         journal: primary_journal,
@@ -367,10 +367,17 @@ fn every_node_sizes_its_own_instances_before_serving() {
     assert_eq!(replayed, GENESIS + 5, "the journal replayed");
     assert_eq!(
         restart_sizing.calls(),
-        vec![Sized {
-            reserve_for: RESTART_RESERVE,
-            value: GENESIS + 5,
-        }],
-        "a recovered node is sized on the recovered state, with the sizing it was restarted with"
+        vec![
+            Sized {
+                reserve_for: RESTART_RESERVE,
+                value: 0,
+            },
+            Sized {
+                reserve_for: RESTART_RESERVE,
+                value: GENESIS + 5,
+            },
+        ],
+        "a recovering node is sized before the replay and on the recovered state, \
+         with the sizing it was restarted with"
     );
 }
