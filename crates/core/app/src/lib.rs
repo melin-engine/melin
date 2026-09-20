@@ -403,9 +403,15 @@ pub trait Application: Sized + Default {
     /// (including one rebuilt after a resync), and once more when a
     /// replica is promoted. A snapshot has no genesis instance, so a
     /// restored one is sized only after. The instance may therefore hold
-    /// state already, and an implementation reserves on top of what is
-    /// there, never replaces a populated collection, and is a no-op the
-    /// second time.
+    /// state already, and the contract is that the call changes capacity
+    /// only: every entry survives, every decision `apply` would make
+    /// afterwards is the same, and a second call with the same sizing is
+    /// a no-op. How the capacity gets there is the implementation's
+    /// choice — a collection with no in-place reserve may be rebuilt at
+    /// the larger size, entries and all. A rebuild may change iteration
+    /// order, and with it the bytes a snapshot of the same state
+    /// produces; that is fine, a snapshot is per node and nothing
+    /// compares bytes across nodes.
     /// Default: no-op. An application that pre-allocates large indices
     /// or slab backing stores should override it to size them and touch
     /// every page.

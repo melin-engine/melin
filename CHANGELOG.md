@@ -64,8 +64,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   A genesis instance is sized before a journal is replayed into it, and
   every instance is sized again before it serves — a restored snapshot only
   then, since it has no genesis instance. An implementation must therefore
-  reserve on top of whatever state is there rather than replace it, and be
-  a no-op when called again.
+  change capacity only — every entry survives and `apply` decides the same
+  afterwards, though a collection may be rebuilt at the larger size — and
+  be a no-op when called again.
 - **Replicas size their application too.** `prefault` now runs on a
   replica before its pipeline starts, and again on one rebuilt after a
   resync. Until now only a primary at boot, and a replica at promotion, ran

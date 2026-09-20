@@ -4,12 +4,12 @@
 //! never anywhere else. A primary gets its own sizing once at boot, on
 //! the state it starts from; a replica gets its own, not the primary's,
 //! before the first streamed event is applied; a node recovering a
-//! journal gets it before the replay, so nothing is replayed into
-//! unsized collections, and again on the recovered state.
+//! journal, primary or replica, gets it before the replay, so nothing is
+//! replayed into unsized collections, and again on the recovered state.
 //!
 //! A primary and one replica (a counter wrapped to observe its sizing,
-//! `disk` ack policy) over real TCP, then the primary restarted standalone
-//! on its own journal.
+//! `disk` ack policy) over real TCP, then both restarted on their own
+//! journals.
 
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
@@ -227,6 +227,17 @@ const RESTART_RESERVE: u64 = 65_536;
 
 #[test]
 fn every_node_sizes_its_own_instances_before_serving() {
+    // Opt-in diagnostics, as in `replicated_failover.rs`: with RUST_LOG
+    // set, the nodes' tracing output says which recovery and reconnect
+    // path each took. No-op when RUST_LOG is unset.
+    if std::env::var_os("RUST_LOG").is_some() {
+        // Error dropped deliberately: try_init fails only when a
+        // subscriber is already installed, which is the state we want.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    }
     let tmp = tempfile::tempdir().expect("tempdir");
     let primary_key = SigningKey::from_bytes(&[0x81; 32]);
     let replica_key = SigningKey::from_bytes(&[0x82; 32]);
@@ -276,7 +287,6 @@ fn every_node_sizes_its_own_instances_before_serving() {
     primary_config.replication_bind = Some(replication_addr);
     let primary_client = primary_config.bind;
     let primary_health = primary_config.health_bind.expect("set above");
-    let primary_journal = primary_config.journal.clone();
     let mut replica_config = node_config("replica", &replica_key);
     replica_config.replica_of = Some(replication_addr);
     let replica_client = replica_config.bind;
@@ -313,10 +323,19 @@ fn every_node_sizes_its_own_instances_before_serving() {
         "the primary is sized once at boot, on the state it starts from"
     );
 
-    // --- The replica streamed the genesis event: sized once, with its
-    // own sizing (not the primary's), before the first streamed event was
-    // applied. ---
+    // --- The replica streamed both events: sized once, with its own
+    // sizing (not the primary's), before the first streamed event was
+    // applied. Under `disk` the primary acks without the replica, and
+    // counts it connected from the handshake, before its pipeline even
+    // exists — so wait until the replica has journaled everything (it
+    // acks only after its fsync) before reading its log or stopping it,
+    // or the restart below would recover an empty journal. ---
     increment(&mut conn, 2, 5);
+    wait_for_gauge(
+        primary_health,
+        "melin_replica_acked_sequence{slot=\"0\"}",
+        2,
+    );
     assert_eq!(
         replica_sizing.calls(),
         vec![Sized {
@@ -334,50 +353,66 @@ fn every_node_sizes_its_own_instances_before_serving() {
         "nothing sizes the primary again while it serves"
     );
 
-    // --- The primary restarted on its journal: sized before the replay,
-    // on the genesis state, so the history lands in reserved collections;
-    // then again on the recovered state, as a snapshot restart would be. ---
-    let restart_config = ServerConfig {
-        bind: free_addr(PORT_BASE),
-        journal: primary_journal,
-        authorized_keys: auth_path.clone(),
-        standalone: true,
-        ack_policy: AckPolicy::Disk,
-        no_mlock: true,
-        cores: PipelineCores::unpinned(),
-        tick_interval_ms: 0,
-        snapshot_interval_ms: 0,
-        health_bind: None,
-        ..ServerConfig::default()
-    };
-    let restart_client = restart_config.bind;
-    let restart_sizing = Sizing::new(RESTART_RESERVE);
-    let restart_shutdown = Arc::new(AtomicBool::new(false));
-    let restarted = spawn_node(
-        restart_config,
+    // --- Both nodes restarted on their own journals, each with a new
+    // sizing: sized before the replay, on the genesis state, so the
+    // history lands in reserved collections; then again on the recovered
+    // state — the primary at boot, the replica when its pipeline is
+    // built on its first session — as a snapshot restart would be. ---
+    let replication_addr = free_addr(PORT_BASE);
+    let mut primary_config = node_config("primary", &primary_key);
+    primary_config.replication_bind = Some(replication_addr);
+    let primary_client = primary_config.bind;
+    let primary_health = primary_config.health_bind.expect("set above");
+    let mut replica_config = node_config("replica", &replica_key);
+    replica_config.replica_of = Some(replication_addr);
+    let replica_client = replica_config.bind;
+
+    let primary_sizing = Sizing::new(RESTART_RESERVE);
+    let primary_shutdown = Arc::new(AtomicBool::new(false));
+    let primary = spawn_node(
+        primary_config,
         genesis(),
-        &restart_sizing,
-        &restart_shutdown,
+        &primary_sizing,
+        &primary_shutdown,
     );
-    let mut conn = connect(restart_client, &client_key);
+    let replica_sizing = Sizing::new(RESTART_RESERVE + 1);
+    let replica_shutdown = Arc::new(AtomicBool::new(false));
+    let replica = spawn_node(
+        replica_config,
+        genesis(),
+        &replica_sizing,
+        &replica_shutdown,
+    );
+    wait_for_gauge(primary_health, "melin_replicas_connected", 1);
+    let mut conn = connect(primary_client, &client_key);
     let replayed = value_of(&mut conn, 1);
     drop(conn);
-    stop_node(restarted, &restart_shutdown, restart_client);
+    stop_node(replica, &replica_shutdown, replica_client);
+    stop_node(primary, &primary_shutdown, primary_client);
 
     assert_eq!(replayed, GENESIS + 5, "the journal replayed");
-    assert_eq!(
-        restart_sizing.calls(),
+    let recovered = |reserve_for: u64| {
         vec![
             Sized {
-                reserve_for: RESTART_RESERVE,
+                reserve_for,
                 value: 0,
             },
             Sized {
-                reserve_for: RESTART_RESERVE,
+                reserve_for,
                 value: GENESIS + 5,
             },
-        ],
-        "a recovering node is sized before the replay and on the recovered state, \
+        ]
+    };
+    assert_eq!(
+        primary_sizing.calls(),
+        recovered(RESTART_RESERVE),
+        "a recovering primary is sized before the replay and on the recovered state, \
+         with the sizing it was restarted with"
+    );
+    assert_eq!(
+        replica_sizing.calls(),
+        recovered(RESTART_RESERVE + 1),
+        "a recovering replica is sized before the replay and on the recovered state, \
          with the sizing it was restarted with"
     );
 }
