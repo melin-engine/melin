@@ -561,6 +561,9 @@ pub fn run_receiver<A>(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
+    // Applied to every instance this loop builds a pipeline around; see
+    // `build_replica_pipeline_with_threads`.
+    sizing: &A::Sizing,
 ) -> ReceiverResult<A, BufferedWriter<A::Event>>
 where
     A: Application + Send + 'static,
@@ -584,6 +587,7 @@ where
             journal_path,
             &snapshot_path,
             &fence_state,
+            sizing,
         )?;
     // The fence epoch now reflects the recovered journal (a fresh replica
     // legitimately recovers epoch 0). Seed the advertised sequence from
@@ -841,6 +845,7 @@ where
                 group_commit_delay,
                 Arc::clone(&fence_state),
                 Arc::clone(pipeline_healthy),
+                sizing,
             )?);
         }
 
@@ -907,6 +912,7 @@ where
             // dropped on the next loop turn when a fresh connection
             // replaces it.
             || {},
+            sizing,
         ) {
             AfterSession::Return(r) => return r,
             AfterSession::Resync {
@@ -1165,6 +1171,7 @@ mod tests {
             type Event = EvtAdd;
             type Report = Rpt;
             type QueryResponse = Rpt;
+            type Sizing = ();
             const APP_VERSION: u16 = 1;
 
             fn apply(&mut self, _e: EvtAdd, _ctx: &ApplyCtx, _out: &mut Vec<Rpt>) -> Option<Rpt> {
@@ -1332,6 +1339,7 @@ mod tests {
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        &(),
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())
@@ -1502,6 +1510,7 @@ mod tests {
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        &(),
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())
@@ -1670,6 +1679,7 @@ mod tests {
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        &(),
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())
@@ -1911,6 +1921,7 @@ mod tests {
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        &(),
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())
@@ -2089,6 +2100,7 @@ mod tests {
                         Duration::ZERO,
                         64,
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        &(),
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())

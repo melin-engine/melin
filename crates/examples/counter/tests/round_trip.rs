@@ -106,6 +106,7 @@ fn start_server() -> (
             listener,
             config,
             StartupEvents::none(),
+            (),
             RequestDecoder,
             ResponseEncoder,
             None,

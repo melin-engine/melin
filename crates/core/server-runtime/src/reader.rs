@@ -1412,6 +1412,7 @@ mod tests {
         type Event = TestEvent;
         type Report = TestReport;
         type QueryResponse = ();
+        type Sizing = ();
         const APP_VERSION: u16 = 0;
         fn apply(
             &mut self,

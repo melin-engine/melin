@@ -232,6 +232,7 @@ fn spawn_node(listener: BlockingTcpListener, config: ServerConfig) -> Server {
             listener,
             config,
             StartupEvents::none(),
+            (),
             RequestDecoder,
             ResponseEncoder,
             None,

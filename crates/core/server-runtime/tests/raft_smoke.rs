@@ -82,6 +82,7 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
             listener,
             config,
             StartupEvents::none(),
+            (),
             RequestDecoder,
             ResponseEncoder,
             None,

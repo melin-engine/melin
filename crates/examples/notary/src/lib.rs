@@ -276,6 +276,8 @@ impl Application for Notary {
     type Event = NotaryEvent;
     type Report = NotaryReport;
     type QueryResponse = NotaryHead;
+    // A fixed-width commitment and a counter: nothing to reserve for.
+    type Sizing = ();
 
     fn apply(
         &mut self,

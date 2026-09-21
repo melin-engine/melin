@@ -277,10 +277,34 @@ pub trait EncodeReport: Copy {
 /// application as journaled events instead, so that replay reproduces
 /// the decisions made under it and every replica holds the primary's
 /// values. `Default` may still pre-allocate: capacity is not state.
+///
+/// # Sizing
+///
+/// Capacity, unlike state, may come from the node: how many accounts
+/// or instruments to reserve for, how deep a book to expect. That
+/// reaches the application through [`Sizing`](Application::Sizing) and
+/// [`prefault`](Application::prefault) only — a hook that runs after
+/// the state exists, on every node, and whose contract is to touch and
+/// reserve memory, never to change what the state means. `Default`
+/// stays the small, parameterless genesis that unit tests build by the
+/// thousand; production sizing is applied on top of whatever state the
+/// node starts from, a fresh genesis or a restored snapshot alike.
 pub trait Application: Sized + Default {
     /// The application-defined event type. One variant per business
     /// operation (submit order, cancel, deposit, …).
     type Event: AppEvent;
+
+    /// What the node's operator tells the application about the
+    /// workload to size for, passed to [`prefault`](Application::prefault)
+    /// on every node. Capacity only: nothing in it may influence what
+    /// [`apply`](Application::apply) decides, or replicas started with
+    /// other values would diverge from the primary. `()` for an
+    /// application with nothing to reserve.
+    ///
+    /// `Send + Sync + 'static` because the runtime keeps it for the
+    /// life of the process: a replica sizes every instance it builds,
+    /// including one rebuilt after a resync.
+    type Sizing: Send + Sync + 'static;
 
     /// Per-event output payloads. One input event may produce many
     /// reports (fills, acks, query rows). `Copy` keeps the output ring
@@ -368,12 +392,30 @@ pub trait Application: Sized + Default {
     /// version so operators can detect incompatible upgrades.
     const APP_VERSION: u16;
 
-    /// Pre-fault any application memory that would otherwise soft-fault
-    /// on the first hot-path access. Called once on startup before the
-    /// matching stage takes the input ring. Default: no-op — apps that
-    /// pre-allocate large indices / slab backing stores (`Exchange`
-    /// does) should override to touch every page.
-    fn prefault(&mut self) {}
+    /// Reserve and pre-fault the application's memory for the workload
+    /// `sizing` describes, so that growth and first-touch page faults
+    /// happen here and not on the hot path.
+    ///
+    /// Called on a genesis instance before a history is applied to it —
+    /// a journal replayed on a primary or a replica, a primary's stream
+    /// on a replica — and again before the pipeline takes an instance:
+    /// on a primary at boot, on a replica before its pipeline starts
+    /// (including one rebuilt after a resync), and once more when a
+    /// replica is promoted. A snapshot has no genesis instance, so a
+    /// restored one is sized only after. The instance may therefore hold
+    /// state already, and the contract is that the call changes capacity
+    /// only: every entry survives, every decision `apply` would make
+    /// afterwards is the same, and a second call with the same sizing is
+    /// a no-op. How the capacity gets there is the implementation's
+    /// choice — a collection with no in-place reserve may be rebuilt at
+    /// the larger size, entries and all. A rebuild may change iteration
+    /// order, and with it the bytes a snapshot of the same state
+    /// produces; that is fine, a snapshot is per node and nothing
+    /// compares bytes across nodes.
+    /// Default: no-op. An application that pre-allocates large indices
+    /// or slab backing stores should override it to size them and touch
+    /// every page.
+    fn prefault(&mut self, _sizing: &Self::Sizing) {}
 
     /// Return a byte-identical clone of the application by round-trip
     /// through [`snapshot`](Application::snapshot) +

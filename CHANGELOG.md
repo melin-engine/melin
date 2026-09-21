@@ -51,6 +51,28 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`Application` requires `Default`**, the state before the first event on
   every node. It must not depend on anything local to the node; capacity may
   still be pre-allocated there.
+- **Capacity comes from the node, through `Application::Sizing`.** The trait
+  gains an associated `Sizing` type — what the operator tells the application
+  to reserve for, `()` when there is nothing — and `prefault` takes it:
+  `fn prefault(&mut self, sizing: &Self::Sizing)`. `server::run` and
+  `server::run_with_listener` take the node's sizing after its startup
+  events: `server::run::<MyApp>(config, startup, sizing, decoder, encoder,
+  None)`; `replication::run_receiver` and `run_receiver_dpdk` take a
+  reference to it. Sizing is local to the node and never journaled, so it
+  must not influence what `apply` decides; `Default` stays the small,
+  parameterless genesis, and production capacity is reserved in `prefault`.
+  A genesis instance is sized before a journal is replayed into it, and
+  every instance is sized again before it serves — a restored snapshot only
+  then, since it has no genesis instance. An implementation must therefore
+  change capacity only — every entry survives and `apply` decides the same
+  afterwards, though a collection may be rebuilt at the larger size — and
+  be a no-op when called again.
+- **Replicas size their application too.** `prefault` now runs on a
+  replica before its pipeline starts, and again on one rebuilt after a
+  resync. Until now only a primary at boot, and a replica at promotion, ran
+  it: a replica applied the whole stream on cold, unsized collections, and
+  under `disk+ram` its growth and page faults sat on the primary's ack
+  path.
 
 ### Removed
 
@@ -61,18 +83,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   for the application from what `empty` built; return `seed_events` as
   `StartupEvents::genesis`; turn what `apply_operator_policy` set into events
   the application applies, passed as `StartupEvents::on_primary`, and keep
-  those values in the snapshot; size collections in `Default` or when the
-  genesis events arrive, instead of in `AppFactory::prefault`
-  (`Application::prefault`, which touches pages, stays). The runtime entry
-  points now name the application type — `server::run::<MyApp>(config,
-  startup, decoder, encoder, None)` — and `replication::run_receiver` /
-  `run_receiver_dpdk` no longer take a factory. An application with nothing
-  to journal at startup passes `StartupEvents::none()`.
+  those values in the snapshot; move what `AppFactory::prefault` sized from
+  into `Application::Sizing`, and do the reserving in `Application::prefault`
+  (see Changed). The runtime entry points now name the application type —
+  `server::run::<MyApp>(config, startup, sizing, decoder, encoder, None)` —
+  and `replication::run_receiver` / `run_receiver_dpdk` no longer take a
+  factory. An application with nothing to journal at startup passes
+  `StartupEvents::none()`, and one with nothing to reserve passes `()`.
 - **`--accounts` and `--instruments`**, and the `ServerConfig` fields behind
   them. They were the counts the runtime seeded an exchange from, and nothing
   read them any more. An application that sizes its genesis from the command
   line defines those flags itself and builds `StartupEvents::genesis` from
-  them.
+  them, and its `Sizing` too if they are also what it reserves memory for.
 
 ### Fixed
 

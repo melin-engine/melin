@@ -634,7 +634,9 @@ impl ServerConfig {
 ///
 /// The application starts from `A::default()` on every node; `startup`
 /// is what the node journals on top of that as it becomes primary — see
-/// [`StartupEvents`].
+/// [`StartupEvents`]. `sizing` is what this node reserves memory for,
+/// handed to [`Application::prefault`] on every instance the node
+/// builds; it is local to the node and never journaled.
 ///
 /// For callers that need a pre-bound listener or an externally
 /// controlled shutdown flag (e.g. benchmarks), use
@@ -642,6 +644,7 @@ impl ServerConfig {
 pub fn run<A>(
     config: ServerConfig,
     startup: StartupEvents<A::Event>,
+    sizing: A::Sizing,
     decoder: impl RequestDecoder<Event = A::Event> + 'static,
     encoder: impl ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -668,6 +671,7 @@ where
         run_dpdk::<A>(
             config,
             startup,
+            sizing,
             Arc::new(decoder),
             Arc::new(encoder),
             event_publisher,
@@ -682,6 +686,7 @@ where
             listener,
             config,
             startup,
+            sizing,
             Arc::new(decoder),
             Arc::new(encoder),
             event_publisher,
@@ -702,6 +707,7 @@ pub fn run_with_listener<A>(
     listener: impl BlockingTransportListener,
     config: ServerConfig,
     startup: StartupEvents<A::Event>,
+    sizing: A::Sizing,
     decoder: impl RequestDecoder<Event = A::Event> + 'static,
     encoder: impl ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -720,6 +726,7 @@ where
         listener,
         config,
         startup,
+        sizing,
         Arc::new(decoder),
         Arc::new(encoder),
         event_publisher,
@@ -731,6 +738,7 @@ fn run_tcp<A, L>(
     listener: L,
     config: ServerConfig,
     startup: StartupEvents<A::Event>,
+    sizing: A::Sizing,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -747,6 +755,7 @@ where
         listener,
         config,
         startup,
+        sizing,
         decoder,
         encoder,
         event_publisher,
@@ -815,6 +824,7 @@ fn run_impl<A, L>(
     listener: L,
     config: ServerConfig,
     mut startup: StartupEvents<A::Event>,
+    sizing: A::Sizing,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -1017,6 +1027,7 @@ where
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             Arc::clone(&fence_state),
+            &sizing,
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
@@ -1027,7 +1038,11 @@ where
                 // Release --health-bind before run_as_primary rebinds it
                 // with the full primary health state.
                 replica_health.stop();
-                <A as Application>::prefault(&mut exchange);
+                // A replica that ran a pipeline sized this instance
+                // already; one promoted before its first session did
+                // not (recovered from disk, never streamed). Sizing is
+                // idempotent, so size here either way.
+                <A as Application>::prefault(&mut exchange, &sizing);
 
                 // A ROTATE received while this node was a replica latched
                 // the flag but rotated nothing (rotation is primary-driven
@@ -1095,12 +1110,13 @@ where
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — the genesis events will flow through the pipeline later.
     let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, BufferedWriter<A::Event>>(&config)?;
+        init_engine::<A, BufferedWriter<A::Event>>(&config, &sizing)?;
 
-    // Pre-fault any application-owned memory (slabs, indices) so page
-    // faults happen now, not on the hot path. Default trait impl is a
-    // no-op; `Exchange` overrides.
-    <A as Application>::prefault(&mut exchange);
+    // Size and pre-fault application-owned memory (slabs, indices) so
+    // growth and page faults happen now, not on the hot path. Runs on the
+    // recovered state too: a snapshot restores contents, not capacity,
+    // and `init_engine` sizes a genesis instance before replay only.
+    <A as Application>::prefault(&mut exchange, &sizing);
 
     // A primary booting directly (not via promotion) keeps whatever epoch
     // its journal recovered; no bump.
@@ -2099,6 +2115,7 @@ where
 fn run_dpdk<A>(
     config: ServerConfig,
     startup: StartupEvents<A::Event>,
+    sizing: A::Sizing,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -2115,6 +2132,7 @@ where
     run_dpdk_impl::<A>(
         config,
         startup,
+        sizing,
         decoder,
         encoder,
         event_publisher,
@@ -2181,6 +2199,7 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String
 fn run_dpdk_impl<A>(
     config: ServerConfig,
     mut startup: StartupEvents<A::Event>,
+    sizing: A::Sizing,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
@@ -2378,6 +2397,7 @@ where
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             Arc::clone(&fence_state),
+            &sizing,
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
@@ -2386,7 +2406,8 @@ where
                 info!("replica promoted (DPDK) — transitioning to primary");
                 // Release --health-bind before run_as_primary rebinds it.
                 replica_health.stop();
-                <A as Application>::prefault(&mut exchange);
+                // Idempotent; see the kernel-TCP promotion path.
+                <A as Application>::prefault(&mut exchange, &sizing);
 
                 // Clear a ROTATE latched while this node was a replica —
                 // see the kernel-TCP promotion path.
@@ -2461,10 +2482,11 @@ where
         "loaded authorized keys"
     );
 
-    // Initialize or recover the exchange.
+    // Initialize or recover the exchange, then size it — see the
+    // kernel-TCP primary path.
     let (mut exchange, writer, needs_seeding, recovered_epoch) =
-        init_engine::<A, BufferedWriter<A::Event>>(&config)?;
-    <A as Application>::prefault(&mut exchange);
+        init_engine::<A, BufferedWriter<A::Event>>(&config, &sizing)?;
+    <A as Application>::prefault(&mut exchange, &sizing);
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
@@ -3109,8 +3131,13 @@ fn choose_bootstrap(
 /// (snapshot+journal, snapshot only, journal only, fresh) are
 /// transport-level concerns and work uniformly for any `A: Application`
 /// via `JournaledApp<A>`. Same engine initialization the TCP / DPDK paths use.
+///
+/// `sizing` is applied to a genesis instance before a journal is replayed
+/// into it, so the history lands in reserved collections; the caller
+/// sizes the result again afterwards, which covers the snapshot paths.
 pub(crate) fn init_engine<A, W>(
     config: &ServerConfig,
+    sizing: &A::Sizing,
 ) -> Result<(A, W, bool, u64), Box<dyn std::error::Error>>
 where
     A: Application,
@@ -3162,7 +3189,12 @@ where
             }
             BootstrapSource::JournalOnly => {
                 info!("recovering from journal");
-                JournaledApp::<A, W>::recover(A::default(), &config.journal)?
+                // Sized before the history is applied to it, as a replica
+                // is before it applies the stream: replay must not grow
+                // the collections the sizing would have reserved.
+                let mut app = A::default();
+                <A as Application>::prefault(&mut app, sizing);
+                JournaledApp::<A, W>::recover(app, &config.journal)?
             }
             BootstrapSource::Fresh => {
                 info!("creating new journal");

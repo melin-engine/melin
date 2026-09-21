@@ -1125,6 +1125,9 @@ pub fn run_receiver_dpdk<A>(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // Applied to every instance this loop builds a pipeline around; see
+    // `build_replica_pipeline_with_threads`.
+    sizing: &A::Sizing,
 ) -> ReceiverResult<A, BufferedWriter<A::Event>>
 where
     A: Application + Send + 'static,
@@ -1140,6 +1143,7 @@ where
             journal_path,
             &snapshot_path,
             &fence_state,
+            sizing,
         )?;
     // Fence epoch now reflects the recovered journal; seed the advertised
     // sequence from the same recovery, then let the raft driver trust
@@ -1550,6 +1554,7 @@ where
                 group_commit_delay,
                 Arc::clone(&fence_state),
                 Arc::clone(pipeline_healthy),
+                sizing,
             )?);
 
             // Pipeline children are spawned and self-pinned. Now safe to
@@ -1613,6 +1618,7 @@ where
             // socket entry to the socket set; each reconnect allocates a
             // fresh one, so skipping it leaks one entry per disconnect.
             || transport.close(handle),
+            sizing,
         ) {
             AfterSession::Return(r) => return r,
             AfterSession::Resync {

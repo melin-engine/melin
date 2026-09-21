@@ -96,6 +96,7 @@ impl Application for TestApp {
     type Event = TestEvent;
     type Report = TestReport;
     type QueryResponse = TestQuery;
+    type Sizing = ();
 
     const APP_VERSION: u16 = 42;
 

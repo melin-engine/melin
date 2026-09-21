@@ -68,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         genesis: my_reference_data(/* ... */),
         on_primary: my_limits(/* ... */),
     };
-    server::run::<MyApp>(config, startup, MyDecoder, MyEncoder, None)
+    server::run::<MyApp>(config, startup, my_sizing(/* ... */), MyDecoder, MyEncoder, None)
 }
 ```
 
