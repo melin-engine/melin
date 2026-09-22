@@ -131,7 +131,7 @@ pub(crate) fn process_client_frames<A: Application>(
         let frame = &parse_buf[cursor + 4..cursor + 4 + frame_len];
         cursor += 4 + frame_len;
 
-        let (seq, event) = match decoder.decode(frame, permission) {
+        let event = match decoder.decode(frame, permission) {
             Decoded::Filter => continue,
             Decoded::PermissionDenied(reason) => {
                 debug!(connection_id, reason, "permission denied, dropping request");
@@ -141,7 +141,7 @@ pub(crate) fn process_client_frames<A: Application>(
                 debug!(connection_id, reason, "decode error");
                 continue;
             }
-            Decoded::Permitted { request_seq, event } => (request_seq, event),
+            Decoded::Permitted(event) => event,
         };
 
         if let Some(reason) = refusal_reason
@@ -171,7 +171,6 @@ pub(crate) fn process_client_frames<A: Application>(
         let push_result = batch.try_push_with(|slot| {
             slot.connection_id = connection_id;
             slot.key_hash = key_hash;
-            slot.request_seq = seq;
             slot.sequence = 0;
             slot.timestamp_ns = ts;
             slot.event = event;

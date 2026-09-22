@@ -582,13 +582,12 @@ fn replay_segment<A: Application>(
                     });
                 }
                 if entry.sequence > snap_sequence {
-                    // Replay produces no output, whatever the outcome: the
-                    // client got its reply — or its refusal — when the
-                    // event was live.
+                    // Replay produces no output: the client got its reply
+                    // when the event was live, and a query is never
+                    // journaled.
                     let _ = dispatch(
                         app,
                         entry.event,
-                        entry.request_seq,
                         &offline_ctx(entry.timestamp_ns, entry.key_hash),
                         last_drain_ns,
                         |epoch| crate::fence::observe_into(recovered_epoch, epoch),
@@ -701,16 +700,15 @@ mod tests {
     use crate::test_support::{TestApp, TestEvent};
     use melin_app::ApplyCtx;
     use melin_journal::{BufferedWriter, JournalEvent, JournalReader};
+    use std::collections::HashMap;
 
     // Concrete writer used by every test. The buffered path covers
     // the same JournaledApp logic without needing PLP hardware.
     type TestApp_ = JournaledApp<TestApp, BufferedWriter<TestEvent>>;
 
-    /// Write events with auto-allocated sequences and fsync them to disk.
-    /// Each event is keyed on `(key_hash = 1, request_seq = first_seq + idx)`
-    /// so tests that append in multiple phases can offset `first_seq` to
-    /// avoid dedup collisions across calls.
-    fn append_events(ja: TestApp_, events: &[TestEvent], first_seq: u64) -> TestApp_ {
+    /// Write events with auto-allocated sequences and fsync them to disk,
+    /// each submitted under `key_hash = 1`.
+    fn append_events(ja: TestApp_, events: &[TestEvent]) -> TestApp_ {
         let (app, mut writer) = ja.into_parts();
         for (i, e) in events.iter().enumerate() {
             let seq = writer.allocate_sequence();
@@ -720,7 +718,6 @@ mod tests {
                     /* timestamp_ns */ 1_000 * (i as u64 + 1),
                     &JournalEvent::App(*e),
                     /* key_hash */ 1,
-                    /* request_seq */ first_seq + i as u64,
                 )
                 .unwrap();
         }
@@ -729,10 +726,9 @@ mod tests {
     }
 
     /// Compute the TestApp state that results from applying `events` in
-    /// order, using the same `(key_hash, request_seq)` scheme as
-    /// `append_events`. Mirrors `replay_entry`'s dedup gate (post-#7) so
-    /// the expected state matches what replay produces.
-    fn expected_state(events: &[TestEvent], first_seq: u64) -> TestApp {
+    /// order under `append_events`' `key_hash` and timestamps, so the
+    /// expected state matches what replay produces.
+    fn expected_state(events: &[TestEvent]) -> TestApp {
         let mut app = TestApp::new();
         let mut reports = Vec::new();
         let ctx = ApplyCtx {
@@ -743,12 +739,9 @@ mod tests {
             key_hash: 1,
         };
         for (i, e) in events.iter().enumerate() {
-            let is_new = app.check_request_seq(1, first_seq + i as u64);
             let ts = 1_000 * (i as u64 + 1);
             app.tick(ts, &mut reports);
-            if is_new {
-                let _ = app.apply(*e, &ctx, &mut reports);
-            }
+            let _ = app.apply(*e, &ctx, &mut reports);
         }
         app
     }
@@ -788,15 +781,15 @@ mod tests {
         // then another App event — the shape a promoted primary produces.
         let s0 = writer.allocate_sequence();
         writer
-            .encode_event(s0, 1_000, &JournalEvent::App(TestEvent::Add(5)), 1, 1)
+            .encode_event(s0, 1_000, &JournalEvent::App(TestEvent::Add(5)), 1)
             .unwrap();
         let s1 = writer.allocate_sequence();
         writer
-            .encode_event(s1, 2_000, &JournalEvent::EpochBump { epoch: 3 }, 0, 0)
+            .encode_event(s1, 2_000, &JournalEvent::EpochBump { epoch: 3 }, 0)
             .unwrap();
         let s2 = writer.allocate_sequence();
         writer
-            .encode_event(s2, 3_000, &JournalEvent::App(TestEvent::Add(7)), 1, 2)
+            .encode_event(s2, 3_000, &JournalEvent::App(TestEvent::Add(7)), 1)
             .unwrap();
         writer.flush_batch_sync().unwrap();
         drop(JournaledApp::from_parts(app, writer, 0));
@@ -831,7 +824,7 @@ mod tests {
         let path = dir.path().join("journal.bin");
 
         let ja = TestApp_::create(TestApp::new(), &path).unwrap();
-        let ja = append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)], 1);
+        let ja = append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)]);
         drop(ja);
 
         // Rewrite the header with an old format version. Header layout
@@ -876,11 +869,11 @@ mod tests {
 
         let events = [TestEvent::Add(3), TestEvent::Add(7), TestEvent::Add(100)];
         let ja = TestApp_::create(TestApp::new(), &path).unwrap();
-        let ja = append_events(ja, &events, 1);
+        let ja = append_events(ja, &events);
         drop(ja);
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
-        assert_eq!(*recovered.app(), expected_state(&events, 1));
+        assert_eq!(*recovered.app(), expected_state(&events));
     }
 
     #[test]
@@ -891,12 +884,12 @@ mod tests {
 
         let events = [TestEvent::Add(10), TestEvent::Add(20)];
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        drop(append_events(ja, &events, 1)); // journal write, writer drops
+        drop(append_events(ja, &events)); // journal write, writer drops
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
         let (restored, seq, _chain, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        assert_eq!(restored, expected_state(&events, 1));
+        assert_eq!(restored, expected_state(&events));
         // Sequences are 1-indexed; after N events, next_sequence = N + 1
         // and save_snapshot records the last issued sequence (next - 1) = N.
         assert_eq!(seq, events.len() as u64);
@@ -911,16 +904,15 @@ mod tests {
         let pre = [TestEvent::Add(1), TestEvent::Add(2)];
         let post = [TestEvent::Add(40), TestEvent::Add(50)];
 
-        // Phase 1: create + pre events (request_seqs 1..=2) + snapshot.
+        // Phase 1: create + pre events + snapshot.
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &pre, 1);
+        let ja = append_events(ja, &pre);
         drop(ja);
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
-        // Phase 2: append post events (request_seqs 3..=4 — disjoint from
-        // pre, so they pass dedup) to the same journal file; no rotation.
-        let ja = append_events(ja, &post, pre.len() as u64 + 1);
+        // Phase 2: append post events to the same journal file; no rotation.
+        let ja = append_events(ja, &post);
         drop(ja);
 
         // Phase 3: recover_from_snapshot should load the snapshot (state
@@ -929,48 +921,40 @@ mod tests {
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
 
         let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
-        assert_eq!(recovered.app().total, expected_state(&all, 1).total);
+        assert_eq!(recovered.app().total, expected_state(&all).total);
     }
 
+    /// Replay hands every journaled app event to `apply` under the key
+    /// that submitted it. The transport filters nothing on the way: an
+    /// application that refuses repeats (a duplicate request) refuses
+    /// them in `apply`, from state rebuilt by exactly this stream, so
+    /// replay reaches the verdict the live dispatch did.
     #[test]
-    fn replay_skips_duplicate_app_events() {
-        // The journal stage writes before the matching stage dedups, so
-        // the journal can legitimately contain two entries sharing a
-        // `(key_hash, request_seq)`. Only the first reaches `apply` on
-        // the live primary; replay must mirror that or recovered state
-        // will double-apply the duplicate.
+    fn replay_applies_every_app_event_under_its_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.bin");
 
         let ja = TestApp_::create(TestApp::new(), &path).unwrap();
         let (_app, mut writer) = ja.into_parts();
 
-        let dup = JournalEvent::App(TestEvent::Add(100));
-        for _ in 0..2 {
+        // Two identical submissions under key 5, one under key 6.
+        let entries = [(5u64, 100u64), (5, 100), (6, 7)];
+        for (key_hash, n) in entries {
             let seq = writer.allocate_sequence();
             writer
-                .encode_event(
-                    seq, 1_000, &dup, /* key_hash */ 5, /* request_seq */ 10,
-                )
+                .encode_event(seq, 1_000, &JournalEvent::App(TestEvent::Add(n)), key_hash)
                 .unwrap();
         }
         writer.flush_batch_sync().unwrap();
         drop(writer);
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
-        // First Add(100) applied; second is a duplicate and must be
-        // skipped — total stays at 100, not 200.
-        assert_eq!(recovered.app().total, 100);
-        // HWM for key 5 should record seq 10 exactly once; a second
-        // check_request_seq at seq 10 must still be rejected as a
-        // duplicate after recovery.
-        let mut app = TestApp {
-            total: recovered.app().total,
-            ticks: recovered.app().ticks,
-            key_hwm: recovered.app().key_hwm.clone(),
-        };
-        assert!(!app.check_request_seq(5, 10));
-        assert!(app.check_request_seq(5, 11));
+        assert_eq!(recovered.app().total, 207);
+        assert_eq!(
+            recovered.app().per_key_total,
+            HashMap::from([(5, 200), (6, 7)]),
+            "each event must reach apply under the key that submitted it"
+        );
     }
 
     #[test]
@@ -981,12 +965,12 @@ mod tests {
 
         let events = [TestEvent::Add(11), TestEvent::Add(22)];
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &events, 1);
+        let mut ja = append_events(ja, &events);
         let pre_rotate_next_seq = ja.next_sequence();
         let pre_rotate_state = TestApp {
             total: ja.app().total,
             ticks: ja.app().ticks,
-            key_hwm: ja.app().key_hwm.clone(),
+            per_key_total: ja.app().per_key_total.clone(),
         };
 
         ja.save_snapshot(&snap_path).unwrap();
@@ -1016,7 +1000,7 @@ mod tests {
     /// the live segment and produce identical balances to a no-rotation
     /// run with the same events.
     ///
-    /// Compares `total` and `key_hwm` only; `ticks` is sensitive to the
+    /// Compares `total` and `per_key_total` only; `ticks` is sensitive to the
     /// per-phase timestamp restart in `append_events` and isn't part of
     /// the rotation behaviour under test.
     #[test]
@@ -1031,20 +1015,16 @@ mod tests {
         let phase_d = [TestEvent::Add(1000)];
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &phase_a, 1);
+        let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
-        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        let mut ja = append_events(ja, &phase_b);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
-        let mut ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
+        let mut ja = append_events(ja, &phase_c);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
-        let ja = append_events(
-            ja,
-            &phase_d,
-            1 + (phase_a.len() + phase_b.len() + phase_c.len()) as u64,
-        );
+        let ja = append_events(ja, &phase_d);
         drop(ja);
 
         // Sanity: all three archives plus a live segment exist on disk.
@@ -1055,13 +1035,12 @@ mod tests {
         assert!(journal_path.exists(), "live journal should exist");
 
         let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
-        let total_events = phase_a.len() + phase_b.len() + phase_c.len() + phase_d.len();
-        assert_eq!(recovered.app().total, 1 + 2 + 10 + 20 + 100 + 200 + 1000);
-        // HWM is per (key_hash=1, request_seq) and append_events uses
-        // sequential request_seqs (1..=7).
+        let expected_total = 1 + 2 + 10 + 20 + 100 + 200 + 1000;
+        assert_eq!(recovered.app().total, expected_total);
+        // append_events submits every event under key_hash 1.
         assert_eq!(
-            recovered.app().key_hwm.get(&1).copied(),
-            Some(total_events as u64)
+            recovered.app().per_key_total,
+            HashMap::from([(1, expected_total)])
         );
     }
 
@@ -1082,13 +1061,13 @@ mod tests {
         let phase_c = [TestEvent::Add(100), TestEvent::Add(200)];
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &phase_a, 1);
+        let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
-        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        let mut ja = append_events(ja, &phase_b);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
-        let ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
+        let ja = append_events(ja, &phase_c);
         drop(ja);
 
         // Replay everything to populate the app, then snapshot it.
@@ -1096,7 +1075,7 @@ mod tests {
         let expected = TestApp {
             total: recovered.app().total,
             ticks: recovered.app().ticks,
-            key_hwm: recovered.app().key_hwm.clone(),
+            per_key_total: recovered.app().per_key_total.clone(),
         };
         let final_snap = dir.path().join("final.snap");
         recovered.save_snapshot(&final_snap).unwrap();
@@ -1133,10 +1112,10 @@ mod tests {
         let phase_b = [TestEvent::Add(2)];
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &phase_a, 1);
+        let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap(); // → archive 000001 sealed
-        let ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        let ja = append_events(ja, &phase_b);
         drop(ja);
 
         // Rewrite the first entry of archive 000001 with a modified
@@ -1203,7 +1182,7 @@ mod tests {
             })
             .sum();
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &events, 1);
+        let ja = append_events(ja, &events);
         let pre_crash_seq = ja.next_sequence();
         // Drop the writer (closes the fd) before the rename so this is
         // a clean simulation of "live archived, no successor file."
@@ -1237,7 +1216,7 @@ mod tests {
         // Append more events through the synthesized live and re-recover
         // — proves the new live is fully usable, not just a placeholder.
         let post = [TestEvent::Add(100)];
-        let ja = append_events(recovered, &post, 1 + events.len() as u64);
+        let ja = append_events(recovered, &post);
         drop(ja);
         let re = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         assert_eq!(re.app().total, expected_total + 100);
@@ -1279,7 +1258,7 @@ mod tests {
         // writing anything else — Phase C state is "rotation finished,
         // no fresh events yet."
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &events, 1);
+        let ja = append_events(ja, &events);
         let (app, mut writer) = ja.into_parts();
         writer.rotate_segment().unwrap();
         drop(writer);
@@ -1318,12 +1297,12 @@ mod tests {
         // pre events (seqs 1-2), recover to populate the app, snapshot
         // at seq 2, then post events (seqs 3-4) into the SAME segment.
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &pre, 1);
+        let ja = append_events(ja, &pre);
         drop(ja);
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         let pre_total = ja.app().total;
         ja.save_snapshot(&snap_path).unwrap();
-        let mut ja = append_events(ja, &post, 1 + pre.len() as u64);
+        let mut ja = append_events(ja, &post);
 
         // Rotation seals seqs 1-4 into archive 000001; deleting the
         // fresh live reproduces the crash window between the rename and
@@ -1350,11 +1329,7 @@ mod tests {
 
         // The synthesized live is usable: append, then re-recover the
         // full lineage from the same snapshot.
-        let ja = append_events(
-            recovered,
-            &[TestEvent::Add(100)],
-            1 + (pre.len() + post.len()) as u64,
-        );
+        let ja = append_events(recovered, &[TestEvent::Add(100)]);
         drop(ja);
         let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
         assert_eq!(re.app().total, pre_total + 10 + 20 + 100);
@@ -1376,14 +1351,14 @@ mod tests {
         let pre = [TestEvent::Add(10), TestEvent::Add(20), TestEvent::Add(30)];
         let post = [TestEvent::Add(40)];
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &pre, 1);
+        let ja = append_events(ja, &pre);
         drop(ja);
         // Recover (populates app state), snapshot at the tail, rotate.
         let mut ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         let expected_pre_total = ja.app().total;
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
-        let ja = append_events(ja, &post, 1 + pre.len() as u64);
+        let ja = append_events(ja, &post);
         drop(ja);
 
         // Trim the archive that contains the anchor entry.
@@ -1409,7 +1384,7 @@ mod tests {
 
         let pre = [TestEvent::Add(1), TestEvent::Add(2)];
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &pre, 1);
+        let mut ja = append_events(ja, &pre);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
         drop(ja);
@@ -1470,7 +1445,7 @@ mod tests {
         let post = [TestEvent::Add(100), TestEvent::Add(200)];
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &pre, 1);
+        let ja = append_events(ja, &pre);
         drop(ja);
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
@@ -1483,12 +1458,12 @@ mod tests {
         );
 
         // Append post-snapshot events and verify round-trip.
-        let ja = append_events(ja, &post, 1 + pre.len() as u64);
+        let ja = append_events(ja, &post);
         drop(ja);
 
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
         let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
-        assert_eq!(recovered.app().total, expected_state(&all, 1).total);
+        assert_eq!(recovered.app().total, expected_state(&all).total);
     }
 
     /// Snapshot-less recovery on a journal whose oldest segment begins
@@ -1507,11 +1482,11 @@ mod tests {
         let phase_c = [TestEvent::Add(100)];
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &phase_a, 1);
+        let mut ja = append_events(ja, &phase_a);
         ja.rotate_segment().unwrap();
-        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        let mut ja = append_events(ja, &phase_b);
         ja.rotate_segment().unwrap();
-        let ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
+        let ja = append_events(ja, &phase_c);
         drop(ja);
 
         // Trim the oldest archive — the surviving 000002 starts at
@@ -1554,10 +1529,10 @@ mod tests {
         // Snapshot at seq 2 (tail of phase_a), then two rotations so
         // the live segment starts at seq 5.
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &phase_a, 1);
+        let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
-        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        let mut ja = append_events(ja, &phase_b);
         ja.rotate_segment().unwrap();
         drop(ja);
 
@@ -1596,11 +1571,11 @@ mod tests {
         let phase_c = [TestEvent::Add(100)];
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &phase_a, 1);
+        let mut ja = append_events(ja, &phase_a);
         ja.rotate_segment().unwrap();
-        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        let mut ja = append_events(ja, &phase_b);
         ja.rotate_segment().unwrap();
-        let ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
+        let ja = append_events(ja, &phase_c);
         drop(ja);
 
         std::fs::remove_file(dir.path().join("journal.bin.000002")).unwrap();
@@ -1630,10 +1605,10 @@ mod tests {
         let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &phase_a, 1);
+        let mut ja = append_events(ja, &phase_a);
         ja.rotate_segment().unwrap();
         ja.rotate_segment().unwrap(); // archive 000002 is empty
-        let ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        let ja = append_events(ja, &phase_b);
         drop(ja);
 
         // Sanity: the empty middle archive exists and starts where the
@@ -1710,7 +1685,7 @@ mod tests {
 
         let events = [TestEvent::Add(5), TestEvent::Add(7)];
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &events, 1);
+        let mut ja = append_events(ja, &events);
         ja.rotate_segment().unwrap();
         ja.rotate_segment().unwrap(); // archive 000002 is empty
         drop(ja);
@@ -1727,7 +1702,7 @@ mod tests {
 
         // The synthesized live must be appendable and re-recoverable —
         // its anchor chained through the empty archive.
-        let ja = append_events(recovered, &[TestEvent::Add(100)], 1 + events.len() as u64);
+        let ja = append_events(recovered, &[TestEvent::Add(100)]);
         drop(ja);
         let re = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         assert_eq!(re.app().total, 5 + 7 + 100);
@@ -1749,7 +1724,7 @@ mod tests {
 
         // Genuine lineage: events, snapshot at the tail, rotate.
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &events, 1);
+        let mut ja = append_events(ja, &events);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
         drop(ja);
@@ -1759,7 +1734,7 @@ mod tests {
         let foreign_dir = tempfile::tempdir().unwrap();
         let foreign_live = foreign_dir.path().join("journal.bin");
         let fja = TestApp_::create(TestApp::new(), &foreign_live).unwrap();
-        let mut fja = append_events(fja, &[TestEvent::Add(9), TestEvent::Add(8)], 1);
+        let mut fja = append_events(fja, &[TestEvent::Add(9), TestEvent::Add(8)]);
         fja.rotate_segment().unwrap();
         drop(fja);
 
@@ -1794,7 +1769,7 @@ mod tests {
         // Build state and snapshot at the journal's tail.
         let events = [TestEvent::Add(3), TestEvent::Add(5), TestEvent::Add(7)];
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &events, 1);
+        let ja = append_events(ja, &events);
         drop(ja);
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
@@ -1807,7 +1782,7 @@ mod tests {
         // first event — its tail sequence sits well below `snap_seq`.
         std::fs::remove_file(&journal_path).unwrap();
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let _ja = append_events(ja, &events[..1], 1);
+        let _ja = append_events(ja, &events[..1]);
         drop(_ja);
 
         let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
@@ -1847,7 +1822,7 @@ mod tests {
         // Three events → seqs 1,2,3. snap_seq = 3.
         let events = [TestEvent::Add(3), TestEvent::Add(5), TestEvent::Add(7)];
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &events, 1);
+        let ja = append_events(ja, &events);
         drop(ja);
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
@@ -1912,12 +1887,12 @@ mod tests {
         // the last event before rotation, which ends up inside archive
         // 000001 after the rotate below.
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &phase_a, 1);
+        let mut ja = append_events(ja, &phase_a);
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
         // Phase B lives in the new live segment; recovery must not
         // reach it once the archive's mismatch is detected.
-        let ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        let ja = append_events(ja, &phase_b);
         drop(ja);
 
         // Round-trip the snapshot with a deliberately wrong chain hash
@@ -1990,7 +1965,7 @@ mod tests {
             TestEvent::Add(17),
         ];
         let ja = TestApp_::create(TestApp::new(), &original).unwrap();
-        let ja = append_events(ja, &events, 1);
+        let ja = append_events(ja, &events);
         drop(ja);
 
         let end = valid_data_end(&original);
@@ -2033,7 +2008,7 @@ mod tests {
 
                         // Append + re-recover to prove the recovered
                         // writer is usable, not just readable.
-                        let ja = append_events(je, &[TestEvent::Add(1)], events.len() as u64 + 1);
+                        let ja = append_events(je, &[TestEvent::Add(1)]);
                         drop(ja);
                         let je2 = TestApp_::recover(TestApp::new(), &work).unwrap();
                         assert!(
@@ -2074,7 +2049,7 @@ mod tests {
         let post = [TestEvent::Add(11), TestEvent::Add(13)];
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &pre, 1);
+        let ja = append_events(ja, &pre);
         drop(ja);
         // Recover to populate app state from journal, then snapshot —
         // `append_events` doesn't apply to the app on the write path,
@@ -2083,7 +2058,7 @@ mod tests {
         let mut ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
         ja.rotate_segment().unwrap();
-        let ja = append_events(ja, &post, 1 + pre.len() as u64);
+        let ja = append_events(ja, &post);
         let final_seq = ja.next_sequence();
         drop(ja);
 
@@ -2179,7 +2154,7 @@ mod tests {
             .sum();
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &archived_events, 1);
+        let ja = append_events(ja, &archived_events);
         let (app, mut writer) = ja.into_parts();
         writer.rotate_segment().unwrap();
         // Encode an event into the new live's in-memory batch but DON'T
@@ -2192,7 +2167,6 @@ mod tests {
                 /* timestamp_ns */ 999_000,
                 &JournalEvent::App(TestEvent::Add(99_999)),
                 /* key_hash */ 1,
-                /* request_seq */ 1 + archived_events.len() as u64,
             )
             .unwrap();
         // Drop without flushing — that's the simulated crash.

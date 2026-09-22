@@ -46,7 +46,6 @@ fn slot(sequence: u64) -> InputSlot<TestEvent> {
     InputSlot {
         connection_id: 0,
         key_hash: 0,
-        request_seq: sequence,
         sequence,
         timestamp_ns: 0,
         event: JournalEvent::App(TestEvent::Add(sequence)),

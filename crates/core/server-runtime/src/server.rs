@@ -1828,7 +1828,6 @@ where
         input_producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: unix_epoch_nanos(),
             event: JournalEvent::EpochBump { epoch: new_epoch },
@@ -2000,9 +1999,10 @@ where
             }
         };
 
-        // Hash the client's public key for per-key idempotency dedup.
-        // FxHash is fast and non-cryptographic — sufficient for dedup
-        // table keying (the public key itself is already authenticated).
+        // Hash the client's public key into the identity the application
+        // sees as `ApplyCtx::key_hash`. FxHash is fast and
+        // non-cryptographic — sufficient for keying per-key state (the
+        // public key itself is already authenticated).
         let key_hash = {
             let mut hasher = rustc_hash::FxHasher::default();
             public_key_bytes.hash(&mut hasher);
@@ -3034,7 +3034,6 @@ fn journal_startup_events<E: melin_app::AppEvent>(
         last_published_seq = input_producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: unix_epoch_nanos(),
             event: JournalEvent::App(event),
@@ -3469,8 +3468,8 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         .read_exact(&mut frame_buf[..frame_len])
         .map_err(|e| io::Error::other(format!("read auth frame payload: {e}")))?;
 
-    let (_seq, cr) = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
-        Ok(pair) => pair,
+    let cr = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
+        Ok(cr) => cr,
         Err(e) => {
             send_auth_failed(writer);
             return Err(io::Error::other(format!("decode ChallengeResponse: {e}")).into());
@@ -3787,14 +3786,13 @@ mod tests {
 
     /// Write a length-prefixed ChallengeResponse frame, matching the
     /// layout the runtime's `control_codec::decode_challenge_response`
-    /// expects: `[len:u32][seq:u64][TAG_CHALLENGE_RESPONSE][sig:64][pubkey:32]`.
+    /// expects: `[len:u32][TAG_CHALLENGE_RESPONSE][sig:64][pubkey:32]`.
     fn write_challenge_response(
         stream: &mut UnixStream,
         signature: [u8; 64],
         public_key: [u8; 32],
     ) {
-        let mut frame = Vec::with_capacity(105);
-        frame.extend_from_slice(&0u64.to_le_bytes()); // request_seq
+        let mut frame = Vec::with_capacity(97);
         frame.push(TAG_CHALLENGE_RESPONSE);
         frame.extend_from_slice(&signature);
         frame.extend_from_slice(&public_key);
@@ -3903,11 +3901,11 @@ mod tests {
         read_challenge(&mut s2);
 
         // Send a frame carrying a transport-heartbeat tag where a
-        // ChallengeResponse is expected. It is the right length (105) so
+        // ChallengeResponse is expected. It is the right length (97) so
         // the auth decoder reaches the tag check and rejects the
         // unexpected tag, replying AuthFailed.
-        let mut frame = vec![0u8; 105];
-        frame[8] = TAG_RESPONSE_HEARTBEAT; // tag byte sits after the u64 seq
+        let mut frame = vec![0u8; 97];
+        frame[0] = TAG_RESPONSE_HEARTBEAT;
         s2.write_all(&(frame.len() as u32).to_le_bytes()).unwrap();
         s2.write_all(&frame).unwrap();
         s2.flush().unwrap();

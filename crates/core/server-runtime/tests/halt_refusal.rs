@@ -11,8 +11,7 @@
 //! One increment is acked while the replica is attached; the replica is
 //! then stopped, and a second increment must be refused while a query
 //! still answers, and counted on the health endpoint. A replica then
-//! attaches again, and the client resends the refused increment under the
-//! same request sequence: a refusal consumed nothing, so the resend is
+//! attaches again, and the client resends the refused increment, which is
 //! taken. The primary is restarted standalone on its own journal, and
 //! replay must reach the value the client was told.
 
@@ -98,13 +97,13 @@ fn wait_for_gauge(health: SocketAddr, name: &str, value: u64) {
 }
 
 /// Send one request and return the single frame of its reply.
-fn one_reply(conn: &mut Connection, seq: u64, tag: u8, body: &[u8]) -> Vec<u8> {
-    conn.request_one(seq, tag, body)
-        .unwrap_or_else(|e| panic!("request {seq} (tag {tag:#04x}) failed: {e}"))
+fn one_reply(conn: &mut Connection, tag: u8, body: &[u8]) -> Vec<u8> {
+    conn.request_one(tag, body)
+        .unwrap_or_else(|e| panic!("request (tag {tag:#04x}) failed: {e}"))
 }
 
-fn value_of(conn: &mut Connection, seq: u64) -> u64 {
-    let reply = one_reply(conn, seq, TAG_GET_VALUE, &[]);
+fn value_of(conn: &mut Connection) -> u64 {
+    let reply = one_reply(conn, TAG_GET_VALUE, &[]);
     assert_eq!(reply[0], TAG_RESP_VALUE);
     u64::from_le_bytes(reply[1..9].try_into().expect("8 bytes"))
 }
@@ -171,19 +170,19 @@ fn a_write_refused_while_halted_is_not_replayed() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut conn = Connection::connect_by(primary_client, &client_key, deadline)
         .expect("client connects to the primary");
-    let ack = one_reply(&mut conn, 1, TAG_INCREMENT, &1u64.to_le_bytes());
+    let ack = one_reply(&mut conn, TAG_INCREMENT, &1u64.to_le_bytes());
     assert_eq!(ack[0], TAG_RESP_ACK, "the first increment is acked");
 
     // --- Halted: the replica leaves, the next write is refused. ---
     stop_node(replica, &replica_shutdown, replica_client);
     wait_for_gauge(primary_health, "melin_replicas_connected", 0);
-    let refused = one_reply(&mut conn, 2, TAG_INCREMENT, &5u64.to_le_bytes());
+    let refused = one_reply(&mut conn, TAG_INCREMENT, &5u64.to_le_bytes());
     assert_eq!(
         refused[0], TAG_RESP_REJECTED,
         "a halted primary must refuse the write"
     );
     assert_eq!(
-        value_of(&mut conn, 3),
+        value_of(&mut conn),
         1,
         "queries still answer, and the refused write is not applied"
     );
@@ -198,12 +197,9 @@ fn a_write_refused_while_halted_is_not_replayed() {
     let replica_shutdown = Arc::new(AtomicBool::new(false));
     let replica = spawn_node(replica_config, &replica_shutdown);
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
-    let ack = one_reply(&mut conn, 2, TAG_INCREMENT, &5u64.to_le_bytes());
-    assert_eq!(
-        ack[0], TAG_RESP_ACK,
-        "a refusal consumed no request sequence: the resend is taken"
-    );
-    assert_eq!(value_of(&mut conn, 4), 6);
+    let ack = one_reply(&mut conn, TAG_INCREMENT, &5u64.to_le_bytes());
+    assert_eq!(ack[0], TAG_RESP_ACK, "the resend is taken");
+    assert_eq!(value_of(&mut conn), 6);
     drop(conn);
     stop_node(replica, &replica_shutdown, replica_client);
     stop_node(primary, &primary_shutdown, primary_client);
@@ -228,7 +224,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut conn = Connection::connect_by(restart_client, &client_key, deadline)
         .expect("client connects to the restarted primary");
-    let replayed = value_of(&mut conn, 5);
+    let replayed = value_of(&mut conn);
     drop(conn);
     stop_node(restarted, &restart_shutdown, restart_client);
 

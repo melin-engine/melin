@@ -111,10 +111,6 @@ impl Application for SizedCounter {
         self.0.tick(now_ns, out)
     }
 
-    fn check_request_seq(&mut self, key_hash: u64, seq: u64) -> bool {
-        self.0.check_request_seq(key_hash, seq)
-    }
-
     fn build_reject(event: &Self::Event, reason: RejectReason) -> Self::Report {
         Counter::build_reject(event, reason)
     }
@@ -207,15 +203,15 @@ fn connect(addr: SocketAddr, key: &SigningKey) -> Connection {
     conn
 }
 
-fn value_of(conn: &mut Connection, seq: u64) -> u64 {
-    let reply = conn.request_one(seq, TAG_GET_VALUE, &[]).expect("query");
+fn value_of(conn: &mut Connection) -> u64 {
+    let reply = conn.request_one(TAG_GET_VALUE, &[]).expect("query");
     assert_eq!(reply[0], TAG_RESP_VALUE);
     u64::from_le_bytes(reply[1..9].try_into().expect("8 bytes"))
 }
 
-fn increment(conn: &mut Connection, seq: u64, amount: u64) {
+fn increment(conn: &mut Connection, amount: u64) {
     let reply = conn
-        .request_one(seq, TAG_INCREMENT, &amount.to_le_bytes())
+        .request_one(TAG_INCREMENT, &amount.to_le_bytes())
         .expect("increment");
     assert_eq!(reply[0], TAG_RESP_ACK, "the increment is acked");
 }
@@ -313,7 +309,7 @@ fn every_node_sizes_its_own_instances_before_serving() {
     // the pipeline like any other. ---
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let mut conn = connect(primary_client, &client_key);
-    assert_eq!(value_of(&mut conn, 1), GENESIS, "genesis applied");
+    assert_eq!(value_of(&mut conn), GENESIS, "genesis applied");
     assert_eq!(
         primary_sizing.calls(),
         vec![Sized {
@@ -330,7 +326,7 @@ fn every_node_sizes_its_own_instances_before_serving() {
     // exists — so wait until the replica has journaled everything (it
     // acks only after its fsync) before reading its log or stopping it,
     // or the restart below would recover an empty journal. ---
-    increment(&mut conn, 2, 5);
+    increment(&mut conn, 5);
     wait_for_gauge(
         primary_health,
         "melin_replica_acked_sequence{slot=\"0\"}",
@@ -385,7 +381,7 @@ fn every_node_sizes_its_own_instances_before_serving() {
     );
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let mut conn = connect(primary_client, &client_key);
-    let replayed = value_of(&mut conn, 1);
+    let replayed = value_of(&mut conn);
     drop(conn);
     stop_node(replica, &replica_shutdown, replica_client);
     stop_node(primary, &primary_shutdown, primary_client);

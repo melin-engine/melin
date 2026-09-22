@@ -81,63 +81,54 @@ pub fn encode_transport_response(
 }
 
 /// Wire size of a challenge-response frame payload:
-/// seq(8) + tag(1) + signature(64) + public_key(32).
-pub const CHALLENGE_RESPONSE_LEN: usize = 8 + 1 + 64 + 32;
+/// tag(1) + signature(64) + public_key(32).
+pub const CHALLENGE_RESPONSE_LEN: usize = 1 + 64 + 32;
 
 /// Encode a client's auth challenge-response into `buf`, as the frame
 /// payload *without* the 4-byte length prefix:
-/// `[seq:u64][tag:u8][signature:64][pubkey:32]`.
+/// `[tag:u8][signature:64][pubkey:32]`.
 ///
 /// The inverse of [`decode_challenge_response`], kept beside it so the
 /// layout has one home. Returns `Err(Truncated)` if `buf` is shorter
 /// than [`CHALLENGE_RESPONSE_LEN`].
 pub fn encode_challenge_response(
-    request_seq: u64,
     response: &ChallengeResponse,
     buf: &mut [u8],
 ) -> Result<usize, ProtocolError> {
     if buf.len() < CHALLENGE_RESPONSE_LEN {
         return Err(ProtocolError::Truncated);
     }
-    buf[..8].copy_from_slice(&request_seq.to_le_bytes());
-    buf[8] = TAG_CHALLENGE_RESPONSE;
-    buf[9..73].copy_from_slice(&response.signature);
-    buf[73..105].copy_from_slice(&response.public_key);
+    buf[0] = TAG_CHALLENGE_RESPONSE;
+    buf[1..65].copy_from_slice(&response.signature);
+    buf[65..97].copy_from_slice(&response.public_key);
     Ok(CHALLENGE_RESPONSE_LEN)
 }
 
 /// Decode a client's auth challenge-response from a wire frame.
 ///
 /// `buf` must contain the frame payload *after* the 4-byte length
-/// prefix has been stripped: `[seq:u64][tag:u8][signature:64][pubkey:32]`.
+/// prefix has been stripped: `[tag:u8][signature:64][pubkey:32]`.
 ///
-/// Returns `(request_seq, ChallengeResponse)`. Returns
-/// `Err(UnknownTag)` if the tag is not `TAG_CHALLENGE_RESPONSE`.
-pub fn decode_challenge_response(buf: &[u8]) -> Result<(u64, ChallengeResponse), ProtocolError> {
+/// Returns `Err(UnknownTag)` if the tag is not `TAG_CHALLENGE_RESPONSE`.
+pub fn decode_challenge_response(buf: &[u8]) -> Result<ChallengeResponse, ProtocolError> {
     if buf.len() < CHALLENGE_RESPONSE_LEN {
         return Err(ProtocolError::Truncated);
     }
 
-    let seq = u64::from_le_bytes(buf[..8].try_into().unwrap());
-    let tag = buf[8];
-
+    let tag = buf[0];
     if tag != TAG_CHALLENGE_RESPONSE {
         return Err(ProtocolError::UnknownTag(tag));
     }
 
-    let payload = &buf[9..];
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&payload[..64]);
+    signature.copy_from_slice(&buf[1..65]);
     let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&payload[64..96]);
+    public_key.copy_from_slice(&buf[65..97]);
 
-    Ok((
-        seq,
-        ChallengeResponse {
-            signature,
-            public_key,
-        },
-    ))
+    Ok(ChallengeResponse {
+        signature,
+        public_key,
+    })
 }
 
 #[cfg(test)]
@@ -204,15 +195,13 @@ mod tests {
         let sig = [0x11; 64];
         let pubkey = [0x22; 32];
 
-        // Build wire frame: [seq:u64][tag:u8][sig:64][pubkey:32]
-        let mut buf = [0u8; 105];
-        buf[..8].copy_from_slice(&42u64.to_le_bytes());
-        buf[8] = TAG_CHALLENGE_RESPONSE;
-        buf[9..73].copy_from_slice(&sig);
-        buf[73..105].copy_from_slice(&pubkey);
+        // Build wire frame: [tag:u8][sig:64][pubkey:32]
+        let mut buf = [0u8; 97];
+        buf[0] = TAG_CHALLENGE_RESPONSE;
+        buf[1..65].copy_from_slice(&sig);
+        buf[65..97].copy_from_slice(&pubkey);
 
-        let (seq, cr) = decode_challenge_response(&buf).unwrap();
-        assert_eq!(seq, 42);
+        let cr = decode_challenge_response(&buf).unwrap();
         assert_eq!(cr.signature, sig);
         assert_eq!(cr.public_key, pubkey);
     }
@@ -224,13 +213,13 @@ mod tests {
             public_key: [0x44; 32],
         };
         let mut buf = [0u8; CHALLENGE_RESPONSE_LEN];
-        let written = encode_challenge_response(7, &response, &mut buf).unwrap();
+        let written = encode_challenge_response(&response, &mut buf).unwrap();
         assert_eq!(written, CHALLENGE_RESPONSE_LEN);
-        assert_eq!(decode_challenge_response(&buf).unwrap(), (7, response));
+        assert_eq!(decode_challenge_response(&buf).unwrap(), response);
 
         let mut short = [0u8; CHALLENGE_RESPONSE_LEN - 1];
         assert!(matches!(
-            encode_challenge_response(7, &response, &mut short),
+            encode_challenge_response(&response, &mut short),
             Err(ProtocolError::Truncated)
         ));
     }
@@ -246,9 +235,8 @@ mod tests {
 
     #[test]
     fn decode_wrong_tag() {
-        let mut buf = [0u8; 105];
-        buf[..8].copy_from_slice(&1u64.to_le_bytes());
-        buf[8] = 99; // not TAG_CHALLENGE_RESPONSE
+        let mut buf = [0u8; CHALLENGE_RESPONSE_LEN];
+        buf[0] = 99; // not TAG_CHALLENGE_RESPONSE
         assert!(matches!(
             decode_challenge_response(&buf),
             Err(ProtocolError::UnknownTag(99))

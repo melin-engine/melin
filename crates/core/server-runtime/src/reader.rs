@@ -105,7 +105,7 @@ pub struct ReaderRegistration<R> {
     /// Permission level established during the auth handshake.
     pub permission: Permission,
     /// FxHash of the client's Ed25519 public key. Stored per-connection
-    /// and copied into every InputSlot for per-key idempotency dedup.
+    /// and copied into every InputSlot as the submitting key's identity.
     pub key_hash: u64,
 }
 
@@ -270,7 +270,7 @@ struct ConnectionEntry<R> {
     /// the reader thread (cold path), zero cost on the matching engine.
     permission: Permission,
     /// FxHash of the client's Ed25519 public key. Copied into every
-    /// InputSlot for per-key idempotency dedup.
+    /// InputSlot as the submitting key's identity.
     key_hash: u64,
     /// Owned reader — keeps the fd alive. Dropping closes the fd.
     _reader: R,
@@ -1425,9 +1425,6 @@ mod tests {
         fn tick(&mut self, _now_ns: u64, _out: &mut Vec<TestReport>) {
             unreachable!()
         }
-        fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
-            unreachable!()
-        }
         fn build_reject(event: &TestEvent, reason: RejectReason) -> TestReport {
             (*event, reason)
         }
@@ -1444,13 +1441,13 @@ mod tests {
     /// filtered, denied, and decode-error frames without standing up the
     /// real wire codec.
     ///
-    /// Tag mapping (`0x00..=0xFB` map 1:1 to a Permitted seq, reserving the
-    /// top four byte values for the non-Permitted outcomes):
+    /// Tag mapping (`0x00..=0xFB` map 1:1 to a Permitted command, reserving
+    /// the top four byte values for the non-Permitted outcomes):
     ///   * `0xFC` -> `Filter`
     ///   * `0xFD` -> `PermissionDenied`
     ///   * `0xFE` -> `DecodeError`
     ///   * `0xFF` -> `Permitted` with `is_query == true`
-    ///   * `0x00..=0xFB` -> `Permitted` with `request_seq == byte`
+    ///   * `0x00..=0xFB` -> `Permitted` with `TestEvent::Cmd(byte)`
     struct TagDecoder;
 
     impl RequestDecoder for TagDecoder {
@@ -1461,14 +1458,8 @@ mod tests {
                 Some(0xFC) => Decoded::Filter,
                 Some(0xFD) => Decoded::PermissionDenied("denied"),
                 Some(0xFE) => Decoded::DecodeError("bad"),
-                Some(0xFF) => Decoded::Permitted {
-                    request_seq: 0xFF,
-                    event: TestEvent::Query,
-                },
-                Some(b) => Decoded::Permitted {
-                    request_seq: b as u64,
-                    event: TestEvent::Cmd(b),
-                },
+                Some(0xFF) => Decoded::Permitted(TestEvent::Query),
+                Some(b) => Decoded::Permitted(TestEvent::Cmd(b)),
             }
         }
     }
@@ -1682,7 +1673,6 @@ mod tests {
             assert_eq!(slot.connection_id, 7);
             assert_eq!(slot.key_hash, 0xC0FFEE_u64);
             let byte = (i + 1) as u8;
-            assert_eq!(slot.request_seq, byte as u64);
             assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(byte)));
             // Non-query event ⇒ inherits the caller-supplied wall-clock.
             assert_eq!(slot.timestamp_ns, 0xDEAD_BEEF);
@@ -1910,7 +1900,7 @@ mod tests {
         const EVENT_COUNT: usize = 32;
         for i in 0..EVENT_COUNT {
             // Use bytes 1..=32 (each ≤ 0xFB so TagDecoder yields
-            // `Permitted` with `request_seq == byte`).
+            // `Permitted` with `TestEvent::Cmd(byte)`).
             conn.parse_buf.extend_from_slice(&frame((i + 1) as u8));
         }
 

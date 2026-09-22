@@ -52,8 +52,9 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// History: 1 = pre-fencing (41-byte handshake, no epoch);
 /// 2 = fencing epochs (epoch on handshake/StreamStart) + this field;
 /// 3 = primary-driven rotation (`Rotate`) + chain validation (`ChainCheck`);
-/// 4 = primary ack policy on `StreamStart` and `Heartbeat`.
-pub const REPL_PROTOCOL_VERSION: u16 = 4;
+/// 4 = primary ack policy on `StreamStart` and `Heartbeat`;
+/// 5 = `request_seq` dropped from the `InputBatch` slot header.
+pub const REPL_PROTOCOL_VERSION: u16 = 5;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -715,7 +716,7 @@ pub fn decode_journal_to_input_slots<E: AppEvent>(
     let mut slots = Vec::with_capacity(64);
     let mut offset = 0;
     while offset < journal_bytes.len() {
-        let (consumed, sequence, timestamp_ns, key_hash, request_seq, event) =
+        let (consumed, sequence, timestamp_ns, key_hash, event) =
             melin_journal::codec::decode::<E>(&journal_bytes[offset..]).map_err(|e| {
                 io::Error::other(format!("journal decode at offset {offset}: {e:?}"))
             })?;
@@ -723,7 +724,6 @@ pub fn decode_journal_to_input_slots<E: AppEvent>(
         slots.push(InputSlot {
             connection_id: 0,
             key_hash,
-            request_seq,
             sequence,
             timestamp_ns,
             event,

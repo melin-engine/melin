@@ -4,11 +4,11 @@
 //! key, send requests, read the replies.
 //!
 //! Every program that talks to a node — a trading gateway, an operator's
-//! tool, a benchmark, an example — does the same five things before any
+//! tool, a benchmark, an example — does the same four things before any
 //! application logic runs: frame bytes with a length prefix, answer the
-//! Ed25519 challenge, stamp each request with a per-key sequence, read
-//! replies until the batch ends while ignoring heartbeats, and turn a
-//! node's silence into an error. This crate is those five things, once.
+//! Ed25519 challenge, read replies until the batch ends while ignoring
+//! heartbeats, and turn a node's silence into an error. This crate is
+//! those four things, once.
 //!
 //! What it is not: the application's protocol. A node hosts an
 //! application whose requests and responses are its own bytes behind a
@@ -47,7 +47,7 @@
 //! let mut node = Connection::connect("127.0.0.1:9876".parse()?, &key)?;
 //! // `0x10` is whatever the application defines as its request tag; the
 //! // reply is its bytes, tag first.
-//! let reply = node.request_one(1, 0x10, b"payload")?;
+//! let reply = node.request_one(0x10, b"payload")?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -71,7 +71,7 @@ pub mod key;
 // is enough to authenticate.
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 // The bound on a frame, so a caller can size its widest request: the
-// body of a request is this less the 8-byte sequence and the tag.
+// body of a request is this less the tag.
 pub use melin_wire_protocol::blocking::MAX_FRAME_SIZE;
 
 /// Read and connect timeout used by [`Connection::connect`] and
@@ -108,7 +108,7 @@ pub enum Error {
     Disconnected,
     /// The node sent something the protocol does not allow here.
     Protocol(String),
-    /// The request, sequence and tag included, would not fit in one
+    /// The request, tag included, would not fit in one
     /// frame of [`MAX_FRAME_SIZE`] bytes; nothing was sent.
     RequestTooLarge { len: usize },
     /// The node is shedding load; retry later, on a new connection.
@@ -354,10 +354,10 @@ impl Connection {
     /// For a request the node may legitimately hold past
     /// [`DEFAULT_TIMEOUT`] — one waiting on the node's durability policy,
     /// say — raise the timeout rather than work around it. When it does
-    /// fire the connection is to be dropped, and the request's sequence
-    /// (see [`send`](Self::send)) is what lets an application that checks
-    /// it take the same request again, on a new connection, without
-    /// applying it twice.
+    /// fire the connection is to be dropped. Whether the same request can
+    /// then be sent again, on a new connection, without applying it twice
+    /// is the application's protocol to say — typically a per-client
+    /// sequence carried in the request body.
     pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), Error> {
         self.stream.set_read_timeout(Some(timeout))?;
         self.read_timeout = timeout;
@@ -374,24 +374,18 @@ impl Connection {
         self.stream.peer_addr()
     }
 
-    /// Send one request: `[request_seq: u64][tag][body]`, flushed.
-    ///
-    /// `request_seq` is the per-key idempotency sequence the application
-    /// checks (see `Application::check_request_seq` in `melin-app`);
-    /// applications that accept every request still want it monotonic
-    /// per connection, which is what a counter gives.
+    /// Send one request: `[tag][body]`, flushed.
     ///
     /// The body is copied once in user space, into the writer's buffer;
     /// there is no staging buffer in between. A body that would take the
     /// frame over [`MAX_FRAME_SIZE`] is [`Error::RequestTooLarge`], and
     /// nothing is written: the node would drop the connection on it.
-    pub fn send(&mut self, request_seq: u64, tag: u8, body: &[u8]) -> Result<(), Error> {
-        let seq = request_seq.to_le_bytes();
-        let len = seq.len() + 1 + body.len();
+    pub fn send(&mut self, tag: u8, body: &[u8]) -> Result<(), Error> {
+        let len = 1 + body.len();
         if len > MAX_FRAME_SIZE {
             return Err(Error::RequestTooLarge { len });
         }
-        self.writer.write_frame_parts(&[&seq, &[tag], body])?;
+        self.writer.write_frame_parts(&[&[tag], body])?;
         self.writer.flush()?;
         Ok(())
     }
@@ -432,13 +426,8 @@ impl Connection {
     /// Send one request and collect the application frames of its reply
     /// batch, in order. A batch may hold none (the application had
     /// nothing to say) or several (a fill and its acknowledgement, say).
-    pub fn request(
-        &mut self,
-        request_seq: u64,
-        tag: u8,
-        body: &[u8],
-    ) -> Result<Vec<Vec<u8>>, Error> {
-        self.send(request_seq, tag, body)?;
+    pub fn request(&mut self, tag: u8, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        self.send(tag, body)?;
         let mut frames = Vec::new();
         loop {
             match self.next_frame()? {
@@ -452,13 +441,8 @@ impl Connection {
 
     /// [`request`](Self::request) for the common case of exactly one
     /// frame in reply; any other count is a protocol error.
-    pub fn request_one(
-        &mut self,
-        request_seq: u64,
-        tag: u8,
-        body: &[u8],
-    ) -> Result<Vec<u8>, Error> {
-        let mut frames = self.request(request_seq, tag, body)?;
+    pub fn request_one(&mut self, tag: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut frames = self.request(tag, body)?;
         match frames.len() {
             1 => Ok(frames.swap_remove(0)),
             n => Err(Error::Protocol(format!(
@@ -611,8 +595,7 @@ impl Handshake {
                     public_key: self.public_key,
                 };
                 self.response[..4].copy_from_slice(&(CHALLENGE_RESPONSE_LEN as u32).to_le_bytes());
-                // The handshake is not a request, so it carries sequence 0.
-                encode_challenge_response(0, &response, &mut self.response[4..]).map_err(|e| {
+                encode_challenge_response(&response, &mut self.response[4..]).map_err(|e| {
                     Error::Protocol(format!("cannot encode the challenge response: {e}"))
                 })?;
                 self.state = HandshakeState::Verdict;
@@ -768,9 +751,7 @@ mod tests {
             .write_all(&control(TransportResponse::Challenge { nonce }))
             .unwrap();
         let mut reader = BlockingFrameReader::new(stream);
-        let (seq, response) =
-            decode_challenge_response(reader.read_frame().unwrap().unwrap()).unwrap();
-        assert_eq!(seq, 0, "the handshake carries sequence 0");
+        let response = decode_challenge_response(reader.read_frame().unwrap().unwrap()).unwrap();
         let presented = VerifyingKey::from_bytes(&response.public_key).unwrap();
         let signature = Signature::from_bytes(&response.signature);
         if presented != allowed || presented.verify(&nonce, &signature).is_err() {
@@ -813,9 +794,9 @@ mod tests {
             _ => {}
         }
         while let Ok(Some(request)) = reader.read_frame() {
-            // `[seq][tag][body]`
-            assert_eq!(request[8], TAG_REQUEST);
-            let body = request[9..].to_vec();
+            // `[tag][body]`
+            assert_eq!(request[0], TAG_REQUEST);
+            let body = request[1..].to_vec();
             let reply: Vec<u8> = match behaviour {
                 Behaviour::Echo | Behaviour::EagerHeartbeat => [
                     app_frame(TAG_REPLY, &body),
@@ -875,17 +856,17 @@ mod tests {
         assert_eq!(node.public_key(), &key.verifying_key());
         assert_eq!(node.peer_addr().unwrap(), addr);
 
-        let reply = node.request_one(1, TAG_REQUEST, b"hello").unwrap();
+        let reply = node.request_one(TAG_REQUEST, b"hello").unwrap();
         assert_eq!(reply, [&[TAG_REPLY][..], b"hello"].concat());
 
         // The same over the pipelined pair, several requests in flight.
-        for seq in 2..=4 {
-            node.send(seq, TAG_REQUEST, &seq.to_le_bytes()).unwrap();
+        for n in 2..=4u64 {
+            node.send(TAG_REQUEST, &n.to_le_bytes()).unwrap();
         }
-        for seq in 2..=4u64 {
+        for n in 2..=4u64 {
             assert_eq!(
                 node.next_frame().unwrap(),
-                Frame::Response(&[&[TAG_REPLY][..], &seq.to_le_bytes()].concat())
+                Frame::Response(&[&[TAG_REPLY][..], &n.to_le_bytes()].concat())
             );
             assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd);
         }
@@ -897,13 +878,13 @@ mod tests {
         let addr = fake_node(key.verifying_key(), Behaviour::ChattyEcho);
         let mut node = Connection::connect(addr, &key).unwrap();
 
-        let frames = node.request(1, TAG_REQUEST, b"x").unwrap();
+        let frames = node.request(TAG_REQUEST, b"x").unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0], [TAG_REPLY, b'x']);
         assert_eq!(frames[1], [&[TAG_REPLY][..], b"again"].concat());
 
         assert!(matches!(
-            node.request_one(2, TAG_REQUEST, b"y"),
+            node.request_one(TAG_REQUEST, b"y"),
             Err(Error::Protocol(_))
         ));
     }
@@ -933,7 +914,7 @@ mod tests {
         let mut node = Connection::connect_timeout(addr, &key, timeout).unwrap();
 
         let started = Instant::now();
-        let err = node.request(1, TAG_REQUEST, b"dropped").unwrap_err();
+        let err = node.request(TAG_REQUEST, b"dropped").unwrap_err();
         assert!(started.elapsed() >= timeout);
         assert!(matches!(err, Error::NoReply { timeout: t } if t == timeout));
         assert!(err.to_string().contains("authorized_keys"), "{err}");
@@ -967,21 +948,21 @@ mod tests {
         let addr = fake_node(key.verifying_key(), Behaviour::Echo);
         let mut node = Connection::connect(addr, &key).unwrap();
 
-        // One byte over the widest body a frame takes once the sequence
-        // and the tag are counted.
-        let body = vec![0xAB; MAX_FRAME_SIZE - 8];
-        let err = node.send(1, TAG_REQUEST, &body).unwrap_err();
+        // One byte over the widest body a frame takes once the tag is
+        // counted.
+        let body = vec![0xAB; MAX_FRAME_SIZE];
+        let err = node.send(TAG_REQUEST, &body).unwrap_err();
         assert!(matches!(err, Error::RequestTooLarge { len } if len == MAX_FRAME_SIZE + 1));
         assert!(err.to_string().contains("request too large"), "{err}");
 
         // Nothing reached the node, so the connection is as good as new,
         // and the widest body that fits goes through it.
         assert_eq!(
-            node.request_one(2, TAG_REQUEST, b"still here").unwrap(),
+            node.request_one(TAG_REQUEST, b"still here").unwrap(),
             [&[TAG_REPLY][..], b"still here"].concat()
         );
         assert_eq!(
-            node.request_one(3, TAG_REQUEST, &body[1..]).unwrap(),
+            node.request_one(TAG_REQUEST, &body[1..]).unwrap(),
             [&[TAG_REPLY][..], &body[1..]].concat()
         );
     }
@@ -991,7 +972,7 @@ mod tests {
         let key = client_key();
         let addr = fake_node(key.verifying_key(), Behaviour::ZeroTag);
         let mut node = Connection::connect(addr, &key).unwrap();
-        node.send(1, TAG_REQUEST, b"").unwrap();
+        node.send(TAG_REQUEST, b"").unwrap();
         assert!(matches!(node.next_frame(), Err(Error::Protocol(_))));
     }
 
@@ -1003,7 +984,7 @@ mod tests {
         let mut node = Connection::connect_timeout(addr, &key, timeout).unwrap();
 
         let started = Instant::now();
-        let err = node.request(1, TAG_REQUEST, b"dropped").unwrap_err();
+        let err = node.request(TAG_REQUEST, b"dropped").unwrap_err();
         assert!(started.elapsed() >= timeout);
         // The deadline is checked as each heartbeat arrives, so the
         // wait ends within a heartbeat gap of the timeout — the node's
@@ -1018,19 +999,19 @@ mod tests {
 
         let addr = fake_node(key.verifying_key(), Behaviour::Busy);
         let mut node = Connection::connect(addr, &key).unwrap();
-        node.send(1, TAG_REQUEST, b"").unwrap();
+        node.send(TAG_REQUEST, b"").unwrap();
         assert_eq!(node.next_frame().unwrap(), Frame::ServerBusy);
         assert!(matches!(
-            node.request(2, TAG_REQUEST, b""),
+            node.request(TAG_REQUEST, b""),
             Err(Error::ServerBusy)
         ));
 
         let addr = fake_node(key.verifying_key(), Behaviour::Failing);
         let mut node = Connection::connect(addr, &key).unwrap();
-        node.send(1, TAG_REQUEST, b"").unwrap();
+        node.send(TAG_REQUEST, b"").unwrap();
         assert_eq!(node.next_frame().unwrap(), Frame::EngineError);
         assert!(matches!(
-            node.request(2, TAG_REQUEST, b""),
+            node.request(TAG_REQUEST, b""),
             Err(Error::EngineError)
         ));
     }
@@ -1064,7 +1045,7 @@ mod tests {
             Connection::connect_by(addr, &key, Instant::now() + Duration::from_secs(10)).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(500));
         assert_eq!(
-            node.request_one(1, TAG_REQUEST, b"up").unwrap(),
+            node.request_one(TAG_REQUEST, b"up").unwrap(),
             [&[TAG_REPLY][..], b"up"].concat()
         );
     }
@@ -1136,7 +1117,7 @@ mod tests {
 
         // The stream is the caller's from here: a request framed by hand
         // gets its reply batch.
-        let request = [&5u64.to_le_bytes()[..], &[TAG_REQUEST], b"raw"].concat();
+        let request = [&[TAG_REQUEST][..], b"raw"].concat();
         stream
             .write_all(&(request.len() as u32).to_le_bytes())
             .unwrap();
@@ -1159,7 +1140,7 @@ mod tests {
         authenticate(&mut stream, &key).unwrap();
         assert_eq!(read_raw_frame(&mut stream), [TAG_RESPONSE_HEARTBEAT]);
 
-        let request = [&1u64.to_le_bytes()[..], &[TAG_REQUEST], b"after"].concat();
+        let request = [&[TAG_REQUEST][..], b"after"].concat();
         stream
             .write_all(&(request.len() as u32).to_le_bytes())
             .unwrap();
@@ -1262,15 +1243,14 @@ mod tests {
         else {
             panic!("a challenge wants an answer");
         };
-        // Prefixed, and the frame a node decodes: sequence 0, the nonce
-        // signed by the key, the key.
+        // Prefixed, and the frame a node decodes: the nonce signed by the
+        // key, the key.
         assert_eq!(frame.len(), 4 + CHALLENGE_RESPONSE_LEN);
         assert_eq!(
             u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize,
             CHALLENGE_RESPONSE_LEN
         );
-        let (seq, response) = decode_challenge_response(&frame[4..]).unwrap();
-        assert_eq!(seq, 0, "the handshake carries sequence 0");
+        let response = decode_challenge_response(&frame[4..]).unwrap();
         assert_eq!(response.public_key, key.verifying_key().to_bytes());
         key.verifying_key()
             .verify(&nonce, &Signature::from_bytes(&response.signature))
@@ -1306,7 +1286,7 @@ mod tests {
         else {
             panic!("a challenge wants an answer");
         };
-        let (_, response) = decode_challenge_response(&frame[4..]).unwrap();
+        let response = decode_challenge_response(&frame[4..]).unwrap();
         allowed
             .verify(&[7; 32], &Signature::from_bytes(&response.signature))
             .unwrap();

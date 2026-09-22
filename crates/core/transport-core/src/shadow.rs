@@ -104,12 +104,11 @@ pub fn run<A: Application>(
         // outside the loop so the per-event drain stays monotonic across
         // batches.
         for slot in &batch[..count] {
-            // The shadow produces no output, whatever the outcome: the
-            // matching stage replies, and refuses, for every event.
+            // The shadow produces no output: the matching stage replies
+            // for every event, queries included.
             let _ = dispatch(
                 &mut app,
                 slot.event,
-                slot.request_seq,
                 &offline_ctx(slot.timestamp_ns, slot.key_hash),
                 &mut last_drain_ns,
                 |epoch| crate::fence::observe_into(&mut shadow_epoch, epoch),
@@ -260,7 +259,6 @@ mod tests {
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent::Add(1000)),
@@ -270,7 +268,6 @@ mod tests {
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent::Add(500)),
@@ -394,7 +391,6 @@ mod tests {
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent::Add(1)),
@@ -420,7 +416,6 @@ mod tests {
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: JournalEvent::App(TestEvent::Add(1)),
@@ -497,7 +492,6 @@ mod tests {
                 producer.publish(InputSlot {
                     connection_id: 0,
                     key_hash: 0,
-                    request_seq: 0,
                     sequence: 0,
                     timestamp_ns: 0,
                     event: JournalEvent::App(TestEvent::Add(n)),

@@ -30,9 +30,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::dispatch::{Dispatched, dispatch, offline_ctx};
+use crate::dispatch::{dispatch, offline_ctx};
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
-use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::encoder::JournalEncoder;
@@ -288,23 +288,21 @@ const MAX_MATCHING_BATCH: usize = 16;
 /// aliases this to `InputSlot<TradingEvent>`.
 ///
 /// `#[repr(align(64))]` forces 64-byte alignment and rounds the struct
-/// size up to a multiple of 64 — without padding the natural layout is
-/// 104 bytes (or 120 with `latency-trace`), which makes adjacent slots
-/// share cache lines and forces every slot access to touch 2–3 lines
-/// instead of 2. With this attribute both configurations occupy exactly
-/// 128 bytes (two cache lines), so the producer's writes to slot N never
-/// share a line with slot N±1 and per-slot line traffic is minimised.
+/// size up to a multiple of 64 — without padding a slot whose natural
+/// layout falls between two multiples of 64 makes adjacent slots share
+/// cache lines and forces every slot access to touch one line more than
+/// it needs. With this attribute a slot occupies whole cache lines, so
+/// the producer's writes to slot N never share a line with slot N±1 and
+/// per-slot line traffic is minimised.
 #[derive(Debug, Clone, Copy)]
 #[repr(align(64))]
 pub struct InputSlot<E: AppEvent> {
     /// Which client connection submitted this command.
     pub connection_id: u64,
-    /// FxHash of the client's Ed25519 public key. Used with `request_seq`
-    /// for per-key idempotency dedup. 0 for seed/internal events.
+    /// FxHash of the client's Ed25519 public key, journaled with the
+    /// event and handed to the application as `ApplyCtx::key_hash`.
+    /// 0 for seed/internal events.
     pub key_hash: u64,
-    /// Per-key monotonic request sequence number from the wire protocol.
-    /// Used with `key_hash` for idempotency dedup. 0 for seed/internal events.
-    pub request_seq: u64,
     /// Journal sequence number. **Always zero on primary-side input** —
     /// the journal stage allocates the sequence at encode time, in
     /// disruptor cursor order, so producers never have to coordinate
@@ -337,7 +335,6 @@ impl<E: AppEvent> Default for InputSlot<E> {
         Self {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
             event: melin_journal::JournalEvent::Tick { now_ns: 0 },
@@ -1282,7 +1279,6 @@ impl<E: AppEvent> Sequencer<E> {
                                 slot.timestamp_ns,
                                 &slot.event,
                                 slot.key_hash,
-                                slot.request_seq,
                             )
                             .map_err(|e| {
                                 JournalError::Io(std::io::Error::other(format!(
@@ -1504,7 +1500,6 @@ impl<E: AppEvent> Sequencer<E> {
                     slot.timestamp_ns,
                     &slot.event,
                     slot.key_hash,
-                    slot.request_seq,
                 ) {
                     tracing::error!(error = %e, "journal encode error on drain");
                     continue;
@@ -2691,27 +2686,16 @@ impl<A: Application> MatchingStage<A> {
                 // (see the type's docs). A free function rather than a
                 // method, so it borrows only the fields it needs while
                 // `out_batch` holds `self.output`.
-                let query_report = match dispatch(
+                let query_report = dispatch(
                     &mut self.app,
                     slot.event,
-                    slot.request_seq,
                     &ctx,
                     &mut self.last_drain_ns,
                     |epoch| {
                         self.fence_state.observe_epoch(epoch);
                     },
                     &mut reports,
-                ) {
-                    Dispatched::Applied(query_report) => query_report,
-                    Dispatched::Refused => {
-                        // Only an app event has a client to tell; internal
-                        // events carry key_hash 0, which is never refused.
-                        if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                            reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
-                        }
-                        None
-                    }
-                };
+                );
 
                 #[cfg(feature = "latency-trace")]
                 {
@@ -2734,7 +2718,6 @@ impl<A: Application> MatchingStage<A> {
                             elapsed_us = elapsed_ns / 1000,
                             event_kind,
                             connection_id = slot.connection_id,
-                            request_seq = slot.request_seq,
                             input_seq,
                             "matching execute outlier"
                         );
@@ -2881,26 +2864,17 @@ impl<A: Application> MatchingStage<A> {
             // Shutdown path, so the advisory counters are left zero — but
             // the timestamp and key are the event's own, as on every other
             // path, since state may depend on them.
-            match dispatch(
+            let query_report = dispatch(
                 &mut self.app,
                 slot.event,
-                slot.request_seq,
                 &offline_ctx(slot.timestamp_ns, slot.key_hash),
                 &mut self.last_drain_ns,
                 |epoch| {
                     self.fence_state.observe_epoch(epoch);
                 },
                 reports,
-            ) {
-                Dispatched::Applied(query_report) => {
-                    debug_assert!(query_report.is_none(), "drain_remaining skips queries");
-                }
-                Dispatched::Refused => {
-                    if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                        reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
-                    }
-                }
-            }
+            );
+            debug_assert!(query_report.is_none(), "drain_remaining skips queries");
 
             #[allow(clippy::let_unit_value)]
             let match_complete_ts = mono_trace_ns();

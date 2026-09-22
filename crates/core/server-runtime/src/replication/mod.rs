@@ -1230,7 +1230,6 @@ mod tests {
         let slot = InputSlot {
             connection_id: 0,
             key_hash: 0,
-            request_seq: 0,
             sequence: end_sequence,
             timestamp_ns: 0,
             event: melin_journal::JournalEvent::Tick { now_ns: 0 },

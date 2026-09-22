@@ -229,10 +229,7 @@ fn connect(endpoint: &Endpoint) -> Result<Connection, Error> {
 /// Send one request and return its one response (tag included), with
 /// the notary's own rejection turned into an error.
 fn request(node: &mut Connection, tag: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
-    // The sequence is 1 rather than a counter: the example accepts every
-    // request (see `check_request_seq` in the library) and this client
-    // sends one per connection.
-    let response = node.request_one(1, tag, body)?;
+    let response = node.request_one(tag, body)?;
     if response.first() == Some(&TAG_RESP_REJECTED) {
         return Err("the server rejected the request".into());
     }

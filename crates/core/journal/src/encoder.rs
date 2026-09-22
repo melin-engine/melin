@@ -34,9 +34,9 @@ use crate::event::JournalEvent;
 /// This is the width of the encoder's scratch buffer — one per encoder,
 /// not one per event — so it is nearly free to set generously, and it is
 /// not what bounds memory. 1088 covers the largest entry a client can
-/// induce: the runtime caps a client frame at 1024 bytes, of which 9 go
-/// to the request sequence and tag, leaving a 1015-byte payload, a
-/// 1016-byte event and a 1057-byte entry.
+/// induce: the runtime caps a client frame at 1024 bytes, of which 1 goes
+/// to the tag, leaving a 1023-byte payload, a 1024-byte event and a
+/// 1057-byte entry.
 ///
 /// What an individual application costs is [`entry_size`], which is what
 /// callers should reserve and what the transport divides a hand-off chunk
@@ -58,7 +58,7 @@ pub const MAX_ENTRY_SIZE: usize = 1088;
 /// an app narrower than 8 bytes still has to leave room for them.
 ///
 /// This, not [`MAX_ENTRY_SIZE`], is the per-application reservation. An
-/// app with 9-byte events reserves 50 bytes per entry and is unaffected
+/// app with 9-byte events reserves 42 bytes per entry and is unaffected
 /// by another app's wider payloads.
 pub const fn entry_size<E: AppEvent>() -> usize {
     // `Ord::max` is not const, hence the branch.
@@ -252,7 +252,6 @@ impl<E: AppEvent> JournalEncoder<E> {
         timestamp_ns: u64,
         event: &JournalEvent<E>,
         key_hash: u64,
-        request_seq: u64,
     ) -> Result<(), JournalError> {
         #[cfg(debug_assertions)]
         {
@@ -265,14 +264,7 @@ impl<E: AppEvent> JournalEncoder<E> {
             self.last_encoded_seq = seq;
         }
 
-        let written = codec::encode(
-            seq,
-            timestamp_ns,
-            key_hash,
-            request_seq,
-            event,
-            &mut self.buffer,
-        )?;
+        let written = codec::encode(seq, timestamp_ns, key_hash, event, &mut self.buffer)?;
 
         let offset = self.batch_len;
         if dst.len() - offset < written {
@@ -455,7 +447,7 @@ mod tests {
 
     fn encode_len<E: AppEvent>(event: JournalEvent<E>) -> usize {
         let mut buf = [0u8; MAX_ENTRY_SIZE];
-        crate::codec::encode(1, 0, 0, 0, &event, &mut buf).expect("encodes")
+        crate::codec::encode(1, 0, 0, &event, &mut buf).expect("encodes")
     }
 
     fn encode_app_len(event: VarEvent) -> usize {

@@ -47,17 +47,11 @@ pub enum Decoded<E: AppEvent> {
     /// (heartbeats, post-auth handshakes, subscription control) that
     /// the runtime never publishes to the pipeline.
     Filter,
-    /// Frame OK and authorized. Caller publishes `event` with the
-    /// per-key sequence `request_seq`. Whether the event needs a
-    /// timestamp is derived by the runtime from [`AppEvent::is_query`]
-    /// — query events bypass the journal and skip the wall-clock
-    /// stamp.
-    Permitted {
-        /// Per-key idempotency sequence carried in the wire frame.
-        request_seq: u64,
-        /// Decoded application event.
-        event: E,
-    },
+    /// Frame OK and authorized. Caller publishes the event. Whether it
+    /// needs a timestamp is derived by the runtime from
+    /// [`AppEvent::is_query`] — query events bypass the journal and skip
+    /// the wall-clock stamp.
+    Permitted(E),
     /// Authenticated connection lacks the permission level for this
     /// operation. The static string is logged at debug level on the
     /// reader thread; the runtime drops the frame.
