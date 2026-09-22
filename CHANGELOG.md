@@ -66,9 +66,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   stripped.
   - **Client protocol.** Breaking on the wire: an application's first byte
     moves behind `TAG_APP`. A node drops a request framed the old way — its
-    tag is no application frame's — and a client built against an earlier
-    `melin-client` reports a protocol error on the node's first reply.
-    Upgrade clients with the nodes.
+    tag is no application frame's — so a client built against an earlier
+    `melin-client` authenticates but is never answered, and sees its
+    requests time out. Upgrade clients with the nodes.
   - **Source.** For application codecs: keep a message discriminator, if
     the application needs one, as the first byte of its own body, and
     parse and write it there. `Encoded` is removed.

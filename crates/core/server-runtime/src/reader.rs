@@ -1938,7 +1938,7 @@ mod tests {
             mut consumer,
             ..
         } = make_fixture(8);
-        conn.parse_buf.extend_from_slice(&frame(0xFF)); // tag → Query
+        conn.parse_buf.extend_from_slice(&frame(0xFF)); // body byte → Query
 
         let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect);

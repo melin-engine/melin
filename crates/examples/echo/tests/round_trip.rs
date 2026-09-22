@@ -13,11 +13,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use std::io::{Read, Write};
+
 use melin_client::{Connection, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
+use melin_wire_protocol::control_codec::{
+    TAG_APP, TAG_BATCH_END, TAG_CHALLENGE_RESPONSE, TAG_ENGINE_ERROR, TAG_RESPONSE_HEARTBEAT,
+    TAG_SERVER_BUSY,
+};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use echo_server::{Echo, KIND_RESP_ECHO, MAX_PAYLOAD, Payload, RequestDecoder, ResponseEncoder};
@@ -258,6 +264,82 @@ fn a_read_only_key_cannot_echo() {
         [sent],
         "a read-only key must not be able to write the journal"
     );
+}
+
+/// The body is the application's from its first byte: a payload that
+/// starts with a byte the protocol uses as a tag, or that is empty, is
+/// carried to the application and back as it is — neither the node nor
+/// the client reads it as one of the protocol's own frames.
+#[test]
+fn a_payload_that_looks_like_a_protocol_frame_is_echoed() {
+    let (tmp, server) = start_server();
+    let mut stream = connect_authenticated(server.addr, &trader_key());
+
+    let payloads: Vec<Vec<u8>> = vec![
+        vec![],
+        vec![0x00],
+        vec![TAG_RESPONSE_HEARTBEAT],
+        vec![TAG_BATCH_END, 0xAA],
+        vec![TAG_ENGINE_ERROR],
+        vec![TAG_SERVER_BUSY],
+        vec![TAG_CHALLENGE_RESPONSE; 97],
+        vec![TAG_APP, TAG_APP],
+    ];
+    for sent in &payloads {
+        assert_eq!(
+            exchange(&mut stream, sent),
+            (KIND_RESP_ECHO, sent.clone()),
+            "{sent:02x?}"
+        );
+    }
+
+    drop(stream);
+    server.stop();
+    assert_eq!(journaled_echoes(tmp.path()), payloads);
+}
+
+/// A frame that is not an application frame is dropped before the
+/// application sees it, and the connection kept: a request framed the way
+/// the protocol once allowed (an application tag in the protocol's
+/// place), one of the protocol's own tags, and an empty frame. Only the
+/// application frame after them is answered, and only it is journaled.
+#[test]
+fn a_frame_that_is_not_an_application_frame_is_dropped() {
+    let (tmp, server) = start_server();
+    // The raw socket, authenticated: `melin-client` only sends
+    // application frames, and these are the frames it cannot send.
+    let mut stream = connect_authenticated(server.addr, &trader_key()).into_stream();
+
+    let raw_frame = |payload: &[u8]| -> Vec<u8> {
+        [&(payload.len() as u32).to_le_bytes()[..], payload].concat()
+    };
+    let sent = bytes(16, 7);
+    let wire = [
+        raw_frame(&[&[0x10][..], &bytes(8, 1)].concat()),
+        raw_frame(&[TAG_RESPONSE_HEARTBEAT]),
+        raw_frame(&[]),
+        raw_frame(&[&[TAG_APP][..], &sent].concat()),
+    ]
+    .concat();
+    stream.write_all(&wire).expect("write frames");
+
+    let mut read_payload = || {
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).expect("read length");
+        let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
+        stream.read_exact(&mut payload).expect("read payload");
+        payload
+    };
+    assert_eq!(
+        read_payload(),
+        [&[TAG_APP, KIND_RESP_ECHO][..], &sent].concat(),
+        "the first reply answers the application frame"
+    );
+    assert_eq!(read_payload(), [TAG_BATCH_END]);
+
+    drop(stream);
+    server.stop();
+    assert_eq!(journaled_echoes(tmp.path()), [sent]);
 }
 
 // ---------------------------------------------------------------------------

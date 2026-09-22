@@ -29,6 +29,11 @@ pub const TAG_LEN: usize = 1;
 /// rather than misread as application frames.
 pub const TAG_APP: u8 = 0x09;
 
+const _: () = assert!(
+    TAG_APP != 0x00 && TAG_APP < 0x10,
+    "TAG_APP must be neither a zeroed byte nor an old application tag"
+);
+
 pub const TAG_RESPONSE_HEARTBEAT: u8 = 0x01;
 pub const TAG_BATCH_END: u8 = 0x02;
 pub const TAG_ENGINE_ERROR: u8 = 0x03;
@@ -174,8 +179,8 @@ mod tests {
         }
     }
 
-    /// The application's tag is distinct from every control frame's, so
-    /// a client can never read one as the other.
+    /// The application-frame tag is distinct from every control frame's,
+    /// so a client can never read one as the other.
     #[test]
     fn the_app_tag_is_no_control_frame() {
         let variants = [
@@ -193,7 +198,6 @@ mod tests {
             assert_ne!(buf[4], TAG_APP, "variant {variant:?}");
         }
         assert_ne!(TAG_APP, TAG_CHALLENGE_RESPONSE);
-        assert_ne!(TAG_APP, 0x00);
     }
 
     #[test]

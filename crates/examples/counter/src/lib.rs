@@ -38,7 +38,8 @@ pub const KIND_RESP_REJECTED: u8 = 0x32;
 /// The body of an `Increment` request, as a client sends it — the
 /// inverse of [`RequestDecoder`] for this kind.
 pub fn increment_request(amount: u64) -> [u8; 9] {
-    let mut body = [KIND_INCREMENT; 9];
+    let mut body = [0u8; 9];
+    body[0] = KIND_INCREMENT;
     body[1..].copy_from_slice(&amount.to_le_bytes());
     body
 }
