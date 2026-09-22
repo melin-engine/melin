@@ -492,6 +492,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             app,
             writer,
             recovered_epoch,
+            // Nothing was replayed, so there is no replayed clock: zero,
+            // as the matching stage starts from at every boot.
             #[cfg(any(test, feature = "test-utils"))]
             last_drain_ns: 0,
         }
