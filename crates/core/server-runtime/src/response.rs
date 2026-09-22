@@ -3889,20 +3889,24 @@ mod tests {
         use std::thread;
         use std::time::Duration;
 
-        use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
+        use counter_server::{
+            Counter, CounterQuery, CounterReport, KIND_RESP_ACK, ResponseEncoder,
+        };
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
         use melin_transport_core::fence::FenceState;
         use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::blocking::BlockingFrameWriter;
+        use melin_wire_protocol::control_codec::TAG_APP;
 
         use crate::ControlEvent;
         use crate::ack_policy::AckPolicy;
         use crate::response::{Response, run};
 
-        /// `CounterReport::Ack` on the wire: len(4) + tag(1) + value(8).
-        const FRAME_LEN: usize = 13;
+        /// `CounterReport::Ack` on the wire: len(4) + tag(1), then the
+        /// counter's body, kind(1) + value(8).
+        const FRAME_LEN: usize = 14;
         /// Long enough that a genuine loss is distinguishable from
         /// scheduler noise on a loaded box, short enough to fail in
         /// bounded time.
@@ -3993,7 +3997,12 @@ mod tests {
                     "the reply was dropped: the control channel was drained before the ring was read",
                 );
                 assert_eq!(
-                    u64::from_le_bytes(frame[5..].try_into().expect("8 bytes")),
+                    frame[4..6],
+                    [TAG_APP, KIND_RESP_ACK],
+                    "an application frame carrying the counter's ack"
+                );
+                assert_eq!(
+                    u64::from_le_bytes(frame[6..].try_into().expect("8 bytes")),
                     7,
                     "the ack carries the counter's value"
                 );
@@ -4016,7 +4025,8 @@ mod tests {
         use std::time::Duration;
 
         use counter_server::{
-            Counter, CounterQuery, CounterReport, ResponseEncoder, TAG_RESP_ACK, TAG_RESP_REJECTED,
+            Counter, CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED,
+            ResponseEncoder,
         };
         use melin_pipeline::padding::CachePadded;
         use melin_pipeline::ring::DisruptorBuilder;
@@ -4025,7 +4035,7 @@ mod tests {
         use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::blocking::BlockingFrameWriter;
-        use melin_wire_protocol::control_codec::TAG_BATCH_END;
+        use melin_wire_protocol::control_codec::{TAG_APP, TAG_BATCH_END};
 
         use crate::ControlEvent;
         use crate::ack_policy::AckPolicy;
@@ -4037,20 +4047,33 @@ mod tests {
         /// How long the test watches for a frame that must not arrive yet.
         const QUIET: Duration = Duration::from_millis(100);
 
-        /// Read one frame and return its tag.
-        pub(super) fn read_tag(sock: &mut UnixStream) -> std::io::Result<u8> {
-            let mut len = [0u8; 4];
-            sock.read_exact(&mut len)?;
-            let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
-            sock.read_exact(&mut body)?;
-            Ok(body[0])
+        /// What one frame on the wire was: a counter response, by the
+        /// kind its body starts with, or one of the protocol's own frames,
+        /// by its tag.
+        #[derive(Debug, PartialEq, Eq)]
+        pub(super) enum Seen {
+            App(u8),
+            Protocol(u8),
         }
 
-        /// Read one frame's tag into `seen`; false if none arrived.
-        fn read_into(sock: &mut UnixStream, seen: &mut Vec<u8>) -> bool {
-            match read_tag(sock) {
-                Ok(tag) => {
-                    seen.push(tag);
+        /// Read one frame and say what it was.
+        pub(super) fn read_frame(sock: &mut UnixStream) -> std::io::Result<Seen> {
+            let mut len = [0u8; 4];
+            sock.read_exact(&mut len)?;
+            let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
+            sock.read_exact(&mut payload)?;
+            Ok(match payload[..] {
+                [TAG_APP, kind, ..] => Seen::App(kind),
+                [tag, ..] => Seen::Protocol(tag),
+                [] => panic!("an empty frame on the wire"),
+            })
+        }
+
+        /// Read one frame into `seen`; false if none arrived.
+        fn read_into(sock: &mut UnixStream, seen: &mut Vec<Seen>) -> bool {
+            match read_frame(sock) {
+                Ok(frame) => {
+                    seen.push(frame);
                     true
                 }
                 Err(_) => false,
@@ -4146,12 +4169,12 @@ mod tests {
                 assert_eq!(
                     seen,
                     [
-                        TAG_RESP_REJECTED,
-                        TAG_BATCH_END,
-                        TAG_RESP_ACK,
-                        TAG_BATCH_END,
-                        TAG_RESP_REJECTED,
-                        TAG_BATCH_END,
+                        Seen::App(KIND_RESP_REJECTED),
+                        Seen::Protocol(TAG_BATCH_END),
+                        Seen::App(KIND_RESP_ACK),
+                        Seen::Protocol(TAG_BATCH_END),
+                        Seen::App(KIND_RESP_REJECTED),
+                        Seen::Protocol(TAG_BATCH_END),
                     ],
                     "replies out of request order"
                 );
@@ -4231,7 +4254,10 @@ mod tests {
                     "connection 2's refusal was dropped: released before its connection registered"
                 );
                 for seen in [seen_1, seen_2] {
-                    assert_eq!(seen, [TAG_RESP_REJECTED, TAG_BATCH_END]);
+                    assert_eq!(
+                        seen,
+                        [Seen::App(KIND_RESP_REJECTED), Seen::Protocol(TAG_BATCH_END)]
+                    );
                 }
             });
         }
@@ -4295,7 +4321,7 @@ mod tests {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        use counter_server::{Counter, CounterQuery, CounterReport, TAG_RESP_ACK};
+        use counter_server::{Counter, CounterQuery, CounterReport, KIND_RESP_ACK};
         use melin_pipeline::padding::CachePadded;
         use melin_pipeline::ring::DisruptorBuilder;
         use melin_pipeline::wait::WaitStrategy;
@@ -4304,7 +4330,7 @@ mod tests {
         use melin_transport_core::{DurableWireSeqCursor, WireSeq};
         use melin_wire_protocol::control_codec::TAG_BATCH_END;
 
-        use super::refusal_order::{config, connection, read_tag};
+        use super::refusal_order::{Seen, config, connection, read_frame};
         use crate::halt::refusal_channel;
         use crate::response::run;
 
@@ -4353,9 +4379,12 @@ mod tests {
             // gate.
             let mut seen = Vec::new();
             for _ in 0..2 {
-                seen.push(read_tag(&mut client).expect("the confirmed reply arrives"));
+                seen.push(read_frame(&mut client).expect("the confirmed reply arrives"));
             }
-            assert_eq!(seen, [TAG_RESP_ACK, TAG_BATCH_END]);
+            assert_eq!(
+                seen,
+                [Seen::App(KIND_RESP_ACK), Seen::Protocol(TAG_BATCH_END)]
+            );
 
             if fenced {
                 assert!(fence.fence(), "first latch");
@@ -4374,7 +4403,7 @@ mod tests {
             // The held reply never went out: the stage closed the
             // connection with nothing more on it.
             assert!(
-                read_tag(&mut client).is_err(),
+                read_frame(&mut client).is_err(),
                 "a reply the policy never confirmed was sent"
             );
         }

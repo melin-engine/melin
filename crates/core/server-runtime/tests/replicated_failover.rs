@@ -41,7 +41,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use counter_server::{Counter, CounterEvent, RequestDecoder, ResponseEncoder};
+use counter_server::{
+    Counter, CounterEvent, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_VALUE, RequestDecoder,
+    ResponseEncoder, increment_request,
+};
 use ed25519_dalek::{Signer, SigningKey};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -49,7 +52,7 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::{
-    TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
+    TAG_APP, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
 };
 use melin_wire_protocol::tcp::BlockingTcpListener;
 use serial_test::serial;
@@ -60,11 +63,6 @@ use serial_test::serial;
 /// `round_trip.rs` 5000..10000. See `test_ports::free_addr` for the
 /// scheme.
 const PORT_BASE: u16 = 10_000;
-
-const TAG_INCREMENT: u8 = 0x10;
-const TAG_GET_VALUE: u8 = 0x11;
-const TAG_RESP_ACK: u8 = 0x30;
-const TAG_RESP_VALUE: u8 = 0x31;
 
 /// Node `i`'s startup events: a genesis increment of `(i + 1) * GENESIS`
 /// and an `on_primary` increment of `(i + 1) * ON_PRIMARY`. The weights
@@ -153,21 +151,24 @@ fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
     }
 }
 
-fn send_request(stream: &mut TcpStream, tag: u8, payload: &[u8]) {
-    let mut frame = Vec::with_capacity(1 + payload.len());
-    frame.push(tag);
-    frame.extend_from_slice(payload);
+/// Send `body` as an application frame.
+fn send_request(stream: &mut TcpStream, body: &[u8]) {
+    let mut frame = Vec::with_capacity(1 + body.len());
+    frame.push(TAG_APP);
+    frame.extend_from_slice(body);
     write_frame(stream, &frame);
 }
 
+/// The bodies of the application frames up to the batch end.
 fn read_until_batch_end(stream: &mut TcpStream) -> Vec<Vec<u8>> {
     let mut responses = Vec::new();
     loop {
         let frame = read_frame(stream).expect("read response frame");
-        if frame[0] == TAG_BATCH_END {
-            break;
+        match frame.split_first() {
+            Some((&TAG_BATCH_END, _)) => break,
+            Some((&TAG_APP, body)) => responses.push(body.to_vec()),
+            other => panic!("unexpected frame in a reply batch: {other:02x?}"),
         }
-        responses.push(frame);
     }
     responses
 }
@@ -407,10 +408,10 @@ fn acked_events_survive_primary_death_under_ram_policy() {
         let mut expected_total = GENESIS + ON_PRIMARY;
         for amount in [1u64, 2, 4] {
             expected_total += amount;
-            send_request(&mut stream, TAG_INCREMENT, &amount.to_le_bytes());
+            send_request(&mut stream, &increment_request(amount));
             let responses = read_until_batch_end(&mut stream);
             assert_eq!(responses.len(), 1);
-            assert_eq!(responses[0][0], TAG_RESP_ACK, "increment must be acked");
+            assert_eq!(responses[0][0], KIND_RESP_ACK, "increment must be acked");
             let value = u64::from_le_bytes(responses[0][1..9].try_into().unwrap());
             assert_eq!(value, expected_total, "ack carries the running total");
         }
@@ -480,10 +481,10 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     // while neither replica's genesis ever was. ---
     {
         let mut stream = connect_authenticated(nodes[winner].client_addr, &client_key);
-        send_request(&mut stream, TAG_GET_VALUE, &[]);
+        send_request(&mut stream, &GET_VALUE_REQUEST);
         let responses = read_until_batch_end(&mut stream);
         assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0][0], TAG_RESP_VALUE);
+        assert_eq!(responses[0][0], KIND_RESP_VALUE);
         let value = u64::from_le_bytes(responses[0][1..9].try_into().unwrap());
         let seqs: Vec<String> = (1..3)
             .map(|i| {

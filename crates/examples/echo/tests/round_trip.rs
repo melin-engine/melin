@@ -20,24 +20,22 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
-use echo_server::{
-    Echo, MAX_PAYLOAD, Payload, RequestDecoder, ResponseEncoder, TAG_ECHO, TAG_RESP_ECHO,
-};
+use echo_server::{Echo, KIND_RESP_ECHO, MAX_PAYLOAD, Payload, RequestDecoder, ResponseEncoder};
 use melin_server_runtime::StartupEvents;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Echo `payload` and return the reply's `(tag, bytes)`.
+/// Echo `payload` and return the reply's `(kind, bytes)`.
 fn exchange(node: &mut Connection, payload: &[u8]) -> (u8, Vec<u8>) {
-    let reply = node.request_one(TAG_ECHO, payload).expect("one reply");
+    let reply = node.request_one(payload).expect("one reply");
     (reply[0], reply[1..].to_vec())
 }
 
 /// Send a request the server is expected to drop: no reply is read.
 fn send(node: &mut Connection, payload: &[u8]) {
-    node.send(TAG_ECHO, payload).expect("send");
+    node.send(payload).expect("send");
 }
 
 /// `len` bytes that no other length or seed produces, so a reply can only
@@ -211,8 +209,8 @@ fn an_echo_returns_the_bytes_it_was_sent() {
     // carried in two bytes, and 256 is where a one-byte length would wrap.
     for (i, len) in [0, 1, 7, 255, 256, MAX_PAYLOAD].into_iter().enumerate() {
         let sent = bytes(len, i as u8);
-        let (tag, back) = exchange(&mut stream, &sent);
-        assert_eq!(tag, TAG_RESP_ECHO, "{len} bytes");
+        let (kind, back) = exchange(&mut stream, &sent);
+        assert_eq!(kind, KIND_RESP_ECHO, "{len} bytes");
         assert_eq!(back, sent, "{len} bytes");
     }
 
@@ -232,8 +230,7 @@ fn an_oversized_payload_is_refused_without_dropping_the_connection() {
     send(&mut stream, &bytes(MAX_PAYLOAD + 1, 1));
 
     let sent = bytes(MAX_PAYLOAD, 2);
-    let (tag, back) = exchange(&mut stream, &sent);
-    assert_eq!((tag, back), (TAG_RESP_ECHO, sent));
+    assert_eq!(exchange(&mut stream, &sent), (KIND_RESP_ECHO, sent));
 
     drop(stream);
     server.stop();
@@ -251,8 +248,7 @@ fn a_read_only_key_cannot_echo() {
 
     let sent = bytes(MAX_PAYLOAD, 9);
     let mut stream = connect_authenticated(server.addr, &trader_key());
-    let (tag, back) = exchange(&mut stream, &sent);
-    assert_eq!((tag, back), (TAG_RESP_ECHO, sent.clone()));
+    assert_eq!(exchange(&mut stream, &sent), (KIND_RESP_ECHO, sent.clone()));
 
     drop(stream);
     drop(watcher);
@@ -320,8 +316,7 @@ fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
     let server = start_server_in(tmp.path());
     let mut stream = connect_authenticated(server.addr, &trader_key());
     let sent = bytes(MAX_PAYLOAD, 4);
-    let (tag, back) = exchange(&mut stream, &sent);
-    assert_eq!((tag, back), (TAG_RESP_ECHO, sent.clone()));
+    assert_eq!(exchange(&mut stream, &sent), (KIND_RESP_ECHO, sent.clone()));
     drop(stream);
     server.stop();
 

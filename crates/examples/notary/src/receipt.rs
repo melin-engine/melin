@@ -5,7 +5,7 @@
 //! this type: its receipt is the wire frame, decoded by
 //! [`Receipt::from_frame`](crate::receipt::Receipt::from_frame).
 
-use crate::{HEAD_LEN, LEAF_LEN, TAG_RESP_RECEIPT, fold};
+use crate::{HEAD_LEN, KIND_RESP_RECEIPT, LEAF_LEN, fold};
 
 /// One link of the chain.
 ///
@@ -28,9 +28,10 @@ pub struct Receipt {
 }
 
 impl Receipt {
-    /// Decode a receipt frame: `[tag][entry: u64][timestamp_ns: u64][prev: 32][head: 32]`.
+    /// Decode a receipt frame's body:
+    /// `[kind][entry: u64][timestamp_ns: u64][prev: 32][head: 32]`.
     pub fn from_frame(frame: &[u8], leaf: [u8; LEAF_LEN]) -> Result<Self, String> {
-        if frame.first() != Some(&TAG_RESP_RECEIPT)
+        if frame.first() != Some(&KIND_RESP_RECEIPT)
             || frame.len() != 1 + 8 + 8 + HEAD_LEN + HEAD_LEN
         {
             return Err(format!("unexpected response to notarize: {}", hex(frame)));
@@ -145,7 +146,7 @@ pub fn unhex<const N: usize>(text: &str) -> Result<[u8; N], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TAG_RESP_HEAD;
+    use crate::KIND_RESP_HEAD;
 
     fn sample() -> Receipt {
         let leaf = [0x11; LEAF_LEN];
@@ -201,7 +202,7 @@ mod tests {
     #[test]
     fn frame_is_decoded_at_the_documented_offsets() {
         let receipt = sample();
-        let mut frame = vec![TAG_RESP_RECEIPT];
+        let mut frame = vec![KIND_RESP_RECEIPT];
         frame.extend_from_slice(&receipt.entry.to_le_bytes());
         frame.extend_from_slice(&receipt.timestamp_ns.to_le_bytes());
         frame.extend_from_slice(&receipt.prev);
@@ -209,7 +210,7 @@ mod tests {
         assert_eq!(Receipt::from_frame(&frame, receipt.leaf).unwrap(), receipt);
 
         assert!(Receipt::from_frame(&frame[..80], receipt.leaf).is_err());
-        frame[0] = TAG_RESP_HEAD;
+        frame[0] = KIND_RESP_HEAD;
         assert!(Receipt::from_frame(&frame, receipt.leaf).is_err());
     }
 

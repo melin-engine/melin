@@ -3,7 +3,7 @@
 //! The server runtime (accept loop, frame reader, DPDK transport)
 //! consumes incoming frames from the network and needs to turn them
 //! into application events to publish to the pipeline. The decoding
-//! itself — pattern-matching on the application's tags, mapping
+//! itself — telling the application's messages apart, mapping
 //! per-variant fields, enforcing per-connection permission policy — is
 //! application-shaped: a trading server decodes order submissions, a
 //! payments server decodes transfers, a logistics server decodes
@@ -12,10 +12,11 @@
 //! concrete wire enum.
 //!
 //! The frame around the request is not the application's. Every client
-//! request is `[tag: u8][body]`, and the runtime reads the tag itself: it
-//! drops an empty frame and a frame whose tag is in the protocol's
-//! reserved range (below `0x10`), and hands the decoder the tag and the
-//! body. An application's tags therefore start at `0x10`.
+//! frame is `[length: u32 LE][tag: u8][body]`, and the tag is the
+//! protocol's: the runtime reads it, handles or drops the protocol's own
+//! frames, and hands the decoder the body of an application frame alone.
+//! The body's layout is the application's from its first byte, with no
+//! value reserved.
 //!
 //! The runtime calls
 //! [`RequestDecoder::decode`](crate::decoder::RequestDecoder::decode) once
@@ -38,11 +39,10 @@ pub trait RequestDecoder: Send + Sync {
     /// `JournalEvent::App`) before publishing.
     type Event: AppEvent;
 
-    /// Decode one request. `tag` is the request's tag, never in the
-    /// protocol's reserved range; `body` is everything after it, up to
-    /// the end of the frame. `permission` is the role established during
-    /// the auth handshake and stored on the connection.
-    fn decode(&self, tag: u8, body: &[u8], permission: Permission) -> Decoded<Self::Event>;
+    /// Decode one request. `body` is the application frame's body, up to
+    /// the end of the frame, and may be empty. `permission` is the role
+    /// established during the auth handshake and stored on the connection.
+    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<Self::Event>;
 }
 
 /// Outcome of a single [`RequestDecoder::decode`] call. The runtime
@@ -62,7 +62,7 @@ pub enum Decoded<E: AppEvent> {
     /// operation. The static string is logged at debug level on the
     /// reader thread; the runtime drops the request.
     PermissionDenied(&'static str),
-    /// Decode failure (unknown tag, malformed body, invalid field). The
+    /// Decode failure (unknown message, malformed body, invalid field). The
     /// runtime logs at debug level and drops the request; the connection
     /// is not closed (a misbehaving client drops itself on the next read
     /// timeout).

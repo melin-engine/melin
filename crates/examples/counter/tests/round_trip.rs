@@ -13,8 +13,8 @@ use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use counter_server::{
-    Counter, RequestDecoder, ResponseEncoder, TAG_GET_VALUE, TAG_INCREMENT, TAG_RESP_ACK,
-    TAG_RESP_VALUE,
+    Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_VALUE, RequestDecoder, ResponseEncoder,
+    increment_request,
 };
 use melin_server_runtime::StartupEvents;
 
@@ -35,7 +35,7 @@ fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
     node
 }
 
-/// The `u64` a value frame carries after its tag.
+/// The `u64` a value frame's body carries after its kind.
 fn value_of(frame: &[u8]) -> u64 {
     u64::from_le_bytes(frame[1..9].try_into().expect("8-byte value"))
 }
@@ -139,22 +139,18 @@ fn full_round_trip() {
     let mut node = connect_authenticated(addr, &key);
 
     // --- Increment by 10 ---
-    let ack = node
-        .request_one(TAG_INCREMENT, &10u64.to_le_bytes())
-        .expect("increment");
-    assert_eq!(ack[0], TAG_RESP_ACK);
+    let ack = node.request_one(&increment_request(10)).expect("increment");
+    assert_eq!(ack[0], KIND_RESP_ACK);
     assert_eq!(value_of(&ack), 10);
 
     // --- Increment by 32 ---
-    let ack = node
-        .request_one(TAG_INCREMENT, &32u64.to_le_bytes())
-        .expect("increment");
-    assert_eq!(ack[0], TAG_RESP_ACK);
+    let ack = node.request_one(&increment_request(32)).expect("increment");
+    assert_eq!(ack[0], KIND_RESP_ACK);
     assert_eq!(value_of(&ack), 42);
 
     // --- GetValue query ---
-    let value = node.request_one(TAG_GET_VALUE, &[]).expect("query");
-    assert_eq!(value[0], TAG_RESP_VALUE);
+    let value = node.request_one(&GET_VALUE_REQUEST).expect("query");
+    assert_eq!(value[0], KIND_RESP_VALUE);
     assert_eq!(value_of(&value), 42);
 
     drop(node);
@@ -170,7 +166,7 @@ fn second_connection_sees_persisted_state() {
     {
         let mut node = connect_authenticated(addr, &key);
         let ack = node
-            .request_one(TAG_INCREMENT, &100u64.to_le_bytes())
+            .request_one(&increment_request(100))
             .expect("increment");
         assert_eq!(value_of(&ack), 100);
     }
@@ -178,8 +174,8 @@ fn second_connection_sees_persisted_state() {
     // Second connection: query — should see 100 (state survives connections).
     {
         let mut node = connect_authenticated(addr, &key);
-        let value = node.request_one(TAG_GET_VALUE, &[]).expect("query");
-        assert_eq!(value[0], TAG_RESP_VALUE);
+        let value = node.request_one(&GET_VALUE_REQUEST).expect("query");
+        assert_eq!(value[0], KIND_RESP_VALUE);
         assert_eq!(value_of(&value), 100);
     }
 

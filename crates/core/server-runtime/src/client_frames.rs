@@ -16,7 +16,7 @@ use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::{MonoTraceInstant, mono_trace_ns};
-use melin_wire_protocol::control_codec::{FIRST_APP_TAG, REQUEST_HEADER_LEN};
+use melin_wire_protocol::control_codec::{TAG_APP, TAG_LEN};
 
 use crate::halt::{HaltGate, Refusal, RefusalSender, Verdict};
 
@@ -34,7 +34,7 @@ pub const MAX_FRAME_SIZE: usize = melin_wire_protocol::blocking::MAX_FRAME_SIZE;
 /// is handed after the runtime has read the tag.
 /// Public so an application can check its widest request against it at
 /// compile time; see the re-export in the crate root.
-pub const MAX_REQUEST_BODY: usize = MAX_FRAME_SIZE - REQUEST_HEADER_LEN;
+pub const MAX_REQUEST_BODY: usize = MAX_FRAME_SIZE - TAG_LEN;
 
 /// Outcome of [`process_client_frames`].
 pub(crate) enum FrameAction {
@@ -136,19 +136,25 @@ pub(crate) fn process_client_frames<A: Application>(
         let frame = &parse_buf[cursor + 4..cursor + 4 + frame_len];
         cursor += 4 + frame_len;
 
-        let Some((&tag, body)) = frame.split_first() else {
-            debug!(connection_id, "empty frame, dropping");
-            continue;
+        // Only an application frame carries a request: a client sends none
+        // of the protocol's own frames after the handshake. Anything else
+        // is dropped here, so no decoder ever sees the tag.
+        let body = match frame.split_first() {
+            Some((&TAG_APP, body)) => body,
+            Some((&tag, _)) => {
+                debug!(
+                    connection_id,
+                    tag, "frame is not an application request, dropping"
+                );
+                continue;
+            }
+            None => {
+                debug!(connection_id, "empty frame, dropping");
+                continue;
+            }
         };
-        // The protocol's range is never an application request, and no
-        // client sends one after the handshake: dropped here so no decoder
-        // has to know the range exists.
-        if tag < FIRST_APP_TAG {
-            debug!(connection_id, tag, "request under a reserved tag, dropping");
-            continue;
-        }
 
-        let event = match decoder.decode(tag, body, permission) {
+        let event = match decoder.decode(body, permission) {
             Decoded::Filter => continue,
             Decoded::PermissionDenied(reason) => {
                 debug!(connection_id, reason, "permission denied, dropping request");

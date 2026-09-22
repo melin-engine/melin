@@ -21,7 +21,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use melin_app::encoder::{Encoded, ResponseEncoder};
+use melin_app::encoder::ResponseEncoder;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 use melin_pipeline::padding::CachePadded;
 use melin_pipeline::ring::DisruptorBuilder;
@@ -34,6 +34,7 @@ use melin_transport_core::fence::FenceState;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 use melin_transport_core::{DurableWireSeqCursor, WireSeq};
 use melin_wire_protocol::blocking::BlockingFrameWriter;
+use melin_wire_protocol::control_codec::TAG_APP;
 
 /// Body bytes per response, as the encoder writes them.
 const BODY_LEN: usize = 395;
@@ -43,9 +44,6 @@ const BODY_LEN: usize = 395;
 /// per-response body bound.
 const FRAME_LEN: usize = 4 + 1 + BODY_LEN;
 const _: () = assert!(BODY_LEN <= melin_server_runtime::MAX_RESPONSE_BODY);
-
-/// The tag every pad response carries.
-const PAD_TAG: u8 = 0x10;
 
 /// Enough slots to cross `MAX_SEND_BUF` in one batch several times
 /// over (400 × 400 B = 160 KiB), while fitting one ring/batch.
@@ -111,23 +109,20 @@ impl Application for PadApp {
     }
 }
 
-/// Body: `[value(8 LE) | zero padding]`, under `PAD_TAG`.
+/// Body: `[value(8 LE) | zero padding]`.
 struct PadEncoder;
 
 impl ResponseEncoder for PadEncoder {
     type Report = PadReport;
     type Query = PadReport;
 
-    fn encode_report(&self, report: &PadReport, buf: &mut [u8]) -> Result<Encoded, &'static str> {
+    fn encode_report(&self, report: &PadReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         buf[..8].copy_from_slice(&report.value.to_le_bytes());
         buf[8..BODY_LEN].fill(0);
-        Ok(Encoded {
-            tag: PAD_TAG,
-            len: BODY_LEN,
-        })
+        Ok(BODY_LEN)
     }
 
-    fn encode_query(&self, query: &Self::Query, buf: &mut [u8]) -> Result<Encoded, &'static str> {
+    fn encode_query(&self, query: &Self::Query, buf: &mut [u8]) -> Result<usize, &'static str> {
         self.encode_report(query, buf)
     }
 }
@@ -150,7 +145,7 @@ fn read_pad(sock: &mut UnixStream) -> io::Result<u64> {
         (1 + BODY_LEN) as u32,
         "unexpected length prefix"
     );
-    assert_eq!(frame[4], PAD_TAG, "unexpected tag");
+    assert_eq!(frame[4], TAG_APP, "unexpected tag");
     Ok(u64::from_le_bytes(
         frame[5..13].try_into().expect("8 bytes"),
     ))

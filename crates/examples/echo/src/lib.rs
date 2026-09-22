@@ -80,18 +80,19 @@ use std::io::{self, Read, Write};
 
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
-use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
+use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 
 // ---------------------------------------------------------------------------
-// Wire tags — application tags start at 0x10; everything below is the
-// protocol's, and the runtime keeps it away from the codecs.
+// Response kinds — the first byte of every response body. A request needs
+// none: there is one kind of request, and its body is the payload whole.
 // ---------------------------------------------------------------------------
 
-pub const TAG_ECHO: u8 = 0x10;
+pub const KIND_RESP_ECHO: u8 = 0x30;
+pub const KIND_RESP_REJECTED: u8 = 0x31;
 
-pub const TAG_RESP_ECHO: u8 = 0x30;
-pub const TAG_RESP_REJECTED: u8 = 0x31;
+/// Bytes a response's kind takes ahead of the echoed payload.
+const KIND_LEN: usize = 1;
 
 /// Most bytes one request may carry, and therefore one reply.
 ///
@@ -112,8 +113,8 @@ const _: () = assert!(
     "a request's payload must fit one client frame's body"
 );
 const _: () = assert!(
-    MAX_PAYLOAD <= melin_server_runtime::MAX_RESPONSE_BODY,
-    "a reply's payload must fit the response stage's body buffer"
+    KIND_LEN + MAX_PAYLOAD <= melin_server_runtime::MAX_RESPONSE_BODY,
+    "a reply's kind and payload must fit the response stage's body buffer"
 );
 
 // ---------------------------------------------------------------------------
@@ -177,7 +178,7 @@ impl fmt::Debug for Payload {
     }
 }
 
-/// Encoded form: `[len: u16 LE][bytes: len]`. No tag: this application
+/// Encoded form: `[len: u16 LE][bytes: len]`. No kind: this application
 /// has one kind of event, and the journal frames each entry itself.
 impl AppEvent for Payload {
     // len(2) + the widest payload. A bound, checked against the journal's
@@ -295,29 +296,24 @@ impl Application for Echo {
 
 /// Decodes client requests into `Payload`.
 ///
-/// The runtime has already read the tag; the body of an echo is the
-/// payload. It needs no length of its own: the frame is already
-/// length-prefixed, so whatever follows the tag is the payload.
+/// The body of a request is the payload, whole: there is one kind of
+/// request, so no byte of it says which. It needs no length of its own
+/// either: the frame is already length-prefixed, so the body the runtime
+/// hands over is exactly the payload.
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = Payload;
 
-    fn decode(&self, tag: u8, body: &[u8], permission: Permission) -> Decoded<Payload> {
-        match tag {
-            TAG_ECHO => {
-                // An echo appends to the journal, so the read-only and
-                // replication roles are refused, as they would be for any
-                // state-mutating event.
-                if matches!(permission, Permission::ReadOnly | Permission::Replication) {
-                    return Decoded::PermissionDenied("echoing requires a writing role");
-                }
-                match Payload::new(body) {
-                    Some(event) => Decoded::Permitted(event),
-                    None => Decoded::DecodeError("payload longer than MAX_PAYLOAD"),
-                }
-            }
-            _ => Decoded::DecodeError("unknown tag"),
+    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<Payload> {
+        // An echo appends to the journal, so the read-only and replication
+        // roles are refused, as they would be for any state-mutating event.
+        if matches!(permission, Permission::ReadOnly | Permission::Replication) {
+            return Decoded::PermissionDenied("echoing requires a writing role");
+        }
+        match Payload::new(body) {
+            Some(event) => Decoded::Permitted(event),
+            None => Decoded::DecodeError("payload longer than MAX_PAYLOAD"),
         }
     }
 }
@@ -326,37 +322,39 @@ impl RequestDecoderTrait for RequestDecoder {
 // Response encoder
 // ---------------------------------------------------------------------------
 
-/// Encodes `EchoReport` into response bodies; the runtime frames them. The
-/// body is the request's bytes for an echo, and empty for a rejection.
+/// Encodes `EchoReport` into response bodies; the runtime frames them. A
+/// response says which it is, since an empty echo and a rejection would
+/// otherwise look alike:
+///   - echo: `[KIND_RESP_ECHO][the request's bytes]`
+///   - rejected: `[KIND_RESP_REJECTED]`
 pub struct ResponseEncoder;
 
 impl ResponseEncoderTrait for ResponseEncoder {
     type Report = EchoReport;
     type Query = ();
 
-    fn encode_report(&self, report: &EchoReport, buf: &mut [u8]) -> Result<Encoded, &'static str> {
+    fn encode_report(&self, report: &EchoReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match report {
             EchoReport::Echoed(payload) => {
                 let bytes = payload.as_bytes();
-                buf.get_mut(..bytes.len())
-                    .ok_or("buffer too small")?
-                    .copy_from_slice(bytes);
-                Ok(Encoded {
-                    tag: TAG_RESP_ECHO,
-                    len: bytes.len(),
-                })
+                let body = buf
+                    .get_mut(..KIND_LEN + bytes.len())
+                    .ok_or("buffer too small")?;
+                body[0] = KIND_RESP_ECHO;
+                body[KIND_LEN..].copy_from_slice(bytes);
+                Ok(body.len())
             }
-            EchoReport::Rejected => Ok(Encoded {
-                tag: TAG_RESP_REJECTED,
-                len: 0,
-            }),
+            EchoReport::Rejected => {
+                *buf.first_mut().ok_or("buffer too small")? = KIND_RESP_REJECTED;
+                Ok(1)
+            }
         }
     }
 
     // Unreachable: no event is a query, so the runtime never has a query
     // response to encode. An error rather than a panic, so that if that
     // ever changes the failure is a logged encode error, not a crash.
-    fn encode_query(&self, _query: &(), _buf: &mut [u8]) -> Result<Encoded, &'static str> {
+    fn encode_query(&self, _query: &(), _buf: &mut [u8]) -> Result<usize, &'static str> {
         Err("this application has no queries")
     }
 }
@@ -490,7 +488,7 @@ mod tests {
             Permission::Trader,
             Permission::Custodian,
         ] {
-            match RequestDecoder.decode(TAG_ECHO, b"hi", permission) {
+            match RequestDecoder.decode(b"hi", permission) {
                 Decoded::Permitted(event) => assert_eq!(event, payload(b"hi")),
                 _ => panic!("expected Permitted for {permission:?}"),
             }
@@ -502,7 +500,7 @@ mod tests {
         for permission in [Permission::ReadOnly, Permission::Replication] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(TAG_ECHO, b"hi", permission),
+                    RequestDecoder.decode(b"hi", permission),
                     Decoded::PermissionDenied(_)
                 ),
                 "{permission:?} must not be able to echo"
@@ -514,7 +512,7 @@ mod tests {
     fn the_payload_is_the_whole_body() {
         for len in [0, 3, MAX_PAYLOAD] {
             let bytes = vec![0x5A; len];
-            match RequestDecoder.decode(TAG_ECHO, &bytes, Permission::Trader) {
+            match RequestDecoder.decode(&bytes, Permission::Trader) {
                 Decoded::Permitted(event) => assert_eq!(event.as_bytes(), bytes),
                 _ => panic!("expected Permitted for {len} bytes"),
             }
@@ -525,50 +523,38 @@ mod tests {
     fn decoder_refuses_what_it_cannot_carry() {
         let too_long = vec![0; MAX_PAYLOAD + 1];
         assert!(matches!(
-            RequestDecoder.decode(TAG_ECHO, &too_long, Permission::Trader),
+            RequestDecoder.decode(&too_long, Permission::Trader),
             Decoded::DecodeError(_)
-        ));
-        assert!(matches!(
-            RequestDecoder.decode(0x7F, b"", Permission::Trader),
-            Decoded::DecodeError("unknown tag")
         ));
     }
 
     // --- Response encoder ---
 
     #[test]
-    fn an_echo_body_is_the_bytes() {
-        let mut buf = [0u8; MAX_PAYLOAD];
+    fn an_echo_body_is_its_kind_then_the_bytes() {
+        let mut buf = [0u8; KIND_LEN + MAX_PAYLOAD];
 
-        let encoded = ResponseEncoder
+        let len = ResponseEncoder
             .encode_report(&EchoReport::Echoed(payload(b"back")), &mut buf)
             .unwrap();
-        assert_eq!(
-            encoded,
-            Encoded {
-                tag: TAG_RESP_ECHO,
-                len: 4
-            }
-        );
-        assert_eq!(&buf[..4], b"back");
+        assert_eq!(buf[..len], [&[KIND_RESP_ECHO][..], b"back"].concat());
 
-        let encoded = ResponseEncoder
+        let len = ResponseEncoder
+            .encode_report(&EchoReport::Echoed(payload(b"")), &mut buf)
+            .unwrap();
+        assert_eq!(buf[..len], [KIND_RESP_ECHO]);
+
+        let len = ResponseEncoder
             .encode_report(&EchoReport::Rejected, &mut buf)
             .unwrap();
-        assert_eq!(
-            encoded,
-            Encoded {
-                tag: TAG_RESP_REJECTED,
-                len: 0
-            }
-        );
+        assert_eq!(buf[..len], [KIND_RESP_REJECTED]);
 
         assert!(ResponseEncoder.encode_query(&(), &mut buf).is_err());
     }
 
     #[test]
     fn encoder_refuses_a_buffer_too_small_for_the_body() {
-        let mut buf = [0u8; 3];
+        let mut buf = [0u8; 4];
         assert_eq!(
             ResponseEncoder.encode_report(&EchoReport::Echoed(payload(b"four")), &mut buf),
             Err("buffer too small")
@@ -577,6 +563,10 @@ mod tests {
             ResponseEncoder
                 .encode_report(&EchoReport::Echoed(payload(b"thr")), &mut buf)
                 .is_ok()
+        );
+        assert_eq!(
+            ResponseEncoder.encode_report(&EchoReport::Rejected, &mut []),
+            Err("buffer too small")
         );
     }
 }

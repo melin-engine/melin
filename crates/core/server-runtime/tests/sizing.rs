@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{
-    Counter, CounterEvent, CounterQuery, CounterReport, RequestDecoder, ResponseEncoder,
-    TAG_GET_VALUE, TAG_INCREMENT, TAG_RESP_ACK, TAG_RESP_VALUE,
+    Counter, CounterEvent, CounterQuery, CounterReport, GET_VALUE_REQUEST, KIND_RESP_ACK,
+    KIND_RESP_VALUE, RequestDecoder, ResponseEncoder, increment_request,
 };
 use ed25519_dalek::SigningKey;
 use melin_app::{Application, ApplyCtx, QueryCtx, RejectReason};
@@ -203,16 +203,16 @@ fn connect(addr: SocketAddr, key: &SigningKey) -> Connection {
 }
 
 fn value_of(conn: &mut Connection) -> u64 {
-    let reply = conn.request_one(TAG_GET_VALUE, &[]).expect("query");
-    assert_eq!(reply[0], TAG_RESP_VALUE);
+    let reply = conn.request_one(&GET_VALUE_REQUEST).expect("query");
+    assert_eq!(reply[0], KIND_RESP_VALUE);
     u64::from_le_bytes(reply[1..9].try_into().expect("8 bytes"))
 }
 
 fn increment(conn: &mut Connection, amount: u64) {
     let reply = conn
-        .request_one(TAG_INCREMENT, &amount.to_le_bytes())
+        .request_one(&increment_request(amount))
         .expect("increment");
-    assert_eq!(reply[0], TAG_RESP_ACK, "the increment is acked");
+    assert_eq!(reply[0], KIND_RESP_ACK, "the increment is acked");
 }
 
 const GENESIS: u64 = 1_000;

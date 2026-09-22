@@ -1,24 +1,33 @@
 //! Codec for transport-level control frames.
 //!
 //! Encodes/decodes [`TransportResponse`] and [`ChallengeResponse`].
-//! Tag constants are public and re-used by the exchange-level codec
-//! so there is a single source of truth for wire values.
+//! Tag constants are public so every program that reads or writes frames
+//! — the node, the client library, a gateway on its own I/O loop — shares
+//! one source of truth for the wire values.
+//!
+//! Every frame, in either direction, is `[length: u32 LE][tag: u8][body]`.
+//! The tag is the protocol's alone: [`TAG_APP`] marks a frame whose body
+//! belongs to the application, and every other tag is one of the
+//! protocol's own frames. The protocol never reads an application body,
+//! and an application never sees the tag, so an application body may
+//! start with any byte.
 
 use crate::control::{ChallengeResponse, TransportResponse};
 use crate::error::ProtocolError;
 
-// Wire tags for transport-level control frames (below `FIRST_APP_TAG`).
-// Public so the exchange-level codec imports them instead of redefining
-// its own copies — single source of truth prevents silent wire drift.
+/// Length of the tag that follows every frame's length prefix, in either
+/// direction.
+pub const TAG_LEN: usize = 1;
 
-/// The first tag an application may use, in either direction. Every tag
-/// below it is the protocol's: its control frames, and headroom for
-/// more.
-pub const FIRST_APP_TAG: u8 = 0x10;
-
-/// Length of the header every client request frame starts with, after
-/// the length prefix: `[tag: u8]`.
-pub const REQUEST_HEADER_LEN: usize = 1;
+/// An application frame: the body is the application's request or
+/// response, opaque to the protocol.
+///
+/// Not `0x00`, so a zeroed buffer on the wire is an unknown tag rather
+/// than an empty application frame. Not in `0x10..`, the range the
+/// protocol once left to application tags in this position, so a client
+/// still framing requests that way has them dropped as unknown tags
+/// rather than misread as application frames.
+pub const TAG_APP: u8 = 0x09;
 
 pub const TAG_RESPONSE_HEARTBEAT: u8 = 0x01;
 pub const TAG_BATCH_END: u8 = 0x02;
@@ -40,8 +49,8 @@ pub fn encode_transport_response(
 ) -> Result<usize, ProtocolError> {
     // 4-byte length prefix + 1-byte tag; Challenge adds 32 nonce bytes.
     let needed = match response {
-        TransportResponse::Challenge { .. } => 4 + 1 + 32,
-        _ => 4 + 1,
+        TransportResponse::Challenge { .. } => 4 + TAG_LEN + 32,
+        _ => 4 + TAG_LEN,
     };
     if buf.len() < needed {
         return Err(ProtocolError::Truncated);
@@ -91,7 +100,7 @@ pub fn encode_transport_response(
 
 /// Wire size of a challenge-response frame payload:
 /// tag(1) + signature(64) + public_key(32).
-pub const CHALLENGE_RESPONSE_LEN: usize = 1 + 64 + 32;
+pub const CHALLENGE_RESPONSE_LEN: usize = TAG_LEN + 64 + 32;
 
 /// Encode a client's auth challenge-response into `buf`, as the frame
 /// payload *without* the 4-byte length prefix:
@@ -163,6 +172,28 @@ mod tests {
             // Length prefix should be 1 (just the tag byte)
             assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 1);
         }
+    }
+
+    /// The application's tag is distinct from every control frame's, so
+    /// a client can never read one as the other.
+    #[test]
+    fn the_app_tag_is_no_control_frame() {
+        let variants = [
+            TransportResponse::Heartbeat,
+            TransportResponse::BatchEnd,
+            TransportResponse::EngineError,
+            TransportResponse::ServerBusy,
+            TransportResponse::Challenge { nonce: [0; 32] },
+            TransportResponse::AuthFailed,
+            TransportResponse::ServerReady,
+        ];
+        for variant in &variants {
+            let mut buf = [0u8; 64];
+            encode_transport_response(variant, &mut buf).unwrap();
+            assert_ne!(buf[4], TAG_APP, "variant {variant:?}");
+        }
+        assert_ne!(TAG_APP, TAG_CHALLENGE_RESPONSE);
+        assert_ne!(TAG_APP, 0x00);
     }
 
     #[test]

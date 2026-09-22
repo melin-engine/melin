@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use melin_client::{Connection, Frame, key};
 
-use echo_server::{MAX_PAYLOAD, TAG_ECHO, TAG_RESP_ECHO, TAG_RESP_REJECTED};
+use echo_server::{KIND_RESP_ECHO, KIND_RESP_REJECTED, MAX_PAYLOAD};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -120,15 +120,20 @@ fn run(cli: Cli) -> Result<(), Error> {
 /// reads frame by frame instead of asking the client for the batch.
 fn echo(node: &mut Connection, request: u64, payload: &[u8]) -> Result<Duration, Error> {
     let started = Instant::now();
-    node.send(TAG_ECHO, payload)?;
+    node.send(payload)?;
     let elapsed = match node.next_frame()? {
         Frame::Response(reply) => {
             let elapsed = started.elapsed();
-            if reply.first() == Some(&TAG_RESP_REJECTED) {
-                return Err("the server rejected the request".into());
-            }
-            if reply.first() != Some(&TAG_RESP_ECHO) || reply[1..] != payload[..] {
-                return Err(format!("the reply to request {request} is not what was sent").into());
+            match reply.split_first() {
+                Some((&KIND_RESP_ECHO, echoed)) if echoed == payload => {}
+                Some((&KIND_RESP_REJECTED, _)) => {
+                    return Err("the server rejected the request".into());
+                }
+                _ => {
+                    return Err(
+                        format!("the reply to request {request} is not what was sent").into(),
+                    );
+                }
             }
             elapsed
         }

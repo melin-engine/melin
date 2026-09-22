@@ -29,8 +29,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the gate gone the runtime never read it, yet every request, journal entry
   and replication slot carried its eight bytes for every application. A
   client frame is now `[tag][body]`, the handshake's challenge response
-  included; `melin-client`'s `send`, `request` and `request_one` lose their
-  sequence argument; `Decoded::Permitted` is a tuple variant carrying only
+  included (see Changed for what the tag now is); `melin-client`'s `send`,
+  `request` and `request_one` lose their sequence argument; `Decoded::Permitted` is a tuple variant carrying only
   the event; `InputSlot` and `JournalEntry` lose `request_seq`, and
   `melin-journal`'s `JournalWrite::encode_event`, `batch_append_with_ts`,
   `codec::encode` and `codec::decode` the matching argument or tuple
@@ -49,25 +49,34 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
-- **The runtime reads and writes the protocol's framing; application codecs
-  see only tags and bodies.** A `RequestDecoder` is called as
-  `decode(tag, body, permission)` and returns `Decoded::Permitted(event)`:
-  the runtime reads the tag, drops an empty frame, and drops a frame whose
-  tag is in the protocol's reserved range (below `0x10`) before any decoder
-  sees it. A `ResponseEncoder` writes only the body and returns
-  `Encoded { tag, len }`; the runtime writes the length prefix and the tag,
-  and refuses — logging at `error!` and dropping the response — a reserved
-  tag, which a client would otherwise read as a protocol frame. This
-  moves no byte on the wire; the frame itself changed with the request
-  sequence's removal (see Removed), and a request must now start with its
-  tag — anything an application carried ahead of it moves into the body.
-  Source-breaking for application codecs: remove the tag parsing, the
-  reserved-tag filter arm, and the length prefix and tag writes.
-  `melin_server_runtime::MAX_RESPONSE_BUF` is replaced by
-  `MAX_RESPONSE_BODY`, a bound on the body alone, and `MAX_REQUEST_BODY`
-  gives the matching request bound; `MAX_FRAME_SIZE` remains for programs
-  that read client frames themselves. `melin-wire-protocol` gains
-  `FIRST_APP_TAG` and `REQUEST_HEADER_LEN`.
+- **The frame's tag is the protocol's alone; an application's bytes are an
+  opaque body behind it.** Every frame is `[length][tag][body]`, and an
+  application's request or response travels as an application frame, under
+  the one tag `TAG_APP` (`0x09`). The protocol no longer shares its tag
+  byte with the application by range, so an application no longer numbers
+  its messages from `0x10`, and nothing it sends can be read as a protocol
+  frame: its body may start with any byte, or be empty. The runtime reads
+  and writes the framing. A `RequestDecoder` is called as
+  `decode(body, permission)` and returns `Decoded::Permitted(event)`; the
+  runtime drops an empty frame and any frame that is not an application
+  frame before a decoder sees it. A `ResponseEncoder` writes the body and
+  returns its length; the runtime writes the length prefix and `TAG_APP`.
+  `melin-client`'s `send`, `request` and `request_one` take the body alone,
+  and `Frame::Response` / `Reply::Response` carry the body with the tag
+  stripped.
+  - **Client protocol.** Breaking on the wire: an application's first byte
+    moves behind `TAG_APP`. A node drops a request framed the old way — its
+    tag is no application frame's — and a client built against an earlier
+    `melin-client` reports a protocol error on the node's first reply.
+    Upgrade clients with the nodes.
+  - **Source.** For application codecs: keep a message discriminator, if
+    the application needs one, as the first byte of its own body, and
+    parse and write it there. `Encoded` is removed.
+    `melin_server_runtime::MAX_RESPONSE_BUF` is replaced by
+    `MAX_RESPONSE_BODY`, a bound on the body alone, and `MAX_REQUEST_BODY`
+    gives the matching request bound; `MAX_FRAME_SIZE` remains for
+    programs that read client frames themselves. `melin-wire-protocol`
+    gains `TAG_APP` and `TAG_LEN`.
 - **Queries have a method of their own, which cannot change state.**
   `Application::query(&self, event, &QueryCtx) -> Option<QueryResponse>`
   answers queries; `Application::apply` now takes only journaled events and

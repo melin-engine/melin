@@ -1336,7 +1336,9 @@ mod tests {
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
-    use melin_wire_protocol::control_codec::REQUEST_HEADER_LEN;
+    use melin_wire_protocol::control_codec::{
+        TAG_APP, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_RESPONSE_HEARTBEAT,
+    };
     use std::io::{ErrorKind, Read};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicU64;
@@ -1373,8 +1375,8 @@ mod tests {
     }
 
     /// Minimal `AppEvent` for these tests. `Copy` is required by `AppEvent`;
-    /// the on-wire codec is unused because [`TagDecoder`] never invokes it
-    /// (frames are interpreted directly from their tag byte).
+    /// the on-wire codec is unused because [`ByteDecoder`] never invokes it
+    /// (frames are interpreted directly from their one body byte).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TestEvent {
         Cmd(u8),
@@ -1435,9 +1437,6 @@ mod tests {
         }
     }
 
-    /// The one application tag the test frames carry.
-    const TEST_TAG: u8 = melin_wire_protocol::control_codec::FIRST_APP_TAG;
-
     /// Stateless decoder that maps a request's single body byte to a
     /// [`Decoded`] outcome. Lets each test feed a precise mix of permitted,
     /// filtered, denied, and decode-error frames without standing up the
@@ -1450,15 +1449,11 @@ mod tests {
     ///   * `0xFE` -> `DecodeError`
     ///   * `0xFF` -> `Permitted` with `is_query == true`
     ///   * `0x00..=0xFB` -> `Permitted(Cmd(byte))`
-    struct TagDecoder;
+    struct ByteDecoder;
 
-    impl RequestDecoder for TagDecoder {
+    impl RequestDecoder for ByteDecoder {
         type Event = TestEvent;
-        fn decode(&self, tag: u8, body: &[u8], _permission: Permission) -> Decoded<TestEvent> {
-            assert!(
-                tag >= TEST_TAG,
-                "the runtime must not hand a reserved tag to a decoder"
-            );
+        fn decode(&self, body: &[u8], _permission: Permission) -> Decoded<TestEvent> {
             match body.first().copied() {
                 None => Decoded::DecodeError("empty body"),
                 Some(0xFC) => Decoded::Filter,
@@ -1473,7 +1468,7 @@ mod tests {
     /// A request frame as a client sends it — `[u32 LE length][tag][body]`
     /// — with the tag chosen by the caller.
     fn request_frame(tag: u8, body: &[u8]) -> Vec<u8> {
-        let len = (REQUEST_HEADER_LEN + body.len()) as u32;
+        let len = (TAG_LEN + body.len()) as u32;
         let mut f = Vec::with_capacity(4 + len as usize);
         f.extend_from_slice(&len.to_le_bytes());
         f.push(tag);
@@ -1481,10 +1476,10 @@ mod tests {
         f
     }
 
-    /// The frame most tests use: the test tag, and `byte` as the one body
-    /// byte [`TagDecoder`] keys on.
+    /// The frame most tests use: an application frame, and `byte` as the
+    /// one body byte [`ByteDecoder`] keys on.
     fn frame(byte: u8) -> Vec<u8> {
-        request_frame(TEST_TAG, &[byte])
+        request_frame(TAG_APP, &[byte])
     }
 
     /// Length prefix announcing an oversize frame. No payload bytes follow —
@@ -1614,7 +1609,7 @@ mod tests {
         let disconnect = process_frames::<TestApp, UnixStream>(
             conn,
             producer,
-            &TagDecoder,
+            &ByteDecoder,
             halt,
             refusals,
             &control_tx,
@@ -1872,7 +1867,7 @@ mod tests {
         let disconnect = process_frames::<TestApp, UnixStream>(
             &mut conn,
             &mut producer,
-            &TagDecoder,
+            &ByteDecoder,
             &gate(None, false),
             &mut refusals,
             &control_tx,
@@ -1914,7 +1909,7 @@ mod tests {
         } = make_fixture(64);
         const EVENT_COUNT: usize = 32;
         for i in 0..EVENT_COUNT {
-            // Use bytes 1..=32 (each ≤ 0xFB so TagDecoder yields
+            // Use bytes 1..=32 (each ≤ 0xFB so ByteDecoder yields
             // `Permitted` with `TestEvent::Cmd(byte)`).
             conn.parse_buf.extend_from_slice(&frame((i + 1) as u8));
         }
@@ -2169,9 +2164,10 @@ mod tests {
     }
 
     /// The request tag is the runtime's to read: an empty frame, or one
-    /// carrying a tag from the protocol's reserved range, is dropped
-    /// before any decoder sees it (`TagDecoder` asserts as much), and the
-    /// frames around it still publish.
+    /// whose tag is not the application's, is dropped before any decoder
+    /// sees it, and the frames around it still publish. The decoder gets
+    /// the body alone, so a body byte equal to a protocol tag is just
+    /// that — `frame(0x01)` carries the heartbeat's value as a command.
     #[test]
     fn process_frames_reads_the_request_tag_itself() {
         let Fixture {
@@ -2183,12 +2179,14 @@ mod tests {
         conn.parse_buf.extend_from_slice(&frame(0x01));
         // An empty frame: no tag at all.
         conn.parse_buf.extend_from_slice(&0u32.to_le_bytes());
-        for reserved in [0x00, 0x01, TEST_TAG - 1] {
+        // A zeroed tag, the protocol's own frames, and a request framed
+        // under an application tag as the protocol once allowed — each
+        // would decode to `Cmd(0x03)` if a decoder saw it.
+        for tag in [0x00, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT, 0x10] {
             conn.parse_buf
-                .extend_from_slice(&request_frame(reserved, &[0x03]));
+                .extend_from_slice(&request_frame(tag, &[0x03]));
         }
-        conn.parse_buf
-            .extend_from_slice(&request_frame(TEST_TAG, &[0x02]));
+        conn.parse_buf.extend_from_slice(&frame(0x02));
 
         let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
         assert!(!disconnect, "malformed requests do not drop the connection");
@@ -2280,7 +2278,7 @@ mod tests {
 
         let mut handle = spawn_reader::<TestApp, UnixStream>(
             producer,
-            Arc::new(TagDecoder),
+            Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
             control_tx,
@@ -2394,7 +2392,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handle = spawn_reader::<TestApp, UnixStream>(
             producer,
-            Arc::new(TagDecoder),
+            Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
             control_tx,
@@ -2470,7 +2468,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handle = spawn_reader::<TestApp, UnixStream>(
             producer,
-            Arc::new(TagDecoder),
+            Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
             control_tx,
