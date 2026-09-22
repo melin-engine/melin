@@ -21,8 +21,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use melin_app::encoder::ResponseEncoder;
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_app::encoder::{Encoded, ResponseEncoder};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 use melin_pipeline::padding::CachePadded;
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_pipeline::wait::WaitStrategy;
@@ -35,13 +35,17 @@ use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization
 use melin_transport_core::{DurableWireSeqCursor, WireSeq};
 use melin_wire_protocol::blocking::BlockingFrameWriter;
 
-/// Payload bytes per frame (the length prefix counts payload only,
-/// matching the runtime's `[len(4) | payload]` wire contract).
-const PAYLOAD_LEN: usize = 396;
-/// Full frame: prefix + payload. Sized so ~165 slots cross the 64 KiB
-/// cap — comfortably inside one 1024-slot batch — while staying under
-/// the stage's 512-byte per-frame encode scratch.
-const FRAME_LEN: usize = 4 + PAYLOAD_LEN;
+/// Body bytes per response, as the encoder writes them.
+const BODY_LEN: usize = 395;
+/// Full frame on the wire: the runtime's `[len(4) | tag(1)]` header, then
+/// the body. Sized so ~165 slots cross the 64 KiB cap — comfortably
+/// inside one 1024-slot batch — while staying under the stage's
+/// per-response body bound.
+const FRAME_LEN: usize = 4 + 1 + BODY_LEN;
+const _: () = assert!(BODY_LEN <= melin_server_runtime::MAX_RESPONSE_BODY);
+
+/// The tag every pad response carries.
+const PAD_TAG: u8 = 0x10;
 
 /// Enough slots to cross `MAX_SEND_BUF` in one batch several times
 /// over (400 × 400 B = 160 KiB), while fitting one ring/batch.
@@ -89,12 +93,10 @@ impl Application for PadApp {
     type QueryResponse = PadReport;
     type Sizing = ();
 
-    fn apply(
-        &mut self,
-        _event: Self::Event,
-        _ctx: &ApplyCtx,
-        _out: &mut Vec<Self::Report>,
-    ) -> Option<Self::QueryResponse> {
+    fn apply(&mut self, _event: Self::Event, _ctx: &ApplyCtx, _out: &mut Vec<Self::Report>) {
+        unreachable!("response-stage-only test")
+    }
+    fn query(&self, _event: Self::Event, _ctx: &QueryCtx) -> Option<Self::QueryResponse> {
         unreachable!("response-stage-only test")
     }
     fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
@@ -109,21 +111,23 @@ impl Application for PadApp {
     }
 }
 
-/// Frame: `[PAYLOAD_LEN(4 LE) | value(8 LE) | zero padding]`.
+/// Body: `[value(8 LE) | zero padding]`, under `PAD_TAG`.
 struct PadEncoder;
 
 impl ResponseEncoder for PadEncoder {
     type Report = PadReport;
     type Query = PadReport;
 
-    fn encode_report(&self, report: &PadReport, buf: &mut [u8]) -> Result<usize, &'static str> {
-        buf[..4].copy_from_slice(&(PAYLOAD_LEN as u32).to_le_bytes());
-        buf[4..12].copy_from_slice(&report.value.to_le_bytes());
-        buf[12..FRAME_LEN].fill(0);
-        Ok(FRAME_LEN)
+    fn encode_report(&self, report: &PadReport, buf: &mut [u8]) -> Result<Encoded, &'static str> {
+        buf[..8].copy_from_slice(&report.value.to_le_bytes());
+        buf[8..BODY_LEN].fill(0);
+        Ok(Encoded {
+            tag: PAD_TAG,
+            len: BODY_LEN,
+        })
     }
 
-    fn encode_query(&self, query: &Self::Query, buf: &mut [u8]) -> Result<usize, &'static str> {
+    fn encode_query(&self, query: &Self::Query, buf: &mut [u8]) -> Result<Encoded, &'static str> {
         self.encode_report(query, buf)
     }
 }
@@ -143,11 +147,12 @@ fn read_pad(sock: &mut UnixStream) -> io::Result<u64> {
     sock.read_exact(&mut frame)?;
     assert_eq!(
         u32::from_le_bytes(frame[..4].try_into().expect("4 bytes")),
-        PAYLOAD_LEN as u32,
+        (1 + BODY_LEN) as u32,
         "unexpected length prefix"
     );
+    assert_eq!(frame[4], PAD_TAG, "unexpected tag");
     Ok(u64::from_le_bytes(
-        frame[4..12].try_into().expect("8 bytes"),
+        frame[5..13].try_into().expect("8 bytes"),
     ))
 }
 

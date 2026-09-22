@@ -1333,9 +1333,10 @@ mod tests {
     use super::*;
     use melin_app::auth::Permission;
     use melin_app::decoder::{Decoded, RequestDecoder};
-    use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+    use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
+    use melin_wire_protocol::control_codec::REQUEST_HEADER_LEN;
     use std::io::{ErrorKind, Read};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicU64;
@@ -1414,12 +1415,10 @@ mod tests {
         type QueryResponse = ();
         type Sizing = ();
         const APP_VERSION: u16 = 0;
-        fn apply(
-            &mut self,
-            _event: TestEvent,
-            _ctx: &ApplyCtx,
-            _out: &mut Vec<TestReport>,
-        ) -> Option<()> {
+        fn apply(&mut self, _event: TestEvent, _ctx: &ApplyCtx, _out: &mut Vec<TestReport>) {
+            unreachable!()
+        }
+        fn query(&self, _event: TestEvent, _ctx: &QueryCtx) -> Option<()> {
             unreachable!()
         }
         fn tick(&mut self, _now_ns: u64, _out: &mut Vec<TestReport>) {
@@ -1436,25 +1435,32 @@ mod tests {
         }
     }
 
-    /// Stateless decoder that maps a frame's single payload byte to a
+    /// The one application tag the test frames carry.
+    const TEST_TAG: u8 = melin_wire_protocol::control_codec::FIRST_APP_TAG;
+
+    /// Stateless decoder that maps a request's single body byte to a
     /// [`Decoded`] outcome. Lets each test feed a precise mix of permitted,
     /// filtered, denied, and decode-error frames without standing up the
     /// real wire codec.
     ///
-    /// Tag mapping (`0x00..=0xFB` map 1:1 to a Permitted command, reserving
-    /// the top four byte values for the non-Permitted outcomes):
+    /// Body-byte mapping (`0x00..=0xFB` map 1:1 to a Permitted command,
+    /// reserving the top four byte values for the non-Permitted outcomes):
     ///   * `0xFC` -> `Filter`
     ///   * `0xFD` -> `PermissionDenied`
     ///   * `0xFE` -> `DecodeError`
     ///   * `0xFF` -> `Permitted` with `is_query == true`
-    ///   * `0x00..=0xFB` -> `Permitted` with `TestEvent::Cmd(byte)`
+    ///   * `0x00..=0xFB` -> `Permitted(Cmd(byte))`
     struct TagDecoder;
 
     impl RequestDecoder for TagDecoder {
         type Event = TestEvent;
-        fn decode(&self, bytes: &[u8], _permission: Permission) -> Decoded<TestEvent> {
-            match bytes.first().copied() {
-                None => Decoded::DecodeError("empty payload"),
+        fn decode(&self, tag: u8, body: &[u8], _permission: Permission) -> Decoded<TestEvent> {
+            assert!(
+                tag >= TEST_TAG,
+                "the runtime must not hand a reserved tag to a decoder"
+            );
+            match body.first().copied() {
+                None => Decoded::DecodeError("empty body"),
                 Some(0xFC) => Decoded::Filter,
                 Some(0xFD) => Decoded::PermissionDenied("denied"),
                 Some(0xFE) => Decoded::DecodeError("bad"),
@@ -1464,12 +1470,21 @@ mod tests {
         }
     }
 
-    /// One-byte payload framed as `[u32 LE length=1][byte]`.
-    fn frame(byte: u8) -> [u8; 5] {
-        let mut f = [0u8; 5];
-        f[..4].copy_from_slice(&1u32.to_le_bytes());
-        f[4] = byte;
+    /// A request frame as a client sends it — `[u32 LE length][tag][body]`
+    /// — with the tag chosen by the caller.
+    fn request_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let len = (REQUEST_HEADER_LEN + body.len()) as u32;
+        let mut f = Vec::with_capacity(4 + len as usize);
+        f.extend_from_slice(&len.to_le_bytes());
+        f.push(tag);
+        f.extend_from_slice(body);
         f
+    }
+
+    /// The frame most tests use: the test tag, and `byte` as the one body
+    /// byte [`TagDecoder`] keys on.
+    fn frame(byte: u8) -> Vec<u8> {
+        request_frame(TEST_TAG, &[byte])
     }
 
     /// Length prefix announcing an oversize frame. No payload bytes follow —
@@ -1997,7 +2012,7 @@ mod tests {
         // the unprocessed tail (the 6th frame's bytes) to the front.
         assert_eq!(
             conn.parse_buf,
-            frame(0x06).to_vec(),
+            frame(0x06),
             "the 6th frame remains in parse_buf for the next recv-cycle"
         );
     }
@@ -2151,6 +2166,38 @@ mod tests {
             conn.parse_buf.is_empty(),
             "all bytes advanced past compaction"
         );
+    }
+
+    /// The request tag is the runtime's to read: an empty frame, or one
+    /// carrying a tag from the protocol's reserved range, is dropped
+    /// before any decoder sees it (`TagDecoder` asserts as much), and the
+    /// frames around it still publish.
+    #[test]
+    fn process_frames_reads_the_request_tag_itself() {
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(16);
+        conn.parse_buf.extend_from_slice(&frame(0x01));
+        // An empty frame: no tag at all.
+        conn.parse_buf.extend_from_slice(&0u32.to_le_bytes());
+        for reserved in [0x00, 0x01, TEST_TAG - 1] {
+            conn.parse_buf
+                .extend_from_slice(&request_frame(reserved, &[0x03]));
+        }
+        conn.parse_buf
+            .extend_from_slice(&request_frame(TEST_TAG, &[0x02]));
+
+        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect, "malformed requests do not drop the connection");
+
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x01)));
+        assert_eq!(events[1].1.event, JournalEvent::App(TestEvent::Cmd(0x02)));
+        assert!(conn.parse_buf.is_empty(), "every frame was consumed");
     }
 
     #[test]

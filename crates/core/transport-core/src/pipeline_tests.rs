@@ -3636,7 +3636,7 @@ fn pipeline_journals_every_event_in_order() {
     );
 }
 
-/// End-to-end pin for the stats-query surface: `ApplyCtx.journal_sequence`
+/// End-to-end pin for the stats-query surface: `QueryCtx::journal_sequence`
 /// must report the durable wire seq — the same space as the health
 /// endpoint's `journal_seq` gauge — both live and, critically, after
 /// recovery, where the journal ring cursor restarts near zero while the
@@ -3776,6 +3776,88 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     shutdown.store(true, Ordering::Relaxed);
     let _writer = t_journal.join().unwrap();
     let _app = t_matching.join().unwrap();
+}
+
+/// A query reaches `Application::query` and nothing else on the matching
+/// stage: it neither reaches `apply` under its key nor drives the
+/// scheduler clock, even when its slot carries a timestamp. Replay never
+/// sees the query (the journal drops it), so either side effect would
+/// leave the live engine in a state recovery cannot reproduce — here,
+/// per-key state the query touched, or a tick replay never fires.
+#[test]
+fn a_query_changes_no_matching_stage_state() {
+    const KEY: u64 = 0xC0FFEE;
+    let dir = tempfile::tempdir().unwrap();
+    let writer = Writer::create(&dir.path().join("query_state.journal")).unwrap();
+    let mut out = build_pipeline_with_replication(
+        TestApp::new(),
+        writer,
+        Duration::ZERO,
+        Arc::new(AtomicU64::new(0)),
+        false,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let mut input_producer = out.input_producer;
+    let journal_stage = out.journal_stage;
+    let matching_stage = out.matching_stage;
+    let mut output_consumer = out.output_consumers.pop().unwrap();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s1 = Arc::clone(&shutdown);
+    let s2 = Arc::clone(&shutdown);
+    let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+    let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+    let slot = |event, timestamp_ns| TestInput {
+        connection_id: 1,
+        key_hash: KEY,
+        sequence: 0,
+        timestamp_ns,
+        event,
+        publish_ts: mono_trace_ns(),
+        recv_ts: mono_trace_ns(),
+    };
+    input_producer.publish(slot(JournalEvent::App(TestEvent::Add(1)), 0));
+    input_producer.publish(slot(JournalEvent::App(TestEvent::Query), 1_000));
+    input_producer.publish(slot(JournalEvent::App(TestEvent::Add(2)), 0));
+
+    let mut payloads = Vec::new();
+    let mut spins = 0u32;
+    let drain_start = std::time::Instant::now();
+    while payloads.len() < 3 {
+        if let Some((_, out_slot)) = output_consumer.try_consume() {
+            payloads.push(out_slot.payload);
+        } else {
+            drain_backoff(&mut spins, drain_start, "draining outputs");
+        }
+    }
+    assert!(matches!(
+        payloads[1],
+        OutputPayload::QueryResponse(TestQuery { total: 1, .. })
+    ));
+    assert!(
+        matches!(
+            payloads[2],
+            OutputPayload::Report(TestReport { total_after: 3 })
+        ),
+        "the write after the query is applied: {:?}",
+        payloads[2]
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = t_journal.join().unwrap();
+    let app = t_matching.join().unwrap();
+    assert_eq!(app.ticks, 0, "a query must not drive the scheduler clock");
+    assert_eq!(
+        app.per_key_total,
+        std::collections::HashMap::from([(KEY, 3)]),
+        "only the writes reach apply under the key"
+    );
 }
 
 // ---------------------------------------------------------------------------

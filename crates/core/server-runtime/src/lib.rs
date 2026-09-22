@@ -25,6 +25,7 @@ mod raft_promotion;
 pub mod reader;
 pub mod replication;
 pub mod response;
+mod response_frame;
 pub mod server;
 mod startup;
 mod uring_teardown;
@@ -37,12 +38,15 @@ pub mod dpdk_response;
 pub mod dpdk_transport;
 
 // The two wire bounds an application's codecs have to fit: the widest
-// request frame the readers accept, and the widest response frame the
-// response stage can encode. Re-exported here so an application can
-// assert against them at compile time, next to the bounds it declares
-// (`AppEvent::MAX_ENCODED_SIZE` is the journal's; these are the wire's).
-pub use client_frames::MAX_FRAME_SIZE;
-pub use response::MAX_RESPONSE_BUF;
+// request body the readers hand a decoder, and the widest response body
+// the response stages give an encoder room for — both after the
+// protocol's framing, which the runtime reads and writes itself.
+// Re-exported here so an application can assert against them at compile
+// time, next to the bounds it declares (`AppEvent::MAX_ENCODED_SIZE` is
+// the journal's; these are the wire's). `MAX_FRAME_SIZE` is the whole
+// request frame, for a program that reads client frames itself.
+pub use client_frames::{MAX_FRAME_SIZE, MAX_REQUEST_BODY};
+pub use response_frame::MAX_RESPONSE_BODY;
 
 /// Control-plane event the accept loop, reader, and response stage
 /// exchange. Transport-agnostic — the payload is a socket fd + writer,

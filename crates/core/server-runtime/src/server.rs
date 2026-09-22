@@ -2989,8 +2989,8 @@ where
 /// Journal a primary's [`StartupEvents`] — `genesis` (empty unless the
 /// journal is new), then `on_primary` — and return once they are applied.
 ///
-/// The events ride the input ring as the node's own (connection 0,
-/// exempt from the request-sequence gate), so the normal pipeline
+/// The events ride the input ring as the node's own (connection 0, key
+/// hash 0: no client identity), so the normal pipeline
 /// journals, replicates and applies them. The caller must still be the
 /// ring's only producer, and must not serve a client until this returns:
 /// a client request would otherwise run before the configuration in

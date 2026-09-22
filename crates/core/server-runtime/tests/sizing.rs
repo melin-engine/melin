@@ -24,7 +24,7 @@ use counter_server::{
     TAG_GET_VALUE, TAG_INCREMENT, TAG_RESP_ACK, TAG_RESP_VALUE,
 };
 use ed25519_dalek::SigningKey;
-use melin_app::{Application, ApplyCtx, RejectReason};
+use melin_app::{Application, ApplyCtx, QueryCtx, RejectReason};
 use melin_client::Connection;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -98,13 +98,12 @@ impl Application for SizedCounter {
     type Sizing = Sizing;
     const APP_VERSION: u16 = Counter::APP_VERSION;
 
-    fn apply(
-        &mut self,
-        event: Self::Event,
-        ctx: &ApplyCtx,
-        out: &mut Vec<Self::Report>,
-    ) -> Option<Self::QueryResponse> {
+    fn apply(&mut self, event: Self::Event, ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
         self.0.apply(event, ctx, out)
+    }
+
+    fn query(&self, event: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        self.0.query(event, ctx)
     }
 
     fn tick(&mut self, now_ns: u64, out: &mut Vec<Self::Report>) {

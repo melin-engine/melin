@@ -80,12 +80,12 @@ use std::io::{self, Read, Write};
 
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
-use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 
 // ---------------------------------------------------------------------------
-// Wire tags — domain tags start at 0x10 to avoid colliding with transport-
-// level control tags (0x01–0x0F) reserved by melin-wire-protocol.
+// Wire tags — application tags start at 0x10; everything below is the
+// protocol's, and the runtime keeps it away from the codecs.
 // ---------------------------------------------------------------------------
 
 pub const TAG_ECHO: u8 = 0x10;
@@ -108,13 +108,12 @@ pub const MAX_PAYLOAD: usize = 288;
 // either is a compile error naming the reason. The journal's bound is
 // checked the same way by the journal itself, from `MAX_ENCODED_SIZE`.
 const _: () = assert!(
-    // Strictly less: the tag byte takes the frame's remaining byte.
-    MAX_PAYLOAD < melin_server_runtime::MAX_FRAME_SIZE,
-    "a request (tag, payload) must fit one client frame"
+    MAX_PAYLOAD <= melin_server_runtime::MAX_REQUEST_BODY,
+    "a request's payload must fit one client frame's body"
 );
 const _: () = assert!(
-    4 + 1 + MAX_PAYLOAD <= melin_server_runtime::MAX_RESPONSE_BUF,
-    "a reply (length prefix, tag, payload) must fit the response stage's encode buffer"
+    MAX_PAYLOAD <= melin_server_runtime::MAX_RESPONSE_BODY,
+    "a reply's payload must fit the response stage's body buffer"
 );
 
 // ---------------------------------------------------------------------------
@@ -256,13 +255,17 @@ impl Application for Echo {
     type Event = Payload;
     type Report = EchoReport;
     // No queries, so no query response. `()` is `Copy`, which is all the
-    // transport asks of the type; `apply` never returns `Some`.
+    // transport asks of the type; `query` never returns `Some`.
     type QueryResponse = ();
     // No state, so nothing to size.
     type Sizing = ();
 
-    fn apply(&mut self, event: Payload, _ctx: &ApplyCtx, out: &mut Vec<EchoReport>) -> Option<()> {
+    fn apply(&mut self, event: Payload, _ctx: &ApplyCtx, out: &mut Vec<EchoReport>) {
         out.push(EchoReport::Echoed(event));
+    }
+
+    // Unreachable: no payload is a query, so the runtime never calls this.
+    fn query(&self, _event: Payload, _ctx: &QueryCtx) -> Option<()> {
         None
     }
 
@@ -290,23 +293,17 @@ impl Application for Echo {
 // Request decoder
 // ---------------------------------------------------------------------------
 
-/// Decodes length-prefixed client frames into `Payload`.
+/// Decodes client requests into `Payload`.
 ///
-/// Wire format (after the 4-byte length prefix is stripped by the runtime):
-///   `[tag: u8][bytes: the rest of the frame]`
-///
-/// The payload needs no length of its own: the frame is already
+/// The runtime has already read the tag; the body of an echo is the
+/// payload. It needs no length of its own: the frame is already
 /// length-prefixed, so whatever follows the tag is the payload.
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = Payload;
 
-    fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<Payload> {
-        let Some((&tag, body)) = bytes.split_first() else {
-            return Decoded::DecodeError("frame too short");
-        };
-
+    fn decode(&self, tag: u8, body: &[u8], permission: Permission) -> Decoded<Payload> {
         match tag {
             TAG_ECHO => {
                 // An echo appends to the journal, so the read-only and
@@ -320,8 +317,6 @@ impl RequestDecoderTrait for RequestDecoder {
                     None => Decoded::DecodeError("payload longer than MAX_PAYLOAD"),
                 }
             }
-            // Transport-level heartbeats and auth frames — filter silently.
-            0x01..=0x0F => Decoded::Filter,
             _ => Decoded::DecodeError("unknown tag"),
         }
     }
@@ -331,42 +326,37 @@ impl RequestDecoderTrait for RequestDecoder {
 // Response encoder
 // ---------------------------------------------------------------------------
 
-/// Encodes `EchoReport` into length-prefixed wire frames.
-///
-/// Wire format: `[length: u32 LE][tag: u8][bytes...]`, where the bytes are
-/// the request's for an echo and absent for a rejection.
+/// Encodes `EchoReport` into response bodies; the runtime frames them. The
+/// body is the request's bytes for an echo, and empty for a rejection.
 pub struct ResponseEncoder;
-
-/// Write one frame — length prefix, tag, bytes — checking `buf` can hold
-/// the whole of it first so the fixed-offset writes cannot panic.
-fn frame(buf: &mut [u8], tag: u8, bytes: &[u8]) -> Result<usize, &'static str> {
-    let frame_len = 4 + 1 + bytes.len();
-    if buf.len() < frame_len {
-        return Err("buffer too small");
-    }
-    // Lossless: a frame is at most a tag plus `MAX_PAYLOAD` bytes.
-    let payload_len = (1 + bytes.len()) as u32;
-    buf[..4].copy_from_slice(&payload_len.to_le_bytes());
-    buf[4] = tag;
-    buf[5..frame_len].copy_from_slice(bytes);
-    Ok(frame_len)
-}
 
 impl ResponseEncoderTrait for ResponseEncoder {
     type Report = EchoReport;
     type Query = ();
 
-    fn encode_report(&self, report: &EchoReport, buf: &mut [u8]) -> Result<usize, &'static str> {
+    fn encode_report(&self, report: &EchoReport, buf: &mut [u8]) -> Result<Encoded, &'static str> {
         match report {
-            EchoReport::Echoed(payload) => frame(buf, TAG_RESP_ECHO, payload.as_bytes()),
-            EchoReport::Rejected => frame(buf, TAG_RESP_REJECTED, &[]),
+            EchoReport::Echoed(payload) => {
+                let bytes = payload.as_bytes();
+                buf.get_mut(..bytes.len())
+                    .ok_or("buffer too small")?
+                    .copy_from_slice(bytes);
+                Ok(Encoded {
+                    tag: TAG_RESP_ECHO,
+                    len: bytes.len(),
+                })
+            }
+            EchoReport::Rejected => Ok(Encoded {
+                tag: TAG_RESP_REJECTED,
+                len: 0,
+            }),
         }
     }
 
     // Unreachable: no event is a query, so the runtime never has a query
     // response to encode. An error rather than a panic, so that if that
     // ever changes the failure is a logged encode error, not a crash.
-    fn encode_query(&self, _query: &(), _buf: &mut [u8]) -> Result<usize, &'static str> {
+    fn encode_query(&self, _query: &(), _buf: &mut [u8]) -> Result<Encoded, &'static str> {
         Err("this application has no queries")
     }
 }
@@ -386,19 +376,8 @@ mod tests {
     fn ctx() -> ApplyCtx {
         ApplyCtx {
             now_ns: 0,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
             key_hash: 0,
         }
-    }
-
-    /// `[tag][body]` as a client would send it.
-    fn request(tag: u8, body: &[u8]) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(1 + body.len());
-        frame.push(tag);
-        frame.extend_from_slice(body);
-        frame
     }
 
     // --- Payload ---
@@ -482,8 +461,7 @@ mod tests {
     fn an_echo_is_reported() {
         let mut app = Echo;
         let mut reports = Vec::new();
-        let query = app.apply(payload(b"durable"), &ctx(), &mut reports);
-        assert!(query.is_none());
+        app.apply(payload(b"durable"), &ctx(), &mut reports);
         assert_eq!(reports, [EchoReport::Echoed(payload(b"durable"))]);
     }
 
@@ -512,7 +490,7 @@ mod tests {
             Permission::Trader,
             Permission::Custodian,
         ] {
-            match RequestDecoder.decode(&request(TAG_ECHO, b"hi"), permission) {
+            match RequestDecoder.decode(TAG_ECHO, b"hi", permission) {
                 Decoded::Permitted(event) => assert_eq!(event, payload(b"hi")),
                 _ => panic!("expected Permitted for {permission:?}"),
             }
@@ -524,7 +502,7 @@ mod tests {
         for permission in [Permission::ReadOnly, Permission::Replication] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(&request(TAG_ECHO, b"hi"), permission),
+                    RequestDecoder.decode(TAG_ECHO, b"hi", permission),
                     Decoded::PermissionDenied(_)
                 ),
                 "{permission:?} must not be able to echo"
@@ -533,10 +511,10 @@ mod tests {
     }
 
     #[test]
-    fn the_payload_is_the_rest_of_the_frame() {
+    fn the_payload_is_the_whole_body() {
         for len in [0, 3, MAX_PAYLOAD] {
             let bytes = vec![0x5A; len];
-            match RequestDecoder.decode(&request(TAG_ECHO, &bytes), Permission::Trader) {
+            match RequestDecoder.decode(TAG_ECHO, &bytes, Permission::Trader) {
                 Decoded::Permitted(event) => assert_eq!(event.as_bytes(), bytes),
                 _ => panic!("expected Permitted for {len} bytes"),
             }
@@ -547,55 +525,50 @@ mod tests {
     fn decoder_refuses_what_it_cannot_carry() {
         let too_long = vec![0; MAX_PAYLOAD + 1];
         assert!(matches!(
-            RequestDecoder.decode(&request(TAG_ECHO, &too_long), Permission::Trader),
+            RequestDecoder.decode(TAG_ECHO, &too_long, Permission::Trader),
             Decoded::DecodeError(_)
         ));
         assert!(matches!(
-            RequestDecoder.decode(&[], Permission::Trader),
-            Decoded::DecodeError("frame too short")
-        ));
-        assert!(matches!(
-            RequestDecoder.decode(&request(0x7F, b""), Permission::Trader),
+            RequestDecoder.decode(0x7F, b"", Permission::Trader),
             Decoded::DecodeError("unknown tag")
-        ));
-    }
-
-    #[test]
-    fn decoder_filters_transport_tags() {
-        // TAG_RESPONSE_HEARTBEAT
-        assert!(matches!(
-            RequestDecoder.decode(&request(0x01, b""), Permission::Trader),
-            Decoded::Filter
         ));
     }
 
     // --- Response encoder ---
 
     #[test]
-    fn encoder_frames_carry_the_bytes_after_the_tag() {
-        let mut buf = [0u8; 4 + 1 + MAX_PAYLOAD];
+    fn an_echo_body_is_the_bytes() {
+        let mut buf = [0u8; MAX_PAYLOAD];
 
-        let n = ResponseEncoder
+        let encoded = ResponseEncoder
             .encode_report(&EchoReport::Echoed(payload(b"back")), &mut buf)
             .unwrap();
-        assert_eq!(n, 4 + 1 + 4);
-        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 5);
-        assert_eq!(buf[4], TAG_RESP_ECHO);
-        assert_eq!(&buf[5..n], b"back");
+        assert_eq!(
+            encoded,
+            Encoded {
+                tag: TAG_RESP_ECHO,
+                len: 4
+            }
+        );
+        assert_eq!(&buf[..4], b"back");
 
-        let n = ResponseEncoder
+        let encoded = ResponseEncoder
             .encode_report(&EchoReport::Rejected, &mut buf)
             .unwrap();
-        assert_eq!(n, 5);
-        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 1);
-        assert_eq!(buf[4], TAG_RESP_REJECTED);
+        assert_eq!(
+            encoded,
+            Encoded {
+                tag: TAG_RESP_REJECTED,
+                len: 0
+            }
+        );
 
         assert!(ResponseEncoder.encode_query(&(), &mut buf).is_err());
     }
 
     #[test]
-    fn encoder_refuses_a_buffer_too_small_for_the_frame() {
-        let mut buf = [0u8; 8];
+    fn encoder_refuses_a_buffer_too_small_for_the_body() {
+        let mut buf = [0u8; 3];
         assert_eq!(
             ResponseEncoder.encode_report(&EchoReport::Echoed(payload(b"four")), &mut buf),
             Err("buffer too small")

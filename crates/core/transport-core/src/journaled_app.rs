@@ -23,10 +23,10 @@
 
 use std::path::Path;
 
-use melin_app::Application;
+use melin_app::{Application, ApplyCtx};
 use melin_journal::{JournalError, JournalReader, JournalWrite};
 
-use crate::dispatch::{dispatch, offline_ctx};
+use crate::dispatch::dispatch;
 use crate::snapshot;
 
 /// Error surfaced by every [`JournaledApp`] method — wraps journal I/O errors and
@@ -169,6 +169,15 @@ pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     /// [`Self::recovered_epoch`] to seed the node's `FenceState` before
     /// the pipeline starts. Not part of `(A, W)` — extracted separately.
     recovered_epoch: u64,
+    /// The per-event clock of the shared dispatch step (see
+    /// [`crate::dispatch`]) as replay left it: the newest timestamp an
+    /// entry was applied under. The test-only single-thread helpers
+    /// continue it, so a run through them and a replay of the journal
+    /// they wrote fire the same ticks. Production hands the application
+    /// to the matching stage, which keeps a clock of its own, so the
+    /// field exists only where the helpers do.
+    #[cfg(any(test, feature = "test-utils"))]
+    last_drain_ns: u64,
 }
 
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
@@ -182,6 +191,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             app,
             writer,
             recovered_epoch: 0,
+            #[cfg(any(test, feature = "test-utils"))]
+            last_drain_ns: 0,
         })
     }
 
@@ -344,6 +355,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 app,
                 writer,
                 recovered_epoch,
+                #[cfg(any(test, feature = "test-utils"))]
+                last_drain_ns,
             });
         }
 
@@ -405,6 +418,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             app,
             writer,
             recovered_epoch,
+            #[cfg(any(test, feature = "test-utils"))]
+            last_drain_ns,
         })
     }
 
@@ -477,6 +492,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             app,
             writer,
             recovered_epoch,
+            // Nothing was replayed, so there is no replayed clock: zero,
+            // as the matching stage starts from at every boot.
+            #[cfg(any(test, feature = "test-utils"))]
+            last_drain_ns: 0,
         }
     }
 
@@ -492,10 +511,11 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     }
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// Journal an event and apply it to the inner application in one
-    /// call. Test-only primitive — production drives events through the
+    /// call, as the node's own (key hash 0) at the current wall-clock
+    /// time. Test-only primitive — production drives events through the
     /// disruptor pipeline (journal stage + matching stage on separate
     /// threads), and never journals-then-applies on the same thread.
     ///
@@ -505,30 +525,50 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         &mut self,
         event: A::Event,
         out: &mut Vec<A::Report>,
-    ) -> Result<Option<A::QueryResponse>, JournalError> {
-        let seq = self
-            .writer
-            .append(&melin_journal::JournalEvent::App(event))?;
-        let ctx = melin_app::ApplyCtx {
-            now_ns: melin_app::unix_epoch_nanos(),
-            journal_sequence: melin_app::WireSeq::new(seq),
-            active_connections: 0,
-            events_processed: 0,
-            key_hash: 0,
-        };
-        Ok(self.app.apply(event, &ctx, out))
+    ) -> Result<(), JournalError> {
+        self.dispatch_journaled(
+            melin_journal::JournalEvent::App(event),
+            melin_app::unix_epoch_nanos(),
+            out,
+        )
     }
 
-    /// Journal a tick event and dispatch it to the inner application.
-    /// Mirrors `apply_journaled` for the tick path.
+    /// Journal a tick at `now_ns` and dispatch it to the inner
+    /// application. Mirrors `apply_journaled` for the tick path.
     pub fn tick_journaled(
         &mut self,
         now_ns: u64,
         out: &mut Vec<A::Report>,
     ) -> Result<(), JournalError> {
-        self.writer
-            .append(&melin_journal::JournalEvent::Tick { now_ns })?;
-        self.app.tick(now_ns, out);
+        self.dispatch_journaled(melin_journal::JournalEvent::Tick { now_ns }, now_ns, out)
+    }
+
+    /// Journal `event` under `timestamp_ns`, durably, then dispatch it
+    /// under the same timestamp through the sequence replay uses. One
+    /// timestamp and one dispatch path are what make a run through these
+    /// helpers and a replay of the journal it wrote the same run: a
+    /// second clock read, or a call to `apply` that skips the clock step,
+    /// would fire due scheduled work at different points on the two.
+    fn dispatch_journaled(
+        &mut self,
+        event: melin_journal::JournalEvent<A::Event>,
+        timestamp_ns: u64,
+        out: &mut Vec<A::Report>,
+    ) -> Result<(), JournalError> {
+        self.writer.batch_append_with_ts(&event, timestamp_ns, 0)?;
+        self.writer.flush_batch_sync()?;
+        dispatch(
+            &mut self.app,
+            event,
+            &ApplyCtx {
+                now_ns: timestamp_ns,
+                key_hash: 0,
+            },
+            &mut self.last_drain_ns,
+            // Neither an application event nor a tick carries an epoch.
+            |_| {},
+            out,
+        );
         Ok(())
     }
 
@@ -583,12 +623,15 @@ fn replay_segment<A: Application>(
                 }
                 if entry.sequence > snap_sequence {
                     // Replay produces no output: the client got its reply
-                    // when the event was live, and a query is never
-                    // journaled.
-                    let _ = dispatch(
+                    // when the event was live. A query is never journaled,
+                    // so every entry here is one `apply` handled live.
+                    dispatch(
                         app,
                         entry.event,
-                        &offline_ctx(entry.timestamp_ns, entry.key_hash),
+                        &ApplyCtx {
+                            now_ns: entry.timestamp_ns,
+                            key_hash: entry.key_hash,
+                        },
                         last_drain_ns,
                         |epoch| crate::fence::observe_into(recovered_epoch, epoch),
                         reports,
@@ -698,7 +741,6 @@ fn verify_boundary_snapshot_anchor<E: melin_app::AppEvent>(
 mod tests {
     use super::*;
     use crate::test_support::{TestApp, TestEvent};
-    use melin_app::ApplyCtx;
     use melin_journal::{BufferedWriter, JournalEvent, JournalReader};
     use std::collections::HashMap;
 
@@ -733,15 +775,12 @@ mod tests {
         let mut reports = Vec::new();
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
             key_hash: 1,
         };
         for (i, e) in events.iter().enumerate() {
             let ts = 1_000 * (i as u64 + 1);
             app.tick(ts, &mut reports);
-            let _ = app.apply(*e, &ctx, &mut reports);
+            app.apply(*e, &ctx, &mut reports);
         }
         app
     }
@@ -874,6 +913,45 @@ mod tests {
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(*recovered.app(), expected_state(&events));
+    }
+
+    /// A run through the single-thread helpers and a replay of the
+    /// journal they wrote are the same run: one timestamp per entry and
+    /// the shared dispatch sequence, so due scheduled work fires at the
+    /// same points. `ticks` counts every firing, on the clock step and on
+    /// a `Tick` alike, so it is where a second clock read or a skipped
+    /// clock step would show.
+    #[test]
+    fn the_helpers_and_a_replay_of_their_journal_are_the_same_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.bin");
+        let mut reports = Vec::new();
+
+        let mut ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        ja.apply_journaled(TestEvent::Add(3), &mut reports).unwrap();
+        // A tick a minute ahead of the wall clock: the event after it is
+        // older than the clock it set, so it must not fire due work.
+        let ahead = melin_app::unix_epoch_nanos() + 60_000_000_000;
+        ja.tick_journaled(ahead, &mut reports).unwrap();
+        ja.apply_journaled(TestEvent::Add(4), &mut reports).unwrap();
+        let live = TestApp {
+            total: ja.app().total,
+            ticks: ja.app().ticks,
+            per_key_total: ja.app().per_key_total.clone(),
+        };
+        drop(ja);
+
+        // One firing for the first event, two for the tick (the clock
+        // step, then the tick itself), none for the event behind the
+        // clock.
+        assert_eq!((live.total, live.ticks), (7, 3));
+
+        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        assert_eq!(
+            *recovered.app(),
+            live,
+            "replay must reproduce the helpers' run"
+        );
     }
 
     #[test]
