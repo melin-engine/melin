@@ -19,9 +19,10 @@ use melin_journal::buffered_writer::BufferedWriter;
 use melin_journal::write::JournalWrite;
 use melin_journal::{JournalEvent, JournalReader};
 
-// 40 bytes — sized to approximate a SubmitOrder-shaped TradingEvent so
-// the read buffer / decode ratio resembles real-world traffic. u64 array
-// because it's the cheapest stable layout for a fixed-width payload.
+// 40 bytes — sized like a compact fixed-width application event (a few
+// numeric fields) so the read buffer / decode ratio resembles real-world
+// traffic. u64 array because it's the cheapest stable layout for a
+// fixed-width payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BenchEvent {
     fields: [u64; 5],

@@ -1,8 +1,8 @@
 //! Operator admin endpoint — single TCP listener for all server-side
-//! commands an exchange operator may send.
+//! commands an operator may send.
 //!
 //! Authentication is Ed25519 challenge-response with operator-only keys
-//! (the same handshake used for trading sessions). After auth, the
+//! (the same handshake used for client sessions). After auth, the
 //! client sends one ASCII command terminated by `\n`:
 //!
 //! - `PROMOTE` — replica → primary leadership transition. Sets the
@@ -15,7 +15,7 @@
 //!   0` or runtime rotation enabled).
 //! - `ACK-POLICY <disk|ram|disk+ram|two-disks>` — atomically swap the
 //!   active ack policy on a node running a response stage (primary, or
-//!   post-promotion replica). Lets an operator resume trading under a
+//!   post-promotion replica). Lets an operator resume taking writes under a
 //!   weaker policy immediately after a promotion (no restart, no client
 //!   reconnects) and restore the target policy once replicas reattach.
 //!   Available only when the spawn caller wired the shared policy
@@ -467,7 +467,7 @@ mod tests {
     /// Perform the transport-level auth handshake on `stream`, returning
     /// the tag byte of the server's final response (`TAG_SERVER_READY` or
     /// `TAG_AUTH_FAILED`). Builds frames directly from the control-codec
-    /// wire format so the test needs no exchange-protocol codec.
+    /// wire format so the test needs no application codec.
     fn client_authenticate(stream: &mut TcpStream, key: &SigningKey) -> u8 {
         // Read the Challenge: [len:u32][TAG_CHALLENGE][nonce:32].
         let mut len_buf = [0u8; 4];

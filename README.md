@@ -59,14 +59,14 @@ Melin's core crates form a generic sequencer. Your application plugs in via four
 | `RequestDecoder` | Turns a request's body, laid out as you define it, into your event; the runtime reads the framing |
 | `ResponseEncoder` | Writes your response's body; the runtime frames it |
 
-The one rule: `Application` must be deterministic: no I/O, no clocks, no randomness. Its state before the first event is its `Default`, identical on every node. Anything an operator configures — initial reference data, rate limits, caps — reaches it as events the runtime journals on the node's behalf (`StartupEvents`): a genesis set when the journal is created, and a set each time a node becomes primary. So replicas apply the primary's values, and replaying the journal reproduces every decision made under them. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and your binary becomes pure composition:
+The one rule: your application must be deterministic, because every node replays the same events and must reach the same state. The [application guide](docs/building-an-application.md) walks through a complete application and sets out what that rule asks of it — along with event design, retries, upgrades and testing. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and your binary becomes pure composition:
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::parse();
     let startup = StartupEvents {
-        genesis: my_reference_data(/* ... */),
-        on_primary: my_limits(/* ... */),
+        genesis: my_reference_data(/* ... */), // journaled when the journal is created
+        on_primary: my_limits(/* ... */),      // journaled each time a node becomes primary
     };
     server::run::<MyApp>(config, startup, my_sizing(/* ... */), MyDecoder, MyEncoder, None)
 }

@@ -11,7 +11,7 @@
 //!   across nodes and stable across `starting_sequence` (a fresh vs recovered
 //!   primary). This is what the durability gate compares.
 //! - [`RingPos`] — a disruptor consumer's progress counter (slots read). Starts
-//!   at `0` every process start and counts *every* input slot (orders, queries,
+//!   at `0` every process start and counts *every* input slot (writes, queries,
 //!   ticks), so it is **not** comparable to a [`WireSeq`].
 //!
 //! [`PipelineCursors`] bundles the journal-progress cursors behind accessors
@@ -244,7 +244,7 @@ impl DurableWireSeqCursor {
 ///   ring), NOT its durable cursor. A promotion drains the ring into the
 ///   journal before serving, so accepted events survive; advertising only
 ///   the fsynced position would understate the tip and let a
-///   less-caught-up candidate win an election and drop acked orders.
+///   less-caught-up candidate win an election and drop acked events.
 /// - **Primary** — the journal stage publishes its durable cursor into it
 ///   after each fsync batch (a primary's ring holds client requests that
 ///   are not yet acked, so the durable cursor is the honest tip).

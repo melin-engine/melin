@@ -42,7 +42,7 @@ pub enum JournaledAppError {
     /// (audit-trail loss), a snapshot copied from a different
     /// cluster/run, or archive trimming that removed the segment
     /// holding the anchor. Recovery refuses to proceed because the
-    /// engine state would silently outrun the journal.
+    /// application state would silently outrun the journal.
     ///
     /// "Reaches" counts both observed entries and header evidence: a
     /// segment whose header `starting_sequence` is `S + 1` proves
@@ -155,11 +155,11 @@ impl From<std::io::Error> for JournaledAppError {
     }
 }
 
-/// A journaled application: the matching engine (or any other
-/// `Application`) paired with a durable journal writer positioned at
-/// the next free sequence. Generic over `W` — the caller picks the
-/// concrete writer type (typically by dispatching on a runtime mode
-/// flag at the boot site) and threads it through.
+/// A journaled application: any `Application` paired with a durable
+/// journal writer positioned at the next free sequence. Generic over
+/// `W` — the caller picks the concrete writer type (typically by
+/// dispatching on a runtime mode flag at the boot site) and threads it
+/// through.
 pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     app: A,
     writer: W,
@@ -448,7 +448,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// sequence. The new segment's header anchor carries the chain
     /// state at the boundary so multi-segment recovery can verify
     /// cross-segment continuity. Snapshots are produced separately by
-    /// the shadow exchange.
+    /// the shadow stage.
     pub fn rotate_segment(&mut self) -> Result<(), JournaledAppError> {
         self.writer.rotate_segment()?;
         Ok(())
@@ -518,9 +518,6 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// time. Test-only primitive — production drives events through the
     /// disruptor pipeline (journal stage + matching stage on separate
     /// threads), and never journals-then-applies on the same thread.
-    ///
-    /// Used by tests that migrated off the now-deleted
-    /// `JournaledExchange` wrapper, which exposed the same shape.
     pub fn apply_journaled(
         &mut self,
         event: A::Event,
@@ -1075,7 +1072,7 @@ mod tests {
 
     /// Multi-segment recovery: build state across three rotations,
     /// then `recover` (no snapshot) — must walk all three archives plus
-    /// the live segment and produce identical balances to a no-rotation
+    /// the live segment and produce identical state to a no-rotation
     /// run with the same events.
     ///
     /// Compares `total` and `per_key_total` only; `ticks` is sensitive to the

@@ -9,7 +9,7 @@
 //! implement for their concrete event type.
 //!
 //! Responsibilities that live on the application side of the boundary
-//! (matching, account state, risk logic, report encoding) stay in the
+//! (business rules, application state, report encoding) stay in the
 //! application crate; the journal stays usable for any Melin
 //! `Application`.
 

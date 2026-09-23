@@ -115,7 +115,7 @@ impl HealthState {
     /// and drives `/health` OK/ERR plus the `melin_pipeline_healthy`
     /// gauge. The queue/journal/replication gauges are intentionally
     /// unpopulated (0); `replicas_connected: Some(0)` makes the node
-    /// report `halted` (it is following, not trading), and the fence
+    /// report `halted` (it is following, not serving writes), and the fence
     /// state still surfaces a superseded ex-primary. This reuses the one
     /// `/metrics` implementation and exposition format rather than
     /// standing up a second endpoint.
@@ -136,7 +136,7 @@ impl HealthState {
             input_cursor: Box::new(ZeroCursor),
             pipeline_healthy,
             // `Some(0)` (not `None`) so the trading flag reports
-            // `halted` — a replica is not accepting client orders.
+            // `halted` — a replica is not accepting client writes.
             replicas_connected: Some(Arc::new(AtomicU32::new(0))),
             fence_state: Some(fence_state),
             replication_metrics: None,
@@ -176,8 +176,8 @@ pub struct RaftStatus {
     pub role: std::sync::atomic::AtomicU8,
     /// Whether the raft driver thread is still running. Flipped to
     /// `false` when the driver exits (clean shutdown, or an
-    /// unrecoverable storage failure that stops raft while trading
-    /// continues). Exposed as `melin_raft_driver_running` so a dead
+    /// unrecoverable storage failure that stops raft while the pipeline
+    /// keeps serving). Exposed as `melin_raft_driver_running` so a dead
     /// control plane is visible instead of its gauges freezing at the
     /// last-published (possibly leader) state.
     pub running: AtomicBool,
@@ -615,7 +615,7 @@ impl HealthSnapshot {
             "# HELP melin_active_connections Current authenticated client connections.\n\
              # TYPE melin_active_connections gauge\n\
              melin_active_connections {}\n\
-             # HELP melin_events_processed Total events processed by the matching engine.\n\
+             # HELP melin_events_processed Total events processed by the matching stage.\n\
              # TYPE melin_events_processed counter\n\
              melin_events_processed {}\n\
              # HELP melin_journal_sequence Latest durable journal sequence number.\n\
@@ -633,7 +633,7 @@ impl HealthSnapshot {
              # HELP melin_input_queue_capacity Total input ring buffer capacity.\n\
              # TYPE melin_input_queue_capacity gauge\n\
              melin_input_queue_capacity {}\n\
-             # HELP melin_trading_active Whether the engine is accepting orders (1) or halted (0).\n\
+             # HELP melin_trading_active Whether the node is accepting client writes (1) or halted (0).\n\
              # TYPE melin_trading_active gauge\n\
              melin_trading_active {}\n\
              # HELP melin_writes_refused_total Client writes turned away at ingress while the node was halted (replication configured, no replica connected). A refused write is never journaled; the client is told ReplicaDisconnected, or ServerBusy when the refusal queue is full.\n\
@@ -790,7 +790,7 @@ impl HealthSnapshot {
                  # HELP melin_raft_is_leader Whether this node currently leads the control plane (1) or not (0).\n\
                  # TYPE melin_raft_is_leader gauge\n\
                  melin_raft_is_leader {}\n\
-                 # HELP melin_raft_driver_running Whether the raft driver thread is alive (1) or has stopped, e.g. on an unrecoverable state-file error while trading continues (0).\n\
+                 # HELP melin_raft_driver_running Whether the raft driver thread is alive (1) or has stopped, e.g. on an unrecoverable state-file error while the pipeline keeps serving (0).\n\
                  # TYPE melin_raft_driver_running gauge\n\
                  melin_raft_driver_running {}\n",
                 raft.node_id,
@@ -1092,7 +1092,7 @@ mod tests {
     fn replica_health_endpoint_serves_raft_gauges_and_reports_halted() {
         // A replica's minimal endpoint must expose the election gauges
         // (the point of having it) and report `halted` (it serves no
-        // client orders).
+        // client writes).
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -1118,7 +1118,7 @@ mod tests {
         assert!(body.contains("melin_raft_term 7\n"), "{body}");
         assert!(body.contains("melin_raft_is_leader 1\n"), "{body}");
         assert!(body.contains("melin_raft_driver_running 1\n"), "{body}");
-        // A replica is following, not accepting client orders.
+        // A replica is following, not accepting client writes.
         assert!(body.contains("melin_trading_active 0\n"), "{body}");
 
         shutdown.store(true, Ordering::Relaxed);
@@ -1541,7 +1541,7 @@ mod tests {
         );
 
         let buf = read_health(addr);
-        assert_eq!(buf, "OK 5 100 0 trading\n", "healthy node trades");
+        assert_eq!(buf, "OK 5 100 0 trading\n", "healthy node reports trading");
 
         fence.fence();
         let buf = read_health(addr);

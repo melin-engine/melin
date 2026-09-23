@@ -921,8 +921,9 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
     capture_node_logs();
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    // Three roles: the trader submits, the replica authenticates its
-    // link as `replication`, and the operator drives the admin endpoint.
+    // Three roles: the client submits as `trader`, the replica
+    // authenticates its link as `replication`, and the operator drives
+    // the admin endpoint.
     let auth_path = tmp.path().join("authorized_keys");
     std::fs::write(
         &auth_path,

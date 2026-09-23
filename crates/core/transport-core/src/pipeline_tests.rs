@@ -2,9 +2,8 @@
 //!
 //! These exercise the journal stage, matching stage, and combined
 //! pipeline against `TestApp` / `TestEvent` rather than any concrete
-//! business engine. They used to live in `melin-exchange-core` only because the
-//! pipeline source was extracted from there; now that the pipeline lives
-//! here, the infrastructure-level tests do too.
+//! application, so the infrastructure-level guarantees are tested where
+//! the pipeline lives.
 //!
 //! A halted node refuses client writes before they reach the pipeline;
 //! that behaviour is tested with the server runtime's readers.

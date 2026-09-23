@@ -103,7 +103,7 @@ mod tests {
         let mut writer = BlockingFrameWriter::new(stream.try_clone().unwrap());
         let mut reader = BlockingFrameReader::new(stream);
 
-        let data = b"hello trading";
+        let data = b"hello melin";
         writer.write_frame(data).unwrap();
         writer.flush().unwrap();
 

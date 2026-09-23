@@ -190,7 +190,7 @@ impl<R> UringReaderHandle<R> {
 /// would not raise throughput — it would only re-introduce contention on
 /// the input ring's multi-producer cursor.
 ///
-/// `tick_cadence: Some(d)` makes the reader the engine's tick generator: it
+/// `tick_cadence: Some(d)` makes the reader the clock-tick generator: it
 /// arms an `IORING_OP_TIMEOUT` so `submit_and_wait` returns at the tick
 /// deadline even when no client traffic is flowing, then publishes a
 /// `JournalEvent::Tick { now_ns }` onto the same input ring it uses for
@@ -267,7 +267,7 @@ struct ConnectionEntry<R> {
     connection_id: u64,
     addr: SocketAddr,
     /// Permission level from auth handshake. Checked per-request on
-    /// the reader thread (cold path), zero cost on the matching engine.
+    /// the reader thread (cold path), zero cost on the matching stage.
     permission: Permission,
     /// FxHash of the client's Ed25519 public key. Copied into every
     /// InputSlot as the submitting key's identity.
@@ -374,8 +374,8 @@ fn ring_entry(sq_pending: usize, cq_ready: bool) -> RingEntry {
 
 /// Main io_uring reader loop. Runs until channel disconnection.
 ///
-/// When `tick_cadence` is `Some`, the loop also generates the engine's
-/// scheduler ticks — see [`spawn_reader`] for the rationale.
+/// When `tick_cadence` is `Some`, the loop also generates the application's
+/// clock ticks — see [`spawn_reader`] for the rationale.
 #[allow(clippy::too_many_arguments)]
 fn reader_loop<A: Application, R: AsRawFd>(
     command_rx: mpsc::Receiver<ReaderRegistration<R>>,
@@ -623,14 +623,13 @@ fn reader_loop<A: Application, R: AsRawFd>(
         );
 
         let batch_now = Instant::now();
-        // One wall-clock read per CQE batch instead of per request. The
-        // reader can see 4–6 M requests/s at peak; a per-request
-        // `unix_epoch_nanos()` was ~2.8 % of the primary's cycles
-        // (vDSO `clock_gettime(CLOCK_REALTIME)`). All requests in the
-        // same batch share the timestamp — precision loss is bounded
-        // by the CQE-drain cadence (tens of µs under load) and order
-        // timestamps are used for reporting, not matching (the engine
-        // orders by sequence, not time).
+        // One wall-clock read per CQE batch instead of per request: at
+        // peak request rates a per-request `unix_epoch_nanos()` (vDSO
+        // `clock_gettime(CLOCK_REALTIME)`) showed up in the primary's
+        // profile. All requests in the same batch share the timestamp —
+        // precision loss is bounded by the CQE-drain cadence. The timestamp
+        // drives the application's clock but orders nothing (the pipeline
+        // orders by sequence), so that resolution is enough.
         let batch_wall_ns = unix_epoch_nanos();
 
         for &(token, result, flags) in &cqes {
@@ -1163,7 +1162,7 @@ fn recycle_buffer(
 /// carrying it, and the slab's LIFO free list would hand the index to
 /// the next registration — the old peer's bytes would then be parsed
 /// under the new connection's identity, key hash, and permissions
-/// (order-flow injection; audit review F1). Instead: sever the peer,
+/// (request injection; audit review F1). Instead: sever the peer,
 /// mark the entry dying, cancel the armed op, and let the terminal CQE
 /// free the index (the `dying` branch of the CQE loop). When no op is
 /// armed there is nothing that can post — free immediately.
@@ -2452,7 +2451,7 @@ mod tests {
     /// Pre-fix, the LIFO free list handed client A's index straight to
     /// client B; A's socket stayed open (the armed op holds a file
     /// reference past the fd close), and A's continued bytes were parsed
-    /// under B's connection id, key hash, and permissions — order-flow
+    /// under B's connection id, key hash, and permissions — request
     /// injection under someone else's identity. Post-fix, A's entry dies
     /// in place until the cancelled op's terminal CQE, so B gets a fresh
     /// index and A's post-teardown bytes are discarded.

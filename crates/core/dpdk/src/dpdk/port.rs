@@ -4,7 +4,7 @@
 //! involves setting up RX/TX queues, descriptor counts, and offload
 //! features. The port must be started before traffic flows.
 //!
-//! For this trading engine we use a single RX queue and a single TX queue
+//! For the sequencer we use a single RX queue and a single TX queue
 //! on a single port — all NIC I/O happens on one dedicated poll thread,
 //! matching the single-threaded LMAX architecture.
 

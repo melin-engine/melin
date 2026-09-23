@@ -11,13 +11,13 @@
 //! 2. **Application**: delivered to the `Application` for state mutation,
 //!    wrapped in `App(E)` so the journal is agnostic to what the app does.
 //!
-//! Only input commands are journaled — not execution reports. The
+//! Only input commands are journaled — not the application's reports. The
 //! application is deterministic, so replaying inputs reproduces outputs
 //! identically (halves journal size, simplifies the format).
 //!
-//! The ≤ 64-byte size bound is enforced by the concrete-`E` consumer
-//! (e.g. `melin-exchange-core` asserts on `JournalEvent<TradingEvent>`), not
-//! here: the bound is meaningful only when `E`'s layout is known.
+//! No bound on the in-memory size of `JournalEvent<E>` is enforced here:
+//! it is meaningful only when `E`'s layout is known, so it is the
+//! concrete-`E` consumer's to choose and to check.
 
 use melin_app::AppEvent;
 
@@ -37,10 +37,10 @@ pub enum JournalEvent<E: AppEvent> {
     /// Replication fencing epoch bump. Written as the first journaled
     /// entry of a node's primary tenure — genesis primaries never emit
     /// it (epoch stays 0); a promoted replica emits `EpochBump { prior
-    /// epoch + 1 }` before accepting any client order. Carries no
+    /// epoch + 1 }` before accepting any client write. Carries no
     /// application state: it is lineage metadata, like the chain anchor,
-    /// but unlike the anchor it must be totally ordered against the order
-    /// flow (every order is unambiguously inside exactly one epoch), so it
+    /// but unlike the anchor it must be totally ordered against the event
+    /// flow (every event is unambiguously inside exactly one epoch), so it
     /// rides the journal as a sequenced event rather than living in the
     /// segment header. Replayed on recovery and replication to advance a
     /// node's observed epoch; never delivered to the `Application`.

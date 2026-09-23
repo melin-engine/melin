@@ -8,9 +8,9 @@
 //!    sequencer also sends a copy of each encoded batch to the replication
 //!    sender thread via a bounded channel, *before* handing it to the disk
 //!    thread, so replicas never wait on local storage either. The bytes are
-//!    identical to what is written to disk — same sequences, timestamps,
-//!    CRC checksums, and checkpoint entries. See [`crate::journal_disk`].
-//! 2. **Matching stage**: executes commands on the `Exchange`, publishes responses
+//!    identical to what is written to disk — same sequences, timestamps
+//!    and CRC checksums. See [`crate::journal_disk`].
+//! 2. **Matching stage**: applies events to the application, publishes responses
 //!    to the output SPSC. Runs concurrently with the journal — no waiting for sync.
 //!
 //! The **response stage** (in the server crate) consumes the output SPSC but
@@ -207,14 +207,15 @@ impl Default for StageUtilization {
 }
 
 /// Ring buffer capacity for the input disruptor (journal + matching consumers).
-/// 2^20 = 1,048,576 slots. At ~72 bytes per slot, this is ~72 MiB — fits in
-/// L3 cache on modern server CPUs. Provides ~100 ms of buffering at 10M
-/// orders/sec, enough headroom for fsync stalls without backpressure.
+/// 2^20 = 1,048,576 slots. Each slot holds the event inline, so the
+/// ring's footprint scales with `size_of::<E>()`. Provides ~100 ms of
+/// buffering at 10M events/sec, enough headroom for fsync stalls without
+/// backpressure.
 pub const INPUT_RING_CAPACITY: usize = 1 << 20;
 
 /// SPSC queue capacity for the output path (matching → response).
 /// Matches the input ring size since one input event can produce multiple
-/// output messages (e.g., Fill + BatchEnd).
+/// output messages (e.g., several reports + BatchEnd).
 pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
 
 /// Maximum number of events processed in one journal batch.
@@ -283,9 +284,9 @@ const MAX_MATCHING_BATCH: usize = 16;
 /// Slot in the input disruptor ring buffer.
 ///
 /// Carries a connection ID alongside the event so the response stage
-/// knows where to route execution reports. `Copy` for zero-cost ring
-/// buffer ops. Generic over `E: AppEvent` — the concrete engine crate
-/// aliases this to `InputSlot<TradingEvent>`.
+/// knows where to route the application's reports. `Copy` for zero-cost
+/// ring buffer ops. Generic over `E: AppEvent`, the application's event
+/// type.
 ///
 /// `#[repr(align(64))]` forces 64-byte alignment and rounds the struct
 /// size up to a multiple of 64 — without padding a slot whose natural
@@ -315,7 +316,8 @@ pub struct InputSlot<E: AppEvent> {
     /// publish time alongside the sequence. Zero only for non-journaled
     /// events (queries).
     pub timestamp_ns: u64,
-    /// The journaled event (order submit, cancel, etc.).
+    /// The journaled event (an application write, a tick, an epoch
+    /// bump, etc.).
     pub event: melin_journal::JournalEvent<E>,
     /// Timestamp when the publisher wrote this slot to the disruptor.
     /// `()` (zero-sized) when `latency-trace` is disabled.
@@ -361,7 +363,7 @@ impl<E: AppEvent> InputSlot<E> {
 
 /// Slot in the output SPSC queue (matching → response).
 ///
-/// Each slot carries an execution report, a query response, or a
+/// Each slot carries an application report, a query response, or a
 /// terminator marker for a specific connection, plus the input
 /// sequence it originated from so the response stage can gate on
 /// journal completion.
@@ -420,12 +422,12 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
 ///
 /// Generic over the application's report type `R` and query response
 /// type `Q`. Must remain `Copy` for zero-allocation ring buffer
-/// transport. Large query-response variants (e.g. the trading engine's
-/// balance snapshot) dominate the enum size; they are rare enough that
+/// transport. Large query-response variants (e.g. a query returning a
+/// state snapshot) dominate the enum size; they are rare enough that
 /// the per-slot overhead is acceptable while the hot-path scratch
 /// `Vec<R>` stays small.
 ///
-/// `Report(R)` carries fan-out reports (fills, acks, cancels) that
+/// `Report(R)` carries fan-out reports (one event may yield several) that
 /// flow through the matching stage's scratch vec. `QueryResponse(Q)`
 /// carries 1:1 query responses returned by `Application::query`,
 /// bypassing the scratch vec entirely.
@@ -1226,7 +1228,7 @@ impl<E: AppEvent> Sequencer<E> {
                 // Batch-encode all events into the writer's internal buffer.
                 // Data stays in the buffer until the write point — the
                 // disk thread's pwritev covers the entire batch.
-                // QueryStats/QueryPosition are not journaled (no state change).
+                // Queries are not journaled (no state change).
                 //
                 // The journal stage is the authoritative sequence allocator
                 // on the primary: when `slot.sequence == 0` (every primary-
@@ -2373,7 +2375,7 @@ impl<E: AppEvent> JournalStage<E> {
     /// appends into pre-written extents generate no extent-conversion
     /// metadata, so `flush_batch_sync`'s `fdatasync` stays on its
     /// data-only fast path instead of periodically forcing the
-    /// filesystem journal on the order pipeline's critical path (see the
+    /// filesystem journal on the write pipeline's critical path (see the
     /// preparer module docs and
     /// `docs/internal/journal-fsync-beat-2026-08.md`).
     ///
@@ -2442,7 +2444,7 @@ impl<E: AppEvent> JournalStage<E> {
 }
 
 /// Matching stage: consumes from the input disruptor (in parallel with
-/// the journal stage), executes commands on the Exchange, and publishes
+/// the journal stage), applies events to the application, and publishes
 /// responses to the output SPSC.
 ///
 /// Runs on a dedicated OS thread. Does NOT wait for journal sync —
@@ -2463,13 +2465,14 @@ pub struct MatchingStage<A: Application> {
     /// primitive. One `fetch_add(1, Relaxed)` per event (~1ns).
     events_processed: Arc<AtomicU64>,
     /// Durable-wire-seq cursor for reading the highest durably-persisted
-    /// sequence. Feeds `QueryCtx::journal_sequence` (read by `QueryStats`),
+    /// sequence. Feeds `QueryCtx::journal_sequence` (read by stats queries),
     /// in the same wire-seq space as the health endpoint's `journal_seq`
     /// gauge so the two operator surfaces agree. One `Acquire` load per
     /// batch — no extra cross-thread synchronization on the hot path.
     durable_wire_seq: DurableWireSeqCursor,
     /// Active connection count, shared with the server accept loop.
-    /// Read only when processing `QueryStats` (once per second at most).
+    /// Loaded once per batch into `QueryCtx::active_connections`, for
+    /// stats queries to read.
     active_connections: Arc<AtomicU64>,
     /// Replication fencing state. Advanced when an `EpochBump` event is
     /// processed (recovery replay, live replication stream, or local
@@ -2544,8 +2547,8 @@ impl<A: Application> MatchingStage<A> {
     /// Returns the application on shutdown for potential snapshot saving.
     pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> A {
         // Pre-allocated report buffer, reused across commands.
-        // Pre-allocate with generous capacity. A market order sweeping many
-        // price levels can produce one Fill per level + Placed/Cancelled. 256
+        // Pre-allocate with generous capacity. One event may fan out into
+        // many reports (how many is the application's business). 256
         // avoids mid-hot-path reallocation for all but extreme scenarios.
         let mut reports: Vec<A::Report> = Vec::with_capacity(256);
         let mut waiter = self.wait.waiter();
@@ -2744,13 +2747,13 @@ impl<A: Application> MatchingStage<A> {
                 #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
                 let match_complete_ts = mono_trace_ns();
 
-                // Push execution reports into the output batch.
+                // Push the application's reports into the output batch.
                 // All output slots for this request carry the same
                 // input_seq so the response stage can gate on journal
-                // completion. Fan-out reports (fills, acks) come from
-                // the scratch vec; query responses (stats, position)
-                // are returned by `Application::query` and pushed here
-                // without ever entering the vec.
+                // completion. Fan-out reports come from the scratch
+                // vec; query responses are returned by
+                // `Application::query` and pushed here without ever
+                // entering the vec.
                 //
                 // The terminating wire `BatchEnd` is signalled via
                 // `is_last_in_request` on the final slot — saving one

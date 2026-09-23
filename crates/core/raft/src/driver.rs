@@ -7,7 +7,7 @@
 //! and confining it here keeps the rest of the codebase synchronous and the
 //! data plane untouched: nothing on the hot path calls into this module,
 //! and a control-plane outage (quorum loss, storage failure) degrades
-//! failover to the manual `PROMOTE` playbook while trading continues.
+//! failover to the manual `PROMOTE` playbook while sequencing continues.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -473,11 +473,11 @@ async fn driver_main(
                 .leader_observed();
         }
         if let Err(fatal) = &m.running_state {
-            // The raft core died (e.g. persistent storage error). Trading
+            // The raft core died (e.g. persistent storage error). Sequencing
             // is unaffected by construction — the data plane never calls
             // into raft — but automatic failover is gone until the operator
             // intervenes, so this is a server malfunction worth an error.
-            error!(error = %fatal, "raft core stopped — control plane down, trading unaffected");
+            error!(error = %fatal, "raft core stopped — control plane down, sequencing unaffected");
             break;
         }
     }

@@ -142,8 +142,8 @@ mod tests {
     fn an_authorized_keys_line_is_role_key_comment() {
         let key = SigningKey::from_bytes(&OPENSSL_SEED).verifying_key();
         assert_eq!(
-            authorized_keys_line("trader", &key, "desk-1"),
-            format!("trader {OPENSSL_PUBKEY_B64} desk-1")
+            authorized_keys_line("trader", &key, "client-1"),
+            format!("trader {OPENSSL_PUBKEY_B64} client-1")
         );
     }
 }

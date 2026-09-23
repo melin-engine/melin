@@ -3,7 +3,7 @@
 Synchronous journal replication from a primary server to one or two
 replicas. The primary streams journaled events to each replica over a
 dedicated connection; the replica persists them locally, acknowledges,
-and replays them through its own matching engine so its state stays
+and applies them to its own copy of the application so its state stays
 warm for failover.
 
 Every client response is gated on a configurable **ack policy** that
@@ -22,7 +22,7 @@ exist before the client gets a reply:
 |---|---|---|---|
 | `disk` | One fsynced copy on PLP-backed NVMe. | Hardware failure of the disk holding that copy. | Dev, staging, single-node deployments. |
 | `ram` | Two copies in memory, on two nodes. Disk writes trail asynchronously — every journal still syncs every batch, just off the ack path. | Simultaneous failure of every node holding the event within the fsync window (typically milliseconds) — the un-synced tail is lost. Any single node failure is fully covered by failover. | Storage where fsync is slow (cloud block volumes) or latency-critical applications that accept a small, bounded RPO. Lowest ack latency of the four policies. |
-| `disk+ram` *(default)* | One fsynced copy on PLP-backed NVMe **plus** a second copy in another node's memory. | Failure of the disk holding the fsynced copy within ~80 µs of the ack — the window before the other node completes its own fsync. PLP-protected power loss is fully handled. | Typical live-trading deployments. Saves ~50–80 µs per fill vs `two-disks`. |
+| `disk+ram` *(default)* | One fsynced copy on PLP-backed NVMe **plus** a second copy in another node's memory. | Failure of the disk holding the fsynced copy within ~80 µs of the ack — the window before the other node completes its own fsync. PLP-protected power loss is fully handled. | Typical production deployments. Faster than `two-disks`: an acknowledgement waits for the second node to receive the event, not to fsync it. |
 | `two-disks` | Two fsynced copies on PLP-backed NVMe, on two nodes. | Simultaneous disk failure on two nodes. | Compliance-driven venues that require two durable copies before client ack. |
 
 The PLP (Power-Loss-Protection) capacitor on the NVMe device is what
@@ -152,12 +152,12 @@ warn-level log line is emitted on transition and every 5 seconds while
 degraded.
 
 This is deliberate: silently down-grading the ack contract under load
-is exactly the kind of failure mode regulators and exchange operators
+is exactly the kind of failure mode regulators and venue operators
 write off in post-mortems. Operators who want the system to keep
-trading under a weaker policy during a partial outage use the runtime
-policy swap below.
+taking writes under a weaker policy during a partial outage use the
+runtime policy swap below.
 
-### Trading halts when all replicas disconnect
+### Writes halt when all replicas disconnect
 
 Independent of the ack gate, the node halts when **every** configured
 replica disconnects. New client writes are refused with a
@@ -176,7 +176,8 @@ their replies wait on the ack policy like any other — sent once a replica
 is back (or an operator relaxes the policy), never if the node is
 superseded or stopped first. A node stopped while such a reply waits stops
 promptly and drops it; the write stays journaled and applied, so a retry
-after reconnect is answered as a duplicate.
+after reconnect applies it again unless the application recognises the
+repeat.
 
 A node superseded by a newer primary does not refuse: it is stopping, and
 answers nothing. A connection that sends anything while it winds down is
@@ -213,13 +214,13 @@ The intended workflow is failover:
 1. Primary dies, replica is promoted (`PROMOTE`).
 2. The promoted node is now standalone — under `disk+ram` its gate is
    structurally unsatisfiable (no second node to hold the in-memory
-   copy) and trading would stall.
+   copy) and replies would stall.
 3. Operator sends `ACK-POLICY disk` → the gate re-evaluates under
-   `disk` and trading resumes in seconds, no restart, no dropped
+   `disk` and replies resume in seconds, no restart, no dropped
    client connections.
 4. New replicas are spun up and connect.
 5. Operator sends `ACK-POLICY disk+ram` → the gate is satisfied by the
-   new cluster shape and trading continues at the full contract.
+   new cluster shape and service continues at the full contract.
 
 The replica's admin listener also accepts `ACK-POLICY` — operators can
 **pre-stage** the post-promotion policy by sending `ACK-POLICY disk`
@@ -237,8 +238,8 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
   timestamps from the primary. The replica's pipeline produces a
   journal that is a **bitwise mirror** of the primary's — same
   sequences, same events, same segment boundaries (see "Journal
-  mirroring and divergence detection") — and runs the same matching
-  engine over it so its state stays warm for promotion.
+  mirroring and divergence detection") — and applies it to its own copy
+  of the application so its state stays warm for promotion.
 - Acknowledges each batch on a **dual track**: an `in_memory_sequence`
   that advances as soon as the batch is received, and an
   `acked_sequence` that advances once the local journal write is
@@ -263,23 +264,23 @@ immediately, on the same batch, and frees the ring. There is no grace
 period: a skipped batch would create a sequence gap in the replica's
 journal that can only be repaired by reconnection + catch-up, so the
 primary refuses to publish past the gap. The surviving replica and
-client trading are unaffected.
+client traffic are unaffected.
 
 ## Manual promotion
 
 The admin endpoint accepts `PROMOTE` on a replica to switch it to
-primary mode in-process: the warm matching state is reused directly,
+primary mode in-process: the warm application state is reused directly,
 no journal re-replay, no snapshot reload. Sub-second switchover.
 
-After promotion the new primary will halt new orders if it has no
+After promotion the new primary will halt new writes if it has no
 replicas connected (see above) — the operator's playbook is to either
 spin up new replicas immediately or send `ACK-POLICY disk` to resume
-trading under the single-copy policy.
+writes under the single-copy policy.
 
 The old primary should still be stopped promptly, but epoch fencing
 (below) now closes the split-brain window if it isn't: the moment the
 stale primary hears from any node that observed the promotion, it
-stops accepting and acknowledging orders and shuts itself down.
+stops accepting and acknowledging writes and shuts itself down.
 
 ## Fencing epochs
 
@@ -287,7 +288,7 @@ Every promotion advances a cluster-wide **fencing epoch**, recorded in
 the journal as the first entry of the new primary's tenure and
 replicated to every node like any other event. The epoch survives
 restarts and snapshots, and establishes which primary tenure any given
-order belongs to.
+event belongs to.
 
 The epoch is exchanged on every replication connection, in both
 directions, and enforces two rules:
@@ -295,7 +296,7 @@ directions, and enforces two rules:
 - **A superseded primary self-demotes.** If a connecting replica
   advertises a higher epoch than the primary's own, a promotion
   happened that this primary missed — it is stale. It immediately
-  stops accepting orders, stops acknowledging in-flight ones (those
+  stops accepting writes, stops acknowledging in-flight ones (those
   clients see a connection reset and should reconcile on reconnect),
   reports `halted` on the health endpoint, logs an error, and shuts
   down. Restart it with `--replica-of` pointing at the new primary to
@@ -318,9 +319,9 @@ election term as the new epoch, closing that gap.
 
 Nodes can optionally run a **control-plane consensus service** (Raft)
 that carries leader election, cluster membership, and fencing epochs —
-and nothing else. Order flow stays on the replication path above, and
+and nothing else. Event flow stays on the replication path above, and
 the ack policies are unchanged. The control plane is fully isolated
-from trading: losing control-plane quorum never halts or slows the
+from the data plane: losing control-plane quorum never halts or slows the
 data plane; failover simply degrades to the manual `PROMOTE` playbook
 until quorum returns.
 
@@ -379,7 +380,7 @@ Auto-promotion is deliberately conservative. The elected replica
   merely slow to start;
 - the primary was acking under the `disk` policy — acks never waited
   for a second copy on another node, so no election can prove the
-  winner holds every acked order; failover stays a manual, eyes-on
+  winner holds every acked event; failover stays a manual, eyes-on
   decision under `disk`;
 - **a reachable peer holds more data than it does.** Election steering
   is best-effort, so a behind replica can end up holding leadership —
@@ -478,7 +479,7 @@ when a replica connects (the primary recomputes its chain at the
 replica's reported position and compares) and periodically during live
 streaming. A mismatch anywhere means the replica's journal holds
 **divergent history** — most commonly an ex-primary rejoining after a
-failover with orders it journaled but never replicated.
+failover with events it journaled but never replicated.
 
 Chain validation requires the tamper-evident hash chain on **both**
 nodes. It is on by default; a node lacks it only if it was built with
@@ -522,7 +523,7 @@ and recurrence at that rate means something upstream is seriously
 wrong). Either way, the replica's
 old journal and snapshot are **archived, never deleted** — moved to a
 sibling directory named `<journal>.divergent.<n>`. Under the `disk`
-policy that journal may hold acked orders that did not survive the
+policy that journal may hold acked events that did not survive the
 failover, which is exactly what an operator or regulator needs for
 reconciliation. Routine (non-divergent) resyncs archive to
 `<journal>.resync.<n>` for the same conservative reason — and note
@@ -694,7 +695,7 @@ normal-case post-recovery state.
 - **Upgrade primaries and replicas together.** The replication
   protocol carries a version number and frame layouts change between
   releases; a mixed-version pair refuses to connect, logging which
-  side is behind. Replication (and trading, under the
+  side is behind. Replication (and writes, under the
   replica-requiring ack policies) is down until the versions
   match, so upgrade the whole cluster in one maintenance window.
 - **Snapshots are forward-compatible.** This release reads snapshots
@@ -749,7 +750,7 @@ normal-case post-recovery state.
   `melin_raft_driver_running` gauges expose control-plane election
   state on every node, replicas included. Alert on
   `melin_raft_driver_running` dropping to 0 (the control plane died —
-  trading continues, but automatic failover is offline) and on a
+  service continues, but automatic failover is offline) and on a
   sustained absence of any node reporting `melin_raft_is_leader 1`
   (control-plane quorum lost).
 
@@ -764,7 +765,7 @@ but two replicas promoted *manually and independently* during the same
 outage land on the *same* epoch and neither fences the other — promote
 exactly one replica per failover. On every deployment, a stale primary
 that never hears from a higher-epoch node (e.g. fully partitioned with
-its own replica set) keeps trading until the partition heals — fencing
+its own replica set) keeps taking writes until the partition heals — fencing
 triggers on contact, not on a timer.
 
 ### Static control-plane membership

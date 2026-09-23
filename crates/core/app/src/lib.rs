@@ -16,7 +16,7 @@
 /// Linux `sched_setaffinity` + `SCHED_FIFO` helpers used by every
 /// pipeline thread in the transport (journal, matching, response,
 /// shadow, replication sender/receiver). Generic OS plumbing — the
-/// matching engine never references it directly.
+/// application never references it directly.
 pub mod affinity;
 /// Clock-read amortization for busy-spin loops. The shadow stage,
 /// replication sender, and replica receiver all hit this on the hot
@@ -84,9 +84,9 @@ impl std::error::Error for CodecError {}
 
 /// Transport-originated rejection reasons. These are the rejections the
 /// transport itself synthesises before an event reaches the application
-/// (a halted pipeline). App-originated rejections (duplicate request,
-/// insufficient balance, risk limits, unknown symbol) are modelled inside
-/// the app's own [`Application::Report`] type and do not appear here.
+/// (a halted pipeline). Rejections the application decides on — a
+/// duplicate request, an invalid operation — are modelled inside its own
+/// [`Application::Report`] type and do not appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     /// Replication is configured but no replica is currently connected;
@@ -251,20 +251,6 @@ pub trait AppEvent: Copy {
     fn is_query(&self) -> bool;
 }
 
-/// Wire encoder for application reports.
-///
-/// Declared here so the transport's response stage can be generic over
-/// `R: EncodeReport` without depending on any concrete protocol. Defined in
-/// this crate rather than bound on [`Application::Report`] today — the
-/// bound is only required at the response-stage integration in Phase 3.
-pub trait EncodeReport: Copy {
-    /// Exact number of bytes [`EncodeReport::encode`] will write.
-    fn encoded_size(&self) -> usize;
-
-    /// Encode into `buf`. Caller guarantees capacity.
-    fn encode(&self, buf: &mut [u8]) -> usize;
-}
-
 /// An application driven by the Melin durable transport.
 ///
 /// The transport feeds events into [`apply`](Application::apply) in a
@@ -295,8 +281,8 @@ pub trait EncodeReport: Copy {
 ///
 /// # Sizing
 ///
-/// Capacity, unlike state, may come from the node: how many accounts
-/// or instruments to reserve for, how deep a book to expect. That
+/// Capacity, unlike state, may come from the node: how many entities
+/// to reserve room for, how large an index to expect. That
 /// reaches the application through [`Sizing`](Application::Sizing) and
 /// [`prefault`](Application::prefault) only — a hook that runs after
 /// the state exists, on every node, and whose contract is to touch and
@@ -306,7 +292,7 @@ pub trait EncodeReport: Copy {
 /// node starts from, a fresh genesis or a restored snapshot alike.
 pub trait Application: Sized + Default {
     /// The application-defined event type. One variant per business
-    /// operation (submit order, cancel, deposit, …).
+    /// operation, plus any queries.
     type Event: AppEvent;
 
     /// What the node's operator tells the application about the
@@ -322,15 +308,15 @@ pub trait Application: Sized + Default {
     type Sizing: Send + Sync + 'static;
 
     /// Per-event output payloads. One input event may produce many
-    /// reports (fills, acks, query rows). `Copy` keeps the output ring
-    /// buffer allocation-free.
+    /// reports (an acknowledgement and the effects it caused, say).
+    /// `Copy` keeps the output ring buffer allocation-free.
     type Report: Copy;
 
     /// 1:1 query responses returned by [`query`](Self::query). Routed
     /// through `OutputPayload::QueryResponse` on the output ring.
     ///
     /// Separated from `Report` so that large query payloads (e.g. a
-    /// balance snapshot) don't inflate the per-element size of the
+    /// summary of many entries) don't inflate the per-element size of the
     /// scratch vec on the hot path.
     type QueryResponse: Copy;
 
@@ -342,7 +328,8 @@ pub trait Application: Sized + Default {
     /// nothing. Every field of `ctx` is journaled with the event, so the
     /// implementation may derive state from any of them.
     ///
-    /// Reports (fills, acks, cancels) go into `out`.
+    /// Reports go into `out`; the client that submitted the event gets
+    /// them as its reply batch, in order.
     fn apply(&mut self, event: Self::Event, ctx: &ApplyCtx, out: &mut Vec<Self::Report>);
 
     /// Answer a query from the application's current state, without
@@ -356,23 +343,37 @@ pub trait Application: Sized + Default {
     fn query(&self, event: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse>;
 
     /// Advance the application's wall-clock without applying a business
-    /// event. The transport calls [`tick`](Application::tick) once per
-    /// dispatched slot, before [`apply`](Application::apply), to fire
-    /// time-driven tasks (expiries, session transitions) with
-    /// monotonically increasing `now_ns`.
+    /// event, to fire whatever time-driven work has come due (expiries,
+    /// session transitions). Reports go into `out`, as from `apply`.
+    ///
+    /// The transport calls it before [`apply`](Application::apply)
+    /// whenever an event's timestamp is past the latest time it has
+    /// handed the application, and for each journaled clock tick, which
+    /// keeps time moving while no client traffic arrives. Live, on
+    /// replay and on a replica, the calls follow the same rules from the
+    /// same journaled times.
+    ///
+    /// `now_ns` is wall-clock time, so do not assume it strictly
+    /// increases: the same value may arrive more than once, and a tick
+    /// may carry a time earlier than one already seen — after the
+    /// primary's clock steps back, or after a failover to a node whose
+    /// clock runs behind. In that case a node that restarted may also
+    /// make calls a node that kept running did not, since the latest
+    /// time handed out is not carried across a restart. So a call for a
+    /// time already passed must change nothing — no due work fires
+    /// again, no state records the earlier time — and elapsed-time
+    /// arithmetic must saturate.
     fn tick(&mut self, now_ns: u64, out: &mut Vec<Self::Report>);
 
     /// Synthesise a rejection report for a transport-originated reject.
-    /// Called by the transport before `apply` has observed the event.
     /// No access to `&self` — the reject must be constructible from the
     /// event alone (plus the transport's reason).
     ///
-    /// Where it runs depends on the reason. A duplicate is rejected on the
-    /// matching thread, in sequence with every other event. A halted node
-    /// ([`ReplicaDisconnected`](RejectReason::ReplicaDisconnected)) rejects
-    /// on the thread that reads client requests, before the event is
-    /// sequenced: the event is never journaled and never reaches the
-    /// application.
+    /// Today the one reason is a halted node
+    /// ([`ReplicaDisconnected`](RejectReason::ReplicaDisconnected)): it
+    /// rejects on the thread that reads client requests, before the event
+    /// is sequenced, so the event is never journaled and never reaches
+    /// [`apply`](Application::apply).
     fn build_reject(event: &Self::Event, reason: RejectReason) -> Self::Report;
 
     /// Serialise the application's live state into `w`. The transport

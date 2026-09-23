@@ -14,6 +14,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Removed
 
+- **`--max-orders-per-account`, `--max-orders-per-second` and
+  `--max-orders-burst`, from `ServerConfig`.** Limits of one application,
+  the exchange, that the runtime never read: every other application's
+  node accepted them and did nothing with them. An application that needs
+  such limits declares its own flags and journals their values as
+  `StartupEvents`. A node given one of these flags now refuses to start,
+  as for any unknown flag.
+- **`melin_app::EncodeReport`.** Nothing implemented or required it; a
+  response is encoded by the application's `ResponseEncoder`.
+
 - **The per-key duplicate-request gate: `Application::check_request_seq` and
   `RejectReason::DuplicateRequest`.** Whether a repeated request is refused
   was already the application's policy; the runtime's part was to ask
@@ -91,6 +101,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   query arms out of `apply` into `query` (returning `None` for any other
   event), leave a no-op arm for query variants in `apply`, and read the
   counters from `QueryCtx`.
+- **Log lines, metric descriptions and messages no longer describe a
+  trading system.** Wording only — no metric, flag or health-endpoint field
+  is renamed — but an alert that matches on message text needs updating:
+  - `all replicas disconnected — trading halted` (warn) is now
+    `all replicas disconnected — halted, refusing client writes`.
+  - `raft core stopped — control plane down, trading unaffected` (error)
+    now ends `sequencing unaffected`.
+  - The snapshot-transfer error now says the *shadow stage* writes
+    snapshots, and the auto-promotion refusal speaks of acked *events*.
+  - The `# HELP` text of `melin_trading_active`, `melin_events_processed`
+    and `melin_raft_driver_running` is reworded; the metric names and the
+    health endpoint's `trading` / `halted` flag are unchanged.
+  - `--help` describes the binary as a node of the Melin replicated
+    sequencer.
 
 ## [0.17.0] - 2026-09-22
 

@@ -51,8 +51,9 @@ const MAX_TX_FRAME: usize = MAX_APP_FRAME + MAX_BATCH_END_FRAME;
 /// Sent from the response stage to the DPDK poll thread via lock-free SPSC.
 ///
 /// Fixed-size and `Copy` to fit the SPSC queue's requirements (no heap
-/// allocation per frame). Trading responses are small (~20-80 bytes),
-/// well within the 132-byte slot.
+/// allocation per frame). The slot is sized for the largest framed
+/// response an application's encoder may produce (`MAX_APP_FRAME`), plus
+/// the `BatchEnd` terminator.
 ///
 /// A frame carries the response *and* the `BatchEnd` terminator when the slot
 /// closes a request. The struct is copied by value out of the SPSC on the poll
@@ -607,11 +608,11 @@ pub fn run<A: Application>(
             // (single connection_id), so we can compute it once and
             // bundle the slot's 1–2 frames under one Release at the end
             // of the slot. Per-slot flush — rather than once per outer
-            // batch — keeps individual orders' RTT short under
+            // batch — keeps individual requests' RTT short under
             // saturation (each request's response ships as soon as
             // encoded) while still letting the DPDK poll thread drain
             // Report + BatchEnd in a single consume cycle for low-rate
-            // workloads (consumer-side win for single-order p99).
+            // workloads (consumer-side win for single-request p99).
             let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
             let conn_id = slot.connection_id;
 

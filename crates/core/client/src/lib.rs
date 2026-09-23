@@ -3,7 +3,7 @@
 //! Client side of the Melin wire protocol: connect to a node, prove a
 //! key, send requests, read the replies.
 //!
-//! Every program that talks to a node — a trading gateway, an operator's
+//! Every program that talks to a node — a client gateway, an operator's
 //! tool, a benchmark, an example — does the same four things before any
 //! application logic runs: frame bytes with a length prefix, answer the
 //! Ed25519 challenge, read replies until the batch ends while ignoring
@@ -431,7 +431,8 @@ impl Connection {
 
     /// Send one request and collect the application frames of its reply
     /// batch, in order. A batch may hold none (the application had
-    /// nothing to say) or several (a fill and its acknowledgement, say).
+    /// nothing to say) or several (an acknowledgement and the reports the
+    /// request caused, say).
     pub fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         self.send(body)?;
         let mut frames = Vec::new();

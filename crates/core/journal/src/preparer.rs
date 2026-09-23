@@ -7,7 +7,7 @@
 //! the journal stage calls `BufferedWriter::rotate_segment`, which
 //! creates the next segment file and materialises its extents before
 //! the first append can land. On PLP-class NVMe drives that ceremony is
-//! a ~38 ms synchronous stall — directly visible in p99.99 of the order
+//! a ~38 ms synchronous stall — directly visible in p99.99 of the event
 //! pipeline.
 //!
 //! The preparer moves that work to a dedicated thread:
@@ -34,7 +34,7 @@
 //! still converts them and every conversion is a logged filesystem
 //! metadata transaction. Those transactions periodically force the
 //! filesystem journal *inside the writer's `fdatasync`* (measured on XFS
-//! as a ~2 ms CIL-force stall every 10.24 s that froze the whole order
+//! as a ~2 ms CIL-force stall every 10.24 s that froze the whole event
 //! pipeline — see `docs/internal/journal-fsync-beat-2026-08.md`).
 //! Appends into pre-written extents carry no metadata, so `fdatasync`
 //! stays on its data-only fast path. The cost is writing every segment
@@ -259,7 +259,7 @@ impl SegmentPreparer {
             pin_core,
             slot: Mutex::new(None),
             // Pre-arm at startup so the worker prepares the first spare
-            // segment in parallel with engine warm-up. The first rotation
+            // segment in parallel with server warm-up. The first rotation
             // then has a ready segment to adopt.
             armed: Mutex::new(true),
             notify: Condvar::new(),

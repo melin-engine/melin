@@ -2,7 +2,8 @@
 //!
 //! Two slot variants share the harness:
 //!   - `Slot104`: 104 bytes — exactly the size of the production
-//!     `InputSlot<TradingEvent>` before the cache-line padding change.
+//!     `InputSlot` carrying a 64-byte event, before the cache-line
+//!     padding change.
 //!     Each slot straddles two 64-byte cache lines and adjacent slots
 //!     share lines, so producer writes to slot N invalidate the line a
 //!     consumer needs to finish reading slot N±1.
@@ -41,9 +42,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-// 104-byte slot — mirrors the pre-padding production `InputSlot<TradingEvent>`
-// layout (5×u64 metadata header + 64-byte event payload). `#[repr(C)]`
-// so the compiler does not reorder fields.
+// 104-byte slot — mirrors the pre-padding production `InputSlot` layout
+// for a 64-byte event (5×u64 metadata header + 64-byte event payload).
+// `#[repr(C)]` so the compiler does not reorder fields.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Slot104 {

@@ -26,11 +26,10 @@ use crate::replication_wire::MSG_INPUT_BATCH;
 /// disk to catch up to the ring (see [`drain_into_contiguity`]). The
 /// gap it closes is one journal flush of slack, so the bound is
 /// calibrated to the *required* production config — PLP NVMe + xfs,
-/// where a `buffered` batch flush is ~10–30 µs (`docs/journal.md`) and
-/// the multi-millisecond stall sources are engineered out (xfs removes
-/// the ext4 jbd2 spike; `sector` mode is barred from production). 30 ms
-/// is ~3 orders of magnitude over that close time, so it never expires
-/// on in-spec hardware.
+/// where a batch flush is a single short device flush and the
+/// multi-millisecond stall sources are engineered out (xfs removes the
+/// ext4 jbd2 spike). 30 ms is orders of magnitude over that close time,
+/// so it never expires on in-spec hardware.
 ///
 /// The bound is deliberately tight rather than generous because the
 /// spin runs inline on the single-threaded DPDK driver loop, where it
@@ -39,8 +38,8 @@ use crate::replication_wire::MSG_INPUT_BATCH;
 /// not a hiccup — and on expiry the handoff falls back to the
 /// receiver's contiguity gate (a reconnect), which is the right
 /// outcome when the disk has stopped keeping up. Out-of-spec hardware
-/// (e.g. `buffered` on a consumer drive, ~50–200 µs with fatter tails)
-/// merely falls back more often: still correct, just less efficient.
+/// (a consumer drive, with slower flushes and fatter tails) merely falls
+/// back more often: still correct, just less efficient.
 /// This is a safety bound, not a steady-state cost.
 const HANDOFF_BRIDGE_TIMEOUT: Duration = Duration::from_millis(30);
 
@@ -140,8 +139,8 @@ pub fn can_catch_up_from_journal(
     // it needs the oldest header to start at 1, i.e. the COMPLETE
     // history. After archive pruning or a snapshot-only restart the
     // oldest surviving header starts past 1 — streaming from there
-    // would build a self-consistent journal on top of an empty
-    // exchange, silently missing every pre-trim event (the replica's
+    // would build a self-consistent journal on top of empty
+    // application state, silently missing every pre-trim event (the replica's
     // own next restart would refuse it with MissingHistoryPrefix).
     // Snapshot transfer is the correct route.
     let info = melin_journal::segment::read_header_info(oldest)
@@ -377,7 +376,7 @@ pub fn preflight_snapshot_transfer(journal_path: &std::path::Path) -> io::Result
     if !snap_path.exists() {
         return Err(io::Error::other(
             "snapshot transfer required but no snapshot available \
-             — set --snapshot-interval-ms to a non-zero value so the shadow exchange writes snapshots",
+             — set --snapshot-interval-ms to a non-zero value so the shadow stage writes snapshots",
         ));
     }
 
@@ -433,7 +432,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     if !snap_path.exists() {
         return Err(io::Error::other(
             "snapshot transfer required but no snapshot available \
-             — set --snapshot-interval-ms to a non-zero value so the shadow exchange writes snapshots",
+             — set --snapshot-interval-ms to a non-zero value so the shadow stage writes snapshots",
         ));
     }
 
@@ -1197,7 +1196,7 @@ mod tests {
     /// on-disk history doesn't reach back to sequence 1. (Regression:
     /// `last_sequence == 0` returned true unconditionally, so a fresh
     /// replica facing a pruned lineage caught up from the surviving
-    /// suffix — a self-consistent journal over an empty exchange,
+    /// suffix — a self-consistent journal over empty application state,
     /// silently missing every pre-trim event.)
     #[test]
     fn fresh_replica_needs_snapshot_when_history_trimmed() {

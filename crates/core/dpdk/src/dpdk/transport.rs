@@ -1,5 +1,5 @@
 //! High-level DPDK transport: combines EAL, port, mempool, and smoltcp
-//! into a single poll-driven interface for the trading server.
+//! into a single poll-driven interface for the server.
 //!
 //! The transport owns the DPDK port and smoltcp interface. The server's
 //! DPDK poll thread calls `poll()` in a tight loop to drive all I/O.
@@ -21,7 +21,7 @@ use crate::port::{ChecksumOffloads, Port};
 
 /// Apply low-latency TCP tuning to a smoltcp socket.
 ///
-/// Called on every socket (listen + accepted) to configure for trading:
+/// Called on every socket (listen + accepted) to configure for low latency:
 /// - Nagle disabled (TCP_NODELAY): send small messages immediately
 /// - Delayed ACK disabled: ACK every segment without waiting 10ms
 /// - RTO floor and initial RTO both at 1ms — fastcp's minimum (its RTT
@@ -45,7 +45,7 @@ fn tune_socket(socket: &mut tcp::Socket<'_>) {
 /// per-connection state vectors that parallel the smoltcp socket set.
 pub const MAX_CONNECTIONS: usize = 1024;
 
-/// TCP listen port for trading connections.
+/// TCP listen port for client connections.
 const LISTEN_PORT: u16 = 9876;
 
 /// Retain callback for zero-copy RX segments. Called by smoltcp when it
@@ -84,7 +84,7 @@ fn mbuf_to_handle(mbuf: *mut ffi::rte_mbuf) -> OpaqueFrameHandle {
 const MAX_TX_QUEUE_SIZE: usize = 64 * 1024;
 
 /// smoltcp TCP RX buffer size. Determines the advertised receive window.
-/// 64 KiB provides enough window for pipelined trading (256+ in-flight
+/// 64 KiB provides enough window for pipelined requests (256+ in-flight
 /// messages at ~100 bytes each).
 const SOCKET_RX_BUF_SIZE: usize = 64 * 1024;
 
@@ -214,7 +214,7 @@ pub struct AcceptedConnection {
     /// listener this is always the same value (config.listen_port); with
     /// multiple listeners (added via `DpdkTransport::add_listener`) the
     /// caller uses this to dispatch the connection to the right handler
-    /// (e.g. trading port → client logic, replication port → replication
+    /// (e.g. client port → client logic, replication port → replication
     /// state machine).
     pub listen_port: u16,
 }
@@ -547,7 +547,7 @@ impl DpdkTransport {
                 rx_buf_size: SOCKET_RX_BUF_SIZE,
                 tx_buf_size: SOCKET_TX_BUF_SIZE,
                 tx_queue_limit: MAX_TX_QUEUE_SIZE,
-                // Trading port: keep the fan-in default so one client's burst
+                // Client port: keep the fan-in default so one client's burst
                 // cannot delay its peers within an egress pass.
                 dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
             }],
@@ -581,7 +581,7 @@ impl DpdkTransport {
     /// Like `from_shared` but overrides the listen port.
     ///
     /// Used by the replication sender to listen on the replication port
-    /// instead of the trading port, while sharing the same DPDK NIC and
+    /// instead of the client port, while sharing the same DPDK NIC and
     /// IP address.
     pub fn from_shared_with_port(
         shared: &Arc<DpdkShared>,
@@ -779,7 +779,7 @@ impl DpdkTransport {
         // Iterate every (port, handle) pair: accept any whose listen
         // socket has progressed to Established, replace it with a fresh
         // listener on the same port. Each port is independent — the
-        // trading port and the replication port (when both are used by
+        // client port and the replication port (when both are used by
         // the same transport) keep their own listener slots.
         let mut i = 0;
         while i < self.listeners.len() {
@@ -888,7 +888,7 @@ impl DpdkTransport {
     /// Add another TCP port to listen on, sharing the same DPDK NIC and
     /// smoltcp interface. Returns immediately; the new listener is
     /// active on the next `poll()`. Used when a single transport handles
-    /// multiple distinct services (e.g. trading on 9876 and replication
+    /// multiple distinct services (e.g. clients on 9876 and replication
     /// on 9877) without needing separate queues / threads.
     pub fn add_listener(&mut self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         self.add_listener_with_buffers(

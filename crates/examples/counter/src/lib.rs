@@ -16,6 +16,13 @@
 
 use std::io::{self, Read, Write};
 
+// The application guide walks through this crate, and its code blocks are
+// compiled and run as this crate's doctests: a guide whose examples no
+// longer build fails the suite instead of misleading its reader.
+#[cfg(doctest)]
+#[doc = include_str!("../../../../docs/building-an-application.md")]
+pub struct ApplicationGuide;
+
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;

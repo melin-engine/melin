@@ -6,7 +6,7 @@
 //! `tx_burst` (or after the application is done with the packet).
 //!
 //! Using a pre-allocated pool avoids per-packet heap allocation — critical
-//! for the ~100ns/order latency budget.
+//! for the ~100ns/event latency budget.
 
 use crate::ffi;
 

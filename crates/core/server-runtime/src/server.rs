@@ -66,11 +66,10 @@ type OutputSlot<A> =
     GenericOutputSlot<<A as Application>::Report, <A as Application>::QueryResponse>;
 
 /// Body of the event-publisher thread: a free function with this exact
-/// signature (the trading binary supplies
-/// `melin_server::event_publisher::run`; the
-/// skip-order-exec binary supplies nothing). Passing it as a function
-/// pointer keeps the runtime decoupled from the trading domain — no
-/// `melin_server::*` reference inside server.rs — without paying for a
+/// signature (an application with an output feed supplies its
+/// publisher; one without supplies nothing). Passing it as a function
+/// pointer keeps the runtime decoupled from the application — no
+/// application reference inside server.rs — without paying for a
 /// boxed closure.
 ///
 /// Threaded into [`run`] (and `run_dpdk` under `feature = "dpdk"`) as `Option<EventPublisherFn>`:
@@ -126,7 +125,10 @@ impl From<JournalStagingMode> for melin_journal::StagingMode {
 
 /// Server configuration, parsed from CLI arguments via clap.
 #[derive(clap::Parser)]
-#[command(name = "melin-server", about = "Low-latency matching engine server")]
+#[command(
+    name = "melin-server",
+    about = "A node of the Melin replicated sequencer"
+)]
 pub struct ServerConfig {
     /// Address to bind the TCP listener.
     #[arg(long, default_value = "127.0.0.1:9876")]
@@ -177,7 +179,8 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 1024)]
     pub max_connections: u64,
     /// Path to the authorized keys file for Ed25519 challenge-response
-    /// authentication. Every connection must authenticate before trading.
+    /// authentication. Every connection must authenticate before sending
+    /// requests.
     /// Required for primary mode; ignored in replica mode (--replica-of).
     /// See `AuthorizedKeys` for file format.
     #[arg(long, default_value = "authorized_keys")]
@@ -205,36 +208,6 @@ pub struct ServerConfig {
     /// assuming, since which one wins is a property of the device.
     #[arg(long, value_enum, default_value_t = JournalStagingMode::ZeroFill)]
     pub journal_staging_mode: JournalStagingMode,
-    /// Maximum number of open orders (resting limits + pending stops, across
-    /// all instruments) per account. New submissions are rejected with
-    /// `ExceedsMaxOpenOrders` once an account hits this cap. `0` means
-    /// unlimited. Bounds the per-account contribution to engine memory
-    /// (SEC-03). Must be set to the same value on the primary and every
-    /// replica — the cap shapes Rejected reports, so a mismatch causes
-    /// replay divergence.
-    #[arg(long, default_value_t = 10_000)]
-    pub max_orders_per_account: u32,
-    /// Per-account sustained order-submission rate (orders/sec). Token
-    /// bucket refills at this rate; clients exceeding it (after burning
-    /// the burst) are rejected with `ExceedsOrderRate`. `0` disables the
-    /// limiter. Prevents a single client from monopolizing matching
-    /// throughput (SEC-04). Must match across primary and every replica
-    /// — same determinism caveat as `--max-orders-per-account`. Default
-    /// (1000/s) is a conservative mid-tier ceiling: comfortable for
-    /// algorithmic and retail flow, but tight for active market-makers
-    /// who routinely re-quote past 1k/s on liquid instruments. Operators
-    /// running with significant MM presence should raise this (and the
-    /// burst) to match their book's quote-update profile.
-    #[arg(long, default_value_t = 1_000)]
-    pub max_orders_per_second: u32,
-    /// Per-account burst capacity (max consecutive orders allowed after a
-    /// quiet period). Paired with `--max-orders-per-second`. `0` disables
-    /// the limiter. Default (5000) lets normal trading bursts through —
-    /// e.g. a market open or a strategy initialization batch — without
-    /// false positives, while still capping the absolute spike a single
-    /// account can produce.
-    #[arg(long, default_value_t = 5_000)]
-    pub max_orders_burst: u32,
 
     /// Address to listen for replica connections (enables synchronous replication).
     /// Mutually exclusive with `--standalone` and `--replica-of`.
@@ -308,11 +281,12 @@ pub struct ServerConfig {
     /// - `disk+ram` (default) `persisted>=1 && in_memory>=2`. One
     ///   fsynced copy plus a second copy in another node's memory.
     ///   Single-failure-safe with a brief RAM-only window for the
-    ///   second copy. Typical live trading deployments. Saves ~50–80 µs
-    ///   per fill vs `two-disks`.
+    ///   second copy. Typical live deployments. Faster than `two-disks`:
+    ///   an acknowledgement waits for the second node to receive the
+    ///   event, not to fsync it.
     /// - `two-disks`          `persisted>=2`. Two fsynced copies before
     ///   the client ack. Zero RAM-only window; the gate stalls when no
-    ///   replica is connected. Compliance-driven venues.
+    ///   replica is connected. Compliance-driven deployments.
     ///
     /// `--standalone` requires `disk`. Under every other policy the
     /// gate stalls while no replica is connected — the correct
@@ -386,8 +360,9 @@ pub struct ServerConfig {
     pub dpdk_vlan: Option<u16>,
 
     /// Address for the output event publisher. Subscribers connect here
-    /// to receive a real-time stream of all execution events (market data,
-    /// fills, cancellations). Ed25519 auth required (ReadOnly or above).
+    /// to receive a real-time stream of the application's reports, as the
+    /// application's publisher encodes them. Ed25519 auth required
+    /// (ReadOnly or above).
     /// Omit to disable (ring has 1 consumer — identical to before).
     #[arg(long)]
     pub event_bind: Option<SocketAddr>,
@@ -425,19 +400,19 @@ pub struct ServerConfig {
     #[arg(long)]
     pub snapshot_path: Option<PathBuf>,
 
-    /// Cadence in milliseconds for the engine-internal scheduler tick.
+    /// Cadence in milliseconds for the application's clock tick.
     /// The ingress thread (io_uring reader or DPDK poll thread) publishes
-    /// a `JournalEvent::Tick { now_ns }` at this interval so time-driven
-    /// tasks (GTD expiry, volatility halts, session transitions) fire in
-    /// deterministic, journaled lockstep. There is no separate tick
-    /// thread on either transport. Set to 0 to disable tick generation
-    /// entirely (useful for benchmarks that don't exercise time-driven
-    /// features).
+    /// a `JournalEvent::Tick { now_ns }` at this interval so the
+    /// application's time-driven work (expiries, timeouts, scheduled
+    /// transitions) fires in deterministic, journaled lockstep. There is
+    /// no separate tick thread on either transport. Set to 0 to disable
+    /// tick generation entirely (useful for benchmarks that don't
+    /// exercise time-driven features).
     ///
-    /// Defaults to 250 ms. Under load the matching stage advances its
-    /// scheduler clock at every-event resolution from `slot.timestamp_ns`
+    /// Defaults to 250 ms. Under load the matching stage advances the
+    /// application's clock at every-event resolution from `slot.timestamp_ns`
     /// (microsecond precision), so the tick is only the safety net for
-    /// quiet periods. 250 ms keeps quiet-market scheduler firings within
+    /// quiet periods. 250 ms keeps time-driven work in quiet periods within
     /// a quarter-second of their deadline at a cost of ~4 events/sec of
     /// journal traffic.
     #[arg(long, default_value_t = 250)]
@@ -453,7 +428,7 @@ pub struct ServerConfig {
     /// the rlimit itself, but only succeeds with the capability.
     ///
     /// Use `--no-mlock` for development / containerised runs where
-    /// the privilege isn't available; on a bare-metal exchange host
+    /// the privilege isn't available; on a bare-metal production host
     /// leave it on.
     #[arg(long, default_value_t = false)]
     pub no_mlock: bool,
@@ -533,9 +508,6 @@ impl Default for ServerConfig {
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
             journal_staging_mode: JournalStagingMode::ZeroFill,
-            max_orders_per_account: 10_000,
-            max_orders_per_second: 1_000,
-            max_orders_burst: 5_000,
 
             replication_bind: None,
             standalone: false,
@@ -1031,7 +1003,7 @@ where
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
-            Some((mut exchange, writer)) => {
+            Some((mut app, writer)) => {
                 // Promotion! Transition to primary mode. Bump the epoch so a
                 // paused/partitioned ex-primary is fenced when it reconnects.
                 info!("replica promoted — transitioning to primary");
@@ -1042,7 +1014,7 @@ where
                 // already; one promoted before its first session did
                 // not (recovered from disk, never streamed). Sizing is
                 // idempotent, so size here either way.
-                <A as Application>::prefault(&mut exchange, &sizing);
+                <A as Application>::prefault(&mut app, &sizing);
 
                 // A ROTATE received while this node was a replica latched
                 // the flag but rotated nothing (rotation is primary-driven
@@ -1058,7 +1030,7 @@ where
                 // returns, so the driver serves elections and the fencing
                 // channel for the whole primary tenure.
                 return run_as_primary::<A, L>(
-                    exchange,
+                    app,
                     writer,
                     listener,
                     repl_listener,
@@ -1109,14 +1081,14 @@ where
 
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — the genesis events will flow through the pipeline later.
-    let (mut exchange, writer, needs_seeding, recovered_epoch) =
+    let (mut app, writer, needs_seeding, recovered_epoch) =
         init_engine::<A, BufferedWriter<A::Event>>(&config, &sizing)?;
 
     // Size and pre-fault application-owned memory (slabs, indices) so
     // growth and page faults happen now, not on the hot path. Runs on the
     // recovered state too: a snapshot restores contents, not capacity,
     // and `init_engine` sizes a genesis instance before replay only.
-    <A as Application>::prefault(&mut exchange, &sizing);
+    <A as Application>::prefault(&mut app, &sizing);
 
     // A primary booting directly (not via promotion) keeps whatever epoch
     // its journal recovered; no bump.
@@ -1156,7 +1128,7 @@ where
 
     // The raft guard drops — stopping the driver — after this returns.
     run_as_primary::<A, L>(
-        exchange,
+        app,
         writer,
         listener,
         repl_listener,
@@ -1323,7 +1295,7 @@ fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
 /// driving the new stage's rotation.
 #[allow(clippy::too_many_arguments)]
 fn run_as_primary<A, L>(
-    exchange: A,
+    app: A,
     writer: BufferedWriter<A::Event>,
     mut listener: L,
     // Pre-bound replication listener (non-blocking by construction),
@@ -1362,10 +1334,9 @@ where
     // Used to enforce max_connections (SEC-02).
     let active_connections = Arc::new(AtomicU64::new(0));
 
-    // Determine replication mode. Both trading and skip-order-exec
-    // builds ship the full durable transport (journal + replication +
-    // shadow), so the
-    // same config knob drives either binary.
+    // Determine replication mode. Every application's binary ships the
+    // full durable transport (journal + replication + shadow), so the
+    // same config knob drives any of them.
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
@@ -1381,20 +1352,20 @@ where
         )
         .into());
     }
-    // Clone the exchange for the shadow snapshot stage before the pipeline
-    // consumes it. Uses snapshot_state() + restore_state() round-trip since
-    // `A` doesn't implement Clone (internal data structures are complex).
+    // Clone the application for the shadow snapshot stage before the pipeline
+    // consumes it. `Application` does not require `Clone`, so this goes
+    // through `clone_via_snapshot` (a snapshot round-trip unless the
+    // application overrides it with something cheaper).
     let enable_shadow = config.snapshot_interval_ms > 0;
-    let shadow_exchange = if enable_shadow {
-        Some(<A as Application>::clone_via_snapshot(&exchange)?)
+    let shadow_app = if enable_shadow {
+        Some(<A as Application>::clone_via_snapshot(&app)?)
     } else {
         None
     };
 
     // Build the disruptor pipeline with optional replication consumer.
-    // Event publisher is trading-only (market-data book mirrors); the
-    // skip-order-exec build silently ignores `--event-bind` so the
-    // same invocation works against either binary.
+    // An application without an event publisher silently ignores
+    // `--event-bind`, so the same invocation works against any binary.
     // The caller (binary) decides whether an event-publisher fn is
     // available; we only allocate the consumer slot when both the fn is
     // wired AND `--event-bind` is set.
@@ -1413,7 +1384,7 @@ where
         replication_ring_progress,
         cursors,
     } = build_pipeline_with_replication(
-        exchange,
+        app,
         writer,
         config.group_commit_delay(),
         Arc::clone(&active_connections),
@@ -1466,7 +1437,7 @@ where
     let heartbeat_interval = config.heartbeat_interval();
 
     // Startup events flow through the disruptor like regular events so
-    // they're journaled, replicated, and processed by the matching engine via
+    // they're journaled, replicated, and processed by the matching stage via
     // the normal pipeline. The input ring is single-producer: main publishes
     // them through `input_producer`, then moves it into the reader thread
     // which becomes the sole steady-state producer. No cloning required.
@@ -1725,10 +1696,10 @@ where
     };
 
     // Spawn event publisher thread if enabled. Consumes from output ring
-    // consumer 1 and broadcasts all execution events to TCP subscribers.
-    // Caller-supplied (the trading binary wires
-    // `domain::event_publisher::run`; the skip-order-exec binary passes
-    // `None`), so the runtime carries no trading-specific reference.
+    // consumer 1 and broadcasts the application's reports to TCP
+    // subscribers. Caller-supplied (an application with an output feed
+    // wires its publisher; one without passes `None`), so the runtime
+    // carries no application-specific reference.
     let event_publisher_handle = spawn_event_publisher::<A>(
         event_publisher_consumer,
         event_publisher,
@@ -1740,7 +1711,7 @@ where
 
     let shadow_handle = spawn_shadow_stage::<A>(
         shadow_consumer,
-        shadow_exchange,
+        shadow_app,
         chain_hash_lock,
         config,
         &cores,
@@ -2098,7 +2069,7 @@ where
     )
 }
 
-/// Run the trading server with DPDK kernel-bypass networking.
+/// Run the server with DPDK kernel-bypass networking.
 ///
 /// Replaces the kernel TCP stack entirely. The DPDK poll thread handles
 /// all NIC I/O and TCP processing via smoltcp. The response stage encodes
@@ -2401,13 +2372,13 @@ where
         )? {
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
-            Some((mut exchange, writer)) => {
+            Some((mut app, writer)) => {
                 // Promotion! Transition to primary mode (DPDK).
                 info!("replica promoted (DPDK) — transitioning to primary");
                 // Release --health-bind before run_as_primary rebinds it.
                 replica_health.stop();
                 // Idempotent; see the kernel-TCP promotion path.
-                <A as Application>::prefault(&mut exchange, &sizing);
+                <A as Application>::prefault(&mut app, &sizing);
 
                 // Clear a ROTATE latched while this node was a replica —
                 // see the kernel-TCP promotion path.
@@ -2431,7 +2402,7 @@ where
                 // the (already exited) promotion thread — after this
                 // returns; see the kernel-TCP promotion path.
                 return run_as_primary::<A, _>(
-                    exchange,
+                    app,
                     writer,
                     listener,
                     repl_listener,
@@ -2482,11 +2453,11 @@ where
         "loaded authorized keys"
     );
 
-    // Initialize or recover the exchange, then size it — see the
+    // Initialize or recover the application, then size it — see the
     // kernel-TCP primary path.
-    let (mut exchange, writer, needs_seeding, recovered_epoch) =
+    let (mut app, writer, needs_seeding, recovered_epoch) =
         init_engine::<A, BufferedWriter<A::Event>>(&config, &sizing)?;
-    <A as Application>::prefault(&mut exchange, &sizing);
+    <A as Application>::prefault(&mut app, &sizing);
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
@@ -2521,11 +2492,11 @@ where
     };
     let raft_status = raft.status();
 
-    // Clone exchange state for the shadow snapshot stage before moving
-    // exchange into the pipeline (same as the kernel TCP path).
+    // Clone the application's state for the shadow snapshot stage before
+    // moving it into the pipeline (same as the kernel TCP path).
     let enable_shadow = config.snapshot_interval_ms > 0;
-    let shadow_exchange = if enable_shadow {
-        Some(<A as Application>::clone_via_snapshot(&exchange)?)
+    let shadow_app = if enable_shadow {
+        Some(<A as Application>::clone_via_snapshot(&app)?)
     } else {
         None
     };
@@ -2571,7 +2542,7 @@ where
         replication_ring_progress,
         cursors,
     } = build_pipeline_with_replication(
-        exchange,
+        app,
         writer,
         config.group_commit_delay(),
         Arc::clone(&active_connections),
@@ -2597,7 +2568,7 @@ where
     // producer into the DPDK poll thread. No cloning required.
     let mut input_producer = input_producer;
 
-    // The DPDK poll thread also generates the engine's scheduler ticks via
+    // The DPDK poll thread also generates the application's clock ticks via
     // a wall-clock comparison between NIC bursts (see `run_dpdk_poll`). The
     // input ring is therefore single-producer in steady state alongside the
     // one-shot seed loop — same property as the io_uring transport.
@@ -2748,7 +2719,7 @@ where
 
     let shadow_handle = spawn_shadow_stage::<A>(
         shadow_consumer,
-        shadow_exchange,
+        shadow_app,
         chain_hash_lock,
         &config,
         &cores,
@@ -2814,9 +2785,9 @@ where
         let journal_path = config.journal.clone();
 
         // Add the replication listener to the client transport so the
-        // poll thread accepts both trading and replication connections
+        // poll thread accepts both client and replication connections
         // off the same queue.
-        // Replication needs larger TX buffers than trading: journal batches
+        // Replication needs larger TX buffers than clients: journal batches
         // can be 100-200 KiB, far exceeding the 16 KiB client TX buffer.
         const REPL_TX_BUF: usize = 512 * 1024;
         const REPL_TX_QUEUE: usize = 512 * 1024;
@@ -3206,7 +3177,7 @@ where
     let needs_seeding = !journal_exists && !archives_exist;
 
     // Archive the live journal segment if it exceeds the configured
-    // size threshold. The shadow exchange owns snapshot writes; here we
+    // size threshold. The shadow stage owns snapshot writes; here we
     // only rotate the segment so disk usage stays bounded across
     // restarts. Recovery walks the archive chain forward from the
     // latest shadow snapshot.
@@ -3258,7 +3229,7 @@ fn build_replication_metrics(
 
 fn spawn_shadow_stage<A: Application + Send + 'static>(
     shadow_consumer: Option<Consumer<InputSlot<A::Event>>>,
-    shadow_exchange: Option<A>,
+    shadow_app: Option<A>,
     chain_hash_lock: Option<
         melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>,
     >,
@@ -3277,7 +3248,7 @@ where
     let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);
     let chain_hash =
         chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
-    let shadow_ex = shadow_exchange.ok_or("shadow exchange must be Some when shadow is enabled")?;
+    let shadow_ex = shadow_app.ok_or("shadow application must be Some when shadow is enabled")?;
     let s_shadow = Arc::clone(shutdown);
     let shadow = cores.shadow;
     let shadow_initial_epoch = initial_epoch;

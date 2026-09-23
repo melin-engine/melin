@@ -224,11 +224,11 @@ impl DpdkReplicaSlot {
     ///   gate — ordering contract B2 (frozen replica-progress cursors would
     ///   otherwise stop the primary acking client requests even with a
     ///   healthy peer).
-    /// - Decrements the trading-halt gate **only if the replica was past auth**
+    /// - Decrements the halt gate **only if the replica was past auth**
     ///   (`Handshaking`/`Streaming`) — an `Authenticating` connection never
     ///   lifted it (the gate is lifted on auth success, not on connect), so it
     ///   must not lower it. Warns if the last authenticated replica just left
-    ///   (trading is now unprotected).
+    ///   (the node now halts).
     /// - Clears per-connection scratch (recv buffer, in-flight challenge,
     ///   pending handshake validation).
     ///
@@ -444,10 +444,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
             return;
         }
         info!(peer = ?peer, slot = idx, "replica connected via DPDK — authenticating");
-        // The trading-halt gate is NOT lifted here: a bare connection hasn't
+        // The halt gate is NOT lifted here: a bare connection hasn't
         // proven a Replication key. It's lifted on auth success (the
-        // `Authenticated` arm) so an unauthenticated peer can't re-enable order
-        // matching.
+        // `Authenticated` arm) so an unauthenticated peer can't re-enable
+        // client writes.
         slot.auth = Some(AuthChallenge {
             nonce,
             deadline: std::time::Instant::now() + AUTH_TIMEOUT,
@@ -541,7 +541,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         AuthOutcome::Authenticated => {
                             slot.auth = None;
                             // Proven a Replication key — only now does this
-                            // connection lift the trading-halt gate (lowered by
+                            // connection lift the halt gate (lowered by
                             // `go_idle` on teardown).
                             ReplicaGate::new(replicas_connected).lift();
                             slot.state = SlotState::Handshaking(handle);
@@ -981,7 +981,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     //    the data is gone from the ring without ever
                     //    reaching the replica — the replica never acks,
                     //    its acked-progress cursor stalls, and the
-                    //    response gate freezes the whole exchange. We saw
+                    //    response gate freezes every client. We saw
                     //    this exact symptom on dpdk-dual-repl.
                     let max_tx = transport.max_tx_queue_size(handle);
                     let used = transport.tx_queue_bytes(handle);
@@ -1061,7 +1061,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         // poll. Without this, a client-traffic burst
                         // starves the replication TX path: the TxQueue
                         // fills, the driver backs off, the ring overflows,
-                        // and the response gate freezes the exchange.
+                        // and the response gate freezes every client.
                         transport.poll();
                         slot.last_send = std::time::Instant::now();
                     }
@@ -1138,7 +1138,7 @@ where
     // Recover local state from journal whenever any segment survives —
     // live OR archived; fresh replicas get `(None, None, 0, zeros)`.
     // See `recover_replica_state` for the lineage rules.
-    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
+    let (mut app, mut journal_writer, mut last_sequence, mut chain_hash) =
         recover_replica_state::<A, BufferedWriter<A::Event>>(
             journal_path,
             &snapshot_path,
@@ -1223,7 +1223,7 @@ where
         }
         if promote.is_requested() {
             info!("promotion triggered while disconnected");
-            return take_pipeline_for_promotion(&mut pipeline, &mut exchange, &mut journal_writer);
+            return take_pipeline_for_promotion(&mut pipeline, &mut app, &mut journal_writer);
         }
 
         info!(
@@ -1445,7 +1445,7 @@ where
                                     shutdown,
                                 },
                                 &mut pipeline,
-                                &mut exchange,
+                                &mut app,
                                 &mut journal_writer,
                                 journal_path,
                                 &snapshot_path,
@@ -1517,7 +1517,7 @@ where
         if pipeline.is_none() && journal_writer.is_none() {
             let writer =
                 BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
-            exchange = Some(A::default());
+            app = Some(A::default());
             journal_writer = Some(writer);
         }
 
@@ -1528,10 +1528,10 @@ where
         // this branch is skipped.
         if pipeline.is_none() {
             // If we still have no state after all the handshake logic, reconnect.
-            if exchange.is_none() || journal_writer.is_none() {
+            if app.is_none() || journal_writer.is_none() {
                 continue;
             }
-            let cur_exchange = exchange.take().expect("exchange initialized");
+            let cur_app = app.take().expect("application initialized");
             let cur_writer = journal_writer.take().expect("journal_writer initialized");
 
             // Unpin before spawning the pipeline. Same rationale as the
@@ -1545,7 +1545,7 @@ where
             }
 
             pipeline = Some(build_replica_pipeline_with_threads::<A>(
-                cur_exchange,
+                cur_app,
                 cur_writer,
                 cores,
                 staging_mode,
@@ -1622,12 +1622,12 @@ where
         ) {
             AfterSession::Return(r) => return r,
             AfterSession::Resync {
-                exchange: ex,
+                app: ex,
                 journal_writer: wr,
                 last_sequence: seq,
                 chain_hash: hash,
             } => {
-                exchange = ex;
+                app = ex;
                 journal_writer = wr;
                 last_sequence = seq;
                 chain_hash = hash;

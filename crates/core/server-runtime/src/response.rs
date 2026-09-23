@@ -183,13 +183,13 @@ pub struct Response<A: Application> {
     /// durability gate on the journal-disk and replication threads.
     pub wait: WaitStrategy,
     pub utilization: Arc<StageUtilization>,
-    /// Wire encoder for application-shaped payloads. Constructed
-    /// once at boot (`Arc::new(ExchangeResponseEncoder)`) and shared
-    /// with the DPDK response stage.
+    /// Wire encoder for application-shaped payloads. The application's
+    /// encoder, constructed once at boot and shared with the DPDK
+    /// response stage.
     pub encoder: ResponseEncoderArc<A>,
     /// Node fencing state. When latched (a higher epoch was observed), the
     /// stage exits *without* the best-effort flush — in-flight responses
-    /// for orders on a superseded epoch must not be acknowledged. Fencing
+    /// for requests on a superseded epoch must not be acknowledged. Fencing
     /// co-sets `shutdown`, so the latch is only consulted on the shutdown
     /// path (zero steady-state cost). See `crate::fence`.
     pub fence_state: Arc<melin_transport_core::fence::FenceState>,
@@ -585,7 +585,7 @@ pub fn run<A: Application>(
         if shutdown.load(Ordering::Relaxed) {
             // Fence: a superseded ex-primary must not acknowledge any
             // further in-flight work — skip the best-effort flush so
-            // responses buffered for orders on the old epoch are dropped
+            // responses buffered for requests on the old epoch are dropped
             // (the client sees a connection reset and reconciles on
             // reconnect). Checked only here, not per slot: fencing always
             // co-sets `shutdown` (`FenceState::fence_if_superseded` owns
@@ -617,7 +617,7 @@ pub fn run<A: Application>(
         // `read_contiguous` rather than `consume_batch`: the latter
         // memcpy'd every ready slot into a stack array before the first
         // one was touched, and `OutputSlot` embeds the application's
-        // largest query response (~330 B for the exchange), so the head
+        // largest query response (often hundreds of bytes), so the head
         // slot of a deep batch paid for the whole copy before it could
         // be encoded. Borrowing costs nothing and the loop below reads
         // each slot exactly once anyway.
@@ -840,7 +840,7 @@ pub fn run<A: Application>(
 
                 // Re-evaluate the ack policy on a slow timer so
                 // the `policy_degraded` flag and the periodic warn track
-                // the cluster's real state even on idle / quiet venues.
+                // the cluster's real state even on an idle / quiet node.
                 // The gate-open block also calls `update_degraded_state`
                 // after each consumed batch; this is the equivalent for
                 // the no-batch path.
@@ -1834,7 +1834,7 @@ fn flush_sends(
 /// journal from replication.
 ///
 /// The primary's in-memory cursor is modeled as `u64::MAX` because the
-/// response stage only gates events the matching engine has already
+/// response stage only gates events the matching stage has already
 /// processed — those are trivially in-memory on the primary.
 ///
 /// Scoped-borrow shape rather than a returned view: `CursorView` holds a
@@ -2823,8 +2823,8 @@ mod tests {
         // `persisted>=2` is structurally unsatisfiable on a 1-node
         // view, so the gate stays at 0 AND surfaces degraded. The
         // readers' `replicas_connected==0` halt is what stops
-        // accepting new orders; the gate side's job is just to keep
-        // the existing in-flight orders stalled and the alert lit.
+        // accepting new writes; the gate side's job is just to keep
+        // the existing in-flight writes stalled and the alert lit.
         let a_disconnected = flags(false, false);
         let r_after = evaluate_durability(&p, WireSeq::new(500), Some(&m), Some(&a_disconnected));
         assert_eq!(r_after.durable_pos, 0);
