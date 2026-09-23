@@ -29,7 +29,7 @@
 //! - `--ack-policy` is what a reply waits for. `disk` — one fsynced copy —
 //!   is the standalone floor. With a replica attached (`--replication-bind`
 //!   on this node, `--replica-of` on the other; see `docs/replication.md`),
-//!   `ram` acknowledges on the second in-memory copy and `disk-and-ram` on
+//!   `ram` acknowledges on the second in-memory copy and `disk+ram` on
 //!   both, which is what a live deployment runs.
 //! - `--no-default-features` builds the server without the journal's hash
 //!   chain: one BLAKE3 update per entry, and the audit trail with it.
