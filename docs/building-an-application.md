@@ -379,7 +379,7 @@ trader   AAAA...  desk-1
 readonly BBBB...  monitoring
 ```
 
-The set of roles is fixed by the runtime today — `operator`, `trader`, `custodian`, `readonly`, `replication` — and it is your decoder that decides what each may do. `replication` authenticates replicas and `operator` the admin endpoint; an application usually refuses writes from `readonly` and `replication` keys:
+A key is listed once; a node refuses to load a file that lists the same key twice. The set of roles is fixed by the runtime today — `operator`, `trader`, `custodian`, `readonly`, `replication` — and it is your decoder that decides what each may do. `replication` authenticates replicas and nothing else: the client listener refuses a replication key during the handshake, so your decoder never sees one. `operator` also opens the admin endpoint. An application usually refuses writes from `readonly` keys:
 
 ```rust
 use counter_server::CounterEvent;
@@ -389,8 +389,7 @@ use melin_app::decoder::Decoded;
 
 /// Permit `event` unless it changes state and the key may only read.
 fn permit(permission: Permission, event: CounterEvent) -> Decoded<CounterEvent> {
-    let read_only = matches!(permission, Permission::ReadOnly | Permission::Replication);
-    if read_only && !event.is_query() {
+    if permission == Permission::ReadOnly && !event.is_query() {
         return Decoded::PermissionDenied("this key may not write");
     }
     Decoded::Permitted(event)

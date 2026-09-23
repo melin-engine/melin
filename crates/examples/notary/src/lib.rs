@@ -371,8 +371,9 @@ impl RequestDecoderTrait for RequestDecoder {
             KIND_NOTARIZE => {
                 // Unlike the counter example, this one gates on
                 // permission: notarizing appends to the log, so the
-                // read-only and replication roles are refused.
-                if matches!(permission, Permission::ReadOnly | Permission::Replication) {
+                // read-only role is refused. (A replication key never gets
+                // this far: the client listener refuses it.)
+                if permission == Permission::ReadOnly {
                     return Decoded::PermissionDenied("notarizing requires a writing role");
                 }
                 match leaf_from(fields) {
@@ -744,26 +745,22 @@ mod tests {
     }
 
     #[test]
-    fn decoder_denies_notarize_from_read_only_roles() {
-        for permission in [Permission::ReadOnly, Permission::Replication] {
-            assert!(
-                matches!(
-                    RequestDecoder.decode(&request(KIND_NOTARIZE, &leaf(1)), permission),
-                    Decoded::PermissionDenied(_)
-                ),
-                "{permission:?} must not be able to notarize"
-            );
-        }
+    fn decoder_denies_notarize_from_the_read_only_role() {
+        assert!(matches!(
+            RequestDecoder.decode(&request(KIND_NOTARIZE, &leaf(1)), Permission::ReadOnly),
+            Decoded::PermissionDenied(_)
+        ));
     }
 
+    /// Every role a client can connect with; replication keys are refused
+    /// at the handshake and never reach the decoder.
     #[test]
-    fn decoder_allows_queries_from_every_role() {
+    fn decoder_allows_queries_from_every_client_role() {
         for permission in [
             Permission::Operator,
             Permission::Trader,
             Permission::Custodian,
             Permission::ReadOnly,
-            Permission::Replication,
         ] {
             assert!(matches!(
                 RequestDecoder.decode(&[KIND_GET_HEAD], permission),

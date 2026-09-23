@@ -10,7 +10,9 @@ outcomes, `melin-client`'s reply correlation). Read-only: nothing was run
 or changed. Three lenses: safety, performance, and the friction an
 application developer meets.
 
-**Status.** Resolved: S5, S4. All other findings open.
+**Status.** Resolved: S5, S4, and S6's low-effort parts (replication keys
+refused on the client listener, duplicate keys refused, doc example
+fixed; application-defined roles remain open). All other findings open.
 
 The findings that matter most are in safety. Four of them concern state
 that outlives the process (journal bytes, per-key identity, snapshot

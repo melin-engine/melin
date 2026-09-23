@@ -745,6 +745,15 @@ fn process_auth_frame(
             return;
         }
     };
+    if !permission.may_connect_as_client() {
+        debug!(
+            connection_id = conn.connection_id.0,
+            permission = ?permission,
+            "DPDK: key refused on the client listener"
+        );
+        send_auth_failed(conn, transport);
+        return;
+    }
 
     // Extract the nonce captured at Challenge-send time and feed it
     // back into the signing payload now.

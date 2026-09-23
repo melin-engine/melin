@@ -306,9 +306,10 @@ impl RequestDecoderTrait for RequestDecoder {
     type Event = Payload;
 
     fn decode(&self, body: &[u8], permission: Permission) -> Decoded<Payload> {
-        // An echo appends to the journal, so the read-only and replication
-        // roles are refused, as they would be for any state-mutating event.
-        if matches!(permission, Permission::ReadOnly | Permission::Replication) {
+        // An echo appends to the journal, so the read-only role is refused,
+        // as it would be for any state-mutating event. (A replication key
+        // never gets this far: the client listener refuses it.)
+        if permission == Permission::ReadOnly {
             return Decoded::PermissionDenied("echoing requires a writing role");
         }
         match Payload::new(body) {
@@ -496,16 +497,11 @@ mod tests {
     }
 
     #[test]
-    fn read_only_roles_may_not_echo() {
-        for permission in [Permission::ReadOnly, Permission::Replication] {
-            assert!(
-                matches!(
-                    RequestDecoder.decode(b"hi", permission),
-                    Decoded::PermissionDenied(_)
-                ),
-                "{permission:?} must not be able to echo"
-            );
-        }
+    fn read_only_role_may_not_echo() {
+        assert!(matches!(
+            RequestDecoder.decode(b"hi", Permission::ReadOnly),
+            Decoded::PermissionDenied(_)
+        ));
     }
 
     #[test]

@@ -75,6 +75,15 @@ impl Permission {
     pub fn is_replication(self) -> bool {
         matches!(self, Permission::Replication)
     }
+
+    /// Whether a key with this permission may connect to the client
+    /// listener at all. A replication key authorizes journal streaming
+    /// between nodes and nothing else, so the runtime refuses it there
+    /// during the handshake: no request of its reaches the application's
+    /// decoder, and no application has to remember to refuse it.
+    pub fn may_connect_as_client(self) -> bool {
+        !self.is_replication()
+    }
 }
 
 /// Maps Ed25519 public keys to permission levels.
@@ -98,7 +107,10 @@ impl AuthorizedKeys {
     /// readonly DDDD...base64... monitoring
     /// ```
     ///
-    /// Lines starting with `#` and empty lines are ignored.
+    /// Lines starting with `#` and empty lines are ignored. A key may be
+    /// listed once: a second line for the same key is refused rather than
+    /// resolved, since which role an operator meant is not the loader's
+    /// to guess.
     pub fn load(path: &Path) -> io::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         Self::parse(&content).map_err(|e| io::Error::other(format!("{path:?}: {e}")))
@@ -151,7 +163,12 @@ impl AuthorizedKeys {
 
             let mut key = [0u8; 32];
             key.copy_from_slice(&key_bytes);
-            keys.insert(key, permission);
+            if keys.insert(key, permission).is_some() {
+                return Err(format!(
+                    "line {}: public key already listed on an earlier line",
+                    line_num + 1
+                ));
+            }
         }
 
         Ok(Self { keys })
@@ -203,6 +220,15 @@ mod tests {
         assert!(Permission::Custodian.can_manage_funds());
         assert!(!Permission::ReadOnly.can_manage_funds());
         assert!(!Permission::Replication.can_manage_funds());
+    }
+
+    #[test]
+    fn only_replication_may_not_connect_as_client() {
+        assert!(Permission::Operator.may_connect_as_client());
+        assert!(Permission::Trader.may_connect_as_client());
+        assert!(Permission::Custodian.may_connect_as_client());
+        assert!(Permission::ReadOnly.may_connect_as_client());
+        assert!(!Permission::Replication.may_connect_as_client());
     }
 
     #[test]
@@ -285,21 +311,27 @@ operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
         assert_eq!(keys.lookup(&pub_key), Some(Permission::Custodian));
     }
 
+    /// Two roles for one key is an operator mistake with no safe reading
+    /// (the loader used to keep the last line silently). Refused, and a
+    /// repeat of the same role with it: a key has one line.
     #[test]
-    fn duplicate_key_last_permission_wins() {
-        let content = "\
+    fn duplicate_key_is_refused() {
+        for content in [
+            "\
 operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= first
 readonly AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= second
-";
-        let keys = AuthorizedKeys::parse(content).unwrap();
-        // HashMap insert overwrites, so the last entry wins.
-        assert_eq!(keys.len(), 1);
-        let key = BASE64
-            .decode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-            .unwrap();
-        let mut k = [0u8; 32];
-        k.copy_from_slice(&key);
-        assert_eq!(keys.lookup(&k), Some(Permission::ReadOnly));
+",
+            "\
+trader AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= first
+trader AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= again
+",
+        ] {
+            let err = AuthorizedKeys::parse(content).unwrap_err();
+            assert!(
+                err.starts_with("line 2:") && err.contains("already listed"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

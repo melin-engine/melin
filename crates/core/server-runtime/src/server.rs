@@ -3457,6 +3457,10 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
             return Err("unknown public key".into());
         }
     };
+    if !permission.may_connect_as_client() {
+        send_auth_failed(writer);
+        return Err(format!("{permission:?} key refused on the client listener").into());
+    }
 
     // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
     // client_eph`. TCP path's ephs are zeros — see Challenge above.
@@ -3975,6 +3979,25 @@ mod tests {
         let perm = handle.join().unwrap().unwrap();
         assert_eq!(perm, Permission::ReadOnly);
         assert!(!perm.can_trade());
+    }
+
+    /// A replication key signs correctly and is in the keys file, but it
+    /// authorizes node-to-node streaming only: the client listener refuses
+    /// it at the handshake, before any request could reach the decoder.
+    #[test]
+    fn auth_replication_key_refused_on_client_listener() {
+        let keys = keys_with_test_key("replication");
+        let key = test_key();
+        let (s1, mut s2) = UnixStream::pair().unwrap();
+
+        let handle = run_server_auth(s1, keys);
+
+        client_sign_challenge(&mut s2, &key);
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_AUTH_FAILED);
+
+        let err = handle.join().unwrap().unwrap_err();
+        assert!(err.contains("client listener"), "unexpected error: {err}");
     }
 }
 
