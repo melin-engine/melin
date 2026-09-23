@@ -235,7 +235,8 @@ pub trait AppEvent: Copy {
 
     /// Encode this event into `buf`. Caller guarantees `buf.len() >=
     /// self.encoded_size()`. Returns the number of bytes written, which
-    /// must equal `self.encoded_size()`.
+    /// must equal `self.encoded_size()`: the journal refuses an event
+    /// whose two figures disagree rather than persist it.
     fn encode(&self, buf: &mut [u8]) -> usize;
 
     /// Decode an event from `buf`. `buf` contains exactly one encoded

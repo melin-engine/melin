@@ -140,7 +140,7 @@ assert!(matches!(CounterEvent::decode(&buf[..len]), Ok(CounterEvent::Increment {
 
 Three things to get right here:
 
-- **`MAX_ENCODED_SIZE` is a bound, `encoded_size` is exact.** The journal reserves the bound for every entry and sizes its batches from it; each entry then takes only its exact size on disk. A bound too small is refused when an event exceeds it; a bound past what the journal can carry fails the build (on `cargo build` and `cargo test` — not on `cargo check`).
+- **`MAX_ENCODED_SIZE` is a bound, `encoded_size` is exact.** The journal reserves the bound for every entry and sizes its batches from it; each entry then takes only its exact size on disk. A bound too small is refused when an event exceeds it; a bound past what the journal can carry fails the build (on `cargo build` and `cargo test` — not on `cargo check`). `encode` must return exactly `encoded_size`: an event whose two figures disagree is refused before it is journaled, since the entry would otherwise hold a truncated event.
 - **The encoding is permanent.** Every event you journal is decoded again by every future version of your application that replays it. See [Snapshots and upgrades](#snapshots-and-upgrades).
 - **A query is an event too.** `is_query` sends it to `Application::query` instead of `apply`, and keeps it out of the journal.
 

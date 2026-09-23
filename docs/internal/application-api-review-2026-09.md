@@ -10,7 +10,7 @@ outcomes, `melin-client`'s reply correlation). Read-only: nothing was run
 or changed. Three lenses: safety, performance, and the friction an
 application developer meets.
 
-**Status.** Resolved: S5. All other findings open.
+**Status.** Resolved: S5, S4. All other findings open.
 
 The findings that matter most are in safety. Four of them concern state
 that outlives the process (journal bytes, per-key identity, snapshot
@@ -31,7 +31,7 @@ client has to change.
 | S1 | A request the decoder refuses gets no reply; pipelined clients misattribute replies | Medium | Protocol |
 | S2 | `key_hash` is persistent identity derived from an unstable hash | Low (code) / Medium (migration) | Persisted values |
 | S3 | No application codec version on the journal or the replication handshake | High | On-disk format |
-| S4 | `encode` / `encoded_size` disagreement only caught in debug builds | Low (hard check) / Medium (structural) | Structural: trait |
+| S4 | `encode` / `encoded_size` disagreement only caught in debug builds | Low | No |
 | S5 | `restore` is not checked for unread trailing bytes | Low | No |
 | S6 | Role model: fixed role list, replication keys reach the decoder, keys-file laxity | Low (parts) / Medium (app-defined roles) | Roles: yes |
 | S7 | Query routing is a convention (`is_query`), not a type | High | Trait |
@@ -144,22 +144,25 @@ the options; until it lands, the operator procedure in `docs/journal.md`
 
 ### S4. `encode` / `encoded_size` disagreement is only caught in debug builds
 
-**Problem.** Both the journal codec (`melin_journal::codec::encode`) and the
-replication encoder (`replication_wire.rs`) check
-`written == encoded_size()` with `debug_assert_eq!`. In release, an
-`encode` that writes fewer bytes than `encoded_size` declared produces a
-journal entry of `written` bytes on the primary and a replication frame
-of `encoded_size` bytes, the tail zero-filled. The replica decodes the
-padded form: a strict decoder refuses it and the replica stalls, a lax
-one accepts an event the primary never decoded.
+**Problem.** The journal codec (`melin_journal::codec::encode`) checks
+`written == encoded_size()` with `debug_assert_eq!` and frames the entry
+from `written`. In release, an `encode` that reports fewer bytes than
+the event needs journals a truncated event, acknowledges it, and ships
+it. The live replication stream carries the journal entry's own bytes
+(`last_user_entry_replication_slice`), so the replica holds the same
+truncated entry. Nothing notices until a recovery or a replica fails to
+decode it, or decodes it into something else.
 
-**Fix.** Quick: make both checks hard (an error in the codec, which
-already returns `CorruptEntry` for the neighbouring case). Structural:
-drop `encoded_size` from `AppEvent`. The journal already reserves
-`MAX_ENCODED_SIZE` per entry; encode into that reservation (and into a
-`MAX_ENCODED_SIZE` extension of the replication buffer, truncated after)
-and use the returned length everywhere, so there is one source of truth
-and nothing to disagree.
+(The first draft of this finding claimed the primary and replica would
+hold different bytes. They cannot: `replication_wire::append_input_slot`,
+which re-encodes events, is only reached from tests.)
+
+**Fix.** Quick: make the check hard, `CorruptEntry` in the codec,
+alongside the neighbouring bound checks; the journal stage then fails
+before the event is persisted or acknowledged. The alternative
+considered, dropping `encoded_size` so the returned length is the only
+figure, removes the disagreement but also the means of detecting a
+short count, so the two figures and the check between them stay.
 
 ### S5. `restore` is not checked for unread trailing bytes
 
