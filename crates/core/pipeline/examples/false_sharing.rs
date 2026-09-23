@@ -43,8 +43,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // 104-byte slot — mirrors the pre-padding production `InputSlot` layout
-// for a 64-byte event (5×u64 metadata header + 64-byte event payload). `#[repr(C)]`
-// so the compiler does not reorder fields.
+// for a 64-byte event (5×u64 metadata header + 64-byte event payload).
+// `#[repr(C)]` so the compiler does not reorder fields.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Slot104 {

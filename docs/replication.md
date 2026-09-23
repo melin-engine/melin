@@ -22,7 +22,7 @@ exist before the client gets a reply:
 |---|---|---|---|
 | `disk` | One fsynced copy on PLP-backed NVMe. | Hardware failure of the disk holding that copy. | Dev, staging, single-node deployments. |
 | `ram` | Two copies in memory, on two nodes. Disk writes trail asynchronously — every journal still syncs every batch, just off the ack path. | Simultaneous failure of every node holding the event within the fsync window (typically milliseconds) — the un-synced tail is lost. Any single node failure is fully covered by failover. | Storage where fsync is slow (cloud block volumes) or latency-critical applications that accept a small, bounded RPO. Lowest ack latency of the four policies. |
-| `disk+ram` *(default)* | One fsynced copy on PLP-backed NVMe **plus** a second copy in another node's memory. | Failure of the disk holding the fsynced copy within ~80 µs of the ack — the window before the other node completes its own fsync. PLP-protected power loss is fully handled. | Typical production deployments. Saves ~50–80 µs per acknowledged event vs `two-disks`. |
+| `disk+ram` *(default)* | One fsynced copy on PLP-backed NVMe **plus** a second copy in another node's memory. | Failure of the disk holding the fsynced copy within ~80 µs of the ack — the window before the other node completes its own fsync. PLP-protected power loss is fully handled. | Typical production deployments. Faster than `two-disks`: an acknowledgement waits for the second node to receive the event, not to fsync it. |
 | `two-disks` | Two fsynced copies on PLP-backed NVMe, on two nodes. | Simultaneous disk failure on two nodes. | Compliance-driven venues that require two durable copies before client ack. |
 
 The PLP (Power-Loss-Protection) capacitor on the NVMe device is what

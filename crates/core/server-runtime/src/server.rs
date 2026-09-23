@@ -281,8 +281,9 @@ pub struct ServerConfig {
     /// - `disk+ram` (default) `persisted>=1 && in_memory>=2`. One
     ///   fsynced copy plus a second copy in another node's memory.
     ///   Single-failure-safe with a brief RAM-only window for the
-    ///   second copy. Typical live deployments. Saves ~50–80 µs per
-    ///   acknowledged write vs `two-disks`.
+    ///   second copy. Typical live deployments. Faster than `two-disks`:
+    ///   an acknowledgement waits for the second node to receive the
+    ///   event, not to fsync it.
     /// - `two-disks`          `persisted>=2`. Two fsynced copies before
     ///   the client ack. Zero RAM-only window; the gate stalls when no
     ///   replica is connected. Compliance-driven deployments.
@@ -405,9 +406,8 @@ pub struct ServerConfig {
     /// application's time-driven work (expiries, timeouts, scheduled
     /// transitions) fires in deterministic, journaled lockstep. There is
     /// no separate tick thread on either transport. Set to 0 to disable
-    /// tick generation
-    /// entirely (useful for benchmarks that don't exercise time-driven
-    /// features).
+    /// tick generation entirely (useful for benchmarks that don't
+    /// exercise time-driven features).
     ///
     /// Defaults to 250 ms. Under load the matching stage advances the
     /// application's clock at every-event resolution from `slot.timestamp_ns`
@@ -1353,8 +1353,9 @@ where
         .into());
     }
     // Clone the application for the shadow snapshot stage before the pipeline
-    // consumes it. Uses snapshot_state() + restore_state() round-trip since
-    // `A` doesn't implement Clone (internal data structures are complex).
+    // consumes it. `Application` does not require `Clone`, so this goes
+    // through `clone_via_snapshot` (a snapshot round-trip unless the
+    // application overrides it with something cheaper).
     let enable_shadow = config.snapshot_interval_ms > 0;
     let shadow_app = if enable_shadow {
         Some(<A as Application>::clone_via_snapshot(&app)?)

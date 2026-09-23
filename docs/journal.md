@@ -6,7 +6,7 @@ This document describes the write-ahead journal, snapshot system, crash recovery
 
 1. **Input-only journaling** — only input events are persisted: the application's events, and the few the runtime journals on its own behalf (clock ticks, fencing epochs). The reports an application produces are *not* journaled. The application is deterministic: replaying the same inputs always produces identical outputs. This keeps the journal small and avoids coupling its format to the application's reports.
 
-2. **Persist-before-ack** — no response is sent to a client until the corresponding journal entry is durable on disk. The LMAX disruptor pipeline enforces this: the response stage gates on the journal cursor, which advances only after `pwritev2 + RWF_DSYNC` completes.
+2. **Persist-before-ack** — no response is sent to a client until the corresponding journal entry is durable on disk. The LMAX disruptor pipeline enforces this: the response stage gates on the journal cursor, which advances only after the batch's `fdatasync` completes.
 
 3. **Manual binary codec** — no serde, no protobuf. Every field of the entry framing is encoded by hand in little-endian with known offsets. This gives predictable layout, zero allocations, and immunity to serialization library version changes. An application's event bytes inside an entry are its own encoding.
 
@@ -62,7 +62,7 @@ The runtime never reads inside an application event's payload: its layout, and h
 
 Each batch is written with `pwrite` plus `fdatasync`, on the journal's disk thread — the sequencing thread hands the batch over and moves on, so encoding and the replica feed keep flowing while the device works. This is honest durability on any drive: `fdatasync` flushes the page cache to the drive and waits for the drive to acknowledge a flush of its own write cache. When it returns, every byte in the batch is in non-volatile storage regardless of whether the drive has power-loss protection — the kernel always issues a flush command (`REQ_OP_FLUSH`) to the device, and the device must acknowledge it before the syscall returns. On a drive with a volatile write cache the flush physically flushes the cache to media; on a PLP drive with the volatile write cache disabled (`VWC=0`) the flush is a near-no-op, because the device acknowledges writes only once the capacitor protects them.
 
-Latency: ~10–30 µs per batch on PLP NVMe, ~50–200 µs on consumer NVMe, where the device flush dominates.
+Its cost is the device flush: short on a drive with power-loss protection, which acknowledges once its capacitors cover the write, and much longer on a consumer drive, which must flush its volatile cache first.
 
 ### Pre-allocation
 
@@ -292,7 +292,8 @@ When changing the journal format (bumping `format_version`) or the application's
 1. **Take a snapshot** with the current (old) version. This captures the full application state at a known journal sequence.
 2. **Deploy the new version.**
 3. **Start fresh**: the new version creates a new journal file (new format) and loads the snapshot.
-   - The snapshot must be one the new version accepts. If the application's snapshot layout changed, the new version refuses the old `app_version`: either a one-time migration tool converts the snapshot, or — when the event encoding did not change and the full history is retained — the new version rebuilds its state by replaying the journal from sequence 1 instead of loading a snapshot.
+   - The snapshot must be one the new version accepts. If the application's snapshot layout changed, the new version refuses the old `app_version`, and a one-time migration tool must convert the snapshot.
+   - When *only* the snapshot layout changed — the journal format and the application's event encoding did not — and the journal is retained from sequence 1, this procedure is not needed: move the old snapshot aside and start the new version on the existing journal, which it replays from the start to rebuild its state.
 4. **Archive the old journal** for audit purposes. It can only be replayed by the old version.
 
 ### Upgrading a Replicated Deployment
@@ -359,7 +360,7 @@ Sequences are `u64`, starting at 1, monotonically increasing, with no gaps. At 1
 
 ### Timestamps
 
-The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`, read on the primary when the event enters the pipeline. The journal never uses it for ordering — sequence numbers do that — but it is the time the application is handed with the event, live and on every replay, so replay reproduces any decision the application based on it. If the system clock jumps (an NTP step), consecutive timestamps may go backwards; the application's time-driven work only ever moves forward, but an application that compares an event's own timestamp against earlier ones must allow for it.
+The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`, read on the primary when the event enters the pipeline. The journal never uses it for ordering — sequence numbers do that — but it is the time the application is handed with the event, live and on every replay, so replay reproduces any decision the application based on it. If the system clock jumps (an NTP step), or a failover hands the primary role to a node whose clock is behind, consecutive timestamps may go backwards, and so may the time the application's time-driven work is advanced to. An application must not assume either only increases.
 
 ### Error Handling
 

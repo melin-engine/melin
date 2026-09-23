@@ -85,7 +85,7 @@ The simplified diagram above shows the primary-side request path. The picture be
    |  |   CLIENT TCP   SUBSCRIBERS
    |  |   (reports)
    |  |
-   |  |  pwritev2 (RWF_DSYNC) -> JOURNAL FILE
+   |  |  pwritev + fdatasync -> JOURNAL FILE
    |  |  journal bytes carry (sequence, timestamp, event, key_hash)
    |  |
    |  |  post-fsync: push encoded batch bytes
@@ -172,7 +172,9 @@ The simplified diagram above shows the primary-side request path. The picture be
 
 The matching stage keeps a watermark of the latest time it has handed the application. Before applying an event whose timestamp is past the watermark, it advances the application's clock to that timestamp — letting it fire whatever time-driven work has come due (expiries, session transitions) — and moves the watermark. Under load every event therefore advances the clock at microsecond precision, with no extra latency hop for a separate `Tick` event. The tick generator's role narrows to "make sure the clock advances during quiet periods" — at the default 250 ms cadence it costs four journal entries a second.
 
-Journal replay and the shadow stage advance the clock at the same points, from the same journaled timestamps, so the live application, a recovered one and the shadow's copy stay identical.
+A journaled tick advances the application's clock to the tick's own time whether or not it is past the watermark.
+
+Journal replay and the shadow stage advance the clock by the same rules, from the same journaled timestamps, so the live application, a recovered one and the shadow's copy see the same clock. One known exception: the watermark is not carried across a restart or snapshot restore, so after a wall clock that stepped backwards — or a failover to a node whose clock is behind — a node that restarted can advance the clock at points where one that kept running did not. An application whose clock handling does nothing for a time it has already passed — no due work fires again, no state records the earlier time — is unaffected.
 
 ## Input Disruptor
 
@@ -224,7 +226,7 @@ The sequencing thread:
 
 The disk thread:
 
-4. Writes every published batch (`pwrite`), then issues a single `fdatasync` covering all of them. A backlog therefore costs one sync to clear, not one per batch. The call returns only once the kernel reports the data is on stable media: approximately 10-30 us on NVMe with power-loss protection, approximately 50-200 us on consumer drives where the device flush dominates.
+4. Writes every published batch (`pwrite`), then issues a single `fdatasync` covering all of them. A backlog therefore costs one sync to clear, not one per batch. The call returns only once the kernel reports the data is on stable media, so its cost is the device flush: short on NVMe with power-loss protection, much longer on consumer drives that must flush a volatile cache.
 5. Publishes the durability cursors -- including the input-ring progress the response stage's gate reads -- and only then releases the hand-off slots.
 
 The hand-off ring holds 64 batches. A device stall is absorbed up to that depth before the sequencing thread stalls at its next batch and producers feel backpressure.
@@ -246,7 +248,7 @@ A batch is handed to the disk thread when any of:
 
 The `group_commit_delay` parameter (configurable via `--group-commit-us`) allows the journal to wait up to a specified duration for more events to accumulate before issuing the durable write. Under high load, the batch fills naturally and the delay rarely fires.
 
-**Important**: Group commit helps throughput only with UDS transport (+34% at 100 us). With TCP transport, it hurts throughput because the delay holds the journal cursor longer, making the response stage block and accumulate larger TCP send buffers. **Keep at 0 for TCP** (the default).
+**Important**: Group commit helps throughput only with UDS transport, where sending a response is nearly free. With TCP transport, it hurts throughput because the delay holds the journal cursor longer, making the response stage block and accumulate larger TCP send buffers. **Keep at 0 for TCP** (the default).
 
 ### Idle behavior
 
@@ -410,11 +412,11 @@ The practical consequence: while the device is slow, the sequencer keeps orderin
 
 Absorption is bounded by the hand-off ring (64 batches). Past that the sequencer stalls at its next batch, the input ring fills, and producers backpressure — the same chain as before, with a deeper buffer in front of it. Watch `melin_journal_disk_lag_batches`.
 
-Give the disk thread a core on the same CCD as `journal-seq`: the two exchange a cache line per batch, and a cross-CCD transfer adds roughly 100 ns to each. On a box that cannot spare the core, set `journal-disk=0` — the thread then runs at default scheduling and yields when idle, like every unpinned thread; it still makes progress, but it competes with everything else on the core it lands on. On a host with isolated cores, that is one of the non-isolated cores, shared with the kernel and interrupt handling (see [CPU core pinning](#cpu-core-pinning)).
+Give the disk thread a core on the same CCD as `journal-seq`: the two exchange a cache line per batch, and a transfer across CCDs costs far more than one within a CCD. On a box that cannot spare the core, set `journal-disk=0` — the thread then runs at default scheduling and yields when idle, like every unpinned thread; it still makes progress, but it competes with everything else on the core it lands on. On a host with isolated cores, that is one of the non-isolated cores, shared with the kernel and interrupt handling (see [CPU core pinning](#cpu-core-pinning)).
 
 ### CPU core pinning
 
-Each pipeline thread calls `sched_setaffinity` (via `crate::affinity::pin_to_core`) immediately after spawning, before entering its main loop. Pinning eliminates involuntary context switches and keeps hot data in L1/L2 cache, reducing p99/p99.9 latency jitter from approximately 5-20 us per core migration to near zero.
+Each pipeline thread calls `sched_setaffinity` (via `crate::affinity::pin_to_core`) immediately after spawning, before entering its main loop. Pinning eliminates involuntary context switches and keeps hot data in L1/L2 cache, removing the latency jitter each core migration adds at p99/p99.9.
 
 A thread given `0` in `--cores` is not pinned. It runs on the CPUs the node process was started with — the set it inherited from whatever launched it, which `taskset`, systemd's `CPUAffinity=` or a container's cpuset narrow — and that holds for every unpinned thread, including the ones the runtime starts from pinned threads. What that set is depends on the host:
 

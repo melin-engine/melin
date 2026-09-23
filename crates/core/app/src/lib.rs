@@ -350,15 +350,19 @@ pub trait Application: Sized + Default {
     /// whenever an event's timestamp is past the latest time it has
     /// handed the application, and for each journaled clock tick, which
     /// keeps time moving while no client traffic arrives. Live, on
-    /// replay and on a replica, the calls come at the same points with
-    /// the same values.
+    /// replay and on a replica, the calls follow the same rules from the
+    /// same journaled times.
     ///
     /// `now_ns` is wall-clock time, so do not assume it strictly
     /// increases: the same value may arrive more than once, and a tick
     /// may carry a time earlier than one already seen — after the
     /// primary's clock steps back, or after a failover to a node whose
-    /// clock runs behind. Firing what is due at `now_ns` must be
-    /// idempotent, and elapsed-time arithmetic must saturate.
+    /// clock runs behind. In that case a node that restarted may also
+    /// make calls a node that kept running did not, since the latest
+    /// time handed out is not carried across a restart. So a call for a
+    /// time already passed must change nothing — no due work fires
+    /// again, no state records the earlier time — and elapsed-time
+    /// arithmetic must saturate.
     fn tick(&mut self, now_ns: u64, out: &mut Vec<Self::Report>);
 
     /// Synthesise a rejection report for a transport-originated reject.

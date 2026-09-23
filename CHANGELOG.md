@@ -101,6 +101,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   query arms out of `apply` into `query` (returning `None` for any other
   event), leave a no-op arm for query variants in `apply`, and read the
   counters from `QueryCtx`.
+- **Log lines, metric descriptions and messages no longer describe a
+  trading system.** Wording only — no metric, flag or health-endpoint field
+  is renamed — but an alert that matches on message text needs updating:
+  - `all replicas disconnected — trading halted` (warn) is now
+    `all replicas disconnected — halted, refusing client writes`.
+  - `raft core stopped — control plane down, trading unaffected` (error)
+    now ends `sequencing unaffected`.
+  - The snapshot-transfer error now says the *shadow stage* writes
+    snapshots, and the auto-promotion refusal speaks of acked *events*.
+  - The `# HELP` text of `melin_trading_active`, `melin_events_processed`
+    and `melin_raft_driver_running` is reworded; the metric names and the
+    health endpoint's `trading` / `halted` flag are unchanged.
+  - `--help` describes the binary as a node of the Melin replicated
+    sequencer.
 
 ## [0.17.0] - 2026-09-22
 

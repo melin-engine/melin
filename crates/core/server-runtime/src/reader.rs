@@ -623,14 +623,13 @@ fn reader_loop<A: Application, R: AsRawFd>(
         );
 
         let batch_now = Instant::now();
-        // One wall-clock read per CQE batch instead of per request. The
-        // reader can see 4–6 M requests/s at peak; a per-request
-        // `unix_epoch_nanos()` was ~2.8 % of the primary's cycles
-        // (vDSO `clock_gettime(CLOCK_REALTIME)`). All requests in the
-        // same batch share the timestamp — precision loss is bounded
-        // by the CQE-drain cadence (tens of µs under load) and request
-        // timestamps are used for reporting, not ordering (the pipeline
-        // orders by sequence, not time).
+        // One wall-clock read per CQE batch instead of per request: at
+        // peak request rates a per-request `unix_epoch_nanos()` (vDSO
+        // `clock_gettime(CLOCK_REALTIME)`) showed up in the primary's
+        // profile. All requests in the same batch share the timestamp —
+        // precision loss is bounded by the CQE-drain cadence. The timestamp
+        // drives the application's clock but orders nothing (the pipeline
+        // orders by sequence), so that resolution is enough.
         let batch_wall_ns = unix_epoch_nanos();
 
         for &(token, result, flags) in &cqes {

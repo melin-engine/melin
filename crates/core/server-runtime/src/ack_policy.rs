@@ -61,8 +61,9 @@ pub enum AckPolicy {
     /// `persisted>=1 && in_memory>=2`. One fsynced copy plus a second
     /// copy in another node's memory. Single-failure-safe with a brief
     /// RAM-only window (~80 µs on PLP-backed NVMe) for the second copy.
-    /// The default — typical live deployments. Saves ~50–80 µs per
-    /// acknowledged write vs [`TwoDisks`](Self::TwoDisks). Fails closed
+    /// The default — typical live deployments. Faster than
+    /// [`TwoDisks`](Self::TwoDisks): an acknowledgement waits for the
+    /// second node to receive the event, not to fsync it. Fails closed
     /// when no replica is connected.
     #[value(name = "disk+ram")]
     DiskAndRam,

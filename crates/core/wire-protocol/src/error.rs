@@ -9,7 +9,8 @@ pub enum ProtocolError {
     Truncated,
     /// Unknown message type tag.
     UnknownTag(u8),
-    /// A field value is invalid (e.g., zero where a count is required, bad enum discriminant).
+    /// A field value is invalid (e.g., zero where a count is required,
+    /// bad enum discriminant).
     InvalidField(&'static str),
     /// Message exceeds maximum allowed frame size.
     MessageTooLarge(usize),

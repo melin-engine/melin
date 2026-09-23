@@ -13,9 +13,10 @@
 /// from operator configuration and consumed once, off any hot path.
 pub struct StartupEvents<E> {
     /// The first events of the history: what every node's state starts
-    /// from (reference data, initial balances, ...). Journaled once, by the node that
-    /// creates the journal as primary. A node that recovers an existing
-    /// journal, or follows a primary, already has them in its history.
+    /// from (reference data, initial balances, ...). Journaled once, by
+    /// the node that creates the journal as primary. A node that recovers
+    /// an existing journal, or follows a primary, already has them in its
+    /// history.
     pub genesis: Vec<E>,
     /// Journaled every time a node becomes primary — after `genesis` on a
     /// new journal, on recovering an existing journal as primary, and

@@ -157,8 +157,9 @@ impl From<std::io::Error> for JournaledAppError {
 
 /// A journaled application: any `Application` paired with a durable
 /// journal writer positioned at the next free sequence. Generic over
-/// `W` — the caller picks the concrete writer type (typically by dispatching on a runtime mode
-/// flag at the boot site) and threads it through.
+/// `W` — the caller picks the concrete writer type (typically by
+/// dispatching on a runtime mode flag at the boot site) and threads it
+/// through.
 pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     app: A,
     writer: W,

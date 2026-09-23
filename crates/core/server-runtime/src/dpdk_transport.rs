@@ -403,10 +403,10 @@ pub fn run_dpdk_poll<A: Application>(
 
         // One wall-clock read per outer poll iteration, reused for
         // every request stamped in this pass. Sub-microsecond precision
-        // loss at DPDK poll rates; request timestamps are for reporting,
-        // not ordering (the pipeline orders by sequence). Deferred until
-        // we actually stamp a frame — `clock_gettime` dominates the
-        // profile on idle polls with no traffic.
+        // loss at DPDK poll rates; the timestamp drives the application's
+        // clock but orders nothing (the pipeline orders by sequence).
+        // Deferred until we actually stamp a frame — `clock_gettime`
+        // dominates the profile on idle polls with no traffic.
         let mut batch_wall_ns: Option<u64> = None;
 
         slow_check_counter = slow_check_counter.wrapping_add(1);

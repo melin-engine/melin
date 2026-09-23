@@ -8,8 +8,8 @@
 //!    sequencer also sends a copy of each encoded batch to the replication
 //!    sender thread via a bounded channel, *before* handing it to the disk
 //!    thread, so replicas never wait on local storage either. The bytes are
-//!    identical to what is written to disk — same sequences, timestamps,
-//!    CRC checksums, and checkpoint entries. See [`crate::journal_disk`].
+//!    identical to what is written to disk — same sequences, timestamps
+//!    and CRC checksums. See [`crate::journal_disk`].
 //! 2. **Matching stage**: applies events to the application, publishes responses
 //!    to the output SPSC. Runs concurrently with the journal — no waiting for sync.
 //!
@@ -207,9 +207,10 @@ impl Default for StageUtilization {
 }
 
 /// Ring buffer capacity for the input disruptor (journal + matching consumers).
-/// 2^20 = 1,048,576 slots. At ~72 bytes per slot, this is ~72 MiB — fits in
-/// L3 cache on modern server CPUs. Provides ~100 ms of buffering at 10M
-/// events/sec, enough headroom for fsync stalls without backpressure.
+/// 2^20 = 1,048,576 slots. Each slot holds the event inline, so the
+/// ring's footprint scales with `size_of::<E>()`. Provides ~100 ms of
+/// buffering at 10M events/sec, enough headroom for fsync stalls without
+/// backpressure.
 pub const INPUT_RING_CAPACITY: usize = 1 << 20;
 
 /// SPSC queue capacity for the output path (matching → response).

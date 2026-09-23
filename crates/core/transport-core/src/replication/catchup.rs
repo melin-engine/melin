@@ -26,11 +26,10 @@ use crate::replication_wire::MSG_INPUT_BATCH;
 /// disk to catch up to the ring (see [`drain_into_contiguity`]). The
 /// gap it closes is one journal flush of slack, so the bound is
 /// calibrated to the *required* production config — PLP NVMe + xfs,
-/// where a `buffered` batch flush is ~10–30 µs (`docs/journal.md`) and
-/// the multi-millisecond stall sources are engineered out (xfs removes
-/// the ext4 jbd2 spike; `sector` mode is barred from production). 30 ms
-/// is ~3 orders of magnitude over that close time, so it never expires
-/// on in-spec hardware.
+/// where a batch flush is a single short device flush and the
+/// multi-millisecond stall sources are engineered out (xfs removes the
+/// ext4 jbd2 spike). 30 ms is orders of magnitude over that close time,
+/// so it never expires on in-spec hardware.
 ///
 /// The bound is deliberately tight rather than generous because the
 /// spin runs inline on the single-threaded DPDK driver loop, where it
@@ -39,8 +38,8 @@ use crate::replication_wire::MSG_INPUT_BATCH;
 /// not a hiccup — and on expiry the handoff falls back to the
 /// receiver's contiguity gate (a reconnect), which is the right
 /// outcome when the disk has stopped keeping up. Out-of-spec hardware
-/// (e.g. `buffered` on a consumer drive, ~50–200 µs with fatter tails)
-/// merely falls back more often: still correct, just less efficient.
+/// (a consumer drive, with slower flushes and fatter tails) merely falls
+/// back more often: still correct, just less efficient.
 /// This is a safety bound, not a steady-state cost.
 const HANDOFF_BRIDGE_TIMEOUT: Duration = Duration::from_millis(30);
 
