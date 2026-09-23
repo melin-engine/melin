@@ -38,7 +38,6 @@ pub mod decoder;
 /// envelope variants (`BatchEnd`, `EngineError`) stay in runtime.
 pub mod encoder;
 
-use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -210,16 +209,45 @@ pub struct QueryCtx {
 /// can call it to learn which value a given key arrives under. The value
 /// is journaled with every event, and an application may keep state
 /// under it, so for a given key it must never change between builds.
+///
+/// Written out here rather than called through a hasher, so that no
+/// dependency update or toolchain upgrade in an application's build can
+/// move it. It computes what earlier releases got from rustc-hash 2.1's
+/// `FxHasher` fed through std's `Hash` for `[u8; 32]` on a 64-bit target:
+/// the length, then the bytes, then the final rotate. Values journaled by
+/// those releases keep their meaning. Not a cryptographic hash, and it
+/// need not be: the key is already authenticated, and the hash only has
+/// to tell keys apart.
 pub fn key_hash(public_key: &[u8; 32]) -> u64 {
-    // FxHash: fast and non-cryptographic, which is enough because the key
-    // is already authenticated and the hash only has to tell keys apart.
-    // Neither rustc-hash nor std's `Hash` for arrays promises the same
-    // output across versions; `key_hash_is_pinned` fails if a bump moves
-    // it. A derivation stable by specification is S2 in
-    // docs/internal/application-api-review-2026-09.md.
-    let mut hasher = rustc_hash::FxHasher::default();
-    public_key.hash(&mut hasher);
-    hasher.finish()
+    // FxHash's multiplier, and the seeds and zero guard of its byte hash.
+    const K: u64 = 0xf135_7aea_2e62_a9c5;
+    const SEED1: u64 = 0x243f_6a88_85a3_08d3;
+    const SEED2: u64 = 0x1319_8a2e_0370_7344;
+    const ZERO_GUARD: u64 = 0xa409_3822_299f_31d0;
+
+    // Full 64x64 -> 128-bit product, halves folded together. `u128` is
+    // what the original uses on every 64-bit target, and what makes this
+    // exact rather than an approximation of it.
+    fn multiply_mix(x: u64, y: u64) -> u64 {
+        let full = u128::from(x) * u128::from(y);
+        full as u64 ^ (full >> 64) as u64
+    }
+
+    let [w0, w1, w2, w3]: [u64; 4] =
+        std::array::from_fn(|i| u64::from_le_bytes(std::array::from_fn(|j| public_key[8 * i + j])));
+    let len = public_key.len() as u64;
+
+    // The byte hash of 32 bytes: one 16-byte block mixed, then the last
+    // 16 bytes folded into the two lanes.
+    let s0 = SEED2 ^ w2;
+    let s1 = multiply_mix(SEED1 ^ w0, ZERO_GUARD ^ w1) ^ w3;
+    let bytes = multiply_mix(s0, s1) ^ len;
+
+    // The hasher: the length prefix std writes for a slice, then the
+    // byte hash, each added and multiplied in; then the finishing rotate.
+    let hash = len.wrapping_mul(K);
+    let hash = hash.wrapping_add(bytes).wrapping_mul(K);
+    hash.rotate_left(26)
 }
 
 /// An application event that can be round-tripped through the journal.
@@ -520,9 +548,11 @@ mod tests {
     use super::*;
 
     /// A key's `key_hash` is journaled and applications keep state under
-    /// it, so it must come out the same in every build. If a dependency or
-    /// toolchain bump makes this fail, do not update the numbers: every
-    /// deployed journal holds the old ones. Keep the old derivation.
+    /// it, so it must come out the same in every build. These are the
+    /// values earlier releases produced through rustc-hash, and the
+    /// written-out derivation was checked against it on random keys. If an
+    /// edit makes this fail, do not update the numbers: every deployed
+    /// journal holds the old ones. Revert the edit.
     #[test]
     fn key_hash_is_pinned() {
         assert_eq!(key_hash(&[0x00; 32]), 3540036477615380542);
@@ -530,7 +560,6 @@ mod tests {
         let counting: [u8; 32] = std::array::from_fn(|i| i as u8);
         assert_eq!(key_hash(&counting), 10220697499077226569);
     }
-
     /// The smallest event that lets the test application below exist: a
     /// write, or a query it has no answer for.
     #[derive(Debug, Clone, Copy)]
