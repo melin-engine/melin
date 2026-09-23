@@ -19,6 +19,8 @@ application developer meets.
   duplicate keys refused, doc example fixed; application-defined roles
   remain open); F1 (defaults for `tick` and `query`; removing
   `build_reject` remains open, with S1).
+- P1: the doc is corrected; routing query responses apart, so they stop
+  widening every slot, remains open.
 - All other findings open.
 
 The findings that matter most are in safety. Four of them concern state

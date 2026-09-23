@@ -363,9 +363,12 @@ pub trait Application: Sized + Default {
     ///
     /// [`NoQuery`] for an application that answers none.
     ///
-    /// Separated from `Report` so that large query payloads (e.g. a
-    /// summary of many entries) don't inflate the per-element size of the
-    /// scratch vec on the hot path.
+    /// Separate from `Report`, so a wide query answer does not widen the
+    /// scratch vec `apply` pushes its reports into. It does not spare the
+    /// output ring: a slot holds a report or a query response inline, so
+    /// every slot is as wide as the wider of the two, and a wide answer
+    /// costs memory in the slot of every write's report too. Keep it as
+    /// narrow as the events.
     type QueryResponse: Copy;
 
     /// Apply a single journaled event to the application state. Must be
