@@ -6,18 +6,18 @@ types (`Application`, `AppEvent`, `RequestDecoder`, `ResponseEncoder`,
 examples (`echo`, `counter`, `notary`), and the runtime code that drives
 them (`transport-core`'s `dispatch` and matching loop, snapshot load, the
 journal and replication encoders, the reader's handling of decoder
-outcomes, `melin-client`'s reply correlation). Read-only: nothing was run
-or changed. Three lenses: safety, performance, and the friction an
-application developer meets.
+outcomes, `melin-client`'s reply correlation). The review itself ran and
+changed nothing; the status below records what was fixed after it. Three
+lenses: safety, performance, and the friction an application developer
+meets.
 
 **Status.**
 
-- Resolved: S4, S5, S9, F2, F8.
-- Partly resolved: S2 (one `melin_app::key_hash` for both transports,
-  with a test pinning its output so a bump that moves it fails; the
-  derivation stable by specification remains open); S6 (replication keys refused on the client listener,
+- Resolved: S2, S4, S5, S9, F2, F8.
+- Partly resolved: S6 (replication keys refused on the client listener,
   duplicate keys refused, doc example fixed; application-defined roles
-  remain open); F1 (defaults for `tick` and `query`; removing
+  remain open); F1 (defaults for `tick` and `query`, the latter
+  asserting in debug builds that it is not handed a query; removing
   `build_reject` remains open, with S1).
 - P1: the doc is corrected; routing query responses apart, so they stop
   widening every slot, remains open.
@@ -132,6 +132,16 @@ for existing deployments, so it wants a release note, and ideally a
 one-time mapping or an operator-visible warning. The consolidation into
 one function is independent and costs nothing.
 
+**Done instead.** `melin_app::key_hash` writes out the arithmetic the
+old call performed (rustc-hash 2.1's byte hash and `FxHasher`, fed
+std's length prefix, on a 64-bit target), checked against rustc-hash on
+random keys and pinned by test vectors. That removes both unstable links
+without changing a single value, so no deployment is orphaned and no
+migration is needed; `melin-app` no longer depends on rustc-hash. A
+BLAKE3 derivation would be no more stable, only differently specified,
+at the cost of the migration above. (32-bit targets computed other
+values before and compute the 64-bit ones now; none is deployed.)
+
 ### S3. No application codec version on the journal or the replication stream
 
 **Problem.** `Application::APP_VERSION` is checked only when a snapshot
@@ -183,8 +193,10 @@ bumping `APP_VERSION` (the mistake the version exists to catch) can
 restore "successfully" into wrong state, because the old reader stops
 short of the new fields.
 
-**Fix.** In `snapshot::load`, after `restore`, fail with a new `SnapshotError` variant if the
-slice is not empty. Update the `Application::restore` doc to say so.
+**Fix.** In `snapshot::load`, after `restore`, fail with a new
+`SnapshotError` variant if the slice is not empty, and apply the same
+check in `Application::clone_via_snapshot`, which builds the shadow
+stage's copy. Update the `Application::restore` doc to say so.
 
 ### S6. Role model
 
@@ -220,7 +232,7 @@ replication and admin). The medium part is now on the roadmap as
 `AppEvent::is_query()`. Consequences:
 
 - every application writes dead arms: a query arm in `apply`, a
-  command arm in `query` (all three examples do);
+  command arm in `query` (the counter and notary do);
 - every application writes journal encode/decode for its query
   variants, which are never journaled;
 - a write misclassified as a query goes to `query(&self)`, changes
@@ -337,11 +349,12 @@ arithmetic.
 `ApplyCtx`, `QueryCtx`, `RejectReason`, and `CodecError` are
 exhaustive, and the examples' tests build the contexts as struct
 literals. (`Decoded` should stay exhaustive: the runtime matches it and
-must be forced to handle a new outcome.) The next field added to a context breaks every application's
-tests. Mark them `#[non_exhaustive]` and add constructors (`ApplyCtx::new`,
-a `QueryCtx` builder or test constructor). Breaking once, then never
-again for this reason. Downstream applications with struct literals need
-a one-line change each.
+must be forced to handle a new outcome.) The next field added to a
+context breaks every application's tests. Mark them `#[non_exhaustive]`
+and add constructors (`ApplyCtx::new`, a `QueryCtx` builder or test
+constructor). Breaking once, then never again for this reason.
+Downstream applications with struct literals need a one-line change
+each.
 
 ### F5. No conformance test kit
 
@@ -380,8 +393,8 @@ The counter is the documented reference application, and:
 - it never exercises an application-level rejection: its `Rejected`
   report exists only for `build_reject`;
 - its `AppEvent::decode` and `RequestDecoder` accept trailing bytes,
-  where the notary and echo are strict, and the journal codec contract says
-  the buffer is exactly one event;
+  where the notary and echo are strict, and the journal codec contract
+  says the buffer is exactly one event;
 - its decoder ignores permission (S6).
 
 Use `checked_add` with an application rejection, make both decoders
@@ -391,12 +404,12 @@ exact, and gate writes on role.
 
 ## Suggested order
 
-1. **Local fixes (Low):** S5, the S4 hard check, S9's crate doc, the Low parts of S6,
-   F1's defaults, F2, F8, the P1 doc correction, and consolidating S2's
-   derivation into one function.
-2. **Persisted-state decisions (Medium–High):** S2's derivation change
-   and S3's codec version (on the roadmap): cheaper before more
-   journals depend on the current behaviour.
+1. **Local fixes (Low):** S5, the S4 hard check, S9's crate doc, the
+   Low parts of S6, F1's defaults, F2, F8, the P1 doc correction, and
+   S2's derivation, written out with its current values. (Done.)
+2. **Persisted-state decision (High):** S3's codec version (on the
+   roadmap): cheaper before more journals depend on the current
+   behaviour.
 3. **S1**: decide between the refusal frame and the guide's deliberate
    silence; if the frame, coordinate with the halt roadmap items.
 4. **One breaking API revision:** S7 with P2, P3, F4, and F1's removal of
