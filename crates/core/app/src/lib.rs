@@ -487,12 +487,24 @@ pub trait Application: Sized + Default {
     /// stage when an application is not `Clone`. The default
     /// implementation is correct for any app with a working snapshot
     /// codec; override only if a cheaper same-process clone is
-    /// possible.
+    /// possible. Like a snapshot load, it fails if `restore` leaves bytes
+    /// unread: the clone would not hold the state that was saved.
     fn clone_via_snapshot(&self) -> io::Result<Self> {
         let mut buf = Vec::new();
         self.snapshot(&mut buf)?;
-        let mut cursor = std::io::Cursor::new(buf);
-        Self::restore(&mut cursor)
+        let mut payload = &buf[..];
+        let clone = Self::restore(&mut payload)?;
+        if !payload.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "restore left {} of the {} bytes snapshot wrote unread",
+                    payload.len(),
+                    buf.len()
+                ),
+            ));
+        }
+        Ok(clone)
     }
 }
 
@@ -510,5 +522,88 @@ mod tests {
         assert_eq!(key_hash(&[0xAB; 32]), 1464126128627794209);
         let counting: [u8; 32] = std::array::from_fn(|i| i as u8);
         assert_eq!(key_hash(&counting), 10220697499077226569);
+    }
+
+    /// The smallest event that lets the test application below exist.
+    #[derive(Debug, Clone, Copy)]
+    struct Nudge;
+
+    impl AppEvent for Nudge {
+        const MAX_ENCODED_SIZE: usize = 1;
+
+        fn encoded_size(&self) -> usize {
+            1
+        }
+
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[0] = 0;
+            1
+        }
+
+        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(Nudge)
+        }
+
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    /// Snapshots two fields. `restore` reads both only when `READS_ALL`,
+    /// so `Pair<false>` is the mistake the unread-bytes check exists for.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Pair<const READS_ALL: bool> {
+        a: u64,
+        b: u64,
+    }
+
+    impl<const READS_ALL: bool> Application for Pair<READS_ALL> {
+        type Event = Nudge;
+        type Sizing = ();
+        type Report = ();
+        type QueryResponse = NoQuery;
+
+        fn apply(&mut self, _event: Nudge, _ctx: &ApplyCtx, _out: &mut Vec<()>) {}
+
+        fn build_reject(_event: &Nudge, _reason: RejectReason) {}
+
+        fn snapshot<W: Write>(&self, w: &mut W) -> io::Result<()> {
+            w.write_all(&self.a.to_le_bytes())?;
+            w.write_all(&self.b.to_le_bytes())
+        }
+
+        fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
+            let mut word = [0u8; 8];
+            r.read_exact(&mut word)?;
+            let a = u64::from_le_bytes(word);
+            let mut b = 0;
+            if READS_ALL {
+                r.read_exact(&mut word)?;
+                b = u64::from_le_bytes(word);
+            }
+            Ok(Self { a, b })
+        }
+
+        const APP_VERSION: u16 = 1;
+    }
+
+    #[test]
+    fn clone_via_snapshot_round_trips() {
+        let app = Pair::<true> { a: 3, b: 4 };
+        assert_eq!(app.clone_via_snapshot().unwrap(), app);
+    }
+
+    /// A `restore` that stops short would hand the shadow stage a state
+    /// that is not the one saved; the clone refuses instead.
+    #[test]
+    fn clone_via_snapshot_refuses_a_restore_that_leaves_bytes_unread() {
+        let err = Pair::<false> { a: 3, b: 4 }
+            .clone_via_snapshot()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("left 8 of the 16 bytes"),
+            "unexpected error: {err}"
+        );
     }
 }
