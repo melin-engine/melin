@@ -347,7 +347,7 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
 /// [`crate::encoder::entry_size::<E>()`](crate::encoder::entry_size)
 /// always suffices.
 ///
-/// Two things are refused with [`JournalError::CorruptEntry`] rather than
+/// Three things are refused with [`JournalError::CorruptEntry`] rather than
 /// panicking:
 ///
 /// - **An app event wider than its declared
@@ -362,6 +362,10 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
 ///   check an application whose `encoded_size` overran it took the
 ///   journal thread down mid-batch with a slice-range panic naming
 ///   neither the app nor the limit.
+/// - **An app event whose `encode` returns a length other than its
+///   `encoded_size`.** The entry is framed from what `encode` returns, so
+///   a short count would persist a truncated event that decodes wrongly,
+///   or not at all, on recovery.
 pub fn encode<E: AppEvent>(
     sequence: u64,
     timestamp_ns: u64,
@@ -425,7 +429,16 @@ pub fn encode<E: AppEvent>(
             // an out-of-bounds panic at the callsite we can fix, not a
             // silent over-write of the CRC region.
             let written = e.encode(&mut buf[pos..pos + n]);
-            debug_assert_eq!(written, n, "AppEvent::encode disagrees with encoded_size");
+            // Checked in release too: the entry is framed from `written`,
+            // so an `encode` that reports fewer bytes than the event needs
+            // would journal (and acknowledge) a truncated event, found
+            // only when recovery fails to decode it. One compare per event.
+            if written != n {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "AppEvent::encode wrote a different length than encoded_size declared",
+                });
+            }
             pos += written;
             TAG_APP
         }
@@ -764,6 +777,50 @@ mod tests {
                 err,
                 JournalError::CorruptEntry { sequence: 9, reason }
                     if reason.contains("MAX_ENCODED_SIZE")
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Writes its whole payload but reports one byte less: an `encode`
+    /// whose return value and `encoded_size` disagree.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ShortCountEvent;
+
+    impl AppEvent for ShortCountEvent {
+        const MAX_ENCODED_SIZE: usize = 9;
+
+        fn encoded_size(&self) -> usize {
+            9
+        }
+
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[..9].fill(0xEF);
+            8
+        }
+
+        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(ShortCountEvent)
+        }
+
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    /// Framing the entry from the short count would journal a truncated
+    /// event that only recovery would notice; the encoder must refuse it
+    /// in release builds, not only under `debug_assert`.
+    #[test]
+    fn app_event_whose_encode_disagrees_with_encoded_size_is_refused() {
+        let mut buf = [0u8; 256];
+        let err = encode(5, 0, 0, &JournalEvent::App(ShortCountEvent), &mut buf)
+            .expect_err("an encode/encoded_size disagreement must be refused");
+        assert!(
+            matches!(
+                err,
+                JournalError::CorruptEntry { sequence: 5, reason }
+                    if reason.contains("encoded_size")
             ),
             "unexpected error: {err:?}"
         );

@@ -116,13 +116,16 @@ impl AppEvent for CounterEvent {
         }
     }
 
+    // `buf` is exactly one event: a byte too many is refused, not ignored.
     fn decode(buf: &[u8]) -> Result<Self, CodecError> {
         match buf.split_first() {
-            Some((&KIND_INCREMENT, amount)) => {
-                let amount = amount.first_chunk::<8>().ok_or(CodecError::Truncated)?;
-                Ok(CounterEvent::Increment { amount: u64::from_le_bytes(*amount) })
-            }
-            Some((&KIND_GET_VALUE, _)) => Ok(CounterEvent::GetValue),
+            Some((&KIND_INCREMENT, amount)) => match <[u8; 8]>::try_from(amount) {
+                Ok(amount) => Ok(CounterEvent::Increment { amount: u64::from_le_bytes(amount) }),
+                Err(_) if amount.len() < 8 => Err(CodecError::Truncated),
+                Err(_) => Err(CodecError::InvalidField),
+            },
+            Some((&KIND_GET_VALUE, [])) => Ok(CounterEvent::GetValue),
+            Some((&KIND_GET_VALUE, _)) => Err(CodecError::InvalidField),
             Some((&kind, _)) => Err(CodecError::UnknownTag(kind)),
             None => Err(CodecError::Truncated),
         }
@@ -138,9 +141,10 @@ let len = CounterEvent::Increment { amount: 42 }.encode(&mut buf);
 assert!(matches!(CounterEvent::decode(&buf[..len]), Ok(CounterEvent::Increment { amount: 42 })));
 ```
 
-Three things to get right here:
+Four things to get right here:
 
-- **`MAX_ENCODED_SIZE` is a bound, `encoded_size` is exact.** The journal reserves the bound for every entry and sizes its batches from it; each entry then takes only its exact size on disk. A bound too small is refused when an event exceeds it; a bound past what the journal can carry fails the build (on `cargo build` and `cargo test` — not on `cargo check`).
+- **`MAX_ENCODED_SIZE` is a bound, `encoded_size` is exact.** The journal reserves the bound for every entry and sizes its batches from it; each entry then takes only its exact size on disk. A bound too small stops the node at the first event that exceeds it, before that event is journaled; a bound past what the journal can carry fails the build (on `cargo build` and `cargo test` — not on `cargo check`). `encode` must return exactly `encoded_size`: an event whose two figures disagree stops the node the same way, since its entry would otherwise hold a truncated event. Both are bugs to catch in your tests, not conditions a cluster rides out: a client that retries the event against the next primary stops that node too.
+- **Decode exactly.** The journal hands `decode` one event and nothing else, so a byte too few or too many means the entry is not what this build wrote. Refuse it rather than read what you can.
 - **The encoding is permanent.** Every event you journal is decoded again by every future version of your application that replays it. See [Snapshots and upgrades](#snapshots-and-upgrades).
 - **A query is an event too.** `is_query` sends it to `Application::query` instead of `apply`, and keeps it out of the journal.
 
@@ -168,10 +172,15 @@ impl Application for Counter {
 
     fn apply(&mut self, event: CounterEvent, _ctx: &ApplyCtx, out: &mut Vec<CounterReport>) {
         match event {
-            CounterEvent::Increment { amount } => {
-                self.value = self.value.wrapping_add(amount);
-                out.push(CounterReport::Ack { new_value: self.value });
-            }
+            // Whether an increment fits depends on the value, so `apply`
+            // decides, and answers a refusal with a report.
+            CounterEvent::Increment { amount } => match self.value.checked_add(amount) {
+                Some(new_value) => {
+                    self.value = new_value;
+                    out.push(CounterReport::Ack { new_value });
+                }
+                None => out.push(CounterReport::Overflow { value: self.value }),
+            },
             // A query never reaches `apply`.
             CounterEvent::GetValue => {}
         }
@@ -184,8 +193,8 @@ impl Application for Counter {
         }
     }
 
-    // Nothing in the counter depends on time.
-    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<CounterReport>) {}
+    // No `tick`: nothing in the counter depends on time, and the default
+    // does nothing.
 
     fn build_reject(_event: &CounterEvent, _reason: RejectReason) -> CounterReport {
         CounterReport::Rejected
@@ -212,11 +221,11 @@ assert!(matches!(reports[..], [CounterReport::Ack { new_value: 5 }]));
 ```
 
 - **`Default` is the state before the first event**, on every node. A fresh node, a replica catching up from the start and a restart with no snapshot all begin there.
-- **`apply` is the only way state changes.** What it pushes into `out` is the reply the client receives, in order.
-- **`query` reads state and cannot change it.** It takes `&self`: a query is never journaled, so a change it made would happen on one node and nowhere else.
-- **`tick` is time passing.** The runtime calls it as time advances, so an application can expire, time out or schedule things. The counter ignores it.
+- **`apply` is the only way state changes.** What it pushes into `out` is the reply the client receives, in order. When state says no, as an increment that would overflow does, `apply` changes nothing and says so in a report: the event stays in the journal with its refusal, and replay refuses it again.
+- **`query` reads state and cannot change it.** It takes `&self`: a query is never journaled, so a change it made would happen on one node and nowhere else. An application with no queries can leave it out, since the default answers nothing. It can also set `QueryResponse` to `melin_app::NoQuery`, a type with no values, so its encoder's `encode_query` is an empty `match` (the echo example does this).
+- **`tick` is time passing.** The runtime calls it as time advances, so an application can expire, time out or schedule things. It is optional: the counter leaves it out, and the default does nothing.
 - **`build_reject` answers a request the runtime refused on its own.** Today that happens in one case: a node that has lost its last replica refuses writes rather than acknowledge them without the copies the policy demands. The rejection is built from the event alone, because the event never reached `apply`.
-- **`snapshot` and `restore` must round-trip exactly**, and `APP_VERSION` names the layout `snapshot` writes.
+- **`snapshot` and `restore` must round-trip exactly**, and `APP_VERSION` names the layout `snapshot` writes. `restore` must read every byte `snapshot` wrote: a node refuses a snapshot whose `restore` leaves bytes unread.
 
 ### Decoding requests
 
@@ -232,26 +241,35 @@ struct Decoder;
 impl RequestDecoder for Decoder {
     type Event = CounterEvent;
 
-    fn decode(&self, body: &[u8], _permission: Permission) -> Decoded<CounterEvent> {
+    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<CounterEvent> {
         let Some((&kind, fields)) = body.split_first() else {
             return Decoded::DecodeError("empty request");
         };
         match kind {
-            KIND_INCREMENT => match fields.first_chunk::<8>() {
-                Some(amount) => Decoded::Permitted(CounterEvent::Increment {
-                    amount: u64::from_le_bytes(*amount),
+            // An increment changes state: a read-only key may not send one.
+            KIND_INCREMENT if permission == Permission::ReadOnly => {
+                Decoded::PermissionDenied("incrementing requires a writing role")
+            }
+            KIND_INCREMENT => match <[u8; 8]>::try_from(fields) {
+                Ok(amount) => Decoded::Permitted(CounterEvent::Increment {
+                    amount: u64::from_le_bytes(amount),
                 }),
-                None => Decoded::DecodeError("increment too short"),
+                Err(_) => Decoded::DecodeError("increment amount must be exactly 8 bytes"),
             },
-            KIND_GET_VALUE => Decoded::Permitted(CounterEvent::GetValue),
+            KIND_GET_VALUE if fields.is_empty() => Decoded::Permitted(CounterEvent::GetValue),
+            KIND_GET_VALUE => Decoded::DecodeError("get value takes no fields"),
             _ => Decoded::DecodeError("unknown kind"),
         }
     }
 }
 
 assert!(matches!(
-    Decoder.decode(&[KIND_GET_VALUE], Permission::Trader),
+    Decoder.decode(&[KIND_GET_VALUE], Permission::ReadOnly),
     Decoded::Permitted(CounterEvent::GetValue)
+));
+assert!(matches!(
+    Decoder.decode(&[KIND_INCREMENT, 1, 0, 0, 0, 0, 0, 0, 0], Permission::ReadOnly),
+    Decoded::PermissionDenied(_)
 ));
 ```
 
@@ -260,7 +278,9 @@ The decoder runs before the event is sequenced. It is the last point at which a 
 ### Encoding responses
 
 ```rust
-use counter_server::{CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE};
+use counter_server::{
+    CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_OVERFLOW, KIND_RESP_REJECTED, KIND_RESP_VALUE,
+};
 use melin_app::encoder::ResponseEncoder;
 
 struct Encoder;
@@ -280,6 +300,7 @@ impl ResponseEncoder for Encoder {
     fn encode_report(&self, report: &CounterReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match *report {
             CounterReport::Ack { new_value } => value_body(buf, KIND_RESP_ACK, new_value),
+            CounterReport::Overflow { value } => value_body(buf, KIND_RESP_OVERFLOW, value),
             CounterReport::Rejected => {
                 *buf.first_mut().ok_or("buffer too small")? = KIND_RESP_REJECTED;
                 Ok(1)
@@ -353,7 +374,7 @@ Your application runs many times over the same events: on the primary, on each r
 
 **A rejection in `apply` is part of the history.** When `apply` refuses an event, the event is still journaled, with the rejection it produced. That is usually what an audit trail wants: the attempt and the refusal are both on record, and both replay.
 
-**Keep events narrow.** The runtime holds each event inline in its rings, sized for your widest event, so width costs memory in every slot; and the journal sizes its batches from `MAX_ENCODED_SIZE`, so a wide bound means fewer events per disk write. A reference to data — an identifier, a digest — is cheaper to sequence than the data itself. The echo and notary examples show both ends: echo carries full payloads and pays for it, and its tests print what; notary carries a 32-byte digest.
+**Keep events narrow.** The runtime holds each event inline in its rings, sized for your widest event, so width costs memory in every slot; and the journal sizes its batches from `MAX_ENCODED_SIZE`, so a wide bound means fewer events per disk write. A reference to data — an identifier, a digest — is cheaper to sequence than the data itself. The same holds on the way out: an output ring slot holds a report or a query response inline, sized for the wider of the two, so one wide query answer widens the slot every report travels in. The echo and notary examples show both ends: echo carries full payloads and pays for it, and its tests print what; notary carries a 32-byte digest.
 
 **Check the limits at compile time.** A request body has a maximum size (`melin_server_runtime::MAX_REQUEST_BODY`), and so does a response body (`MAX_RESPONSE_BODY`). A request over the limit costs the client its connection, and a response the encoder cannot fit is dropped. Assert your widest message against both, next to its definition, so a change that breaks them does not compile:
 
@@ -379,7 +400,7 @@ trader   AAAA...  desk-1
 readonly BBBB...  monitoring
 ```
 
-The set of roles is fixed by the runtime today — `operator`, `trader`, `custodian`, `readonly`, `replication` — and it is your decoder that decides what each may do. `replication` authenticates replicas and `operator` the admin endpoint; an application usually refuses writes from `readonly` and `replication` keys:
+A key is listed once; a node refuses to load a file that lists the same key twice. The set of roles is fixed by the runtime today — `operator`, `trader`, `custodian`, `readonly`, `replication` — and it is your decoder that decides what each may do. `replication` authenticates replicas and nothing else: the client listener refuses a replication key during the handshake, so your decoder never sees one. `operator` also opens the admin endpoint. An application usually refuses writes from `readonly` keys:
 
 ```rust
 use counter_server::CounterEvent;
@@ -389,8 +410,7 @@ use melin_app::decoder::Decoded;
 
 /// Permit `event` unless it changes state and the key may only read.
 fn permit(permission: Permission, event: CounterEvent) -> Decoded<CounterEvent> {
-    let read_only = matches!(permission, Permission::ReadOnly | Permission::Replication);
-    if read_only && !event.is_query() {
+    if permission == Permission::ReadOnly && !event.is_query() {
         return Decoded::PermissionDenied("this key may not write");
     }
     Decoded::Permitted(event)
@@ -455,7 +475,7 @@ Events the node journals on its own behalf, such as startup events, carry a `key
 
 **Snapshots bound recovery time.** A node periodically writes a snapshot of your application from a background copy that applies the same events, so taking one never pauses the node. On restart it loads the newest snapshot and replays only the journal after it. `snapshot` writes your state and `restore` reads it back; the runtime adds the framing, the position in the journal and a checksum around it. The round trip must be exact: a restored application must make every future decision the original would have.
 
-**`APP_VERSION` names your snapshot layout.** Bump it whenever the bytes `snapshot` writes change. A node refuses to load a snapshot written under a different `APP_VERSION`, before your `restore` sees it.
+**`APP_VERSION` names your snapshot layout.** Bump it whenever the bytes `snapshot` writes change. A node refuses to load a snapshot written under a different `APP_VERSION`, before your `restore` sees it. It also refuses one whose `restore` returns without reading every byte of it, the usual sign that the layout changed and the version did not.
 
 **Changing your event encoding needs care, because the journal does not record it.** Old entries are decoded by whichever version of your application replays them. Adding a new kind of event is safe for replay, since no existing entry carries it — but upgrade every node before one is written, or a node on the old version cannot decode it. Changing an existing event's layout changes what entries already in the journal mean: do it only across a snapshot boundary, so the new version never replays an entry the old one wrote. The procedures are in [Journal & Event Sourcing](journal.md#migration-procedure).
 

@@ -6,8 +6,9 @@
 //! holds only the trait definitions and small transport-shared types — no
 //! matching logic, no wire codec, no I/O.
 //!
-//! Split rationale: the transport is the reusable, commercial core; apps
-//! (trading engines, bespoke matchers, no-op benchmarks) plug in. Keeping
+//! Split rationale: the transport is the reusable, commercial core, and
+//! applications (any deterministic state machine, down to a no-op
+//! benchmark) plug in. Keeping
 //! trait definitions in their own crate means an app can depend on the
 //! abstraction without pulling transport internals.
 
@@ -150,12 +151,21 @@ impl WireSeq {
 /// by `&ApplyCtx` on the hot path.
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyCtx {
-    /// Wall-clock time at which the transport dispatched this event, in
-    /// nanoseconds since the Unix epoch. Identical across primary and
-    /// replica for deterministic replay.
+    /// Wall-clock time the primary stamped on this event when it read it
+    /// from the client, in nanoseconds since the Unix epoch. Journaled
+    /// with the event, so the primary, every replica and every replay see
+    /// the same value.
+    ///
+    /// Not monotonic from one event to the next, and not unique. Events
+    /// read together share one stamp; a rare race between the node's
+    /// producers can sequence an event slightly out of stamp order; and a
+    /// clock step on the primary, or a failover to a node whose clock is
+    /// behind, moves it backwards. Order is the sequence, never this. An
+    /// application that reports or attests to this time should not
+    /// promise its readers that it increases.
     pub now_ns: u64,
-    /// FxHash of the public key that authenticated the connection that
-    /// submitted this event. `0` for events the node journals on its own
+    /// [`key_hash`] of the public key that authenticated the connection
+    /// that submitted this event. `0` for events the node journals on its own
     /// behalf, which carry no client identity. Journaled with the event,
     /// so replay hands `apply` the same value the live dispatch did. Lets
     /// the application keep per-key state (an idempotency sequence, a
@@ -182,11 +192,61 @@ pub struct QueryCtx {
     /// Monotonic count of events the matching stage has processed since
     /// this process started.
     pub events_processed: u64,
-    /// FxHash of the public key that authenticated the connection asking.
+    /// [`key_hash`] of the public key that authenticated the connection
+    /// asking.
     /// Lets a self-introspecting query ("what is my own state?") look up
     /// per-key state without embedding identity in the event — the
     /// transport already knows it from the connection.
     pub key_hash: u64,
+}
+
+/// The client identity the runtime hands the application as
+/// [`ApplyCtx::key_hash`] and [`QueryCtx::key_hash`], derived from the
+/// Ed25519 public key the connection authenticated with.
+///
+/// Every transport derives it here, and an application or a test harness
+/// can call it to learn which value a given key arrives under. The value
+/// is journaled with every event, and an application may keep state
+/// under it, so for a given key it must never change between builds.
+///
+/// Written out here rather than called through a hasher, so that no
+/// dependency update or toolchain upgrade in an application's build can
+/// move it. It computes what earlier releases got from rustc-hash 2.1's
+/// `FxHasher` fed through std's `Hash` for `[u8; 32]` on a 64-bit target:
+/// the length, then the bytes, then the final rotate. Values journaled by
+/// those releases keep their meaning. Not a cryptographic hash, and it
+/// need not be: the key is already authenticated, and the hash only has
+/// to tell keys apart.
+pub fn key_hash(public_key: &[u8; 32]) -> u64 {
+    // FxHash's multiplier, and the seeds and zero guard of its byte hash.
+    const K: u64 = 0xf135_7aea_2e62_a9c5;
+    const SEED1: u64 = 0x243f_6a88_85a3_08d3;
+    const SEED2: u64 = 0x1319_8a2e_0370_7344;
+    const ZERO_GUARD: u64 = 0xa409_3822_299f_31d0;
+
+    // Full 64x64 -> 128-bit product, halves folded together. `u128` is
+    // what the original uses on every 64-bit target, and what makes this
+    // exact rather than an approximation of it.
+    fn multiply_mix(x: u64, y: u64) -> u64 {
+        let full = u128::from(x) * u128::from(y);
+        full as u64 ^ (full >> 64) as u64
+    }
+
+    let [w0, w1, w2, w3]: [u64; 4] =
+        std::array::from_fn(|i| u64::from_le_bytes(std::array::from_fn(|j| public_key[8 * i + j])));
+    let len = public_key.len() as u64;
+
+    // The byte hash of 32 bytes: one 16-byte block mixed, then the last
+    // 16 bytes folded into the two lanes.
+    let s0 = SEED2 ^ w2;
+    let s1 = multiply_mix(SEED1 ^ w0, ZERO_GUARD ^ w1) ^ w3;
+    let bytes = multiply_mix(s0, s1) ^ len;
+
+    // The hasher: the length prefix std writes for a slice, then the
+    // byte hash, each added and multiplied in; then the finishing rotate.
+    let hash = len.wrapping_mul(K);
+    let hash = hash.wrapping_add(bytes).wrapping_mul(K);
+    hash.rotate_left(26)
 }
 
 /// An application event that can be round-tripped through the journal.
@@ -211,8 +271,8 @@ pub trait AppEvent: Copy {
     /// small is a bug the journal cannot paper over — every reservation
     /// downstream is computed from this number — so it is checked at
     /// compile time against the journal's entry ceiling, and at encode
-    /// time against each event's actual `encoded_size`, which is refused
-    /// if it exceeds what was declared.
+    /// time against each event's actual `encoded_size`: an event that
+    /// exceeds what was declared stops the node rather than be journaled.
     ///
     /// The compile-time check fires when the journal is instantiated for
     /// this type, so it surfaces on `cargo build` and `cargo test`, not on
@@ -235,7 +295,8 @@ pub trait AppEvent: Copy {
 
     /// Encode this event into `buf`. Caller guarantees `buf.len() >=
     /// self.encoded_size()`. Returns the number of bytes written, which
-    /// must equal `self.encoded_size()`.
+    /// must equal `self.encoded_size()`: an event whose two figures
+    /// disagree stops the node rather than be journaled truncated.
     fn encode(&self, buf: &mut [u8]) -> usize;
 
     /// Decode an event from `buf`. `buf` contains exactly one encoded
@@ -250,6 +311,18 @@ pub trait AppEvent: Copy {
     /// state. All other events are journaled.
     fn is_query(&self) -> bool;
 }
+
+/// The [`Application::QueryResponse`] of an application that answers no
+/// queries.
+///
+/// It has no values, so [`Application::query`] can only return `None`,
+/// and a response encoder's `encode_query` is `match *query {}`: the
+/// compiler proves the arm unreachable, where a comment could only claim
+/// it. That is why it is an empty enum rather than `()`: `()` has a
+/// value, so code handling it has to invent an answer, or an error, for
+/// a case that cannot occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoQuery {}
 
 /// An application driven by the Melin durable transport.
 ///
@@ -315,9 +388,14 @@ pub trait Application: Sized + Default {
     /// 1:1 query responses returned by [`query`](Self::query). Routed
     /// through `OutputPayload::QueryResponse` on the output ring.
     ///
-    /// Separated from `Report` so that large query payloads (e.g. a
-    /// summary of many entries) don't inflate the per-element size of the
-    /// scratch vec on the hot path.
+    /// [`NoQuery`] for an application that answers none.
+    ///
+    /// Separate from `Report`, so a wide query answer does not widen the
+    /// scratch vec `apply` pushes its reports into. It does not spare the
+    /// output ring: a slot holds a report or a query response inline, so
+    /// every slot is as wide as the wider of the two, and a wide answer
+    /// costs memory in the slot of every write's report too. Keep it as
+    /// narrow as the events.
     type QueryResponse: Copy;
 
     /// Apply a single journaled event to the application state. Must be
@@ -340,7 +418,19 @@ pub trait Application: Sized + Default {
     /// true. `None` is the answer for any other event, so an
     /// implementation needs no unreachable arm; the client then gets an
     /// empty reply batch.
-    fn query(&self, event: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse>;
+    ///
+    /// Default: `None` for every event, right for an application with no
+    /// queries, whose `is_query` is never true. An application that has
+    /// queries and forgot to implement this would answer each with an
+    /// empty batch, so debug builds panic when the default is handed one.
+    fn query(&self, event: Self::Event, _ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        debug_assert!(
+            !event.is_query(),
+            "a query reached the default Application::query: implement query \
+             for an application whose is_query can be true"
+        );
+        None
+    }
 
     /// Advance the application's wall-clock without applying a business
     /// event, to fire whatever time-driven work has come due (expiries,
@@ -363,7 +453,11 @@ pub trait Application: Sized + Default {
     /// time already passed must change nothing — no due work fires
     /// again, no state records the earlier time — and elapsed-time
     /// arithmetic must saturate.
-    fn tick(&mut self, now_ns: u64, out: &mut Vec<Self::Report>);
+    ///
+    /// Default: nothing, right for an application with no time-driven
+    /// work. Under load it runs ahead of nearly every event, so an
+    /// override should make "nothing is due" a cheap check.
+    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
 
     /// Synthesise a rejection report for a transport-originated reject.
     /// No access to `&self` — the reject must be constructible from the
@@ -385,7 +479,9 @@ pub trait Application: Sized + Default {
     /// Reconstruct application state from a snapshot produced by
     /// [`snapshot`](Application::snapshot). `r` yields exactly the bytes
     /// that `snapshot` wrote — the transport has already stripped its
-    /// framing.
+    /// framing. It must read all of them: bytes left unread mean the two
+    /// disagree about the layout, and the transport refuses the snapshot
+    /// rather than run on state that is not the one saved.
     fn restore<R: Read>(r: &mut R) -> io::Result<Self>;
 
     /// Schema version for the application's snapshot payload. Bumped
@@ -425,11 +521,159 @@ pub trait Application: Sized + Default {
     /// stage when an application is not `Clone`. The default
     /// implementation is correct for any app with a working snapshot
     /// codec; override only if a cheaper same-process clone is
-    /// possible.
+    /// possible. Like a snapshot load, it fails if `restore` leaves bytes
+    /// unread: the clone would not hold the state that was saved.
     fn clone_via_snapshot(&self) -> io::Result<Self> {
         let mut buf = Vec::new();
         self.snapshot(&mut buf)?;
-        let mut cursor = std::io::Cursor::new(buf);
-        Self::restore(&mut cursor)
+        let mut payload = &buf[..];
+        let clone = Self::restore(&mut payload)?;
+        if !payload.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "restore left {} of the {} bytes snapshot wrote unread",
+                    payload.len(),
+                    buf.len()
+                ),
+            ));
+        }
+        Ok(clone)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key's `key_hash` is journaled and applications keep state under
+    /// it, so it must come out the same in every build. These are the
+    /// values earlier releases produced through rustc-hash, and the
+    /// written-out derivation was checked against it on random keys. If an
+    /// edit makes this fail, do not update the numbers: every deployed
+    /// journal holds the old ones. Revert the edit.
+    #[test]
+    fn key_hash_is_pinned() {
+        assert_eq!(key_hash(&[0x00; 32]), 3540036477615380542);
+        assert_eq!(key_hash(&[0xAB; 32]), 1464126128627794209);
+        let counting: [u8; 32] = std::array::from_fn(|i| i as u8);
+        assert_eq!(key_hash(&counting), 10220697499077226569);
+    }
+    /// The smallest event that lets the test application below exist: a
+    /// write, or a query it has no answer for.
+    #[derive(Debug, Clone, Copy)]
+    enum Nudge {
+        Write,
+        Ask,
+    }
+
+    impl AppEvent for Nudge {
+        const MAX_ENCODED_SIZE: usize = 1;
+
+        fn encoded_size(&self) -> usize {
+            1
+        }
+
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[0] = *self as u8;
+            1
+        }
+
+        fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+            match buf {
+                [0] => Ok(Nudge::Write),
+                [1] => Ok(Nudge::Ask),
+                _ => Err(CodecError::InvalidField),
+            }
+        }
+
+        fn is_query(&self) -> bool {
+            matches!(self, Nudge::Ask)
+        }
+    }
+
+    /// Snapshots two fields. `restore` reads both only when `READS_ALL`,
+    /// so `Pair<false>` is the mistake the unread-bytes check exists for.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Pair<const READS_ALL: bool> {
+        a: u64,
+        b: u64,
+    }
+
+    impl<const READS_ALL: bool> Application for Pair<READS_ALL> {
+        type Event = Nudge;
+        type Sizing = ();
+        type Report = ();
+        type QueryResponse = NoQuery;
+
+        fn apply(&mut self, _event: Nudge, _ctx: &ApplyCtx, _out: &mut Vec<()>) {}
+
+        fn build_reject(_event: &Nudge, _reason: RejectReason) {}
+
+        fn snapshot<W: Write>(&self, w: &mut W) -> io::Result<()> {
+            w.write_all(&self.a.to_le_bytes())?;
+            w.write_all(&self.b.to_le_bytes())
+        }
+
+        fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
+            let mut word = [0u8; 8];
+            r.read_exact(&mut word)?;
+            let a = u64::from_le_bytes(word);
+            let mut b = 0;
+            if READS_ALL {
+                r.read_exact(&mut word)?;
+                b = u64::from_le_bytes(word);
+            }
+            Ok(Self { a, b })
+        }
+
+        const APP_VERSION: u16 = 1;
+    }
+
+    #[test]
+    fn clone_via_snapshot_round_trips() {
+        let app = Pair::<true> { a: 3, b: 4 };
+        assert_eq!(app.clone_via_snapshot().unwrap(), app);
+    }
+
+    /// A `restore` that stops short would hand the shadow stage a state
+    /// that is not the one saved; the clone refuses instead.
+    #[test]
+    fn clone_via_snapshot_refuses_a_restore_that_leaves_bytes_unread() {
+        let err = Pair::<false> { a: 3, b: 4 }
+            .clone_via_snapshot()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("left 8 of the 16 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn query_ctx() -> QueryCtx {
+        QueryCtx {
+            journal_sequence: WireSeq::new(0),
+            active_connections: 0,
+            events_processed: 0,
+            key_hash: 0,
+        }
+    }
+
+    #[test]
+    fn default_query_answers_nothing() {
+        assert!(
+            Pair::<true>::default()
+                .query(Nudge::Write, &query_ctx())
+                .is_none()
+        );
+    }
+
+    /// `Pair` has a query event but no `query`: in a debug build the
+    /// default says so rather than answer it with an empty batch.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a query reached the default Application::query")]
+    fn default_query_panics_on_a_query_in_debug_builds() {
+        Pair::<true>::default().query(Nudge::Ask, &query_ctx());
     }
 }

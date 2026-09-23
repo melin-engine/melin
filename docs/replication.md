@@ -234,6 +234,9 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
 - Authenticates with the primary via Ed25519 challenge-response
   (`--replication-key`). The corresponding public key must be in the
   primary's `authorized_keys` file with the `replication` permission.
+  That permission is for node-to-node links only: a replication key
+  cannot open a client connection, and the client listener refuses it
+  during the handshake. Give clients their own keys.
 - Receives a stream of input events with pre-assigned sequences and
   timestamps from the primary. The replica's pipeline produces a
   journal that is a **bitwise mirror** of the primary's — same

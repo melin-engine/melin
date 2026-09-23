@@ -81,7 +81,7 @@ use std::io::{self, Read, Write};
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, NoQuery, RejectReason};
 
 // ---------------------------------------------------------------------------
 // Response kinds — the first byte of every response body. A request needs
@@ -255,9 +255,9 @@ pub struct Echo;
 impl Application for Echo {
     type Event = Payload;
     type Report = EchoReport;
-    // No queries, so no query response. `()` is `Copy`, which is all the
-    // transport asks of the type; `query` never returns `Some`.
-    type QueryResponse = ();
+    // No queries, so no query response: `NoQuery` has no values, so
+    // there is nothing `query` could return and nothing to encode.
+    type QueryResponse = NoQuery;
     // No state, so nothing to size.
     type Sizing = ();
 
@@ -265,12 +265,9 @@ impl Application for Echo {
         out.push(EchoReport::Echoed(event));
     }
 
-    // Unreachable: no payload is a query, so the runtime never calls this.
-    fn query(&self, _event: Payload, _ctx: &QueryCtx) -> Option<()> {
-        None
-    }
-
-    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
+    // No `query` and no `tick`: no payload is a query and nothing here is
+    // time-driven, so the defaults (no answer, no work) are the whole
+    // story.
 
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         EchoReport::Rejected
@@ -306,9 +303,10 @@ impl RequestDecoderTrait for RequestDecoder {
     type Event = Payload;
 
     fn decode(&self, body: &[u8], permission: Permission) -> Decoded<Payload> {
-        // An echo appends to the journal, so the read-only and replication
-        // roles are refused, as they would be for any state-mutating event.
-        if matches!(permission, Permission::ReadOnly | Permission::Replication) {
+        // An echo appends to the journal, so the read-only role is refused,
+        // as it would be for any state-mutating event. (A replication key
+        // never gets this far: the client listener refuses it.)
+        if permission == Permission::ReadOnly {
             return Decoded::PermissionDenied("echoing requires a writing role");
         }
         match Payload::new(body) {
@@ -331,7 +329,7 @@ pub struct ResponseEncoder;
 
 impl ResponseEncoderTrait for ResponseEncoder {
     type Report = EchoReport;
-    type Query = ();
+    type Query = NoQuery;
 
     fn encode_report(&self, report: &EchoReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match report {
@@ -351,11 +349,10 @@ impl ResponseEncoderTrait for ResponseEncoder {
         }
     }
 
-    // Unreachable: no event is a query, so the runtime never has a query
-    // response to encode. An error rather than a panic, so that if that
-    // ever changes the failure is a logged encode error, not a crash.
-    fn encode_query(&self, _query: &(), _buf: &mut [u8]) -> Result<usize, &'static str> {
-        Err("this application has no queries")
+    // A `NoQuery` cannot exist, so neither can a call to this: the empty
+    // match is the compiler's proof, not a runtime error to hope for.
+    fn encode_query(&self, query: &NoQuery, _buf: &mut [u8]) -> Result<usize, &'static str> {
+        match *query {}
     }
 }
 
@@ -496,16 +493,11 @@ mod tests {
     }
 
     #[test]
-    fn read_only_roles_may_not_echo() {
-        for permission in [Permission::ReadOnly, Permission::Replication] {
-            assert!(
-                matches!(
-                    RequestDecoder.decode(b"hi", permission),
-                    Decoded::PermissionDenied(_)
-                ),
-                "{permission:?} must not be able to echo"
-            );
-        }
+    fn read_only_role_may_not_echo() {
+        assert!(matches!(
+            RequestDecoder.decode(b"hi", Permission::ReadOnly),
+            Decoded::PermissionDenied(_)
+        ));
     }
 
     #[test]
@@ -548,8 +540,8 @@ mod tests {
             .encode_report(&EchoReport::Rejected, &mut buf)
             .unwrap();
         assert_eq!(buf[..len], [KIND_RESP_REJECTED]);
-
-        assert!(ResponseEncoder.encode_query(&(), &mut buf).is_err());
+        // No query case to test: `encode_query` takes a `NoQuery`, which
+        // cannot be built.
     }
 
     #[test]

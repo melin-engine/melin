@@ -12,6 +12,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`Application::tick` and `Application::query` have defaults.** `tick`
+  does nothing, and `query` answers nothing, so an application with no
+  time-driven work or no queries leaves them out. The default `query`
+  panics in debug builds when handed an event whose `is_query` is true:
+  an application that has queries and forgot to implement it would
+  otherwise answer each with an empty batch.
+- **`melin_app::NoQuery`**, a type with no values, for the
+  `QueryResponse` of an application that answers no queries. Its
+  encoder's `encode_query` becomes `match *query {}`, which the compiler
+  proves unreachable. The echo example uses it.
+- **`melin_app::key_hash`**, the function every transport derives
+  `ApplyCtx::key_hash` and `QueryCtx::key_hash` from, so a test harness
+  or tool can compute which value a given public key arrives under.
+- **`Permission::may_connect_as_client`**, false for the `replication`
+  role only.
+
 ### Removed
 
 - **`--max-orders-per-account`, `--max-orders-per-second` and
@@ -115,6 +133,40 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     health endpoint's `trading` / `halted` flag are unchanged.
   - `--help` describes the binary as a node of the Melin replicated
     sequencer.
+- **A replication key can no longer open a client connection.** The
+  `replication` role authorizes node-to-node streaming only; the client
+  listener, over TCP and DPDK, now refuses it during the handshake, so no
+  request of its reaches an application's decoder. A client that
+  connected with a replication key needs a key of its own, under a
+  client role.
+- **An `authorized_keys` file that lists a key twice no longer loads.**
+  The last line used to win silently; which role was meant is not the
+  loader's to guess. A node given such a file refuses to start and names
+  the line. Remove the duplicate before upgrading.
+- **A snapshot whose `restore` leaves bytes unread is refused.** Unread
+  bytes mean `snapshot` and `restore` disagree about the layout, usually
+  a layout changed without an `APP_VERSION` bump, and the restored state
+  is not the saved one. A node refuses to start from such a snapshot
+  (`SnapshotError::UnreadPayload`), and `Application::clone_via_snapshot`,
+  which builds the shadow stage's copy, fails the same way. An
+  application whose `restore` deliberately skipped trailing bytes must
+  read them. Source-breaking for code that matches `SnapshotError`
+  exhaustively.
+- **An `AppEvent::encode` that returns a length other than
+  `encoded_size` stops the node.** Release builds used to frame the
+  entry from the returned length and journal, acknowledge and replicate
+  a truncated event that recovery could not decode. The journal now
+  refuses it before it is written, and the node stops. It is an
+  application bug: a retry of the same event stops the next primary too.
+- **`key_hash` is computed by Melin's own code rather than through
+  rustc-hash**, so an application's dependency updates or toolchain can
+  no longer change it. Every key keeps the value it had; journals and
+  state kept under it are unaffected.
+- **The counter example refuses an increment that would overflow**, with
+  a new response (`KIND_RESP_OVERFLOW`, `0x33`) carrying the unchanged
+  value, where it used to wrap. It also decodes exactly, refusing
+  trailing bytes in requests and journal entries, and refuses increments
+  from `readonly` keys.
 
 ## [0.17.0] - 2026-09-22
 

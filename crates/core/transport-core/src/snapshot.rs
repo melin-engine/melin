@@ -68,8 +68,15 @@ pub enum SnapshotError {
     BadMagic,
     UnsupportedTransportVersion(u16),
     UnsupportedAppVersion(u16),
-    ChecksumMismatch { expected: u32, actual: u32 },
+    ChecksumMismatch {
+        expected: u32,
+        actual: u32,
+    },
     TooLarge(u64),
+    /// `A::restore` returned without reading this many bytes of the app
+    /// payload: it and the `A::snapshot` that wrote the file disagree
+    /// about the layout, so the state it returned is not the one saved.
+    UnreadPayload(usize),
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -97,6 +104,11 @@ impl std::fmt::Display for SnapshotError {
             Self::TooLarge(size) => write!(
                 f,
                 "snapshot file size {size} exceeds {MAX_SNAPSHOT_SIZE} byte cap"
+            ),
+            Self::UnreadPayload(n) => write!(
+                f,
+                "snapshot app payload has {n} bytes the application did not read \
+                 (layout changed without an APP_VERSION bump?)"
             ),
         }
     }
@@ -367,7 +379,15 @@ pub fn load<A: Application>(path: &Path) -> Result<(A, u64, [u8; 32], u64), Snap
     }
 
     // App payload occupies everything between the header and the CRC.
-    let app = A::restore(&mut &bytes[header.len..data_end])?;
+    let mut payload = &bytes[header.len..data_end];
+    let app = A::restore(&mut payload)?;
+    // `restore` must read exactly what `snapshot` wrote. Bytes left over
+    // mean the two disagree about the layout (typically a `snapshot` that
+    // grew a field without an `APP_VERSION` bump, read back by a `restore`
+    // that stops short of it), and the state is not the saved one.
+    if !payload.is_empty() {
+        return Err(SnapshotError::UnreadPayload(payload.len()));
+    }
 
     Ok((app, header.sequence, header.chain_hash, header.epoch))
 }
@@ -577,6 +597,31 @@ mod tests {
         match load::<TestApp>(&path) {
             Err(SnapshotError::UnsupportedAppVersion(v)) if v == TestApp::APP_VERSION + 1 => {}
             other => panic!("expected UnsupportedAppVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unread_payload_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        // A valid payload with bytes after it: what a `snapshot` that grew
+        // a field looks like to a `restore` that was not taught about it.
+        let mut payload = Vec::new();
+        populated_app().snapshot(&mut payload).unwrap();
+        payload.extend_from_slice(&[0xEE; 3]);
+        let bytes = craft_snapshot(
+            SNAP_MAGIC,
+            TRANSPORT_VERSION,
+            TestApp::APP_VERSION,
+            0,
+            [0u8; 32],
+            0,
+            &payload,
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        match load::<TestApp>(&path) {
+            Err(SnapshotError::UnreadPayload(3)) => {}
+            other => panic!("expected UnreadPayload(3), got {other:?}"),
         }
     }
 

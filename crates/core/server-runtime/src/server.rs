@@ -17,8 +17,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use std::hash::{Hash, Hasher};
-
 use tracing::{debug, error, info, warn};
 
 use melin_journal::BufferedWriter;
@@ -1970,15 +1968,8 @@ where
             }
         };
 
-        // Hash the client's public key into the identity the application
-        // sees as `ApplyCtx::key_hash`. FxHash is fast and
-        // non-cryptographic — sufficient for keying per-key state (the
-        // public key itself is already authenticated).
-        let key_hash = {
-            let mut hasher = rustc_hash::FxHasher::default();
-            public_key_bytes.hash(&mut hasher);
-            hasher.finish()
-        };
+        // The identity the application sees as `ApplyCtx::key_hash`.
+        let key_hash = melin_app::key_hash(&public_key_bytes);
 
         active_connections.fetch_add(1, Ordering::Relaxed);
 
@@ -3404,7 +3395,6 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
 ) -> Result<(Permission, [u8; 32]), Box<dyn std::error::Error>> {
     use std::io;
 
-    use ed25519_dalek::{Verifier, VerifyingKey};
     use melin_wire_protocol::control::TransportResponse;
     use melin_wire_protocol::control_codec;
 
@@ -3447,28 +3437,14 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         }
     };
 
-    let (signature_bytes, public_key_bytes) = (cr.signature, cr.public_key);
-
-    // Look up the public key in authorized_keys.
-    let permission = match authorized_keys.lookup(&public_key_bytes) {
-        Some(perm) => perm,
-        None => {
-            send_auth_failed(writer);
-            return Err("unknown public key".into());
-        }
-    };
-
-    // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
-    // client_eph`. TCP path's ephs are zeros — see Challenge above.
-    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-        send_auth_failed(writer);
-        io::Error::other(format!("invalid public key: {e}"))
-    })?;
-    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    verifying_key.verify(&nonce, &signature).map_err(|e| {
-        send_auth_failed(writer);
-        io::Error::other(format!("signature verification failed: {e}"))
-    })?;
+    let public_key_bytes = cr.public_key;
+    let permission = crate::client_auth::verify_client(
+        authorized_keys,
+        &nonce,
+        &public_key_bytes,
+        &cr.signature,
+    )
+    .inspect_err(|_| send_auth_failed(writer))?;
 
     // Auth succeeded — send ServerReady.
     let written =
@@ -3975,6 +3951,25 @@ mod tests {
         let perm = handle.join().unwrap().unwrap();
         assert_eq!(perm, Permission::ReadOnly);
         assert!(!perm.can_trade());
+    }
+
+    /// A replication key signs correctly and is in the keys file, but it
+    /// authorizes node-to-node streaming only: the client listener refuses
+    /// it at the handshake, before any request could reach the decoder.
+    #[test]
+    fn auth_replication_key_refused_on_client_listener() {
+        let keys = keys_with_test_key("replication");
+        let key = test_key();
+        let (s1, mut s2) = UnixStream::pair().unwrap();
+
+        let handle = run_server_auth(s1, keys);
+
+        client_sign_challenge(&mut s2, &key);
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_AUTH_FAILED);
+
+        let err = handle.join().unwrap().unwrap_err();
+        assert!(err.contains("client listener"), "unexpected error: {err}");
     }
 }
 
