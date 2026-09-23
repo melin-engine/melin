@@ -385,7 +385,9 @@ pub trait Application: Sized + Default {
     /// Reconstruct application state from a snapshot produced by
     /// [`snapshot`](Application::snapshot). `r` yields exactly the bytes
     /// that `snapshot` wrote — the transport has already stripped its
-    /// framing.
+    /// framing. It must read all of them: bytes left unread mean the two
+    /// disagree about the layout, and the transport refuses the snapshot
+    /// rather than run on state that is not the one saved.
     fn restore<R: Read>(r: &mut R) -> io::Result<Self>;
 
     /// Schema version for the application's snapshot payload. Bumped

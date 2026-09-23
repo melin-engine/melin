@@ -10,7 +10,7 @@ outcomes, `melin-client`'s reply correlation). Read-only: nothing was run
 or changed. Three lenses: safety, performance, and the friction an
 application developer meets.
 
-**Status: all findings open.**
+**Status.** Resolved: S5. All other findings open.
 
 The findings that matter most are in safety. Four of them concern state
 that outlives the process (journal bytes, per-key identity, snapshot

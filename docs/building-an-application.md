@@ -216,7 +216,7 @@ assert!(matches!(reports[..], [CounterReport::Ack { new_value: 5 }]));
 - **`query` reads state and cannot change it.** It takes `&self`: a query is never journaled, so a change it made would happen on one node and nowhere else.
 - **`tick` is time passing.** The runtime calls it as time advances, so an application can expire, time out or schedule things. The counter ignores it.
 - **`build_reject` answers a request the runtime refused on its own.** Today that happens in one case: a node that has lost its last replica refuses writes rather than acknowledge them without the copies the policy demands. The rejection is built from the event alone, because the event never reached `apply`.
-- **`snapshot` and `restore` must round-trip exactly**, and `APP_VERSION` names the layout `snapshot` writes.
+- **`snapshot` and `restore` must round-trip exactly**, and `APP_VERSION` names the layout `snapshot` writes. `restore` must read every byte `snapshot` wrote: a node refuses a snapshot whose `restore` leaves bytes unread.
 
 ### Decoding requests
 
@@ -455,7 +455,7 @@ Events the node journals on its own behalf, such as startup events, carry a `key
 
 **Snapshots bound recovery time.** A node periodically writes a snapshot of your application from a background copy that applies the same events, so taking one never pauses the node. On restart it loads the newest snapshot and replays only the journal after it. `snapshot` writes your state and `restore` reads it back; the runtime adds the framing, the position in the journal and a checksum around it. The round trip must be exact: a restored application must make every future decision the original would have.
 
-**`APP_VERSION` names your snapshot layout.** Bump it whenever the bytes `snapshot` writes change. A node refuses to load a snapshot written under a different `APP_VERSION`, before your `restore` sees it.
+**`APP_VERSION` names your snapshot layout.** Bump it whenever the bytes `snapshot` writes change. A node refuses to load a snapshot written under a different `APP_VERSION`, before your `restore` sees it. It also refuses one whose `restore` returns without reading every byte of it, the usual sign that the layout changed and the version did not.
 
 **Changing your event encoding needs care, because the journal does not record it.** Old entries are decoded by whichever version of your application replays them. Adding a new kind of event is safe for replay, since no existing entry carries it — but upgrade every node before one is written, or a node on the old version cannot decode it. Changing an existing event's layout changes what entries already in the journal mean: do it only across a snapshot boundary, so the new version never replays an entry the old one wrote. The procedures are in [Journal & Event Sourcing](journal.md#migration-procedure).
 
