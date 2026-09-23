@@ -6,8 +6,9 @@
 //! holds only the trait definitions and small transport-shared types — no
 //! matching logic, no wire codec, no I/O.
 //!
-//! Split rationale: the transport is the reusable, commercial core; apps
-//! (trading engines, bespoke matchers, no-op benchmarks) plug in. Keeping
+//! Split rationale: the transport is the reusable, commercial core, and
+//! applications (any deterministic state machine, down to a no-op
+//! benchmark) plug in. Keeping
 //! trait definitions in their own crate means an app can depend on the
 //! abstraction without pulling transport internals.
 
@@ -150,9 +151,19 @@ impl WireSeq {
 /// by `&ApplyCtx` on the hot path.
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyCtx {
-    /// Wall-clock time at which the transport dispatched this event, in
-    /// nanoseconds since the Unix epoch. Identical across primary and
-    /// replica for deterministic replay.
+    /// Wall-clock time the primary stamped on this event when it read it
+    /// from the client, in nanoseconds since the Unix epoch. Journaled
+    /// with the event, so the primary, every replica and every replay see
+    /// the same value.
+    ///
+    /// Not monotonic from one event to the next, and not unique. Events
+    /// read together share one stamp; a rare race between the node's
+    /// producers can sequence an event slightly out of stamp order; and a
+    /// clock step on
+    /// the primary, or a failover to a node whose clock is behind, moves
+    /// it backwards. Order is the sequence, never this. An application
+    /// that reports or attests to this time should not promise its
+    /// readers that it increases.
     pub now_ns: u64,
     /// FxHash of the public key that authenticated the connection that
     /// submitted this event. `0` for events the node journals on its own

@@ -195,9 +195,10 @@ pub enum NotaryReport {
         /// that one is node-local and fsync-timing dependent, which is why
         /// only a query can see it (`QueryCtx::journal_sequence`).
         entry: u64,
-        /// When the sequencer dispatched the leaf, in nanoseconds since
+        /// When the sequencer received the leaf, in nanoseconds since
         /// the Unix epoch. Folded into `head`, so it is attested, not
-        /// merely reported.
+        /// merely reported. Not guaranteed to increase from one receipt
+        /// to the next (see `ApplyCtx::now_ns`): order is `entry`.
         timestamp_ns: u64,
         /// Commitment before this leaf was folded in. What makes the
         /// receipt verifiable on its own:
