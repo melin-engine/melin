@@ -52,7 +52,7 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::{
-    TAG_APP, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
+    TAG_APP, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_SERVER_READY,
 };
 use melin_wire_protocol::tcp::BlockingTcpListener;
 use serial_test::serial;
@@ -153,7 +153,7 @@ fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
 
 /// Send `body` as an application frame.
 fn send_request(stream: &mut TcpStream, body: &[u8]) {
-    let mut frame = Vec::with_capacity(1 + body.len());
+    let mut frame = Vec::with_capacity(TAG_LEN + body.len());
     frame.push(TAG_APP);
     frame.extend_from_slice(body);
     write_frame(stream, &frame);

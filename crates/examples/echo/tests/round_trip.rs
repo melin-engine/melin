@@ -300,8 +300,8 @@ fn a_payload_that_looks_like_a_protocol_frame_is_echoed() {
 
 /// A frame that is not an application frame is dropped before the
 /// application sees it, and the connection kept: a request framed the way
-/// the protocol once allowed (an application tag in the protocol's
-/// place), one of the protocol's own tags, and an empty frame. Only the
+/// a pre-release build did (an application tag in the protocol's place),
+/// one of the protocol's own tags, and an empty frame. Only the
 /// application frame after them is answered, and only it is journaled.
 #[test]
 fn a_frame_that_is_not_an_application_frame_is_dropped() {

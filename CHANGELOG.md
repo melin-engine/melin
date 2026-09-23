@@ -29,9 +29,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the gate gone the runtime never read it, yet every request, journal entry
   and replication slot carried its eight bytes for every application. A
   client frame is now `[tag][body]`, the handshake's challenge response
-  included (see Changed for what the tag now is); `melin-client`'s `send`,
-  `request` and `request_one` lose their sequence argument; `Decoded::Permitted` is a tuple variant carrying only
-  the event; `InputSlot` and `JournalEntry` lose `request_seq`, and
+  included (see Changed for what the tag now is); `melin-client`'s
+  `send`, `request` and `request_one` lose their sequence argument;
+  `Decoded::Permitted` is a tuple variant carrying only the event;
+  `InputSlot` and `JournalEntry` lose `request_seq`, and
   `melin-journal`'s `JournalWrite::encode_event`, `batch_append_with_ts`,
   `codec::encode` and `codec::decode` the matching argument or tuple
   field. An application that sequences requests puts the sequence in its
@@ -65,10 +66,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   and `Frame::Response` / `Reply::Response` carry the body with the tag
   stripped.
   - **Client protocol.** Breaking on the wire: an application's first byte
-    moves behind `TAG_APP`. A node drops a request framed the old way — its
-    tag is no application frame's — so a client built against an earlier
-    `melin-client` authenticates but is never answered, and sees its
-    requests time out. Upgrade clients with the nodes.
+    moves behind `TAG_APP`. It ships with the request sequence's removal,
+    whose break an earlier client already meets at the handshake (see
+    Removed), so there is no further upgrade step.
   - **Source.** For application codecs: keep a message discriminator, if
     the application needs one, as the first byte of its own body, and
     parse and write it there. `Encoded` is removed.

@@ -34,7 +34,8 @@
 //! ## Silence
 //!
 //! A node does not answer a request it refuses — a key whose role may
-//! not perform the operation, a malformed frame — it drops the frame and
+//! not perform the operation, a malformed frame, a request laid out for
+//! another version of the node's application — it drops the frame and
 //! keeps the connection. The only signal is the read timeout, which this
 //! crate reports as [`Error::NoReply`] with that explanation attached, so
 //! callers do not each have to know it. A node heartbeats idle
@@ -140,7 +141,7 @@ impl fmt::Display for Error {
                 f,
                 "no reply within {:.1}s: a node silently drops requests it refuses — check \
                  that the key's role in authorized_keys may perform this operation, and that \
-                 the request is well-formed",
+                 the request is well-formed for the application version the node runs",
                 timeout.as_secs_f64()
             ),
             Error::Disconnected => f.write_str("the node closed the connection"),
@@ -1375,8 +1376,8 @@ mod tests {
     #[test]
     fn classify_refuses_what_a_reply_never_carries() {
         // Nothing, a zeroed frame, the handshake's frames, a tag the
-        // protocol does not define, and an application tag as the
-        // protocol once framed one.
+        // protocol does not define, and an application tag as a
+        // pre-release build framed one.
         assert!(matches!(classify(&[]), Err(Error::Protocol(_))));
         for wrong in [
             vec![0x00],

@@ -2180,7 +2180,7 @@ mod tests {
         // An empty frame: no tag at all.
         conn.parse_buf.extend_from_slice(&0u32.to_le_bytes());
         // A zeroed tag, the protocol's own frames, and a request framed
-        // under an application tag as the protocol once allowed — each
+        // under an application tag, as a pre-release build did — each
         // would decode to `Cmd(0x03)` if a decoder saw it.
         for tag in [0x00, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT, 0x10] {
             conn.parse_buf

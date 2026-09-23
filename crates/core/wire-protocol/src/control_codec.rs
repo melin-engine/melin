@@ -23,16 +23,41 @@ pub const TAG_LEN: usize = 1;
 /// response, opaque to the protocol.
 ///
 /// Not `0x00`, so a zeroed buffer on the wire is an unknown tag rather
-/// than an empty application frame. Not in `0x10..`, the range the
-/// protocol once left to application tags in this position, so a client
-/// still framing requests that way has them dropped as unknown tags
-/// rather than misread as application frames.
+/// than an empty application frame. Not in `0x10..`, where application
+/// tags sat while applications shared this byte with the protocol (a
+/// development build between releases, never a released one), so a
+/// client still framing requests that way has them dropped as unknown
+/// tags rather than misread as application frames. And no control
+/// frame's tag, so neither side can read one as the other.
 pub const TAG_APP: u8 = 0x09;
 
-const _: () = assert!(
-    TAG_APP != 0x00 && TAG_APP < 0x10,
-    "TAG_APP must be neither a zeroed byte nor an old application tag"
-);
+/// Every control frame's tag, in either direction. An array, as the one
+/// collection a `const` block can walk.
+const CONTROL_TAGS: [u8; 8] = [
+    TAG_RESPONSE_HEARTBEAT,
+    TAG_BATCH_END,
+    TAG_ENGINE_ERROR,
+    TAG_SERVER_BUSY,
+    TAG_CHALLENGE,
+    TAG_CHALLENGE_RESPONSE,
+    TAG_AUTH_FAILED,
+    TAG_SERVER_READY,
+];
+
+const _: () = {
+    assert!(
+        TAG_APP != 0x00 && TAG_APP < 0x10,
+        "TAG_APP must be neither a zeroed byte nor an old application tag"
+    );
+    let mut i = 0;
+    while i < CONTROL_TAGS.len() {
+        assert!(
+            CONTROL_TAGS[i] != TAG_APP,
+            "TAG_APP must be no control frame's tag"
+        );
+        i += 1;
+    }
+};
 
 pub const TAG_RESPONSE_HEARTBEAT: u8 = 0x01;
 pub const TAG_BATCH_END: u8 = 0x02;
@@ -179,8 +204,9 @@ mod tests {
         }
     }
 
-    /// The application-frame tag is distinct from every control frame's,
-    /// so a client can never read one as the other.
+    /// `CONTROL_TAGS` is checked against `TAG_APP` at compile time; this
+    /// checks the frames as the encoder writes them, so a variant written
+    /// under a tag missing from that list cannot slip past.
     #[test]
     fn the_app_tag_is_no_control_frame() {
         let variants = [
@@ -196,8 +222,8 @@ mod tests {
             let mut buf = [0u8; 64];
             encode_transport_response(variant, &mut buf).unwrap();
             assert_ne!(buf[4], TAG_APP, "variant {variant:?}");
+            assert!(CONTROL_TAGS.contains(&buf[4]), "variant {variant:?}");
         }
-        assert_ne!(TAG_APP, TAG_CHALLENGE_RESPONSE);
     }
 
     #[test]

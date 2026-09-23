@@ -4064,6 +4064,8 @@ mod tests {
             sock.read_exact(&mut payload)?;
             Ok(match payload[..] {
                 [TAG_APP, kind, ..] => Seen::App(kind),
+                // Every counter response carries a kind.
+                [TAG_APP] => panic!("a counter response with an empty body"),
                 [tag, ..] => Seen::Protocol(tag),
                 [] => panic!("an empty frame on the wire"),
             })
