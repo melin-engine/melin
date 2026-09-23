@@ -213,7 +213,7 @@ assert!(matches!(reports[..], [CounterReport::Ack { new_value: 5 }]));
 
 - **`Default` is the state before the first event**, on every node. A fresh node, a replica catching up from the start and a restart with no snapshot all begin there.
 - **`apply` is the only way state changes.** What it pushes into `out` is the reply the client receives, in order.
-- **`query` reads state and cannot change it.** It takes `&self`: a query is never journaled, so a change it made would happen on one node and nowhere else. An application with no queries can leave it out; the default answers nothing.
+- **`query` reads state and cannot change it.** It takes `&self`: a query is never journaled, so a change it made would happen on one node and nowhere else. An application with no queries can leave it out, since the default answers nothing. It can also set `QueryResponse` to `melin_app::NoQuery`, a type with no values, so its encoder's `encode_query` is an empty `match` (the echo example does this).
 - **`tick` is time passing.** The runtime calls it as time advances, so an application can expire, time out or schedule things. It is optional: the counter leaves it out, and the default does nothing.
 - **`build_reject` answers a request the runtime refused on its own.** Today that happens in one case: a node that has lost its last replica refuses writes rather than acknowledge them without the copies the policy demands. The rejection is built from the event alone, because the event never reached `apply`.
 - **`snapshot` and `restore` must round-trip exactly**, and `APP_VERSION` names the layout `snapshot` writes. `restore` must read every byte `snapshot` wrote: a node refuses a snapshot whose `restore` leaves bytes unread.

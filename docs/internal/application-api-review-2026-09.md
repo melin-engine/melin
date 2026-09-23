@@ -12,7 +12,7 @@ application developer meets.
 
 **Status.**
 
-- Resolved: S4, S5, S9.
+- Resolved: S4, S5, S9, F2.
 - Partly resolved: S6 (replication keys refused on the client listener,
   duplicate keys refused, doc example fixed; application-defined roles
   remain open); F1 (defaults for `tick` and `query`; removing

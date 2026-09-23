@@ -81,7 +81,7 @@ use std::io::{self, Read, Write};
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, NoQuery, RejectReason};
 
 // ---------------------------------------------------------------------------
 // Response kinds — the first byte of every response body. A request needs
@@ -255,9 +255,9 @@ pub struct Echo;
 impl Application for Echo {
     type Event = Payload;
     type Report = EchoReport;
-    // No queries, so no query response. `()` is `Copy`, which is all the
-    // transport asks of the type; `query` never returns `Some`.
-    type QueryResponse = ();
+    // No queries, so no query response: `NoQuery` has no values, so
+    // there is nothing `query` could return and nothing to encode.
+    type QueryResponse = NoQuery;
     // No state, so nothing to size.
     type Sizing = ();
 
@@ -329,7 +329,7 @@ pub struct ResponseEncoder;
 
 impl ResponseEncoderTrait for ResponseEncoder {
     type Report = EchoReport;
-    type Query = ();
+    type Query = NoQuery;
 
     fn encode_report(&self, report: &EchoReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match report {
@@ -349,11 +349,10 @@ impl ResponseEncoderTrait for ResponseEncoder {
         }
     }
 
-    // Unreachable: no event is a query, so the runtime never has a query
-    // response to encode. An error rather than a panic, so that if that
-    // ever changes the failure is a logged encode error, not a crash.
-    fn encode_query(&self, _query: &(), _buf: &mut [u8]) -> Result<usize, &'static str> {
-        Err("this application has no queries")
+    // A `NoQuery` cannot exist, so neither can a call to this: the empty
+    // match is the compiler's proof, not a runtime error to hope for.
+    fn encode_query(&self, query: &NoQuery, _buf: &mut [u8]) -> Result<usize, &'static str> {
+        match *query {}
     }
 }
 
@@ -541,8 +540,8 @@ mod tests {
             .encode_report(&EchoReport::Rejected, &mut buf)
             .unwrap();
         assert_eq!(buf[..len], [KIND_RESP_REJECTED]);
-
-        assert!(ResponseEncoder.encode_query(&(), &mut buf).is_err());
+        // No query case to test: `encode_query` takes a `NoQuery`, which
+        // cannot be built.
     }
 
     #[test]

@@ -263,6 +263,18 @@ pub trait AppEvent: Copy {
     fn is_query(&self) -> bool;
 }
 
+/// The [`Application::QueryResponse`] of an application that answers no
+/// queries.
+///
+/// It has no values, so [`Application::query`] can only return `None`,
+/// and a response encoder's `encode_query` is `match *query {}`: the
+/// compiler proves the arm unreachable, where a comment could only claim
+/// it. That is why it is an empty enum rather than `()`: `()` has a
+/// value, so code handling it has to invent an answer, or an error, for
+/// a case that cannot occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoQuery {}
+
 /// An application driven by the Melin durable transport.
 ///
 /// The transport feeds events into [`apply`](Application::apply) in a
@@ -326,6 +338,8 @@ pub trait Application: Sized + Default {
 
     /// 1:1 query responses returned by [`query`](Self::query). Routed
     /// through `OutputPayload::QueryResponse` on the output ring.
+    ///
+    /// [`NoQuery`] for an application that answers none.
     ///
     /// Separated from `Report` so that large query payloads (e.g. a
     /// summary of many entries) don't inflate the per-element size of the
