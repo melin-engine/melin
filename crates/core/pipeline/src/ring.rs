@@ -202,7 +202,7 @@ impl<T: Copy + Default> Producer<T> {
     /// a `T` by value.
     ///
     /// Hot paths publishing large `InputSlot`-sized entries should prefer
-    /// this API: at 10M orders/sec a ~100-byte per-publish memcpy shows up
+    /// this API: at 10M events/sec a ~100-byte per-publish memcpy shows up
     /// as ~30% of the ingest core in `perf annotate` (SSE `movdqu`/`movdqa`
     /// pairs). Writing fields directly into the slot removes the copy.
     ///

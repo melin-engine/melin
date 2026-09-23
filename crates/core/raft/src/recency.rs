@@ -1,8 +1,8 @@
 //! Journal-tip recency filter for vote requests.
 //!
-//! Melin replicates order data out-of-band (the replication data plane),
+//! Melin replicates event data out-of-band (the replication data plane),
 //! so Raft's own log-recency vote check says nothing about which node
-//! holds the most order data. Left unmodified, Raft could elect a node
+//! holds the most event data. Left unmodified, Raft could elect a node
 //! whose journal is behind, and auto-promotion would then lose acked
 //! events. The fix — the same shape as MongoDB's election over its
 //! out-of-band oplog, PacificA, and Viewstamped Replication — extends

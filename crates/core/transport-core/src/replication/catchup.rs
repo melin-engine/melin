@@ -140,8 +140,8 @@ pub fn can_catch_up_from_journal(
     // it needs the oldest header to start at 1, i.e. the COMPLETE
     // history. After archive pruning or a snapshot-only restart the
     // oldest surviving header starts past 1 — streaming from there
-    // would build a self-consistent journal on top of an empty
-    // exchange, silently missing every pre-trim event (the replica's
+    // would build a self-consistent journal on top of empty
+    // application state, silently missing every pre-trim event (the replica's
     // own next restart would refuse it with MissingHistoryPrefix).
     // Snapshot transfer is the correct route.
     let info = melin_journal::segment::read_header_info(oldest)
@@ -377,7 +377,7 @@ pub fn preflight_snapshot_transfer(journal_path: &std::path::Path) -> io::Result
     if !snap_path.exists() {
         return Err(io::Error::other(
             "snapshot transfer required but no snapshot available \
-             — set --snapshot-interval-ms to a non-zero value so the shadow exchange writes snapshots",
+             — set --snapshot-interval-ms to a non-zero value so the shadow stage writes snapshots",
         ));
     }
 
@@ -433,7 +433,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     if !snap_path.exists() {
         return Err(io::Error::other(
             "snapshot transfer required but no snapshot available \
-             — set --snapshot-interval-ms to a non-zero value so the shadow exchange writes snapshots",
+             — set --snapshot-interval-ms to a non-zero value so the shadow stage writes snapshots",
         ));
     }
 
@@ -1197,7 +1197,7 @@ mod tests {
     /// on-disk history doesn't reach back to sequence 1. (Regression:
     /// `last_sequence == 0` returned true unconditionally, so a fresh
     /// replica facing a pruned lineage caught up from the surviving
-    /// suffix — a self-consistent journal over an empty exchange,
+    /// suffix — a self-consistent journal over empty application state,
     /// silently missing every pre-trim event.)
     #[test]
     fn fresh_replica_needs_snapshot_when_history_trimmed() {

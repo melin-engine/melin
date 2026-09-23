@@ -3,7 +3,7 @@
 //! Mirror of [`crate::decoder::RequestDecoder`] on the outbound path:
 //! the runtime's response stage consumes
 //! `OutputPayload<A::Report, A::QueryResponse>` from the matching
-//! engine and needs to turn the application-shaped halves
+//! stage and needs to turn the application-shaped halves
 //! (`Report`, `QueryResponse`) into wire bytes. The encoding is
 //! application-shaped (a trading server emits execution reports, a
 //! payments server emits settlement acks), so it lives behind this

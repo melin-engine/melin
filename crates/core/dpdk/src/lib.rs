@@ -1,4 +1,4 @@
-//! DPDK kernel-bypass transport for the trading engine.
+//! DPDK kernel-bypass transport for the sequencer.
 //!
 //! Bypasses the Linux kernel network stack entirely by talking directly
 //! to the NIC via DPDK's userspace Poll Mode Driver (PMD). TCP/IP

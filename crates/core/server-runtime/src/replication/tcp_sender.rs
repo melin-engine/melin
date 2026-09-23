@@ -144,7 +144,7 @@ pub fn run_sender<A: Application>(
     // to the active flags.
     let cursors = Arc::new(ReplicaCursors::new(replica_slots, Arc::clone(&metrics)));
 
-    // Per-slot "this connection authenticated" latch. The trading-halt gate
+    // Per-slot "this connection authenticated" latch. The halt gate
     // (`replicas_connected`) is lifted by the handler thread only after auth
     // succeeds, so the main loop must lower it on teardown only when the
     // handler got that far — a connection that drops mid-auth never counted.
@@ -196,8 +196,8 @@ pub fn run_sender<A: Application>(
 
         // Disengage a finished slot's shared state. Both the clean-exit and
         // panic arms below call this, so they cannot drift: a panicked handler
-        // must tear down exactly like a clean exit, or it leaks the trading-halt
-        // gate and — far worse — leaves the slot's progress cursors engaged,
+        // must tear down exactly like a clean exit, or it leaks the halt gate
+        // and — far worse — leaves the slot's progress cursors engaged,
         // so the primary stops acking client requests even with a healthy
         // surviving replica. Borrows only atomics (interior
         // mutability), so it coexists with the `&mut` iteration over `slots`.
@@ -205,7 +205,7 @@ pub fn run_sender<A: Application>(
             // Lower the gate only if this connection authenticated (and so
             // lifted it); `swap` reads and resets the latch in one op, and the
             // `join()` ordered the handler's post-auth writes before here.
-            // `lower` warns "trading halted" if this was the last replica.
+            // `lower` warns "halted" if this was the last replica.
             if authenticated_flags[slot_idx].swap(false, Ordering::AcqRel) {
                 ReplicaGate::new(replicas_connected).lower();
             }
@@ -287,7 +287,7 @@ pub fn run_sender<A: Application>(
                         debug!(error = %e, "failed to set SO_BUSY_POLL on replica connection");
                     }
 
-                    // The trading-halt gate is NOT lifted here — a bare connect
+                    // The halt gate is NOT lifted here — a bare connect
                     // hasn't proven a Replication key. The handler lifts it after
                     // auth succeeds (see `handle_replica_connection`).
 
@@ -416,7 +416,7 @@ struct SlotContext<'a> {
     batch_size: usize,
     heartbeat_secs: u64,
     wait: WaitStrategy,
-    /// Trading-halt gate. The handler lifts it (`fetch_add`) only after auth
+    /// Halt gate. The handler lifts it (`fetch_add`) only after auth
     /// succeeds; the main loop lowers it on teardown, gated by `authenticated`.
     replicas_connected: &'a AtomicU32,
     /// Per-slot latch the handler sets true once this connection passes auth,
@@ -477,7 +477,7 @@ fn handle_replica_connection<A: Application>(
     authenticate_replica(&mut reader, authorized_keys)?;
     info!("replica authenticated");
 
-    // Auth passed — only now lift the trading-halt gate. The main loop lowers
+    // Auth passed — only now lift the halt gate. The main loop lowers
     // it on slot teardown, reading `authenticated` to know this connection
     // lifted it. Set the latch after the increment so a post-join read of the
     // latch implies the increment is visible too.

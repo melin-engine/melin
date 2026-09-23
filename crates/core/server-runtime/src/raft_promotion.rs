@@ -117,7 +117,7 @@ fn observe_peer(
 
 /// The ack policy the auto-promotion refusal judges: the policy
 /// the *primary* last advertised on the replication stream — that is
-/// the gate acked orders actually passed through — falling back to
+/// the gate acked events actually passed through — falling back to
 /// this node's own configured policy while no primary has ever been
 /// observed (`ACK_POLICY_UNKNOWN`), which is exactly the
 /// pre-propagation behavior. `None` for an unrecognised byte (e.g. a
@@ -194,7 +194,7 @@ struct AutoPromotionInputs {
 ///   restarted data-bearing replica (journal non-empty) is unaffected
 ///   and may still win a real failover.
 /// - `disk` ack policy — acks under `disk` never waited for this
-///   replica, so no election can prove it holds every acked order.
+///   replica, so no election can prove it holds every acked event.
 ///   Failover stays a manual, eyes-on decision.
 /// - `peers` — the authoritative journal-safety check the vote filter
 ///   defers to (see `melin_raft::recency`). The election is only
@@ -259,14 +259,14 @@ fn auto_promotion_decision(inputs: &AutoPromotionInputs) -> Result<(), &'static 
         Some(AckPolicy::Disk) => {
             return Err(
                 "the primary acks under the `disk` policy — an election win cannot prove \
-                 this node holds every acked order; promote manually if the lag is acceptable",
+                 this node holds every acked event; promote manually if the lag is acceptable",
             );
         }
         None => return Err("ack policy is unrecognised"),
         // Every policy that requires a second node before the ack
         // (`in_memory>=2` or `persisted>=2`) qualifies: the election's
         // recency filter can then prove the winner holds every acked
-        // order. `ram` qualifies on the same grounds as `disk+ram`
+        // event. `ram` qualifies on the same grounds as `disk+ram`
         // — its acks waited for a second node's in-memory receipt.
         Some(AckPolicy::DiskAndRam | AckPolicy::TwoDisks | AckPolicy::Ram) => {}
     }

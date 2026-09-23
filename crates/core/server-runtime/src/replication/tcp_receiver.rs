@@ -2,7 +2,7 @@
 //!
 //! Connects to the primary, authenticates, performs catch-up / snapshot
 //! recovery, and runs the streaming receive loop via [`streaming_loop`].
-//! Builds the replica's local pipeline (journal + matching engine + drain
+//! Builds the replica's local pipeline (journal + matching stage + drain
 //! stages) to apply incoming events and ack durable batches back to the
 //! primary.
 
@@ -582,7 +582,7 @@ where
     // Recover whenever any journal segment survives — live OR archived;
     // fresh replicas get `(None, None, 0, zeros)`. See
     // `recover_replica_state` for the lineage rules.
-    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
+    let (mut app, mut journal_writer, mut last_sequence, mut chain_hash) =
         recover_replica_state::<A, BufferedWriter<A::Event>>(
             journal_path,
             &snapshot_path,
@@ -642,7 +642,7 @@ where
         }
         if promote.is_requested() {
             info!("promotion triggered while disconnected");
-            return take_pipeline_for_promotion(&mut pipeline, &mut exchange, &mut journal_writer);
+            return take_pipeline_for_promotion(&mut pipeline, &mut app, &mut journal_writer);
         }
 
         // --- Connect and authenticate ---
@@ -789,7 +789,7 @@ where
                         reader: &mut reader,
                     },
                     &mut pipeline,
-                    &mut exchange,
+                    &mut app,
                     &mut journal_writer,
                     journal_path,
                     &snapshot_path,
@@ -827,16 +827,16 @@ where
             let (lineage_start, lineage_anchor) = stream_lineage;
             let writer =
                 BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
-            exchange = Some(A::default());
+            app = Some(A::default());
             journal_writer = Some(writer);
         }
 
         // --- Build pipeline if absent ---
         if pipeline.is_none() {
-            let cur_exchange = exchange.take().expect("exchange initialized");
+            let cur_app = app.take().expect("application initialized");
             let cur_writer = journal_writer.take().expect("journal_writer initialized");
             pipeline = Some(build_replica_pipeline_with_threads::<A>(
-                cur_exchange,
+                cur_app,
                 cur_writer,
                 cores,
                 staging_mode,
@@ -916,12 +916,12 @@ where
         ) {
             AfterSession::Return(r) => return r,
             AfterSession::Resync {
-                exchange: ex,
+                app: ex,
                 journal_writer: wr,
                 last_sequence: seq,
                 chain_hash: hash,
             } => {
-                exchange = ex;
+                app = ex;
                 journal_writer = wr;
                 last_sequence = seq;
                 chain_hash = hash;
@@ -1452,7 +1452,7 @@ mod tests {
         /// A resync whose snapshot transfer drops mid-flight must retry
         /// as a fresh replica with NO leftover in-memory state. On the
         /// in-process divergence repair path `recover_replica_state`
-        /// leaves `exchange`/`journal_writer` populated; the resync arm
+        /// leaves `app`/`journal_writer` populated; the resync arm
         /// archives the live journal (renaming it aside) before the
         /// transfer. If the transfer then fails and those handles are not
         /// nulled, the stale writer — its backing file now under the
@@ -1539,7 +1539,7 @@ mod tests {
             // --- Session 1: fresh sync, event 1, poisoned rotation —
             // the journal stage detects divergence and the receiver
             // repairs in-process (`recover_replica_state` repopulates
-            // `exchange`/`journal_writer`).
+            // `app`/`journal_writer`).
             let mut buf = Vec::new();
             let mut s1 = accept_within(&listener, 30);
             let mut s1r = s1.try_clone().expect("clone");
@@ -1783,19 +1783,19 @@ mod tests {
         fn promotion_hands_back_local_state_when_present() {
             let dir = tempfile::tempdir().unwrap();
             let mut pipeline: Option<PromoteHandles> = None;
-            let mut exchange = Some(App);
+            let mut app = Some(App);
             let mut journal_writer =
                 Some(BufferedWriter::<EvtAdd>::create(&dir.path().join("p.journal")).unwrap());
 
             let result = crate::replication::take_pipeline_for_promotion(
                 &mut pipeline,
-                &mut exchange,
+                &mut app,
                 &mut journal_writer,
             );
 
             assert!(matches!(result, Ok(Some(_))), "warm state must be promoted");
             assert!(
-                exchange.is_none() && journal_writer.is_none(),
+                app.is_none() && journal_writer.is_none(),
                 "state must be moved into the result"
             );
         }
@@ -1803,12 +1803,12 @@ mod tests {
         #[test]
         fn promotion_errs_when_no_local_state() {
             let mut pipeline: Option<PromoteHandles> = None;
-            let mut exchange: Option<App> = None;
+            let mut app: Option<App> = None;
             let mut journal_writer: Option<BufferedWriter<EvtAdd>> = None;
 
             let result = crate::replication::take_pipeline_for_promotion(
                 &mut pipeline,
-                &mut exchange,
+                &mut app,
                 &mut journal_writer,
             );
 
@@ -1825,14 +1825,14 @@ mod tests {
 
         #[test]
         fn promotion_errs_on_partial_state() {
-            // Exchange present, writer missing — not a usable hand-off.
+            // Application present, writer missing — not a usable hand-off.
             let mut pipeline: Option<PromoteHandles> = None;
-            let mut exchange = Some(App);
+            let mut app = Some(App);
             let mut journal_writer: Option<BufferedWriter<EvtAdd>> = None;
 
             let result = crate::replication::take_pipeline_for_promotion(
                 &mut pipeline,
-                &mut exchange,
+                &mut app,
                 &mut journal_writer,
             );
 

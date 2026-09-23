@@ -18,10 +18,10 @@ pub fn hex_prefix(hash: &[u8; 32]) -> String {
 ///
 /// Every variant describes a transport-level failure: I/O, framing,
 /// CRC/chain integrity, or version/format mismatch. App-level rejections
-/// (insufficient balance, risk limits, unknown account) are the app's
-/// concern and propagate through the app's own error type alongside
-/// this one — kept trading-agnostic so the journal crate stays usable
-/// by any application.
+/// (a request the application's own rules refuse) are the app's concern
+/// and propagate through the app's own error type alongside this one —
+/// kept application-agnostic so the journal crate stays usable by any
+/// application.
 #[derive(Debug)]
 pub enum JournalError {
     /// Underlying I/O error.

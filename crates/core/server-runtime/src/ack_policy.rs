@@ -61,15 +61,15 @@ pub enum AckPolicy {
     /// `persisted>=1 && in_memory>=2`. One fsynced copy plus a second
     /// copy in another node's memory. Single-failure-safe with a brief
     /// RAM-only window (~80 µs on PLP-backed NVMe) for the second copy.
-    /// The default — typical live trading deployments. Saves ~50–80 µs
-    /// per fill vs [`TwoDisks`](Self::TwoDisks). Fails closed when no
-    /// replica is connected.
+    /// The default — typical live deployments. Saves ~50–80 µs per
+    /// acknowledged write vs [`TwoDisks`](Self::TwoDisks). Fails closed
+    /// when no replica is connected.
     #[value(name = "disk+ram")]
     DiskAndRam,
 
     /// `persisted>=2`. Two fsynced copies before the client ack. Zero
     /// RAM-only window; the gate stalls if no replica is currently
-    /// connected. Compliance-driven venues.
+    /// connected. Compliance-driven deployments.
     TwoDisks,
 }
 

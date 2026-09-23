@@ -22,7 +22,7 @@ pub enum TransportResponse {
     Heartbeat,
     /// Marks the end of a response batch for a single request.
     BatchEnd,
-    /// The matching engine encountered an internal error processing
+    /// The matching stage encountered an internal error processing
     /// the request. The client should not retry.
     EngineError,
     /// The server's accept queue is full; the client should back off

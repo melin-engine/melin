@@ -63,8 +63,8 @@ melin-dpdk = { workspace = true, optional = true }
 # The runtime's library API is application-agnostic. Tests that need a
 # concrete `Application`/`AppEvent` to instantiate the generic pipeline
 # (replication wire format, DPDK frame fixtures) use the in-tree counter
-# example rather than any exchange crate — this keeps the core dependency
-# graph free of exchange coupling. Auth-handshake tests build their wire
+# example rather than a production application's crate — this keeps the
+# core dependency graph free of application coupling. Auth-handshake tests build their wire
 # frames directly from `melin-wire-protocol::control_codec` (already a
 # normal dependency), the same path the runtime itself uses.
 #

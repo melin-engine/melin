@@ -174,7 +174,7 @@ impl StageRecorder {
     /// Saturates instead of returning an error when `ns` exceeds the
     /// histogram's max bound — diagnostic samples are best-effort, and
     /// dropping a single very-out-of-range sample is preferable to
-    /// crashing the trading thread.
+    /// crashing a hot-path thread.
     #[inline]
     pub fn record_ns(&mut self, ns: u64) {
         self.rec.saturating_record(ns);

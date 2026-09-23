@@ -93,8 +93,8 @@ impl AuthorizedKeys {
     /// File format (one entry per line):
     /// ```text
     /// # <permission> <base64-encoded-public-key> <optional-comment>
-    /// admin AAAA...base64... ops-team
-    /// trader BBBB...base64... market-maker-1
+    /// operator AAAA...base64... ops-team
+    /// trader BBBB...base64... desk-1
     /// readonly DDDD...base64... monitoring
     /// ```
     ///

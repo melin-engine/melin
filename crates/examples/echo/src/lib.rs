@@ -32,9 +32,9 @@
 //! wants separately. Every request is a state-mutating event as far as
 //! the runtime is concerned: sequenced, journaled, replicated, and
 //! acknowledged only once the copies the ack policy demands exist. This is
-//! what an order costs before any matching happens, and the floor is the
-//! runtime as shipped — each cost it adds has a switch (see `main.rs`),
-//! not a corner cut in the application.
+//! what a request costs before the application does any work, and the
+//! floor is the runtime as shipped — each cost it adds has a switch (see
+//! `main.rs`), not a corner cut in the application.
 //!
 //! ## Sizing
 //!

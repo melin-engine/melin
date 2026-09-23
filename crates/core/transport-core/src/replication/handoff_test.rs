@@ -22,7 +22,7 @@
 //! sender can't see. See [`bridge_catchup_to_live`] for the full
 //! reasoning.
 //!
-//! Regression: the 2026-06-07 LAN bench (tcp-dual-repl, ~2.9M orders/s)
+//! Regression: the 2026-06-07 LAN bench (tcp-dual-repl, ~2.9M events/s)
 //! evicted a slow replica during warmup; on reconnect, catch-up ended
 //! at seq 6932800 and live streaming resumed at 6933013 — entries
 //! 6932801..=6933012 were never sent, and the replica's journal failed

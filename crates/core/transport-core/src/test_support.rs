@@ -73,8 +73,8 @@ pub struct TestReport {
 pub struct TestQuery {
     pub total: u64,
     /// Echo of `QueryCtx::journal_sequence` (durable wire seq) at query
-    /// time. Mirrors the exchange app's `QueryStats`, so pipeline tests
-    /// can assert what the stats-style query surface reports.
+    /// time. Mirrors what an application's stats query would report, so
+    /// pipeline tests can assert what that query surface sees.
     pub journal_sequence: u64,
 }
 

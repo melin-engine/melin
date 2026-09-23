@@ -123,7 +123,7 @@ fn answer_challenge(stream: &mut TcpStream, key: &SigningKey) -> Option<()> {
     (ready.first() == Some(&TAG_SERVER_READY)).then_some(())
 }
 
-/// Connect and authenticate a trading client, retrying until the node
+/// Connect and authenticate a client, retrying until the node
 /// serves. The kernel backlog accepts the TCP SYN before the accept
 /// loop runs, so a successful `connect` alone proves nothing.
 fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> TcpStream {
@@ -274,7 +274,7 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             admin_addr: free_addr(PORT_BASE),
         })
         .collect();
-    // One key for both trading and admin: the operator permission
+    // One key for both client writes and admin: the operator permission
     // covers each.
     let client_key = SigningKey::from_bytes(&[0x11; 32]);
 

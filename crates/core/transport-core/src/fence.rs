@@ -3,7 +3,7 @@
 //!
 //! An **epoch** is a monotonic `u64` bumped on every promotion (see
 //! [`melin_journal::JournalEvent::EpochBump`]). It establishes which
-//! primary tenure a journaled order belongs to. A node advances its epoch
+//! primary tenure a journaled event belongs to. A node advances its epoch
 //! by replaying `EpochBump` entries — on recovery, on the replication
 //! stream, and at its own promotion — so the epoch is recovered state, not
 //! a separately-maintained counter.

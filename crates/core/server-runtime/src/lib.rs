@@ -8,9 +8,9 @@
 //! [`StartupEvents`], `RequestDecoder`, `ResponseEncoder`, and event-
 //! publisher fn.
 //!
-//! The trading-side wiring (`ServerApp`, `ExchangeRequestDecoder`,
-//! `ExchangeResponseEncoder`, market-data firehose) lives in the
-//! separate `melin-server` crate.
+//! The application-side wiring (the `Application` itself, its decoder
+//! and encoder, any event publisher) lives in the application's own
+//! crate — see the examples under `crates/examples/`.
 
 pub mod ack_policy;
 pub mod admin;

@@ -294,7 +294,7 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     // node tears its own server down and the flag we never write to
     // ourselves ends up set — the fingerprint of fence-on-supersession,
     // the only thing that stops a serving node from the inside (a driver
-    // fatal leaves trading up). Requires `--raft-auto-promote` (already
+    // fatal leaves the node serving). Requires `--raft-auto-promote` (already
     // set), which is what arms the `SupersessionPolicy`.
     let revived_shutdown = Arc::new(AtomicBool::new(false));
     let revived_handle = {

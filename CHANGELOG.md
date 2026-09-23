@@ -14,6 +14,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Removed
 
+- **`--max-orders-per-account`, `--max-orders-per-second` and
+  `--max-orders-burst`, from `ServerConfig`.** Limits of one application,
+  the exchange, that the runtime never read: every other application's
+  node accepted them and did nothing with them. An application that needs
+  such limits declares its own flags and journals their values as
+  `StartupEvents`. A node given one of these flags now refuses to start,
+  as for any unknown flag.
+- **`melin_app::EncodeReport`.** Nothing implemented or required it; a
+  response is encoded by the application's `ResponseEncoder`.
+
 - **The per-key duplicate-request gate: `Application::check_request_seq` and
   `RejectReason::DuplicateRequest`.** Whether a repeated request is refused
   was already the application's policy; the runtime's part was to ask

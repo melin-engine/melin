@@ -154,7 +154,7 @@ mod tests {
         let mut writer = BlockingFrameWriter::new(client);
         let mut reader = BlockingFrameReader::new(server);
 
-        let data = b"hello trading";
+        let data = b"hello melin";
         writer.write_frame(data).unwrap();
         writer.flush().unwrap();
 

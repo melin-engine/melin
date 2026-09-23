@@ -78,7 +78,7 @@ enum AuthState {
         /// When the connection was accepted. Used for timeout.
         accepted_at: Instant,
     },
-    /// Auth completed successfully. Connection is ready for trading.
+    /// Auth completed successfully. Connection is ready for requests.
     Authenticated { permission: Permission },
 }
 
@@ -104,8 +104,8 @@ struct ConnectionState {
 /// This replaces the io_uring reader. It accepts connections, drives
 /// auth handshakes, parses frames, publishes events to the disruptor,
 /// and drains the TX channel from the response stage into smoltcp sockets.
-/// When `tick_cadence` is `Some`, this thread also generates the engine's
-/// scheduler ticks via a wall-clock comparison between NIC bursts.
+/// When `tick_cadence` is `Some`, this thread also generates the application's
+/// clock ticks via a wall-clock comparison between NIC bursts.
 ///
 /// Called from a dedicated OS thread pinned to its own core.
 ///
@@ -140,7 +140,7 @@ pub fn run_dpdk_poll<A: Application>(
     active_connections: Arc<std::sync::atomic::AtomicU64>,
     thread_id: u8,
     // Optional replication driver. When `Some`, this thread owns BOTH
-    // client traffic on the trading port and replication traffic on the
+    // client traffic on the client port and replication traffic on the
     // configured replication listen port. Connections accepted on the
     // replication port are handed to the driver; per-iteration the
     // driver's `tick()` advances each replica slot's state machine
@@ -236,7 +236,7 @@ pub fn run_dpdk_poll<A: Application>(
     // this iteration. Idle iterations would otherwise drown the percentiles
     // in ~100ns samples; what we want is "how long does a poll cycle take
     // when there's actual work to do" — which is the cycle an in-flight
-    // order experiences. Registered with the global stats registry; the
+    // request experiences. Registered with the global stats registry; the
     // /stats-dump endpoint snapshots it alongside the other stages.
     #[cfg(feature = "latency-trace")]
     let mut poll_iter_rec = melin_transport_core::trace::register_stage(
@@ -328,7 +328,7 @@ pub fn run_dpdk_poll<A: Application>(
 
         // 3. Accept new connections — dispatch by listen port so the
         //    replication driver gets its own connections, client logic
-        //    only sees trading-port connections.
+        //    only sees client-port connections.
         for accepted in transport.take_accepted() {
             if let Some(ref mut driver) = repl_driver
                 && accepted.listen_port == repl_listen_port
@@ -403,8 +403,8 @@ pub fn run_dpdk_poll<A: Application>(
 
         // One wall-clock read per outer poll iteration, reused for
         // every request stamped in this pass. Sub-microsecond precision
-        // loss at DPDK poll rates; order timestamps are for reporting,
-        // not matching (the engine orders by sequence). Deferred until
+        // loss at DPDK poll rates; request timestamps are for reporting,
+        // not ordering (the pipeline orders by sequence). Deferred until
         // we actually stamp a frame — `clock_gettime` dominates the
         // profile on idle polls with no traffic.
         let mut batch_wall_ns: Option<u64> = None;
@@ -831,8 +831,8 @@ mod tests {
 
     // The framing tests below operate on raw length-prefixed bytes, so any
     // `AppEvent` serves as a realistic payload. The in-tree counter example
-    // stands in for an exchange event, keeping these tests free of any
-    // exchange crate.
+    // stands in for a production application's event, keeping these tests
+    // free of any application crate but the example.
     use counter_server::CounterEvent;
     use melin_app::AppEvent;
 

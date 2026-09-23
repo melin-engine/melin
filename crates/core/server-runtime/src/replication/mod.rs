@@ -82,12 +82,12 @@ mod validation_worker;
 
 use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
 
-/// Writer-side view of the trading-halt gate (the `replicas_connected`
+/// Writer-side view of the halt gate (the `replicas_connected`
 /// counter). The readers refuse client writes while the count is zero, so
 /// the counter must reflect the number of replicas that have **authenticated**
 /// — a bare connection must not lift the halt. Both senders (kernel-TCP and
 /// DPDK) lift/lower the gate through this view so the policy, the memory
-/// orderings, and the "trading halted" warning live in one place and cannot
+/// orderings, and the "halted" warning live in one place and cannot
 /// drift apart.
 ///
 /// Deliberately a *borrowed view*, not an owner: `melin_transport_core` owns
@@ -110,7 +110,7 @@ impl<'a> ReplicaGate<'a> {
     }
 
     /// A replica left — lower the halt by one. Returns `true` if it was the
-    /// last one (trading is now unprotected), emitting the halt warning here so
+    /// last one (the node now halts), emitting the halt warning here so
     /// both senders share the wording. `fetch_sub` returns the *prior* count,
     /// so `== 1` means this call took it to zero; deriving "last one" from the
     /// returned value rather than a follow-up load avoids a TOCTOU race with a
@@ -118,7 +118,7 @@ impl<'a> ReplicaGate<'a> {
     pub(crate) fn lower(&self) -> bool {
         let was_last = self.count.fetch_sub(1, Ordering::Release) == 1;
         if was_last {
-            tracing::warn!("all replicas disconnected — trading halted");
+            tracing::warn!("all replicas disconnected — halted, refusing client writes");
         }
         was_last
     }
@@ -175,7 +175,7 @@ pub struct ReplicaControlPlane {
     /// contact), refreshed by `StreamStart` and every `Heartbeat`. The
     /// raft driver's auto-promotion refusal reads this — the policy the
     /// *primary* acked under decides whether an election win proves
-    /// this replica holds every acked order, not this node's own
+    /// this replica holds every acked write, not this node's own
     /// (possibly pre-staged) configuration. Falls back to this node's
     /// own policy while unknown, which is exactly the pre-propagation
     /// behavior.
@@ -321,7 +321,7 @@ pub(super) enum TeardownOutcome<A, W> {
     Panicked,
 }
 
-/// Shut down the replica pipeline and extract Exchange + journal writer
+/// Shut down the replica pipeline and extract the application + journal writer
 /// from the stage threads.
 ///
 /// Relies on the caller having published a `JournalEvent::Shutdown`
@@ -373,7 +373,7 @@ pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
         Err(_) => return TeardownOutcome::Panicked,
     };
     match matching_result {
-        Ok(exchange) => TeardownOutcome::Clean(exchange, writer),
+        Ok(app) => TeardownOutcome::Clean(app, writer),
         Err(_) => TeardownOutcome::Panicked,
     }
 }
@@ -433,7 +433,7 @@ pub(super) type ReplicaHandles<A> =
 /// `Disconnected` reconnects.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_replica_pipeline_with_threads<A>(
-    mut exchange: A,
+    mut app: A,
     writer: BufferedWriter<A::Event>,
     cores: crate::layout::PipelineCores,
     // How the replica's segment preparer materialises staged extents.
@@ -465,15 +465,15 @@ where
     // first events nor the copy's first snapshot grow the collections on
     // the matching thread. A replica's apply sits on the primary's ack
     // path under `disk+ram`, so its page faults are the primary's tail.
-    <A as Application>::prefault(&mut exchange, sizing);
-    let shadow_exchange = <A as Application>::clone_via_snapshot(&exchange)?;
+    <A as Application>::prefault(&mut app, sizing);
+    let shadow_app = <A as Application>::clone_via_snapshot(&app)?;
 
     let enable_shadow = snapshot_interval_ms > 0;
     // Shadow snapshot seeds its epoch from the fence state's current value
     // (set from the replica's recovered journal before this builder runs).
     let shadow_initial_epoch = fence_state.epoch();
     let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
-        exchange,
+        app,
         writer,
         4096, // max_journal_batch
         group_commit_delay,
@@ -580,7 +580,7 @@ where
                     melin_app::affinity::pin_thread("replica-shadow", shadow.core);
                     melin_transport_core::shadow::run(
                         shadow_cons,
-                        shadow_exchange,
+                        shadow_app,
                         snap_path,
                         std::time::Duration::from_millis(snapshot_interval_ms),
                         chain_lock,
@@ -715,8 +715,8 @@ where
     // Seed the observed epoch from the replica's own recovered journal.
     // Streaming `EpochBump`s and the snapshot-resync path raise it later.
     fence_state.observe_epoch(engine.recovered_epoch());
-    let (exchange, writer) = engine.into_parts();
-    Ok((Some(exchange), Some(writer), last, hash))
+    let (app, writer) = engine.into_parts();
+    Ok((Some(app), Some(writer), last, hash))
 }
 
 /// Reconnect backoff cap shared by both receivers — exponential from
@@ -739,7 +739,7 @@ pub(in crate::replication) enum AfterSession<A, W> {
     /// and reconnects; the primary's `HashMismatch` verdict then routes
     /// the replica through archive + re-seed.
     Resync {
-        exchange: Option<A>,
+        app: Option<A>,
         journal_writer: Option<W>,
         last_sequence: u64,
         chain_hash: [u8; 32],
@@ -855,8 +855,8 @@ where
             // Transport-specific teardown before reconnecting.
             close();
             match recover_replica_state::<A, W>(journal_path, snapshot_path, fence_state, sizing) {
-                Ok((exchange, journal_writer, seq, hash)) => AfterSession::Resync {
-                    exchange,
+                Ok((app, journal_writer, seq, hash)) => AfterSession::Resync {
+                    app,
                     journal_writer,
                     last_sequence: seq,
                     chain_hash: hash,
@@ -914,7 +914,7 @@ where
 
 /// Tear the live pipeline down for a promotion that fired while the
 /// receiver was disconnected — at the top of the reconnect loop or
-/// during reconnect backoff — and return the warm Exchange + writer for
+/// during reconnect backoff — and return the warm application + writer for
 /// the promoted primary. Shared by both receivers.
 ///
 /// A clean teardown hands back the warm state; if there is no pipeline
@@ -923,7 +923,7 @@ where
 /// pair is a hard error — a promote with nothing to promote.
 pub(in crate::replication) fn take_pipeline_for_promotion<A, W>(
     pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
-    exchange: &mut Option<A>,
+    app: &mut Option<A>,
     journal_writer: &mut Option<W>,
 ) -> ReceiverResult<A, W>
 where
@@ -933,10 +933,10 @@ where
     if let Some(p) = pipeline.take()
         && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
     {
-        *exchange = Some(e);
+        *app = Some(e);
         *journal_writer = Some(w);
     }
-    match (exchange.take(), journal_writer.take()) {
+    match (app.take(), journal_writer.take()) {
         (Some(e), Some(w)) => Ok(Some((e, w))),
         _ => Err("promotion requested but no local state available".into()),
     }
@@ -951,7 +951,7 @@ type ResyncTransfer<A> = (A, u64, [u8; 32], u64);
 pub(in crate::replication) enum ResyncDecision {
     /// Resync complete — resume streaming from `resume_sequence` on the
     /// re-seeded lineage `(segment_start_sequence, anchor_hash)`. The
-    /// recovered App + writer are left in the receiver's `exchange` /
+    /// recovered App + writer are left in the receiver's `app` /
     /// `journal_writer` locals.
     Ready {
         segment_start_sequence: u64,
@@ -999,7 +999,7 @@ where
     std::fs::rename(&tmp_path, snapshot_path)?;
     tracing::info!(snap_sequence, snap_len, "snapshot received and verified");
 
-    let (snap_exchange, _snap_seq, snap_hash, snap_epoch) =
+    let (snap_app, _snap_seq, snap_hash, snap_epoch) =
         melin_transport_core::snapshot::load::<A>(snapshot_path)?;
     if snap_hash != snap_chain_hash {
         return Err(format!(
@@ -1037,7 +1037,7 @@ where
     }
     std::fs::rename(&seed_tmp, journal_path)?;
     melin_journal::segment::fsync_parent_dir(journal_path)?;
-    Ok((snap_exchange, snap_sequence, snap_chain_hash, seed_len))
+    Ok((snap_app, snap_sequence, snap_chain_hash, seed_len))
 }
 
 /// Handle a `NeedSnapshot` / `HashMismatch` resync verdict — shared by
@@ -1047,7 +1047,7 @@ where
 /// segment and ties its chain to the snapshot, then validates the
 /// post-snapshot `StreamStart` inline before resuming.
 ///
-/// On success the recovered App + writer are left in `exchange` /
+/// On success the recovered App + writer are left in `app` /
 /// `journal_writer` and [`ResyncDecision::Ready`] carries the resume
 /// lineage. A network-shaped transfer failure yields
 /// [`ResyncDecision::Retry`] (the caller backs off and reconnects). An
@@ -1057,7 +1057,7 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
     divergent: bool,
     source: &mut S,
     pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
-    exchange: &mut Option<A>,
+    app: &mut Option<A>,
     journal_writer: &mut Option<W>,
     journal_path: &std::path::Path,
     snapshot_path: &std::path::Path,
@@ -1094,7 +1094,7 @@ where
     // without this reset the stale writer — now pointing at an
     // archived-away journal — would survive the fresh-replica create gate
     // and get rebuilt into the next pipeline.
-    *exchange = None;
+    *app = None;
     *journal_writer = None;
 
     // Move the local lineage aside — never delete. Divergent journals are
@@ -1117,7 +1117,7 @@ where
         .journal_tip
         .reset(melin_transport_core::WireSeq::new(0));
 
-    let (snap_exchange, snap_sequence, snap_chain_hash, seed_len) =
+    let (snap_app, snap_sequence, snap_chain_hash, seed_len) =
         match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path, fence_state) {
             Ok(v) => v,
             Err(e) => {
@@ -1129,7 +1129,7 @@ where
                 return Ok(ResyncDecision::Retry);
             }
         };
-    *exchange = Some(snap_exchange);
+    *app = Some(snap_app);
 
     // Open the seeded segment for appending at the snapshot position —
     // recovery's resume path: the chain rebuilds from the seeded bytes and
@@ -1208,8 +1208,8 @@ mod tests {
     // Any `AppEvent` works as the pipeline's event type here — these
     // protocol-level tests never construct a real app event (the slot's
     // event is always `JournalEvent::Tick`), so the counter example's
-    // event type stands in for an exchange event and keeps the runtime's
-    // test deps free of exchange crates.
+    // event type stands in for a production application's event and keeps
+    // the runtime's test deps free of any application crate but the example.
     use counter_server::CounterEvent;
     type InputSlot = melin_transport_core::pipeline::InputSlot<CounterEvent>;
     use melin_transport_core::replication::protocol::{

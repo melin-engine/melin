@@ -6,7 +6,7 @@
 //!
 //! The wire framing and message encoders/decoders live in
 //! `melin_transport_core::replication::protocol`; this module is the
-//! exchange-side glue that pairs the generic auth flow with the
+//! runtime-side glue that pairs the generic auth flow with the
 //! operator-managed `AuthorizedKeys` permission table.
 
 use std::io::{self, Read, Write};

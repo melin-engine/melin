@@ -49,8 +49,8 @@ pub trait RequestDecoder: Send + Sync {
 /// branches on this and never needs to know the underlying wire enum.
 pub enum Decoded<E: AppEvent> {
     /// Drop the request silently. For application messages that are not
-    /// events — a subscription request arriving on the order-entry
-    /// connection, say. The protocol's own frames never reach the
+    /// events — a subscription request arriving on a connection that
+    /// only submits events, say. The protocol's own frames never reach the
     /// decoder.
     Filter,
     /// Request OK and authorized. The runtime publishes the event. Whether

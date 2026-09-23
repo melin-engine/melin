@@ -125,7 +125,7 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     // ---- default convenience wrappers ----
     //
     // Built on the three primitives (`allocate_sequence`, `encode_event`,
-    // `flush_batch_sync`). Used by engine lifecycle, tests, and benches —
+    // `flush_batch_sync`). Used by server lifecycle, tests, and benches —
     // never on the pipeline's hot path, which goes through the primitives
     // directly to avoid the extra trait dispatches on each event.
 
