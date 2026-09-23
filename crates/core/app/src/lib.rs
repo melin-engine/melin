@@ -393,8 +393,15 @@ pub trait Application: Sized + Default {
     /// empty reply batch.
     ///
     /// Default: `None` for every event, right for an application with no
-    /// queries, whose `is_query` is never true.
-    fn query(&self, _event: Self::Event, _ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+    /// queries, whose `is_query` is never true. An application that has
+    /// queries and forgot to implement this would answer each with an
+    /// empty batch, so debug builds panic when the default is handed one.
+    fn query(&self, event: Self::Event, _ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        debug_assert!(
+            !event.is_query(),
+            "a query reached the default Application::query: implement query \
+             for an application whose is_query can be true"
+        );
         None
     }
 
@@ -524,9 +531,13 @@ mod tests {
         assert_eq!(key_hash(&counting), 10220697499077226569);
     }
 
-    /// The smallest event that lets the test application below exist.
+    /// The smallest event that lets the test application below exist: a
+    /// write, or a query it has no answer for.
     #[derive(Debug, Clone, Copy)]
-    struct Nudge;
+    enum Nudge {
+        Write,
+        Ask,
+    }
 
     impl AppEvent for Nudge {
         const MAX_ENCODED_SIZE: usize = 1;
@@ -536,16 +547,20 @@ mod tests {
         }
 
         fn encode(&self, buf: &mut [u8]) -> usize {
-            buf[0] = 0;
+            buf[0] = *self as u8;
             1
         }
 
-        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
-            Ok(Nudge)
+        fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+            match buf {
+                [0] => Ok(Nudge::Write),
+                [1] => Ok(Nudge::Ask),
+                _ => Err(CodecError::InvalidField),
+            }
         }
 
         fn is_query(&self) -> bool {
-            false
+            matches!(self, Nudge::Ask)
         }
     }
 
@@ -605,5 +620,32 @@ mod tests {
             err.to_string().contains("left 8 of the 16 bytes"),
             "unexpected error: {err}"
         );
+    }
+
+    fn query_ctx() -> QueryCtx {
+        QueryCtx {
+            journal_sequence: WireSeq::new(0),
+            active_connections: 0,
+            events_processed: 0,
+            key_hash: 0,
+        }
+    }
+
+    #[test]
+    fn default_query_answers_nothing() {
+        assert!(
+            Pair::<true>::default()
+                .query(Nudge::Write, &query_ctx())
+                .is_none()
+        );
+    }
+
+    /// `Pair` has a query event but no `query`: in a debug build the
+    /// default says so rather than answer it with an empty batch.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a query reached the default Application::query")]
+    fn default_query_panics_on_a_query_in_debug_builds() {
+        Pair::<true>::default().query(Nudge::Ask, &query_ctx());
     }
 }
