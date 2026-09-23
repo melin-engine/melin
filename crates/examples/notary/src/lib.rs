@@ -371,10 +371,9 @@ impl RequestDecoderTrait for RequestDecoder {
         };
         match kind {
             KIND_NOTARIZE => {
-                // Unlike the counter example, this one gates on
-                // permission: notarizing appends to the log, so the
-                // read-only role is refused. (A replication key never gets
-                // this far: the client listener refuses it.)
+                // Notarizing appends to the log, so the read-only role is
+                // refused. (A replication key never gets this far: the
+                // client listener refuses it.)
                 if permission == Permission::ReadOnly {
                     return Decoded::PermissionDenied("notarizing requires a writing role");
                 }
