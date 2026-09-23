@@ -19,6 +19,7 @@ path = "src/lib.rs"
 [dependencies]
 base64 = { workspace = true }
 libc = { workspace = true }
+rustc-hash = "2"
 tracing = { workspace = true }
 
 [dev-dependencies]

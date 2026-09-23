@@ -13,7 +13,9 @@ application developer meets.
 **Status.**
 
 - Resolved: S4, S5, S9, F2, F8.
-- Partly resolved: S6 (replication keys refused on the client listener,
+- Partly resolved: S2 (one `melin_app::key_hash` for both transports,
+  with a test pinning its output so a bump that moves it fails; the
+  derivation stable by specification remains open); S6 (replication keys refused on the client listener,
   duplicate keys refused, doc example fixed; application-defined roles
   remain open); F1 (defaults for `tick` and `query`; removing
   `build_reject` remains open, with S1).

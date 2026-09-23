@@ -798,16 +798,9 @@ fn process_auth_frame(
         "DPDK: authenticated"
     );
 
-    // Compute the key hash the application sees as `ApplyCtx::key_hash`.
-    use std::hash::{Hash, Hasher};
-    let key_hash = {
-        let mut hasher = rustc_hash::FxHasher::default();
-        public_key_bytes.hash(&mut hasher);
-        hasher.finish()
-    };
-
-    // Transition to authenticated state.
-    conn.key_hash = key_hash;
+    // Transition to authenticated state, under the identity the
+    // application sees as `ApplyCtx::key_hash`.
+    conn.key_hash = melin_app::key_hash(&public_key_bytes);
     conn.auth = AuthState::Authenticated { permission };
 
     // Register with the response stage and ID map — before this thread

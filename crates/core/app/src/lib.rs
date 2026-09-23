@@ -38,6 +38,7 @@ pub mod decoder;
 /// envelope variants (`BatchEnd`, `EngineError`) stay in runtime.
 pub mod encoder;
 
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -165,8 +166,8 @@ pub struct ApplyCtx {
     /// that reports or attests to this time should not promise its
     /// readers that it increases.
     pub now_ns: u64,
-    /// FxHash of the public key that authenticated the connection that
-    /// submitted this event. `0` for events the node journals on its own
+    /// [`key_hash`] of the public key that authenticated the connection
+    /// that submitted this event. `0` for events the node journals on its own
     /// behalf, which carry no client identity. Journaled with the event,
     /// so replay hands `apply` the same value the live dispatch did. Lets
     /// the application keep per-key state (an idempotency sequence, a
@@ -193,11 +194,32 @@ pub struct QueryCtx {
     /// Monotonic count of events the matching stage has processed since
     /// this process started.
     pub events_processed: u64,
-    /// FxHash of the public key that authenticated the connection asking.
+    /// [`key_hash`] of the public key that authenticated the connection
+    /// asking.
     /// Lets a self-introspecting query ("what is my own state?") look up
     /// per-key state without embedding identity in the event — the
     /// transport already knows it from the connection.
     pub key_hash: u64,
+}
+
+/// The client identity the runtime hands the application as
+/// [`ApplyCtx::key_hash`] and [`QueryCtx::key_hash`], derived from the
+/// Ed25519 public key the connection authenticated with.
+///
+/// Every transport derives it here, and an application or a test harness
+/// can call it to learn which value a given key arrives under. The value
+/// is journaled with every event, and an application may keep state
+/// under it, so for a given key it must never change between builds.
+pub fn key_hash(public_key: &[u8; 32]) -> u64 {
+    // FxHash: fast and non-cryptographic, which is enough because the key
+    // is already authenticated and the hash only has to tell keys apart.
+    // Neither rustc-hash nor std's `Hash` for arrays promises the same
+    // output across versions; `key_hash_is_pinned` fails if a bump moves
+    // it. A derivation stable by specification is S2 in
+    // docs/internal/application-api-review-2026-09.md.
+    let mut hasher = rustc_hash::FxHasher::default();
+    public_key.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// An application event that can be round-tripped through the journal.
@@ -468,5 +490,22 @@ pub trait Application: Sized + Default {
         self.snapshot(&mut buf)?;
         let mut cursor = std::io::Cursor::new(buf);
         Self::restore(&mut cursor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key's `key_hash` is journaled and applications keep state under
+    /// it, so it must come out the same in every build. If a dependency or
+    /// toolchain bump makes this fail, do not update the numbers: every
+    /// deployed journal holds the old ones. Keep the old derivation.
+    #[test]
+    fn key_hash_is_pinned() {
+        assert_eq!(key_hash(&[0x00; 32]), 3540036477615380542);
+        assert_eq!(key_hash(&[0xAB; 32]), 1464126128627794209);
+        let counting: [u8; 32] = std::array::from_fn(|i| i as u8);
+        assert_eq!(key_hash(&counting), 10220697499077226569);
     }
 }

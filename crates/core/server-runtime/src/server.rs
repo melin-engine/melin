@@ -17,8 +17,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use std::hash::{Hash, Hasher};
-
 use tracing::{debug, error, info, warn};
 
 use melin_journal::BufferedWriter;
@@ -1970,15 +1968,8 @@ where
             }
         };
 
-        // Hash the client's public key into the identity the application
-        // sees as `ApplyCtx::key_hash`. FxHash is fast and
-        // non-cryptographic — sufficient for keying per-key state (the
-        // public key itself is already authenticated).
-        let key_hash = {
-            let mut hasher = rustc_hash::FxHasher::default();
-            public_key_bytes.hash(&mut hasher);
-            hasher.finish()
-        };
+        // The identity the application sees as `ApplyCtx::key_hash`.
+        let key_hash = melin_app::key_hash(&public_key_bytes);
 
         active_connections.fetch_add(1, Ordering::Relaxed);
 
