@@ -341,7 +341,12 @@ pub trait Application: Sized + Default {
     /// true. `None` is the answer for any other event, so an
     /// implementation needs no unreachable arm; the client then gets an
     /// empty reply batch.
-    fn query(&self, event: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse>;
+    ///
+    /// Default: `None` for every event, right for an application with no
+    /// queries, whose `is_query` is never true.
+    fn query(&self, _event: Self::Event, _ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        None
+    }
 
     /// Advance the application's wall-clock without applying a business
     /// event, to fire whatever time-driven work has come due (expiries,
@@ -364,7 +369,11 @@ pub trait Application: Sized + Default {
     /// time already passed must change nothing — no due work fires
     /// again, no state records the earlier time — and elapsed-time
     /// arithmetic must saturate.
-    fn tick(&mut self, now_ns: u64, out: &mut Vec<Self::Report>);
+    ///
+    /// Default: nothing, right for an application with no time-driven
+    /// work. Under load it runs ahead of nearly every event, so an
+    /// override should make "nothing is due" a cheap check.
+    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
 
     /// Synthesise a rejection report for a transport-originated reject.
     /// No access to `&self` — the reject must be constructible from the

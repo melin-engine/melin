@@ -81,7 +81,7 @@ use std::io::{self, Read, Write};
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
+use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
 
 // ---------------------------------------------------------------------------
 // Response kinds — the first byte of every response body. A request needs
@@ -265,12 +265,9 @@ impl Application for Echo {
         out.push(EchoReport::Echoed(event));
     }
 
-    // Unreachable: no payload is a query, so the runtime never calls this.
-    fn query(&self, _event: Payload, _ctx: &QueryCtx) -> Option<()> {
-        None
-    }
-
-    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
+    // No `query` and no `tick`: no payload is a query and nothing here is
+    // time-driven, so the defaults (no answer, no work) are the whole
+    // story.
 
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         EchoReport::Rejected

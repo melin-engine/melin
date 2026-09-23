@@ -176,7 +176,8 @@ impl Application for Counter {
         }
     }
 
-    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
+    // No `tick`: the counter has no time-driven work, and the default
+    // does nothing.
 
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         CounterReport::Rejected

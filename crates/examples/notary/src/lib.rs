@@ -325,7 +325,8 @@ impl Application for Notary {
         }
     }
 
-    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
+    // No `tick`: the notary has no time-driven work, and the default does
+    // nothing. Time reaches it through `ApplyCtx::now_ns` alone.
 
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         NotaryReport::Rejected
