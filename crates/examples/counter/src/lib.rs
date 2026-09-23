@@ -41,6 +41,7 @@ pub const KIND_GET_VALUE: u8 = 0x11;
 pub const KIND_RESP_ACK: u8 = 0x30;
 pub const KIND_RESP_VALUE: u8 = 0x31;
 pub const KIND_RESP_REJECTED: u8 = 0x32;
+pub const KIND_RESP_OVERFLOW: u8 = 0x33;
 
 /// The body of an `Increment` request, as a client sends it — the
 /// inverse of [`RequestDecoder`] for this kind.
@@ -94,25 +95,33 @@ impl AppEvent for CounterEvent {
         }
     }
 
+    // Exact, not "at least": the journal hands over one event and nothing
+    // else, so a byte left over means the entry is not what this build
+    // wrote, and decoding it anyway would replay something else.
     fn decode(buf: &[u8]) -> Result<Self, CodecError> {
-        if buf.is_empty() {
-            return Err(CodecError::Truncated);
-        }
-        match buf[0] {
-            KIND_INCREMENT => {
-                if buf.len() < 9 {
-                    return Err(CodecError::Truncated);
-                }
-                let amount = u64::from_le_bytes(buf[1..9].try_into().expect("8 bytes"));
-                Ok(CounterEvent::Increment { amount })
-            }
-            KIND_GET_VALUE => Ok(CounterEvent::GetValue),
+        let (&kind, fields) = buf.split_first().ok_or(CodecError::Truncated)?;
+        match kind {
+            KIND_INCREMENT => Ok(CounterEvent::Increment {
+                amount: u64::from_le_bytes(amount_from(fields)?),
+            }),
+            KIND_GET_VALUE if fields.is_empty() => Ok(CounterEvent::GetValue),
+            KIND_GET_VALUE => Err(CodecError::InvalidField),
             kind => Err(CodecError::UnknownTag(kind)),
         }
     }
 
     fn is_query(&self) -> bool {
         matches!(self, CounterEvent::GetValue)
+    }
+}
+
+/// Read an increment's amount from exactly its eight bytes: fewer is a
+/// truncated message, more is one this build does not understand.
+fn amount_from(fields: &[u8]) -> Result<[u8; 8], CodecError> {
+    match fields.len() {
+        8 => Ok(fields.try_into().expect("checked to be 8 bytes")),
+        n if n < 8 => Err(CodecError::Truncated),
+        _ => Err(CodecError::InvalidField),
     }
 }
 
@@ -123,7 +132,14 @@ impl AppEvent for CounterEvent {
 /// Fan-out report emitted by `apply`. One per state-mutating event.
 #[derive(Debug, Clone, Copy)]
 pub enum CounterReport {
+    /// The increment was applied; `new_value` is the counter after it.
     Ack { new_value: u64 },
+    /// The application refused the increment: it would have taken the
+    /// counter past `u64::MAX`. Nothing was added; `value` is the counter
+    /// as it stands.
+    Overflow { value: u64 },
+    /// The runtime refused the event before `apply` saw it (see
+    /// [`Application::build_reject`]).
     Rejected,
 }
 
@@ -153,16 +169,22 @@ impl Application for Counter {
     fn apply(&mut self, event: Self::Event, _ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
         match event {
             CounterEvent::Increment { amount } => {
-                // Wraps on overflow — a deliberate simplification for this example.
-                // A production app would saturate, reject, or use a wider type.
-                // Also a simplification: a client that retries an Increment
+                // Whether the increment fits depends on the counter's
+                // value, which the decoder cannot see, so the refusal is
+                // made here and answered with a report. The event is still
+                // journaled, with its refusal: replay refuses it again.
+                //
+                // A simplification: a client that retries an Increment
                 // adds twice. An application whose requests are not
                 // idempotent carries a per-client sequence in its events
                 // and refuses a repeat here, keyed on `ctx.key_hash`.
-                self.value = self.value.wrapping_add(amount);
-                out.push(CounterReport::Ack {
-                    new_value: self.value,
-                });
+                match self.value.checked_add(amount) {
+                    Some(new_value) => {
+                        self.value = new_value;
+                        out.push(CounterReport::Ack { new_value });
+                    }
+                    None => out.push(CounterReport::Overflow { value: self.value }),
+                }
             }
             // A query: answered by `query`, never applied.
             CounterEvent::GetValue => {}
@@ -203,7 +225,7 @@ impl Application for Counter {
 // ---------------------------------------------------------------------------
 
 /// Decodes client requests into `CounterEvent`. A request body is its
-/// kind, then the kind's fields:
+/// kind, then the kind's fields, and nothing after them:
 ///   - increment: `[KIND_INCREMENT][amount: u64 LE]`
 ///   - get value: `[KIND_GET_VALUE]`
 pub struct RequestDecoder;
@@ -211,18 +233,28 @@ pub struct RequestDecoder;
 impl RequestDecoderTrait for RequestDecoder {
     type Event = CounterEvent;
 
-    fn decode(&self, body: &[u8], _permission: Permission) -> Decoded<CounterEvent> {
+    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<CounterEvent> {
         let Some((&kind, fields)) = body.split_first() else {
             return Decoded::DecodeError("empty request");
         };
         match kind {
-            KIND_INCREMENT => match fields.first_chunk::<8>() {
-                Some(amount) => Decoded::Permitted(CounterEvent::Increment {
-                    amount: u64::from_le_bytes(*amount),
-                }),
-                None => Decoded::DecodeError("increment too short"),
-            },
-            KIND_GET_VALUE => Decoded::Permitted(CounterEvent::GetValue),
+            KIND_INCREMENT => {
+                // An increment changes state, so a read-only key may not
+                // send one. (A replication key never gets this far: the
+                // client listener refuses it.)
+                if permission == Permission::ReadOnly {
+                    return Decoded::PermissionDenied("incrementing requires a writing role");
+                }
+                match amount_from(fields) {
+                    Ok(amount) => Decoded::Permitted(CounterEvent::Increment {
+                        amount: u64::from_le_bytes(amount),
+                    }),
+                    Err(_) => Decoded::DecodeError("increment amount must be exactly 8 bytes"),
+                }
+            }
+            // Queries are open to every role.
+            KIND_GET_VALUE if fields.is_empty() => Decoded::Permitted(CounterEvent::GetValue),
+            KIND_GET_VALUE => Decoded::DecodeError("get value takes no fields"),
             _ => Decoded::DecodeError("unknown kind"),
         }
     }
@@ -235,7 +267,8 @@ impl RequestDecoderTrait for RequestDecoder {
 /// Encodes `CounterReport` / `CounterQuery` into response bodies; the
 /// runtime frames them. A response body is its kind, then the kind's
 /// fields:
-///   - ack, value: `[KIND_RESP_ACK | KIND_RESP_VALUE][value: u64 LE]`
+///   - ack, overflow, value:
+///     `[KIND_RESP_ACK | KIND_RESP_OVERFLOW | KIND_RESP_VALUE][value: u64 LE]`
 ///   - rejected: `[KIND_RESP_REJECTED]`
 pub struct ResponseEncoder;
 
@@ -254,6 +287,7 @@ impl ResponseEncoderTrait for ResponseEncoder {
     fn encode_report(&self, report: &CounterReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match *report {
             CounterReport::Ack { new_value } => value_body(buf, KIND_RESP_ACK, new_value),
+            CounterReport::Overflow { value } => value_body(buf, KIND_RESP_OVERFLOW, value),
             CounterReport::Rejected => {
                 *buf.first_mut().ok_or("buffer too small")? = KIND_RESP_REJECTED;
                 Ok(1)
@@ -308,6 +342,70 @@ mod tests {
         reports.clear();
         counter.apply(CounterEvent::Increment { amount: 32 }, &ctx, &mut reports);
         assert!(matches!(reports[0], CounterReport::Ack { new_value: 42 }));
+    }
+
+    /// An increment that would pass `u64::MAX` is refused with a report
+    /// and changes nothing; one that lands exactly on it is accepted.
+    #[test]
+    fn apply_refuses_an_overflowing_increment() {
+        let mut counter = Counter {
+            value: u64::MAX - 1,
+        };
+        let ctx = ApplyCtx {
+            now_ns: 0,
+            key_hash: 0,
+        };
+        let mut reports = Vec::new();
+
+        counter.apply(CounterEvent::Increment { amount: 2 }, &ctx, &mut reports);
+        assert!(matches!(
+            reports[..],
+            [CounterReport::Overflow { value }] if value == u64::MAX - 1
+        ));
+        assert_eq!(
+            counter.value,
+            u64::MAX - 1,
+            "a refused increment adds nothing"
+        );
+
+        reports.clear();
+        counter.apply(CounterEvent::Increment { amount: 1 }, &ctx, &mut reports);
+        assert!(matches!(
+            reports[..],
+            [CounterReport::Ack {
+                new_value: u64::MAX
+            }]
+        ));
+    }
+
+    /// The journal hands `decode` exactly one event: a short entry is
+    /// truncated, and a byte past the event is refused, not ignored.
+    #[test]
+    fn event_decode_is_exact() {
+        let mut short = vec![KIND_INCREMENT];
+        short.extend_from_slice(&[0; 7]);
+        assert_eq!(
+            CounterEvent::decode(&short).unwrap_err(),
+            CodecError::Truncated
+        );
+        let mut long = vec![KIND_INCREMENT];
+        long.extend_from_slice(&[0; 9]);
+        assert_eq!(
+            CounterEvent::decode(&long).unwrap_err(),
+            CodecError::InvalidField
+        );
+        assert_eq!(
+            CounterEvent::decode(&[KIND_GET_VALUE, 0]).unwrap_err(),
+            CodecError::InvalidField
+        );
+        assert_eq!(
+            CounterEvent::decode(&[]).unwrap_err(),
+            CodecError::Truncated
+        );
+        assert_eq!(
+            CounterEvent::decode(&[0x7F]).unwrap_err(),
+            CodecError::UnknownTag(0x7F)
+        );
     }
 
     #[test]
@@ -376,19 +474,55 @@ mod tests {
     }
 
     #[test]
-    fn decoder_refuses_empty_short_and_unknown() {
+    fn decoder_refuses_empty_short_long_and_unknown() {
         assert!(matches!(
             RequestDecoder.decode(&[], Permission::Operator),
             Decoded::DecodeError("empty request")
         ));
+        for amount in [&[0u8; 7][..], &[0u8; 9][..]] {
+            assert!(
+                matches!(
+                    RequestDecoder.decode(&message(KIND_INCREMENT, amount), Permission::Operator),
+                    Decoded::DecodeError(_)
+                ),
+                "a {}-byte amount must be refused",
+                amount.len()
+            );
+        }
         assert!(matches!(
-            RequestDecoder.decode(&message(KIND_INCREMENT, &[0; 7]), Permission::Operator),
-            Decoded::DecodeError("increment too short")
+            RequestDecoder.decode(&message(KIND_GET_VALUE, &[0]), Permission::Operator),
+            Decoded::DecodeError(_)
         ));
         assert!(matches!(
             RequestDecoder.decode(&[0x7F], Permission::Operator),
             Decoded::DecodeError("unknown kind")
         ));
+    }
+
+    /// A read-only key may read the counter but not change it.
+    #[test]
+    fn decoder_refuses_increments_from_the_read_only_role() {
+        assert!(matches!(
+            RequestDecoder.decode(&increment_request(1), Permission::ReadOnly),
+            Decoded::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            RequestDecoder.decode(&GET_VALUE_REQUEST, Permission::ReadOnly),
+            Decoded::Permitted(CounterEvent::GetValue)
+        ));
+        for permission in [
+            Permission::Operator,
+            Permission::Trader,
+            Permission::Custodian,
+        ] {
+            assert!(
+                matches!(
+                    RequestDecoder.decode(&increment_request(1), permission),
+                    Decoded::Permitted(CounterEvent::Increment { amount: 1 })
+                ),
+                "{permission:?} may increment"
+            );
+        }
     }
 
     #[test]
@@ -398,6 +532,15 @@ mod tests {
             .encode_report(&CounterReport::Ack { new_value: 42 }, &mut buf)
             .unwrap();
         assert_eq!(buf[..len], message(KIND_RESP_ACK, &42u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn encoder_report_overflow() {
+        let mut buf = [0u8; 64];
+        let len = ResponseEncoder
+            .encode_report(&CounterReport::Overflow { value: 7 }, &mut buf)
+            .unwrap();
+        assert_eq!(buf[..len], message(KIND_RESP_OVERFLOW, &7u64.to_le_bytes()));
     }
 
     #[test]

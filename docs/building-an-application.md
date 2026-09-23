@@ -116,13 +116,16 @@ impl AppEvent for CounterEvent {
         }
     }
 
+    // `buf` is exactly one event: a byte too many is refused, not ignored.
     fn decode(buf: &[u8]) -> Result<Self, CodecError> {
         match buf.split_first() {
-            Some((&KIND_INCREMENT, amount)) => {
-                let amount = amount.first_chunk::<8>().ok_or(CodecError::Truncated)?;
-                Ok(CounterEvent::Increment { amount: u64::from_le_bytes(*amount) })
-            }
-            Some((&KIND_GET_VALUE, _)) => Ok(CounterEvent::GetValue),
+            Some((&KIND_INCREMENT, amount)) => match <[u8; 8]>::try_from(amount) {
+                Ok(amount) => Ok(CounterEvent::Increment { amount: u64::from_le_bytes(amount) }),
+                Err(_) if amount.len() < 8 => Err(CodecError::Truncated),
+                Err(_) => Err(CodecError::InvalidField),
+            },
+            Some((&KIND_GET_VALUE, [])) => Ok(CounterEvent::GetValue),
+            Some((&KIND_GET_VALUE, _)) => Err(CodecError::InvalidField),
             Some((&kind, _)) => Err(CodecError::UnknownTag(kind)),
             None => Err(CodecError::Truncated),
         }
@@ -138,9 +141,10 @@ let len = CounterEvent::Increment { amount: 42 }.encode(&mut buf);
 assert!(matches!(CounterEvent::decode(&buf[..len]), Ok(CounterEvent::Increment { amount: 42 })));
 ```
 
-Three things to get right here:
+Four things to get right here:
 
 - **`MAX_ENCODED_SIZE` is a bound, `encoded_size` is exact.** The journal reserves the bound for every entry and sizes its batches from it; each entry then takes only its exact size on disk. A bound too small is refused when an event exceeds it; a bound past what the journal can carry fails the build (on `cargo build` and `cargo test` — not on `cargo check`). `encode` must return exactly `encoded_size`: an event whose two figures disagree is refused before it is journaled, since the entry would otherwise hold a truncated event.
+- **Decode exactly.** The journal hands `decode` one event and nothing else, so a byte too few or too many means the entry is not what this build wrote. Refuse it rather than read what you can.
 - **The encoding is permanent.** Every event you journal is decoded again by every future version of your application that replays it. See [Snapshots and upgrades](#snapshots-and-upgrades).
 - **A query is an event too.** `is_query` sends it to `Application::query` instead of `apply`, and keeps it out of the journal.
 
@@ -168,10 +172,15 @@ impl Application for Counter {
 
     fn apply(&mut self, event: CounterEvent, _ctx: &ApplyCtx, out: &mut Vec<CounterReport>) {
         match event {
-            CounterEvent::Increment { amount } => {
-                self.value = self.value.wrapping_add(amount);
-                out.push(CounterReport::Ack { new_value: self.value });
-            }
+            // Whether an increment fits depends on the value, so `apply`
+            // decides, and answers a refusal with a report.
+            CounterEvent::Increment { amount } => match self.value.checked_add(amount) {
+                Some(new_value) => {
+                    self.value = new_value;
+                    out.push(CounterReport::Ack { new_value });
+                }
+                None => out.push(CounterReport::Overflow { value: self.value }),
+            },
             // A query never reaches `apply`.
             CounterEvent::GetValue => {}
         }
@@ -212,7 +221,7 @@ assert!(matches!(reports[..], [CounterReport::Ack { new_value: 5 }]));
 ```
 
 - **`Default` is the state before the first event**, on every node. A fresh node, a replica catching up from the start and a restart with no snapshot all begin there.
-- **`apply` is the only way state changes.** What it pushes into `out` is the reply the client receives, in order.
+- **`apply` is the only way state changes.** What it pushes into `out` is the reply the client receives, in order. When state says no, as an increment that would overflow does, `apply` changes nothing and says so in a report: the event stays in the journal with its refusal, and replay refuses it again.
 - **`query` reads state and cannot change it.** It takes `&self`: a query is never journaled, so a change it made would happen on one node and nowhere else. An application with no queries can leave it out, since the default answers nothing. It can also set `QueryResponse` to `melin_app::NoQuery`, a type with no values, so its encoder's `encode_query` is an empty `match` (the echo example does this).
 - **`tick` is time passing.** The runtime calls it as time advances, so an application can expire, time out or schedule things. It is optional: the counter leaves it out, and the default does nothing.
 - **`build_reject` answers a request the runtime refused on its own.** Today that happens in one case: a node that has lost its last replica refuses writes rather than acknowledge them without the copies the policy demands. The rejection is built from the event alone, because the event never reached `apply`.
@@ -232,26 +241,35 @@ struct Decoder;
 impl RequestDecoder for Decoder {
     type Event = CounterEvent;
 
-    fn decode(&self, body: &[u8], _permission: Permission) -> Decoded<CounterEvent> {
+    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<CounterEvent> {
         let Some((&kind, fields)) = body.split_first() else {
             return Decoded::DecodeError("empty request");
         };
         match kind {
-            KIND_INCREMENT => match fields.first_chunk::<8>() {
-                Some(amount) => Decoded::Permitted(CounterEvent::Increment {
-                    amount: u64::from_le_bytes(*amount),
+            // An increment changes state: a read-only key may not send one.
+            KIND_INCREMENT if permission == Permission::ReadOnly => {
+                Decoded::PermissionDenied("incrementing requires a writing role")
+            }
+            KIND_INCREMENT => match <[u8; 8]>::try_from(fields) {
+                Ok(amount) => Decoded::Permitted(CounterEvent::Increment {
+                    amount: u64::from_le_bytes(amount),
                 }),
-                None => Decoded::DecodeError("increment too short"),
+                Err(_) => Decoded::DecodeError("increment amount must be exactly 8 bytes"),
             },
-            KIND_GET_VALUE => Decoded::Permitted(CounterEvent::GetValue),
+            KIND_GET_VALUE if fields.is_empty() => Decoded::Permitted(CounterEvent::GetValue),
+            KIND_GET_VALUE => Decoded::DecodeError("get value takes no fields"),
             _ => Decoded::DecodeError("unknown kind"),
         }
     }
 }
 
 assert!(matches!(
-    Decoder.decode(&[KIND_GET_VALUE], Permission::Trader),
+    Decoder.decode(&[KIND_GET_VALUE], Permission::ReadOnly),
     Decoded::Permitted(CounterEvent::GetValue)
+));
+assert!(matches!(
+    Decoder.decode(&[KIND_INCREMENT, 1, 0, 0, 0, 0, 0, 0, 0], Permission::ReadOnly),
+    Decoded::PermissionDenied(_)
 ));
 ```
 
@@ -260,7 +278,9 @@ The decoder runs before the event is sequenced. It is the last point at which a 
 ### Encoding responses
 
 ```rust
-use counter_server::{CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE};
+use counter_server::{
+    CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_OVERFLOW, KIND_RESP_REJECTED, KIND_RESP_VALUE,
+};
 use melin_app::encoder::ResponseEncoder;
 
 struct Encoder;
@@ -280,6 +300,7 @@ impl ResponseEncoder for Encoder {
     fn encode_report(&self, report: &CounterReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match *report {
             CounterReport::Ack { new_value } => value_body(buf, KIND_RESP_ACK, new_value),
+            CounterReport::Overflow { value } => value_body(buf, KIND_RESP_OVERFLOW, value),
             CounterReport::Rejected => {
                 *buf.first_mut().ok_or("buffer too small")? = KIND_RESP_REJECTED;
                 Ok(1)

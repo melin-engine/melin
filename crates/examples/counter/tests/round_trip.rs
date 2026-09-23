@@ -13,8 +13,8 @@ use melin_server_runtime::server::{self, ServerConfig};
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use counter_server::{
-    Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_VALUE, RequestDecoder, ResponseEncoder,
-    increment_request,
+    Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_OVERFLOW, KIND_RESP_VALUE, RequestDecoder,
+    ResponseEncoder, increment_request,
 };
 use melin_server_runtime::StartupEvents;
 
@@ -152,6 +152,35 @@ fn full_round_trip() {
     let value = node.request_one(&GET_VALUE_REQUEST).expect("query");
     assert_eq!(value[0], KIND_RESP_VALUE);
     assert_eq!(value_of(&value), 42);
+
+    drop(node);
+    stop_server(shutdown, addr, handle);
+}
+
+/// An increment that would pass `u64::MAX` is answered with an overflow
+/// report carrying the unchanged value, and leaves the counter as it was.
+#[test]
+fn overflowing_increment_is_refused() {
+    let (shutdown, addr, handle) = start_server();
+    let key = SigningKey::from_bytes(&[0xAA; 32]);
+    let mut node = connect_authenticated(addr, &key);
+
+    let ack = node
+        .request_one(&increment_request(u64::MAX))
+        .expect("increment");
+    assert_eq!(ack[0], KIND_RESP_ACK);
+    assert_eq!(value_of(&ack), u64::MAX);
+
+    let refused = node.request_one(&increment_request(1)).expect("increment");
+    assert_eq!(refused[0], KIND_RESP_OVERFLOW);
+    assert_eq!(value_of(&refused), u64::MAX);
+
+    let value = node.request_one(&GET_VALUE_REQUEST).expect("query");
+    assert_eq!(
+        value_of(&value),
+        u64::MAX,
+        "a refused increment adds nothing"
+    );
 
     drop(node);
     stop_server(shutdown, addr, handle);
