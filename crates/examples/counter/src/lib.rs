@@ -7,8 +7,8 @@
 //!
 //!   1. [`AppEvent`]        — the event type (journal codec)
 //!   2. [`Application`]     — the state machine, starting from `Default`
-//!   3. [`RequestDecoder`]  — request tag and body → event
-//!   4. [`ResponseEncoder`] — report → response tag and body
+//!   3. [`RequestDecoder`]  — request body → event
+//!   4. [`ResponseEncoder`] — report → response body
 //!
 //! The application is a simple counter: clients send `Increment(amount)`
 //! commands and receive the new total. A `GetValue` query returns the
@@ -18,20 +18,34 @@ use std::io::{self, Read, Write};
 
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
-use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
+use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 
 // ---------------------------------------------------------------------------
-// Wire tags — application tags start at 0x10; everything below is the
-// protocol's, and the runtime keeps it away from the codecs.
+// Message kinds — the first byte of every request and response body. The
+// body is the application's from its first byte, so any value will do:
+// these are the counter's own, and the request kinds double as its
+// journal encoding.
 // ---------------------------------------------------------------------------
 
-pub const TAG_INCREMENT: u8 = 0x10;
-pub const TAG_GET_VALUE: u8 = 0x11;
+pub const KIND_INCREMENT: u8 = 0x10;
+pub const KIND_GET_VALUE: u8 = 0x11;
 
-pub const TAG_RESP_ACK: u8 = 0x30;
-pub const TAG_RESP_VALUE: u8 = 0x31;
-pub const TAG_RESP_REJECTED: u8 = 0x32;
+pub const KIND_RESP_ACK: u8 = 0x30;
+pub const KIND_RESP_VALUE: u8 = 0x31;
+pub const KIND_RESP_REJECTED: u8 = 0x32;
+
+/// The body of an `Increment` request, as a client sends it — the
+/// inverse of [`RequestDecoder`] for this kind.
+pub fn increment_request(amount: u64) -> [u8; 9] {
+    let mut body = [0u8; 9];
+    body[0] = KIND_INCREMENT;
+    body[1..].copy_from_slice(&amount.to_le_bytes());
+    body
+}
+
+/// The body of a `GetValue` request: the kind alone.
+pub const GET_VALUE_REQUEST: [u8; 1] = [KIND_GET_VALUE];
 
 // ---------------------------------------------------------------------------
 // Event
@@ -47,14 +61,14 @@ pub enum CounterEvent {
 }
 
 impl AppEvent for CounterEvent {
-    // The widest variant: `Increment`'s tag(1) + amount(8).
+    // The widest variant: `Increment`'s kind(1) + amount(8).
     const MAX_ENCODED_SIZE: usize = 9;
 
     fn encoded_size(&self) -> usize {
         match self {
-            // tag(1) + amount(8)
+            // kind(1) + amount(8)
             CounterEvent::Increment { .. } => 9,
-            // tag(1)
+            // kind(1)
             CounterEvent::GetValue => 1,
         }
     }
@@ -62,12 +76,12 @@ impl AppEvent for CounterEvent {
     fn encode(&self, buf: &mut [u8]) -> usize {
         match *self {
             CounterEvent::Increment { amount } => {
-                buf[0] = TAG_INCREMENT;
+                buf[0] = KIND_INCREMENT;
                 buf[1..9].copy_from_slice(&amount.to_le_bytes());
                 9
             }
             CounterEvent::GetValue => {
-                buf[0] = TAG_GET_VALUE;
+                buf[0] = KIND_GET_VALUE;
                 1
             }
         }
@@ -78,15 +92,15 @@ impl AppEvent for CounterEvent {
             return Err(CodecError::Truncated);
         }
         match buf[0] {
-            TAG_INCREMENT => {
+            KIND_INCREMENT => {
                 if buf.len() < 9 {
                     return Err(CodecError::Truncated);
                 }
                 let amount = u64::from_le_bytes(buf[1..9].try_into().expect("8 bytes"));
                 Ok(CounterEvent::Increment { amount })
             }
-            TAG_GET_VALUE => Ok(CounterEvent::GetValue),
-            tag => Err(CodecError::UnknownTag(tag)),
+            KIND_GET_VALUE => Ok(CounterEvent::GetValue),
+            kind => Err(CodecError::UnknownTag(kind)),
         }
     }
 
@@ -180,26 +194,28 @@ impl Application for Counter {
 // Request decoder
 // ---------------------------------------------------------------------------
 
-/// Decodes client requests into `CounterEvent`.
-///
-/// The runtime has already read the tag; the bodies are:
-///   - increment: `[amount: u64 LE]`
-///   - get value: empty
+/// Decodes client requests into `CounterEvent`. A request body is its
+/// kind, then the kind's fields:
+///   - increment: `[KIND_INCREMENT][amount: u64 LE]`
+///   - get value: `[KIND_GET_VALUE]`
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = CounterEvent;
 
-    fn decode(&self, tag: u8, body: &[u8], _permission: Permission) -> Decoded<CounterEvent> {
-        match tag {
-            TAG_INCREMENT => match body.first_chunk::<8>() {
+    fn decode(&self, body: &[u8], _permission: Permission) -> Decoded<CounterEvent> {
+        let Some((&kind, fields)) = body.split_first() else {
+            return Decoded::DecodeError("empty request");
+        };
+        match kind {
+            KIND_INCREMENT => match fields.first_chunk::<8>() {
                 Some(amount) => Decoded::Permitted(CounterEvent::Increment {
                     amount: u64::from_le_bytes(*amount),
                 }),
-                None => Decoded::DecodeError("increment body too short"),
+                None => Decoded::DecodeError("increment too short"),
             },
-            TAG_GET_VALUE => Decoded::Permitted(CounterEvent::GetValue),
-            _ => Decoded::DecodeError("unknown tag"),
+            KIND_GET_VALUE => Decoded::Permitted(CounterEvent::GetValue),
+            _ => Decoded::DecodeError("unknown kind"),
         }
     }
 }
@@ -209,38 +225,36 @@ impl RequestDecoderTrait for RequestDecoder {
 // ---------------------------------------------------------------------------
 
 /// Encodes `CounterReport` / `CounterQuery` into response bodies; the
-/// runtime frames them. The bodies are:
-///   - ack, value: `[value: u64 LE]`
-///   - rejected: empty
+/// runtime frames them. A response body is its kind, then the kind's
+/// fields:
+///   - ack, value: `[KIND_RESP_ACK | KIND_RESP_VALUE][value: u64 LE]`
+///   - rejected: `[KIND_RESP_REJECTED]`
 pub struct ResponseEncoder;
 
-/// Write `value` as a body under `tag`.
-fn value_body(buf: &mut [u8], tag: u8, value: u64) -> Result<Encoded, &'static str> {
-    let body = buf.first_chunk_mut::<8>().ok_or("buffer too small")?;
-    *body = value.to_le_bytes();
-    Ok(Encoded { tag, len: 8 })
+/// Write `value` as a body under `kind`.
+fn value_body(buf: &mut [u8], kind: u8, value: u64) -> Result<usize, &'static str> {
+    let body = buf.first_chunk_mut::<9>().ok_or("buffer too small")?;
+    body[0] = kind;
+    body[1..].copy_from_slice(&value.to_le_bytes());
+    Ok(9)
 }
 
 impl ResponseEncoderTrait for ResponseEncoder {
     type Report = CounterReport;
     type Query = CounterQuery;
 
-    fn encode_report(
-        &self,
-        report: &CounterReport,
-        buf: &mut [u8],
-    ) -> Result<Encoded, &'static str> {
+    fn encode_report(&self, report: &CounterReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match *report {
-            CounterReport::Ack { new_value } => value_body(buf, TAG_RESP_ACK, new_value),
-            CounterReport::Rejected => Ok(Encoded {
-                tag: TAG_RESP_REJECTED,
-                len: 0,
-            }),
+            CounterReport::Ack { new_value } => value_body(buf, KIND_RESP_ACK, new_value),
+            CounterReport::Rejected => {
+                *buf.first_mut().ok_or("buffer too small")? = KIND_RESP_REJECTED;
+                Ok(1)
+            }
         }
     }
 
-    fn encode_query(&self, query: &CounterQuery, buf: &mut [u8]) -> Result<Encoded, &'static str> {
-        value_body(buf, TAG_RESP_VALUE, query.value)
+    fn encode_query(&self, query: &CounterQuery, buf: &mut [u8]) -> Result<usize, &'static str> {
+        value_body(buf, KIND_RESP_VALUE, query.value)
     }
 }
 
@@ -325,9 +339,16 @@ mod tests {
         assert_eq!(restored.value, 12345);
     }
 
+    /// A request or response body: the kind, then its fields.
+    fn message(kind: u8, fields: &[u8]) -> Vec<u8> {
+        [&[kind][..], fields].concat()
+    }
+
     #[test]
     fn decoder_increment() {
-        match RequestDecoder.decode(TAG_INCREMENT, &100u64.to_le_bytes(), Permission::Operator) {
+        let body = increment_request(100);
+        assert_eq!(body[..], message(KIND_INCREMENT, &100u64.to_le_bytes()));
+        match RequestDecoder.decode(&body, Permission::Operator) {
             Decoded::Permitted(event) => {
                 assert!(matches!(event, CounterEvent::Increment { amount: 100 }));
             }
@@ -337,7 +358,7 @@ mod tests {
 
     #[test]
     fn decoder_get_value() {
-        match RequestDecoder.decode(TAG_GET_VALUE, &[], Permission::Operator) {
+        match RequestDecoder.decode(&GET_VALUE_REQUEST, Permission::Operator) {
             Decoded::Permitted(event) => {
                 assert!(matches!(event, CounterEvent::GetValue));
                 assert!(event.is_query());
@@ -347,68 +368,56 @@ mod tests {
     }
 
     #[test]
-    fn decoder_refuses_short_increment_and_unknown_tag() {
+    fn decoder_refuses_empty_short_and_unknown() {
         assert!(matches!(
-            RequestDecoder.decode(TAG_INCREMENT, &[0; 7], Permission::Operator),
-            Decoded::DecodeError(_)
+            RequestDecoder.decode(&[], Permission::Operator),
+            Decoded::DecodeError("empty request")
         ));
         assert!(matches!(
-            RequestDecoder.decode(0x7F, &[], Permission::Operator),
-            Decoded::DecodeError("unknown tag")
+            RequestDecoder.decode(&message(KIND_INCREMENT, &[0; 7]), Permission::Operator),
+            Decoded::DecodeError("increment too short")
+        ));
+        assert!(matches!(
+            RequestDecoder.decode(&[0x7F], Permission::Operator),
+            Decoded::DecodeError("unknown kind")
         ));
     }
 
     #[test]
     fn encoder_report_ack() {
         let mut buf = [0u8; 64];
-        let encoded = ResponseEncoder
+        let len = ResponseEncoder
             .encode_report(&CounterReport::Ack { new_value: 42 }, &mut buf)
             .unwrap();
-        assert_eq!(
-            encoded,
-            Encoded {
-                tag: TAG_RESP_ACK,
-                len: 8
-            }
-        );
-        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 42);
+        assert_eq!(buf[..len], message(KIND_RESP_ACK, &42u64.to_le_bytes()));
     }
 
     #[test]
     fn encoder_report_rejected() {
         let mut buf = [0u8; 64];
-        let encoded = ResponseEncoder
+        let len = ResponseEncoder
             .encode_report(&CounterReport::Rejected, &mut buf)
             .unwrap();
-        assert_eq!(
-            encoded,
-            Encoded {
-                tag: TAG_RESP_REJECTED,
-                len: 0
-            }
-        );
+        assert_eq!(buf[..len], [KIND_RESP_REJECTED]);
     }
 
     #[test]
     fn encoder_query() {
         let mut buf = [0u8; 64];
-        let encoded = ResponseEncoder
+        let len = ResponseEncoder
             .encode_query(&CounterQuery { value: 99 }, &mut buf)
             .unwrap();
-        assert_eq!(
-            encoded,
-            Encoded {
-                tag: TAG_RESP_VALUE,
-                len: 8
-            }
-        );
-        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 99);
+        assert_eq!(buf[..len], message(KIND_RESP_VALUE, &99u64.to_le_bytes()));
     }
 
     #[test]
     fn encoder_refuses_a_buffer_too_small() {
         assert_eq!(
-            ResponseEncoder.encode_query(&CounterQuery { value: 1 }, &mut [0u8; 7]),
+            ResponseEncoder.encode_query(&CounterQuery { value: 1 }, &mut [0u8; 8]),
+            Err("buffer too small")
+        );
+        assert_eq!(
+            ResponseEncoder.encode_report(&CounterReport::Rejected, &mut []),
             Err("buffer too small")
         );
     }

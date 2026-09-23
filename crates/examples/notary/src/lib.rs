@@ -70,23 +70,25 @@ use std::io::{self, Read, Write};
 
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
-use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
+use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
 
 /// The receipt as clients keep it — shared by the client and the auditor.
 pub mod receipt;
 
 // ---------------------------------------------------------------------------
-// Wire tags — application tags start at 0x10; everything below is the
-// protocol's, and the runtime keeps it away from the codecs.
+// Message kinds — the first byte of every request and response body. The
+// body is the application's from its first byte, so any value will do:
+// these are the notary's own, and the request kinds double as its
+// journal encoding.
 // ---------------------------------------------------------------------------
 
-pub const TAG_NOTARIZE: u8 = 0x10;
-pub const TAG_GET_HEAD: u8 = 0x11;
+pub const KIND_NOTARIZE: u8 = 0x10;
+pub const KIND_GET_HEAD: u8 = 0x11;
 
-pub const TAG_RESP_RECEIPT: u8 = 0x30;
-pub const TAG_RESP_HEAD: u8 = 0x31;
-pub const TAG_RESP_REJECTED: u8 = 0x32;
+pub const KIND_RESP_RECEIPT: u8 = 0x30;
+pub const KIND_RESP_HEAD: u8 = 0x31;
+pub const KIND_RESP_REJECTED: u8 = 0x32;
 
 /// Width of a submitted digest, in bytes.
 ///
@@ -121,14 +123,14 @@ pub enum NotaryEvent {
 }
 
 impl AppEvent for NotaryEvent {
-    // The widest variant: `Notarize`'s tag(1) + leaf(32). Checked against
+    // The widest variant: `Notarize`'s kind(1) + leaf(32). Checked against
     // the journal's entry ceiling at compile time.
     const MAX_ENCODED_SIZE: usize = 1 + LEAF_LEN;
 
     fn encoded_size(&self) -> usize {
         match self {
             NotaryEvent::Notarize { .. } => Self::MAX_ENCODED_SIZE,
-            // tag(1)
+            // kind(1)
             NotaryEvent::GetHead => 1,
         }
     }
@@ -136,25 +138,25 @@ impl AppEvent for NotaryEvent {
     fn encode(&self, buf: &mut [u8]) -> usize {
         match self {
             NotaryEvent::Notarize { leaf } => {
-                buf[0] = TAG_NOTARIZE;
+                buf[0] = KIND_NOTARIZE;
                 buf[1..1 + LEAF_LEN].copy_from_slice(leaf);
                 Self::MAX_ENCODED_SIZE
             }
             NotaryEvent::GetHead => {
-                buf[0] = TAG_GET_HEAD;
+                buf[0] = KIND_GET_HEAD;
                 1
             }
         }
     }
 
     fn decode(buf: &[u8]) -> Result<Self, CodecError> {
-        let (&tag, rest) = buf.split_first().ok_or(CodecError::Truncated)?;
-        match tag {
-            TAG_NOTARIZE => Ok(NotaryEvent::Notarize {
+        let (&kind, rest) = buf.split_first().ok_or(CodecError::Truncated)?;
+        match kind {
+            KIND_NOTARIZE => Ok(NotaryEvent::Notarize {
                 leaf: leaf_from(rest)?,
             }),
-            TAG_GET_HEAD => Ok(NotaryEvent::GetHead),
-            tag => Err(CodecError::UnknownTag(tag)),
+            KIND_GET_HEAD => Ok(NotaryEvent::GetHead),
+            kind => Err(CodecError::UnknownTag(kind)),
         }
     }
 
@@ -352,33 +354,35 @@ impl Application for Notary {
 // Request decoder
 // ---------------------------------------------------------------------------
 
-/// Decodes client requests into `NotaryEvent`.
-///
-/// The runtime has already read the tag; the bodies are:
-///   - notarize: `[leaf: 32 bytes]`
-///   - get head: empty
+/// Decodes client requests into `NotaryEvent`. A request body is its kind,
+/// then the kind's fields:
+///   - notarize: `[KIND_NOTARIZE][leaf: 32 bytes]`
+///   - get head: `[KIND_GET_HEAD]`
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = NotaryEvent;
 
-    fn decode(&self, tag: u8, body: &[u8], permission: Permission) -> Decoded<NotaryEvent> {
-        match tag {
-            TAG_NOTARIZE => {
+    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<NotaryEvent> {
+        let Some((&kind, fields)) = body.split_first() else {
+            return Decoded::DecodeError("empty request");
+        };
+        match kind {
+            KIND_NOTARIZE => {
                 // Unlike the counter example, this one gates on
                 // permission: notarizing appends to the log, so the
                 // read-only and replication roles are refused.
                 if matches!(permission, Permission::ReadOnly | Permission::Replication) {
                     return Decoded::PermissionDenied("notarizing requires a writing role");
                 }
-                match leaf_from(body) {
+                match leaf_from(fields) {
                     Ok(leaf) => Decoded::Permitted(NotaryEvent::Notarize { leaf }),
                     Err(_) => Decoded::DecodeError("leaf must be exactly 32 bytes"),
                 }
             }
             // Queries are readable by every authenticated role.
-            TAG_GET_HEAD => Decoded::Permitted(NotaryEvent::GetHead),
-            _ => Decoded::DecodeError("unknown tag"),
+            KIND_GET_HEAD => Decoded::Permitted(NotaryEvent::GetHead),
+            _ => Decoded::DecodeError("unknown kind"),
         }
     }
 }
@@ -388,33 +392,31 @@ impl RequestDecoderTrait for RequestDecoder {
 // ---------------------------------------------------------------------------
 
 /// Encodes `NotaryReport` / `NotaryHead` into response bodies; the runtime
-/// frames them. The bodies are:
-///   - receipt:  `[entry: u64][timestamp_ns: u64][prev: 32 bytes][head: 32 bytes]`
-///   - head:     `[entries: u64][head: 32 bytes]`
-///   - rejected: empty
+/// frames them. A response body is its kind, then the kind's fields:
+///   - receipt:  `[KIND_RESP_RECEIPT][entry: u64][timestamp_ns: u64][prev: 32 bytes][head: 32 bytes]`
+///   - head:     `[KIND_RESP_HEAD][entries: u64][head: 32 bytes]`
+///   - rejected: `[KIND_RESP_REJECTED]`
 pub struct ResponseEncoder;
 
-/// Entry (8) + timestamp (8) + prev (32) + head (32).
-const RECEIPT_BODY_LEN: usize = 8 + 8 + HEAD_LEN + HEAD_LEN;
+/// Kind (1) + entry (8) + timestamp (8) + prev (32) + head (32).
+const RECEIPT_BODY_LEN: usize = 1 + 8 + 8 + HEAD_LEN + HEAD_LEN;
 
-/// Entries (8) + head (32).
-const HEAD_BODY_LEN: usize = 8 + HEAD_LEN;
+/// Kind (1) + entries (8) + head (32).
+const HEAD_BODY_LEN: usize = 1 + 8 + HEAD_LEN;
 
-/// The first `len` bytes of `buf`, checked so the callers' fixed-offset
-/// writes cannot panic.
-fn body(buf: &mut [u8], len: usize) -> Result<&mut [u8], &'static str> {
-    buf.get_mut(..len).ok_or("buffer too small")
+/// The first `len` bytes of `buf`, with `kind` written into the first of
+/// them, checked so the callers' fixed-offset writes cannot panic.
+fn body(buf: &mut [u8], kind: u8, len: usize) -> Result<&mut [u8], &'static str> {
+    let body = buf.get_mut(..len).ok_or("buffer too small")?;
+    *body.first_mut().ok_or("buffer too small")? = kind;
+    Ok(body)
 }
 
 impl ResponseEncoderTrait for ResponseEncoder {
     type Report = NotaryReport;
     type Query = NotaryHead;
 
-    fn encode_report(
-        &self,
-        report: &NotaryReport,
-        buf: &mut [u8],
-    ) -> Result<Encoded, &'static str> {
+    fn encode_report(&self, report: &NotaryReport, buf: &mut [u8]) -> Result<usize, &'static str> {
         match report {
             NotaryReport::Receipt {
                 entry,
@@ -422,31 +424,25 @@ impl ResponseEncoderTrait for ResponseEncoder {
                 prev,
                 head,
             } => {
-                let body = body(buf, RECEIPT_BODY_LEN)?;
-                body[..8].copy_from_slice(&entry.to_le_bytes());
-                body[8..16].copy_from_slice(&timestamp_ns.to_le_bytes());
-                body[16..48].copy_from_slice(prev);
-                body[48..].copy_from_slice(head);
-                Ok(Encoded {
-                    tag: TAG_RESP_RECEIPT,
-                    len: RECEIPT_BODY_LEN,
-                })
+                let body = body(buf, KIND_RESP_RECEIPT, RECEIPT_BODY_LEN)?;
+                body[1..9].copy_from_slice(&entry.to_le_bytes());
+                body[9..17].copy_from_slice(&timestamp_ns.to_le_bytes());
+                body[17..49].copy_from_slice(prev);
+                body[49..].copy_from_slice(head);
+                Ok(RECEIPT_BODY_LEN)
             }
-            NotaryReport::Rejected => Ok(Encoded {
-                tag: TAG_RESP_REJECTED,
-                len: 0,
-            }),
+            NotaryReport::Rejected => {
+                body(buf, KIND_RESP_REJECTED, 1)?;
+                Ok(1)
+            }
         }
     }
 
-    fn encode_query(&self, query: &NotaryHead, buf: &mut [u8]) -> Result<Encoded, &'static str> {
-        let body = body(buf, HEAD_BODY_LEN)?;
-        body[..8].copy_from_slice(&query.entries.to_le_bytes());
-        body[8..].copy_from_slice(&query.head);
-        Ok(Encoded {
-            tag: TAG_RESP_HEAD,
-            len: HEAD_BODY_LEN,
-        })
+    fn encode_query(&self, query: &NotaryHead, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let body = body(buf, KIND_RESP_HEAD, HEAD_BODY_LEN)?;
+        body[1..9].copy_from_slice(&query.entries.to_le_bytes());
+        body[9..].copy_from_slice(&query.head);
+        Ok(HEAD_BODY_LEN)
     }
 }
 
@@ -528,14 +524,14 @@ mod tests {
 
     #[test]
     fn event_decode_rejects_wrong_leaf_width() {
-        let mut short = vec![TAG_NOTARIZE];
+        let mut short = vec![KIND_NOTARIZE];
         short.extend_from_slice(&[0u8; LEAF_LEN - 1]);
         assert!(matches!(
             NotaryEvent::decode(&short),
             Err(CodecError::Truncated)
         ));
 
-        let mut long = vec![TAG_NOTARIZE];
+        let mut long = vec![KIND_NOTARIZE];
         long.extend_from_slice(&[0u8; LEAF_LEN + 1]);
         assert!(
             matches!(NotaryEvent::decode(&long), Err(CodecError::InvalidField)),
@@ -727,6 +723,11 @@ mod tests {
 
     // --- Decoder ---
 
+    /// A request body as a client sends it: the kind, then its fields.
+    fn request(kind: u8, fields: &[u8]) -> Vec<u8> {
+        [&[kind][..], fields].concat()
+    }
+
     #[test]
     fn decoder_accepts_notarize_from_writing_roles() {
         let l = leaf(0x5A);
@@ -735,7 +736,7 @@ mod tests {
             Permission::Trader,
             Permission::Custodian,
         ] {
-            match RequestDecoder.decode(TAG_NOTARIZE, &l, permission) {
+            match RequestDecoder.decode(&request(KIND_NOTARIZE, &l), permission) {
                 Decoded::Permitted(event) => assert_eq!(event, NotaryEvent::Notarize { leaf: l }),
                 _ => panic!("expected Permitted for {permission:?}"),
             }
@@ -747,7 +748,7 @@ mod tests {
         for permission in [Permission::ReadOnly, Permission::Replication] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(TAG_NOTARIZE, &leaf(1), permission),
+                    RequestDecoder.decode(&request(KIND_NOTARIZE, &leaf(1)), permission),
                     Decoded::PermissionDenied(_)
                 ),
                 "{permission:?} must not be able to notarize"
@@ -765,7 +766,7 @@ mod tests {
             Permission::Replication,
         ] {
             assert!(matches!(
-                RequestDecoder.decode(TAG_GET_HEAD, &[], permission),
+                RequestDecoder.decode(&[KIND_GET_HEAD], permission),
                 Decoded::Permitted(NotaryEvent::GetHead)
             ));
         }
@@ -773,23 +774,27 @@ mod tests {
 
     #[test]
     fn decoder_rejects_wrong_leaf_width() {
-        for body in [vec![0u8; LEAF_LEN - 1], vec![0u8; LEAF_LEN + 1], Vec::new()] {
+        for fields in [vec![0u8; LEAF_LEN - 1], vec![0u8; LEAF_LEN + 1], Vec::new()] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(TAG_NOTARIZE, &body, Permission::Trader),
+                    RequestDecoder.decode(&request(KIND_NOTARIZE, &fields), Permission::Trader),
                     Decoded::DecodeError(_)
                 ),
                 "a {}-byte leaf must be refused",
-                body.len()
+                fields.len()
             );
         }
     }
 
     #[test]
-    fn decoder_rejects_unknown_tag() {
+    fn decoder_rejects_empty_and_unknown_kind() {
         assert!(matches!(
-            RequestDecoder.decode(0x7F, &[], Permission::Trader),
-            Decoded::DecodeError(_)
+            RequestDecoder.decode(&[], Permission::Trader),
+            Decoded::DecodeError("empty request")
+        ));
+        assert!(matches!(
+            RequestDecoder.decode(&[0x7F], Permission::Trader),
+            Decoded::DecodeError("unknown kind")
         ));
     }
 
@@ -800,7 +805,7 @@ mod tests {
         let mut buf = [0u8; 128];
         let prev = [0xCDu8; HEAD_LEN];
         let head = [0xABu8; HEAD_LEN];
-        let encoded = ResponseEncoder
+        let len = ResponseEncoder
             .encode_report(
                 &NotaryReport::Receipt {
                     entry: 7,
@@ -811,50 +816,34 @@ mod tests {
                 &mut buf,
             )
             .unwrap();
-        assert_eq!(
-            encoded,
-            Encoded {
-                tag: TAG_RESP_RECEIPT,
-                len: 80
-            }
-        );
-        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 7);
-        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 9);
-        assert_eq!(&buf[16..48], &prev);
-        assert_eq!(&buf[48..80], &head);
+        assert_eq!(len, 81);
+        assert_eq!(buf[0], KIND_RESP_RECEIPT);
+        assert_eq!(u64::from_le_bytes(buf[1..9].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(buf[9..17].try_into().unwrap()), 9);
+        assert_eq!(&buf[17..49], &prev);
+        assert_eq!(&buf[49..81], &head);
     }
 
     #[test]
     fn encoder_rejected() {
         let mut buf = [0u8; 64];
-        let encoded = ResponseEncoder
+        let len = ResponseEncoder
             .encode_report(&NotaryReport::Rejected, &mut buf)
             .unwrap();
-        assert_eq!(
-            encoded,
-            Encoded {
-                tag: TAG_RESP_REJECTED,
-                len: 0
-            }
-        );
+        assert_eq!(buf[..len], [KIND_RESP_REJECTED]);
     }
 
     #[test]
     fn encoder_head_query() {
         let mut buf = [0u8; 64];
         let head = [0x5Au8; HEAD_LEN];
-        let encoded = ResponseEncoder
+        let len = ResponseEncoder
             .encode_query(&NotaryHead { entries: 3, head }, &mut buf)
             .unwrap();
-        assert_eq!(
-            encoded,
-            Encoded {
-                tag: TAG_RESP_HEAD,
-                len: 40
-            }
-        );
-        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 3);
-        assert_eq!(&buf[8..40], &head);
+        assert_eq!(len, 41);
+        assert_eq!(buf[0], KIND_RESP_HEAD);
+        assert_eq!(u64::from_le_bytes(buf[1..9].try_into().unwrap()), 3);
+        assert_eq!(&buf[9..41], &head);
     }
 
     #[test]
@@ -884,11 +873,11 @@ mod tests {
                 )
                 .is_err()
         );
-        // A rejection has no body, so no buffer is too small for it.
+        // A rejection is its kind alone, which still needs a byte.
         assert!(
             ResponseEncoder
                 .encode_report(&NotaryReport::Rejected, &mut [])
-                .is_ok()
+                .is_err()
         );
     }
 }

@@ -11,9 +11,10 @@
 //! those four things, once.
 //!
 //! What it is not: the application's protocol. A node hosts an
-//! application whose requests and responses are its own bytes behind a
-//! tag; this crate carries them and never looks inside. Decoding a reply
-//! is the caller's, with the tag constants the application publishes.
+//! application whose requests and responses are its own bytes; this crate
+//! frames them as application frames and never looks inside. Encoding a
+//! request and decoding a reply are the caller's, with whatever layout
+//! the application publishes.
 //!
 //! ## Shape
 //!
@@ -33,7 +34,8 @@
 //! ## Silence
 //!
 //! A node does not answer a request it refuses — a key whose role may
-//! not perform the operation, a malformed frame — it drops the frame and
+//! not perform the operation, a malformed frame, a request laid out for
+//! another version of the node's application — it drops the frame and
 //! keeps the connection. The only signal is the read timeout, which this
 //! crate reports as [`Error::NoReply`] with that explanation attached, so
 //! callers do not each have to know it. A node heartbeats idle
@@ -45,9 +47,9 @@
 //!
 //! let key = key::load_signing_key("client.pem".as_ref())?;
 //! let mut node = Connection::connect("127.0.0.1:9876".parse()?, &key)?;
-//! // `0x10` is whatever the application defines as its request tag; the
-//! // reply is its bytes, tag first.
-//! let reply = node.request_one(0x10, b"payload")?;
+//! // The request and the reply are the application's bytes, laid out as
+//! // it defines them.
+//! let reply = node.request_one(b"request")?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -61,8 +63,8 @@ use ed25519_dalek::Signer;
 use melin_wire_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use melin_wire_protocol::control::ChallengeResponse;
 use melin_wire_protocol::control_codec::{
-    CHALLENGE_RESPONSE_LEN, FIRST_APP_TAG, TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE,
-    TAG_ENGINE_ERROR, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
+    CHALLENGE_RESPONSE_LEN, TAG_APP, TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE,
+    TAG_ENGINE_ERROR, TAG_LEN, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
     encode_challenge_response,
 };
 
@@ -72,7 +74,7 @@ pub mod key;
 // is enough to authenticate.
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 // The bound on a frame, so a caller can size its widest request: the
-// body of a request is this less the tag.
+// body of a request is this less the protocol's one-byte tag.
 pub use melin_wire_protocol::blocking::MAX_FRAME_SIZE;
 
 /// Read and connect timeout used by [`Connection::connect`] and
@@ -109,8 +111,8 @@ pub enum Error {
     Disconnected,
     /// The node sent something the protocol does not allow here.
     Protocol(String),
-    /// The request, tag included, would not fit in one
-    /// frame of [`MAX_FRAME_SIZE`] bytes; nothing was sent.
+    /// The request, with the protocol's tag in front of it, would not
+    /// fit in one frame of [`MAX_FRAME_SIZE`] bytes; nothing was sent.
     RequestTooLarge { len: usize },
     /// The node is shedding load; retry later, on a new connection.
     ServerBusy,
@@ -139,7 +141,7 @@ impl fmt::Display for Error {
                 f,
                 "no reply within {:.1}s: a node silently drops requests it refuses — check \
                  that the key's role in authorized_keys may perform this operation, and that \
-                 the request is well-formed",
+                 the request is well-formed for the application version the node runs",
                 timeout.as_secs_f64()
             ),
             Error::Disconnected => f.write_str("the node closed the connection"),
@@ -178,9 +180,9 @@ impl From<io::Error> for Error {
 /// Heartbeats never surface: they carry nothing and are skipped.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Frame<'a> {
-    /// An application response: its bytes, tag first. Application tags
-    /// start at `0x10` — everything below is the protocol's. Borrowed
-    /// from the connection's buffer, valid until the next read.
+    /// An application response: its body, the application's bytes with
+    /// the protocol's framing stripped. Borrowed from the connection's
+    /// buffer, valid until the next read.
     Response(&'a [u8]),
     /// The last frame of one request's reply batch.
     BatchEnd,
@@ -198,8 +200,8 @@ pub enum Frame<'a> {
 /// matches an arm that cannot come.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reply<'a> {
-    /// As [`Frame::Response`]: the response's bytes, tag first, borrowed
-    /// from the payload.
+    /// As [`Frame::Response`]: the response's body, borrowed from the
+    /// payload.
     Response(&'a [u8]),
     /// The node is alive and has nothing to say. Not an answer: a caller
     /// waiting on a reply keeps its own deadline, as `next_frame` does.
@@ -218,23 +220,22 @@ pub enum Reply<'a> {
 /// load generator on a user-space TCP stack — so it need not know the
 /// protocol's tags.
 ///
-/// Application tags start at `0x10`; the range below is the protocol's.
-/// A tag from it that is not one of the four a reply may carry — the
-/// handshake's tags, which are over before any reply, and reserved
-/// headroom — is [`Error::Protocol`]. So is an empty frame, and `0x00`
-/// with it: a zeroed buffer on the wire is a loud error, not an
-/// application response.
+/// A tag that is not one of the five a reply may carry — the
+/// handshake's tags, which are over before any reply, and any the
+/// protocol does not define — is [`Error::Protocol`]. So is an empty
+/// frame, and `0x00` with it: a zeroed buffer on the wire is a loud
+/// error, not an application response.
 pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
-    match payload.first() {
+    match payload.split_first() {
         None => Err(Error::Protocol("empty frame".into())),
-        Some(&TAG_RESPONSE_HEARTBEAT) => Ok(Reply::Heartbeat),
-        Some(&TAG_BATCH_END) => Ok(Reply::BatchEnd),
-        Some(&TAG_SERVER_BUSY) => Ok(Reply::ServerBusy),
-        Some(&TAG_ENGINE_ERROR) => Ok(Reply::EngineError),
-        Some(&tag) if tag < FIRST_APP_TAG => Err(Error::Protocol(format!(
-            "reserved tag {tag:#04x} in a response frame (application tags start at {FIRST_APP_TAG:#04x})"
+        Some((&TAG_APP, body)) => Ok(Reply::Response(body)),
+        Some((&TAG_RESPONSE_HEARTBEAT, _)) => Ok(Reply::Heartbeat),
+        Some((&TAG_BATCH_END, _)) => Ok(Reply::BatchEnd),
+        Some((&TAG_SERVER_BUSY, _)) => Ok(Reply::ServerBusy),
+        Some((&TAG_ENGINE_ERROR, _)) => Ok(Reply::EngineError),
+        Some((&tag, _)) => Err(Error::Protocol(format!(
+            "unexpected tag {tag:#04x} in a response frame"
         ))),
-        Some(_) => Ok(Reply::Response(payload)),
     }
 }
 
@@ -375,18 +376,19 @@ impl Connection {
         self.stream.peer_addr()
     }
 
-    /// Send one request: `[tag][body]`, flushed.
+    /// Send one request, the application's bytes, as an application
+    /// frame, flushed.
     ///
     /// The body is copied once in user space, into the writer's buffer;
     /// there is no staging buffer in between. A body that would take the
     /// frame over [`MAX_FRAME_SIZE`] is [`Error::RequestTooLarge`], and
     /// nothing is written: the node would drop the connection on it.
-    pub fn send(&mut self, tag: u8, body: &[u8]) -> Result<(), Error> {
-        let len = 1 + body.len();
+    pub fn send(&mut self, body: &[u8]) -> Result<(), Error> {
+        let len = TAG_LEN + body.len();
         if len > MAX_FRAME_SIZE {
             return Err(Error::RequestTooLarge { len });
         }
-        self.writer.write_frame_parts(&[&[tag], body])?;
+        self.writer.write_frame_parts(&[&[TAG_APP], body])?;
         self.writer.flush()?;
         Ok(())
     }
@@ -419,7 +421,10 @@ impl Connection {
                 Reply::BatchEnd => return Ok(Frame::BatchEnd),
                 Reply::ServerBusy => return Ok(Frame::ServerBusy),
                 Reply::EngineError => return Ok(Frame::EngineError),
-                Reply::Response(_) => return Ok(Frame::Response(self.reader.frame())),
+                // `classify` saw the tag, so the frame holds at least it.
+                Reply::Response(_) => {
+                    return Ok(Frame::Response(&self.reader.frame()[TAG_LEN..]));
+                }
             }
         }
     }
@@ -427,8 +432,8 @@ impl Connection {
     /// Send one request and collect the application frames of its reply
     /// batch, in order. A batch may hold none (the application had
     /// nothing to say) or several (a fill and its acknowledgement, say).
-    pub fn request(&mut self, tag: u8, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-        self.send(tag, body)?;
+    pub fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        self.send(body)?;
         let mut frames = Vec::new();
         loop {
             match self.next_frame()? {
@@ -442,8 +447,8 @@ impl Connection {
 
     /// [`request`](Self::request) for the common case of exactly one
     /// frame in reply; any other count is a protocol error.
-    pub fn request_one(&mut self, tag: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut frames = self.request(tag, body)?;
+    pub fn request_one(&mut self, body: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut frames = self.request(body)?;
         match frames.len() {
             1 => Ok(frames.swap_remove(0)),
             n => Err(Error::Protocol(format!(
@@ -693,15 +698,10 @@ mod tests {
 
     use super::*;
 
-    /// The application's side of the fake: a request tag and its reply.
-    const TAG_REQUEST: u8 = 0x10;
-    const TAG_REPLY: u8 = 0x30;
-
     /// How the fake node behaves once a client is authenticated.
     #[derive(Clone, Copy)]
     enum Behaviour {
-        /// Reply to every request with its body behind `TAG_REPLY`, then
-        /// end the batch.
+        /// Reply to every request with its body, then end the batch.
         Echo,
         /// A heartbeat before every reply, and two reply frames per batch.
         ChattyEcho,
@@ -732,11 +732,17 @@ mod tests {
         buf[..n].to_vec()
     }
 
-    fn app_frame(tag: u8, body: &[u8]) -> Vec<u8> {
-        let mut frame = ((1 + body.len()) as u32).to_le_bytes().to_vec();
+    /// A frame under any tag, length prefix included.
+    fn tagged_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = ((TAG_LEN + body.len()) as u32).to_le_bytes().to_vec();
         frame.push(tag);
         frame.extend_from_slice(body);
         frame
+    }
+
+    /// An application frame carrying `body`, length prefix included.
+    fn app_frame(body: &[u8]) -> Vec<u8> {
+        tagged_frame(TAG_APP, body)
     }
 
     /// The node's half of the handshake on `stream`, any kind of stream:
@@ -796,18 +802,16 @@ mod tests {
         }
         while let Ok(Some(request)) = reader.read_frame() {
             // `[tag][body]`
-            assert_eq!(request[0], TAG_REQUEST);
-            let body = request[1..].to_vec();
+            assert_eq!(request[0], TAG_APP);
+            let body = request[TAG_LEN..].to_vec();
             let reply: Vec<u8> = match behaviour {
-                Behaviour::Echo | Behaviour::EagerHeartbeat => [
-                    app_frame(TAG_REPLY, &body),
-                    control(TransportResponse::BatchEnd),
-                ]
-                .concat(),
+                Behaviour::Echo | Behaviour::EagerHeartbeat => {
+                    [app_frame(&body), control(TransportResponse::BatchEnd)].concat()
+                }
                 Behaviour::ChattyEcho => [
                     control(TransportResponse::Heartbeat),
-                    app_frame(TAG_REPLY, &body),
-                    app_frame(TAG_REPLY, b"again"),
+                    app_frame(&body),
+                    app_frame(b"again"),
                     control(TransportResponse::BatchEnd),
                 ]
                 .concat(),
@@ -823,7 +827,7 @@ mod tests {
                     }
                     return;
                 }
-                Behaviour::ZeroTag => app_frame(0x00, b"looks zeroed"),
+                Behaviour::ZeroTag => tagged_frame(0x00, b"looks zeroed"),
                 Behaviour::Busy => control(TransportResponse::ServerBusy),
                 Behaviour::Failing => control(TransportResponse::EngineError),
                 Behaviour::Hangup | Behaviour::AdminLines => unreachable!(),
@@ -857,19 +861,37 @@ mod tests {
         assert_eq!(node.public_key(), &key.verifying_key());
         assert_eq!(node.peer_addr().unwrap(), addr);
 
-        let reply = node.request_one(TAG_REQUEST, b"hello").unwrap();
-        assert_eq!(reply, [&[TAG_REPLY][..], b"hello"].concat());
+        let reply = node.request_one(b"hello").unwrap();
+        assert_eq!(reply, b"hello");
 
         // The same over the pipelined pair, several requests in flight.
         for n in 2..=4u64 {
-            node.send(TAG_REQUEST, &n.to_le_bytes()).unwrap();
+            node.send(&n.to_le_bytes()).unwrap();
         }
         for n in 2..=4u64 {
             assert_eq!(
                 node.next_frame().unwrap(),
-                Frame::Response(&[&[TAG_REPLY][..], &n.to_le_bytes()].concat())
+                Frame::Response(&n.to_le_bytes())
             );
             assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd);
+        }
+    }
+
+    /// The body is the application's from its first byte: one equal to a
+    /// protocol tag, or no byte at all, goes out and comes back as it is.
+    #[test]
+    fn a_body_is_carried_whatever_its_bytes() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::Echo);
+        let mut node = Connection::connect(addr, &key).unwrap();
+        for body in [
+            &[][..],
+            &[0x00],
+            &[TAG_BATCH_END],
+            &[TAG_APP, TAG_APP],
+            &[TAG_SERVER_BUSY, 1, 2, 3],
+        ] {
+            assert_eq!(node.request_one(body).unwrap(), body);
         }
     }
 
@@ -879,15 +901,12 @@ mod tests {
         let addr = fake_node(key.verifying_key(), Behaviour::ChattyEcho);
         let mut node = Connection::connect(addr, &key).unwrap();
 
-        let frames = node.request(TAG_REQUEST, b"x").unwrap();
+        let frames = node.request(b"x").unwrap();
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0], [TAG_REPLY, b'x']);
-        assert_eq!(frames[1], [&[TAG_REPLY][..], b"again"].concat());
+        assert_eq!(frames[0], b"x");
+        assert_eq!(frames[1], b"again");
 
-        assert!(matches!(
-            node.request_one(TAG_REQUEST, b"y"),
-            Err(Error::Protocol(_))
-        ));
+        assert!(matches!(node.request_one(b"y"), Err(Error::Protocol(_))));
     }
 
     #[test]
@@ -915,7 +934,7 @@ mod tests {
         let mut node = Connection::connect_timeout(addr, &key, timeout).unwrap();
 
         let started = Instant::now();
-        let err = node.request(TAG_REQUEST, b"dropped").unwrap_err();
+        let err = node.request(b"dropped").unwrap_err();
         assert!(started.elapsed() >= timeout);
         assert!(matches!(err, Error::NoReply { timeout: t } if t == timeout));
         assert!(err.to_string().contains("authorized_keys"), "{err}");
@@ -952,20 +971,14 @@ mod tests {
         // One byte over the widest body a frame takes once the tag is
         // counted.
         let body = vec![0xAB; MAX_FRAME_SIZE];
-        let err = node.send(TAG_REQUEST, &body).unwrap_err();
+        let err = node.send(&body).unwrap_err();
         assert!(matches!(err, Error::RequestTooLarge { len } if len == MAX_FRAME_SIZE + 1));
         assert!(err.to_string().contains("request too large"), "{err}");
 
         // Nothing reached the node, so the connection is as good as new,
         // and the widest body that fits goes through it.
-        assert_eq!(
-            node.request_one(TAG_REQUEST, b"still here").unwrap(),
-            [&[TAG_REPLY][..], b"still here"].concat()
-        );
-        assert_eq!(
-            node.request_one(TAG_REQUEST, &body[1..]).unwrap(),
-            [&[TAG_REPLY][..], &body[1..]].concat()
-        );
+        assert_eq!(node.request_one(b"still here").unwrap(), b"still here");
+        assert_eq!(node.request_one(&body[1..]).unwrap(), &body[1..]);
     }
 
     #[test]
@@ -973,7 +986,7 @@ mod tests {
         let key = client_key();
         let addr = fake_node(key.verifying_key(), Behaviour::ZeroTag);
         let mut node = Connection::connect(addr, &key).unwrap();
-        node.send(TAG_REQUEST, b"").unwrap();
+        node.send(b"").unwrap();
         assert!(matches!(node.next_frame(), Err(Error::Protocol(_))));
     }
 
@@ -985,7 +998,7 @@ mod tests {
         let mut node = Connection::connect_timeout(addr, &key, timeout).unwrap();
 
         let started = Instant::now();
-        let err = node.request(TAG_REQUEST, b"dropped").unwrap_err();
+        let err = node.request(b"dropped").unwrap_err();
         assert!(started.elapsed() >= timeout);
         // The deadline is checked as each heartbeat arrives, so the
         // wait ends within a heartbeat gap of the timeout — the node's
@@ -1000,21 +1013,15 @@ mod tests {
 
         let addr = fake_node(key.verifying_key(), Behaviour::Busy);
         let mut node = Connection::connect(addr, &key).unwrap();
-        node.send(TAG_REQUEST, b"").unwrap();
+        node.send(b"").unwrap();
         assert_eq!(node.next_frame().unwrap(), Frame::ServerBusy);
-        assert!(matches!(
-            node.request(TAG_REQUEST, b""),
-            Err(Error::ServerBusy)
-        ));
+        assert!(matches!(node.request(b""), Err(Error::ServerBusy)));
 
         let addr = fake_node(key.verifying_key(), Behaviour::Failing);
         let mut node = Connection::connect(addr, &key).unwrap();
-        node.send(TAG_REQUEST, b"").unwrap();
+        node.send(b"").unwrap();
         assert_eq!(node.next_frame().unwrap(), Frame::EngineError);
-        assert!(matches!(
-            node.request(TAG_REQUEST, b""),
-            Err(Error::EngineError)
-        ));
+        assert!(matches!(node.request(b""), Err(Error::EngineError)));
     }
 
     #[test]
@@ -1045,10 +1052,7 @@ mod tests {
         let mut node =
             Connection::connect_by(addr, &key, Instant::now() + Duration::from_secs(10)).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(500));
-        assert_eq!(
-            node.request_one(TAG_REQUEST, b"up").unwrap(),
-            [&[TAG_REPLY][..], b"up"].concat()
-        );
+        assert_eq!(node.request_one(b"up").unwrap(), b"up");
     }
 
     #[test]
@@ -1118,14 +1122,10 @@ mod tests {
 
         // The stream is the caller's from here: a request framed by hand
         // gets its reply batch.
-        let request = [&[TAG_REQUEST][..], b"raw"].concat();
-        stream
-            .write_all(&(request.len() as u32).to_le_bytes())
-            .unwrap();
-        stream.write_all(&request).unwrap();
+        stream.write_all(&app_frame(b"raw")).unwrap();
         assert_eq!(
             read_raw_frame(&mut stream),
-            [&[TAG_REPLY][..], b"raw"].concat()
+            [&[TAG_APP][..], b"raw"].concat()
         );
         assert_eq!(read_raw_frame(&mut stream), [TAG_BATCH_END]);
     }
@@ -1141,14 +1141,10 @@ mod tests {
         authenticate(&mut stream, &key).unwrap();
         assert_eq!(read_raw_frame(&mut stream), [TAG_RESPONSE_HEARTBEAT]);
 
-        let request = [&[TAG_REQUEST][..], b"after"].concat();
-        stream
-            .write_all(&(request.len() as u32).to_le_bytes())
-            .unwrap();
-        stream.write_all(&request).unwrap();
+        stream.write_all(&app_frame(b"after")).unwrap();
         assert_eq!(
             read_raw_frame(&mut stream),
-            [&[TAG_REPLY][..], b"after"].concat()
+            [&[TAG_APP][..], b"after"].concat()
         );
     }
 
@@ -1365,19 +1361,23 @@ mod tests {
             Reply::EngineError
         );
 
-        // A response is handed back whole, tag first, from the first
-        // application tag to the last.
-        let response = [&[TAG_REPLY][..], b"body"].concat();
-        assert_eq!(classify(&response).unwrap(), Reply::Response(&response));
-        for tag in [0x10, 0xFF] {
-            assert_eq!(classify(&[tag]).unwrap(), Reply::Response(&[tag]));
+        // A response is handed back as its body, the tag stripped, and
+        // the body may start with any byte or be empty.
+        let response = app_frame(b"body");
+        assert_eq!(classify(&response[4..]).unwrap(), Reply::Response(b"body"));
+        for body in [&[][..], &[0x00], &[TAG_BATCH_END], &[TAG_APP]] {
+            assert_eq!(
+                classify(&app_frame(body)[4..]).unwrap(),
+                Reply::Response(body)
+            );
         }
     }
 
     #[test]
     fn classify_refuses_what_a_reply_never_carries() {
-        // Nothing, a zeroed frame, the handshake's frames, and the rest
-        // of the protocol's range.
+        // Nothing, a zeroed frame, the handshake's frames, a tag the
+        // protocol does not define, and an application tag as a
+        // pre-release build framed one.
         assert!(matches!(classify(&[]), Err(Error::Protocol(_))));
         for wrong in [
             vec![0x00],
@@ -1386,10 +1386,14 @@ mod tests {
             payload(TransportResponse::AuthFailed),
             payload(TransportResponse::ServerReady),
             vec![0x0F],
+            vec![0x10, 0x01],
         ] {
             let err = classify(&wrong).unwrap_err();
             assert!(matches!(err, Error::Protocol(_)), "{wrong:?}: {err}");
-            assert!(err.to_string().contains("reserved tag"), "{wrong:?}: {err}");
+            assert!(
+                err.to_string().contains("unexpected tag"),
+                "{wrong:?}: {err}"
+            );
         }
     }
 

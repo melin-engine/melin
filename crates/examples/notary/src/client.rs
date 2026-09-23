@@ -35,7 +35,7 @@ use clap::{Args, Parser, Subcommand};
 use melin_client::{Connection, key};
 use notary_server::receipt::{Receipt, hex};
 use notary_server::{
-    HEAD_LEN, LEAF_LEN, TAG_GET_HEAD, TAG_NOTARIZE, TAG_RESP_HEAD, TAG_RESP_REJECTED,
+    HEAD_LEN, KIND_GET_HEAD, KIND_NOTARIZE, KIND_RESP_HEAD, KIND_RESP_REJECTED, LEAF_LEN,
 };
 
 type Error = Box<dyn std::error::Error>;
@@ -166,7 +166,7 @@ fn default_receipt_path(file: &Path) -> PathBuf {
 fn notarize(file: &Path, endpoint: &Endpoint) -> Result<Receipt, Error> {
     let leaf = digest_file(file)?;
     let mut node = connect(endpoint)?;
-    let response = request(&mut node, TAG_NOTARIZE, &leaf)?;
+    let response = request(&mut node, KIND_NOTARIZE, &leaf)?;
     let receipt = Receipt::from_frame(&response, leaf)?;
     // The server is not trusted blindly: a receipt that does not fold is
     // worthless, and better refused now than discovered at verification.
@@ -196,9 +196,9 @@ fn verify(file: &Path, receipt: &Receipt) -> Result<Result<(), String>, Error> {
 
 fn query_head(endpoint: &Endpoint) -> Result<(u64, [u8; HEAD_LEN]), Error> {
     let mut node = connect(endpoint)?;
-    let response = request(&mut node, TAG_GET_HEAD, &[])?;
-    // `[tag][entries: u64][head: 32]`
-    if response.first() != Some(&TAG_RESP_HEAD) || response.len() != 1 + 8 + HEAD_LEN {
+    let response = request(&mut node, KIND_GET_HEAD, &[])?;
+    // `[kind][entries: u64][head: 32]`
+    if response.first() != Some(&KIND_RESP_HEAD) || response.len() != 1 + 8 + HEAD_LEN {
         return Err(format!("unexpected response to a head query: {}", hex(&response)).into());
     }
     Ok((
@@ -226,11 +226,12 @@ fn connect(endpoint: &Endpoint) -> Result<Connection, Error> {
     Ok(Connection::connect(endpoint.server, &key)?)
 }
 
-/// Send one request and return its one response (tag included), with
-/// the notary's own rejection turned into an error.
-fn request(node: &mut Connection, tag: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
-    let response = node.request_one(tag, body)?;
-    if response.first() == Some(&TAG_RESP_REJECTED) {
+/// Send one request, its `kind` then its `fields`, and return its one
+/// response (kind first), with the notary's own rejection turned into an
+/// error.
+fn request(node: &mut Connection, kind: u8, fields: &[u8]) -> Result<Vec<u8>, Error> {
+    let response = node.request_one(&[&[kind][..], fields].concat())?;
+    if response.first() == Some(&KIND_RESP_REJECTED) {
         return Err("the server rejected the request".into());
     }
     Ok(response)

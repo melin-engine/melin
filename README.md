@@ -56,8 +56,8 @@ Melin's core crates form a generic sequencer. Your application plugs in via four
 |-------|------|
 | `AppEvent` | Your journaled event type: its encoding, and the widest it can get, which the journal sizes itself from |
 | `Application` | Your business logic: receives events, produces output, snapshots and restores its state |
-| `RequestDecoder` | Turns a request's tag and body into your event; the runtime reads the framing |
-| `ResponseEncoder` | Writes your response's body and names its tag; the runtime frames it |
+| `RequestDecoder` | Turns a request's body, laid out as you define it, into your event; the runtime reads the framing |
+| `ResponseEncoder` | Writes your response's body; the runtime frames it |
 
 The one rule: `Application` must be deterministic: no I/O, no clocks, no randomness. Its state before the first event is its `Default`, identical on every node. Anything an operator configures — initial reference data, rate limits, caps — reaches it as events the runtime journals on the node's behalf (`StartupEvents`): a genesis set when the journal is created, and a set each time a node becomes primary. So replicas apply the primary's values, and replaying the journal reproduces every decision made under them. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and your binary becomes pure composition:
 

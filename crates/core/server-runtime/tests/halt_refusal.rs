@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{
-    Counter, RequestDecoder, ResponseEncoder, TAG_GET_VALUE, TAG_INCREMENT, TAG_RESP_ACK,
-    TAG_RESP_REJECTED, TAG_RESP_VALUE,
+    Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE, RequestDecoder,
+    ResponseEncoder, increment_request,
 };
 use ed25519_dalek::SigningKey;
 use melin_client::Connection;
@@ -97,14 +97,14 @@ fn wait_for_gauge(health: SocketAddr, name: &str, value: u64) {
 }
 
 /// Send one request and return the single frame of its reply.
-fn one_reply(conn: &mut Connection, tag: u8, body: &[u8]) -> Vec<u8> {
-    conn.request_one(tag, body)
-        .unwrap_or_else(|e| panic!("request (tag {tag:#04x}) failed: {e}"))
+fn one_reply(conn: &mut Connection, body: &[u8]) -> Vec<u8> {
+    conn.request_one(body)
+        .unwrap_or_else(|e| panic!("request {body:02x?} failed: {e}"))
 }
 
 fn value_of(conn: &mut Connection) -> u64 {
-    let reply = one_reply(conn, TAG_GET_VALUE, &[]);
-    assert_eq!(reply[0], TAG_RESP_VALUE);
+    let reply = one_reply(conn, &GET_VALUE_REQUEST);
+    assert_eq!(reply[0], KIND_RESP_VALUE);
     u64::from_le_bytes(reply[1..9].try_into().expect("8 bytes"))
 }
 
@@ -170,15 +170,15 @@ fn a_write_refused_while_halted_is_not_replayed() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut conn = Connection::connect_by(primary_client, &client_key, deadline)
         .expect("client connects to the primary");
-    let ack = one_reply(&mut conn, TAG_INCREMENT, &1u64.to_le_bytes());
-    assert_eq!(ack[0], TAG_RESP_ACK, "the first increment is acked");
+    let ack = one_reply(&mut conn, &increment_request(1));
+    assert_eq!(ack[0], KIND_RESP_ACK, "the first increment is acked");
 
     // --- Halted: the replica leaves, the next write is refused. ---
     stop_node(replica, &replica_shutdown, replica_client);
     wait_for_gauge(primary_health, "melin_replicas_connected", 0);
-    let refused = one_reply(&mut conn, TAG_INCREMENT, &5u64.to_le_bytes());
+    let refused = one_reply(&mut conn, &increment_request(5));
     assert_eq!(
-        refused[0], TAG_RESP_REJECTED,
+        refused[0], KIND_RESP_REJECTED,
         "a halted primary must refuse the write"
     );
     assert_eq!(
@@ -197,8 +197,8 @@ fn a_write_refused_while_halted_is_not_replayed() {
     let replica_shutdown = Arc::new(AtomicBool::new(false));
     let replica = spawn_node(replica_config, &replica_shutdown);
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
-    let ack = one_reply(&mut conn, TAG_INCREMENT, &5u64.to_le_bytes());
-    assert_eq!(ack[0], TAG_RESP_ACK, "the resend is taken");
+    let ack = one_reply(&mut conn, &increment_request(5));
+    assert_eq!(ack[0], KIND_RESP_ACK, "the resend is taken");
     assert_eq!(value_of(&mut conn), 6);
     drop(conn);
     stop_node(replica, &replica_shutdown, replica_client);

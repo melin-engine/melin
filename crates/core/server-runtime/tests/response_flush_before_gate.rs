@@ -20,7 +20,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use counter_server::{Counter, CounterQuery, CounterReport, ResponseEncoder};
+use counter_server::{Counter, CounterQuery, CounterReport, KIND_RESP_ACK, ResponseEncoder};
 use melin_pipeline::padding::CachePadded;
 use melin_pipeline::ring::DisruptorBuilder;
 use melin_pipeline::wait::WaitStrategy;
@@ -32,11 +32,13 @@ use melin_transport_core::fence::FenceState;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 use melin_transport_core::{DurableWireSeqCursor, WireSeq};
 use melin_wire_protocol::blocking::BlockingFrameWriter;
+use melin_wire_protocol::control_codec::TAG_APP;
 
-/// `CounterReport::Ack` on the wire: len(4) + tag(1) + value(8).
-const FRAME_LEN: usize = 13;
-/// Payload length the counter encoder writes into the length prefix.
-const PAYLOAD_LEN: u32 = 9;
+/// `CounterReport::Ack` on the wire: len(4) + tag(1), then the counter's
+/// body, kind(1) + value(8).
+const FRAME_LEN: usize = 14;
+/// What the length prefix counts: the tag and the body.
+const PAYLOAD_LEN: u32 = 10;
 
 /// Long enough that a genuine hang is distinguishable from scheduler
 /// noise on a loaded box, short enough to fail in bounded time.
@@ -68,7 +70,12 @@ fn read_ack(sock: &mut UnixStream) -> std::io::Result<u64> {
         PAYLOAD_LEN,
         "unexpected length prefix"
     );
-    Ok(u64::from_le_bytes(frame[5..].try_into().expect("8 bytes")))
+    assert_eq!(
+        frame[4..6],
+        [TAG_APP, KIND_RESP_ACK],
+        "an application frame carrying the counter's ack"
+    );
+    Ok(u64::from_le_bytes(frame[6..].try_into().expect("8 bytes")))
 }
 
 /// Build a response-stage config gating on `journal_cursor` alone.

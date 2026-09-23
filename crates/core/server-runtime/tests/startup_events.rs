@@ -16,8 +16,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use counter_server::{
-    Counter, CounterEvent, RequestDecoder, ResponseEncoder, TAG_GET_VALUE, TAG_INCREMENT,
-    TAG_RESP_VALUE,
+    Counter, CounterEvent, GET_VALUE_REQUEST, KIND_RESP_VALUE, RequestDecoder, ResponseEncoder,
+    increment_request,
 };
 use melin_client::{Connection, SigningKey, key};
 use melin_server_runtime::StartupEvents;
@@ -100,8 +100,8 @@ impl Node {
         .expect("a serving node (boot stuck before the accept loop?)");
         node.set_read_timeout(Duration::from_secs(30))
             .expect("set timeout");
-        let frame = node.request_one(TAG_GET_VALUE, &[]).expect("query");
-        assert_eq!(frame[0], TAG_RESP_VALUE);
+        let frame = node.request_one(&GET_VALUE_REQUEST).expect("query");
+        assert_eq!(frame[0], KIND_RESP_VALUE);
         u64::from_le_bytes(frame[1..9].try_into().expect("8-byte value"))
     }
 
@@ -114,7 +114,7 @@ impl Node {
         .expect("a serving node");
         node.set_read_timeout(Duration::from_secs(30))
             .expect("set timeout");
-        node.request_one(TAG_INCREMENT, &amount.to_le_bytes())
+        node.request_one(&increment_request(amount))
             .expect("increment");
     }
 
