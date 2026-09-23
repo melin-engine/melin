@@ -244,8 +244,8 @@ pub trait AppEvent: Copy {
     /// small is a bug the journal cannot paper over — every reservation
     /// downstream is computed from this number — so it is checked at
     /// compile time against the journal's entry ceiling, and at encode
-    /// time against each event's actual `encoded_size`, which is refused
-    /// if it exceeds what was declared.
+    /// time against each event's actual `encoded_size`: an event that
+    /// exceeds what was declared stops the node rather than be journaled.
     ///
     /// The compile-time check fires when the journal is instantiated for
     /// this type, so it surfaces on `cargo build` and `cargo test`, not on
@@ -268,8 +268,8 @@ pub trait AppEvent: Copy {
 
     /// Encode this event into `buf`. Caller guarantees `buf.len() >=
     /// self.encoded_size()`. Returns the number of bytes written, which
-    /// must equal `self.encoded_size()`: the journal refuses an event
-    /// whose two figures disagree rather than persist it.
+    /// must equal `self.encoded_size()`: an event whose two figures
+    /// disagree stops the node rather than be journaled truncated.
     fn encode(&self, buf: &mut [u8]) -> usize;
 
     /// Decode an event from `buf`. `buf` contains exactly one encoded
