@@ -175,8 +175,13 @@ truncated entry. Nothing notices until a recovery or a replica fails to
 decode it, or decodes it into something else.
 
 (The first draft of this finding claimed the primary and replica would
-hold different bytes. They cannot: `replication_wire::append_input_slot`,
-which re-encodes events, is only reached from tests.)
+hold different bytes. On the live stream they cannot. The one production
+path that re-encodes, `replication_wire::append_input_slot` under journal
+catch-up, encodes events it has just decoded out of journal files, so a
+disagreement there is either an entry an earlier build wrote or a
+`decode` whose result encodes to a different size than the bytes it
+read; it asserts, stopping the catch-up thread, rather than ship a frame
+the replica cannot decode.)
 
 **Fix.** Quick: make the check hard, `CorruptEntry` in the codec,
 alongside the neighbouring bound checks; the journal stage then fails

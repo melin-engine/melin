@@ -159,11 +159,10 @@ pub struct ApplyCtx {
     /// Not monotonic from one event to the next, and not unique. Events
     /// read together share one stamp; a rare race between the node's
     /// producers can sequence an event slightly out of stamp order; and a
-    /// clock step on
-    /// the primary, or a failover to a node whose clock is behind, moves
-    /// it backwards. Order is the sequence, never this. An application
-    /// that reports or attests to this time should not promise its
-    /// readers that it increases.
+    /// clock step on the primary, or a failover to a node whose clock is
+    /// behind, moves it backwards. Order is the sequence, never this. An
+    /// application that reports or attests to this time should not
+    /// promise its readers that it increases.
     pub now_ns: u64,
     /// [`key_hash`] of the public key that authenticated the connection
     /// that submitted this event. `0` for events the node journals on its own

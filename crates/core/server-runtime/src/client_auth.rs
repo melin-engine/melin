@@ -122,6 +122,22 @@ mod tests {
         assert!(err.to_string().contains("client listener"), "{err}");
     }
 
+    /// A keys file can list any 32 bytes; ones that are not a point on
+    /// the curve cannot verify anything and are refused as such.
+    #[test]
+    fn a_listed_key_that_is_not_a_curve_point_is_refused() {
+        let not_a_point = [0x02; 32];
+        assert!(
+            VerifyingKey::from_bytes(&not_a_point).is_err(),
+            "the fixture must not decompress to a point"
+        );
+        let listed = base64::engine::general_purpose::STANDARD.encode(not_a_point);
+        let keys = AuthorizedKeys::parse(&format!("operator {listed} test\n")).unwrap();
+        let signature = key().sign(&NONCE).to_bytes();
+        let err = verify_client(&keys, &NONCE, &not_a_point, &signature).unwrap_err();
+        assert!(matches!(err, ClientAuthError::InvalidKey(_)), "{err}");
+    }
+
     #[test]
     fn a_signature_by_another_key_is_refused() {
         let impostor = SigningKey::from_bytes(&[0x33; 32]);

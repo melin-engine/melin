@@ -153,8 +153,14 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
             let written = e.encode(&mut buf[start..start + n]);
             // The journal codec refuses this disagreement before an event
             // is journaled, and the live stream ships the journal's own
-            // bytes rather than re-encoding here; a mismatch reaching this
-            // encoder is a bug to stop on, not a case to handle.
+            // bytes rather than re-encoding here. Journal catch-up does
+            // re-encode, from events it decoded out of journal files, so
+            // a mismatch can reach this encoder only from an entry an
+            // earlier build wrote or from a `decode` whose result encodes
+            // to a different size than the bytes it read: an application
+            // bug either way, and one that stops the catch-up (a panic on
+            // its thread) rather than ship a frame the replica cannot
+            // decode.
             assert_eq!(written, n, "AppEvent::encode disagrees with encoded_size");
             SLOT_TAG_APP
         }
