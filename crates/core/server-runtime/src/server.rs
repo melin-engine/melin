@@ -3395,7 +3395,6 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
 ) -> Result<(Permission, [u8; 32]), Box<dyn std::error::Error>> {
     use std::io;
 
-    use ed25519_dalek::{Verifier, VerifyingKey};
     use melin_wire_protocol::control::TransportResponse;
     use melin_wire_protocol::control_codec;
 
@@ -3438,32 +3437,14 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         }
     };
 
-    let (signature_bytes, public_key_bytes) = (cr.signature, cr.public_key);
-
-    // Look up the public key in authorized_keys.
-    let permission = match authorized_keys.lookup(&public_key_bytes) {
-        Some(perm) => perm,
-        None => {
-            send_auth_failed(writer);
-            return Err("unknown public key".into());
-        }
-    };
-    if !permission.may_connect_as_client() {
-        send_auth_failed(writer);
-        return Err(format!("{permission:?} key refused on the client listener").into());
-    }
-
-    // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
-    // client_eph`. TCP path's ephs are zeros — see Challenge above.
-    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-        send_auth_failed(writer);
-        io::Error::other(format!("invalid public key: {e}"))
-    })?;
-    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    verifying_key.verify(&nonce, &signature).map_err(|e| {
-        send_auth_failed(writer);
-        io::Error::other(format!("signature verification failed: {e}"))
-    })?;
+    let public_key_bytes = cr.public_key;
+    let permission = crate::client_auth::verify_client(
+        authorized_keys,
+        &nonce,
+        &public_key_bytes,
+        &cr.signature,
+    )
+    .inspect_err(|_| send_auth_failed(writer))?;
 
     // Auth succeeded — send ServerReady.
     let written =

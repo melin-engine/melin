@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 
-use ed25519_dalek::{Verifier, VerifyingKey};
 use melin_app::Application;
 use melin_app::auth::AuthorizedKeys;
 use melin_app::auth::Permission;
@@ -731,58 +730,30 @@ fn process_auth_frame(
     conn.parse_buf.copy_within(consumed.., 0);
     conn.parse_buf.truncate(remaining);
 
-    let (signature_bytes, public_key_bytes) = (cr.signature, cr.public_key);
-
-    // Look up the public key.
-    let permission = match authorized_keys.lookup(&public_key_bytes) {
-        Some(perm) => perm,
-        None => {
-            debug!(
-                connection_id = conn.connection_id.0,
-                "DPDK: unknown public key"
-            );
-            send_auth_failed(conn, transport);
-            return;
-        }
-    };
-    if !permission.may_connect_as_client() {
-        debug!(
-            connection_id = conn.connection_id.0,
-            permission = ?permission,
-            "DPDK: key refused on the client listener"
-        );
-        send_auth_failed(conn, transport);
-        return;
-    }
-
-    // Extract the nonce captured at Challenge-send time and feed it
-    // back into the signing payload now.
+    // The nonce captured at Challenge-send time, which the client signed.
     let nonce = match &conn.auth {
         AuthState::WaitingForResponse { nonce, .. } => *nonce,
         _ => unreachable!("process_auth_frame called in wrong state"),
     };
 
-    // Verify the Ed25519 signature over the nonce.
-    let verifying_key = match VerifyingKey::from_bytes(&public_key_bytes) {
-        Ok(k) => k,
-        Err(_) => {
+    let public_key_bytes = cr.public_key;
+    let permission = match crate::client_auth::verify_client(
+        authorized_keys,
+        &nonce,
+        &public_key_bytes,
+        &cr.signature,
+    ) {
+        Ok(permission) => permission,
+        Err(e) => {
             debug!(
                 connection_id = conn.connection_id.0,
-                "DPDK: invalid public key"
+                error = %e,
+                "DPDK: auth failed"
             );
             send_auth_failed(conn, transport);
             return;
         }
     };
-    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    if verifying_key.verify(&nonce, &signature).is_err() {
-        debug!(
-            connection_id = conn.connection_id.0,
-            "DPDK: signature verification failed"
-        );
-        send_auth_failed(conn, transport);
-        return;
-    }
 
     // Auth succeeded — send ServerReady.
     let mut buf = [0u8; 16];
