@@ -4,9 +4,9 @@ This document describes the journaling policy, rotation mechanism, and every rec
 
 ## Overview
 
-The trading engine uses a write-ahead journal for event sourcing and crash recovery. Every input command (order submit, cancel, deposit, etc.) is journaled before acknowledgement. The matching engine is deterministic, so replaying the journal from genesis reproduces the exact same state.
+The sequencer uses a write-ahead journal for event sourcing and crash recovery. Every input event is journaled before acknowledgement. The application is deterministic, so replaying the journal from genesis reproduces the exact same state.
 
-Snapshots capture the full exchange state at a known journal sequence boundary. Recovery from a snapshot skips replaying all events before that boundary, reducing startup time from O(total events) to O(events since snapshot).
+Snapshots capture the application's full state at a known journal sequence boundary. Recovery from a snapshot skips replaying all events before that boundary, reducing startup time from O(total events) to O(events since snapshot).
 
 Journal rotation prevents unbounded disk growth by archiving the active journal as a sealed segment and starting a fresh one. **Rotation runs while the engine is live** — no restart required.
 

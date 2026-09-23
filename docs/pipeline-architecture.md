@@ -1,6 +1,6 @@
 # Pipeline Architecture
 
-This document describes the LMAX-style disruptor pipeline that forms the core of the trading engine's I/O and execution model.
+This document describes the LMAX-style disruptor pipeline that forms the core of the sequencer's I/O and execution model, around the application it hosts.
 
 ## Overview
 
@@ -23,17 +23,17 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
                                                      (gated on journal)
 ```
 
-1. **Reader** -- a single thread multiplexes every TCP client connection and publishes decoded requests into the input disruptor. The same thread also generates the engine's scheduler ticks at the configured cadence (**default 250 ms**). With this, the input ring is single-producer in steady state on both transports.
+1. **Reader** -- a single thread multiplexes every TCP client connection and publishes decoded requests into the input disruptor. The same thread also generates the application's clock ticks at the configured cadence (**default 250 ms**). With this, the input ring is single-producer in steady state on both transports.
    - **io_uring**: the reader arms an `IORING_OP_TIMEOUT` SQE at the cadence; the deadline wakes `submit_and_wait` even when no client traffic is flowing, and the loop emits a `JournalEvent::Tick { now_ns }` when the deadline passes.
    - **DPDK**: the poll thread compares the wall clock to the deadline once every ~4096 poll iterations (negligible cost on a 100% busy spin loop) and emits the tick the same way.
-2. **Tick semantics** -- the matching stage advances its scheduler clock from `slot.timestamp_ns` on every event, so under load each order/cancel implicitly fires due tasks at microsecond precision. The 250 ms tick is the safety net that keeps time moving forward during quiet periods (no client traffic).
+2. **Tick semantics** -- the matching stage advances the application's clock from each event's timestamp, so under load every event implicitly fires the application's due time-driven work at microsecond precision. The 250 ms tick is the safety net that keeps time moving forward during quiet periods (no client traffic).
 3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwrite` + `fdatasync`. Advances its cursor only after the write is durable.
-4. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
+4. **Matching stage** -- applies each event to the application (the `matching` thread in `--cores`) and publishes the reports it produces to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
 5. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
-6. **Event publisher** (optional) -- second consumer on the output ring, enabled by `--event-bind`. Broadcasts all execution events to TCP subscribers for market data gateways, analytics, and audit loggers. Ed25519 auth required.
-7. **Shadow stage** -- third consumer on the input ring, gated on the journal cursor. Periodically saves an exchange snapshot on a dedicated thread without pausing the matching engine. On by default; `--snapshot-interval-ms 0` disables it.
+6. **Event publisher** (optional) -- second consumer on the output ring, running a feed the application's binary supplies (a market-data broadcast, an audit stream) when `--event-bind` is set. An application that supplies none has no publisher.
+7. **Shadow stage** -- third consumer on the input ring, gated on the journal cursor. Periodically snapshots its own copy of the application on a dedicated thread, without pausing the matching stage. On by default; `--snapshot-interval-ms 0` disables it.
 
-**Why this design**: Single-threaded business logic (the matching stage) eliminates locks on the hot path. Parallelizing journal I/O with matching hides fsync latency. The persist-before-ack boundary is enforced at the response stage, not in the matching stage, so the engine never stalls waiting for disk.
+**Why this design**: Single-threaded business logic (the matching stage) eliminates locks on the hot path. Parallelizing journal I/O with the application hides fsync latency. The persist-before-ack boundary is enforced at the response stage, not in the matching stage, so the application never stalls waiting for disk.
 
 ## Full data flow (primary + replica)
 
@@ -82,8 +82,8 @@ The simplified diagram above shows the primary-side request path. The picture be
    |  |   +---+----+ +----+------+
    |  |       |           |
    |  |       v           v
-   |  |   CLIENT TCP   MARKET-DATA
-   |  |   (reports)    SUBSCRIBERS
+   |  |   CLIENT TCP   SUBSCRIBERS
+   |  |   (reports)
    |  |
    |  |  pwritev2 (RWF_DSYNC) -> JOURNAL FILE
    |  |  journal bytes carry (sequence, timestamp, event, key_hash)
@@ -153,10 +153,10 @@ The simplified diagram above shows the primary-side request path. The picture be
 | Reader (primary)           | Client TCP/DPDK + cadence wakeup (wall-clock-cadenced, monotonic-clamped) | Client requests AND `JournalEvent::Tick` into the same input ring |
 | Startup events (primary, boot or promotion) | The application's genesis and on-primary events | Application events into the input ring, applied before the first client is served |
 | Journal stage              | Input ring                              | Journal file; batch bytes into each replication ring  |
-| Matching stage             | Input ring                              | Execution reports into output ring                    |
+| Matching stage             | Input ring                              | Application reports into output ring                  |
 | Shadow stage               | Input ring (gated on journal)           | Periodic `.snapshot` files                            |
 | Response stage (primary)   | Output ring (gated on journal cursor)   | Client TCP                                            |
-| Event publisher (opt)      | Output ring                             | Subscriber TCP (market data feed)                     |
+| Event publisher (opt)      | Output ring                             | Subscriber TCP (the application's feed)               |
 | Replication sender         | Replication ring                        | Replica TCP                                           |
 | Replication receiver (rep) | Primary TCP                             | `InputSlot` into replica input ring (sequence stamped from primary's bytes) |
 
@@ -170,15 +170,15 @@ The simplified diagram above shows the primary-side request path. The picture be
 
 ### Scheduler clock
 
-The matching stage maintains a per-instance `last_drain_ns` watermark. At the head of every event it processes, if `slot.timestamp_ns > last_drain_ns` it drains all due scheduled tasks up to `slot.timestamp_ns` and updates the watermark. Under load this means each order/cancel event implicitly fires due tasks (GTD expiry, etc.) at microsecond precision, with no extra latency hop for a separate `Tick` event. The tick generator's role narrows to "make sure the clock advances during quiet periods" — at the default 250 ms cadence it costs ~4 events/sec of journal traffic.
+The matching stage keeps a watermark of the latest time it has handed the application. Before applying an event whose timestamp is past the watermark, it advances the application's clock to that timestamp — letting it fire whatever time-driven work has come due (expiries, session transitions) — and moves the watermark. Under load every event therefore advances the clock at microsecond precision, with no extra latency hop for a separate `Tick` event. The tick generator's role narrows to "make sure the clock advances during quiet periods" — at the default 250 ms cadence it costs four journal entries a second.
 
-`replay_event` and the shadow stage's `dispatch_event` mirror the same drain at the same point so live, replay, and shadow exchanges stay byte-identical.
+Journal replay and the shadow stage advance the clock at the same points, from the same journaled timestamps, so the live application, a recovered one and the shadow's copy stay identical.
 
 ## Input Disruptor
 
 The input disruptor is a multi-producer, multi-consumer ring buffer defined in `crates/core/pipeline/src/ring.rs`.
 
-**Capacity**: `INPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). At approximately 72 bytes per `InputSlot`, this is roughly 72 MiB -- sized to fit in L3 cache on modern server CPUs. Provides approximately 100 ms of buffering at 10M orders/sec, enough headroom for fsync stalls without backpressure reaching the readers.
+**Capacity**: `INPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). A slot holds the application's widest event inline beside the runtime's own fields, so the ring's footprint grows with the event width the application declares — one reason to keep events narrow. Provides approximately 100 ms of buffering at 10M events/sec, enough headroom for fsync stalls without backpressure reaching the readers.
 
 **Publishing**: Reader threads publish via `MultiProducer`, which uses CAS-based slot claiming (the LMAX multi-producer pattern):
 
@@ -192,16 +192,19 @@ The `MultiProducer` is `Clone + Send + Sync` -- each reader thread holds its own
 
 - **Consumer 0**: Journal stage
 - **Consumer 1**: Matching stage
-- **Consumer 2**: Shadow exchange stage, on by default (`--snapshot-interval-ms 0` disables it). Gated on the journal cursor — it only processes events after they are durable. Takes periodic snapshots on a dedicated thread without pausing the matching engine.
+- **Consumer 2**: Shadow stage, on by default (`--snapshot-interval-ms 0` disables it). Gated on the journal cursor — it only processes events after they are durable. Takes periodic snapshots on a dedicated thread without pausing the matching stage.
 
 Because the journal and matching consumers are gated only on the producer, they can process events concurrently. The journal stage does not block the matching stage, and vice versa. Backpressure is applied by the producer checking the minimum progress of all terminal consumers before claiming new slots.
 
-**`InputSlot` layout** (~72 bytes):
+**`InputSlot` layout** (padded to whole cache lines):
 
 | Field | Description |
 |-------|-------------|
 | `connection_id: u64` | Originating client connection |
-| `event: JournalEvent` | The command (order submit, cancel, deposit, etc.) |
+| `key_hash: u64` | Hash of the client's public key; 0 for events the node journals on its own behalf |
+| `sequence: u64` | Journal sequence; assigned by the journal stage on a primary, carried from the primary's stream on a replica |
+| `timestamp_ns: u64` | Wall-clock time stamped at ingress; zero for queries |
+| `event: JournalEvent` | An application event, or one the runtime journals itself (a tick, an epoch bump) |
 | `publish_ts: TraceTimestamp` | Disruptor publish timestamp (zero-sized when `latency-trace` disabled) |
 | `recv_ts: TraceTimestamp` | Wire receive timestamp (zero-sized when `latency-trace` disabled) |
 
@@ -257,22 +260,17 @@ On shutdown, the journal stage hands over any pending data, then drains all rema
 
 Defined in `crates/core/transport-core/src/pipeline.rs` as `MatchingStage`.
 
-The matching stage runs on a dedicated OS thread and is the only thread that mutates the `Exchange` state. This single-writer design eliminates all locks on the hot path.
+The matching stage runs on a dedicated OS thread and is the only thread that mutates the application's live state. This single-writer design eliminates all locks on the hot path.
 
 ### Processing loop
 
 1. Call `consumer.try_consume()` to read one event at a time (single-entry consumption, not batched).
-2. Execute the event against the `Exchange`, producing execution reports into a pre-allocated `Vec<ExecutionReport>` (capacity 256, reused across commands).
-3. Publish each execution report as an `OutputSlot` to the output SPSC, followed by a `BatchEnd` marker signaling the end of reports for this request.
+2. Apply the event to the application, which pushes its reports into a pre-allocated buffer reused across events. A query is answered instead, from the application's state without changing it.
+3. Publish each report as an `OutputSlot` to the output SPSC, followed by a `BatchEnd` marker signaling the end of reports for this request.
 
-### QueryStats handling
+### Queries
 
-`QueryStats` is handled inline in the matching stage without touching the `Exchange`. It reads:
-- A thread-local events counter (plain `u64`, flushed to a shared `Arc<AtomicU64>` only on `QueryStats` or shutdown)
-- The journal cursor (via a shared `Arc<Sequence>`)
-- The active connection count (via a shared `Arc<AtomicU64>`)
-
-This avoids adding any cross-thread synchronization cost on the trading hot path.
+A query never reaches the journal; the matching stage hands it to the application's query handler, in sequence with the events around it, so the answer reflects every event before it. Beside the query itself, the handler is given node-local facts it may report — the last durable journal sequence, the number of connected clients, the events processed since the process started — read without adding cross-thread synchronization to the hot path.
 
 ### Parallelism with journal
 
@@ -328,7 +326,7 @@ The check is made **per response**, not once per batch. A response is released a
 
 The one reply exempt from the wait is the refusal of a write while the node is halted. The write is refused before it enters the pipeline, so there is no event to wait on; the refusal is sent once the replies to everything received before it on that connection have gone out, keeping replies in request order.
 
-A reply still waiting when the node stops, whether an operator stopped it or a newer primary superseded it, is dropped: the policy never confirmed the event, so the node cannot acknowledge it. The client sees the connection close, as it would on a crash, and reconciles on reconnect. The event itself is journaled and applied, so a retry of the same request is answered as a duplicate.
+A reply still waiting when the node stops, whether an operator stopped it or a newer primary superseded it, is dropped: the policy never confirmed the event, so the node cannot acknowledge it. The client sees the connection close, as it would on a crash, and reconciles on reconnect. The event itself is journaled and applied, so a retry of the same request is applied a second time unless the application recognises it as a repeat — a client that retries needs an application that deduplicates.
 
 The acked position is cached across batches to avoid redundant atomic loads when the policy's cursors are running ahead of the response stage.
 
@@ -363,7 +361,7 @@ When the SPSC is empty (idle period), the response stage scans connections for h
 
 The output SPSC queue connects the matching stage to the response stage. Defined in `crates/core/pipeline/src/spsc.rs`.
 
-**Capacity**: `OUTPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). Matches the input ring size because one input event can produce multiple output messages (e.g., a market order sweeping many price levels produces one `Fill` per level plus a `BatchEnd`).
+**Capacity**: `OUTPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). Matches the input ring size because one input event can produce several reports, followed by a `BatchEnd`.
 
 **Multi-consumer**: When `--event-bind` is set, the output ring has two consumers: (1) the response stage (per-client, gated on durability cursors), and (2) the event publisher (TCP broadcast to subscribers). Both consumers run in parallel. The producer is gated on the slowest consumer.
 
@@ -373,11 +371,11 @@ The output SPSC queue connects the matching stage to the response stage. Defined
 |-------|-------------|
 | `connection_id: u64` | Target client connection |
 | `input_seq: u64` | Input disruptor sequence (for journal cursor gating) |
-| `payload: OutputPayload` | `Report(ExecutionReport)`, `BatchEnd`, `EngineError`, or `StatsHeader` |
+| `payload: OutputPayload` | `Report` (an application report), `QueryResponse`, `BatchEnd`, or `EngineError` |
 | `match_complete_ts` | Matching completion timestamp (zero-sized when `latency-trace` disabled) |
 | `recv_ts` | Wire receive timestamp (zero-sized when `latency-trace` disabled) |
 
-The `BatchEnd` marker is critical: it tells the response stage that all execution reports for a given request have been published. The client uses this to know when a request is fully processed.
+The `BatchEnd` marker is critical: it tells the response stage that all reports for a given request have been published. The client uses this to know when a request is fully processed.
 
 The SPSC uses two cache-line-padded atomic counters (`head` and `tail`) for coordination, with cached values to reduce atomic reads on the fast path.
 
@@ -389,11 +387,11 @@ The server spawns four always-on pipeline threads plus one reader thread, and th
 |--------|-------------|------|-----------|
 | Journal Seq | 1 | Sequencing, encoding, hash chain, replica feed | No |
 | Journal Disk | 11 | Writes and syncs the journal; publishes durability | No |
-| Matching | 2 | Order execution (single-writer) | No |
+| Matching | 2 | Applies events to the application (single-writer) | No |
 | Response | 3 | Client socket writes | No |
 | Reader | 4 | io_uring-based connection multiplexing + tick generation | No |
-| Event Publisher | 6 | Broadcast execution events to subscribers | Yes (`--event-bind`) |
-| Shadow Exchange | 7 | Periodic snapshots without pausing matching | On by default (`--snapshot-interval-ms 0` disables) |
+| Event Publisher | 6 | Runs the application's subscriber feed | Yes (`--event-bind`, when the application supplies a feed) |
+| Shadow | 7 | Periodic snapshots without pausing matching | On by default (`--snapshot-interval-ms 0` disables) |
 | Repl Handler 0/1 | 8, 9 | Per-replica connection handling | Yes (one per connected replica) |
 | Segment Preparer | 10 | Pre-stage the next journal segment off the rotation path | Yes (recurring rotation only) |
 
@@ -437,9 +435,9 @@ The persist-before-ack invariant guarantees that **no client ever receives a res
 
 ### Why it matters
 
-Without this invariant, a crash between matching and journal sync could cause:
-- A client believes an order was placed, but the journal never recorded it.
-- On recovery, the exchange state diverges from what clients observed.
+Without this invariant, a crash between the application applying an event and the journal syncing it could cause:
+- A client believes its request took effect, but the journal never recorded it.
+- On recovery, the application's state diverges from what clients observed.
 - Regulatory audit trail is broken.
 
 ### How it is enforced
@@ -465,7 +463,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Feature | Effect |
 |---------|--------|
-| `no-persist` | Disables journal writes entirely. Events are still sequenced through the disruptor but not written to disk. Used for benchmarking engine throughput without I/O overhead. |
+| `no-persist` | Disables journal writes entirely. Events are still sequenced through the disruptor but not written to disk. Used for benchmarking the pipeline and the application without I/O overhead. |
 | `pipeline-stats` | Enables busy/idle utilization counters on each stage. Printed on shutdown showing percentage busy, total busy iterations, and total idle iterations. |
 | `latency-trace` | Enables per-event timestamps at each pipeline boundary. Tracks: disruptor wakeup latency (publish to consume), batch processing time, SPSC wakeup latency, dispatch latency, and server-side end-to-end (reader recv to response flush). Histograms are printed on shutdown. The `TraceTimestamp` type is `()` (zero-sized) when disabled, so there is no overhead in production builds. |
 | `io-uring` | No-op (kept for backward compatibility). io_uring is now always used for readers, response writes, and replication I/O. |
