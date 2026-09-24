@@ -126,11 +126,15 @@ differs.
 The floor is the last journaled timestamp, held where the sequence and
 chain hash already are:
 
-- the writer tracks `last_timestamp_ns` as it encodes, and recovery
-  restores it from the replayed tail: `open_append` takes it beside
-  `last_seq` and `valid_end`, and the crash-interrupted-rotation path
-  that synthesizes a live segment from `last_seq_seen` seeds the writer
-  from the last stamp seen the same way;
+- `JournalEncoder` tracks `last_timestamp_ns` as it encodes. It is the
+  one encoder behind every write: `BufferedWriter` wraps it, the journal
+  stage runs on it after `into_halves` splits the writer, and
+  `from_halves` hands it back when a replica is promoted, so the floor
+  moves with it through both handoffs with nothing to copy. Recovery
+  restores it from the replayed tail through the writer: `open_append`
+  takes it beside `last_seq` and `valid_end`, and the
+  crash-interrupted-rotation path that synthesizes a live segment from
+  `last_seq_seen` seeds it from the last stamp seen the same way;
 - the snapshot moves to transport version 3 with the timestamp at its
   anchor, and a node that starts from a snapshot (snapshot-only boot, or
   a replica seeded by snapshot transfer) seeds its writer from it. A v2
@@ -138,7 +142,8 @@ chain hash already are:
   upgrade boot. A v1 snapshot (no epoch) lacks the timestamp too and
   takes the same branch.
 
-`run_as_primary` (kernel TCP and DPDK) seeds the clock from the writer.
+`run_as_primary` (kernel TCP and DPDK) seeds the clock from the floor
+of the writer it receives.
 
 Not in the segment header. Every path that opens a writer reaches the
 floor from either a replayed entry or a snapshot: recovery walks back to
@@ -150,23 +155,27 @@ receivers. That is a replication protocol change for a convenience.
 
 ### 4. Enforce on disk, not by convention
 
-- The writer refuses a timestamp that is not strictly greater than its
-  last (`JournalError::TimestampRegression`). One check covers the
-  primary's journal stage, the replica's journal stage and the test
-  helpers. On a primary a refusal is a bug: the journal stage stops as
-  it does on an I/O failure, and the regression never reaches disk.
-  The writer's floor survives rotation (rotation runs on the same
-  writer, so an in-memory `last_timestamp_ns` carries over), which is
-  what covers segment boundaries on a replica: every entry it adopts,
-  including the first after a `Rotate`, goes through that check. No
-  separate check at `Rotate` is needed. That rests on one detail:
-  `begin_segment` resets the starting sequence, the batch state and
-  the chain, and the floor is the one piece of encoder state it must
-  leave alone. Resetting it there alongside the rest is the natural
-  mistake, and it would reopen the boundary on every replica with
-  nothing failing. A rotation test in the buffered writer pins it: an
-  entry stamped below the outgoing segment's last is refused as the
-  first entry of the new one.
+- `JournalEncoder` refuses a timestamp that is not strictly greater
+  than its last (`JournalError::TimestampRegression`). Being the one
+  encoder behind every write (decision 3), this single check covers the
+  primary's journal stage, the replica's journal stage, `BufferedWriter`
+  and the test helpers. On a primary a refusal is a bug: the journal
+  stage stops as it does on an I/O failure, and the regression never
+  reaches disk.
+  The floor survives rotation, which is what covers segment boundaries
+  on a replica: every entry it adopts, including the first after a
+  `Rotate`, goes through that check. No separate check at `Rotate` is
+  needed. That rests on one detail: `JournalEncoder::begin_segment`
+  resets the starting sequence, the batch state and the chain, and the
+  floor is the one piece of encoder state it must leave alone.
+  Resetting it there alongside the rest is the natural mistake, and it
+  would reopen the boundary on every replica with nothing failing. It
+  has two callers, `BufferedWriter`'s rotation and the journal stage's
+  (the one every running node, primary or replica, goes through), so
+  the test that pins it lives in `encoder.rs`, on `begin_segment`
+  itself: an entry stamped below the outgoing segment's last is refused
+  as the first entry of the new one. A test on either caller would
+  leave the other unpinned.
 - The reader applies the same rule on replay and catch-up, within a
   segment, as a hard error. Unlike `SequenceGap`, which recovery treats
   as a torn tail on the live segment and truncates at, a CRC-valid entry
@@ -221,12 +230,14 @@ One commit per step, each reviewable on its own.
    the separate tick clamp state in `tick.rs`, `reader.rs` and
    `dpdk_transport.rs`. Seeded at zero for now, so the only behaviour
    change is strict increase within one process lifetime.
-2. **The journal carries the floor:** writer `last_timestamp_ns`
-   (encode path, `open_append`, the interrupted-rotation path),
-   snapshot v3, recovery exposing the value, and `run_as_primary`
-   seeding the clock from the writer, with the lead warning.
-3. **Enforcement:** writer refusal (its floor surviving rotation, with
-   the rotation test that pins it), reader validation within a segment,
+2. **The journal carries the floor:** `JournalEncoder`'s
+   `last_timestamp_ns` (encode path, and seeded through the writer's
+   `open_append` and the interrupted-rotation path), snapshot v3,
+   recovery exposing the value, and `run_as_primary` seeding the clock
+   from the writer, with the lead warning.
+3. **Enforcement:** the encoder's refusal (its floor surviving
+   rotation, with the `begin_segment` test in `encoder.rs` that pins
+   it), reader validation within a segment,
    and the boundary check in recovery, seeded from the snapshot's
    timestamp when there is one.
    Must not land before step 2: with the floor not yet carried across a
