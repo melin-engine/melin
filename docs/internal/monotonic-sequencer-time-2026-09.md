@@ -159,7 +159,14 @@ receivers. That is a replication protocol change for a convenience.
   writer, so an in-memory `last_timestamp_ns` carries over), which is
   what covers segment boundaries on a replica: every entry it adopts,
   including the first after a `Rotate`, goes through that check. No
-  separate check at `Rotate` is needed.
+  separate check at `Rotate` is needed. That rests on one detail:
+  `begin_segment` resets the starting sequence, the batch state and
+  the chain, and the floor is the one piece of encoder state it must
+  leave alone. Resetting it there alongside the rest is the natural
+  mistake, and it would reopen the boundary on every replica with
+  nothing failing. A rotation test in the buffered writer pins it: an
+  entry stamped below the outgoing segment's last is refused as the
+  first entry of the new one.
 - The reader applies the same rule on replay and catch-up, within a
   segment, as a hard error. Unlike `SequenceGap`, which recovery treats
   as a torn tail on the live segment and truncates at, a CRC-valid entry
@@ -218,9 +225,10 @@ One commit per step, each reviewable on its own.
    (encode path, `open_append`, the interrupted-rotation path),
    snapshot v3, recovery exposing the value, and `run_as_primary`
    seeding the clock from the writer, with the lead warning.
-3. **Enforcement:** writer refusal (its floor surviving rotation),
-   reader validation within a segment, and the boundary check in
-   recovery, seeded from the snapshot's timestamp when there is one.
+3. **Enforcement:** writer refusal (its floor surviving rotation, with
+   the rotation test that pins it), reader validation within a segment,
+   and the boundary check in recovery, seeded from the snapshot's
+   timestamp when there is one.
    Must not land before step 2: with the floor not yet carried across a
    restart, the first entry after a clock step back would be refused.
    Carries most of the test churn, since many tests hand-build slots
