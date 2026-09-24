@@ -52,6 +52,18 @@ Findings that confirm, sharpen or correct the roadmap entry.
   `last_drain_ns`, and the matching stage (`pipeline.rs`), recovery
   (`journaled_app.rs`) and the shadow stage (`shadow.rs`) each hold
   their own copy, all starting at zero.
+- **A replica's journal is a bitwise mirror of the primary's.** A fresh
+  replica creates its segment from the `StreamStart` lineage (starting
+  sequence and chain anchor), the snapshot resync path from the `Ready`
+  decision, and adopted `Rotate` boundaries keep the files identical
+  across rotations (`tcp_receiver.rs`, `replication/dpdk.rs`). Whatever
+  the segment header gains, those frames must carry.
+- **No replica-generated journal entries exist.** The tick generator
+  runs only on a primary (reader thread, DPDK poll loop), so a replica's
+  journal holds the primary's stamps and nothing else.
+- **Queries see a zero clock.** `Application::query` receives
+  `now_ns == 0`: the decoder zeroes a query's stamp and the matching
+  stage passes it through.
 
 ## Design decisions
 
@@ -64,10 +76,23 @@ client events, ticks, startup events and the epoch bump. Client events
 are stamped per event from the per-batch wall-clock read, so the batch
 still costs one clock read and each event costs one compare.
 
-Queries keep timestamp `0` and consume nothing: they are never
-journaled. Halt refusals are never published, so they consume nothing
-either. The replica pipeline keeps the raw producer, since its slots
-carry the primary's stamps.
+The wrapper is the only stamping site. Today the frame decoder
+(`client_frames.rs`) writes the batch stamp into the slot; it stops
+doing so, and the slot reaches the wrapper unstamped. A second site
+that agrees with the first by convention is the shape this item is
+deleting elsewhere.
+
+Queries consume nothing: they are never journaled. They do get a time:
+the wrapper hands a query the last issued stamp without advancing the
+clock, so `Application::query` sees the clock the application was last
+driven to rather than zero. Halt refusals are never published, so they
+consume nothing either. The replica pipeline keeps the raw producer,
+since its slots carry the primary's stamps.
+
+The test-only helpers `apply_journaled` and `tick_journaled` stamp
+through the same clock rather than a test-only variant, so two calls
+inside one nanosecond stay strict and the helpers keep exercising the
+production rule.
 
 Not in the journal stage: the matching stage reads the slot, not the
 journal stage's output, so stamping there would need a mirrored copy of
@@ -82,10 +107,12 @@ watermark. There is nothing to seed, snapshot or reset on the consuming
 side, which is what makes the three consumers agree by construction.
 
 Cost: `tick` runs once per event instead of once per batch under load.
+Today's per-batch shared stamp already fires it once per drain, so the
+delta is per-batch to per-event, not nothing to per-event.
 `Application::tick`'s rustdoc already asks for a cheap "nothing is due"
 check and says it "runs ahead of nearly every event"; the exchange's
-`tick` is `drain_due_scheduled_tasks`. Measure with echo and counter
-before merging.
+`tick` is `drain_due_scheduled_tasks`, a heap peek when nothing is due.
+Measure with echo and counter before merging.
 
 Fallback if it measures badly: non-decreasing stamps, with `tick`
 firing when an entry's timestamp exceeds the previous entry's. That
@@ -99,15 +126,26 @@ differs.
 The floor is part of the lineage, next to sequence and chain hash:
 
 - the writer tracks `last_timestamp_ns` as it encodes, and recovery
-  restores it from the replayed tail;
+  restores it from the replayed tail: `open_append` takes it beside
+  `last_seq` and `valid_end`, and the crash-interrupted-rotation path
+  that synthesizes a live segment from `last_seq_seen` seeds the new
+  header from the last stamp seen the same way;
 - the segment file header gains an anchor timestamp beside
   `starting_sequence` and `anchor_hash`, so a segment on its own states
   its floor (useful for single-segment readers such as the planned
   `journal-info` inspector, and for checking the first entry across a
   rotation boundary);
+- the replication stream carries the anchor wherever it carries the
+  segment identity: the `StreamStart` lineage, the resync `Ready`
+  decision and the `Rotate` boundary frame. Without it a fresh replica
+  cannot create a header identical to the primary's, the bitwise mirror
+  breaks, and the replica's reader cannot validate its first entry.
+  Free while protocol 5 is unreleased;
 - the snapshot moves to transport version 3 with the timestamp at its
   anchor. A v2 snapshot seeds zero and logs a `warn!`; that only happens
-  once, on the upgrade boot.
+  once, on the upgrade boot. Transport v1 (no epoch) is dropped at the
+  same time: it predates the released upgrade path, and accepting it
+  would mean a second legacy branch to seed and test.
 
 `run_as_primary` (kernel TCP and DPDK) seeds the clock from the writer.
 
@@ -118,8 +156,11 @@ The floor is part of the lineage, next to sequence and chain hash:
   primary's journal stage, the replica's journal stage and the test
   helpers. On a primary a refusal is a bug: the journal stage stops as
   it does on an I/O failure, and the regression never reaches disk.
-- The reader applies the same rule on replay and catch-up, as it does
-  for `SequenceGap`.
+- The reader applies the same rule on replay and catch-up, on every
+  segment, as a hard error. Unlike `SequenceGap`, which recovery treats
+  as a torn tail on the live segment and truncates at, a CRC-valid entry
+  whose stamp regresses is not a torn write: it is a bug or tampering,
+  and recovery fails on it rather than silently dropping the tail.
 
 This is the "assertion, not a variable" the roadmap asks for, and it
 costs one compare per entry.
@@ -135,14 +176,18 @@ call. Free while format 15 and protocol 5 are unreleased.
 ### 6. Time is never wound back, so make a held clock visible
 
 After a failover to a node whose clock is behind, stamps advance by one
-nanosecond per event until the wall clock catches up, and due work does
-not fire in that window. A forward clock step on a primary is permanent
-for the same reason. Both are the intended trade (monotonic over
-accurate), but the operator must see them:
+nanosecond per event until the wall clock catches up, so work that
+falls due inside that window waits for it (work already due keeps
+firing). A forward clock step on a primary is permanent for the same
+reason. Both are the intended trade (monotonic over accurate), but the
+operator must see them:
 
-- a health gauge for how far the issued stamp leads the wall clock;
-- a `warn!` at boot or promotion when the lead exceeds a threshold
-  (proposed default: 1 s);
+- a health gauge for how far the issued stamp leads the wall clock. The
+  clock lives on the reader thread or the DPDK poll loop, so the gauge
+  is a shared atomic they store to once per tick, never per event;
+- a `warn!` at boot or promotion when that gauge exceeds a threshold
+  (proposed default: 1 s), so the warning is a threshold on a value the
+  operator can already read, not a separate code path;
 - a note in the operator docs that nodes need disciplined clocks and
   that a forward step cannot be undone.
 
@@ -155,23 +200,28 @@ One branch per step, each a reviewable commit.
    below build on it.
 1. **Clock and stamping producer** (`transport-core`, `server-runtime`):
    `SequencerClock` and the producer wrapper; the reader, the DPDK poll
-   loop, `journal_startup_events` and the epoch bump publish through it.
-   Replaces the separate tick clamp state in `tick.rs`, `reader.rs` and
+   loop, `journal_startup_events`, the epoch bump and the test helpers
+   publish through it, and the frame decoder stops stamping. Replaces
+   the separate tick clamp state in `tick.rs`, `reader.rs` and
    `dpdk_transport.rs`. Seeded at zero for now, so the only behaviour
    change is strict increase within one process lifetime.
-2. **The journal carries the floor:** writer `last_timestamp_ns`, the
-   header anchor timestamp, snapshot v3, recovery exposing the value,
-   and `run_as_primary` seeding the clock from the writer.
-3. **Enforcement:** writer refusal and reader validation. Carries most of
-   the test churn, since many tests hand-build slots with timestamp zero
-   or repeated timestamps; they need a stamping helper.
+2. **The journal carries the floor:** writer `last_timestamp_ns`
+   (encode path and `open_append`), the header anchor timestamp, the
+   anchor in `StreamStart`, `Ready` and `Rotate`, snapshot v3, recovery
+   exposing the value, and `run_as_primary` seeding the clock from the
+   writer.
+3. **Enforcement:** writer refusal and reader validation. Must not land
+   before step 2: with the floor not yet carried across a restart, the
+   first entry after a clock step back would be refused. Carries most
+   of the test churn, since many tests hand-build slots with timestamp
+   zero or repeated timestamps; they need a stamping helper.
 4. **Dispatch:** remove `last_drain_ns` from `dispatch`, the matching
    stage, the shadow stage and recovery; `tick` before every journaled
    event and exactly once for a `Tick` entry; drop the `Tick` payload
    and update the codec and wire golden-byte tests. Restore the strong
    contract in the rustdoc of `Application::tick` (strictly increasing,
-   the same calls on every path) and `ApplyCtx::now_ns`. Measure before
-   merging (decision 2).
+   the same calls on every path) and `ApplyCtx::now_ns`, including what
+   a query sees (decision 1). Measure before merging (decision 2).
 5. **Observability and docs:** the gauge and warning; the timestamp
    field's meaning in `docs/journal.md`; the reader row in
    `docs/pipeline-architecture.md`; the operator note on clock
@@ -201,7 +251,10 @@ Read, not changed:
 
 ## Open decisions
 
-- Strict (recommended) or non-decreasing, i.e. whether a `tick` per
-  event is acceptable once measured.
+- Strict (recommended: the only variant with no consuming-side state,
+  which is the point of the item) or non-decreasing, i.e. whether a
+  `tick` per event is acceptable once measured.
 - Dropping the `Tick` payload now (recommended).
 - The clock-lead warning threshold.
+- Whether a query sees the last issued stamp (recommended, decision 1)
+  or keeps zero.
