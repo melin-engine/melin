@@ -61,9 +61,6 @@ Findings that confirm, sharpen or correct the roadmap entry.
 - **No replica-generated journal entries exist.** The tick generator
   runs only on a primary (reader thread, DPDK poll loop), so a replica's
   journal holds the primary's stamps and nothing else.
-- **Queries see a zero clock.** `Application::query` receives
-  `now_ns == 0`: the decoder zeroes a query's stamp and the matching
-  stage passes it through.
 
 ## Design decisions
 
@@ -82,11 +79,12 @@ doing so, and the slot reaches the wrapper unstamped. A second site
 that agrees with the first by convention is the shape this item is
 deleting elsewhere.
 
-Queries consume nothing: they are never journaled. They do get a time:
-the wrapper hands a query the last issued stamp without advancing the
-clock, so `Application::query` sees the clock the application was last
-driven to rather than zero. Halt refusals are never published, so they
-consume nothing either. The replica pipeline keeps the raw producer,
+Queries stay unstamped and consume nothing: they are never journaled,
+and `QueryCtx` carries no time field, so no query ever reads the slot's
+stamp. An application that wants its clock in `query` already has it:
+the time of its last `tick`, held in its own state. Giving `QueryCtx`
+a clock would be an application API addition, not part of this item.
+Halt refusals are never published, so they consume nothing either. The replica pipeline keeps the raw producer,
 since its slots carry the primary's stamps.
 
 The test-only helpers `apply_journaled` and `tick_journaled` stamp
@@ -106,10 +104,8 @@ calls `tick(ts)` before each event unconditionally and keeps no
 watermark. There is nothing to seed, snapshot or reset on the consuming
 side, which is what makes the three consumers agree by construction.
 
-Cost: `tick` runs once per event instead of once per batch under load.
-Today's per-batch shared stamp already fires it once per drain, so the
-delta is per-batch to per-event, not nothing to per-event.
-`Application::tick`'s rustdoc already asks for a cheap "nothing is due"
+Cost: under load `tick` already fires once per batch (the batch shares
+one stamp); it now fires once per event. `Application::tick`'s rustdoc already asks for a cheap "nothing is due"
 check and says it "runs ahead of nearly every event"; the exchange's
 `tick` is `drain_due_scheduled_tasks`, a heap peek when nothing is due.
 Measure with echo and counter before merging.
@@ -143,9 +139,8 @@ The floor is part of the lineage, next to sequence and chain hash:
   Free while protocol 5 is unreleased;
 - the snapshot moves to transport version 3 with the timestamp at its
   anchor. A v2 snapshot seeds zero and logs a `warn!`; that only happens
-  once, on the upgrade boot. Transport v1 (no epoch) is dropped at the
-  same time: it predates the released upgrade path, and accepting it
-  would mean a second legacy branch to seed and test.
+  once, on the upgrade boot. A v1 snapshot (no epoch) lacks the
+  timestamp too and takes the same branch.
 
 `run_as_primary` (kernel TCP and DPDK) seeds the clock from the writer.
 
@@ -160,7 +155,10 @@ The floor is part of the lineage, next to sequence and chain hash:
   segment, as a hard error. Unlike `SequenceGap`, which recovery treats
   as a torn tail on the live segment and truncates at, a CRC-valid entry
   whose stamp regresses is not a torn write: it is a bug or tampering,
-  and recovery fails on it rather than silently dropping the tail.
+  and recovery fails on it rather than silently dropping the tail. The
+  timestamp check runs after the sequence checks (`SequenceGap`,
+  `SequenceDuplicate`), so stale bytes past the tail still take the
+  truncate-at-gap path and never reach it.
 
 This is the "assertion, not a variable" the roadmap asks for, and it
 costs one compare per entry.
@@ -220,8 +218,8 @@ One branch per step, each a reviewable commit.
    event and exactly once for a `Tick` entry; drop the `Tick` payload
    and update the codec and wire golden-byte tests. Restore the strong
    contract in the rustdoc of `Application::tick` (strictly increasing,
-   the same calls on every path) and `ApplyCtx::now_ns`, including what
-   a query sees (decision 1). Measure before merging (decision 2).
+   the same calls on every path) and `ApplyCtx::now_ns`. Measure before
+   merging (decision 2).
 5. **Observability and docs:** the gauge and warning; the timestamp
    field's meaning in `docs/journal.md`; the reader row in
    `docs/pipeline-architecture.md`; the operator note on clock
@@ -246,8 +244,8 @@ Read, not changed:
 
 - `ServerApp::tick` is compatible as is; it will run once per event
   instead of once per batch.
-- `scheduler.rs`'s module doc and `tests/journal_recovery.rs` refer to
-  `Tick { now_ns }` and need updating when the payload goes.
+- `scheduler.rs`'s module doc refers to `Tick { now_ns }` and needs
+  updating when the payload goes.
 
 ## Open decisions
 
@@ -256,5 +254,13 @@ Read, not changed:
   `tick` per event is acceptable once measured.
 - Dropping the `Tick` payload now (recommended).
 - The clock-lead warning threshold.
-- Whether a query sees the last issued stamp (recommended, decision 1)
-  or keeps zero.
+
+## Not part of this item
+
+- **Dropping snapshot transport v1.** v2 has been written since the
+  fencing-epoch release, so v1 files only come from much older nodes,
+  and dropping them may well be right. But v1 and v2 share the same
+  "no timestamp, seed zero" branch here, so this item gives no reason
+  to drop it; if it goes, it goes in its own commit with its own case.
+- **A clock on `QueryCtx`.** See decision 1: an application API
+  question, decided separately if anyone needs it.
