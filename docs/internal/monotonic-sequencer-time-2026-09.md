@@ -155,6 +155,11 @@ receivers. That is a replication protocol change for a convenience.
   primary's journal stage, the replica's journal stage and the test
   helpers. On a primary a refusal is a bug: the journal stage stops as
   it does on an I/O failure, and the regression never reaches disk.
+  The writer's floor survives rotation (rotation runs on the same
+  writer, so an in-memory `last_timestamp_ns` carries over), which is
+  what covers segment boundaries on a replica: every entry it adopts,
+  including the first after a `Rotate`, goes through that check. No
+  separate check at `Rotate` is needed.
 - The reader applies the same rule on replay and catch-up, within a
   segment, as a hard error. Unlike `SequenceGap`, which recovery treats
   as a torn tail on the live segment and truncates at, a CRC-valid entry
@@ -163,14 +168,15 @@ receivers. That is a replication protocol change for a convenience.
   timestamp check runs after the sequence checks (`SequenceGap`,
   `SequenceDuplicate`), so stale bytes past the tail still take the
   truncate-at-gap path and never reach it.
-- The segment boundary is checked by whoever walks segments, not by
-  the reader. With no floor in the header (decision 3) a reader opened
-  on a segment cannot judge its first entry, so recovery carries the
+- On replay the segment boundary is checked by recovery, not by the
+  reader. With no floor in the header (decision 3) a reader opened on a
+  segment cannot judge its first entry, so recovery carries the
   previous segment's last stamp across the boundary and compares the
   next segment's first entry against it, exactly as it carries the
-  tail hash and the expected starting sequence today. Replica catch-up
-  does the same at each `Rotate` it adopts. Without this the first
-  entry of every segment is the one unchecked point in the lineage.
+  tail hash and the expected starting sequence today. Recovery from a
+  snapshot starts that carry from the snapshot's timestamp, so the
+  first entry after the anchor is checked too. Without this the first
+  entry of every segment is the one unchecked point in replay.
 
 This is the "assertion, not a variable" the roadmap asks for, and it
 costs one compare per entry.
@@ -212,12 +218,14 @@ One commit per step, each reviewable on its own.
    (encode path, `open_append`, the interrupted-rotation path),
    snapshot v3, recovery exposing the value, and `run_as_primary`
    seeding the clock from the writer, with the lead warning.
-3. **Enforcement:** writer refusal, reader validation within a segment,
-   and the boundary check in recovery and replica catch-up. Must not
-   land before step 2: with the floor not yet carried across a restart,
-   the first entry after a clock step back would be refused. Carries
-   most of the test churn, since many tests hand-build slots with
-   timestamp zero or repeated timestamps; they need a stamping helper.
+3. **Enforcement:** writer refusal (its floor surviving rotation),
+   reader validation within a segment, and the boundary check in
+   recovery, seeded from the snapshot's timestamp when there is one.
+   Must not land before step 2: with the floor not yet carried across a
+   restart, the first entry after a clock step back would be refused.
+   Carries most of the test churn, since many tests hand-build slots
+   with timestamp zero or repeated timestamps; they need a stamping
+   helper.
 4. **Dispatch:** remove `last_drain_ns` from `dispatch`, the matching
    stage, the shadow stage and recovery; `tick` before every journaled
    event and exactly once for a `Tick` entry, taking the time from the
@@ -226,9 +234,9 @@ One commit per step, each reviewable on its own.
    journal codec and `replication_wire`, with the golden-byte tests
    updated. Once dispatch reads the header, the payload is a second
    copy of the time that nothing reads and that can disagree with the
-   first, which is the shape this item removes; leaving it as an
-   optional follow-up means it ships, and then costs a format bump
-   forever. Restore the strong contract in the rustdoc of
+   first, which is the shape this item removes. Left as an optional
+   follow-up it would likely ship, and removing it afterwards costs a
+   format bump. Restore the strong contract in the rustdoc of
    `Application::tick` (strictly increasing, the same calls on every
    path) and `ApplyCtx::now_ns`. Measure before merging (decision 2).
 5. **Acceptance tests**, each asserting the same `tick` sequence on the
