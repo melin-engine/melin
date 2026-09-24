@@ -70,15 +70,20 @@ Findings that confirm, sharpen or correct the roadmap entry.
   visits every entry of every retained segment for chain validation and
   skips dispatching those at or below the anchor, comparing the chain
   hash when it passes the anchor entry.
-- **The encoder already reads the segment on resume.**
-  `JournalEncoder::resume` re-absorbs the raw bytes
-  `[ENTRY_OFFSET, valid_end)` to rebuild the chain from the file alone,
-  "so no chain state needs to be threaded in from the recovery walk".
+- **Resume takes its position from the recovery walk.**
+  `open_append` receives `last_seq` and `valid_end` from the walk. The
+  chain rebuild in `JournalEncoder::resume` hashes the raw byte range
+  `[ENTRY_OFFSET, valid_end)` without parsing entries, and does not read
+  the file at all with `hash-chain` compiled out, so the encoder has no
+  pass over the segment's entries to take a timestamp from. The format
+  offers no backward scan either: an entry's length sits in its header,
+  ahead of the trailing CRC.
 - **The resync seed holds the anchor entry.** A replica resynced by
   snapshot transfer receives the primary's segment prefix ending at the
-  snapshot's sequence (`verify_segment_prefix`) and opens it with
-  `open_append`. That prefix is empty of entries only when the snapshot
-  sits at a segment boundary.
+  snapshot's sequence and opens it with `open_append`. That prefix is
+  empty of entries only when the snapshot sits at a segment boundary.
+  `verify_segment_prefix` already walks the seed's entries to prove it
+  ends at the snapshot's sequence.
 - **Encoder errors lose their type in the journal stage.** The stage
   wraps every `encode_event` failure in `JournalError::Io`. On a replica
   a failed journal stage tears the session down for reconnect and resync
@@ -158,8 +163,7 @@ one stamp); it now fires once per event. `Application::tick`'s rustdoc
 already asks for a cheap "nothing is due" check and says it "runs ahead
 of nearly every event"; the exchange's `tick` is
 `drain_due_scheduled_tasks`, a heap peek when nothing is due. Measure
-with echo and counter before merging, together with the jump guard's
-extra clock read (decision 5).
+with echo and counter before merging.
 
 Fallback if it measures badly: non-decreasing stamps, with `tick`
 firing when an entry's timestamp exceeds the previous entry's. That
@@ -178,27 +182,26 @@ chain hash already are.
   journal stage runs on it after `into_halves` splits the writer, and
   `from_halves` hands it back when a replica is promoted, so the floor
   moves with it through both handoffs with nothing to copy.
-- **A segment with entries states its own floor.** When the encoder
-  resumes on a segment, it takes the floor from the segment's last
-  entry, read in the same one-shot pass that already rebuilds the chain
-  from the file. Nothing is threaded in from the recovery walk, so no
-  call site can pass a wrong value. This covers recovery on the live
-  segment and a resync seed that holds the anchor entry.
-- **An empty segment needs its predecessor stated, and the type makes
-  the caller state it.** Every constructor that can produce an empty
-  segment (`create`, `create_continuing`, `open_append` on a header-only
-  segment) takes a `TimeFloor`, with no default:
+- **Every writer constructor takes the floor, typed, with no default.**
+  `create`, `create_continuing` and `open_append` take a `TimeFloor`,
+  threaded in beside `last_seq` with the same provenance, so one
+  parameter covers an empty segment and a resumed one alike:
   - `Genesis`: a brand-new journal, nothing precedes it;
-  - `After(ts)`: the stamp of the entry just before the segment (the
-    last stamp seen in the walked archives on the interrupted-rotation
-    path, the snapshot's stamp on a snapshot-only boot or a seed that
-    sits at a segment boundary);
+  - `After(ts)`: the stamp of the last entry before the write position.
+    Recovery on the live segment passes the last stamp its walk read,
+    the interrupted-rotation path the last stamp seen in the walked
+    archives, and a snapshot-only boot or a resync the snapshot's stamp
+    (a resync seed ends at the snapshot's anchor entry, or holds no
+    entries when the snapshot sits at a segment boundary, so the
+    snapshot's stamp is the floor either way);
   - `Unknown`: a v1 or v2 snapshot, which records no stamp.
 
   `Genesis` and `Unknown` both behave as zero, but they are distinct at
   the call site, so every place the guarantee is waived can be found by
   name. `Unknown` logs a `warn!`; it only happens once, on the upgrade
-  boot.
+  boot. A caller that passes a floor too low lets at most a regressing
+  entry through the encoder, and the reader's within-segment check
+  (decision 4) fails recovery on it at the next boot: loud, if late.
 - **The snapshot moves to transport version 3 with the timestamp at its
   anchor.** The journal stage publishes the floor in `FsyncState` beside
   `journal_seq` and `chain_hash`, under the same seqlock, and
@@ -208,7 +211,8 @@ chain hash already are.
   hand.** Recovery compares the anchor entry's stamp with the
   snapshot's beside the existing chain check
   (`SnapshotTimestampMismatch`), and the resync path compares the seed's
-  last entry with the transferred snapshot beside its chain check. A
+  last entry with the transferred snapshot beside its chain check, the
+  stamp coming from the walk `verify_segment_prefix` already makes. A
   wrong stamp in a snapshot is otherwise invisible until a snapshot-only
   boot seeds a primary below its replicas' floors.
 
@@ -290,8 +294,17 @@ source, a VM resumed with a stale clock, a node taking writes before
 its time daemon has synced) would hold the application's time for
 years, and winding the journal back would not help, because the
 application has already absorbed the future time. Today a restart
-resets the damage; under this plan only prevention does. So the clock
-refuses to follow a jump.
+undoes a forward jump; under strict time nothing does, so this plan
+creates the hazard and has to answer it.
+
+The answer is a guard on the running clock, and it is worth being plain
+about its reach. It protects a node that is already running, and buys
+the operator time to fix the clock. It cannot protect seeding: a
+restart or a failover seeds from the wall clock, so a jump the guard
+refused is accepted by the next boot if the clock is still wrong, and a
+clock already wrong at boot is caught only by the sync-state warning
+below. Comparing the wall clock with the journal's floor at boot cannot
+tell a bad clock from a long downtime.
 
 - **A reference on a clock that cannot jump.** Beside the wall-clock
   reading, the clock reads `CLOCK_BOOTTIME` and keeps the pair from its
@@ -300,14 +313,18 @@ refuses to follow a jump.
   `CLOCK_MONOTONIC` (what `Instant` reads), so a suspended VM that
   resumes is not taken for a jump. It is read once per batch beside the
   wall clock (the reader and the DPDK loop already make one wall-clock
-  read per batch), and once per tick.
+  read per batch), and once per tick: one more vDSO read per batch,
+  never per event.
 - **A reading more than the jump limit ahead of the expected time is
   refused.** The clock issues from the expected time instead, so time
   keeps flowing at the real rate rather than standing still, and it
   keeps its reference, so it follows the wall clock again as soon as a
   reading comes back within the limit. A refusal logs a `warn!` once per
   episode naming the jump, and counts in
-  `melin_clock_jumps_refused_total`. A backward reading is accepted as
+  `melin_clock_jumps_refused_total`. While refused, the node's time runs
+  behind the wall clock, which the offset gauge shows as a negative
+  value (decision 6), so "behind" is as alertable as "held ahead". A
+  backward reading is accepted as
   the reference (stamps are then held by `last + 1`, decision 6); only
   the forward direction is refused.
 - **A deliberate jump is accepted by the operator.** A legitimate
@@ -316,10 +333,14 @@ refuses to follow a jump.
   accepts the current wall clock; the wrapper reads the request from an
   atomic once per batch, as it reads the halt gate. A restart or a
   failover also re-seeds from the wall clock.
-- **Seeding has no reference, so it checks the clock's sync state.** At
-  boot and promotion the clock seeds from `max(wall_clock, floor + 1)`
-  with nothing to compare a jump against. It asks the kernel whether the
-  clock is synchronized (`adjtimex`) and logs a `warn!` if not.
+- **Seeding has no reference, so it checks the clock's sync state, and
+  only warns.** At boot and promotion the clock seeds from
+  `max(wall_clock, floor + 1)` with nothing to compare a jump against.
+  It asks the kernel whether the clock is synchronized (`adjtimex`) and
+  logs a `warn!` if not. A warning is the ceiling: time daemons (chrony,
+  ntpd, ptp4l with phc2sys) do not report sync state to the kernel
+  alike, and refusing to serve on that flag would turn a correctly
+  disciplined node into an outage.
 
 The jump limit is a server setting (proposed default: 60 s), well above
 any correction a disciplined clock makes on a running node and far
@@ -344,10 +365,12 @@ over accurate), but the operator and the application author must know:
   reading and the last issued stamp for every batch and tick, so this
   is one compare per batch, never per event, and it runs whether or not
   a tick cadence is configured;
-- **a gauge, `melin_sequencer_clock_lead_seconds`**, on the health
-  endpoint beside the other gauges: how far the last issued stamp leads
-  the wall clock, zero when it does not. Operators alert on metrics,
-  not log lines, and a held clock is otherwise silent;
+- **a signed gauge, `melin_sequencer_clock_offset_seconds`**, on the
+  health endpoint beside the other gauges: the last issued stamp minus
+  the wall clock. Positive while the clock is held ahead, negative while
+  a refused jump leaves it behind (decision 5), near zero otherwise.
+  Operators alert on metrics, not log lines, and both states are
+  otherwise silent;
 - **the application contract says it**: `Application::tick`'s rustdoc
   states that time may stand still, advancing one nanosecond per event,
   for as long as the clock is held;
@@ -381,9 +404,9 @@ One commit per step, each reviewable on its own.
    only behaviour changes are strict increase within one process
    lifetime and refused forward jumps.
 2. **The journal carries the floor:** `JournalEncoder`'s
-   `last_timestamp_ns` (encode path, and taken from the segment's last
-   entry on resume), `TimeFloor` on the constructors that can produce
-   an empty segment, the floor in `FsyncState`, snapshot v3, and
+   `last_timestamp_ns` (encode path), `TimeFloor` on every writer
+   constructor with recovery threading the walked stamp beside
+   `last_seq`, the floor in `FsyncState`, snapshot v3, and
    `run_as_primary` seeding the clock from the writer. The snapshot
    stamp checks (recovery's anchor, the resync seed) land here, since
    they are what makes v3's new field trustworthy.
@@ -414,8 +437,8 @@ One commit per step, each reviewable on its own.
    still while the clock is held) and `ApplyCtx::now_ns`. Measure
    before merging (decision 2).
 5. **Operator surface:** the seeding and running lead warnings, the
-   lead gauge, the jump counter, `CLOCK-ACCEPT`, and the sync-state
-   check at seeding.
+   offset gauge, the jump counter, `CLOCK-ACCEPT`, and the sync-state
+   warning at seeding.
 6. **Acceptance tests**, each asserting the same `tick` sequence on the
    live, replay and snapshot-restore paths:
    - a restart across a clock step back;
@@ -461,11 +484,6 @@ Read, not changed:
 - The clock-lead warning threshold, shared by the seeding and the
   running warnings.
 - The forward-jump limit (proposed: 60 s).
-- Whether an unsynchronized clock at seeding only warns (proposed) or
-  refuses to take the primary role. Refusing is stronger, but how each
-  time stack (chrony, ntpd, ptp4l with phc2sys) reports sync state to
-  the kernel needs checking first, or a correctly disciplined node could
-  refuse to serve.
 
 ## Not part of this item
 
