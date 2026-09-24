@@ -30,10 +30,11 @@ Findings that confirm, sharpen or correct the roadmap entry.
   `next_sequence` and `chain_hash` across that handoff for the same
   reason. Seeding inside `run_as_primary` covers boot, snapshot boot
   and promotion with one code path.
-- **Journal format 15 is unreleased** (it sits under `[Unreleased]` in
-  the CHANGELOG), and the journal reader accepts only `FORMAT_VERSION`,
-  so there is no legacy replay path to preserve. The replay rule can
-  change before the release without a further format bump.
+- **Journal format 15 and replication protocol 5 are unreleased**
+  (both sit under `[Unreleased]` in the CHANGELOG), and the journal
+  reader accepts only `FORMAT_VERSION`, so there is no legacy replay
+  path to preserve. The replay rule and the `Tick` entry layout can
+  change before the release without a further bump of either.
 - **The "rare producer race" is no longer a multi-producer race.**
   Out-of-order event timestamps now come from two places:
   - the reader and the DPDK poll loop stamp client events with one
@@ -154,7 +155,7 @@ receivers. That is a replication protocol change for a convenience.
   primary's journal stage, the replica's journal stage and the test
   helpers. On a primary a refusal is a bug: the journal stage stops as
   it does on an I/O failure, and the regression never reaches disk.
-- The reader applies the same rule on replay and catch-up, on every
+- The reader applies the same rule on replay and catch-up, within a
   segment, as a hard error. Unlike `SequenceGap`, which recovery treats
   as a torn tail on the live segment and truncates at, a CRC-valid entry
   whose stamp regresses is not a torn write: it is a bug or tampering,
@@ -162,6 +163,14 @@ receivers. That is a replication protocol change for a convenience.
   timestamp check runs after the sequence checks (`SequenceGap`,
   `SequenceDuplicate`), so stale bytes past the tail still take the
   truncate-at-gap path and never reach it.
+- The segment boundary is checked by whoever walks segments, not by
+  the reader. With no floor in the header (decision 3) a reader opened
+  on a segment cannot judge its first entry, so recovery carries the
+  previous segment's last stamp across the boundary and compares the
+  next segment's first entry against it, exactly as it carries the
+  tail hash and the expected starting sequence today. Replica catch-up
+  does the same at each `Rotate` it adopts. Without this the first
+  entry of every segment is the one unchecked point in the lineage.
 
 This is the "assertion, not a variable" the roadmap asks for, and it
 costs one compare per entry.
@@ -178,6 +187,13 @@ operator must know:
 - a `warn!` when the clock is seeded, at boot or promotion, if the
   journal's floor leads the wall clock by more than a threshold
   (proposed default: 1 s), naming the lead;
+- the same `warn!` from the tick generator on a running primary, once
+  per crossing, when the issued stamp leads the raw clock by more than
+  the threshold. A wall clock that steps forward and then back on a
+  running node holds the sequencer clock at the high-water mark with
+  nothing else to say so until the next restart. The generator already
+  reads the raw clock a few times per second, so this is one compare
+  and one flag per tick, never per event;
 - a note in the operator docs that nodes need disciplined clocks and
   that a forward step cannot be undone.
 
@@ -196,17 +212,25 @@ One commit per step, each reviewable on its own.
    (encode path, `open_append`, the interrupted-rotation path),
    snapshot v3, recovery exposing the value, and `run_as_primary`
    seeding the clock from the writer, with the lead warning.
-3. **Enforcement:** writer refusal and reader validation. Must not land
-   before step 2: with the floor not yet carried across a restart, the
-   first entry after a clock step back would be refused. Carries most
-   of the test churn, since many tests hand-build slots with timestamp
-   zero or repeated timestamps; they need a stamping helper.
+3. **Enforcement:** writer refusal, reader validation within a segment,
+   and the boundary check in recovery and replica catch-up. Must not
+   land before step 2: with the floor not yet carried across a restart,
+   the first entry after a clock step back would be refused. Carries
+   most of the test churn, since many tests hand-build slots with
+   timestamp zero or repeated timestamps; they need a stamping helper.
 4. **Dispatch:** remove `last_drain_ns` from `dispatch`, the matching
    stage, the shadow stage and recovery; `tick` before every journaled
-   event and exactly once for a `Tick` entry. Restore the strong
-   contract in the rustdoc of `Application::tick` (strictly increasing,
-   the same calls on every path) and `ApplyCtx::now_ns`. Measure before
-   merging (decision 2).
+   event and exactly once for a `Tick` entry, taking the time from the
+   entry header. Drop the `Tick` payload in the same step:
+   `JournalEvent::Tick { now_ns }` becomes `JournalEvent::Tick` in the
+   journal codec and `replication_wire`, with the golden-byte tests
+   updated. Once dispatch reads the header, the payload is a second
+   copy of the time that nothing reads and that can disagree with the
+   first, which is the shape this item removes; leaving it as an
+   optional follow-up means it ships, and then costs a format bump
+   forever. Restore the strong contract in the rustdoc of
+   `Application::tick` (strictly increasing, the same calls on every
+   path) and `ApplyCtx::now_ns`. Measure before merging (decision 2).
 5. **Acceptance tests**, each asserting the same `tick` sequence on the
    live, replay and snapshot-restore paths:
    - a restart across a clock step back;
@@ -222,17 +246,10 @@ One commit per step, each reviewable on its own.
    clock discipline; CHANGELOG under Unreleased; the note in
    [application-api-review-2026-09.md](application-api-review-2026-09.md);
    remove the roadmap entry.
-7. **Optional: drop the `Tick` payload.** `JournalEvent::Tick { now_ns }`
-   duplicates the entry header's timestamp; making it `JournalEvent::Tick`
-   in the journal codec and `replication_wire` leaves the header as the
-   single source of time. Not needed for correctness (step 4 already
-   fixes the double call), and it reaches the codec and wire golden-byte
-   tests, a published crate's API and the Exchange Core's docs. Free
-   only while format 15 and protocol 5 are unreleased; otherwise leave
-   it.
 
-Steps 1 to 4 must ship in the release that introduces format 15. After
-that, the changed replay rule needs its own format bump.
+Steps 1 to 4 must ship in the release that introduces format 15 and
+protocol 5. After that, the changed replay rule and the `Tick` layout
+each need their own version bump.
 
 ## Downstream impact (Exchange Core)
 
@@ -240,24 +257,25 @@ Read, not changed:
 
 - `ServerApp::tick` is compatible as is; it will run once per event
   instead of once per batch.
-- If step 7 lands, `scheduler.rs`'s module doc refers to
-  `Tick { now_ns }` and needs updating.
+- `scheduler.rs`'s module doc refers to `Tick { now_ns }` and needs
+  updating when the payload goes (step 4).
 
 ## Open decisions
 
 - Strict (recommended: the only variant with no consuming-side state,
   which is the point of the item) or non-decreasing, i.e. whether a
   `tick` per event is acceptable once measured.
-- The clock-lead warning threshold.
-- Whether to take step 7 before the release.
+- The clock-lead warning threshold, shared by the seeding and the
+  tick-generator warnings.
 
 ## Not part of this item
 
 - **An anchor timestamp in the segment header.** See decision 3: not
   needed for correctness, and it drags in a replication protocol change.
 - **A health gauge for the clock's lead over the wall clock.** The
-  warning at seeding tells the operator what they need; add a gauge if
-  someone asks to watch it continuously.
+  warnings at seeding and from the tick generator tell the operator
+  when the clock is held; add a gauge if someone asks to watch the lead
+  continuously.
 - **Dropping snapshot transport v1.** v2 has been written since the
   fencing-epoch release, so v1 files only come from much older nodes,
   and dropping them may well be right. But v1 and v2 share the same
