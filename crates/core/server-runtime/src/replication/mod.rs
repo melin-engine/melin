@@ -60,9 +60,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use melin_journal::{BufferedWriter, JournalWrite};
+use melin_journal::{BufferedWriter, JournalWrite, TimeFloor};
 
-use melin_app::Application;
+use melin_app::{Application, SequencerTime};
 use melin_transport_core::pipeline::{InputSlot, OutputSlot};
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
@@ -942,9 +942,65 @@ where
     }
 }
 
-/// The four facts a successful snapshot + segment-seed transfer yields:
-/// `(snapshot App, snapshot sequence, snapshot chain hash, seed length)`.
-type ResyncTransfer<A> = (A, u64, [u8; 32], u64);
+/// What a successful snapshot + segment-seed transfer yields.
+struct ResyncTransfer<A> {
+    /// The restored snapshot state.
+    app: A,
+    snap_sequence: u64,
+    snap_chain_hash: [u8; 32],
+    /// The snapshot's time floor: the stamp of its anchor entry, unknown
+    /// for a snapshot from before recorded stamps.
+    snap_floor: TimeFloor,
+    /// The seed's byte length, the journal's `valid_end`.
+    seed_len: u64,
+    /// Stamp of the seed's last entry, the anchor entry; `None` when the
+    /// seed holds no entries (the snapshot sits at a segment boundary).
+    seed_last_timestamp: Option<SequencerTime>,
+}
+
+/// The time floor a resynced replica's journal opens with: the stamp of
+/// the snapshot's anchor entry, read from the seed when it holds that
+/// entry, else (the snapshot sits at a segment boundary) the snapshot's
+/// own.
+///
+/// The seed's last entry is the anchor entry, so a snapshot that records a
+/// stamp must record that entry's. An error is an inconsistent primary: the
+/// stamp becomes the floor of any node booted from the snapshot alone, and
+/// nothing later would catch a wrong one.
+fn resync_time_floor(
+    snap_sequence: u64,
+    snap_floor: TimeFloor,
+    seed_last_timestamp: Option<SequencerTime>,
+) -> Result<TimeFloor, String> {
+    if let (TimeFloor::After(recorded), Some(seeded)) = (snap_floor, seed_last_timestamp)
+        && recorded != seeded
+    {
+        return Err(format!(
+            "segment seed's entry at {snap_sequence} carries timestamp {} ns, the \
+             transferred snapshot records {} ns; inconsistent primary",
+            seeded.as_ns(),
+            recorded.as_ns()
+        ));
+    }
+    Ok(seed_last_timestamp.map_or(snap_floor, TimeFloor::After))
+}
+
+/// The time floor of a fresh replica's journal, created from the
+/// `StreamStart` lineage with no local history. A primary streams to a
+/// replica with nothing only when catch-up can serve it from sequence 1
+/// (otherwise it sends a snapshot), so that journal starts at genesis, in
+/// time as in sequence. Any other lineage start is a primary breaking that
+/// rule, refused rather than opened with an unknown floor.
+pub(in crate::replication) fn fresh_replica_floor(lineage_start: u64) -> Result<TimeFloor, String> {
+    if lineage_start == 1 {
+        Ok(TimeFloor::Genesis)
+    } else {
+        Err(format!(
+            "primary streamed a lineage starting at sequence {lineage_start} to a replica \
+             with no history and no snapshot; it can only replay from sequence 1"
+        ))
+    }
+}
 
 /// What [`handle_resync_verdict`] resolved a `NeedSnapshot` /
 /// `HashMismatch` verdict to.
@@ -999,18 +1055,18 @@ where
     std::fs::rename(&tmp_path, snapshot_path)?;
     tracing::info!(snap_sequence, snap_len, "snapshot received and verified");
 
-    let (snap_app, _snap_seq, snap_hash, snap_epoch) =
-        melin_transport_core::snapshot::load::<A>(snapshot_path)?;
-    if snap_hash != snap_chain_hash {
+    let loaded = melin_transport_core::snapshot::load::<A>(snapshot_path)?;
+    if loaded.chain_hash != snap_chain_hash {
         return Err(format!(
             "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
-             loaded snapshot has {snap_hash:02x?}"
+             loaded snapshot has {:02x?}",
+            loaded.chain_hash
         )
         .into());
     }
     // Adopt the primary's snapshot epoch — the resync rebases this replica
     // onto the primary's lineage, including its epoch.
-    fence_state.observe_epoch(snap_epoch);
+    fence_state.observe_epoch(loaded.epoch);
 
     // Segment seed: the raw byte prefix of the primary's segment
     // containing `snap_sequence`. Written verbatim as our live segment, it
@@ -1029,15 +1085,24 @@ where
     // the snapshot sequence. (With hash-chain on, the chain cross-check in
     // `handle_resync_verdict` subsumes this; without it, this is the only
     // guard.)
-    if let Err(e) =
-        melin_journal::segment::verify_segment_prefix(&seed_tmp, snap_sequence, seed_len)
-    {
-        let _ = std::fs::remove_file(&seed_tmp);
-        return Err(format!("segment seed failed structural verification: {e}").into());
-    }
+    let seed_last_timestamp =
+        match melin_journal::segment::verify_segment_prefix(&seed_tmp, snap_sequence, seed_len) {
+            Ok(last) => last,
+            Err(e) => {
+                let _ = std::fs::remove_file(&seed_tmp);
+                return Err(format!("segment seed failed structural verification: {e}").into());
+            }
+        };
     std::fs::rename(&seed_tmp, journal_path)?;
     melin_journal::segment::fsync_parent_dir(journal_path)?;
-    Ok((snap_app, snap_sequence, snap_chain_hash, seed_len))
+    Ok(ResyncTransfer {
+        app: loaded.app,
+        snap_sequence,
+        snap_chain_hash,
+        snap_floor: loaded.floor,
+        seed_len,
+        seed_last_timestamp,
+    })
 }
 
 /// Handle a `NeedSnapshot` / `HashMismatch` resync verdict — shared by
@@ -1117,7 +1182,7 @@ where
         .journal_tip
         .reset(melin_transport_core::WireSeq::new(0));
 
-    let (snap_app, snap_sequence, snap_chain_hash, seed_len) =
+    let transfer =
         match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path, fence_state) {
             Ok(v) => v,
             Err(e) => {
@@ -1129,7 +1194,16 @@ where
                 return Ok(ResyncDecision::Retry);
             }
         };
+    let ResyncTransfer {
+        app: snap_app,
+        snap_sequence,
+        snap_chain_hash,
+        snap_floor,
+        seed_len,
+        seed_last_timestamp,
+    } = transfer;
     *app = Some(snap_app);
+    let floor = resync_time_floor(snap_sequence, snap_floor, seed_last_timestamp)?;
 
     // Open the seeded segment for appending at the snapshot position —
     // recovery's resume path: the chain rebuilds from the seeded bytes and
@@ -1137,7 +1211,7 @@ where
     // chain hash. `chain_hash()` is `None` only with `hash-chain` disabled
     // (nothing to tie); an all-zeros snapshot hash means the primary runs
     // without `hash-chain` (also nothing to tie).
-    let writer = W::open_append(journal_path, snap_sequence, seed_len)?;
+    let writer = W::open_append(journal_path, snap_sequence, seed_len, floor)?;
     let seeded_chain = writer.chain_hash().unwrap_or(snap_chain_hash);
     if snap_chain_hash != [0u8; 32] && seeded_chain != snap_chain_hash {
         return Err(format!(
@@ -1222,6 +1296,42 @@ mod tests {
         encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
         read_frame, try_decode_input_batch,
     };
+
+    /// A resynced journal opens at the anchor entry's stamp, whichever
+    /// side has it, and refuses a snapshot that disagrees with the seed.
+    #[test]
+    fn a_resync_opens_at_the_anchor_stamp_and_refuses_a_disagreeing_snapshot() {
+        let t = SequencerTime::from_ns;
+        // The seed holds the anchor entry: its stamp is the floor, and a
+        // snapshot that records one must agree.
+        assert_eq!(
+            resync_time_floor(4, TimeFloor::After(t(40)), Some(t(40))),
+            Ok(TimeFloor::After(t(40)))
+        );
+        assert!(resync_time_floor(4, TimeFloor::After(t(39)), Some(t(40))).is_err());
+        // A snapshot from before recorded stamps has nothing to check,
+        // and the seed still supplies the floor.
+        assert_eq!(
+            resync_time_floor(4, TimeFloor::Unknown, Some(t(40))),
+            Ok(TimeFloor::After(t(40)))
+        );
+        // The snapshot sits at a segment boundary: the seed holds no
+        // entry, so the snapshot's floor stands, known or not.
+        assert_eq!(
+            resync_time_floor(4, TimeFloor::After(t(40)), None),
+            Ok(TimeFloor::After(t(40)))
+        );
+        assert_eq!(
+            resync_time_floor(4, TimeFloor::Unknown, None),
+            Ok(TimeFloor::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_fresh_replica_journal_starts_at_genesis_or_not_at_all() {
+        assert_eq!(fresh_replica_floor(1), Ok(TimeFloor::Genesis));
+        assert!(fresh_replica_floor(21).is_err());
+    }
 
     /// Build a wire-ready `InputBatch` frame containing a single `Tick`
     /// slot at the given sequence — the protocol-level tests don't need

@@ -187,11 +187,12 @@ fn refold(
             while let Some(entry) = reader.next_entry()? {
                 if let JournalEvent::App(NotaryEvent::Notarize { leaf }) = entry.event {
                     let prev = head;
-                    head = fold(&prev, &leaf, entry.timestamp_ns);
+                    let timestamp_ns = entry.timestamp.as_ns();
+                    head = fold(&prev, &leaf, timestamp_ns);
                     notarized += 1;
                     let link = Receipt {
                         entry: notarized,
-                        timestamp_ns: entry.timestamp_ns,
+                        timestamp_ns,
                         leaf,
                         prev,
                         head,

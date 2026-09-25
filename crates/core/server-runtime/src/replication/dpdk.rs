@@ -1515,8 +1515,12 @@ where
         // byte-identical to the primary's, and adopted `Rotate`
         // boundaries keep it that way across rotations (bitwise mirror).
         if pipeline.is_none() && journal_writer.is_none() {
-            let writer =
-                BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
+            let writer = BufferedWriter::create_continuing(
+                journal_path,
+                lineage_start,
+                lineage_anchor,
+                super::fresh_replica_floor(lineage_start)?,
+            )?;
             app = Some(A::default());
             journal_writer = Some(writer);
         }

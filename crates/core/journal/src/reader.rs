@@ -9,7 +9,7 @@ use std::io::Read;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use melin_app::AppEvent;
+use melin_app::{AppEvent, SequencerTime};
 
 use zerocopy::FromBytes;
 
@@ -63,8 +63,9 @@ pub(crate) fn advise_sequential(file: &File) {
 pub struct JournalEntry<E: AppEvent> {
     /// Monotonically increasing sequence number (starts at 1).
     pub sequence: u64,
-    /// Wall-clock nanos since epoch at write time (informational, not for ordering).
-    pub timestamp_ns: u64,
+    /// The time the sequencer assigned the entry, the application's clock
+    /// when it is applied.
+    pub timestamp: SequencerTime,
     /// Hash of the client's Ed25519 public key. Zero for internal/seed events.
     pub key_hash: u64,
     /// The event that was journaled.
@@ -357,7 +358,7 @@ impl<E: AppEvent> JournalReader<E> {
 
         Ok(Some(JournalEntry {
             sequence,
-            timestamp_ns,
+            timestamp: SequencerTime::from_ns(timestamp_ns),
             key_hash,
             event,
         }))
@@ -503,6 +504,10 @@ pub struct RawJournalScanner {
     pos: usize,
     /// Number of valid bytes in `buf`.
     valid: usize,
+    /// Stamp of the last entry a raw batch returned, read from its header
+    /// at no extra cost: the one entry field a caller of a raw scan needs
+    /// besides its sequence. `None` before the first.
+    last_timestamp: Option<SequencerTime>,
 }
 
 impl RawJournalScanner {
@@ -523,7 +528,14 @@ impl RawJournalScanner {
             buf: vec![0u8; 64 * 1024], // 64 KiB read buffer
             pos: 0,
             valid: 0,
+            last_timestamp: None,
         })
+    }
+
+    /// Stamp of the last entry a raw batch returned, `None` before the
+    /// first.
+    pub fn last_timestamp(&self) -> Option<SequencerTime> {
+        self.last_timestamp
     }
 
     /// Peek at the first entry's sequence number without advancing.
@@ -621,12 +633,13 @@ impl RawJournalScanner {
 
             // Copy scalars out of the header view before any mutating call
             // on `self` (ensure_available below) invalidates the borrow.
-            let (entry_seq, total) = {
+            let (entry_seq, entry_time, total) = {
                 let header = EntryHeader::ref_from_prefix(&self.buf[self.pos..])
                     .expect("ensure_available guarantees at least ENTRY_HEADER_SIZE bytes")
                     .0;
                 (
                     header.sequence.get(),
+                    SequencerTime::from_ns(header.timestamp_ns.get()),
                     ENTRY_HEADER_SIZE + header.length.get() as usize + CRC_SIZE,
                 )
             };
@@ -650,6 +663,7 @@ impl RawJournalScanner {
             }
 
             end_seq = entry_seq;
+            self.last_timestamp = Some(entry_time);
             out.extend_from_slice(&self.buf[self.pos..self.pos + total]);
             self.pos += total;
             any = true;
@@ -1169,8 +1183,13 @@ mod tests {
         let path = dir.path().join("test.journal");
         {
             // Continue from sequence 100 — header records 100.
-            let mut writer =
-                BufferedWriter::<TestEvent>::create_continuing(&path, 100, [0u8; 32]).unwrap();
+            let mut writer = BufferedWriter::<TestEvent>::create_continuing(
+                &path,
+                100,
+                [0u8; 32],
+                crate::TimeFloor::Unknown,
+            )
+            .unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
 

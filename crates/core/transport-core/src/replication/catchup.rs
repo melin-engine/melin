@@ -909,7 +909,15 @@ mod tests {
     fn boundary_replica_of_empty_live_catches_up_with_nothing_to_send() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("resumed.journal");
-        drop(BufferedWriter::<TestEvent>::create_continuing(&live, 34, [7u8; 32]).unwrap());
+        drop(
+            BufferedWriter::<TestEvent>::create_continuing(
+                &live,
+                34,
+                [7u8; 32],
+                melin_journal::TimeFloor::Unknown,
+            )
+            .unwrap(),
+        );
 
         assert!(can_catch_up_from_journal(&live, 33).unwrap());
 
@@ -1051,6 +1059,7 @@ mod tests {
         // (the seed must carry the live header plus entries 3..=4).
         let mut w = melin_journal::BufferedWriter::<TestEvent>::create(&live).unwrap();
         let mut chain_at_4 = [0u8; 32];
+        let mut stamp_at_4 = melin_app::SequencerTime::default();
         for v in 1..=5u64 {
             w.append(&JournalEvent::App(TestEvent::Add(v))).unwrap();
             if v == 2 {
@@ -1058,6 +1067,7 @@ mod tests {
             }
             if v == 4 {
                 chain_at_4 = w.chain_hash().unwrap();
+                stamp_at_4 = w.last_timestamp();
             }
         }
         drop(w);
@@ -1067,6 +1077,7 @@ mod tests {
             WireSeq::new(4),
             chain_at_4,
             7,
+            stamp_at_4,
             &snap_path,
         )
         .unwrap();
@@ -1159,8 +1170,13 @@ mod tests {
         // the snapshot's hash (born aligned).
         let replica = dir.path().join("r.journal");
         std::fs::write(&replica, &seed_body).unwrap();
-        let replica_writer =
-            melin_journal::BufferedWriter::<TestEvent>::open_append(&replica, 4, seed_len).unwrap();
+        let replica_writer = melin_journal::BufferedWriter::<TestEvent>::open_append(
+            &replica,
+            4,
+            seed_len,
+            melin_journal::TimeFloor::After(stamp_at_4),
+        )
+        .unwrap();
         assert_eq!(replica_writer.chain_hash().unwrap(), chain_at_4);
         assert_eq!(replica_writer.segment_starting_sequence(), 3);
         assert_eq!(replica_writer.next_sequence(), 5);
@@ -1213,7 +1229,15 @@ mod tests {
         // A snapshot-only restart layout: single live segment whose
         // header starts past 1 (no entries yet).
         let resumed = dir.path().join("resumed.journal");
-        drop(BufferedWriter::<TestEvent>::create_continuing(&resumed, 21, [7u8; 32]).unwrap());
+        drop(
+            BufferedWriter::<TestEvent>::create_continuing(
+                &resumed,
+                21,
+                [7u8; 32],
+                melin_journal::TimeFloor::Unknown,
+            )
+            .unwrap(),
+        );
         assert!(
             !can_catch_up_from_journal(&resumed, 0).unwrap(),
             "fresh replica must not catch up from a snapshot-anchored journal"

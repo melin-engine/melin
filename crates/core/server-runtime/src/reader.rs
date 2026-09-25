@@ -1510,7 +1510,11 @@ mod tests {
     ) -> StampingProducer<TestEvent> {
         StampingProducer::new(
             producer,
-            SequencerClock::new(SystemClocks, DEFAULT_JUMP_LIMIT),
+            SequencerClock::new(
+                SystemClocks,
+                DEFAULT_JUMP_LIMIT,
+                melin_app::SequencerTime::default(),
+            ),
         )
     }
 
@@ -1553,7 +1557,11 @@ mod tests {
                 .add_consumer()
                 .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().expect("consumer present");
-        let clock = SequencerClock::new(FixedClocks, DEFAULT_JUMP_LIMIT);
+        let clock = SequencerClock::new(
+            FixedClocks,
+            DEFAULT_JUMP_LIMIT,
+            melin_app::SequencerTime::default(),
+        );
 
         Fixture {
             conn: entry,

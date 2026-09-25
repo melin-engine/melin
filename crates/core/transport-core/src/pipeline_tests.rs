@@ -14,12 +14,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use melin_app::SequencerTime;
 use melin_journal::replication::REPLICATION_RING_CAPACITY;
 // Only the journal-reading tests touch these, and those are gated off
 // under no-persist (every read needs a really-persisted journal file).
-use melin_app::SequencerTime;
 #[cfg(not(feature = "no-persist"))]
 use melin_journal::JournalReader;
+// Only the hash-chain journal tests continue a lineage by hand.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+use melin_journal::TimeFloor;
 use melin_journal::{BufferedWriter, JournalEvent};
 use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
@@ -768,7 +771,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
 
     // Fresh-replica creation path: segment header identity comes from
     // the primary's StreamStart in production.
-    let writer = Writer::create_continuing(&path, 1, [0xB7u8; 32]).unwrap();
+    let writer = Writer::create_continuing(&path, 1, [0xB7u8; 32], TimeFloor::Genesis).unwrap();
     let replica = build_replica_pipeline(
         TestApp::new(),
         writer,
@@ -889,12 +892,12 @@ fn journal_stage_uses_preassigned_sequences() {
 
         let entry1 = reader.next_entry().unwrap().unwrap();
         assert_eq!(entry1.sequence, 1);
-        assert_eq!(entry1.timestamp_ns, 1_700_000_000_000_000_000);
+        assert_eq!(entry1.timestamp.as_ns(), 1_700_000_000_000_000_000);
         assert!(matches!(entry1.event, JournalEvent::App(TestEvent::Add(7))));
 
         let entry2 = reader.next_entry().unwrap().unwrap();
         assert_eq!(entry2.sequence, 2);
-        assert_eq!(entry2.timestamp_ns, 1_700_000_000_000_000_001);
+        assert_eq!(entry2.timestamp.as_ns(), 1_700_000_000_000_000_001);
         assert!(matches!(
             entry2.event,
             JournalEvent::App(TestEvent::Add(11))
@@ -1255,7 +1258,8 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
     let shared_anchor = [0xA5u8; 32];
 
     // -------- primary --------
-    let primary_writer = Writer::create_continuing(&primary_path, 1, shared_anchor).unwrap();
+    let primary_writer =
+        Writer::create_continuing(&primary_path, 1, shared_anchor, TimeFloor::Genesis).unwrap();
     let primary_active_conns = Arc::new(AtomicU64::new(0));
     let mut primary = build_pipeline_with_replication(
         TestApp::new(),
@@ -1272,7 +1276,8 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
     );
 
     // -------- replica --------
-    let replica_writer = Writer::create_continuing(&replica_path, 1, shared_anchor).unwrap();
+    let replica_writer =
+        Writer::create_continuing(&replica_path, 1, shared_anchor, TimeFloor::Genesis).unwrap();
     let replica = build_replica_pipeline(
         TestApp::new(),
         replica_writer,
@@ -1575,12 +1580,12 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
     // replica's local tail must equal it.
     let tail_at_2 = {
         let ref_path = dir.path().join("reference.journal");
-        let mut w = Writer::create_continuing(&ref_path, 1, anchor).unwrap();
+        let mut w = Writer::create_continuing(&ref_path, 1, anchor, TimeFloor::Genesis).unwrap();
         for seq in 1..=2u64 {
             assert_eq!(w.allocate_sequence(), seq);
             w.encode_event(
                 seq,
-                1_000_000_000 + seq,
+                SequencerTime::from_ns(1_000_000_000 + seq),
                 &JournalEvent::App(TestEvent::Add(seq)),
                 0,
             )
@@ -1590,7 +1595,7 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
         w.chain_hash().expect("hash-chain enabled")
     };
 
-    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, TimeFloor::Genesis).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -1682,7 +1687,7 @@ fn mid_batch_barrier_commits_only_the_encoded_prefix() {
     let path = dir.path().join("barrier_progress.journal");
     let anchor = [0x5Cu8; 32];
 
-    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, TimeFloor::Genesis).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -1790,7 +1795,7 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
     let snap_path = dir.path().join("shadow_window.snapshot");
     let anchor = [0x5Cu8; 32];
 
-    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, TimeFloor::Genesis).unwrap();
     // journal(0), shadow(1) gated on journal — the production wiring
     // (`build_input_disruptor`) minus the matching stage.
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
@@ -1878,12 +1883,12 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(snap_path.exists(), "the aligned shadow must snapshot");
-    let (restored, journal_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+    let loaded = snapshot::load::<TestApp>(&snap_path).unwrap();
     assert_eq!(
-        restored.total, 3,
+        loaded.app.total, 3,
         "state = Add(1)+Add(2), exactly the prefix"
     );
-    assert_eq!(journal_seq, 2);
+    assert_eq!(loaded.sequence, 2);
 
     // Now the window: the disk thread, publishing the tail batch, stores
     // progress first and the seqlock second. Freeze it between the two.
@@ -1906,9 +1911,9 @@ fn barrier_fsync_state_pair_is_self_consistent_for_the_shadow() {
     shutdown.store(true, Ordering::Relaxed);
     handle.join().unwrap();
 
-    let (restored, journal_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+    let loaded = snapshot::load::<TestApp>(&snap_path).unwrap();
     assert_eq!(
-        (restored.total, journal_seq),
+        (loaded.app.total, loaded.sequence),
         (3, 2),
         "a stale-but-consistent pair must not let the shadow snapshot past its journal_seq"
     );
@@ -1956,14 +1961,19 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
     let tails: Vec<[u8; 32]> = {
         let ref_dir = dir.path().join("reference");
         std::fs::create_dir(&ref_dir).unwrap();
-        let mut w =
-            Writer::create_continuing(&ref_dir.join("reference.journal"), 1, anchor).unwrap();
+        let mut w = Writer::create_continuing(
+            &ref_dir.join("reference.journal"),
+            1,
+            anchor,
+            TimeFloor::Genesis,
+        )
+        .unwrap();
         let mut tails = Vec::new();
         for seq in 1..=N {
             assert_eq!(w.allocate_sequence(), seq);
             w.encode_event(
                 seq,
-                1_000_000_000 + seq,
+                SequencerTime::from_ns(1_000_000_000 + seq),
                 &JournalEvent::App(TestEvent::Add(seq)),
                 0,
             )
@@ -1980,7 +1990,7 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
 
     let path = dir.path().join("sweep.journal");
     let snap_path = dir.path().join("sweep.snapshot");
-    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, TimeFloor::Genesis).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .add_consumer_after(0)
@@ -2059,9 +2069,10 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
     // NotFound here just means "try again next round".
     let mut snapshots: BTreeMap<u64, std::path::PathBuf> = BTreeMap::new();
     let collect = |snapshots: &mut BTreeMap<u64, std::path::PathBuf>| {
-        if let Ok((_, seq, _, _)) = snapshot::load::<TestApp>(&snap_path)
-            && !snapshots.contains_key(&seq)
+        if let Ok(loaded) = snapshot::load::<TestApp>(&snap_path)
+            && !snapshots.contains_key(&loaded.sequence)
         {
+            let seq = loaded.sequence;
             let copy = dir.path().join(format!("snap-{seq}.snapshot"));
             // The shadow may replace the file between our load and copy;
             // a copy of a *newer* complete snapshot is still a valid
@@ -2071,7 +2082,7 @@ fn fsync_state_pairs_stay_consistent_across_adopted_rotations() {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
                 Err(e) => panic!("copying the shadow snapshot: {e}"),
             }
-            let (_, actual, _, _) = snapshot::load::<TestApp>(&copy).unwrap();
+            let actual = snapshot::load::<TestApp>(&copy).unwrap().sequence;
             snapshots.insert(actual, copy);
         }
     };
@@ -2170,13 +2181,13 @@ fn adopted_rotation_honors_second_mark_in_same_batch() {
     // rotate too for its chain at 4 to be comparable.
     let (tail_at_2, tail_at_4) = {
         let ref_path = dir.path().join("reference.journal");
-        let mut w = Writer::create_continuing(&ref_path, 1, anchor).unwrap();
+        let mut w = Writer::create_continuing(&ref_path, 1, anchor, TimeFloor::Genesis).unwrap();
         let mut tail_at_2 = [0u8; 32];
         for seq in 1..=4u64 {
             assert_eq!(w.allocate_sequence(), seq);
             w.encode_event(
                 seq,
-                1_000_000_000 + seq,
+                SequencerTime::from_ns(1_000_000_000 + seq),
                 &JournalEvent::App(TestEvent::Add(seq)),
                 0,
             )
@@ -2191,7 +2202,7 @@ fn adopted_rotation_honors_second_mark_in_same_batch() {
         (tail_at_2, w.chain_hash().expect("hash-chain enabled"))
     };
 
-    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let writer = Writer::create_continuing(&path, 1, anchor, TimeFloor::Genesis).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -2260,7 +2271,7 @@ fn adopted_rotation_with_zero_tail_skips_chain_comparison() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("adopt_zero_tail.journal");
 
-    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32]).unwrap();
+    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32], TimeFloor::Genesis).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -2311,7 +2322,7 @@ fn adopted_rotation_with_wrong_tail_hash_is_divergence() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("adopt_diverge.journal");
 
-    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32]).unwrap();
+    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32], TimeFloor::Genesis).unwrap();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -2380,12 +2391,12 @@ fn chain_check_mark_verifies_at_exact_position() {
     // Reference chain value at sequence 2.
     let chain_at_2 = {
         let ref_path = dir.path().join("reference.journal");
-        let mut w = Writer::create_continuing(&ref_path, 1, anchor).unwrap();
+        let mut w = Writer::create_continuing(&ref_path, 1, anchor, TimeFloor::Genesis).unwrap();
         for seq in 1..=2u64 {
             assert_eq!(w.allocate_sequence(), seq);
             w.encode_event(
                 seq,
-                1_000_000_000 + seq,
+                SequencerTime::from_ns(1_000_000_000 + seq),
                 &JournalEvent::App(TestEvent::Add(seq)),
                 0,
             )
@@ -2397,7 +2408,7 @@ fn chain_check_mark_verifies_at_exact_position() {
 
     let run_with_check = |name: &str, expected: [u8; 32]| {
         let path = dir.path().join(format!("{name}.journal"));
-        let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+        let writer = Writer::create_continuing(&path, 1, anchor, TimeFloor::Genesis).unwrap();
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
             .add_consumer()
             .build(WaitStrategy::SpinThenYield);
@@ -2577,7 +2588,8 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
 
     let shared_anchor = [0xA5u8; 32];
 
-    let primary_writer = Writer::create_continuing(&primary_path, 1, shared_anchor).unwrap();
+    let primary_writer =
+        Writer::create_continuing(&primary_path, 1, shared_anchor, TimeFloor::Genesis).unwrap();
     let primary_active_conns = Arc::new(AtomicU64::new(0));
     let mut primary = build_pipeline_with_replication(
         TestApp::new(),
@@ -2603,7 +2615,8 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
         melin_pipeline::seqlock::split(crate::pipeline::FsyncState::default());
     primary.journal_stage.set_chain_hash_lock(p_fsync_writer);
 
-    let replica_writer = Writer::create_continuing(&replica_path, 1, shared_anchor).unwrap();
+    let replica_writer =
+        Writer::create_continuing(&replica_path, 1, shared_anchor, TimeFloor::Genesis).unwrap();
     let mut replica = build_replica_pipeline(
         TestApp::new(),
         replica_writer,
@@ -4184,6 +4197,7 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
         melin_pipeline::seqlock::split(crate::pipeline::FsyncState {
             journal_seq: WireSeq::new(slots.len() as u64),
             chain_hash: [0; 32],
+            last_timestamp: slots[slots.len() - 1].timestamp,
             input_ring_seq: crate::cursors::RingPos::new(slots.len() as u64),
         });
     let snap_path = dir.path().join("duplicate.snapshot");
@@ -4212,7 +4226,7 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     }
     shadow_shutdown.store(true, Ordering::Relaxed);
     t_shadow.join().unwrap();
-    let (shadow, _, _, _) = crate::snapshot::load::<TestApp>(&snap_path).unwrap();
+    let shadow = crate::snapshot::load::<TestApp>(&snap_path).unwrap().app;
     assert_eq!(
         shadow, live,
         "the shadow's snapshot must apply every submission as live did"

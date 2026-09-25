@@ -10,6 +10,7 @@
 //! | sequence         | u64      | 8     | Journal sequence at snapshot   |
 //! | chain_hash       | [u8; 32] | 32    | BLAKE3 hash chain state        |
 //! | epoch            | u64      | 8     | Fencing epoch at snapshot       |
+//! | timestamp        | u64      | 8     | Stamp of the anchor entry      |
 //! | app_payload      | var      | var   | Bytes from `A::snapshot`       |
 //! | crc32c           | u32      | 4     | CRC32C over everything above   |
 //!
@@ -22,24 +23,29 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use melin_app::Application;
+use melin_app::{Application, SequencerTime};
+use melin_journal::TimeFloor;
 
 use crate::cursors::WireSeq;
 use tracing::warn;
 
 const SNAP_MAGIC: u32 = 0x534E_4150;
-// v2 appended the fencing `epoch` field after `chain_hash`. Writes always
-// produce v2; reads accept v1 as well (epoch defaults to 0) so a node
-// upgraded in place can still bootstrap from its pre-fencing snapshot —
-// a v1 file predates any promotion, so epoch 0 is exact, and journal
-// replay re-applies any later `EpochBump`s on top. Unlike the journal's
+// v2 appended the fencing `epoch` field after `chain_hash`; v3 appended
+// the anchor entry's `timestamp` after that. Writes always produce v3;
+// reads accept v1 and v2 as well, so a node upgraded in place can still
+// bootstrap from its older snapshot. A v1 file predates any promotion,
+// so its epoch of 0 is exact, and journal replay re-applies any later
+// `EpochBump`s on top. A v1 or v2 file records no stamp, which is not
+// recoverable: it loads with an unknown time floor. Unlike the journal's
 // strict `FORMAT_VERSION` gate (where replay semantics could silently
-// change), the v1 layout is a strict prefix of v2, so the best-effort
+// change), each layout is a strict prefix of the next, so the best-effort
 // decode is unambiguous.
-const TRANSPORT_VERSION: u16 = 2;
+const TRANSPORT_VERSION: u16 = 3;
+const TRANSPORT_VERSION_V2: u16 = 2;
 const TRANSPORT_VERSION_V1: u16 = 1;
 const HEADER_SIZE_V1: usize = 4 + 2 + 2 + 8 + 32; // magic + t_ver + a_ver + seq + hash
-const HEADER_SIZE: usize = HEADER_SIZE_V1 + 8; // v2 appends the epoch
+const HEADER_SIZE_V2: usize = HEADER_SIZE_V1 + 8; // v2 appends the epoch
+const HEADER_SIZE: usize = HEADER_SIZE_V2 + 8; // v3 appends the timestamp
 const CRC_SIZE: usize = 4;
 const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -148,6 +154,10 @@ pub struct SnapshotHeader {
     /// fencing — exact, not approximate: a v1 snapshot can only have been
     /// taken before any promotion was journaled.
     pub epoch: u64,
+    /// The journal's time floor at the anchor: the stamp of the anchor
+    /// entry. [`TimeFloor::Unknown`] for v1 and v2 files, which predate
+    /// recorded stamps.
+    pub floor: TimeFloor,
     /// Bytes the header occupies in this file (version-dependent). The
     /// app payload starts at this offset.
     pub len: usize,
@@ -155,8 +165,9 @@ pub struct SnapshotHeader {
 
 impl SnapshotHeader {
     /// Decode and validate the framing header at the start of `bytes`.
-    /// Accepts transport versions 1 (no epoch) and 2. Does not touch the
-    /// app payload or the trailing CRC — callers own those checks.
+    /// Accepts transport versions 1 (no epoch), 2 (no timestamp) and 3.
+    /// Does not touch the app payload or the trailing CRC; callers own
+    /// those checks.
     pub fn parse(bytes: &[u8]) -> Result<Self, SnapshotError> {
         if bytes.len() < HEADER_SIZE_V1 {
             return Err(SnapshotError::Truncated);
@@ -178,6 +189,7 @@ impl SnapshotHeader {
         );
         let len = match transport_version {
             TRANSPORT_VERSION_V1 => HEADER_SIZE_V1,
+            TRANSPORT_VERSION_V2 => HEADER_SIZE_V2,
             TRANSPORT_VERSION => HEADER_SIZE,
             other => return Err(SnapshotError::UnsupportedTransportVersion(other)),
         };
@@ -205,11 +217,21 @@ impl SnapshotHeader {
                     .expect("epoch slice size fixed by header layout"),
             )
         };
+        let floor = if transport_version == TRANSPORT_VERSION {
+            TimeFloor::After(SequencerTime::from_ns(u64::from_le_bytes(
+                bytes[56..64]
+                    .try_into()
+                    .expect("timestamp slice size fixed by header layout"),
+            )))
+        } else {
+            TimeFloor::Unknown
+        };
         Ok(Self {
             app_version,
             sequence,
             chain_hash,
             epoch,
+            floor,
             len,
         })
     }
@@ -223,11 +245,14 @@ impl SnapshotHeader {
 /// `journal_sequence` is the recovery resume point — typed [`WireSeq`]
 /// because recording any other space (e.g. a ring position) here would
 /// make recovery replay already-applied events on top of restored state.
+/// `last_timestamp` is the stamp of the entry at `journal_sequence`, the
+/// time floor a writer continuing from the snapshot opens with.
 pub fn save<A: Application>(
     app: &A,
     journal_sequence: WireSeq,
     chain_hash: [u8; 32],
     epoch: u64,
+    last_timestamp: SequencerTime,
     path: &Path,
 ) -> Result<(), SnapshotError> {
     save_with_limit::<A>(
@@ -235,6 +260,7 @@ pub fn save<A: Application>(
         journal_sequence,
         chain_hash,
         epoch,
+        last_timestamp,
         path,
         MAX_SNAPSHOT_SIZE,
     )
@@ -247,6 +273,7 @@ fn save_with_limit<A: Application>(
     journal_sequence: WireSeq,
     chain_hash: [u8; 32],
     epoch: u64,
+    last_timestamp: SequencerTime,
     path: &Path,
     max_size: u64,
 ) -> Result<(), SnapshotError> {
@@ -258,6 +285,7 @@ fn save_with_limit<A: Application>(
     buf.extend_from_slice(&journal_sequence.get().to_le_bytes());
     buf.extend_from_slice(&chain_hash);
     buf.extend_from_slice(&epoch.to_le_bytes());
+    buf.extend_from_slice(&last_timestamp.as_ns().to_le_bytes());
     // App payload.
     app.snapshot(&mut buf)?;
     // CRC over everything written so far.
@@ -333,11 +361,27 @@ fn save_with_limit<A: Application>(
     Ok(())
 }
 
+/// A snapshot read back by [`load`]: the restored application and where
+/// it sits in the journal.
+#[derive(Debug)]
+pub struct LoadedSnapshot<A> {
+    pub app: A,
+    /// Journal sequence the snapshot is anchored at.
+    pub sequence: u64,
+    /// Hash-chain state at the anchor.
+    pub chain_hash: [u8; 32],
+    /// Fencing epoch at save time.
+    pub epoch: u64,
+    /// The journal's time floor at the anchor (see
+    /// [`SnapshotHeader::floor`]).
+    pub floor: TimeFloor,
+}
+
 /// Load a snapshot from `path`. Returns the restored application plus
-/// the journal sequence, chain hash, and fencing epoch recorded at save
-/// time so the caller can resume the journal from the right spot and seed
-/// its observed epoch.
-pub fn load<A: Application>(path: &Path) -> Result<(A, u64, [u8; 32], u64), SnapshotError> {
+/// the journal sequence, chain hash, fencing epoch and time floor recorded
+/// at save time, so the caller can resume the journal from the right spot
+/// and seed its observed epoch.
+pub fn load<A: Application>(path: &Path) -> Result<LoadedSnapshot<A>, SnapshotError> {
     let mut file = File::open(path)?;
     let file_size = file.seek(SeekFrom::End(0))?;
     if file_size > MAX_SNAPSHOT_SIZE {
@@ -373,8 +417,8 @@ pub fn load<A: Application>(path: &Path) -> Result<(A, u64, [u8; 32], u64), Snap
         return Err(SnapshotError::UnsupportedAppVersion(header.app_version));
     }
     if header.len > data_end {
-        // A v2 header that overlaps the CRC region — only reachable for a
-        // payload-less v2 file whose size passed the v1 minimum above.
+        // A v2 or v3 header that overlaps the CRC region: only reachable
+        // for a payload-less file whose size passed the v1 minimum above.
         return Err(SnapshotError::Truncated);
     }
 
@@ -389,7 +433,13 @@ pub fn load<A: Application>(path: &Path) -> Result<(A, u64, [u8; 32], u64), Snap
         return Err(SnapshotError::UnreadPayload(payload.len()));
     }
 
-    Ok((app, header.sequence, header.chain_hash, header.epoch))
+    Ok(LoadedSnapshot {
+        app,
+        sequence: header.sequence,
+        chain_hash: header.chain_hash,
+        epoch: header.epoch,
+        floor: header.floor,
+    })
 }
 
 #[cfg(test)]
@@ -418,11 +468,15 @@ mod tests {
         buf.extend_from_slice(&sequence.to_le_bytes());
         buf.extend_from_slice(&chain_hash);
         buf.extend_from_slice(&epoch.to_le_bytes());
+        buf.extend_from_slice(&STAMP.as_ns().to_le_bytes());
         buf.extend_from_slice(app_payload);
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         buf
     }
+
+    /// The anchor stamp every test snapshot records.
+    const STAMP: SequencerTime = SequencerTime::from_ns(1_700_000_000_000_000_000);
 
     fn populated_app() -> TestApp {
         let mut a = TestApp::new();
@@ -445,13 +499,14 @@ mod tests {
         // save/load today, just an intent guard).
         for (label, chain) in [("populated", [0xCDu8; 32]), ("zero sentinel", [0u8; 32])] {
             let path = dir.path().join(format!("snap.{label}"));
-            save::<TestApp>(&app, WireSeq::new(999), chain, 7, &path).unwrap();
+            save::<TestApp>(&app, WireSeq::new(999), chain, 7, STAMP, &path).unwrap();
 
-            let (restored, seq, ch, epoch) = load::<TestApp>(&path).unwrap();
-            assert_eq!(seq, 999, "{label}");
-            assert_eq!(ch, chain, "{label}");
-            assert_eq!(epoch, 7, "{label}");
-            assert_eq!(restored, app, "{label}");
+            let loaded = load::<TestApp>(&path).unwrap();
+            assert_eq!(loaded.sequence, 999, "{label}");
+            assert_eq!(loaded.chain_hash, chain, "{label}");
+            assert_eq!(loaded.epoch, 7, "{label}");
+            assert_eq!(loaded.floor, TimeFloor::After(STAMP), "{label}");
+            assert_eq!(loaded.app, app, "{label}");
         }
     }
 
@@ -464,7 +519,7 @@ mod tests {
         let app = populated_app();
 
         // First save — no previous snapshot exists; `.prev` is not created.
-        save::<TestApp>(&app, WireSeq::new(1), [0x11; 32], 0, &path).unwrap();
+        save::<TestApp>(&app, WireSeq::new(1), [0x11; 32], 0, STAMP, &path).unwrap();
         assert!(path.exists());
         assert!(
             !prev_path.exists(),
@@ -473,7 +528,7 @@ mod tests {
         let first_bytes = std::fs::read(&path).unwrap();
 
         // Second save — previous snapshot must be rotated to .prev verbatim.
-        save::<TestApp>(&app, WireSeq::new(2), [0x22; 32], 0, &path).unwrap();
+        save::<TestApp>(&app, WireSeq::new(2), [0x22; 32], 0, STAMP, &path).unwrap();
         assert!(path.exists());
         assert!(prev_path.exists(), "second save must produce a .prev file");
         assert_eq!(
@@ -483,13 +538,13 @@ mod tests {
         );
 
         // Both files must round-trip independently with their own metadata.
-        let (_, seq_curr, hash_curr, _) = load::<TestApp>(&path).unwrap();
-        assert_eq!(seq_curr, 2);
-        assert_eq!(hash_curr, [0x22; 32]);
+        let current = load::<TestApp>(&path).unwrap();
+        assert_eq!(current.sequence, 2);
+        assert_eq!(current.chain_hash, [0x22; 32]);
 
-        let (_, seq_prev, hash_prev, _) = load::<TestApp>(&prev_path).unwrap();
-        assert_eq!(seq_prev, 1);
-        assert_eq!(hash_prev, [0x11; 32]);
+        let prev = load::<TestApp>(&prev_path).unwrap();
+        assert_eq!(prev.sequence, 1);
+        assert_eq!(prev.chain_hash, [0x11; 32]);
     }
 
     #[test]
@@ -561,11 +616,12 @@ mod tests {
         let bytes = craft_snapshot_v1(777, [0xCD; 32], &payload);
         std::fs::write(&path, &bytes).unwrap();
 
-        let (restored, seq, chain, epoch) = load::<TestApp>(&path).unwrap();
-        assert_eq!(restored, app, "v1 payload must restore unchanged");
-        assert_eq!(seq, 777);
-        assert_eq!(chain, [0xCD; 32]);
-        assert_eq!(epoch, 0, "v1 snapshots predate fencing — epoch is 0");
+        let loaded = load::<TestApp>(&path).unwrap();
+        assert_eq!(loaded.app, app, "v1 payload must restore unchanged");
+        assert_eq!(loaded.sequence, 777);
+        assert_eq!(loaded.chain_hash, [0xCD; 32]);
+        assert_eq!(loaded.epoch, 0, "v1 snapshots predate fencing, epoch is 0");
+        assert_eq!(loaded.floor, TimeFloor::Unknown, "v1 records no stamp");
 
         // The shared header parser agrees with `load` (catch-up uses it
         // directly on the raw bytes).
@@ -573,7 +629,39 @@ mod tests {
         assert_eq!(header.sequence, 777);
         assert_eq!(header.chain_hash, [0xCD; 32]);
         assert_eq!(header.epoch, 0);
+        assert_eq!(header.floor, TimeFloor::Unknown);
         assert_eq!(header.len, HEADER_SIZE_V1);
+    }
+
+    /// A v2 snapshot, the layout before recorded stamps, keeps loading
+    /// after the upgrade: its epoch is read, and its time floor is
+    /// unknown rather than guessed.
+    #[test]
+    fn v2_snapshot_loads_with_an_unknown_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap.v2");
+        let app = populated_app();
+        let mut payload = Vec::new();
+        app.snapshot(&mut payload).unwrap();
+        let mut bytes = Vec::with_capacity(HEADER_SIZE_V2 + payload.len() + CRC_SIZE);
+        bytes.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&TRANSPORT_VERSION_V2.to_le_bytes());
+        bytes.extend_from_slice(&TestApp::APP_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&888u64.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 32]);
+        bytes.extend_from_slice(&5u64.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        let crc = crc32c::crc32c(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let loaded = load::<TestApp>(&path).unwrap();
+        assert_eq!(loaded.app, app, "v2 payload must restore unchanged");
+        assert_eq!(loaded.sequence, 888);
+        assert_eq!(loaded.chain_hash, [0xAB; 32]);
+        assert_eq!(loaded.epoch, 5);
+        assert_eq!(loaded.floor, TimeFloor::Unknown, "v2 records no stamp");
+        assert_eq!(SnapshotHeader::parse(&bytes).unwrap().len, HEADER_SIZE_V2);
     }
 
     #[test]
@@ -629,7 +717,15 @@ mod tests {
     fn checksum_mismatch_detected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snap");
-        save::<TestApp>(&populated_app(), WireSeq::new(0), [0u8; 32], 0, &path).unwrap();
+        save::<TestApp>(
+            &populated_app(),
+            WireSeq::new(0),
+            [0u8; 32],
+            0,
+            STAMP,
+            &path,
+        )
+        .unwrap();
         // Flip one bit inside the payload region (after the header, before
         // the trailing CRC). The mutated byte recomputes to a different
         // CRC than the one written at save time.
@@ -666,9 +762,10 @@ mod tests {
             other => panic!("expected Truncated, got {other:?}"),
         }
 
-        // A v2 header cut off before its epoch field must also read as
-        // truncated, not as a short payload: the file passes the v1-size
-        // gate, so the version-aware header parse is what must catch it.
+        // A v3 header cut off inside its timestamp field must also read
+        // as truncated, not as a short payload: the file passes the
+        // v1-size gate, so the version-aware header parse is what must
+        // catch it.
         let bytes = craft_snapshot(
             SNAP_MAGIC,
             TRANSPORT_VERSION,
@@ -680,14 +777,14 @@ mod tests {
         );
         // Keep CRC validity out of the way: rewrite the trailing CRC over
         // the truncated prefix so only the length check can fail.
-        let cut = HEADER_SIZE - 4; // mid-epoch
+        let cut = HEADER_SIZE - 4; // mid-timestamp
         let mut short = bytes[..cut].to_vec();
         let crc = crc32c::crc32c(&short);
         short.extend_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &short).unwrap();
         match load::<TestApp>(&path) {
             Err(SnapshotError::Truncated) => {}
-            other => panic!("expected Truncated for cut-off v2 header, got {other:?}"),
+            other => panic!("expected Truncated for cut-off v3 header, got {other:?}"),
         }
     }
 
@@ -706,6 +803,7 @@ mod tests {
             WireSeq::new(0),
             [0u8; 32],
             0,
+            STAMP,
             &path,
             /* max_size */ 16,
         ) {

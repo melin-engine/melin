@@ -43,13 +43,14 @@
 
 use std::path::{Path, PathBuf};
 
-use melin_app::AppEvent;
+use melin_app::{AppEvent, SequencerTime};
 
 use crate::codec;
 use crate::encoder::{JournalEncoder, entry_size};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 use crate::segment_file::SegmentFile;
+use crate::time_floor::TimeFloor;
 
 /// Append-only journal writer that goes through the kernel page cache
 /// and forces durability with `fdatasync` per flush.
@@ -75,24 +76,29 @@ const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
 impl<E: AppEvent> BufferedWriter<E> {
     /// Create a fresh journal file. The chain anchor is random salt so
-    /// histories from different runs/clusters are never confusable.
+    /// histories from different runs/clusters are never confusable. A
+    /// brand-new journal starts at sequence 1, so nothing precedes it in
+    /// time either: the floor is [`TimeFloor::Genesis`].
     pub fn create(path: &Path) -> Result<Self, JournalError> {
         crate::preparer::cleanup_staging_orphan(path);
-        Self::create_continuing(path, 1, crate::fresh_anchor()?)
+        Self::create_continuing(path, 1, crate::fresh_anchor()?, TimeFloor::Genesis)
     }
 
     /// Create a fresh journal that continues a previous segment's sequence
     /// numbers, anchored to `anchor_hash` (the prior segment's chain tip,
     /// or random salt for a brand-new journal). Both values are recorded
-    /// in the file header; no entries are written.
+    /// in the file header; no entries are written. `floor` is the time
+    /// of the entry before `starting_sequence`, which the header does not
+    /// record.
     pub fn create_continuing(
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
+        floor: TimeFloor,
     ) -> Result<Self, JournalError> {
         Ok(Self {
             segment: SegmentFile::create_continuing(path, starting_sequence, anchor_hash)?,
-            encoder: JournalEncoder::new(starting_sequence, anchor_hash),
+            encoder: JournalEncoder::new(starting_sequence, anchor_hash, floor),
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
         })
     }
@@ -108,8 +114,15 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// the file header and the hasher re-absorbs the raw byte range
     /// `[ENTRY_OFFSET, valid_end)` — the chain is a pure function of
     /// those two inputs, so no chain state needs to be threaded in from
-    /// the recovery walk.
-    pub fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
+    /// the recovery walk. The time floor is: `floor` is the stamp of the
+    /// entry at `last_seq`, which the walk read (see
+    /// [`JournalEncoder::resume`]).
+    pub fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        floor: TimeFloor,
+    ) -> Result<Self, JournalError> {
         // The segment half opens and scrubs the file, and hands back
         // the decoded header the stream half needs to resume: the
         // anchor to rebuild the chain from, and the segment's first
@@ -121,6 +134,7 @@ impl<E: AppEvent> BufferedWriter<E> {
             info.anchor_hash,
             last_seq,
             valid_end,
+            floor,
         )?;
         Ok(Self {
             encoder,
@@ -146,7 +160,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     pub fn encode_event(
         &mut self,
         seq: u64,
-        timestamp_ns: u64,
+        timestamp: SequencerTime,
         event: &JournalEvent<E>,
         key_hash: u64,
     ) -> Result<(), JournalError> {
@@ -170,7 +184,14 @@ impl<E: AppEvent> BufferedWriter<E> {
             self.batch_buf.resize(grown, 0);
         }
         self.encoder
-            .encode_event(&mut self.batch_buf, seq, timestamp_ns, event, key_hash)
+            .encode_event(&mut self.batch_buf, seq, timestamp, event, key_hash)
+    }
+
+    /// The journal's time floor: the stamp of the last entry encoded, or
+    /// the floor the writer opened with. See
+    /// [`JournalEncoder::last_timestamp`].
+    pub fn last_timestamp(&self) -> SequencerTime {
+        self.encoder.last_timestamp()
     }
 
     /// Write the accumulated batch and force it to stable media.
@@ -392,6 +413,12 @@ mod tests {
         JournalEvent::App(TestEvent(n))
     }
 
+    /// A stamp for hand-encoded entries: pass increasing `n` for
+    /// increasing stamps, as the sequencer clock issues them.
+    fn stamp(n: u64) -> SequencerTime {
+        SequencerTime::from_ns(1_000 + n)
+    }
+
     fn read_all_payloads(path: &Path) -> Vec<u64> {
         let mut reader = JournalReader::<TestEvent>::open(path).unwrap();
         let mut out = Vec::new();
@@ -480,12 +507,12 @@ mod tests {
 
         while BATCH_BUF_CAPACITY - w.encoder.batch_len() >= tick_len {
             let seq = w.allocate_sequence();
-            w.encode_event(seq, 1_000, &JournalEvent::App(TinyEvent), 0)
+            w.encode_event(seq, stamp(seq), &JournalEvent::App(TinyEvent), 0)
                 .expect("narrow entry");
         }
 
         let seq = w.allocate_sequence();
-        w.encode_event(seq, 2_000, &tick, 0)
+        w.encode_event(seq, stamp(seq), &tick, 0)
             .expect("a tick must always fit the reserved headroom");
     }
 
@@ -526,7 +553,9 @@ mod tests {
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         for i in 1..=10u64 {
-            writer.batch_append_with_ts(&sample(i), 0, 0).unwrap();
+            writer
+                .batch_append_with_ts(&sample(i), stamp(i), 0)
+                .unwrap();
         }
         // Before flush, no user data has reached disk past the header.
         // After flush, all ten entries land in one pwrite.
@@ -542,8 +571,12 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        writer.batch_append_with_ts(&sample(1), 0, 0).unwrap();
-        writer.batch_append_with_ts(&sample(2), 0, 0).unwrap();
+        writer
+            .batch_append_with_ts(&sample(1), stamp(1), 0)
+            .unwrap();
+        writer
+            .batch_append_with_ts(&sample(2), stamp(2), 0)
+            .unwrap();
         assert!(!writer.pending_batch_bytes().is_empty());
 
         writer.discard_batch_buf();
@@ -568,15 +601,37 @@ mod tests {
         writer.append(&sample(2)).unwrap();
         let last_seq = writer.next_sequence() - 1;
         let valid_end = writer.valid_end();
+        let floor = TimeFloor::After(writer.last_timestamp());
         drop(writer);
 
         let mut reopened =
-            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end, floor).unwrap();
+        assert_eq!(
+            TimeFloor::After(reopened.last_timestamp()),
+            floor,
+            "the reopened writer resumes from the floor it was given"
+        );
         reopened.append(&sample(3)).unwrap();
         reopened.append(&sample(4)).unwrap();
         drop(reopened);
 
         assert_eq!(read_all_payloads(&path), vec![1, 2, 3, 4]);
+    }
+
+    /// A rotation opens a new segment, not a new history: the floor
+    /// carries over, so the new segment's first entry is still judged
+    /// against the outgoing segment's last.
+    #[test]
+    fn rotation_keeps_the_time_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        assert_eq!(writer.last_timestamp(), SequencerTime::default());
+        let seq = writer.allocate_sequence();
+        writer.encode_event(seq, stamp(7), &sample(1), 0).unwrap();
+        writer.rotate_segment().unwrap();
+        assert_eq!(writer.last_timestamp(), stamp(7));
     }
 
     #[test]
@@ -834,10 +889,11 @@ mod tests {
         let chain_before = writer.chain_hash().unwrap();
         let last_seq = writer.next_sequence() - 1;
         let valid_end = writer.valid_end();
+        let floor = TimeFloor::After(writer.last_timestamp());
         drop(writer);
 
         let reopened =
-            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end, floor).unwrap();
 
         // Without any new events, the chain hash must reproduce the
         // value captured before close — proves the self-contained
@@ -852,7 +908,9 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        writer.batch_append_with_ts(&sample(42), 0, 0).unwrap();
+        writer
+            .batch_append_with_ts(&sample(42), stamp(1), 0)
+            .unwrap();
 
         // The full encoded entry is [magic(2) | header | payload | CRC(4)].
         // The replication slice strips the leading magic and trailing CRC.
@@ -881,6 +939,7 @@ mod tests {
         writer.append(&sample(22)).unwrap();
         let valid_end = writer.valid_end();
         let last_seq = writer.next_sequence() - 1;
+        let floor = TimeFloor::After(writer.last_timestamp());
         drop(writer);
 
         // Splat 4 KiB of plausibly-magic-looking garbage past valid_end.
@@ -901,7 +960,7 @@ mod tests {
         // either fail with a CRC error past `valid_end` or worse, treat
         // the garbage as a valid frame.
         let reopened =
-            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end, floor).unwrap();
         drop(reopened);
 
         // Fresh reader: must see exactly the two pre-crash entries —
@@ -962,10 +1021,11 @@ mod tests {
 
         let valid_end = writer.valid_end();
         let last_seq = writer.next_sequence() - 1;
+        let floor = TimeFloor::After(writer.last_timestamp());
         drop(writer);
 
         let mut reopened =
-            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end, floor).unwrap();
         assert_eq!(reopened.chain_hash(), Some(chain_no_crash));
 
         // The rebuilt hasher must continue identically: append one more

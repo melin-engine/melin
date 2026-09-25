@@ -19,7 +19,7 @@
 use std::marker::PhantomData;
 use std::path::Path;
 
-use melin_app::AppEvent;
+use melin_app::{AppEvent, SequencerTime};
 
 #[cfg(feature = "hash-chain")]
 use crate::chain::SegmentChain;
@@ -28,6 +28,7 @@ use crate::codec;
 use crate::codec::ENTRY_OFFSET;
 use crate::error::JournalError;
 use crate::event::JournalEvent;
+use crate::time_floor::TimeFloor;
 
 /// Ceiling on one encoded entry, for **any** application.
 ///
@@ -104,6 +105,11 @@ pub struct JournalEncoder<E: AppEvent> {
     starting_sequence: u64,
     #[cfg(feature = "hash-chain")]
     hash_chain: SegmentChain,
+    // The journal's time floor: the stamp of the last entry encoded, or
+    // the floor the stream was opened with before the first. Carried
+    // across `begin_segment`, since time strictly increases across the
+    // whole journal, not per segment.
+    last_timestamp: SequencerTime,
     // Debug-only monotonicity guard: every fresh seq must strictly
     // exceed this. Excluded from release builds — zero hot-path cost.
     #[cfg(debug_assertions)]
@@ -131,10 +137,10 @@ impl<E: AppEvent> JournalEncoder<E> {
     );
 
     /// Start a stream at the beginning of a segment: the next event
-    /// gets `starting_sequence`, and the chain starts at `anchor_hash`
-    /// (the previous segment's tail, or random salt for a brand-new
-    /// journal).
-    pub fn new(starting_sequence: u64, anchor_hash: [u8; 32]) -> Self {
+    /// gets `starting_sequence`, the chain starts at `anchor_hash` (the
+    /// previous segment's tail, or random salt for a brand-new journal),
+    /// and `floor` is the time that precedes it.
+    pub fn new(starting_sequence: u64, anchor_hash: [u8; 32], floor: TimeFloor) -> Self {
         let _: () = Self::FITS_ONE_ENTRY;
         // The chain is the anchor's only consumer; with `hash-chain`
         // compiled out the parameter stays in the signature so callers
@@ -149,6 +155,7 @@ impl<E: AppEvent> JournalEncoder<E> {
             starting_sequence,
             #[cfg(feature = "hash-chain")]
             hash_chain: SegmentChain::new(anchor_hash),
+            last_timestamp: opened_floor(floor, starting_sequence),
             #[cfg(debug_assertions)]
             last_encoded_seq: 0,
             last_user_entry_offset: 0,
@@ -165,12 +172,18 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// threaded in from the recovery walk. (Reading those bytes is the
     /// one place this half touches a file, and it is a one-shot read at
     /// startup, not ownership of the descriptor.)
+    ///
+    /// The time floor, on the other hand, is threaded in (`floor`, the
+    /// stamp of the entry at `last_seq`): the chain rebuild does not
+    /// parse entries, and the format cannot be read backwards to find the
+    /// last one.
     pub fn resume(
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
         last_seq: u64,
         valid_end: u64,
+        floor: TimeFloor,
     ) -> Result<Self, JournalError> {
         let _: () = Self::FITS_ONE_ENTRY;
         // Chain-rebuild inputs only — see `new`.
@@ -189,6 +202,7 @@ impl<E: AppEvent> JournalEncoder<E> {
                 ENTRY_OFFSET,
                 valid_end,
             )?,
+            last_timestamp: opened_floor(floor, last_seq + 1),
             #[cfg(debug_assertions)]
             last_encoded_seq: last_seq,
             last_user_entry_offset: 0,
@@ -201,7 +215,9 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// and the batch is empty.
     ///
     /// No sequence is consumed — the next event still gets
-    /// `starting_sequence`.
+    /// `starting_sequence`. The time floor is left alone: time strictly
+    /// increases across segments, and this is the one piece of state a
+    /// new segment does not reset.
     pub fn begin_segment(&mut self, starting_sequence: u64, anchor_hash: [u8; 32]) {
         self.starting_sequence = starting_sequence;
         self.batch_len = 0;
@@ -249,7 +265,7 @@ impl<E: AppEvent> JournalEncoder<E> {
         &mut self,
         dst: &mut [u8],
         seq: u64,
-        timestamp_ns: u64,
+        timestamp: SequencerTime,
         event: &JournalEvent<E>,
         key_hash: u64,
     ) -> Result<(), JournalError> {
@@ -264,7 +280,7 @@ impl<E: AppEvent> JournalEncoder<E> {
             self.last_encoded_seq = seq;
         }
 
-        let written = codec::encode(seq, timestamp_ns, key_hash, event, &mut self.buffer)?;
+        let written = codec::encode(seq, timestamp.as_ns(), key_hash, event, &mut self.buffer)?;
 
         let offset = self.batch_len;
         if dst.len() - offset < written {
@@ -291,8 +307,16 @@ impl<E: AppEvent> JournalEncoder<E> {
         dst[offset..offset + written].copy_from_slice(&self.buffer[..written]);
         self.last_user_entry_len = written;
         self.batch_len += written;
+        self.last_timestamp = timestamp;
 
         Ok(())
+    }
+
+    /// The journal's time floor: the stamp of the last entry encoded, or
+    /// the floor the stream opened with before the first. The stamp the
+    /// next entry must exceed.
+    pub fn last_timestamp(&self) -> SequencerTime {
+        self.last_timestamp
     }
 
     /// Bytes encoded into the destination since the last
@@ -373,6 +397,20 @@ impl<E: AppEvent> JournalEncoder<E> {
         let end = start + self.last_user_entry_len;
         &dst[start + 2..end - 4]
     }
+}
+
+/// The floor a stream opens with, as a stamp. An unknown floor is the one
+/// place the journal's time guarantee is waived, so it is said out loud.
+fn opened_floor(floor: TimeFloor, next_sequence: u64) -> SequencerTime {
+    if floor == TimeFloor::Unknown {
+        tracing::warn!(
+            next_sequence,
+            "journal opened with no time floor: it continues from a snapshot that \
+             predates recorded stamps, so the next entry's time is not checked \
+             against the history before it"
+        );
+    }
+    floor.time()
 }
 
 #[cfg(test)]

@@ -88,6 +88,10 @@ pub struct JournalWriteMeta {
     pub journal_seq: u64,
     /// Chain value after this batch. `[0u8; 32]` with `hash-chain` off.
     pub chain_hash: [u8; 32],
+    /// The journal's time floor after this batch: the stamp of the entry
+    /// at `journal_seq`. Published as `FsyncState.last_timestamp`, so a
+    /// snapshot records the stamp of its anchor entry.
+    pub last_timestamp: melin_app::SequencerTime,
     /// Input-ring position the disk thread publishes as consumer
     /// progress once the batch is durable. This is what gates slot
     /// reuse upstream and, on a replica, persisted acks — so it must
@@ -415,6 +419,7 @@ mod tests {
             len: len as u32,
             journal_seq,
             chain_hash: [journal_seq as u8; 32],
+            last_timestamp: melin_app::SequencerTime::from_ns(1_000 + journal_seq),
             ring_progress: journal_seq * 10,
         }
     }

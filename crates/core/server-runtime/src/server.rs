@@ -603,12 +603,16 @@ impl ServerConfig {
         }
     }
 
-    /// The primary's sequencer clock, with the configured jump limit.
-    /// Starts from zero: nothing is carried over from the journal yet.
-    pub fn sequencer_clock(&self) -> melin_transport_core::clock::SequencerClock {
+    /// The primary's sequencer clock, with the configured jump limit,
+    /// seeded at `floor`: the time floor of the journal it stamps for.
+    pub fn sequencer_clock(
+        &self,
+        floor: melin_app::SequencerTime,
+    ) -> melin_transport_core::clock::SequencerClock {
         melin_transport_core::clock::SequencerClock::new(
             melin_transport_core::clock::SystemClocks,
             std::time::Duration::from_millis(self.clock_jump_limit_ms),
+            floor,
         )
     }
 
@@ -1395,6 +1399,10 @@ where
     // available; we only allocate the consumer slot when both the fn is
     // wired AND `--event-bind` is set.
     let enable_event_publisher = event_publisher.is_some() && config.event_bind.is_some();
+    // The journal's time floor, read before the pipeline takes the writer:
+    // the sequencer clock starts past it. One path for a boot, a snapshot
+    // boot and a promotion alike, since each hands over its writer.
+    let time_floor = writer.last_timestamp();
     let Pipeline {
         input_producer,
         journal_stage,
@@ -1468,7 +1476,8 @@ where
     // which becomes the sole steady-state producer. No cloning required.
     // The sequencer clock travels with it, so every event the node
     // journals is stamped by the one clock.
-    let mut input_producer = StampingProducer::new(input_producer, config.sequencer_clock());
+    let mut input_producer =
+        StampingProducer::new(input_producer, config.sequencer_clock(time_floor));
 
     // Spawn pipeline OS threads.
     let cores = config.cores;
@@ -2538,6 +2547,9 @@ where
     // honoured here too — no orphan consumer slot is wired up.
     let enable_event_publisher = event_publisher.is_some() && config.event_bind.is_some();
     let enable_shadow = config.snapshot_interval_ms > 0;
+    // The journal's time floor, read before the pipeline takes the writer:
+    // the sequencer clock starts past it.
+    let time_floor = writer.last_timestamp();
     let Pipeline {
         input_producer,
         journal_stage,
@@ -2577,7 +2589,8 @@ where
     // ring is single-producer: main publishes seeds, then moves the
     // producer into the DPDK poll thread. No cloning required. The
     // sequencer clock travels with it.
-    let mut input_producer = StampingProducer::new(input_producer, config.sequencer_clock());
+    let mut input_producer =
+        StampingProducer::new(input_producer, config.sequencer_clock(time_floor));
 
     // The DPDK poll thread also generates the application's clock ticks via
     // a wall-clock comparison between NIC bursts (see `run_dpdk_poll`). The
@@ -3151,11 +3164,16 @@ where
                     snapshot = %snap_path.display(),
                     "recovering from snapshot only (no journal segments on disk)"
                 );
-                let (app, snap_sequence, snap_chain_hash, snap_epoch) =
-                    melin_transport_core::snapshot::load::<A>(snap_path)?;
-                let writer =
-                    W::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
-                JournaledApp::<A, W>::from_parts(app, writer, snap_epoch)
+                let loaded = melin_transport_core::snapshot::load::<A>(snap_path)?;
+                // The snapshot's stamp is the time floor: nothing on disk
+                // is later than its anchor entry.
+                let writer = W::create_continuing(
+                    &config.journal,
+                    loaded.sequence + 1,
+                    loaded.chain_hash,
+                    loaded.floor,
+                )?;
+                JournaledApp::<A, W>::from_parts(loaded.app, writer, loaded.epoch)
             }
             BootstrapSource::JournalOnly => {
                 info!("recovering from journal");
