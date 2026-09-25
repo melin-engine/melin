@@ -24,15 +24,17 @@
 //! Strict time makes a forward jump of the wall clock permanent: every
 //! later stamp stays at least as far ahead, and nothing that has seen the
 //! future time can be wound back. So a reading more than the jump limit
-//! ahead of where the wall clock should be is refused. "Where it should
-//! be" comes from `CLOCK_BOOTTIME`, which never jumps (and, unlike
-//! `CLOCK_MONOTONIC`, keeps counting while a VM is suspended, so a resume
-//! is not taken for a jump): the last accepted wall reading plus the boot
-//! time elapsed since. While refused, the clock issues that expected time,
-//! so time keeps flowing at the real rate, and it follows the wall clock
-//! again as soon as a reading comes back within the limit. A step back is
-//! accepted; the `last + 1` rule then holds stamps until the wall clock
-//! catches up.
+//! ahead of both where the wall clock should be and the last stamp is
+//! refused. "Where it should be" comes from `CLOCK_BOOTTIME`, which never
+//! jumps (and, unlike `CLOCK_MONOTONIC`, keeps counting while a VM is
+//! suspended, so a resume is not taken for a jump): the last accepted wall
+//! reading plus the boot time elapsed since. While refused, the clock
+//! issues that expected time, so time keeps flowing at the real rate, and
+//! it follows the wall clock again as soon as a reading comes back within
+//! the limit. A step back is accepted; the `last + 1` rule then holds
+//! stamps until the wall clock catches up, and a correction of the step
+//! is accepted too, since it takes journaled time no further than the
+//! last stamp plus the limit.
 //!
 //! The guard protects a running node only. The first reading has nothing
 //! to compare against and is taken as it is, so a restart accepts a wall
@@ -197,7 +199,11 @@ impl<S: TimeSource> SequencerClock<S> {
         let expected_ns = reference
             .wall_ns
             .saturating_add(boot_ns.saturating_sub(reference.boot_ns));
-        let ahead_ns = wall_ns.saturating_sub(expected_ns);
+        // Judged against the journal as well as the projection: after a
+        // step back the projection trails the last stamp, and the reading
+        // that corrects the step lands well ahead of the projection but
+        // moves journaled time forward no further than any other reading.
+        let ahead_ns = wall_ns.saturating_sub(expected_ns.max(self.last.as_ns()));
         if ahead_ns > self.jump_limit_ns {
             if !self.refusing {
                 self.refusing = true;
@@ -438,10 +444,44 @@ mod tests {
         clocks.step_wall(T0 - 1_000_000);
         assert_eq!(now_ns(&mut clock), T0 + 1, "held one past the last stamp");
         assert_eq!(now_ns(&mut clock), T0 + 2);
-        // The step back became the reference, so time from it on is real
-        // time: once the wall clock passes the last stamp it is followed.
+        // Time runs on from the stepped-back wall clock: once it passes
+        // the last stamp it is followed.
         clocks.advance(2_000_000);
         assert_eq!(now_ns(&mut clock), T0 + 1_000_000);
+    }
+
+    /// The operator's natural fix for a step back is to set the wall
+    /// clock right again. That reading lies far ahead of where the
+    /// stepped-back clock should be, but no further ahead of the journal
+    /// than any other reading, so it is followed, not refused.
+    #[test]
+    fn a_correction_of_a_step_back_is_followed() {
+        const HOUR_NS: u64 = 3_600_000_000_000;
+        let (clocks, mut clock) = clock_at(T0);
+        clock.now();
+        clocks.step_wall(T0 - HOUR_NS);
+        assert_eq!(now_ns(&mut clock), T0 + 1, "held while the clock is behind");
+        clocks.advance(1_000);
+        clocks.step_wall(T0 + 1_000);
+        assert_eq!(now_ns(&mut clock), T0 + 1_000, "the correction is followed");
+    }
+
+    /// Judging against the journal as well as the projection widens
+    /// nothing: after a step back, a runaway reading is still more than
+    /// the limit past both.
+    #[test]
+    fn a_runaway_jump_after_a_step_back_is_still_refused() {
+        const HOUR_NS: u64 = 3_600_000_000_000;
+        let (clocks, mut clock) = clock_at(T0);
+        clock.now();
+        clocks.step_wall(T0 - HOUR_NS);
+        clock.now();
+        clocks.step_wall(T0 + 2 + LIMIT_NS + 1);
+        assert_eq!(
+            now_ns(&mut clock),
+            T0 + 2,
+            "refused: held past the last stamp"
+        );
     }
 
     #[test]

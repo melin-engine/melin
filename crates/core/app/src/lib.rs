@@ -165,7 +165,7 @@ impl SequencerTime {
         Self(ns)
     }
 
-    /// Nanoseconds since the Unix epoch — for encoding, arithmetic and
+    /// Nanoseconds since the Unix epoch, for encoding, arithmetic and
     /// display, where the value leaves the type system.
     #[inline]
     pub const fn as_ns(self) -> u64 {
