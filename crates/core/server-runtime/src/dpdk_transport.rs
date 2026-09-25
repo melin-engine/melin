@@ -765,7 +765,7 @@ fn process_auth_frame(
     debug!(
         connection_id = conn.connection_id.0,
         addr = %conn.addr,
-        permission = ?permission,
+        role = %permission,
         "DPDK: authenticated"
     );
 

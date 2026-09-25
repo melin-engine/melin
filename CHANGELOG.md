@@ -27,8 +27,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`melin_app::key_hash`**, the function every transport derives
   `ApplyCtx::key_hash` and `QueryCtx::key_hash` from, so a test harness
   or tool can compute which value a given public key arrives under.
-- **`Permission::may_connect_as_client`**, false for the `replication`
-  role only.
+- **`melin_app::auth::KeyRole`**, what `authorized_keys` grants a key:
+  `Replication`, or `Client(Permission)`. `KeyRole::client` gives the
+  permission a key has on the client listener, and `None` for a
+  replication key, so a listener of an application's own that admits the
+  same keys applies the client listener's rule through it.
 
 ### Removed
 
@@ -139,6 +142,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   request of its reaches an application's decoder. A client that
   connected with a replication key needs a key of its own, under a
   client role.
+- **`Permission` has no `Replication` variant, and
+  `AuthorizedKeys::lookup` returns a `KeyRole`.** A decoder never sees a
+  replication key, and its type now says so. Source-breaking: match
+  `KeyRole::Replication` where code matched `Permission::Replication`,
+  call `is_replication` on the `KeyRole`, and take a client permission
+  from `KeyRole::client`. Errors and logs now name a role by its token in
+  the keys file (`trader`, not `Trader`), and a keys file naming an
+  unknown role is refused with `unknown role`, listing every valid one,
+  where it said `unknown permission`.
 - **An `authorized_keys` file that lists a key twice no longer loads.**
   The last line used to win silently; which role was meant is not the
   loader's to guess. A node given such a file refuses to start and names

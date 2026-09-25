@@ -200,17 +200,17 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
 
     let (signature_bytes, public_key_bytes) = (cr.signature, cr.public_key);
 
-    let permission = match authorized_keys.lookup(&public_key_bytes) {
-        Some(perm) => perm,
+    let role = match authorized_keys.lookup(&public_key_bytes) {
+        Some(role) => role,
         None => {
             send_auth_failed(stream);
             return Err("unknown public key".into());
         }
     };
-    if permission != Permission::Operator {
+    if !role.client().is_some_and(Permission::is_operator) {
         send_auth_failed(stream);
         return Err(format!(
-            "admin endpoint requires operator key, got {permission:?}"
+            "admin endpoint requires an operator key, got a {role} key"
         ));
     }
 
