@@ -285,10 +285,8 @@ impl<E: AppEvent, S: TimeSource> StampingProducer<E, S> {
     /// rather than blocking ingress.
     pub fn try_publish_tick(&mut self) -> Result<u64, Full> {
         let now = self.clock.now();
-        let tick = JournalEvent::Tick {
-            now_ns: now.as_ns(),
-        };
-        self.producer.try_publish(internal_slot(tick, now))
+        self.producer
+            .try_publish(internal_slot(JournalEvent::Tick, now))
     }
 
     /// The last stamp issued, or the floor the clock was seeded at.
@@ -653,8 +651,8 @@ mod tests {
         let slots = drain(&mut consumer);
         assert_eq!(stamps(&slots), [T0, T0 + 1, T0 + 2, T0 + 3]);
         assert!(
-            matches!(slots[1].event, JournalEvent::Tick { now_ns } if now_ns == T0 + 1),
-            "a tick carries its own stamp"
+            matches!(slots[1].event, JournalEvent::Tick),
+            "the tick sits in ring order, its time in its stamp"
         );
     }
 

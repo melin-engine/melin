@@ -486,34 +486,34 @@ mod tests {
     }
 
     /// The headroom kept ahead of the encoder has to cover the *widest*
-    /// entry the journal can write, not just the app's own — a tick is
-    /// journaled whatever `E` is.
+    /// entry the journal can write, not just the app's own: an epoch
+    /// bump is journaled whatever `E` is.
     ///
-    /// Fills the batch buffer down to a gap too small for a tick, then
-    /// writes one. A reservation derived from the app's width alone
+    /// Fills the batch buffer down to a gap too small for an epoch bump,
+    /// then writes one. A reservation derived from the app's width alone
     /// leaves that gap looking sufficient, so the buffer is not grown and
-    /// the tick is refused mid-batch.
+    /// the bump is refused mid-batch.
     #[test]
-    fn a_tick_fits_the_headroom_a_narrow_app_reserves() {
+    fn an_epoch_bump_fits_the_headroom_a_narrow_app_reserves() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.journal");
         let mut w = BufferedWriter::<TinyEvent>::create(&path).unwrap();
 
-        let tick = JournalEvent::Tick { now_ns: u64::MAX };
-        let tick_len = {
+        let bump = JournalEvent::EpochBump { epoch: u64::MAX };
+        let bump_len = {
             let mut probe = [0u8; crate::encoder::MAX_ENTRY_SIZE];
-            codec::encode(1, 0, 0, &tick, &mut probe).unwrap()
+            codec::encode(1, 0, 0, &bump, &mut probe).unwrap()
         };
 
-        while BATCH_BUF_CAPACITY - w.encoder.batch_len() >= tick_len {
+        while BATCH_BUF_CAPACITY - w.encoder.batch_len() >= bump_len {
             let seq = w.allocate_sequence();
             w.encode_event(seq, stamp(seq), &JournalEvent::App(TinyEvent), 0)
                 .expect("narrow entry");
         }
 
         let seq = w.allocate_sequence();
-        w.encode_event(seq, stamp(seq), &tick, 0)
-            .expect("a tick must always fit the reserved headroom");
+        w.encode_event(seq, stamp(seq), &bump, 0)
+            .expect("an epoch bump must always fit the reserved headroom");
     }
 
     #[test]

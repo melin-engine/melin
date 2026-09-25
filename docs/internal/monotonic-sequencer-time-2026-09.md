@@ -522,13 +522,20 @@ One commit per step, each reviewable on its own.
    increasing, the same calls on every path, and time that may stand
    still while the clock is held) and `ApplyCtx::now_ns`. Confirm the
    microbenchmark in the real pipeline before merging (decision 2).
+   Not done in this step: the repository has no pipeline benchmark, and
+   the measurement needs the bench fleet (echo and counter for the
+   stamping and the encoder's compare, a scheduler-shaped application for
+   the per-event `tick`). It is deferred to the release benchmark and
+   gates the merge of this item (step 6); until it runs, the strict-tick
+   decision rests on the dated microbenchmark above alone.
    `dispatch` must return before the clock step for a `Shutdown` slot:
    the matching stage's shutdown drain hands it the pipeline sentinel,
    whose zero time would otherwise reach `tick`.
-   Decide here whether the application sees `SequencerTime` (decision 1):
-   the type would carry the contract where application authors read
-   it, at the cost of a public API break for every application's `tick`
-   and every reader of `now_ns`.
+   Decided here: the application sees `SequencerTime` (decision 1).
+   `ApplyCtx::now` and `Application::tick(now)` take it, so the
+   contract travels with the type where application authors read it; the
+   price is a public API break for every application's `tick` and every
+   reader of the old `now_ns`.
 
    Guarded by the property test that proves the runtime's half of
    determinism: the sequence of calls into the application depends on
@@ -569,9 +576,15 @@ One commit per step, each reviewable on its own.
    determinism test, which stays an independent roadmap item: it checks
    the application's half (identical calls give identical state), not
    the runtime's.
-7. **Docs:** the timestamp field's meaning in `docs/journal.md`; the
-   reader row in `docs/pipeline-architecture.md`; the operator notes of
-   decision 6; `CLOCK-ACCEPT` beside the other admin commands in
+
+   Also the merge gate deferred from step 4: the pipeline benchmark with
+   `tick` before every entry, on the bench fleet, its result recorded in
+   decision 2 with the date and the hardware.
+7. **Docs:** the operator notes of decision 6, including the jump
+   limit (the timestamp field in `docs/journal.md`, and the timestamp and
+   scheduler clock in `docs/pipeline-architecture.md`, were corrected in
+   step 4, where they became false); `CLOCK-ACCEPT` beside the other
+   admin commands in
    `docs/replication.md`; CHANGELOG under
    Unreleased (the format-15 and protocol-5 entries become 16 and 6);
    the note in
@@ -605,10 +618,19 @@ Read, not changed here; the fixes belong to the exchange.
     discards it and compiles unchanged.
   - `JournalEntry::timestamp_ns` is now `timestamp: SequencerTime`:
     `server/src/bin/journal-diff.rs`.
-- `ServerApp::tick` is compatible as is; it will run once per event
-  instead of once per batch.
-- `scheduler.rs`'s module doc refers to `Tick { now_ns }` and needs
-  updating when the payload goes (step 4).
+- **Broken since step 4**, mechanical, in the server crate only (the
+  core crate keeps plain `u64` nanoseconds internally):
+  - `ApplyCtx::now_ns` is now `now: SequencerTime`:
+    `server/src/exchange_app.rs` (`ctx.now_ns` into
+    `set_current_event_ts_ns`, and an `ApplyCtx` literal in its tests)
+    and `server/tests/journal_recovery.rs` (a literal).
+  - `Application::tick` takes `now: SequencerTime`:
+    `ServerApp::tick` in `server/src/exchange_app.rs`, which passes
+    `now.as_ns()` on to `drain_due_scheduled_tasks`.
+  - `ServerApp::tick` now runs before every journaled entry rather than
+    once per batch; its behaviour needs no change.
+- `scheduler.rs`'s module doc refers to `Tick { now_ns }`, which no
+  longer exists: a tick's time is its entry's timestamp.
 - The exchange's rate limiter reads the clock `tick` stamps, so it
   stops refilling while the sequencer clock is held (decision 6). Worth
   a line in its own docs; no code change.

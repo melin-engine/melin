@@ -24,9 +24,9 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
 ```
 
 1. **Reader** -- a single thread multiplexes every TCP client connection and publishes decoded requests into the input disruptor. The same thread also generates the application's clock ticks at the configured cadence (**default 250 ms**). With this, the input ring is single-producer in steady state on both transports.
-   - **io_uring**: the reader arms an `IORING_OP_TIMEOUT` SQE at the cadence; the deadline wakes `submit_and_wait` even when no client traffic is flowing, and the loop emits a `JournalEvent::Tick { now_ns }` when the deadline passes.
+   - **io_uring**: the reader arms an `IORING_OP_TIMEOUT` SQE at the cadence; the deadline wakes `submit_and_wait` even when no client traffic is flowing, and the loop emits a `JournalEvent::Tick` when the deadline passes.
    - **DPDK**: the poll thread compares the wall clock to the deadline once every ~4096 poll iterations (negligible cost on a 100% busy spin loop) and emits the tick the same way.
-2. **Tick semantics** -- the matching stage advances the application's clock from each event's timestamp, so under load every event implicitly fires the application's due time-driven work at microsecond precision. The 250 ms tick is the safety net that keeps time moving forward during quiet periods (no client traffic).
+2. **Tick semantics** -- every journaled event advances the application's clock to its own time before it is applied, so under load due time-driven work fires at the first event past its deadline. The 250 ms tick is the safety net that keeps time moving forward during quiet periods (no client traffic).
 3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwrite` + `fdatasync`. Advances its cursor only after the write is durable.
 4. **Matching stage** -- applies each event to the application (the `matching` thread in `--cores`) and publishes the reports it produces to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
 5. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
@@ -52,11 +52,11 @@ The simplified diagram above shows the primary-side request path. The picture be
  |    READER      |----+                     |
  | (1 io_uring    |  arms tick timeout       |
  |  thread; also  |  per cadence; emits      |
- |  publishes     |  Tick{now_ns} when       |
+ |  publishes     |  a Tick when             |
  |  Ticks)        |  the deadline passes     |
  +-------+--------+                          |
          |                                   |
-         | client requests + Tick{now_ns}    |  genesis /
+         | client requests + Ticks           |  genesis /
          |                                   |  on-primary events
          v                                   v
  +---------------------------------------------+
@@ -164,17 +164,15 @@ The simplified diagram above shows the primary-side request path. The picture be
 
 - **Event payload**: produced at the ingress edge (client requests, the ingress thread's tick generator, startup events). Flows unchanged through every stage and across the TCP boundary to replicas.
 - **Sequence number**: on the primary, allocated by the journal stage at encode time, in disruptor ring-cursor order. Producers publish `InputSlot { sequence: 0, … }` and never coordinate across an external counter — eliminating the prior "claim then publish" leak window. On replicas the replication receiver decodes the primary's sequence from the wire bytes and stamps it onto `InputSlot.sequence` before publishing; the journal stage uses that value verbatim. Either way the on-disk journal sequence and the disruptor cursor advance in lock-step.
-- **Wall-clock timestamp**: stamped at ingress by each producer (e.g. `wall_clock_nanos()` in the reader). Embedded into the journal entry and shipped to replicas.
+- **Timestamp**: stamped at ingress by the primary's one sequencer clock, which travels with the input ring's producer, strictly later than the entry before it (see [Journal & Event Sourcing](journal.md#timestamps)). Embedded into the journal entry and shipped to replicas, which keep it verbatim.
 - **Hash chain**: per journal segment, anchored in the segment's file header and computed over the raw entry bytes (`chain(S) = BLAKE3(entry bytes through S ‖ anchor)`). No chain metadata rides in the entry stream — see [Journal & Event Sourcing](journal.md) for the full model.
 - **Replica journals** carry an event stream byte-identical to the primary's (same sequences, same timestamps, same payloads — the wire ships the primary's encoded fields verbatim). Segment *files* stay byte-identical too: rotation is primary-driven, so boundaries — and with them per-segment anchors and chain values — match on both nodes, which is what makes the cross-node chain comparison possible (see [replication.md](replication.md)).
 
 ### Scheduler clock
 
-The matching stage keeps a watermark of the latest time it has handed the application. Before applying an event whose timestamp is past the watermark, it advances the application's clock to that timestamp — letting it fire whatever time-driven work has come due (expiries, session transitions) — and moves the watermark. Under load every event therefore advances the clock at microsecond precision, with no extra latency hop for a separate `Tick` event. The tick generator's role narrows to "make sure the clock advances during quiet periods" — at the default 250 ms cadence it costs four journal entries a second.
+Before applying each journaled event, the matching stage advances the application's clock to that event's timestamp, letting it fire whatever time-driven work has come due (expiries, session transitions). Timestamps strictly increase, so every event is its own instant: under load the clock advances at every event, and due work fires at the first event past its deadline, with no extra latency hop for a separate `Tick` event. The tick generator's role narrows to making sure the clock advances during quiet periods; at the default 250 ms cadence it costs four journal entries a second. A journaled tick advances the clock to its own time, once, and does nothing else.
 
-A journaled tick advances the application's clock to the tick's own time whether or not it is past the watermark.
-
-Journal replay and the shadow stage advance the clock by the same rules, from the same journaled timestamps, so the live application, a recovered one and the shadow's copy see the same clock. One known exception: the watermark is not carried across a restart or snapshot restore, so after a wall clock that stepped backwards — or a failover to a node whose clock is behind — a node that restarted can advance the clock at points where one that kept running did not. An application whose clock handling does nothing for a time it has already passed — no due work fires again, no state records the earlier time — is unaffected.
+Journal replay and the shadow stage advance the clock by the same rule, from the same journaled timestamps, and the rule keeps no state: what reaches the application depends on each entry alone. So the live application, a recovered one, a replica and a node restored from any snapshot receive the same calls in the same order, with no exception for restarts or clock steps.
 
 ## Input Disruptor
 

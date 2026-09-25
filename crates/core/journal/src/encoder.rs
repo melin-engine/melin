@@ -536,14 +536,14 @@ mod tests {
     }
 
     /// `entry_size` is what every caller reserves, and the journal writes
-    /// more than app events: `Tick` and `EpochBump` carry an 8-byte
-    /// payload whatever `E` is. An app narrower than that must still
-    /// reserve enough for them, or a tick lands in a hole too small for
-    /// it and a durable write fails.
+    /// more than app events: `EpochBump` carries an 8-byte payload
+    /// whatever `E` is. An app narrower than that must still reserve
+    /// enough for it, or an epoch bump lands in a hole too small for it
+    /// and a durable write fails.
     #[test]
     fn entry_size_bounds_the_transport_variants() {
         for event in [
-            JournalEvent::<TinyEvent>::Tick { now_ns: u64::MAX },
+            JournalEvent::<TinyEvent>::Tick,
             JournalEvent::<TinyEvent>::EpochBump { epoch: u64::MAX },
         ] {
             let len = encode_len(event);

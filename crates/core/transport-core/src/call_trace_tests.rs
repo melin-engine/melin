@@ -136,7 +136,7 @@ impl Application for RecordingApp {
         };
         self.calls.push(Call::Apply {
             id,
-            now_ns: ctx.now_ns,
+            now_ns: ctx.now.as_ns(),
             key_hash: ctx.key_hash,
         });
     }
@@ -147,8 +147,10 @@ impl Application for RecordingApp {
         None
     }
 
-    fn tick(&mut self, now_ns: u64, _out: &mut Vec<()>) {
-        self.calls.push(Call::Tick { now_ns });
+    fn tick(&mut self, now: SequencerTime, _out: &mut Vec<()>) {
+        self.calls.push(Call::Tick {
+            now_ns: now.as_ns(),
+        });
     }
 
     fn build_reject(_event: &Step, _reason: RejectReason) {}
@@ -268,7 +270,7 @@ fn build_slots(plan: &[Planned]) -> (Vec<InputSlot<Step>>, Vec<usize>) {
             }
             Op::App { key_hash } => (1, key_hash, JournalEvent::App(Step::Write(id as u64))),
             Op::Query { key_hash } => (1, key_hash, JournalEvent::App(Step::Query)),
-            Op::Tick => (0, 0, JournalEvent::Tick { now_ns: stamp }),
+            Op::Tick => (0, 0, JournalEvent::Tick),
             Op::EpochBump => {
                 epoch += 1;
                 (0, 0, JournalEvent::EpochBump { epoch })

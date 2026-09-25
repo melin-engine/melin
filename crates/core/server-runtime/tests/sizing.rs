@@ -106,8 +106,8 @@ impl Application for SizedCounter {
         self.0.query(event, ctx)
     }
 
-    fn tick(&mut self, now_ns: u64, out: &mut Vec<Self::Report>) {
-        self.0.tick(now_ns, out)
+    fn tick(&mut self, now: melin_app::SequencerTime, out: &mut Vec<Self::Report>) {
+        self.0.tick(now, out)
     }
 
     fn build_reject(event: &Self::Event, reason: RejectReason) -> Self::Report {

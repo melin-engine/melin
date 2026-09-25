@@ -396,7 +396,7 @@ mod tests {
 
     fn ctx() -> ApplyCtx {
         ApplyCtx {
-            now_ns: 0,
+            now: melin_app::SequencerTime::default(),
             key_hash: 0,
         }
     }

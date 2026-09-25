@@ -401,19 +401,17 @@ pub struct ServerConfig {
 
     /// Cadence in milliseconds for the application's clock tick.
     /// The ingress thread (io_uring reader or DPDK poll thread) publishes
-    /// a `JournalEvent::Tick { now_ns }` at this interval so the
-    /// application's time-driven work (expiries, timeouts, scheduled
-    /// transitions) fires in deterministic, journaled lockstep. There is
-    /// no separate tick thread on either transport. Set to 0 to disable
-    /// tick generation entirely (useful for benchmarks that don't
-    /// exercise time-driven features).
+    /// a clock tick at this interval so the application's time-driven
+    /// work (expiries, timeouts, scheduled transitions) fires in
+    /// deterministic, journaled lockstep. There is no separate tick thread
+    /// on either transport. Set to 0 to disable tick generation entirely
+    /// (useful for benchmarks that don't exercise time-driven features).
     ///
-    /// Defaults to 250 ms. Under load the matching stage advances the
-    /// application's clock at every-event resolution from each event's
-    /// journaled time, so the tick is only the safety net for
-    /// quiet periods. 250 ms keeps time-driven work in quiet periods within
-    /// a quarter-second of their deadline at a cost of ~4 events/sec of
-    /// journal traffic.
+    /// Defaults to 250 ms. Every journaled event advances the
+    /// application's clock to its own time, so under load the tick is
+    /// only the safety net for quiet periods. 250 ms keeps time-driven
+    /// work in quiet periods within a quarter-second of their deadline at
+    /// a cost of ~4 events/sec of journal traffic.
     #[arg(long, default_value_t = 250)]
     pub tick_interval_ms: u64,
 

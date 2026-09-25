@@ -194,15 +194,6 @@ pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     /// [`Self::recovered_epoch`] to seed the node's `FenceState` before
     /// the pipeline starts. Not part of `(A, W)` — extracted separately.
     recovered_epoch: u64,
-    /// The per-event clock of the shared dispatch step (see
-    /// [`crate::dispatch`]) as replay left it: the newest timestamp an
-    /// entry was applied under. The test-only single-thread helpers
-    /// continue it, so a run through them and a replay of the journal
-    /// they wrote fire the same ticks. Production hands the application
-    /// to the matching stage, which keeps a clock of its own, so the
-    /// field exists only where the helpers do.
-    #[cfg(any(test, feature = "test-utils"))]
-    last_drain_ns: u64,
     /// Stamps the test-only helpers' events: the production clock, so two
     /// calls inside one nanosecond stay strictly ordered as they would
     /// live. Seeded from the writer's time floor, as the primary's is.
@@ -222,12 +213,7 @@ struct SnapshotAnchor {
 
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// Assemble from a recovered (or fresh) application and writer.
-    fn assembled(
-        app: A,
-        writer: W,
-        recovered_epoch: u64,
-        #[cfg(any(test, feature = "test-utils"))] last_drain_ns: u64,
-    ) -> Self {
+    fn assembled(app: A, writer: W, recovered_epoch: u64) -> Self {
         #[cfg(any(test, feature = "test-utils"))]
         let clock = crate::clock::SequencerClock::new(
             crate::clock::SystemClocks,
@@ -239,8 +225,6 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             writer,
             recovered_epoch,
             #[cfg(any(test, feature = "test-utils"))]
-            last_drain_ns,
-            #[cfg(any(test, feature = "test-utils"))]
             clock,
         }
     }
@@ -251,13 +235,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     pub fn create(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
         let writer = W::create(journal_path)?;
         // Genesis node — no prior promotion, so epoch starts at 0.
-        Ok(Self::assembled(
-            app,
-            writer,
-            0,
-            #[cfg(any(test, feature = "test-utils"))]
-            0,
-        ))
+        Ok(Self::assembled(app, writer, 0))
     }
 
     /// Recover from an existing journal. Replays every archived segment
@@ -330,7 +308,6 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         let mut last_walked: Option<SequencerTime> = None;
 
         let mut reports: Vec<A::Report> = Vec::new();
-        let mut last_drain_ns: u64 = 0;
         // The oldest walked segment must start at or before this floor,
         // or a prefix of history is provably missing (see
         // [`Self::MissingHistoryPrefix`]).
@@ -366,7 +343,6 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 &mut reader,
                 &mut app,
                 snapshot,
-                &mut last_drain_ns,
                 &mut recovered_epoch,
                 &mut last_walked,
                 &mut reports,
@@ -429,13 +405,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             let anchor = prev_tail_hash.unwrap_or([0u8; 32]);
             let floor = walked_floor(last_walked, snapshot);
             let writer = W::create_continuing(journal_path, last_seq_seen + 1, anchor, floor)?;
-            return Ok(Self::assembled(
-                app,
-                writer,
-                recovered_epoch,
-                #[cfg(any(test, feature = "test-utils"))]
-                last_drain_ns,
-            ));
+            return Ok(Self::assembled(app, writer, recovered_epoch));
         }
 
         let mut reader = JournalReader::<A::Event>::open(journal_path)?;
@@ -448,7 +418,6 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             &mut reader,
             &mut app,
             snapshot,
-            &mut last_drain_ns,
             &mut recovered_epoch,
             &mut last_walked,
             &mut reports,
@@ -497,13 +466,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             "writer's rebuilt chain must equal the reader's accumulated chain"
         );
 
-        Ok(Self::assembled(
-            app,
-            writer,
-            recovered_epoch,
-            #[cfg(any(test, feature = "test-utils"))]
-            last_drain_ns,
-        ))
+        Ok(Self::assembled(app, writer, recovered_epoch))
     }
 
     /// Save a snapshot of the current application state. The snapshot
@@ -572,15 +535,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// "snapshot-only" recovery path (journal missing post-rotation),
     /// which supplies the epoch read from the snapshot it loaded.
     pub fn from_parts(app: A, writer: W, recovered_epoch: u64) -> Self {
-        Self::assembled(
-            app,
-            writer,
-            recovered_epoch,
-            // Nothing was replayed, so there is no replayed clock: zero,
-            // as the matching stage starts from at every boot.
-            #[cfg(any(test, feature = "test-utils"))]
-            0,
-        )
+        Self::assembled(app, writer, recovered_epoch)
     }
 
     /// Decompose into parts for the pipeline architecture.
@@ -623,18 +578,13 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         out: &mut Vec<A::Report>,
     ) -> Result<(), JournalError> {
         let timestamp = self.clock.stamp_at(now_ns);
-        let tick = melin_journal::JournalEvent::Tick {
-            now_ns: timestamp.as_ns(),
-        };
-        self.dispatch_journaled(tick, timestamp, out)
+        self.dispatch_journaled(melin_journal::JournalEvent::Tick, timestamp, out)
     }
 
     /// Journal `event` under `timestamp`, durably, then dispatch it under
     /// the same timestamp through the sequence replay uses. One timestamp
     /// and one dispatch path are what make a run through these helpers
-    /// and a replay of the journal it wrote the same run: a second clock
-    /// read, or a call to `apply` that skips the clock step, would fire
-    /// due scheduled work at different points on the two.
+    /// and a replay of the journal it wrote the same run.
     fn dispatch_journaled(
         &mut self,
         event: melin_journal::JournalEvent<A::Event>,
@@ -647,10 +597,9 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             &mut self.app,
             event,
             &ApplyCtx {
-                now_ns: timestamp.as_ns(),
+                now: timestamp,
                 key_hash: 0,
             },
-            &mut self.last_drain_ns,
             // Neither an application event nor a tick carries an epoch.
             |_| {},
             out,
@@ -688,7 +637,6 @@ fn replay_segment<A: Application>(
     reader: &mut JournalReader<A::Event>,
     app: &mut A,
     snapshot: Option<SnapshotAnchor>,
-    last_drain_ns: &mut u64,
     recovered_epoch: &mut u64,
     last_walked: &mut Option<SequencerTime>,
     reports: &mut Vec<A::Report>,
@@ -736,10 +684,9 @@ fn replay_segment<A: Application>(
                         app,
                         entry.event,
                         &ApplyCtx {
-                            now_ns: entry.timestamp.as_ns(),
+                            now: entry.timestamp,
                             key_hash: entry.key_hash,
                         },
-                        last_drain_ns,
                         |epoch| crate::fence::observe_into(recovered_epoch, epoch),
                         reports,
                     );
@@ -926,14 +873,10 @@ mod tests {
     fn expected_state(events: &[TestEvent]) -> TestApp {
         let mut app = TestApp::new();
         let mut reports = Vec::new();
-        let ctx = ApplyCtx {
-            now_ns: 0,
-            key_hash: 1,
-        };
         for (i, e) in events.iter().enumerate() {
-            let ts = 1_000 * (i as u64 + 1);
-            app.tick(ts, &mut reports);
-            app.apply(*e, &ctx, &mut reports);
+            let now = ns(1_000 * (i as u64 + 1));
+            app.tick(now, &mut reports);
+            app.apply(*e, &ApplyCtx { now, key_hash: 1 }, &mut reports);
         }
         app
     }
@@ -1071,9 +1014,8 @@ mod tests {
     /// A run through the single-thread helpers and a replay of the
     /// journal they wrote are the same run: one timestamp per entry and
     /// the shared dispatch sequence, so due scheduled work fires at the
-    /// same points. `ticks` counts every firing, on the clock step and on
-    /// a `Tick` alike, so it is where a second clock read or a skipped
-    /// clock step would show.
+    /// same points. `ticks` counts every firing, so it is where a second
+    /// clock read or a skipped clock step would show.
     #[test]
     fn the_helpers_and_a_replay_of_their_journal_are_the_same_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -1095,10 +1037,9 @@ mod tests {
         };
         drop(ja);
 
-        // One firing for the first event, two for the tick (the clock
-        // step, then the tick itself), and one for the event after it,
-        // whose stamp is past the tick's.
-        assert_eq!((live.total, live.ticks), (7, 4));
+        // One firing per entry: the first event, the tick, and the event
+        // after it, whose stamp is past the tick's.
+        assert_eq!((live.total, live.ticks), (7, 3));
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(
