@@ -93,6 +93,20 @@ Findings that confirm, sharpen or correct the roadmap entry.
   `last_drain_ns`, and the matching stage (`pipeline.rs`), recovery
   (`journaled_app.rs`) and the shadow stage (`shadow.rs`) each hold
   their own copy, all starting at zero.
+- **Divergence does not need a clock fault.** Events of one reader
+  batch share a stamp, and a snapshot's anchor is an fsync boundary,
+  which falls anywhere relative to those batches. When it falls inside
+  a run of equal stamps, the live node skips `tick` for the next entry
+  (its stamp equals the watermark) while a node restored from the
+  snapshot calls it (its watermark starts at zero). The same happens
+  when a replica's recovered journal ends inside such a run, since the
+  live matching stage also starts at zero after replay. The extra call
+  changes state when an event inside the run scheduled work already
+  due at that stamp: the restored node runs it before the next entry,
+  the live node after. The `Application::tick` contract does not cover
+  this: it forbids a repeated call from firing work *again*, and this
+  work became due between the two calls. Narrow, but present on a
+  healthy cluster with good clocks.
 - **A replica's journal is a bitwise mirror of the primary's.** A fresh
   replica creates its segment from the `StreamStart` lineage (starting
   sequence and chain anchor), the snapshot resync path from the `Ready`
@@ -436,6 +450,22 @@ One commit per step, each reviewable on its own.
    increasing, the same calls on every path, and time that may stand
    still while the clock is held) and `ApplyCtx::now_ns`. Measure
    before merging (decision 2).
+
+   Lands with the property test that proves the runtime's half of
+   determinism: the sequence of calls into the application depends on
+   the journal alone. A recording test application logs every call it
+   receives (`tick` with its time, `apply` with its sequence, time and
+   key, `on_epoch` with its epoch). A generated journal (application
+   events, `Tick` and `EpochBump` entries, rotations at random points)
+   runs through the live pipeline, through recovery, and through a
+   snapshot restore at every anchor followed by replay of the rest; for
+   each anchor, the calls after it must equal the live run's calls
+   after the same anchor. Write it before step 1 and confirm it fails on
+   today's code, by generating runs of equal stamps across an anchor
+   (the snapshot-inside-a-batch divergence above). It enters history in
+   this step, the first where it passes. The failing run has to happen
+   up front: from step 3 the encoder refuses the equal stamps that
+   reproduce the bug.
 5. **Operator surface:** the seeding and running lead warnings, the
    offset gauge, the jump counter, `CLOCK-ACCEPT`, and the sync-state
    warning at seeding.
@@ -450,8 +480,12 @@ One commit per step, each reviewable on its own.
      from the snapshot's stamp.
 
    Written at the `transport-core` level, driving a pipeline through
-   the clock's test time source. They do not wait on the counter
-   determinism test, which stays an independent roadmap item.
+   the clock's test time source. Where step 4's property test covers
+   every anchor of generated journals, these cover the clock scenarios
+   the generator does not produce. They do not wait on the counter
+   determinism test, which stays an independent roadmap item: it checks
+   the application's half (identical calls give identical state), not
+   the runtime's.
 7. **Docs:** the timestamp field's meaning in `docs/journal.md`; the
    reader row in `docs/pipeline-architecture.md`; the operator notes of
    decision 6; `CLOCK-ACCEPT` beside the other admin commands in
