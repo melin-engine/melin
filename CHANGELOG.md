@@ -200,7 +200,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   a new response (`KIND_RESP_OVERFLOW`, `0x33`) carrying the unchanged
   value, where it used to wrap. It also decodes exactly, refusing
   trailing bytes in requests and journal entries, and refuses increments
-  from `readonly` keys.
+  from `reader` keys.
+- **The examples declare roles of their own.** The counter and echo
+  examples admit `writer` and `reader` keys, the notary `submitter` and
+  `auditor`, in place of the exchange's `trader` and `readonly`: a keys
+  file written for an example needs its role tokens renamed.
 
 ## [0.17.0] - 2026-09-22
 

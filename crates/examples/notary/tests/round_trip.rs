@@ -117,15 +117,15 @@ fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
     node
 }
 
-/// The writing identity. `trader`, not `operator`: this example gates
+/// The writing identity. `submitter`, not `operator`: this example gates
 /// submissions on a writing role, so the round trip must authenticate as
 /// one.
-fn trader_key() -> SigningKey {
+fn submitter_key() -> SigningKey {
     SigningKey::from_bytes(&[0xAA; 32])
 }
 
 /// The auditing identity: may read the head, may not extend the chain.
-fn readonly_key() -> SigningKey {
+fn auditor_key() -> SigningKey {
     SigningKey::from_bytes(&[0xBB; 32])
 }
 
@@ -186,9 +186,9 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
     std::fs::write(
         &auth_path,
         format!(
-            "trader {} test\nreadonly {} audit\noperator {} ops\n",
-            pubkey_b64(&trader_key()),
-            pubkey_b64(&readonly_key()),
+            "submitter {} test\nauditor {} audit\noperator {} ops\n",
+            pubkey_b64(&submitter_key()),
+            pubkey_b64(&auditor_key()),
             pubkey_b64(&operator_key())
         ),
     )
@@ -265,7 +265,7 @@ fn start_server() -> (tempfile::TempDir, Server) {
 #[test]
 fn an_empty_log_reports_genesis() {
     let (_tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &submitter_key());
 
     assert_eq!(
         head_of(&request(&mut stream, KIND_GET_HEAD, &[])),
@@ -279,7 +279,7 @@ fn an_empty_log_reports_genesis() {
 #[test]
 fn notarize_builds_a_chain_the_client_can_reproduce() {
     let (_tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &submitter_key());
 
     // Stand-in documents. Only their digests ever leave the client.
     let documents: [&[u8]; 4] = [b"", b"the quick brown fox", b"contract v1", b"contract v2"];
@@ -322,7 +322,7 @@ fn an_independent_client_verifies_its_own_receipt() {
 
     // Someone else's history, unknown to the verifier below.
     {
-        let mut other = connect_authenticated(server.addr, &trader_key());
+        let mut other = connect_authenticated(server.addr, &submitter_key());
         for i in 1..=3u64 {
             receipt_of(&request(
                 &mut other,
@@ -334,7 +334,7 @@ fn an_independent_client_verifies_its_own_receipt() {
 
     // The verifier holds only its document and its receipt — no earlier
     // leaves, no query — and that is enough to check the commitment.
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &submitter_key());
     let leaf = digest(b"my document");
     let receipt = receipt_of(&request(&mut stream, KIND_NOTARIZE, &leaf));
     assert_eq!(receipt.entry, 4);
@@ -363,7 +363,7 @@ fn an_independent_client_verifies_its_own_receipt() {
 #[test]
 fn a_malformed_leaf_is_refused_without_dropping_the_connection() {
     let (_tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &submitter_key());
 
     // Wrong digest width: the runtime drops the frame and logs at debug,
     // leaving the connection usable — a malformed client request is not a
@@ -383,9 +383,9 @@ fn a_malformed_leaf_is_refused_without_dropping_the_connection() {
 }
 
 #[test]
-fn a_read_only_key_can_audit_but_not_notarize() {
+fn an_auditor_key_can_audit_but_not_notarize() {
     let (_tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &readonly_key());
+    let mut stream = connect_authenticated(server.addr, &auditor_key());
 
     // The submission is refused at the decoder: the runtime drops it
     // without a response and keeps the connection, so the refusal is
@@ -396,12 +396,12 @@ fn a_read_only_key_can_audit_but_not_notarize() {
     let response = request(&mut stream, KIND_GET_HEAD, &[]);
     assert_eq!(
         response[0], KIND_RESP_HEAD,
-        "a read-only key must still be able to audit"
+        "an auditor key must still be able to audit"
     );
     assert_eq!(
         head_of(&response),
         (0, GENESIS_HEAD),
-        "a read-only key must not be able to extend the chain"
+        "an auditor key must not be able to extend the chain"
     );
 
     drop(stream);
@@ -416,7 +416,7 @@ fn second_connection_sees_persisted_chain() {
 
     // First connection: notarize once.
     let expected = {
-        let mut s = connect_authenticated(server.addr, &trader_key());
+        let mut s = connect_authenticated(server.addr, &submitter_key());
         let receipt = receipt_of(&request(&mut s, KIND_NOTARIZE, &leaf));
         assert_eq!(
             fold(&GENESIS_HEAD, &leaf, receipt.timestamp_ns),
@@ -427,7 +427,7 @@ fn second_connection_sees_persisted_chain() {
 
     // Second connection: the chain survives the first one closing.
     {
-        let mut s = connect_authenticated(server.addr, &trader_key());
+        let mut s = connect_authenticated(server.addr, &submitter_key());
         assert_eq!(head_of(&request(&mut s, KIND_GET_HEAD, &[])), (1, expected));
     }
 
@@ -445,7 +445,7 @@ fn the_chain_survives_a_restart() {
     // on disk before the node goes down.
     let server = start_server_in(tmp.path());
     {
-        let mut stream = connect_authenticated(server.addr, &trader_key());
+        let mut stream = connect_authenticated(server.addr, &submitter_key());
         for document in &documents {
             let leaf = digest(document);
             let receipt = receipt_of(&request(&mut stream, KIND_NOTARIZE, &leaf));
@@ -460,7 +460,7 @@ fn the_chain_survives_a_restart() {
     // journaled leaves in order. Matching the client's fold is the
     // determinism the example exists to demonstrate, applied to recovery.
     let server = start_server_in(tmp.path());
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &submitter_key());
     assert_eq!(
         head_of(&request(&mut stream, KIND_GET_HEAD, &[])),
         (documents.len() as u64, expected),
@@ -476,7 +476,7 @@ fn the_journal_carries_the_runtime_hash_chain() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let server = start_server_in(tmp.path());
     {
-        let mut stream = connect_authenticated(server.addr, &trader_key());
+        let mut stream = connect_authenticated(server.addr, &submitter_key());
         for i in 1..=3u64 {
             let receipt = request(&mut stream, KIND_NOTARIZE, &digest(&i.to_le_bytes()));
             assert_eq!(receipt[0], KIND_RESP_RECEIPT);
@@ -540,10 +540,10 @@ fn the_client_notarizes_a_file_and_verifies_it_offline() {
     let (tmp, server) = start_server();
     // The binary connects once, without retrying, so wait for the server
     // to be ready the way the in-process tests do before spawning it.
-    drop(connect_authenticated(server.addr, &trader_key()));
+    drop(connect_authenticated(server.addr, &submitter_key()));
 
-    let key = tmp.path().join("trader.key");
-    std::fs::write(&key, trader_key().to_bytes()).expect("write key");
+    let key = tmp.path().join("submitter.key");
+    std::fs::write(&key, submitter_key().to_bytes()).expect("write key");
     let document = tmp.path().join("contract.txt");
     std::fs::write(&document, b"I, the undersigned, ...").expect("write document");
     let receipt = tmp.path().join("contract.txt.receipt");
@@ -611,7 +611,7 @@ fn the_client_notarizes_a_file_and_verifies_it_offline() {
 #[test]
 fn the_client_reports_an_unauthorized_key() {
     let (tmp, server) = start_server();
-    drop(connect_authenticated(server.addr, &trader_key()));
+    drop(connect_authenticated(server.addr, &submitter_key()));
 
     // A key the server has never heard of: the handshake fails, and the
     // client says which public key to authorize.
@@ -641,10 +641,10 @@ fn the_client_reports_an_unauthorized_key() {
 #[test]
 fn the_client_explains_a_silently_dropped_request() {
     let (tmp, server) = start_server();
-    drop(connect_authenticated(server.addr, &trader_key()));
+    drop(connect_authenticated(server.addr, &submitter_key()));
 
-    let key = tmp.path().join("readonly.key");
-    std::fs::write(&key, readonly_key().to_bytes()).expect("write key");
+    let key = tmp.path().join("auditor.key");
+    std::fs::write(&key, auditor_key().to_bytes()).expect("write key");
     let document = tmp.path().join("audit-only.txt");
     std::fs::write(&document, "may read, may not attest").expect("write document");
 
@@ -689,10 +689,10 @@ fn the_auditor_refolds_the_head_from_the_journal_alone() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let admin_addr = free_addr(PORT_BASE);
     let server = start_server_with(tmp.path(), |config| config.admin_bind = Some(admin_addr));
-    drop(connect_authenticated(server.addr, &trader_key()));
+    drop(connect_authenticated(server.addr, &submitter_key()));
 
-    let key = tmp.path().join("trader.key");
-    std::fs::write(&key, trader_key().to_bytes()).expect("write key");
+    let key = tmp.path().join("submitter.key");
+    std::fs::write(&key, submitter_key().to_bytes()).expect("write key");
     let path_of = |name: &str| tmp.path().join(name);
     let arg = |path: &Path| path.to_str().expect("utf-8 path").to_owned();
     let server_arg = server.addr.to_string();
@@ -834,7 +834,7 @@ fn the_auditor_refolds_the_head_from_the_journal_alone() {
 #[test]
 fn the_auditor_reports_an_empty_log_and_a_missing_one() {
     let (tmp, server) = start_server();
-    drop(connect_authenticated(server.addr, &trader_key()));
+    drop(connect_authenticated(server.addr, &submitter_key()));
     server.stop();
 
     let journal = tmp.path().join("notary.journal");
@@ -921,15 +921,15 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
     capture_node_logs();
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    // Three roles: the client submits as `trader`, the replica
+    // Three roles: the client submits as `submitter`, the replica
     // authenticates its link as `replication`, and the operator drives
     // the admin endpoint.
     let auth_path = tmp.path().join("authorized_keys");
     std::fs::write(
         &auth_path,
         format!(
-            "trader {} test\nreplication {} replica\noperator {} ops\n",
-            pubkey_b64(&trader_key()),
+            "submitter {} test\nreplication {} replica\noperator {} ops\n",
+            pubkey_b64(&submitter_key()),
             pubkey_b64(&node_key()),
             pubkey_b64(&operator_key())
         ),
@@ -981,7 +981,7 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
     let documents: [&[u8]; 3] = [b"deed", b"codicil", b"witness statement"];
     let mut last: Option<Receipt> = None;
     {
-        let mut stream = connect_authenticated(primary.addr, &trader_key());
+        let mut stream = connect_authenticated(primary.addr, &submitter_key());
         let mut expected = GENESIS_HEAD;
         for (i, document) in documents.iter().enumerate() {
             let leaf = digest(document);
@@ -1001,7 +1001,7 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
     admin_until_ok(admin_addr, &operator_key(), "PROMOTE");
     admin_until_ok(admin_addr, &operator_key(), "ACK-POLICY disk");
 
-    let mut stream = connect_authenticated(replica.addr, &trader_key());
+    let mut stream = connect_authenticated(replica.addr, &submitter_key());
     assert_eq!(
         head_of(&request(&mut stream, KIND_GET_HEAD, &[])),
         (documents.len() as u64, last.head),

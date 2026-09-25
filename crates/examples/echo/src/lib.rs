@@ -297,16 +297,14 @@ impl Application for Echo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EchoRole {
     /// May echo.
-    Trader,
+    Writer,
     /// May not echo: an echo is journaled like any write.
-    ReadOnly,
+    Reader,
 }
 
 impl Role for EchoRole {
-    const ROLES: &'static [(&'static str, Self)] = &[
-        ("trader", EchoRole::Trader),
-        ("readonly", EchoRole::ReadOnly),
-    ];
+    const ROLES: &'static [(&'static str, Self)] =
+        &[("writer", EchoRole::Writer), ("reader", EchoRole::Reader)];
 }
 
 // ---------------------------------------------------------------------------
@@ -326,10 +324,10 @@ impl RequestDecoderTrait for RequestDecoder {
     type Role = EchoRole;
 
     fn decode(&self, body: &[u8], role: ClientRole<EchoRole>) -> Decoded<Payload> {
-        // An echo appends to the journal, so the read-only role is refused,
-        // as it would be for any state-mutating event. (A replication key
-        // never gets this far: the client listener refuses it.)
-        if role == ClientRole::App(EchoRole::ReadOnly) {
+        // An echo appends to the journal, so a reader is refused, as it
+        // would be for any state-mutating event. (A replication key never
+        // gets this far: the client listener refuses it.)
+        if role == ClientRole::App(EchoRole::Reader) {
             return Decoded::PermissionDenied("echoing requires a writing role");
         }
         match Payload::new(body) {
@@ -503,7 +501,7 @@ mod tests {
 
     #[test]
     fn writing_roles_may_echo() {
-        for role in [ClientRole::Operator, ClientRole::App(EchoRole::Trader)] {
+        for role in [ClientRole::Operator, ClientRole::App(EchoRole::Writer)] {
             match RequestDecoder.decode(b"hi", role) {
                 Decoded::Permitted(event) => assert_eq!(event, payload(b"hi")),
                 _ => panic!("expected Permitted for {role:?}"),
@@ -512,9 +510,9 @@ mod tests {
     }
 
     #[test]
-    fn read_only_role_may_not_echo() {
+    fn a_reader_may_not_echo() {
         assert!(matches!(
-            RequestDecoder.decode(b"hi", ClientRole::App(EchoRole::ReadOnly)),
+            RequestDecoder.decode(b"hi", ClientRole::App(EchoRole::Reader)),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -528,7 +526,7 @@ mod tests {
     fn the_payload_is_the_whole_body() {
         for len in [0, 3, MAX_PAYLOAD] {
             let bytes = vec![0x5A; len];
-            match RequestDecoder.decode(&bytes, ClientRole::App(EchoRole::Trader)) {
+            match RequestDecoder.decode(&bytes, ClientRole::App(EchoRole::Writer)) {
                 Decoded::Permitted(event) => assert_eq!(event.as_bytes(), bytes),
                 _ => panic!("expected Permitted for {len} bytes"),
             }
@@ -539,7 +537,7 @@ mod tests {
     fn decoder_refuses_what_it_cannot_carry() {
         let too_long = vec![0; MAX_PAYLOAD + 1];
         assert!(matches!(
-            RequestDecoder.decode(&too_long, ClientRole::App(EchoRole::Trader)),
+            RequestDecoder.decode(&too_long, ClientRole::App(EchoRole::Writer)),
             Decoded::DecodeError(_)
         ));
     }

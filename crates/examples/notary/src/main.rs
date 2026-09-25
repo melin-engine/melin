@@ -6,7 +6,7 @@
 //! # 1. Generate an Ed25519 keypair and write an authorized_keys file:
 //! openssl genpkey -algorithm ed25519 -out /tmp/notary-key.pem
 //! PUB=$(openssl pkey -in /tmp/notary-key.pem -pubout -outform DER | tail -c 32 | base64)
-//! echo "trader $PUB me" > /tmp/authorized_keys
+//! echo "submitter $PUB me" > /tmp/authorized_keys
 //!
 //! # 2. Start the notary server:
 //! cargo run --bin notary-server -- --standalone --ack-policy disk --authorized-keys /tmp/authorized_keys --journal /tmp/notary.journal
