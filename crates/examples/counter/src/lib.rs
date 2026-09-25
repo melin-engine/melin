@@ -225,20 +225,27 @@ impl Application for Counter {
 // ---------------------------------------------------------------------------
 
 /// The counter's client roles, each named by a token in the node's
-/// `authorized_keys` file. Beside them, the runtime's `operator` role may
-/// do anything a client can.
+/// `authorized_keys` file:
+///
+/// ```text
+/// writer AAAA... desk-1
+/// reader BBBB... monitoring
+/// ```
+///
+/// Beside them, the runtime's `operator` role may do anything a client
+/// can.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CounterRole {
     /// May increment the counter and read it.
-    Trader,
+    Writer,
     /// May read the counter only.
-    ReadOnly,
+    Reader,
 }
 
 impl Role for CounterRole {
     const ROLES: &'static [(&'static str, Self)] = &[
-        ("trader", CounterRole::Trader),
-        ("readonly", CounterRole::ReadOnly),
+        ("writer", CounterRole::Writer),
+        ("reader", CounterRole::Reader),
     ];
 }
 
@@ -262,11 +269,16 @@ impl RequestDecoderTrait for RequestDecoder {
         };
         match kind {
             KIND_INCREMENT => {
-                // An increment changes state, so a read-only key may not
-                // send one. (A replication key never gets this far: the
-                // client listener refuses it.)
-                if role == ClientRole::App(CounterRole::ReadOnly) {
-                    return Decoded::PermissionDenied("incrementing requires a writing role");
+                // An increment changes state, so a reader may not send one.
+                // Matched exhaustively rather than with a wildcard: a role
+                // added later is a compile error here, not a silent grant.
+                // (A replication key never gets this far: the client
+                // listener refuses it.)
+                match role {
+                    ClientRole::Operator | ClientRole::App(CounterRole::Writer) => {}
+                    ClientRole::App(CounterRole::Reader) => {
+                        return Decoded::PermissionDenied("incrementing requires a writing role");
+                    }
                 }
                 match amount_from(fields) {
                     Ok(amount) => Decoded::Permitted(CounterEvent::Increment {
@@ -522,19 +534,19 @@ mod tests {
         ));
     }
 
-    /// A read-only key may read the counter but not change it.
+    /// A reader may read the counter but not change it.
     #[test]
-    fn decoder_refuses_increments_from_the_read_only_role() {
-        let read_only = ClientRole::App(CounterRole::ReadOnly);
+    fn decoder_refuses_increments_from_a_reader() {
+        let reader = ClientRole::App(CounterRole::Reader);
         assert!(matches!(
-            RequestDecoder.decode(&increment_request(1), read_only),
+            RequestDecoder.decode(&increment_request(1), reader),
             Decoded::PermissionDenied(_)
         ));
         assert!(matches!(
-            RequestDecoder.decode(&GET_VALUE_REQUEST, read_only),
+            RequestDecoder.decode(&GET_VALUE_REQUEST, reader),
             Decoded::Permitted(CounterEvent::GetValue)
         ));
-        for role in [ClientRole::Operator, ClientRole::App(CounterRole::Trader)] {
+        for role in [ClientRole::Operator, ClientRole::App(CounterRole::Writer)] {
             assert!(
                 matches!(
                     RequestDecoder.decode(&increment_request(1), role),

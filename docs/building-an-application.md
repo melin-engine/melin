@@ -26,7 +26,7 @@ Before writing anything, watch a node work. The echo example is the smallest app
 # 1. A client key, and a node that accepts it:
 openssl genpkey -algorithm ed25519 -out /tmp/melin-key.pem
 PUB=$(openssl pkey -in /tmp/melin-key.pem -pubout -outform DER | tail -c 32 | base64)
-echo "trader $PUB me" > /tmp/authorized_keys
+echo "writer $PUB me" > /tmp/authorized_keys
 
 # 2. A standalone node, set up for a development machine:
 RUST_LOG=info cargo run --release --bin echo-server -- --standalone --ack-policy disk --authorized-keys /tmp/authorized_keys --journal /tmp/echo.journal --cores none --no-mlock
@@ -247,8 +247,8 @@ impl RequestDecoder for Decoder {
             return Decoded::DecodeError("empty request");
         };
         match kind {
-            // An increment changes state: a read-only key may not send one.
-            KIND_INCREMENT if role == ClientRole::App(CounterRole::ReadOnly) => {
+            // An increment changes state: a reader may not send one.
+            KIND_INCREMENT if role == ClientRole::App(CounterRole::Reader) => {
                 Decoded::PermissionDenied("incrementing requires a writing role")
             }
             KIND_INCREMENT => match <[u8; 8]>::try_from(fields) {
@@ -264,13 +264,13 @@ impl RequestDecoder for Decoder {
     }
 }
 
-let read_only = ClientRole::App(CounterRole::ReadOnly);
+let reader = ClientRole::App(CounterRole::Reader);
 assert!(matches!(
-    Decoder.decode(&[KIND_GET_VALUE], read_only),
+    Decoder.decode(&[KIND_GET_VALUE], reader),
     Decoded::Permitted(CounterEvent::GetValue)
 ));
 assert!(matches!(
-    Decoder.decode(&[KIND_INCREMENT, 1, 0, 0, 0, 0, 0, 0, 0], read_only),
+    Decoder.decode(&[KIND_INCREMENT, 1, 0, 0, 0, 0, 0, 0, 0], reader),
     Decoded::PermissionDenied(_)
 ));
 ```
@@ -398,11 +398,11 @@ const _: () = assert!(WIDEST_MESSAGE <= melin_server_runtime::MAX_RESPONSE_BODY)
 
 ```text
 # <role> <base64 public key> <comment>
-trader   AAAA...  desk-1
-readonly BBBB...  monitoring
+writer  AAAA...  desk-1
+reader  BBBB...  monitoring
 ```
 
-A key is listed once; a node refuses to load a file that lists the same key twice. The runtime owns two roles, `operator` and `replication`; every other token names a role your application declares as its own type, as the counter does with `trader` and `readonly`, and it is your decoder that decides what each may do. `replication` authenticates replicas and nothing else: the client listener refuses a replication key during the handshake, so your decoder never sees one. `operator` also opens the admin endpoint. An application usually refuses writes from `readonly` keys:
+A key is listed once; a node refuses to load a file that lists the same key twice. The runtime owns two roles, `operator` and `replication`; every other token names a role your application declares as its own type, as the counter does with `writer` and `reader`, and it is your decoder that decides what each may do. `replication` authenticates replicas and nothing else: the client listener refuses a replication key during the handshake, so your decoder never sees one. `operator` also opens the admin endpoint. An application usually refuses writes from keys that may only read:
 
 ```rust
 use counter_server::{CounterEvent, CounterRole};
@@ -412,16 +412,16 @@ use melin_app::decoder::Decoded;
 
 /// Permit `event` unless it changes state and the key may only read.
 fn permit(role: ClientRole<CounterRole>, event: CounterEvent) -> Decoded<CounterEvent> {
-    if role == ClientRole::App(CounterRole::ReadOnly) && !event.is_query() {
+    if role == ClientRole::App(CounterRole::Reader) && !event.is_query() {
         return Decoded::PermissionDenied("this key may not write");
     }
     Decoded::Permitted(event)
 }
 
-let read_only = ClientRole::App(CounterRole::ReadOnly);
+let reader = ClientRole::App(CounterRole::Reader);
 let increment = CounterEvent::Increment { amount: 1 };
-assert!(matches!(permit(read_only, increment), Decoded::PermissionDenied(_)));
-assert!(matches!(permit(read_only, CounterEvent::GetValue), Decoded::Permitted(_)));
+assert!(matches!(permit(reader, increment), Decoded::PermissionDenied(_)));
+assert!(matches!(permit(reader, CounterEvent::GetValue), Decoded::Permitted(_)));
 ```
 
 **A refused request gets no answer.** When your decoder returns anything but `Permitted` — a decode error, a permission denied, a filtered message — the runtime logs it and drops the request, and keeps the connection. The client learns nothing until its read times out. That is deliberate: a node spends nothing on a client sending it garbage. When a client needs to know why a well-formed request was refused, let the decoder permit it and have `apply` answer with a rejection report.

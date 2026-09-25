@@ -65,14 +65,14 @@ fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
     node
 }
 
-/// The writing identity. `trader`, not `operator`: echoing is gated on a
+/// The writing identity. `writer`, not `operator`: echoing is gated on a
 /// writing role, so the round trip must authenticate as one.
-fn trader_key() -> SigningKey {
+fn writer_key() -> SigningKey {
     SigningKey::from_bytes(&[0xAA; 32])
 }
 
 /// May ping, may not echo.
-fn readonly_key() -> SigningKey {
+fn reader_key() -> SigningKey {
     SigningKey::from_bytes(&[0xBB; 32])
 }
 
@@ -128,9 +128,9 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
     std::fs::write(
         &auth_path,
         format!(
-            "trader {} test\nreadonly {} watch\n",
-            pubkey_b64(&trader_key()),
-            pubkey_b64(&readonly_key()),
+            "writer {} test\nreader {} watch\n",
+            pubkey_b64(&writer_key()),
+            pubkey_b64(&reader_key()),
         ),
     )
     .expect("write auth keys");
@@ -209,7 +209,7 @@ fn journaled_echoes(dir: &Path) -> Vec<Vec<u8>> {
 #[test]
 fn an_echo_returns_the_bytes_it_was_sent() {
     let (_tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &writer_key());
 
     // Sizes either side of the `u8` boundary included: the length is
     // carried in two bytes, and 256 is where a one-byte length would wrap.
@@ -227,7 +227,7 @@ fn an_echo_returns_the_bytes_it_was_sent() {
 #[test]
 fn an_oversized_payload_is_refused_without_dropping_the_connection() {
     let (_tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &writer_key());
 
     // One byte past the cap. The runtime drops the frame at the decoder
     // without a response and keeps the connection, so the refusal is
@@ -243,17 +243,17 @@ fn an_oversized_payload_is_refused_without_dropping_the_connection() {
 }
 
 #[test]
-fn a_read_only_key_cannot_echo() {
+fn a_reader_key_cannot_echo() {
     let (tmp, server) = start_server();
 
     // Refused at the decoder: no reply, connection kept — there is no
-    // request a read-only key can make that would be answered, so the
+    // request a reader key can make that would be answered, so the
     // refusal is observable only in the journal afterwards.
-    let mut watcher = connect_authenticated(server.addr, &readonly_key());
+    let mut watcher = connect_authenticated(server.addr, &reader_key());
     send(&mut watcher, b"not mine to journal");
 
     let sent = bytes(MAX_PAYLOAD, 9);
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &writer_key());
     assert_eq!(exchange(&mut stream, &sent), (KIND_RESP_ECHO, sent.clone()));
 
     drop(stream);
@@ -262,7 +262,7 @@ fn a_read_only_key_cannot_echo() {
     assert_eq!(
         journaled_echoes(tmp.path()),
         [sent],
-        "a read-only key must not be able to write the journal"
+        "a reader key must not be able to write the journal"
     );
 }
 
@@ -273,7 +273,7 @@ fn a_read_only_key_cannot_echo() {
 #[test]
 fn a_payload_that_looks_like_a_protocol_frame_is_echoed() {
     let (tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &writer_key());
 
     let payloads: Vec<Vec<u8>> = vec![
         vec![],
@@ -308,7 +308,7 @@ fn a_frame_that_is_not_an_application_frame_is_dropped() {
     let (tmp, server) = start_server();
     // The raw socket, authenticated: `melin-client` only sends
     // application frames, and these are the frames it cannot send.
-    let mut stream = connect_authenticated(server.addr, &trader_key()).into_stream();
+    let mut stream = connect_authenticated(server.addr, &writer_key()).into_stream();
 
     let raw_frame = |payload: &[u8]| -> Vec<u8> {
         [&(payload.len() as u32).to_le_bytes()[..], payload].concat()
@@ -351,7 +351,7 @@ fn the_journal_holds_every_echo_in_order() {
     let (tmp, server) = start_server();
     let echoes = [bytes(0, 0), bytes(MAX_PAYLOAD, 1), bytes(5, 2)];
     {
-        let mut stream = connect_authenticated(server.addr, &trader_key());
+        let mut stream = connect_authenticated(server.addr, &writer_key());
         for sent in &echoes {
             exchange(&mut stream, sent);
         }
@@ -376,7 +376,7 @@ fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
     // runtime's framing — the case worth proving restores.
     let server = start_server_with(tmp.path(), |config| config.snapshot_interval_ms = 50);
     {
-        let mut stream = connect_authenticated(server.addr, &trader_key());
+        let mut stream = connect_authenticated(server.addr, &writer_key());
         for sent in &before {
             exchange(&mut stream, sent);
         }
@@ -396,7 +396,7 @@ fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
     // step failed the node would not come up; the echo after it shows
     // the pipeline is whole, and the journal that it lost nothing.
     let server = start_server_in(tmp.path());
-    let mut stream = connect_authenticated(server.addr, &trader_key());
+    let mut stream = connect_authenticated(server.addr, &writer_key());
     let sent = bytes(MAX_PAYLOAD, 4);
     assert_eq!(exchange(&mut stream, &sent), (KIND_RESP_ECHO, sent.clone()));
     drop(stream);
@@ -430,10 +430,10 @@ fn the_client_measures_a_closed_loop() {
     let (tmp, server) = start_server();
     // The binary connects once, without retrying, so wait for the server
     // to be ready the way the in-process tests do before spawning it.
-    drop(connect_authenticated(server.addr, &trader_key()));
+    drop(connect_authenticated(server.addr, &writer_key()));
 
-    let key = tmp.path().join("trader.key");
-    std::fs::write(&key, trader_key().to_bytes()).expect("write key");
+    let key = tmp.path().join("writer.key");
+    std::fs::write(&key, writer_key().to_bytes()).expect("write key");
     let addr = server.addr.to_string();
     let key_arg = key.to_str().expect("utf-8 path");
     let common = ["--server", &addr, "--key", key_arg];
@@ -481,7 +481,7 @@ fn the_client_refuses_a_size_the_server_would_drop() {
 #[test]
 fn the_client_reports_an_unauthorized_key() {
     let (tmp, server) = start_server();
-    drop(connect_authenticated(server.addr, &trader_key()));
+    drop(connect_authenticated(server.addr, &writer_key()));
 
     // A key the server has never heard of: the handshake fails, and the
     // client says which public key to authorize.

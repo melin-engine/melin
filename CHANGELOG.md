@@ -61,6 +61,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `Trader`), and a keys file naming an unknown role is refused with
   `unknown role`, listing every valid one, where it said
   `unknown permission`.
+- **The examples declare roles of their own.** The counter and echo
+  examples admit `writer` and `reader` keys, the notary `submitter` and
+  `auditor`, in place of the exchange's `trader` and `readonly`: a keys
+  file written for an example needs its role tokens renamed.
 
 ## [0.18.0] - 2026-09-27
 
