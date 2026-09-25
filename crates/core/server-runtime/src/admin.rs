@@ -46,7 +46,7 @@ use crate::promotion::PromotionRequest;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info, warn};
 
-use melin_app::auth::{AuthorizedKeys, Permission};
+use melin_app::auth::AuthorizedKeys;
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
@@ -207,10 +207,11 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
             return Err("unknown public key".into());
         }
     };
-    if !role.client().is_some_and(Permission::is_operator) {
+    if !role.client().is_some_and(|role| role.is_operator()) {
         send_auth_failed(stream);
         return Err(format!(
-            "admin endpoint requires an operator key, got a {role} key"
+            "admin endpoint requires an operator key, got a {} key",
+            authorized_keys.token(role)
         ));
     }
 
@@ -442,26 +443,26 @@ mod tests {
         TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
     };
 
+    use crate::test_roles::desk_keys;
+
     fn operator_keys() -> (SigningKey, Arc<AuthorizedKeys>) {
         let signing_key = SigningKey::from_bytes(&[0xAD; 32]);
         let pub_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             signing_key.verifying_key().to_bytes(),
         );
-        let content = format!("operator {pub_b64} test-ops\n");
-        let keys = AuthorizedKeys::parse(&content).expect("parse authorized_keys");
-        (signing_key, Arc::new(keys))
+        (signing_key, Arc::new(desk_keys("operator", &pub_b64)))
     }
 
+    /// A key under an application role: refused, like any key that is not
+    /// the operator's.
     fn trader_keys() -> (SigningKey, Arc<AuthorizedKeys>) {
         let signing_key = SigningKey::from_bytes(&[0xBD; 32]);
         let pub_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             signing_key.verifying_key().to_bytes(),
         );
-        let content = format!("trader {pub_b64} test-trader\n");
-        let keys = AuthorizedKeys::parse(&content).expect("parse authorized_keys");
-        (signing_key, Arc::new(keys))
+        (signing_key, Arc::new(desk_keys("trader", &pub_b64)))
     }
 
     /// Perform the transport-level auth handshake on `stream`, returning

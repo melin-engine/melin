@@ -31,14 +31,15 @@ use crate::ControlEvent;
 use crate::buf_ring::BufRing;
 use crate::halt::{HaltGate, RefusalSender};
 use melin_app::Application;
-use melin_app::auth::Permission;
-use melin_app::decoder::RequestDecoder;
+use melin_app::auth::{ClientRole, RoleId};
+use melin_app::decoder::ErasedDecoder;
 
-/// Decoder type alias: request decoder bound to the application's `Event`
-/// type. Mirrors [`crate::response::ResponseEncoderArc`]; hides
-/// the `dyn RequestDecoder<Event = …>` spelling at call sites that thread
-/// the decoder through several functions.
-pub type RequestDecoderArc<A> = Arc<dyn RequestDecoder<Event = <A as Application>::Event>>;
+/// Decoder type alias: the application's request decoder, bound to its
+/// `Event` type, with its role type erased (see [`ErasedDecoder`]).
+/// Mirrors [`crate::response::ResponseEncoderArc`]; hides the
+/// `dyn ErasedDecoder<…>` spelling at call sites that thread the decoder
+/// through several functions.
+pub type RequestDecoderArc<A> = Arc<dyn ErasedDecoder<<A as Application>::Event>>;
 use melin_app::unix_epoch_nanos;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
@@ -102,8 +103,8 @@ pub struct ReaderRegistration<R> {
     pub connection_id: ConnectionId,
     pub reader: R,
     pub addr: SocketAddr,
-    /// Permission level established during the auth handshake.
-    pub permission: Permission,
+    /// The client's role, established during the auth handshake.
+    pub role: ClientRole<RoleId>,
     /// FxHash of the client's Ed25519 public key. Stored per-connection
     /// and copied into every InputSlot as the submitting key's identity.
     pub key_hash: u64,
@@ -202,7 +203,7 @@ impl<R> UringReaderHandle<R> {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
     producer: ring::Producer<InputSlot<A::Event>>,
-    decoder: Arc<dyn RequestDecoder<Event = A::Event>>,
+    decoder: RequestDecoderArc<A>,
     halt: HaltGate,
     refusals: RefusalSender<A::Report>,
     control_tx: mpsc::Sender<ControlEvent>,
@@ -266,9 +267,10 @@ where
 struct ConnectionEntry<R> {
     connection_id: u64,
     addr: SocketAddr,
-    /// Permission level from auth handshake. Checked per-request on
-    /// the reader thread (cold path), zero cost on the matching stage.
-    permission: Permission,
+    /// The client's role, from the auth handshake. Checked per-request
+    /// by the decoder on the reader thread (cold path), zero cost on the
+    /// matching stage.
+    role: ClientRole<RoleId>,
     /// FxHash of the client's Ed25519 public key. Copied into every
     /// InputSlot as the submitting key's identity.
     key_hash: u64,
@@ -384,7 +386,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // releases it by dropping the `Arc` rather than by closing the fd.
     wakeup_fd: Arc<OwnedFd>,
     mut producer: ring::Producer<InputSlot<A::Event>>,
-    decoder: &dyn RequestDecoder<Event = A::Event>,
+    decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
     mut refusals: RefusalSender<A::Report>,
     control_tx: &mpsc::Sender<ControlEvent>,
@@ -674,7 +676,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                         let entry = ConnectionEntry {
                             connection_id: reg.connection_id.0,
                             addr: reg.addr,
-                            permission: reg.permission,
+                            role: reg.role,
                             key_hash: reg.key_hash,
                             fd,
                             _reader: reg.reader,
@@ -1264,7 +1266,7 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
 fn process_frames<A: Application, R>(
     conn: &mut ConnectionEntry<R>,
     producer: &mut ring::Producer<InputSlot<A::Event>>,
-    decoder: &dyn RequestDecoder<Event = A::Event>,
+    decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
     refusals: &mut RefusalSender<A::Report>,
     control_tx: &mpsc::Sender<ControlEvent>,
@@ -1279,7 +1281,7 @@ fn process_frames<A: Application, R>(
         &mut conn.parse_buf,
         conn.connection_id,
         conn.key_hash,
-        conn.permission,
+        conn.role,
         producer,
         decoder,
         halt,
@@ -1330,7 +1332,7 @@ mod tests {
     //! regress the "earlier frames must be visible before ServerBusy /
     //! disconnect" guarantees.
     use super::*;
-    use melin_app::auth::Permission;
+    use melin_app::auth::NoRoles;
     use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
     use melin_journal::JournalEvent;
@@ -1452,7 +1454,9 @@ mod tests {
 
     impl RequestDecoder for ByteDecoder {
         type Event = TestEvent;
-        fn decode(&self, body: &[u8], _permission: Permission) -> Decoded<TestEvent> {
+        // The reader never looks at a role: operator keys are enough.
+        type Role = NoRoles;
+        fn decode(&self, body: &[u8], _role: ClientRole<NoRoles>) -> Decoded<TestEvent> {
             match body.first().copied() {
                 None => Decoded::DecodeError("empty body"),
                 Some(0xFC) => Decoded::Filter,
@@ -1512,7 +1516,7 @@ mod tests {
         let entry = ConnectionEntry::<UnixStream> {
             connection_id: 7,
             addr: "127.0.0.1:1".parse().expect("addr parses"),
-            permission: Permission::Trader,
+            role: ClientRole::Operator,
             key_hash: 0xC0FFEE_u64,
             fd: server_side.as_raw_fd(),
             _reader: server_side,
@@ -2294,7 +2298,7 @@ mod tests {
                 connection_id: ConnectionId(id),
                 reader: server_side,
                 addr: "127.0.0.1:1".parse().expect("addr"),
-                permission: Permission::Trader,
+                role: ClientRole::Operator,
                 key_hash: id,
             });
             writers.push(std::thread::spawn(move || {
@@ -2408,7 +2412,7 @@ mod tests {
                 connection_id: ConnectionId(id),
                 reader: server_side,
                 addr: "127.0.0.1:1".parse().expect("addr"),
-                permission: Permission::Trader,
+                role: ClientRole::Operator,
                 key_hash: id,
             });
             // One delivered frame per connection proves its multishot
@@ -2488,7 +2492,7 @@ mod tests {
             connection_id: ConnectionId(A_ID),
             reader: a_server,
             addr: "127.0.0.1:1".parse().expect("addr"),
-            permission: Permission::Trader,
+            role: ClientRole::Operator,
             key_hash: A_ID,
         });
         let a_writer = std::thread::spawn(move || {
@@ -2528,7 +2532,7 @@ mod tests {
             connection_id: ConnectionId(B_ID),
             reader: b_server,
             addr: "127.0.0.1:2".parse().expect("addr"),
-            permission: Permission::Trader,
+            role: ClientRole::Operator,
             key_hash: B_ID,
         });
         let b_writer = std::thread::spawn(move || {

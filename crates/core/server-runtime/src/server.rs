@@ -36,11 +36,10 @@ type Pipeline<A> = GenericPipeline<A>;
 use crate::StartupEvents;
 use crate::reader::RequestDecoderArc;
 use crate::response::ResponseEncoderArc;
-use melin_app::Application;
-use melin_app::auth::AuthorizedKeys;
-use melin_app::auth::Permission;
-use melin_app::decoder::RequestDecoder;
+use melin_app::auth::{AuthorizedKeys, ClientRole, KeyRole, RoleId};
+use melin_app::decoder::{ErasedDecoder, RequestDecoder};
 use melin_app::encoder::ResponseEncoder;
+use melin_app::{AppEvent, Application};
 use melin_pipeline::ring::Consumer;
 use melin_pipeline::wait::WaitStrategy;
 
@@ -629,6 +628,7 @@ where
     // narrow this thread to one lcore: the CPU set captured here is what
     // every unpinned thread runs on.
     melin_app::affinity::capture_home_mask();
+    let authorized_keys = load_authorized_keys(&decoder, &config.authorized_keys)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     crate::process::install_shutdown_handler(&shutdown);
 
@@ -645,6 +645,7 @@ where
             Arc::new(decoder),
             Arc::new(encoder),
             event_publisher,
+            authorized_keys,
             shutdown,
         )
     }
@@ -660,8 +661,40 @@ where
             Arc::new(decoder),
             Arc::new(encoder),
             event_publisher,
+            authorized_keys,
             shutdown,
         )
+    }
+}
+
+/// Load the `authorized_keys` file for the decoder's roles: the one place
+/// the file meets the application's role type. Generic over the decoder so
+/// its role type is named while it is still in scope; past the entry
+/// points the runtime holds the table and an erased decoder, and never
+/// the type.
+fn load_authorized_keys<D: RequestDecoder>(
+    _decoder: &D,
+    path: &std::path::Path,
+) -> Result<Arc<AuthorizedKeys>, Box<dyn std::error::Error>> {
+    let keys = AuthorizedKeys::load::<D::Role>(path)?;
+    info!(keys = keys.len(), path = %path.display(), "loaded authorized keys");
+    Ok(Arc::new(keys))
+}
+
+/// Refuse to start on a keys table parsed for a role type other than the
+/// decoder's: its role indices would name the decoder's roles wrongly,
+/// granting one role another's rights. Correct by construction today, as
+/// both come from the same decoder in the entry point; checked where the
+/// two arrive as separate parameters, which is the seam a later change
+/// could break.
+fn check_keys_match_decoder<E: AppEvent>(
+    decoder: &dyn ErasedDecoder<E>,
+    authorized_keys: &AuthorizedKeys,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if decoder.matches_keys(authorized_keys) {
+        Ok(())
+    } else {
+        Err("authorized keys were parsed for a role type other than the decoder's".into())
     }
 }
 
@@ -692,6 +725,7 @@ where
     // As in `run`: the CPU set unpinned threads run on, captured before
     // anything pins a thread.
     melin_app::affinity::capture_home_mask();
+    let authorized_keys = load_authorized_keys(&decoder, &config.authorized_keys)?;
     run_tcp::<A, _>(
         listener,
         config,
@@ -700,10 +734,12 @@ where
         Arc::new(decoder),
         Arc::new(encoder),
         event_publisher,
+        authorized_keys,
         shutdown,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // entry-chain hop, same arguments as run_impl
 fn run_tcp<A, L>(
     listener: L,
     config: ServerConfig,
@@ -712,6 +748,7 @@ fn run_tcp<A, L>(
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
+    authorized_keys: Arc<AuthorizedKeys>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -721,6 +758,7 @@ where
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
 {
+    check_keys_match_decoder(&*decoder, &authorized_keys)?;
     run_impl::<A, L>(
         listener,
         config,
@@ -729,6 +767,7 @@ where
         decoder,
         encoder,
         event_publisher,
+        authorized_keys,
         shutdown,
     )
 }
@@ -790,6 +829,7 @@ fn log_layout(cores: &PipelineCores) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // boot assembly point: each argument is one piece the node is built from
 fn run_impl<A, L>(
     listener: L,
     config: ServerConfig,
@@ -798,6 +838,7 @@ fn run_impl<A, L>(
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
+    authorized_keys: Arc<AuthorizedKeys>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -879,15 +920,6 @@ where
             bytes.copy_from_slice(&seed);
             ed25519_dalek::SigningKey::from_bytes(&bytes)
         };
-
-        // Load authorized keys early — the admin listener needs them for
-        // Ed25519 challenge-response auth (operator keys only).
-        let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
-        info!(
-            keys = authorized_keys.len(),
-            path = %config.authorized_keys.display(),
-            "loaded authorized keys (replica mode)"
-        );
 
         // The replica's control-plane bundle: promotion request (admin
         // PROMOTE / raft auto-promotion), tip readiness + advertised
@@ -1050,13 +1082,6 @@ where
             }
         }
     }
-    // Load authorized keys for challenge-response authentication.
-    let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
-    info!(
-        keys = authorized_keys.len(),
-        path = %config.authorized_keys.display(),
-        "loaded authorized keys"
-    );
 
     // Spawn the admin listener once if configured. PROMOTE is rejected
     // (with ERR) on a primary because no promote flag is wired here —
@@ -1954,7 +1979,7 @@ where
         // 2. Read ChallengeResponse (signature + public key)
         // 3. Verify signature and look up key in authorized_keys
         // 4. Send ServerReady on success, AuthFailed on failure
-        let (permission, public_key_bytes) = match authenticate_connection(
+        let (role, public_key_bytes) = match authenticate_connection(
             connection_id,
             addr,
             &mut std_read,
@@ -2032,7 +2057,7 @@ where
             connection_id,
             reader: std_read,
             addr,
-            permission,
+            role,
             key_hash,
         });
     }
@@ -2081,6 +2106,7 @@ fn run_dpdk<A>(
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
+    authorized_keys: Arc<AuthorizedKeys>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -2089,6 +2115,7 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
 {
+    check_keys_match_decoder(&*decoder, &authorized_keys)?;
     let dpdk_config = dpdk_config_from(&config)?;
 
     run_dpdk_impl::<A>(
@@ -2098,6 +2125,7 @@ where
         decoder,
         encoder,
         event_publisher,
+        authorized_keys,
         dpdk_config,
         shutdown,
     )
@@ -2158,6 +2186,7 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String
 }
 
 #[cfg(feature = "dpdk")]
+#[allow(clippy::too_many_arguments)] // boot assembly point, as run_impl
 fn run_dpdk_impl<A>(
     config: ServerConfig,
     mut startup: StartupEvents<A::Event>,
@@ -2165,6 +2194,7 @@ fn run_dpdk_impl<A>(
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
+    authorized_keys: Arc<AuthorizedKeys>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -2212,15 +2242,6 @@ where
         info!(primary = %primary_addr, "starting in replica mode (DPDK)");
         // As on the kernel-TCP path: a replica never journals genesis.
         startup.genesis = Vec::new();
-
-        // Load authorized keys early — the admin listener needs them for
-        // Ed25519 challenge-response auth (operator keys only).
-        let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
-        info!(
-            keys = authorized_keys.len(),
-            path = %config.authorized_keys.display(),
-            "loaded authorized keys (DPDK replica mode)"
-        );
 
         // Load the replication signing key — the replica signs the primary's
         // challenge with it. Mirrors the kernel-TCP replica path.
@@ -2435,14 +2456,6 @@ where
         }
         transports.push(transport);
     }
-
-    // Load authorized keys for challenge-response authentication.
-    let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
-    info!(
-        keys = authorized_keys.len(),
-        path = %config.authorized_keys.display(),
-        "loaded authorized keys"
-    );
 
     // Initialize or recover the application, then size it — see the
     // kernel-TCP primary path.
@@ -3385,14 +3398,14 @@ where
 /// Uses raw `read_exact` instead of `BufReader` to avoid over-reading
 /// bytes that belong to the first post-auth request.
 ///
-/// Returns `(Permission, public_key_bytes)` on success.
+/// Returns `(role, public_key_bytes)` on success.
 fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     connection_id: ConnectionId,
     addr: SocketAddr,
     reader: &mut R,
     writer: &mut W,
     authorized_keys: &AuthorizedKeys,
-) -> Result<(Permission, [u8; 32]), Box<dyn std::error::Error>> {
+) -> Result<(ClientRole<RoleId>, [u8; 32]), Box<dyn std::error::Error>> {
     use std::io;
 
     use melin_wire_protocol::control::TransportResponse;
@@ -3438,7 +3451,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     };
 
     let public_key_bytes = cr.public_key;
-    let permission = crate::client_auth::verify_client(
+    let role = crate::client_auth::verify_client(
         authorized_keys,
         &nonce,
         &public_key_bytes,
@@ -3456,11 +3469,11 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     debug!(
         connection_id = connection_id.0,
         addr = %addr,
-        role = %permission,
+        role = authorized_keys.token(KeyRole::Client(role)),
         "authenticated"
     );
 
-    Ok((permission, public_key_bytes))
+    Ok((role, public_key_bytes))
 }
 
 /// Set a read timeout on a raw fd via `setsockopt(SO_RCVTIMEO)`.
@@ -3592,8 +3605,8 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use ed25519_dalek::{Signer, SigningKey};
-    use melin_app::auth::AuthorizedKeys;
-    use melin_app::auth::Permission;
+    use melin_app::auth::{AuthorizedKeys, ClientRole, KeyRole, NoRoles};
+    use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_wire_protocol::control::ConnectionId;
     use melin_wire_protocol::control_codec::{
         TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT,
@@ -3662,14 +3675,14 @@ mod tests {
         SigningKey::from_bytes(&[0xAA; 32])
     }
 
-    /// Build an `AuthorizedKeys` containing the test key with the given permission.
-    fn keys_with_test_key(perm: &str) -> AuthorizedKeys {
+    /// Build an `AuthorizedKeys` listing the test key under `role`.
+    fn keys_with_test_key(role: &str) -> AuthorizedKeys {
         // Encode the public key bytes as base64 with the local helper so
         // the test has no external codec dependency (all test keys produce
         // valid base64), then feed it through AuthorizedKeys::parse.
         let pub_bytes = test_key().verifying_key().to_bytes();
         let pub_b64 = base64_encode(&pub_bytes);
-        AuthorizedKeys::parse(&format!("{perm} {pub_b64} test\n")).unwrap()
+        crate::test_roles::desk_keys(role, &pub_b64)
     }
 
     /// Minimal base64 encoder for test use only. Avoids adding base64
@@ -3699,11 +3712,12 @@ mod tests {
     }
 
     /// Run `authenticate_connection` on one end of a `UnixStream::pair()`,
-    /// returning the result. Maps the error to `String` so it's `Send`.
+    /// returning the admitted role's token in the keys file. Maps the
+    /// error to `String` so it's `Send`.
     fn run_server_auth(
         mut stream: UnixStream,
         keys: AuthorizedKeys,
-    ) -> std::thread::JoinHandle<Result<Permission, String>> {
+    ) -> std::thread::JoinHandle<Result<&'static str, String>> {
         std::thread::spawn(move || {
             // Clone the stream so we have independent read/write halves.
             let mut writer = stream.try_clone().unwrap();
@@ -3714,7 +3728,7 @@ mod tests {
                 &mut writer,
                 &keys,
             )
-            .map(|(perm, _pk)| perm)
+            .map(|(role, _pk)| keys.token(KeyRole::Client(role)))
             .map_err(|e| e.to_string())
         })
     }
@@ -3777,7 +3791,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_success_returns_permission() {
+    fn auth_success_returns_the_application_role() {
         let keys = keys_with_test_key("trader");
         let key = test_key();
         let (s1, mut s2) = UnixStream::pair().unwrap();
@@ -3789,11 +3803,11 @@ mod tests {
         assert_eq!(resp, TAG_SERVER_READY);
 
         let result = handle.join().unwrap();
-        assert_eq!(result.unwrap(), Permission::Trader);
+        assert_eq!(result.unwrap(), "trader");
     }
 
     #[test]
-    fn auth_admin_permission() {
+    fn auth_returns_the_operator_role() {
         let keys = keys_with_test_key("operator");
         let key = test_key();
         let (s1, mut s2) = UnixStream::pair().unwrap();
@@ -3804,12 +3818,12 @@ mod tests {
         let resp = read_response_tag(&mut s2);
         assert_eq!(resp, TAG_SERVER_READY);
 
-        assert_eq!(handle.join().unwrap().unwrap(), Permission::Operator);
+        assert_eq!(handle.join().unwrap().unwrap(), "operator");
     }
 
     #[test]
     fn auth_unknown_key_sends_auth_failed() {
-        let keys = AuthorizedKeys::parse("").unwrap();
+        let keys = AuthorizedKeys::parse::<NoRoles>("").unwrap();
         let key = test_key();
         let (s1, mut s2) = UnixStream::pair().unwrap();
 
@@ -3937,7 +3951,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_readonly_permission() {
+    fn auth_readonly_role() {
         let keys = keys_with_test_key("readonly");
         let key = test_key();
         let (s1, mut s2) = UnixStream::pair().unwrap();
@@ -3948,9 +3962,35 @@ mod tests {
         let resp = read_response_tag(&mut s2);
         assert_eq!(resp, TAG_SERVER_READY);
 
-        let perm = handle.join().unwrap().unwrap();
-        assert_eq!(perm, Permission::ReadOnly);
-        assert!(!perm.can_trade());
+        assert_eq!(handle.join().unwrap().unwrap(), "readonly");
+    }
+
+    /// A decoder with no application roles, for the pairing check below.
+    struct OperatorOnlyDecoder;
+
+    impl RequestDecoder for OperatorOnlyDecoder {
+        type Event = counter_server::CounterEvent;
+        type Role = NoRoles;
+
+        fn decode(&self, _body: &[u8], _role: ClientRole<NoRoles>) -> Decoded<Self::Event> {
+            Decoded::Filter
+        }
+    }
+
+    /// A keys table parsed for another role type than the decoder's is
+    /// refused before the node starts: its role indices would name the
+    /// decoder's roles wrongly.
+    #[test]
+    fn keys_parsed_for_another_role_type_are_refused() {
+        let decoder = OperatorOnlyDecoder;
+        let other_roles = keys_with_test_key("operator");
+        let err = super::check_keys_match_decoder(&decoder, &other_roles).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "authorized keys were parsed for a role type other than the decoder's"
+        );
+        let own_roles = AuthorizedKeys::parse::<NoRoles>("").unwrap();
+        super::check_keys_match_decoder(&decoder, &own_roles).unwrap();
     }
 
     /// A replication key signs correctly and is in the keys file, but it

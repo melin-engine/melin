@@ -8,16 +8,17 @@
 use std::fmt;
 
 use ed25519_dalek::{Signature, SignatureError, Verifier, VerifyingKey};
-use melin_app::auth::{AuthorizedKeys, KeyRole, Permission};
+use melin_app::auth::{AuthorizedKeys, ClientRole, RoleId};
 
 /// Why the client listener refused a challenge response.
 #[derive(Debug)]
 pub(crate) enum ClientAuthError {
+    /// The key is listed as `replication`, which authorizes streaming
+    /// between nodes and may not open a client connection (see
+    /// [`KeyRole::client`](melin_app::auth::KeyRole::client)).
+    ReplicationKeyRefused,
     /// The key is not in the authorized keys file.
     UnknownKey,
-    /// The key is listed, under a role that may not open a client
-    /// connection (see [`KeyRole::client`]).
-    RoleRefused(KeyRole),
     /// The listed bytes are not a valid Ed25519 public key.
     InvalidKey(SignatureError),
     /// The signature over the nonce does not verify.
@@ -27,8 +28,10 @@ pub(crate) enum ClientAuthError {
 impl fmt::Display for ClientAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ReplicationKeyRefused => {
+                f.write_str("replication key refused on the client listener")
+            }
             Self::UnknownKey => f.write_str("unknown public key"),
-            Self::RoleRefused(role) => write!(f, "{role} key refused on the client listener"),
             Self::InvalidKey(e) => write!(f, "invalid public key: {e}"),
             Self::BadSignature(e) => write!(f, "signature verification failed: {e}"),
         }
@@ -39,6 +42,7 @@ impl std::error::Error for ClientAuthError {}
 
 /// Decide a client's challenge response: the key must be listed, under a
 /// role that may connect as a client, and must have signed `nonce`.
+/// Returns the connection's role, as the runtime carries it.
 ///
 /// The role is checked before the signature, so a refused key costs no
 /// verification; the answer the client sees is the same failure either
@@ -48,17 +52,18 @@ pub(crate) fn verify_client(
     nonce: &[u8; 32],
     public_key: &[u8; 32],
     signature: &[u8; 64],
-) -> Result<Permission, ClientAuthError> {
+) -> Result<ClientRole<RoleId>, ClientAuthError> {
     let role = authorized_keys
         .lookup(public_key)
-        .ok_or(ClientAuthError::UnknownKey)?;
-    let permission = role.client().ok_or(ClientAuthError::RoleRefused(role))?;
+        .ok_or(ClientAuthError::UnknownKey)?
+        .client()
+        .ok_or(ClientAuthError::ReplicationKeyRefused)?;
     let verifying_key =
         VerifyingKey::from_bytes(public_key).map_err(ClientAuthError::InvalidKey)?;
     verifying_key
         .verify(nonce, &Signature::from_bytes(signature))
         .map_err(ClientAuthError::BadSignature)?;
-    Ok(permission)
+    Ok(role)
 }
 
 #[cfg(test)]
@@ -67,6 +72,9 @@ mod tests {
 
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
+    use melin_app::auth::KeyRole;
+
+    use crate::test_roles::desk_keys;
 
     const NONCE: [u8; 32] = [0x5A; 32];
 
@@ -77,25 +85,26 @@ mod tests {
     fn keys_listing(role: &str, key: &SigningKey) -> AuthorizedKeys {
         let public =
             base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
-        AuthorizedKeys::parse(&format!("{role} {public} test\n")).unwrap()
+        desk_keys(role, &public)
     }
 
-    fn verify(keys: &AuthorizedKeys, signer: &SigningKey) -> Result<Permission, ClientAuthError> {
+    fn verify(
+        keys: &AuthorizedKeys,
+        signer: &SigningKey,
+    ) -> Result<ClientRole<RoleId>, ClientAuthError> {
         let public_key = key().verifying_key().to_bytes();
         let signature = signer.sign(&NONCE).to_bytes();
         verify_client(keys, &NONCE, &public_key, &signature)
     }
 
+    /// The operator and every application role are admitted, each as the
+    /// role it is listed under.
     #[test]
     fn a_listed_client_key_that_signed_the_nonce_is_admitted() {
-        for (role, permission) in [
-            ("operator", Permission::Operator),
-            ("trader", Permission::Trader),
-            ("custodian", Permission::Custodian),
-            ("readonly", Permission::ReadOnly),
-        ] {
-            let admitted = verify(&keys_listing(role, &key()), &key()).unwrap();
-            assert_eq!(admitted, permission);
+        for role in ["operator", "trader", "readonly"] {
+            let keys = keys_listing(role, &key());
+            let admitted = verify(&keys, &key()).unwrap();
+            assert_eq!(keys.token(KeyRole::Client(admitted)), role);
         }
     }
 
@@ -112,7 +121,7 @@ mod tests {
     fn a_replication_key_is_refused() {
         let err = verify(&keys_listing("replication", &key()), &key()).unwrap_err();
         assert!(
-            matches!(err, ClientAuthError::RoleRefused(KeyRole::Replication)),
+            matches!(err, ClientAuthError::ReplicationKeyRefused),
             "{err}"
         );
         // Named by its token, as the operator wrote it in the keys file.
@@ -132,7 +141,7 @@ mod tests {
             "the fixture must not decompress to a point"
         );
         let listed = base64::engine::general_purpose::STANDARD.encode(not_a_point);
-        let keys = AuthorizedKeys::parse(&format!("operator {listed} test\n")).unwrap();
+        let keys = desk_keys("operator", &listed);
         let signature = key().sign(&NONCE).to_bytes();
         let err = verify_client(&keys, &NONCE, &not_a_point, &signature).unwrap_err();
         assert!(matches!(err, ClientAuthError::InvalidKey(_)), "{err}");

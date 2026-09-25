@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use ed25519_dalek::SigningKey;
-use melin_app::auth::AuthorizedKeys;
+use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_raft::network::RaftClientFactory;
 use melin_raft::recency::TipSource;
 use melin_raft::rpc_server::{RaftApi, RpcServerConfig, SupersessionPolicy, serve};
@@ -80,7 +80,7 @@ async fn start_server() -> Harness {
         b64(&unlisted_peer_key),
         b64(&operator_key),
     );
-    let authorized_keys = Arc::new(AuthorizedKeys::parse(&table).unwrap());
+    let authorized_keys = Arc::new(AuthorizedKeys::parse::<NoRoles>(&table).unwrap());
     let peer_ids = Arc::new(HashMap::from([(
         client_key.verifying_key().to_bytes(),
         2u64,
@@ -255,7 +255,7 @@ async fn votes_are_dropped_until_the_tip_is_ready() {
         "replication {} node-2\n",
         base64::engine::general_purpose::STANDARD.encode(client_key.verifying_key().to_bytes())
     );
-    let authorized_keys = Arc::new(AuthorizedKeys::parse(&table).unwrap());
+    let authorized_keys = Arc::new(AuthorizedKeys::parse::<NoRoles>(&table).unwrap());
     let peer_ids = Arc::new(HashMap::from([(
         client_key.verifying_key().to_bytes(),
         2u64,
@@ -323,7 +323,7 @@ async fn serving_node_fences_on_higher_peer_epoch() {
         "replication {} node-2\n",
         base64::engine::general_purpose::STANDARD.encode(client_key.verifying_key().to_bytes())
     );
-    let authorized_keys = Arc::new(AuthorizedKeys::parse(&table).unwrap());
+    let authorized_keys = Arc::new(AuthorizedKeys::parse::<NoRoles>(&table).unwrap());
     let peer_ids = Arc::new(HashMap::from([(
         client_key.verifying_key().to_bytes(),
         2u64,
