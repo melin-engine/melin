@@ -2,8 +2,9 @@
 //! application depend on the journal alone.
 //!
 //! A recording application logs every call it receives. A generated
-//! history (application events, journaled ticks, epoch bumps, rotations
-//! at random points) runs through the live pipeline, then through
+//! history (application writes and queries, journaled ticks, epoch
+//! bumps, rotations at random points) runs through the live pipeline,
+//! then through
 //! recovery from genesis, then through a restore from a snapshot at every
 //! anchor followed by replay of the rest. Each must hand the application
 //! the calls the live run did. The snapshots are the shadow stage's own,
@@ -21,7 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason, SequencerTime};
+use melin_app::{
+    AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason, SequencerTime,
+};
 use melin_journal::replication::REPLICATION_RING_CAPACITY;
 use melin_journal::{BufferedWriter, JournalEvent, JournalReader};
 use melin_pipeline::ring;
@@ -40,30 +43,61 @@ use crate::trace::mono_trace_ns;
 /// suite runs many busy-spinning stages at once.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// An application event: an identifier unique within the history, which
-/// the recording names `apply` calls by (`ApplyCtx` carries no sequence).
+/// An application event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Step(u64);
+enum Step {
+    /// A write, carrying an identifier unique within the history, which
+    /// the recording names `apply` calls by (`ApplyCtx` carries no
+    /// sequence).
+    Write(u64),
+    /// A query: seen by the live matching stage and the shadow, never
+    /// journaled.
+    Query,
+}
+
+impl Step {
+    const TAG_WRITE: u8 = 1;
+    const TAG_QUERY: u8 = 2;
+}
 
 impl AppEvent for Step {
-    const MAX_ENCODED_SIZE: usize = 8;
+    const MAX_ENCODED_SIZE: usize = 1 + 8;
 
     fn encoded_size(&self) -> usize {
-        8
+        match self {
+            Step::Write(_) => 1 + 8,
+            Step::Query => 1,
+        }
     }
 
     fn encode(&self, buf: &mut [u8]) -> usize {
-        buf[..8].copy_from_slice(&self.0.to_le_bytes());
-        8
+        match self {
+            Step::Write(id) => {
+                buf[0] = Self::TAG_WRITE;
+                buf[1..9].copy_from_slice(&id.to_le_bytes());
+                9
+            }
+            Step::Query => {
+                buf[0] = Self::TAG_QUERY;
+                1
+            }
+        }
     }
 
     fn decode(buf: &[u8]) -> Result<Self, CodecError> {
-        let bytes: [u8; 8] = buf.try_into().map_err(|_| CodecError::Truncated)?;
-        Ok(Step(u64::from_le_bytes(bytes)))
+        match buf.split_first() {
+            Some((&Self::TAG_WRITE, id)) => {
+                let bytes: [u8; 8] = id.try_into().map_err(|_| CodecError::Truncated)?;
+                Ok(Step::Write(u64::from_le_bytes(bytes)))
+            }
+            Some((&Self::TAG_QUERY, _)) => Ok(Step::Query),
+            Some((&tag, _)) => Err(CodecError::UnknownTag(tag)),
+            None => Err(CodecError::Truncated),
+        }
     }
 
     fn is_query(&self) -> bool {
-        false
+        matches!(self, Step::Query)
     }
 }
 
@@ -96,11 +130,21 @@ impl Application for RecordingApp {
     const APP_VERSION: u16 = 1;
 
     fn apply(&mut self, event: Step, ctx: &ApplyCtx, _out: &mut Vec<()>) {
+        let Step::Write(id) = event else {
+            // Panics the stage thread, which fails the test at its join.
+            unreachable!("the runtime never hands a query to apply");
+        };
         self.calls.push(Call::Apply {
-            id: event.0,
+            id,
             now_ns: ctx.now_ns,
             key_hash: ctx.key_hash,
         });
+    }
+
+    /// Answered live only, from `&self`: a query cannot be recorded,
+    /// which is right, since no journal could reproduce it.
+    fn query(&self, _event: Step, _ctx: &QueryCtx) -> Option<melin_app::NoQuery> {
+        None
     }
 
     fn tick(&mut self, now_ns: u64, _out: &mut Vec<()>) {
@@ -170,6 +214,10 @@ impl Application for RecordingApp {
 enum Op {
     /// A client write under one of a few keys.
     App { key_hash: u64 },
+    /// A client query: published, answered live, never journaled. Where
+    /// one sits, the journal's sequence and the input ring's position
+    /// part, and the shadow's snapshot anchor pairs the two.
+    Query { key_hash: u64 },
     /// A journaled clock tick.
     Tick,
     /// A promotion's epoch bump.
@@ -192,6 +240,7 @@ struct Planned {
 fn planned() -> impl Strategy<Value = Planned> {
     let op = prop_oneof![
         6 => (0u64..3).prop_map(|key_hash| Op::App { key_hash }),
+        2 => (0u64..3).prop_map(|key_hash| Op::Query { key_hash }),
         2 => Just(Op::Tick),
         1 => Just(Op::EpochBump),
         1 => Just(Op::Rotate),
@@ -217,24 +266,37 @@ fn build_slots(plan: &[Planned]) -> (Vec<InputSlot<Step>>, Vec<usize>) {
                 rotate_after.push(slots.len());
                 continue;
             }
-            Op::App { key_hash } => (1, key_hash, JournalEvent::App(Step(id as u64))),
+            Op::App { key_hash } => (1, key_hash, JournalEvent::App(Step::Write(id as u64))),
+            Op::Query { key_hash } => (1, key_hash, JournalEvent::App(Step::Query)),
             Op::Tick => (0, 0, JournalEvent::Tick { now_ns: stamp }),
             Op::EpochBump => {
                 epoch += 1;
                 (0, 0, JournalEvent::EpochBump { epoch })
             }
         };
+        // Queries are published unstamped, as the stamping producer
+        // publishes them.
+        let timestamp = if event.is_query() {
+            SequencerTime::default()
+        } else {
+            SequencerTime::from_ns(stamp)
+        };
         slots.push(InputSlot {
             connection_id,
             key_hash,
             sequence: 0,
-            timestamp: SequencerTime::from_ns(stamp),
+            timestamp,
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
         });
     }
     (slots, rotate_after)
+}
+
+/// How many of `slots` the journal records: all but the queries.
+fn journaled_count(slots: &[InputSlot<Step>]) -> u64 {
+    slots.iter().filter(|s| !s.event.is_query()).count() as u64
 }
 
 /// Poll `done` until it holds, panicking with `what` past the deadline.
@@ -272,6 +334,7 @@ fn run_live(journal: &Path, slots: &[InputSlot<Step>], rotate_after: &[usize]) -
         .journal_stage
         .set_rotation(0, Some(Arc::clone(&rotate)));
     let durable = pipeline.cursors.durable_wire_seq();
+    let journal_progress = pipeline.cursors.journal_ring_arc();
     let mut producer = pipeline.input_producer;
     let journal_stage = pipeline.journal_stage;
     let matching_stage = pipeline.matching_stage;
@@ -286,18 +349,26 @@ fn run_live(journal: &Path, slots: &[InputSlot<Step>], rotate_after: &[usize]) -
         std::thread::spawn(move || matching_stage.run(&shutdown))
     };
 
-    // A rotation takes effect after the batch that follows the request,
-    // so each one is confirmed by its archive before the next is asked
-    // for; otherwise two requests could collapse into one rotation.
+    // The journal stage acts on a rotation request after the next batch it
+    // submits, and skips it when the live segment holds no entry, as it
+    // does in production. So a rotation is asked for only once the stage
+    // has taken everything published so far, and only when a journaled
+    // slot surely lies past the last boundary: then it happens, whichever
+    // batch acts on it, and its archive confirms it before the next one.
+    // The slot published right after a request may fall on either side of
+    // its boundary, so it is not counted as past it.
     let mut rotations = 0usize;
-    let mut rotation_pending = false;
+    let mut journaled_past_boundary = 0u64;
     for (i, slot) in slots.iter().enumerate() {
-        if rotate_after.contains(&i) && !rotation_pending {
+        let request = rotate_after.contains(&i) && journaled_past_boundary > 0;
+        if request {
+            wait_for("the journal stage to take every published slot", || {
+                journal_progress.get().load(Ordering::Acquire) == i as u64
+            });
             rotate.store(true, Ordering::Release);
-            rotation_pending = true;
         }
         producer.publish(*slot);
-        if rotation_pending {
+        if request {
             rotations += 1;
             wait_for("a rotation", || {
                 melin_journal::segment::list_archives(journal)
@@ -305,10 +376,12 @@ fn run_live(journal: &Path, slots: &[InputSlot<Step>], rotate_after: &[usize]) -
                     .len()
                     == rotations
             });
-            rotation_pending = false;
+            journaled_past_boundary = 0;
+        } else if !slot.event.is_query() {
+            journaled_past_boundary += 1;
         }
     }
-    let journaled = slots.len() as u64;
+    let journaled = journaled_count(slots);
     wait_for("the journal to reach the last slot", || {
         durable.load().get() == journaled
     });
@@ -341,6 +414,14 @@ fn chain_after_each_entry(journal: &Path) -> Vec<[u8; 32]> {
 /// Feed the slots to the shadow stage one at a time, with the fsync
 /// state at each anchor, and save the snapshot it writes there to
 /// `anchor-<k>.snapshot`. Returns their paths, indexed by anchor.
+///
+/// An anchor is each journaled slot. Its fsync state pairs the slot's
+/// journal sequence with its input-ring position, which counts every
+/// query before it, as the journal stage publishes them: it counts a
+/// query toward its ring progress without journaling it. An anchor on a
+/// query itself would repeat the previous anchor's sequence and state,
+/// indistinguishable from it, so a query only moves the ring position of
+/// the anchors after it.
 fn shadow_snapshots(dir: &Path, slots: &[InputSlot<Step>], chain: &[[u8; 32]]) -> Vec<PathBuf> {
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot<Step>>::new(64)
         .add_consumer()
@@ -367,11 +448,17 @@ fn shadow_snapshots(dir: &Path, slots: &[InputSlot<Step>], chain: &[[u8; 32]]) -
 
     let mut anchors = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {
-        let anchor = i as u64 + 1;
+        if slot.event.is_query() {
+            // The shadow consumes it and runs past the fsync state's ring
+            // position, so it saves nothing until the next anchor.
+            producer.publish(*slot);
+            continue;
+        }
+        let anchor = anchors.len() as u64 + 1;
         fsync_writer.store(FsyncState {
             journal_seq: WireSeq::new(anchor),
             chain_hash: chain[anchor as usize],
-            input_ring_seq: RingPos::new(anchor),
+            input_ring_seq: RingPos::new(i as u64 + 1),
         });
         producer.publish(*slot);
         // The shadow saves repeatedly while it sits at the anchor, and
@@ -425,7 +512,11 @@ fn check_history(plan: &[Planned]) -> Result<(), TestCaseError> {
     );
 
     let chain = chain_after_each_entry(&journal);
-    prop_assert_eq!(chain.len(), slots.len() + 1, "every slot journaled");
+    prop_assert_eq!(
+        chain.len() as u64,
+        journaled_count(&slots) + 1,
+        "every write, tick and epoch bump journaled, no query"
+    );
     for (i, snapshot) in shadow_snapshots(dir.path(), &slots, &chain)
         .iter()
         .enumerate()
