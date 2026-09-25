@@ -792,6 +792,12 @@ mod tests {
     use crate::test_support::TestEvent;
     use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
 
+    /// The floor a node restarted from a snapshot alone opens its fresh
+    /// live segment with: the snapshot's stamp, here a stand-in.
+    fn snapshot_floor() -> melin_journal::TimeFloor {
+        melin_journal::TimeFloor::After(melin_app::SequencerTime::from_ns(1_000))
+    }
+
     /// Build a 3-segment journal (two rotations) with one event per
     /// phase, returning the live path.
     fn three_segment_journal(dir: &std::path::Path) -> std::path::PathBuf {
@@ -910,13 +916,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("resumed.journal");
         drop(
-            BufferedWriter::<TestEvent>::create_continuing(
-                &live,
-                34,
-                [7u8; 32],
-                melin_journal::TimeFloor::Unknown,
-            )
-            .unwrap(),
+            BufferedWriter::<TestEvent>::create_continuing(&live, 34, [7u8; 32], snapshot_floor())
+                .unwrap(),
         );
 
         assert!(can_catch_up_from_journal(&live, 33).unwrap());
@@ -1234,7 +1235,7 @@ mod tests {
                 &resumed,
                 21,
                 [7u8; 32],
-                melin_journal::TimeFloor::Unknown,
+                snapshot_floor(),
             )
             .unwrap(),
         );

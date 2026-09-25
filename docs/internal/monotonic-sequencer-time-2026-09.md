@@ -273,6 +273,19 @@ chain hash already are.
   journal. A wrong stamp in a snapshot is otherwise invisible until a
   snapshot-only boot seeds a primary below its replicas' floors.
 
+  One case stays unchecked, and no later step closes it: a stamp too
+  low, when the anchor entry is no longer on disk (the snapshot sits at a
+  segment boundary and the segment holding its anchor is gone). Only the
+  anchor entry can show a stamp too low. Step 3's boundary carry checks
+  the first entry past the anchor against the snapshot's stamp, which
+  catches one too high; a first entry is later than a too-low stamp
+  either way, and when the walk reads no entry at all, which is exactly
+  when the writer opens at the snapshot's stamp, there is nothing to
+  compare. The risk is narrow: the shadow copies the stamp from
+  `FsyncState`, so a wrong one takes a bug or tampering; the wall clock
+  normally runs far ahead of any floor; and the replicas still hold the
+  true one, so from step 3 a regressing entry stops them, loud if late.
+
 `run_as_primary` (kernel TCP and DPDK) seeds the clock from the floor
 of the writer it receives.
 
