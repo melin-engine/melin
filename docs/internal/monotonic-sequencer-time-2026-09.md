@@ -328,8 +328,11 @@ receivers. That is a replication protocol change for a convenience.
     session ends with a distinct fatal exit that does not go through
     reconnect and resync, logs an `error!` naming the sequence and both
     stamps, and leaves the journal as it is for inspection.
-- **The reader applies the same rule on replay and catch-up, within a
-  segment, as a hard error.** Unlike `SequenceGap`, which recovery
+- **The reader applies the same rule within a segment, as a hard
+  error**, on replay and in every tool built on `JournalReader`. The
+  primary's catch-up scan reads raw bytes and checks nothing, CRCs
+  included, by design; what it streams is checked where it lands, by
+  the replica's encoder. Unlike `SequenceGap`, which recovery
   treats as a torn tail on the live segment and truncates at, a
   CRC-valid entry whose stamp regresses is not a torn write: it is a bug
   or tampering, and recovery fails on it rather than silently dropping

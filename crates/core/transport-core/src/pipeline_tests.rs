@@ -847,6 +847,55 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
     assert_eq!(report.entries, 5, "exactly the five primary entries");
 }
 
+/// A slot whose stamp is not later than the one before it stops the
+/// journal stage with the encoder's typed refusal, not an I/O error: on
+/// a replica the node reads the type to tell a stream breaking time
+/// order from a disk failure. The refused entry never reaches the disk.
+#[test]
+fn journal_stage_stops_on_a_regressing_stamp_with_its_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("regression.journal");
+    let writer = Writer::create(&path).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let stage = JournalStage::new(
+        writer,
+        consumers.pop().unwrap(),
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
+    producer.publish(add_slot(1, 2_000));
+    producer.publish(add_slot(2, 2_000));
+
+    let shutdown = AtomicBool::new(false);
+    match stage.run(&shutdown) {
+        Err(melin_journal::JournalError::TimestampRegression {
+            sequence,
+            previous,
+            timestamp,
+        }) => {
+            assert_eq!(sequence, 2);
+            assert_eq!(previous, SequencerTime::from_ns(2_000));
+            assert_eq!(timestamp, SequencerTime::from_ns(2_000));
+        }
+        Err(other) => panic!("expected TimestampRegression, got {other}"),
+        Ok(_) => panic!("expected the stage to stop"),
+    }
+
+    #[cfg(not(feature = "no-persist"))]
+    {
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        while let Some(entry) = reader.next_entry().unwrap() {
+            assert_ne!(
+                entry.sequence, 2,
+                "the refused entry must not reach the disk"
+            );
+        }
+    }
+}
+
 /// Verify the JournalStage uses pre-assigned sequences and timestamps
 /// when `InputSlot.sequence != 0` (replica mode). The encoded journal
 /// entries must carry the primary's sequence numbers, not locally
@@ -3664,12 +3713,14 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stats_query_durable.journal");
 
-    fn slot(event: JournalEvent<TestEvent>) -> TestInput {
+    /// A slot stamped `timestamp_ns`: increasing for writes, zero for
+    /// queries, as the stamping producer publishes them.
+    fn slot(event: JournalEvent<TestEvent>, timestamp_ns: u64) -> TestInput {
         InputSlot {
             connection_id: 1,
             key_hash: 0,
             sequence: 0,
-            timestamp: SequencerTime::default(),
+            timestamp: SequencerTime::from_ns(timestamp_ns),
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -3723,7 +3774,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
         let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
 
         for n in 1..=5u64 {
-            input_producer.publish(slot(JournalEvent::App(TestEvent::Add(n))));
+            input_producer.publish(slot(JournalEvent::App(TestEvent::Add(n)), n));
         }
         // Wait for the fsync to land before querying: the durable cursor
         // then sits at exactly 5 and cannot move (queries are never
@@ -3734,7 +3785,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
         }
         assert_eq!(last_seq.load().get(), 5, "phase 1 fsync");
 
-        input_producer.publish(slot(JournalEvent::App(TestEvent::Query)));
+        input_producer.publish(slot(JournalEvent::App(TestEvent::Query), 0));
         let q = drain_query(&mut output_consumer);
         assert_eq!(q.total, 1 + 2 + 3 + 4 + 5);
         assert_eq!(
@@ -3778,7 +3829,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
     // The query is the FIRST slot consumed after boot — the journal ring
     // cursor is still ~0, so reading the ring instead of the durable
     // cursor (the pre-fix behaviour) would report ~0 here, not 5.
-    input_producer.publish(slot(JournalEvent::App(TestEvent::Query)));
+    input_producer.publish(slot(JournalEvent::App(TestEvent::Query), 0));
     let q = drain_query(&mut output_consumer);
     assert_eq!(q.total, 15, "recovered state");
     assert_eq!(

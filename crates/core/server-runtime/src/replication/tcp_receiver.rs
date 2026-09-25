@@ -1643,6 +1643,10 @@ mod tests {
                     stamp_at_4 = w.last_timestamp();
                 }
             }
+            // Entry 6, streamed after the resync, follows entry 5 in time
+            // as it does in sequence: the replica judges it against the
+            // floor the resync left it at.
+            let stamp_6 = melin_app::SequencerTime::from_ns(w.last_timestamp().as_ns() + 1);
             drop(w);
             melin_transport_core::snapshot::save::<App>(
                 &App,
@@ -1754,7 +1758,7 @@ mod tests {
                     connection_id: 0,
                     key_hash: 0,
                     sequence: 6,
-                    timestamp: melin_app::SequencerTime::from_ns(6),
+                    timestamp: stamp_6,
                     event: JournalEvent::App(EvtAdd(6)),
                     publish_ts: Default::default(),
                     recv_ts: Default::default(),

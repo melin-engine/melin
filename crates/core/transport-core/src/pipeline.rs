@@ -1282,20 +1282,13 @@ impl<E: AppEvent> Sequencer<E> {
                         // split costs no copy.
                         self.core.claim_slot()?;
                         let chunk = self.core.claim.as_mut().expect("claimed above");
-                        self.core
-                            .encoder
-                            .encode_event(
-                                chunk.bytes_mut(),
-                                seq,
-                                slot.timestamp,
-                                &slot.event,
-                                slot.key_hash,
-                            )
-                            .map_err(|e| {
-                                JournalError::Io(std::io::Error::other(format!(
-                                    "journal encode (sequencer, seq {seq}): {e}"
-                                )))
-                            })?;
+                        self.core.encoder.encode_event(
+                            chunk.bytes_mut(),
+                            seq,
+                            slot.timestamp,
+                            &slot.event,
+                            slot.key_hash,
+                        )?;
                         let journal_slice = self
                             .core
                             .encoder
@@ -1512,8 +1505,12 @@ impl<E: AppEvent> Sequencer<E> {
                     &slot.event,
                     slot.key_hash,
                 ) {
-                    tracing::error!(error = %e, "journal encode error on drain");
-                    continue;
+                    // Stop, as the steady-state loop does: skipping the
+                    // entry would leave its sequence unwritten and every
+                    // later entry past a hole (and a refused stamp would
+                    // be followed by entries judged against it).
+                    tracing::error!(error = %e, seq, "journal encode error on drain");
+                    return;
                 }
                 let journal_slice = self
                     .core

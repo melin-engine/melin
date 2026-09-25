@@ -261,6 +261,13 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// and is refused rather than silently truncated. It must also be
     /// the same buffer used for the rest of the batch (see the type
     /// docs).
+    ///
+    /// `timestamp` must be strictly later than the journal's floor
+    /// ([`last_timestamp`](Self::last_timestamp)); anything else is
+    /// refused with [`JournalError::TimestampRegression`], leaving the
+    /// encoder unchanged. This is the one check behind every write: the
+    /// journal stage on a primary and on a replica, and every writer
+    /// built on this encoder.
     pub fn encode_event(
         &mut self,
         dst: &mut [u8],
@@ -269,6 +276,16 @@ impl<E: AppEvent> JournalEncoder<E> {
         event: &JournalEvent<E>,
         key_hash: u64,
     ) -> Result<(), JournalError> {
+        // Time strictly increases across the whole journal. Checked first,
+        // so a refused entry leaves the encoder exactly as it was: chain,
+        // batch and floor untouched.
+        if timestamp <= self.last_timestamp {
+            return Err(JournalError::TimestampRegression {
+                sequence: seq,
+                previous: self.last_timestamp,
+                timestamp,
+            });
+        }
         #[cfg(debug_assertions)]
         {
             debug_assert!(
@@ -544,5 +561,105 @@ mod tests {
     #[test]
     fn narrow_events_reserve_far_less_than_the_ceiling() {
         assert!(entry_size::<VarEvent>() < MAX_ENTRY_SIZE / 4);
+    }
+
+    fn stamp(ns: u64) -> SequencerTime {
+        SequencerTime::from_ns(ns)
+    }
+
+    const ENTRY: JournalEvent<TinyEvent> = JournalEvent::App(TinyEvent);
+
+    fn destination() -> Vec<u8> {
+        vec![0u8; MAX_ENTRY_SIZE * 8]
+    }
+
+    /// An equal or earlier stamp is refused, and the refusal leaves the
+    /// encoder as it was: nothing absorbed into the chain, nothing
+    /// appended to the batch, the floor where it stood. The next entry
+    /// then encodes as if the refused one had never been offered.
+    #[test]
+    fn a_stamp_not_later_than_the_floor_is_refused_and_changes_nothing() {
+        let mut encoder = JournalEncoder::<TinyEvent>::new(1, [7; 32], TimeFloor::Genesis);
+        let mut dst = destination();
+        encoder
+            .encode_event(&mut dst, 1, stamp(10), &ENTRY, 0)
+            .unwrap();
+        let before = (encoder.batch_len(), encoder.chain_hash());
+
+        for refused in [stamp(10), stamp(9)] {
+            match encoder.encode_event(&mut dst, 2, refused, &ENTRY, 0) {
+                Err(JournalError::TimestampRegression {
+                    sequence: 2,
+                    previous,
+                    timestamp,
+                }) => {
+                    assert_eq!(previous, stamp(10));
+                    assert_eq!(timestamp, refused);
+                }
+                other => panic!("expected TimestampRegression, got {other:?}"),
+            }
+            assert_eq!((encoder.batch_len(), encoder.chain_hash()), before);
+            assert_eq!(encoder.last_timestamp(), stamp(10));
+        }
+        encoder
+            .encode_event(&mut dst, 2, stamp(11), &ENTRY, 0)
+            .unwrap();
+        assert_eq!(encoder.last_timestamp(), stamp(11));
+    }
+
+    /// The floor a stream opens with is enforced from the first entry:
+    /// genesis refuses a zero stamp, and a stream resumed partway through
+    /// history refuses anything not past the last stamp before it.
+    #[test]
+    fn the_floor_a_stream_opens_with_binds_its_first_entry() {
+        let mut dst = destination();
+        let mut genesis = JournalEncoder::<TinyEvent>::new(1, [7; 32], TimeFloor::Genesis);
+        assert!(
+            genesis
+                .encode_event(&mut dst, 1, stamp(0), &ENTRY, 0)
+                .is_err()
+        );
+
+        let mut dst = destination();
+        let mut resumed =
+            JournalEncoder::<TinyEvent>::new(40, [7; 32], TimeFloor::After(stamp(100)));
+        assert!(
+            resumed
+                .encode_event(&mut dst, 40, stamp(100), &ENTRY, 0)
+                .is_err()
+        );
+        resumed
+            .encode_event(&mut dst, 40, stamp(101), &ENTRY, 0)
+            .unwrap();
+    }
+
+    /// `begin_segment` resets the starting sequence, the batch and the
+    /// chain, and must leave the floor alone: time strictly increases
+    /// across segments. Resetting it with the rest is the natural mistake,
+    /// and it would open a hole at every rotation on every node, primary
+    /// and replica alike, with nothing else failing. Pinned here, on the
+    /// method itself, because it has two callers (the writer's rotation
+    /// and the journal stage's) and a test on either would leave the
+    /// other unpinned.
+    #[test]
+    fn begin_segment_keeps_the_time_floor() {
+        let mut encoder = JournalEncoder::<TinyEvent>::new(1, [7; 32], TimeFloor::Genesis);
+        let mut dst = destination();
+        encoder
+            .encode_event(&mut dst, 1, stamp(10), &ENTRY, 0)
+            .unwrap();
+        encoder.clear_batch();
+
+        encoder.begin_segment(2, [8; 32]);
+        assert_eq!(encoder.last_timestamp(), stamp(10));
+        assert!(
+            encoder
+                .encode_event(&mut dst, 2, stamp(5), &ENTRY, 0)
+                .is_err(),
+            "the new segment's first entry is judged against the old segment's last"
+        );
+        encoder
+            .encode_event(&mut dst, 2, stamp(11), &ENTRY, 0)
+            .unwrap();
     }
 }

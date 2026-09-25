@@ -521,7 +521,21 @@ where
                 // Mirror into the process-lifetime gauge the replica
                 // health endpoint serves.
                 pipeline_healthy.store(false, Ordering::Release);
-                tracing::error!(error = %e, "replica journal stage failed — session teardown");
+                if let melin_journal::JournalError::TimestampRegression {
+                    sequence,
+                    previous,
+                    timestamp,
+                } = e
+                {
+                    tracing::error!(
+                        sequence,
+                        previous_ns = previous.as_ns(),
+                        timestamp_ns = timestamp.as_ns(),
+                        "primary's stream breaks time order: entry refused, replica stopping"
+                    );
+                } else {
+                    tracing::error!(error = %e, "replica journal stage failed; session teardown");
+                }
             }
             result
         })
@@ -828,11 +842,27 @@ where
             // Every other fatal exits as before: protocol violations and
             // journal I/O death (ENOSPC, RO-FS) would fail the same way
             // after a resync.
-            let TeardownOutcome::JournalFailed(
-                je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
-            ) = outcome
-            else {
-                return AfterSession::Return(Err(e));
+            let je = match outcome {
+                TeardownOutcome::JournalFailed(
+                    je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
+                ) => je,
+                // The primary streamed an entry whose stamp is not later
+                // than the one before it. No resync repairs that: catch-up
+                // and a snapshot's seed both carry the primary's stamps,
+                // so the next session would be refused at the same entry.
+                // Stop, and leave the journal (which never took the entry)
+                // as it is for inspection.
+                TeardownOutcome::JournalFailed(
+                    je @ melin_journal::JournalError::TimestampRegression { .. },
+                ) => {
+                    return AfterSession::Return(Err(format!(
+                        "the primary's stream breaks time order ({je}); stopping without \
+                         resync, which would replay the same entry, and leaving the local \
+                         journal as it is for inspection"
+                    )
+                    .into()));
+                }
+                _ => return AfterSession::Return(Err(e)),
             };
 
             *divergence_resyncs += 1;
@@ -2853,6 +2883,71 @@ mod tests {
             shadow_handle: None,
         };
         (handles, consumer)
+    }
+
+    /// A primary whose stream breaks time order is not something a resync
+    /// repairs: catch-up and a snapshot's seed carry the same stamps, so
+    /// the next session would be refused at the same entry. The exit
+    /// handler stops the replica, naming the entry, instead of taking the
+    /// divergence path's in-process resync.
+    #[test]
+    fn a_stream_breaking_time_order_stops_the_replica_without_resync() {
+        type Writer = BufferedWriter<CounterEvent>;
+        let (input_producer, _consumers) =
+            melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(8)
+                .add_consumer()
+                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+        let refused = melin_journal::JournalError::TimestampRegression {
+            sequence: 42,
+            previous: SequencerTime::from_ns(2_000),
+            timestamp: SequencerTime::from_ns(1_000),
+        };
+        let handles = ReplicaPipelineHandles::<counter_server::Counter, Writer> {
+            input_producer,
+            journal_cursor: Arc::new(make_journal_cursor(0)),
+            last_seq: melin_transport_core::DurableWireSeqCursor::detached(
+                melin_transport_core::WireSeq::new(0),
+            ),
+            chain_hash_lock: None,
+            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            journal_failed: Arc::new(AtomicBool::new(true)),
+            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
+            journal_handle: std::thread::spawn(move || -> Result<Writer, _> { Err(refused) }),
+            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            drain_handle: std::thread::spawn(|| {}),
+            shadow_handle: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut pipeline = Some(handles);
+        let mut resyncs = 0;
+        let mut backoff = std::time::Duration::from_secs(1);
+        let result = StreamingResult {
+            exit: SessionExit::Fatal("replica journal stage failed".into()),
+            heard_from_primary: true,
+        };
+        let after = handle_session_exit::<counter_server::Counter, Writer>(
+            result,
+            &mut pipeline,
+            &mut resyncs,
+            &mut backoff,
+            41,
+            &dir.path().join("j.journal"),
+            &dir.path().join("j.snapshot"),
+            &melin_transport_core::fence::FenceState::new(0),
+            &AtomicBool::new(false),
+            &crate::promotion::PromotionRequest::new(),
+            || {},
+            &(),
+        );
+        match after {
+            AfterSession::Return(Err(e)) => {
+                let message = e.to_string();
+                assert!(message.contains("breaks time order"), "{message}");
+                assert!(message.contains("sequence 42"), "{message}");
+            }
+            _ => panic!("expected the replica to stop"),
+        }
+        assert_eq!(resyncs, 0, "no resync is attempted");
     }
 
     /// The invariant behind moving the sentinel publish into

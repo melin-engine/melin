@@ -90,6 +90,10 @@ pub struct JournalReader<E: AppEvent> {
     valid: usize,
     /// Last sequence number read, for gap detection.
     last_sequence: Option<u64>,
+    /// Stamp of the last entry read, for the within-segment time check.
+    /// `None` before the first: a segment cannot judge its own first
+    /// entry, which recovery checks against the segment before.
+    last_timestamp: Option<SequencerTime>,
     /// Byte offset in the file of the end of the last successfully decoded entry.
     /// Used by recovery to know where to truncate trailing garbage.
     valid_file_end: u64,
@@ -135,6 +139,7 @@ impl<E: AppEvent> JournalReader<E> {
             pos: 0,
             valid: 0,
             last_sequence: None,
+            last_timestamp: None,
             valid_file_end: info.sector_size as u64,
             sector_size: info.sector_size,
             starting_sequence: info.starting_sequence,
@@ -344,6 +349,25 @@ impl<E: AppEvent> JournalReader<E> {
             }
         }
 
+        // Time strictly increases across the journal. Within a segment the
+        // reader checks it; the first entry has no predecessor here, and
+        // recovery checks it against the segment before (see
+        // `last_timestamp`). After the sequence checks, so stale bytes past
+        // a torn tail still stop at a sequence gap and never reach this:
+        // a CRC-valid entry that carries the next sequence and a regressing
+        // stamp is not a torn write, it is a bug or tampering, and is a hard
+        // error rather than a place to truncate.
+        let timestamp = SequencerTime::from_ns(timestamp_ns);
+        if let Some(previous) = self.last_timestamp
+            && timestamp <= previous
+        {
+            return Err(JournalError::TimestampRegression {
+                sequence,
+                previous,
+                timestamp,
+            });
+        }
+
         // Absorb the entry's raw on-disk bytes (header + payload + CRC)
         // into the segment chain. Verification happens at the consumers'
         // compare points: snapshot anchor, segment boundary, divergence
@@ -353,12 +377,13 @@ impl<E: AppEvent> JournalReader<E> {
             .absorb(&self.buffer[self.pos..self.pos + consumed]);
 
         self.last_sequence = Some(sequence);
+        self.last_timestamp = Some(timestamp);
         self.pos += consumed;
         self.valid_file_end += consumed as u64;
 
         Ok(Some(JournalEntry {
             sequence,
-            timestamp: SequencerTime::from_ns(timestamp_ns),
+            timestamp,
             key_hash,
             event,
         }))
@@ -379,6 +404,12 @@ impl<E: AppEvent> JournalReader<E> {
     /// Last successfully read sequence number.
     pub fn last_sequence(&self) -> Option<u64> {
         self.last_sequence
+    }
+
+    /// Stamp of the last successfully read entry, `None` before the
+    /// first.
+    pub fn last_timestamp(&self) -> Option<SequencerTime> {
+        self.last_timestamp
     }
 
     /// Byte offset in the file just past the last valid entry.
@@ -1219,5 +1250,52 @@ mod tests {
             matches!(err, Err(JournalError::SequenceGap { expected: 100, .. })),
             "expected SequenceGap at first entry, got {err:?}"
         );
+    }
+
+    /// A CRC-valid entry carrying the next sequence but a stamp that is
+    /// not later than the entry before it is a hard error, whether the
+    /// stamp repeats or goes back: it is not a torn write.
+    #[test]
+    fn an_entry_not_later_than_the_one_before_it_is_refused() {
+        use std::os::unix::fs::FileExt;
+
+        for back_ns in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.journal");
+            let (valid_end, last) = {
+                let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+                writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+                writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
+                (writer.valid_end(), writer.last_timestamp())
+            };
+            let regressing = last.as_ns() - back_ns;
+            let mut scratch = [0u8; 256];
+            let len = codec::encode(
+                3,
+                regressing,
+                0,
+                &JournalEvent::App(TestEvent(3)),
+                &mut scratch,
+            )
+            .unwrap();
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all_at(&scratch[..len], valid_end).unwrap();
+            file.sync_all().unwrap();
+
+            let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+            reader.next_entry().unwrap().expect("entry 1");
+            reader.next_entry().unwrap().expect("entry 2");
+            match reader.next_entry() {
+                Err(JournalError::TimestampRegression {
+                    sequence: 3,
+                    previous,
+                    timestamp,
+                }) => {
+                    assert_eq!(previous, last);
+                    assert_eq!(timestamp.as_ns(), regressing);
+                }
+                other => panic!("expected TimestampRegression, got {other:?}"),
+            }
+        }
     }
 }

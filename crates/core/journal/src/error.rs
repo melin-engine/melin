@@ -74,6 +74,19 @@ pub enum JournalError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
+    /// An entry's stamp is not strictly later than the entry before it.
+    /// Journaled time strictly increases across the whole journal, so
+    /// this is never a torn write. Refused by the encoder, it is a bug on
+    /// a primary, or on a replica a primary whose stream breaks time
+    /// order; found by the reader in a CRC-valid entry, a bug or
+    /// tampering.
+    TimestampRegression {
+        sequence: u64,
+        /// The stamp the entry had to exceed.
+        previous: melin_app::SequencerTime,
+        /// The entry's own stamp.
+        timestamp: melin_app::SequencerTime,
+    },
 }
 
 impl fmt::Display for JournalError {
@@ -129,6 +142,17 @@ impl fmt::Display for JournalError {
                  snapshot resync required",
                 hex_prefix(actual),
                 hex_prefix(expected)
+            ),
+            Self::TimestampRegression {
+                sequence,
+                previous,
+                timestamp,
+            } => write!(
+                f,
+                "timestamp regression at sequence {sequence}: {} ns is not later than \
+                 the {} ns before it",
+                timestamp.as_ns(),
+                previous.as_ns()
             ),
         }
     }
