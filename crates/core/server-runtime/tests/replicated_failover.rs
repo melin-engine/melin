@@ -274,8 +274,8 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             admin_addr: free_addr(PORT_BASE),
         })
         .collect();
-    // One key for both client writes and admin: the operator permission
-    // covers each.
+    // One key for both client writes and admin: the operator role covers
+    // each.
     let client_key = SigningKey::from_bytes(&[0x11; 32]);
 
     let b64 = |k: &SigningKey| {
