@@ -676,8 +676,9 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 /// the snapshot records one). Every entry surfaces to this loop, so no
 /// capture machinery is needed.
 ///
-/// `last_walked` is left at the stamp of the last entry read, replayed or
-/// not: the writer's time floor.
+/// `last_walked` carries the stamp of the last entry read, replayed or
+/// not, across segments: every entry must be later than it, and it is
+/// left as the writer's time floor.
 ///
 /// `allow_partial_tail` controls how `SequenceGap` is treated: archived
 /// segments are sealed and any gap is corruption (returned as an error);
@@ -697,6 +698,30 @@ fn replay_segment<A: Application>(
     loop {
         match reader.next_entry() {
             Ok(Some(entry)) => {
+                // Time strictly increases across the whole journal. The
+                // reader checks it within a segment; carrying the last
+                // stamp walked checks it across the boundary too, where a
+                // segment cannot judge its own first entry. When the walk
+                // begins right after the anchor (the segment holding it is
+                // gone), the snapshot's stamp starts the carry.
+                let previous = last_walked.or_else(|| {
+                    snapshot
+                        .filter(|s| entry.sequence == s.sequence + 1)
+                        .and_then(|s| match s.floor {
+                            TimeFloor::After(time) => Some(time),
+                            TimeFloor::Genesis | TimeFloor::Unknown => None,
+                        })
+                });
+                if let Some(previous) = previous
+                    && entry.timestamp <= previous
+                {
+                    return Err(JournalError::TimestampRegression {
+                        sequence: entry.sequence,
+                        previous,
+                        timestamp: entry.timestamp,
+                    }
+                    .into());
+                }
                 *last_walked = Some(entry.timestamp);
                 if entry.sequence == snap_sequence
                     && let Some(snapshot) = snapshot
@@ -1225,6 +1250,105 @@ mod tests {
             Err(other) => panic!("expected SnapshotTimestampMismatch, got {other:?}"),
             Ok(_) => panic!("expected SnapshotTimestampMismatch, recovery succeeded"),
         }
+    }
+
+    /// Append a CRC-valid entry at the end of `path`'s valid data, bypassing
+    /// the encoder's refusal: what a bug or tampering leaves on disk.
+    fn forge_entry(path: &Path, sequence: u64, stamp: SequencerTime) {
+        use std::os::unix::fs::FileExt;
+        let mut scratch = [0u8; 256];
+        let len = melin_journal::codec::encode(
+            sequence,
+            stamp.as_ns(),
+            1,
+            &JournalEvent::App(TestEvent::Add(99)),
+            &mut scratch,
+        )
+        .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(&scratch[..len], valid_data_end(path))
+            .unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn expect_regression(
+        result: Result<TestApp_, JournaledAppError>,
+        sequence: u64,
+    ) -> (SequencerTime, SequencerTime) {
+        match result {
+            Err(JournaledAppError::Journal(JournalError::TimestampRegression {
+                sequence: at,
+                previous,
+                timestamp,
+            })) => {
+                assert_eq!(at, sequence);
+                (previous, timestamp)
+            }
+            Err(other) => panic!("expected TimestampRegression, got {other:?}"),
+            Ok(_) => panic!("expected TimestampRegression, recovery succeeded"),
+        }
+    }
+
+    /// A segment cannot judge its own first entry, so recovery carries the
+    /// last stamp it walked across the boundary and judges it there.
+    #[test]
+    fn recovery_refuses_a_regression_across_a_segment_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)]);
+        ja.rotate_segment().unwrap();
+        drop(ja);
+        forge_entry(&journal_path, 3, ns(1_500));
+
+        let (previous, timestamp) =
+            expect_regression(TestApp_::recover(TestApp::new(), &journal_path), 3);
+        assert_eq!((previous, timestamp), (ns(2_000), ns(1_500)));
+    }
+
+    /// A CRC-valid entry that carries the next sequence and a stamp not
+    /// later than the one before is not a torn write. Recovery fails on it
+    /// rather than truncating the live tail there, and leaves the file as
+    /// it found it for inspection.
+    #[test]
+    fn recovery_fails_on_a_regressing_live_tail_rather_than_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        drop(append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)]));
+        forge_entry(&journal_path, 3, ns(2_000));
+        let before = std::fs::read(&journal_path).unwrap();
+
+        expect_regression(TestApp_::recover(TestApp::new(), &journal_path), 3);
+        assert_eq!(
+            std::fs::read(&journal_path).unwrap(),
+            before,
+            "the journal must not be truncated or rewritten"
+        );
+    }
+
+    /// When the segment holding the snapshot's anchor is gone, the walk
+    /// begins right after the anchor and the snapshot's stamp starts the
+    /// carry: the first entry must be later than it. This is also what
+    /// catches a snapshot stamp recorded too high.
+    #[test]
+    fn the_snapshot_stamp_judges_the_first_entry_after_a_trimmed_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap");
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)]);
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
+        drop(ja);
+        std::fs::remove_file(dir.path().join("journal.bin.000001")).unwrap();
+        forge_entry(&journal_path, 3, ns(2_000));
+
+        let (previous, timestamp) = expect_regression(
+            TestApp_::recover_from_snapshot(&snap_path, &journal_path),
+            3,
+        );
+        assert_eq!((previous, timestamp), (ns(2_000), ns(2_000)));
     }
 
     /// Replay hands every journaled app event to `apply` under the key

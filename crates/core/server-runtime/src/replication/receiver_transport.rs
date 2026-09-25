@@ -777,12 +777,12 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             break SessionExit::Shutdown;
         }
         if journal_failed.load(Ordering::Acquire) {
-            // The journal stage died (chain divergence, journal I/O
-            // failure). Its cursor is frozen, so no further slot can
-            // ever be journaled or acked — stop publishing and exit
-            // fatally; teardown + restart routes the node through the
-            // reconnect handshake, where divergence is repaired by
-            // snapshot resync.
+            // The journal stage died (chain divergence, a stamp breaking
+            // time order, journal I/O failure). Its cursor is frozen, so
+            // no further slot can ever be journaled or acked: stop
+            // publishing and exit fatally. The exit handler repairs
+            // divergence by snapshot resync and stops the node on
+            // anything else.
             break SessionExit::Fatal(
                 "replica journal stage failed — tearing down for reconnect/resync".into(),
             );

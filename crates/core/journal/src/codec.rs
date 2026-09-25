@@ -12,7 +12,7 @@
 //! | Field             | Type     | Bytes | Purpose                             |
 //! |-------------------|----------|-------|-------------------------------------|
 //! | file_magic        | u32      | 4     | `0x4A4F5552` ("JOUR")               |
-//! | format_version    | u16      | 2     | Current version = 15                |
+//! | format_version    | u16      | 2     | Current version = 16                |
 //! | sector_size       | u16      | 2     | Always [`MAX_SECTOR_SIZE`] (4096)   |
 //! | starting_sequence | u64      | 8     | Sequence of this segment's first entry |
 //! | anchor_hash       | [u8; 32] | 32    | Chain anchor: random salt (fresh journal) or previous segment's tail hash (rotation) |
@@ -30,7 +30,7 @@
 //! | magic        | u16    | 2     | `0x4A45` — misalignment detection     |
 //! | length       | u16    | 2     | Byte count after header, before CRC   |
 //! | sequence     | u64    | 8     | Monotonically increasing, starts at 1 |
-//! | timestamp_ns | u64    | 8     | Wall-clock nanos since epoch           |
+//! | timestamp_ns | u64    | 8     | Sequencer time, ns since epoch; strictly increasing |
 //! | key_hash     | u64    | 8     | FxHash of client Ed25519 pubkey       |
 //! | event_tag    | u8     | 1     | Transport variant discriminant        |
 //! | payload      | varies | ≤64K  | Transport-variant fields, or `E::encode` bytes for `App(e)` |
@@ -89,7 +89,14 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v14 → v15: per-entry `request_seq` removed from the metadata block
 /// (17 → 9 bytes). The runtime never read it; an application that needs
 /// a request sequence carries it in its own event payload.
-pub const FORMAT_VERSION: u16 = 15;
+///
+/// v15 → v16: no layout change; the entry timestamp became the
+/// sequencer's time, strictly increasing across the journal, and the
+/// reader refuses an entry whose stamp is not later than the one before
+/// it. Journals written before that break the rule as a matter of course
+/// (a batch shared one stamp), so they are refused by version rather
+/// than read as a regression.
+pub const FORMAT_VERSION: u16 = 16;
 
 /// Entry magic bytes for corruption/misalignment detection.
 const ENTRY_MAGIC: u16 = 0x4A45;
