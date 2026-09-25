@@ -32,12 +32,16 @@ Findings that confirm, sharpen or correct the roadmap entry.
   sees (decision 2).
 - **The decoder can already never see `Replication`.** The client
   listener refuses such a key during the handshake, yet the type still
-  has the variant, so every decoder's `match` carries an arm for a case
-  that cannot happen. The roadmap entry lists `Replication` among what
-  the decoder receives; this plan removes it from that type.
-- **Roles never reach the journal.** `ApplyCtx` carries `key_hash`, not
-  the role, and no journal or replication frame encodes one. Changing
-  the role type changes no on-disk or on-wire format.
+  has the variant, so a decoder that matches exhaustively must write an
+  arm for a case that cannot happen. The roadmap entry lists
+  `Replication` among what the decoder receives; this plan removes it
+  from that type.
+- **Roles never reach the journal or the wire.** `ApplyCtx` carries
+  `key_hash`, not the role, and no journal, replication or client frame
+  encodes one. Changing the role type changes no on-disk or on-wire
+  format, and `melin-client`, which is published, gets no API change:
+  only the doc comment of `authorized_keys_line`, which lists the
+  runtime's roles.
 - **The keys table leaves the runtime in one place.** `EventPublisherFn`
   hands `Arc<AuthorizedKeys>` to the application's event publisher. The
   exchange's publisher uses it to admit subscribers by the client
@@ -46,8 +50,9 @@ Findings that confirm, sharpen or correct the roadmap entry.
   application's role.
 - **The table is loaded in four places,** one per transport and node
   mode (kernel TCP and DPDK, replica and primary start), each reading
-  `config.authorized_keys` in its own `AuthorizedKeys::load`. Each is a
-  point where the decoder's role type has to meet the file.
+  `config.authorized_keys` in its own `AuthorizedKeys::load`, all before
+  journal recovery. Each is a point where the decoder's role type has
+  to meet the file.
 - **Every in-repo decoder uses the same test.** Echo, counter and notary
   all refuse writes from `ReadOnly` and admit every other role; their
   tests and quick-start lines write `trader` keys. The runtime's own
@@ -77,24 +82,39 @@ unchanged. A payments system declares `payer` and `auditor`.
 One table pairing each token with its value, not a `token()` method
 beside a list of values: the two could not then disagree.
 
-The table is validated whenever a keys file is parsed, before anything
-binds a port. Parsing refuses:
+The order of the table is free. A role travels inside the runtime as its
+index in the table (decision 3), but that index is never persisted or
+sent: not journaled, not in a snapshot, not on any wire. Adding a role
+in the middle of the table, or reordering it, between two builds changes
+nothing a node reads back.
+
+`melin_app::auth::validate_roles::<R>()` checks the table, and every
+parse of a keys file calls it first, so a node refuses a bad table
+before it binds a port. It refuses:
 
 - a token the runtime owns (`operator`, `replication`);
-- a token listed twice, and a value listed twice (one token per role;
-  aliases can be allowed later without breaking anything, but not
-  withdrawn once allowed);
-- an empty token, one containing whitespace, or one starting with `#`,
-  none of which the file format can express;
+- a token listed twice, and a value listed twice (one token per role);
+- a token outside `[a-z][a-z0-9_-]*`: lowercase ASCII letters, digits,
+  `-` and `_`, starting with a letter. That also rules out the empty
+  token, whitespace and a leading `#`, which the file format cannot
+  express;
 - a table longer than a `RoleId` can index (decision 3).
 
-Parsing an empty file validates the table as well, so an application
-pins its own table with a one-line test
-(`AuthorizedKeys::parse::<MyRole>("")`). The same check at compile
-time would need string comparison in `const` evaluation of a trait's
-constant, and it would fail as a post-monomorphization error that
-points into `melin-app`. Checked at startup, the node still refuses to
-serve, and the message names the bad token.
+Matching a token in the file is exact and case-sensitive. The likeliest
+slip, `Trader` in one place and `trader` in the other, cannot come from
+the type, whose tokens are lowercase by the rule above; from the file,
+it fails the load with an error that lists `trader`. Every token in use
+today fits the charset. As with
+aliases (refused too: one token per role), each of these refusals can
+be relaxed later without breaking anything, and none can be tightened
+once relaxed.
+
+An application pins its own table with a one-line test,
+`validate_roles::<MyRole>()`. The same check at compile time would need
+string comparison in `const` evaluation of a trait's constant, and it
+would fail as a post-monomorphization error that points into
+`melin-app`. Checked at startup, the node still refuses to serve, and
+the message names the bad token.
 
 An unknown token in the file names every valid one in its error,
 runtime tokens first: `unknown role 'tradr' (expected operator,
@@ -128,7 +148,7 @@ may do: deciding that is the decoder's job, and a refusal is still
 new `Role`, `RoleId` and `KeyRole` all speak of roles, and
 `Permission<ExchangeRole>` would read as a permission holding a role.
 The rename adds no call site to the migration, since every decoder's
-signature and every named variant change in step 1 anyway; done later,
+signature and every named variant change in step 2 anyway; done later,
 it would be a second breaking change for every application.
 
 ### 3. Typed at the edge, erased inside the runtime
@@ -139,9 +159,9 @@ an index into the application's table:
 - **`RoleId(u8)`**, the index of a role in `R::ROLES`. `u8` because a
   connection's role sits beside other per-connection state on the reader
   and in the DPDK connection table, and no access model needs more than
-  a few hundred roles. Its field is private to `melin-app`; only
-  parsing a keys file makes one, so every `RoleId` indexes a real
-  table.
+  256 roles. Its field is private to `melin-app`; only parsing a keys
+  file makes one, so every `RoleId` indexes a real table. Never
+  persisted or sent (decision 1).
 - **`KeyRole`**, what the keys table maps a key to: `Replication`, or
   `Client(ClientRole<RoleId>)`. `may_connect_as_client()` and
   `is_replication()` move here from `Permission`, since that is where
@@ -157,27 +177,37 @@ an index into the application's table:
   `ErasedDecoder<E>` in `melin_app::decoder`, blanket-implemented for
   every `D: RequestDecoder<Event = E>`, takes `ClientRole<RoleId>`,
   turns `App(id)` back into `D::Role` through `D::Role::ROLES`, and
-  calls the typed `decode`. It also loads the keys table for its role
-  type, so the runtime gets the table from the decoder and the two are
-  paired where they are built. The runtime's `RequestDecoderArc<A>`
-  becomes `Arc<dyn ErasedDecoder<A::Event>>`, and `run`,
-  `run_with_listener` and the DPDK entry take `impl RequestDecoder`
-  exactly as today.
+  calls the typed `decode`. It also reports its role type's `TypeId`.
+  The runtime's `RequestDecoderArc<A>` becomes
+  `Arc<dyn ErasedDecoder<A::Event>>`, and `run` and `run_with_listener`
+  take `impl RequestDecoder` exactly as today.
 
 The conversion runs once per request on the reader thread (the DPDK
 poll loop on that transport): one bounds-checked load from a static
-table. It never runs on the business-logic thread.
+table. It never runs on the business-logic thread. A failed bounds
+check can only be a bug, never client input, and the reader thread must
+not panic on it: the erased decoder logs an `error!` naming the index
+and the table's length, and answers `PermissionDenied` without calling
+the typed `decode`. It fails closed. The `TypeId` check below makes it
+unreachable, which is why it gets a stated behaviour rather than an
+index expression that would panic.
 
-Where the runtime pairs a table with a decoder, it checks the table's
-recorded `TypeId` against the decoder's role type, and refuses to start
-on a mismatch. With the table loaded through the decoder this cannot
-fire today. It keeps a future path that passes a table in from
-elsewhere from ever turning an index into the wrong role at decode
-time, which would grant one role another's rights in silence.
+**The keys table is loaded where the role type is still in scope.**
+`run` and `run_with_listener`, the only public entry points (the DPDK
+path is reached through `run`), load the table with
+`AuthorizedKeys::load::<D::Role>` before they erase the decoder, and
+pass the `Arc<AuthorizedKeys>` down the internal chain (`run_tcp`,
+`run_impl`, `run_dpdk`, `run_dpdk_impl`) beside it. The four load sites
+go. The decoder stays a decoder: reading a file is not its job.
 
-The four load sites become one helper that loads through the decoder and
-logs the count, so there is one place where the file meets the role
-type.
+Where the table and the erased decoder arrive together as separate
+parameters (`run_tcp` and `run_dpdk`), the runtime checks the table's
+recorded `TypeId` against the decoder's and refuses to start on a
+mismatch. Both come from the same `D` in the same entry function, so
+the pairing is correct by construction today. The check sits at the
+seam a later refactor could break, where it keeps a table from another
+role type from ever turning an index into the wrong role at decode time,
+which would grant one role another's rights in silence.
 
 Rejected: threading `R` through the runtime as a type parameter
 (`AuthorizedKeys<R>`, a generic reader, DPDK transport, admin endpoint,
@@ -206,42 +236,61 @@ part of this item.
 
 One commit per step, each reviewable on its own.
 
-1. **Role model and erased seam** (`melin-app`, `server-runtime`,
+1. **`KeyRole`, and `Replication` out of the decoder's type**
+   (`melin-app`, `server-runtime`, `melin-raft`): the keys table maps a
+   key to `KeyRole { Replication, Client(Permission) }`, and
+   `Permission` loses its `Replication` variant (decision 2 without the
+   rename, which comes next). `may_connect_as_client()` and
+   `is_replication()` move to `KeyRole`. The admin endpoint, the
+   replication handshake, `melin-raft`'s peer handshake and the client
+   listener decide on `KeyRole`, and the handshake logs name a key's
+   role by its token. The tokens and the decoder signature are
+   unchanged, so no decoder and no key file changes. This commit is
+   the handshake diff on its own, and it survives the next one, which
+   only changes what `KeyRole::Client` holds.
+
+   Tests: the existing handshake tests (`client_auth.rs`, `admin.rs`,
+   `replication/auth.rs`, `melin-raft`'s `auth.rs`, `server.rs`) on
+   `KeyRole`, a replication key still refused on the client listener,
+   and a log-by-token check on the refusal message.
+2. **Role model and erased seam** (`melin-app`, `server-runtime`,
    `melin-raft`, the three examples, the doc-tested
-   `building-an-application.md`): the
-   `Role` trait with table validation, `NoRoles`, `RoleId`, `KeyRole`,
-   `ClientRole<R>` replacing `Permission`, `AuthorizedKeys::parse::<R>` /
-   `load::<R>` recording the role type, `RequestDecoder::Role`, and
-   `ErasedDecoder` with its blanket impl. The runtime moves to
-   `KeyRole` in the admin endpoint, the replication handshake,
-   `melin-raft`'s peer handshake and the client listener (tests that
-   build a table for replication keys only parse it with `NoRoles`),
-   stores `ClientRole<RoleId>` per connection, loads
-   the table through the decoder in one helper with the `TypeId` check,
-   and logs roles by token. The examples declare a role type that keeps
-   today's tokens (`trader`, `readonly`, and the rest they use), so
-   this step is mechanical for them and no key file changes. One commit
-   because the new `decode` signature breaks every decoder at once.
+   `building-an-application.md`): the `Role` trait, `validate_roles`,
+   `NoRoles`, `RoleId`, `ClientRole<R>` replacing `Permission` (so
+   `KeyRole::Client(Permission)` becomes
+   `KeyRole::Client(ClientRole<RoleId>)`), `AuthorizedKeys::parse::<R>`
+   / `load::<R>` recording the role type, `RequestDecoder::Role`, and
+   `ErasedDecoder` with its blanket impl and fail-closed conversion.
+   `run` and `run_with_listener` load the table and pass it down; the
+   four load sites go; `run_tcp` and `run_dpdk` check the `TypeId`. The
+   runtime stores `ClientRole<RoleId>` per connection. Tests that build
+   a table for replication keys only parse it with `NoRoles`. The
+   examples declare a role type that keeps today's tokens (`trader`,
+   `readonly`, and the rest they use), so this step is mechanical for
+   them and no key file changes. One commit because the new `decode`
+   signature breaks every decoder at once.
 
    Tests, in `melin-app` unless noted:
-   - table validation: each refusal in decision 1, including on an
-     empty file;
-   - parsing: runtime tokens take precedence, app tokens map to their
-     values, the unknown-token error names every valid token;
+   - `validate_roles`: each refusal in decision 1 (a runtime token, a
+     duplicate token, a duplicate value, each charset violation, an
+     oversized table), and a valid table accepted;
+   - parsing: runtime tokens parse to their `KeyRole` whatever the app
+     table holds, app tokens map to their values, matching is
+     case-sensitive (`Trader` refused where `trader` is listed), and the
+     unknown-token error names every valid token;
    - a round trip for every role of a test role type: listed in a file,
      parsed, looked up, and passed through the erased decoder to a
      recording decoder, which must receive exactly that role, and
      `Operator` as `Operator`;
-   - the `TypeId` mismatch refused (the runtime's startup helper);
-   - the existing handshake tests (`client_auth.rs`, `admin.rs`,
-     `replication/auth.rs`, `melin-raft`'s `auth.rs`, `server.rs`) on
-     `KeyRole`, with a
-     replication key still refused on the client listener.
-2. **The examples adopt their own vocabulary** (decision 4): new role
+   - an out-of-range `RoleId` through the erased decoder answers
+     `PermissionDenied` without calling `decode` (the test builds the
+     id through a table of a larger role type, the one way to reach it);
+   - the `TypeId` mismatch refused at startup (`server-runtime`).
+3. **The examples adopt their own vocabulary** (decision 4): new role
    types, their decoders, unit tests and `round_trip.rs` key files, and
    the `echo "trader $PUB me"` quick-start lines in `echo` and `notary`.
    A reviewer can see here what an application author writes.
-3. **Docs:** `building-an-application.md`'s roles section rewritten
+4. **Docs:** `building-an-application.md`'s roles section rewritten
    around declaring a role type (the runtime's two roles, what the
    decoder receives, how the table is validated); the quick-start line
    there; `melin-client`'s `authorized_keys_line` doc, which lists the
@@ -253,8 +302,8 @@ One commit per step, each reviewable on its own.
    [application-api-review-2026-09.md](application-api-review-2026-09.md);
    remove the roadmap entry.
 
-No journal format or replication protocol bump: roles are never
-journaled or sent between nodes.
+No journal format, replication protocol or client protocol bump: roles
+are never journaled or sent over any wire.
 
 ## Downstream impact (Exchange Core)
 
