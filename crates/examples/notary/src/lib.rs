@@ -395,10 +395,15 @@ impl RequestDecoderTrait for RequestDecoder {
         match kind {
             KIND_NOTARIZE => {
                 // Notarizing appends to the log, so an auditor is refused.
+                // Matched exhaustively rather than with a wildcard: a role
+                // added later is a compile error here, not a silent grant.
                 // (A replication key never gets this far: the client
                 // listener refuses it.)
-                if role == ClientRole::App(NotaryRole::Auditor) {
-                    return Decoded::PermissionDenied("notarizing requires a writing role");
+                match role {
+                    ClientRole::Operator | ClientRole::App(NotaryRole::Submitter) => {}
+                    ClientRole::App(NotaryRole::Auditor) => {
+                        return Decoded::PermissionDenied("notarizing requires a writing role");
+                    }
                 }
                 match leaf_from(fields) {
                     Ok(leaf) => Decoded::Permitted(NotaryEvent::Notarize { leaf }),

@@ -325,10 +325,15 @@ impl RequestDecoderTrait for RequestDecoder {
 
     fn decode(&self, body: &[u8], role: ClientRole<EchoRole>) -> Decoded<Payload> {
         // An echo appends to the journal, so a reader is refused, as it
-        // would be for any state-mutating event. (A replication key never
-        // gets this far: the client listener refuses it.)
-        if role == ClientRole::App(EchoRole::Reader) {
-            return Decoded::PermissionDenied("echoing requires a writing role");
+        // would be for any state-mutating event. Matched exhaustively
+        // rather than with a wildcard: a role added later is a compile
+        // error here, not a silent grant. (A replication key never gets
+        // this far: the client listener refuses it.)
+        match role {
+            ClientRole::Operator | ClientRole::App(EchoRole::Writer) => {}
+            ClientRole::App(EchoRole::Reader) => {
+                return Decoded::PermissionDenied("echoing requires a writing role");
+            }
         }
         match Payload::new(body) {
             Some(event) => Decoded::Permitted(event),
