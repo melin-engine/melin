@@ -13,10 +13,8 @@ meets.
 
 **Status.**
 
-- Resolved: S2, S4, S5, S9, F2, F8.
-- Partly resolved: S6 (replication keys refused on the client listener,
-  duplicate keys refused, doc example fixed; application-defined roles
-  remain open); F1 (defaults for `tick` and `query`, the latter
+- Resolved: S2, S4, S5, S6, S9, F2, F8.
+- Partly resolved: F1 (defaults for `tick` and `query`, the latter
   asserting in debug builds that it is not handed a query; removing
   `build_reject` remains open, with S1).
 - P1: the doc is corrected; routing query responses apart, so they stop
@@ -62,8 +60,9 @@ client has to change.
 
 **Tracked elsewhere.** Work that landed on main while this review was
 under way overlaps three findings. The roadmap now carries S3 ("Record
-the application's event-encoding version in the journal") and S6's
-application-defined roles ("Application-defined client roles"); the
+the application's event-encoding version in the journal"); it carried
+S6's application-defined roles until they landed (see
+[application-defined-roles-2026-09.md](application-defined-roles-2026-09.md)); the
 `ApplyCtx::now_ns` item left in S9 belongs with "Monotonic sequencer
 time, derived from the journal". The runtime refactor that stripped out
 the exchange fixed the rest of S9. The new application guide
@@ -230,6 +229,14 @@ the role set application-defined (an associated type parsed from the
 keys file, with the runtime keeping only its own infrastructure roles:
 replication and admin). The medium part is now on the roadmap as
 "Application-defined client roles".
+
+**Resolved.** Both parts. The low part landed first; the medium part
+followed [application-defined-roles-2026-09.md](application-defined-roles-2026-09.md):
+an application declares its roles as a `Role` type, the runtime keeps
+`operator` and `replication`, and the decoder receives a `ClientRole`,
+which has no replication variant. `ClientRole` is exhaustive on purpose,
+an exception to F4: a new runtime role must be a compile error in every
+decoder, not a case a wildcard arm grants.
 
 ### S7. Query routing is a convention, not a type
 

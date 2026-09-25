@@ -61,9 +61,10 @@ What you implement:
 |-------|-------|------------|
 | Event | `AppEvent` | The events your state machine takes, and how each is encoded in the journal |
 | State machine | `Application` | Your state, how an event changes it, what it reports, and how it snapshots and restores itself |
-| Decoder | `RequestDecoder` | A client's request bytes to an event |
+| Decoder | `RequestDecoder` | A client's request bytes to an event, or a refusal |
+| Roles | `Role` | Who your clients are: the roles their keys may carry, each named in the node's keys file |
 | Encoder | `ResponseEncoder` | A report to response bytes |
-| Binary | — | A `main` that hands those four to the runtime |
+| Binary | — | A `main` that hands the rest to the runtime |
 
 Everything else — transport, framing, authentication, ordering, journaling, replication, failover, snapshots, recovery, CPU pinning — is the runtime's.
 
@@ -247,16 +248,21 @@ impl RequestDecoder for Decoder {
             return Decoded::DecodeError("empty request");
         };
         match kind {
-            // An increment changes state: a reader may not send one.
-            KIND_INCREMENT if role == ClientRole::App(CounterRole::Reader) => {
-                Decoded::PermissionDenied("incrementing requires a writing role")
+            KIND_INCREMENT => {
+                // An increment changes state: a reader may not send one.
+                match role {
+                    ClientRole::Operator | ClientRole::App(CounterRole::Writer) => {}
+                    ClientRole::App(CounterRole::Reader) => {
+                        return Decoded::PermissionDenied("incrementing requires a writing role");
+                    }
+                }
+                match <[u8; 8]>::try_from(fields) {
+                    Ok(amount) => Decoded::Permitted(CounterEvent::Increment {
+                        amount: u64::from_le_bytes(amount),
+                    }),
+                    Err(_) => Decoded::DecodeError("increment amount must be exactly 8 bytes"),
+                }
             }
-            KIND_INCREMENT => match <[u8; 8]>::try_from(fields) {
-                Ok(amount) => Decoded::Permitted(CounterEvent::Increment {
-                    amount: u64::from_le_bytes(amount),
-                }),
-                Err(_) => Decoded::DecodeError("increment amount must be exactly 8 bytes"),
-            },
             KIND_GET_VALUE if fields.is_empty() => Decoded::Permitted(CounterEvent::GetValue),
             KIND_GET_VALUE => Decoded::DecodeError("get value takes no fields"),
             _ => Decoded::DecodeError("unknown kind"),
@@ -274,6 +280,8 @@ assert!(matches!(
     Decoded::PermissionDenied(_)
 ));
 ```
+
+`role` is who the client is: the node's operator, or one of the counter's own roles, `writer` and `reader`, which it declares as `CounterRole` — see [Roles come from the client's key](#requests-and-responses). The role is matched with every case listed, which the same section explains.
 
 The decoder runs before the event is sequenced. It is the last point at which a request can be turned away without leaving a trace in the journal — see [Designing events](#designing-events).
 
@@ -394,15 +402,47 @@ const _: () = assert!(WIDEST_MESSAGE <= melin_server_runtime::MAX_RESPONSE_BODY)
 
 **The request is yours from its first byte.** The runtime frames each request and reads the frame's own header; your decoder sees the body alone, and no value of it is reserved. A kind byte first, as the counter does, is one convention; an application with a single kind of request needs none.
 
-**Permissions come from the client's key.** Each key in the node's `authorized_keys` file carries a role, and the decoder receives it with every request:
+**Roles come from the client's key.** Each key in the node's `authorized_keys` file carries a role, and your decoder receives the client's role with every request:
 
 ```text
 # <role> <base64 public key> <comment>
-writer  AAAA...  desk-1
-reader  BBBB...  monitoring
+operator     AAAA...  ops-team
+writer       BBBB...  desk-1
+reader       CCCC...  monitoring
+replication  DDDD...  node-2
 ```
 
-A key is listed once; a node refuses to load a file that lists the same key twice. The runtime owns two roles, `operator` and `replication`; every other token names a role your application declares as its own type, as the counter does with `writer` and `reader`, and it is your decoder that decides what each may do. `replication` authenticates replicas and nothing else: the client listener refuses a replication key during the handshake, so your decoder never sees one. `operator` also opens the admin endpoint. An application usually refuses writes from keys that may only read:
+The runtime owns two roles. `operator` is the node's administrator: it opens the admin endpoint, and it connects as a client too, so your decoder decides what it may do there. `replication` authenticates replicas and the control plane, and nothing else: the client listener refuses a replication key during the handshake, so your decoder never sees one.
+
+Every other role is yours, declared as a type that pairs each role with the token naming it in the file. The counter's:
+
+```rust
+use melin_app::auth::Role;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CounterRole {
+    /// May increment the counter and read it.
+    Writer,
+    /// May read the counter only.
+    Reader,
+}
+
+impl Role for CounterRole {
+    const ROLES: &'static [(&'static str, Self)] =
+        &[("writer", CounterRole::Writer), ("reader", CounterRole::Reader)];
+}
+
+// A one-line test pins the table: the node runs the same check at startup.
+melin_app::auth::validate_roles::<CounterRole>().expect("a valid role table");
+```
+
+Your decoder names the type as its `Role`, and receives a `ClientRole`: `ClientRole::Operator`, or `ClientRole::App(role)` with one of yours. An application with no roles of its own uses `melin_app::auth::NoRoles`, and its node admits operator keys only.
+
+A node checks your table every time it loads the keys file, and refuses to start on a bad one, naming the token: a token is lowercase ASCII letters, digits, `-` and `_`, starting with a letter; it is not `operator` or `replication`; and no token or role appears twice. Tokens in the file match exactly — `Writer` is not `writer` — and a file naming a role your type does not declare is refused at startup, with every valid role listed. A key is listed once; a node refuses to load a file that lists the same key twice.
+
+A role never reaches the journal: it is decided before an event is sequenced. Moving a key to another role, or renaming, adding or reordering roles between two builds, changes nothing a node reads back.
+
+**List every role in an access check.** Match the role with every case written out — no `_` arm, and no `==` or `!=` against one role — so that a role you add later is a compile error at every check that must decide about it, rather than silently inheriting whatever the other case allows. `ClientRole` is exhaustive for the same reason: were the runtime to add a role, your decoder would not compile until you decided what it may do.
 
 ```rust
 use counter_server::{CounterEvent, CounterRole};
@@ -410,12 +450,15 @@ use melin_app::AppEvent;
 use melin_app::auth::ClientRole;
 use melin_app::decoder::Decoded;
 
-/// Permit `event` unless it changes state and the key may only read.
+/// Permit a query from anyone, and a write from a role that may write.
 fn permit(role: ClientRole<CounterRole>, event: CounterEvent) -> Decoded<CounterEvent> {
-    if role == ClientRole::App(CounterRole::Reader) && !event.is_query() {
-        return Decoded::PermissionDenied("this key may not write");
+    if event.is_query() {
+        return Decoded::Permitted(event);
     }
-    Decoded::Permitted(event)
+    match role {
+        ClientRole::Operator | ClientRole::App(CounterRole::Writer) => Decoded::Permitted(event),
+        ClientRole::App(CounterRole::Reader) => Decoded::PermissionDenied("this key may not write"),
+    }
 }
 
 let reader = ClientRole::App(CounterRole::Reader);
@@ -586,6 +629,7 @@ When the three disagree, which pair differs says where to look: the restored run
 - [ ] Time-driven work is idempotent at a given time, does nothing for a time already passed, and saturates elapsed-time arithmetic.
 - [ ] Operator configuration reaches the application as `StartupEvents`, never through `Default` or `Sizing`.
 - [ ] The decoder refuses everything malformed and everything a role may not do.
+- [ ] Every access check lists every role, with no `_` arm and no `==` or `!=` against a single role, and a test calls `validate_roles` on your role table.
 - [ ] Your widest request, response and event are checked against the runtime's limits at compile time.
 - [ ] Repeated requests are refused, if your requests are not safe to apply twice, and clients can recover their sequence.
 - [ ] `snapshot` and `restore` round-trip exactly, and `APP_VERSION` changes whenever the snapshot layout does.

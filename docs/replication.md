@@ -233,8 +233,8 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
 
 - Authenticates with the primary via Ed25519 challenge-response
   (`--replication-key`). The corresponding public key must be in the
-  primary's `authorized_keys` file with the `replication` permission.
-  That permission is for node-to-node links only: a replication key
+  primary's `authorized_keys` file under the `replication` role.
+  That role is for node-to-node links only: a replication key
   cannot open a client connection, and the client listener refuses it
   during the handshake. Give clients their own keys.
 - Receives a stream of input events with pre-assigned sequences and
@@ -339,7 +339,7 @@ Enable it per node with:
 | `--raft-auto-promote` | Act on election wins (below). Off by default. |
 
 Peer links authenticate with the same Ed25519 replication keys as the
-data plane (`replication` permission in `authorized_keys`), so
+data plane (the `replication` role in `authorized_keys`), so
 `--replication-key` is required on every raft-enabled node, primaries
 included. Election state is observable on every node's `--health-bind`
 endpoint via the `melin_raft_*` gauges (node id, term, leader, role,
@@ -570,7 +570,7 @@ requiring the full journal history.
 | `--replication-bind <addr>` | No | — | Address to listen for replica connections. Bound at startup on any node that sets it — including a replica, which holds the port from boot and starts serving on it at promotion. |
 | `--standalone` | No | `false` | Explicitly disable replication. Requires `--ack-policy disk`. |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary. |
-| `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
+| `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` under the `replication` role. |
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `ACK-POLICY <policy>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
 | `--ack-policy <policy>` | Primary | `disk+ram` | Active ack policy at startup: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Can be swapped at runtime via admin `ACK-POLICY`. |
 | `--dpdk-peer-mac <mac>` | Replica on DPDK | derived | Ethernet address of the primary named by `--replica-of`. Only consulted when replicating over DPDK. See below. |

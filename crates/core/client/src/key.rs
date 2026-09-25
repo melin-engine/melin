@@ -66,9 +66,10 @@ pub fn public_key_base64(key: &VerifyingKey) -> String {
 }
 
 /// One line of a node's `authorized_keys` file: `<role> <public key>
-/// <comment>`. The role is one of the runtime's (`operator`, `trader`,
-/// `custodian`, `readonly`, `replication`); the comment is free text
-/// without spaces, for the operator's benefit.
+/// <comment>`. The role is one of the runtime's (`operator`,
+/// `replication`) or one the application declares (the counter example's
+/// `writer` and `reader`, say); the comment is free text without spaces,
+/// for the operator's benefit.
 pub fn authorized_keys_line(role: &str, key: &VerifyingKey, comment: &str) -> String {
     format!("{role} {} {comment}", public_key_base64(key))
 }
@@ -142,8 +143,8 @@ mod tests {
     fn an_authorized_keys_line_is_role_key_comment() {
         let key = SigningKey::from_bytes(&OPENSSL_SEED).verifying_key();
         assert_eq!(
-            authorized_keys_line("trader", &key, "client-1"),
-            format!("trader {OPENSSL_PUBKEY_B64} client-1")
+            authorized_keys_line("writer", &key, "client-1"),
+            format!("writer {OPENSSL_PUBKEY_B64} client-1")
         );
     }
 }
