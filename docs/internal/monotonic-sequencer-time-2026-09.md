@@ -593,7 +593,10 @@ One commit per step, each reviewable on its own.
    step 4, where they became false); `CLOCK-ACCEPT` beside the other
    admin commands, and `melin_sequencer_clock_offset_seconds` and
    `melin_clock_jumps_refused_total` beside the other metrics, in
-   `docs/replication.md`; CHANGELOG under
+   `docs/replication.md`, saying that both the gauge and an accept wait
+   for the clock's next read (a batch or a tick), so on a quiet node
+   with ticks disabled `CLOCK-ACCEPT` takes effect at the next write;
+   CHANGELOG under
    Unreleased (the format-15 and protocol-5 entries become 16 and 6);
    the note in
    [application-api-review-2026-09.md](application-api-review-2026-09.md);

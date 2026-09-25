@@ -92,7 +92,7 @@ pub const DEFAULT_JUMP_LIMIT: Duration = Duration::from_secs(5);
 pub const LEAD_WARNING: Duration = Duration::from_millis(100);
 
 /// [`LEAD_WARNING`] in signed nanoseconds, the offset's unit.
-const LEAD_WARNING_NS: i64 = 100_000_000;
+const LEAD_WARNING_NS: i64 = LEAD_WARNING.as_nanos() as i64;
 /// The running warning re-arms once the lead falls back under this, so a
 /// lead hovering at the threshold does not warn on every batch.
 const LEAD_REARM_NS: i64 = LEAD_WARNING_NS / 2;

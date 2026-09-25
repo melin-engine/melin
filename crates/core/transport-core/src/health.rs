@@ -2328,7 +2328,11 @@ mod tests {
         let mut buf = [0u8; 16384];
         let len = HealthSnapshot::collect(&state).write_prometheus(&mut buf);
         let body = std::str::from_utf8(&buf[..len]).unwrap();
-        assert!(!body.contains("clock"), "{body}");
+        assert!(
+            !body.contains("melin_sequencer_clock_offset_seconds"),
+            "{body}"
+        );
+        assert!(!body.contains("melin_clock_jumps_refused_total"), "{body}");
     }
 
     #[test]
