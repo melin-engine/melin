@@ -91,6 +91,10 @@ pub struct HealthState {
     /// thread. `None` when the node runs without control-plane raft
     /// (no `--raft-bind`).
     pub raft: Option<Arc<RaftStatus>>,
+    /// The sequencer clock's offset and refused jumps. `None` on a
+    /// replica, which stamps nothing: the series are omitted rather than
+    /// exported as a misleading zero.
+    pub clock: Option<Arc<crate::clock::ClockControl>>,
 }
 
 /// A [`QueueCursor`] that always reads 0 — used for the pipeline-cursor
@@ -147,6 +151,7 @@ impl HealthState {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft,
+            clock: None,
         }
     }
 }
@@ -335,6 +340,9 @@ struct HealthSnapshot {
     /// Control-plane raft election state; `None` when raft isn't
     /// configured on this node.
     raft: Option<RaftSnapshot>,
+    /// The sequencer clock's offset (nanoseconds) and refused jumps;
+    /// `None` on a replica.
+    clock: Option<(i64, u64)>,
 }
 
 /// Point-in-time copy of [`RaftStatus`] for the formatters.
@@ -579,6 +587,10 @@ impl HealthSnapshot {
                 role: r.role.load(Ordering::Relaxed),
                 running: r.running.load(Ordering::Relaxed),
             }),
+            clock: state
+                .clock
+                .as_ref()
+                .map(|c| (c.offset_ns(), c.jumps_refused())),
         }
     }
 
@@ -803,6 +815,20 @@ impl HealthSnapshot {
                 u8::from(raft.running),
             );
         }
+        if let Some((offset_ns, jumps_refused)) = self.clock {
+            // Best-effort, as above.
+            let _ = write!(
+                c,
+                "# HELP melin_sequencer_clock_offset_seconds The sequencer clock's time minus the wall clock, measured at its last batch or tick. Positive while time is held ahead of a wall clock that is behind the last stamp (a step back, a failover onto a slower clock); negative while a refused forward jump leaves the clock behind (CLOCK-ACCEPT accepts it); near zero otherwise.\n\
+                 # TYPE melin_sequencer_clock_offset_seconds gauge\n\
+                 melin_sequencer_clock_offset_seconds {:.9}\n\
+                 # HELP melin_clock_jumps_refused_total Forward wall-clock jumps past the jump limit that the sequencer clock refused, one per episode.\n\
+                 # TYPE melin_clock_jumps_refused_total counter\n\
+                 melin_clock_jumps_refused_total {}\n",
+                offset_ns as f64 / 1e9,
+                jumps_refused,
+            );
+        }
         c.position() as usize
     }
 }
@@ -1019,7 +1045,8 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
     // - Prometheus body is ~6.5 KiB with max-length u64 values
     //   (per-replica replication metrics, ring depth, the
     //   fastest-replica cursor, the gate/degraded series and their
-    //   deprecated aliases), plus the raft gauges on raft nodes.
+    //   deprecated aliases), plus the raft gauges on raft nodes and the
+    //   clock series on a primary.
     // - StatsDump body is ~260 bytes per registered stage; current
     //   set is 9–13 stages (transport-dependent) for ~3.5 KiB tops.
     //   16 KiB keeps the headroom test (75 % of this) meaningful.
@@ -1293,6 +1320,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            clock: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1420,6 +1448,7 @@ mod tests {
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
                 raft: None,
+                clock: None,
             },
             Arc::clone(&shutdown),
         );
@@ -1456,6 +1485,7 @@ mod tests {
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
                 raft: None,
+                clock: None,
             },
             Arc::new(AtomicBool::new(false)),
         );
@@ -1618,6 +1648,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            clock: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1685,6 +1716,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            clock: None,
         };
         let handle = std::thread::spawn(move || {
             health_loop(&listener, &state, &s);
@@ -1771,6 +1803,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            clock: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1839,6 +1872,7 @@ mod tests {
             matching_utilization: matching_util,
             response_utilization: response_util,
             raft: None,
+            clock: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1918,6 +1952,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            clock: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1971,6 +2006,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            clock: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2228,6 +2264,12 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            // A primary's clock, held a quarter second ahead after two
+            // refused jumps.
+            clock: Some(Arc::new(crate::clock::ClockControl::reporting(
+                250_000_000,
+                2,
+            ))),
         };
 
         let handle = std::thread::spawn(move || {
@@ -2236,6 +2278,57 @@ mod tests {
 
         let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
         (body, shutdown, handle)
+    }
+
+    #[test]
+    fn metrics_emits_the_sequencer_clock_series_on_a_primary() {
+        let (body, shutdown, handle) = prometheus_with_full_replication_state();
+        assert!(
+            body.contains("melin_sequencer_clock_offset_seconds 0.250000000\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("melin_clock_jumps_refused_total 2\n"),
+            "{body}"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    /// Behind the wall clock is as alertable as ahead of it.
+    #[test]
+    fn a_clock_behind_the_wall_clock_reports_a_negative_offset() {
+        let mut state = HealthState::for_replica(
+            Arc::new(crate::fence::FenceState::new(0)),
+            None,
+            Arc::new(AtomicBool::new(true)),
+        );
+        state.clock = Some(Arc::new(crate::clock::ClockControl::reporting(
+            -1_500_000_000,
+            1,
+        )));
+        let mut buf = [0u8; 16384];
+        let len = HealthSnapshot::collect(&state).write_prometheus(&mut buf);
+        let body = std::str::from_utf8(&buf[..len]).unwrap();
+        assert!(
+            body.contains("melin_sequencer_clock_offset_seconds -1.500000000\n"),
+            "{body}"
+        );
+    }
+
+    /// A replica stamps nothing: no clock series rather than a zero that
+    /// reads as "in step".
+    #[test]
+    fn clock_series_absent_on_a_replica() {
+        let state = HealthState::for_replica(
+            Arc::new(crate::fence::FenceState::new(0)),
+            None,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let mut buf = [0u8; 16384];
+        let len = HealthSnapshot::collect(&state).write_prometheus(&mut buf);
+        let body = std::str::from_utf8(&buf[..len]).unwrap();
+        assert!(!body.contains("clock"), "{body}");
     }
 
     #[test]
@@ -2312,6 +2405,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            clock: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2389,6 +2483,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            clock: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2554,6 +2649,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: response_util,
             raft: None,
+            clock: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2660,8 +2756,7 @@ mod tests {
             .expect("HTTP head separator present");
 
         // The body buffer in handle_health_connection is 16384 bytes.
-        // Today's body is around 6.5 KiB without the raft gauges; keep
-        // 25 % headroom and fail loudly if we ever drift past it. The
+        // Keep 25 % headroom and fail loudly if we ever drift past it. The
         // point of this test is to fire before silent truncation, not
         // to track the exact size.
         const BODY_BUF: usize = 16384;

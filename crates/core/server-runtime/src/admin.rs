@@ -22,6 +22,12 @@
 //!   atomic. `DURABILITY <local|replicated|hybrid|durably-replicated>`
 //!   is accepted as a deprecated alias for one release and logged at
 //!   `warn!`.
+//! - `CLOCK-ACCEPT`: accept the current wall clock after the sequencer
+//!   clock refused a forward jump past the jump limit (a deliberate
+//!   correction, not a runaway). The clock takes it up at its next batch
+//!   or tick. Available only while a sequencer clock runs (a primary); a
+//!   replica, which stamps nothing, rejects it rather than latching it
+//!   for a later promotion.
 //!
 //! A command for which the corresponding flag is `None` is rejected
 //! with `ERR <command> not available on this node\n` so operators get
@@ -47,6 +53,7 @@ use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info, warn};
 
 use melin_app::auth::{AuthorizedKeys, Permission};
+use melin_transport_core::clock::ClockControl;
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
@@ -64,12 +71,15 @@ use melin_wire_protocol::control_codec;
 /// listener still accepts connections and authenticates them — a
 /// disabled command is rejected at the command-dispatch step, not at
 /// connect time, so operator tooling sees a structured ERR rather than
-/// a TCP RST.
+/// a TCP RST. `clock` is always wired: whether `CLOCK-ACCEPT` is available
+/// changes when a replica is promoted, so the control answers at the time
+/// of the command.
 pub fn spawn(
     bind_addr: SocketAddr,
     promote: Option<PromotionRequest>,
     rotate_requested: Option<Arc<AtomicBool>>,
     ack_policy: Option<Arc<AtomicU8>>,
+    clock: Arc<ClockControl>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
 ) -> Result<(JoinHandle<()>, SocketAddr), Box<dyn std::error::Error>> {
@@ -91,6 +101,7 @@ pub fn spawn(
                     promote.as_ref(),
                     rotate_requested.as_deref(),
                     ack_policy.as_deref(),
+                    &clock,
                     &shutdown,
                     &authorized_keys,
                 )
@@ -122,6 +133,7 @@ fn run(
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
     ack_policy: Option<&AtomicU8>,
+    clock: &ClockControl,
     shutdown: &AtomicBool,
     authorized_keys: &AuthorizedKeys,
 ) {
@@ -146,6 +158,7 @@ fn run(
                     promote,
                     rotate_requested,
                     ack_policy,
+                    clock,
                     authorized_keys,
                 );
             }
@@ -271,6 +284,7 @@ fn handle_connection(
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
     ack_policy: Option<&AtomicU8>,
+    clock: &ClockControl,
     authorized_keys: &AuthorizedKeys,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -329,6 +343,18 @@ fn handle_connection(
                 debug!("rejected ROTATE — flag not wired");
             }
         },
+        "CLOCK-ACCEPT" => {
+            if clock.request_accept() {
+                send_best_effort(&mut stream, b"OK\n");
+                info!("wall clock accept requested by operator");
+            } else {
+                send_best_effort(
+                    &mut stream,
+                    b"ERR CLOCK-ACCEPT not available on this node (no sequencer clock: a replica stamps nothing)\n",
+                );
+                debug!("rejected CLOCK-ACCEPT: no sequencer clock attached");
+            }
+        }
         cmd if cmd.starts_with("ACK-POLICY") => {
             // Parse `ACK-POLICY <policy>` with any positive whitespace
             // between the verb and the argument. `splitn(2, ' ')` is
@@ -527,7 +553,8 @@ mod tests {
         let holder = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = holder.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let err = spawn(addr, None, None, None, shutdown, auth_keys)
+        let clock = Arc::new(ClockControl::new());
+        let err = spawn(addr, None, None, None, clock, shutdown, auth_keys)
             .expect_err("bind on a taken port must fail");
         assert!(
             err.to_string().contains("failed to bind admin listener"),
@@ -546,6 +573,7 @@ mod tests {
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
+            Arc::new(ClockControl::new()),
             Arc::clone(&shutdown),
             auth_keys,
         )
@@ -569,6 +597,7 @@ mod tests {
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
+            Arc::new(ClockControl::new()),
             Arc::clone(&shutdown),
             auth_keys,
         )
@@ -593,6 +622,7 @@ mod tests {
             None,
             Some(Arc::clone(&rotate)),
             None,
+            Arc::new(ClockControl::new()),
             Arc::clone(&shutdown),
             auth_keys,
         )
@@ -616,6 +646,7 @@ mod tests {
             Some(promote.clone()),
             None,
             None,
+            Arc::new(ClockControl::new()),
             Arc::clone(&shutdown),
             auth_keys,
         )
@@ -642,6 +673,7 @@ mod tests {
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
+            Arc::new(ClockControl::new()),
             Arc::clone(&shutdown),
             auth_keys,
         )
@@ -676,6 +708,7 @@ mod tests {
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
+            Arc::new(ClockControl::new()),
             Arc::clone(&shutdown),
             auth_keys,
         )
@@ -700,6 +733,7 @@ mod tests {
             Some(promote.clone()),
             Some(Arc::clone(&rotate)),
             None,
+            Arc::new(ClockControl::new()),
             Arc::clone(&shutdown),
             auth_keys,
         )
@@ -727,6 +761,7 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&policy)),
+            Arc::new(ClockControl::new()),
             Arc::clone(&shutdown),
             auth_keys,
         )
@@ -802,6 +837,52 @@ mod tests {
         assert_eq!(after, Some(AckPolicy::DiskAndRam));
     }
 
+    /// Spawn a listener with only `clock` wired, send `CLOCK-ACCEPT`, and
+    /// return the response.
+    fn run_clock_accept(clock: Arc<ClockControl>) -> String {
+        let (key, auth_keys) = operator_keys();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (_h, addr) = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            None,
+            None,
+            clock,
+            Arc::clone(&shutdown),
+            auth_keys,
+        )
+        .expect("spawn admin listener");
+        let resp = send_command(addr, &key, b"CLOCK-ACCEPT\n");
+        shutdown.store(true, Ordering::Release);
+        resp
+    }
+
+    /// On a primary the request reaches the clock (which takes it up at
+    /// its next read; see the clock's tests).
+    #[test]
+    fn clock_accept_is_taken_while_a_clock_runs() {
+        use melin_transport_core::clock::{DEFAULT_JUMP_LIMIT, SequencerClock, SystemClocks};
+        let control = Arc::new(ClockControl::new());
+        let _clock = SequencerClock::new(
+            SystemClocks,
+            DEFAULT_JUMP_LIMIT,
+            melin_app::SequencerTime::default(),
+            Arc::clone(&control),
+        );
+        assert_eq!(run_clock_accept(control), "OK");
+    }
+
+    /// On a replica there is no clock to accept anything: a structured
+    /// ERR, not an OK that silently does nothing.
+    #[test]
+    fn clock_accept_rejected_without_a_clock() {
+        let resp = run_clock_accept(Arc::new(ClockControl::new()));
+        assert!(
+            resp.starts_with("ERR CLOCK-ACCEPT not available"),
+            "expected not-available ERR, got {resp}"
+        );
+    }
+
     #[test]
     fn ack_policy_command_rejected_when_not_wired() {
         // On a pure-replica node (no response stage), ACK-POLICY must
@@ -814,6 +895,7 @@ mod tests {
             Some(promote.clone()),
             None,
             None,
+            Arc::new(ClockControl::new()),
             Arc::clone(&shutdown),
             auth_keys,
         )

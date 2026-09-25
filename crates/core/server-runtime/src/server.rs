@@ -22,7 +22,7 @@ use tracing::{debug, error, info, warn};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
-use melin_transport_core::clock::StampingProducer;
+use melin_transport_core::clock::{ClockControl, StampingProducer};
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
     InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline,
@@ -603,14 +603,18 @@ impl ServerConfig {
 
     /// The primary's sequencer clock, with the configured jump limit,
     /// seeded at `floor`: the time floor of the journal it stamps for.
+    /// Attached to `control`, the process's handle shared with the admin
+    /// and health endpoints.
     pub fn sequencer_clock(
         &self,
         floor: melin_app::SequencerTime,
+        control: Arc<ClockControl>,
     ) -> melin_transport_core::clock::SequencerClock {
         melin_transport_core::clock::SequencerClock::new(
             melin_transport_core::clock::SystemClocks,
             std::time::Duration::from_millis(self.clock_jump_limit_ms),
             floor,
+            control,
         )
     }
 
@@ -928,6 +932,9 @@ where
         let control = crate::replication::ReplicaControlPlane::new();
         let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+        // Detached until a promotion attaches the new primary's clock, so
+        // CLOCK-ACCEPT on a replica gets an ERR.
+        let clock_control = Arc::new(ClockControl::new());
         let _admin_handle = config
             .admin_bind
             .map(|addr| {
@@ -936,6 +943,7 @@ where
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
                     Some(Arc::clone(&ack_policy_atomic)),
+                    Arc::clone(&clock_control),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -1070,6 +1078,7 @@ where
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
                     rotate_flag,
+                    clock_control,
                     ack_policy_atomic,
                     fence_state,
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
@@ -1092,6 +1101,7 @@ where
     // promotion is meaningful only on a replica. ROTATE is wired
     // whenever the admin endpoint is configured.
     let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    let clock_control = Arc::new(ClockControl::new());
     let _admin_handle = config
         .admin_bind
         .map(|addr| {
@@ -1100,6 +1110,7 @@ where
                 None,
                 rotate_flag.clone(),
                 Some(Arc::clone(&ack_policy_atomic)),
+                Arc::clone(&clock_control),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -1168,6 +1179,7 @@ where
         authorized_keys,
         needs_seeding,
         rotate_flag,
+        clock_control,
         ack_policy_atomic,
         fence_state,
         None, // not promoted — no EpochBump injection
@@ -1319,7 +1331,9 @@ fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
 /// promotion path the replica's journal stage is torn down and a new
 /// primary stage is built here; passing the flag through means the
 /// admin endpoint, which was spawned once at process start, keeps
-/// driving the new stage's rotation.
+/// driving the new stage's rotation. `clock_control` is passed through
+/// for the same reason: the sequencer clock built here attaches to it,
+/// and CLOCK-ACCEPT reaches it from then on.
 #[allow(clippy::too_many_arguments)]
 fn run_as_primary<A, L>(
     app: A,
@@ -1339,6 +1353,7 @@ fn run_as_primary<A, L>(
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
     rotate_flag: Option<Arc<AtomicBool>>,
+    clock_control: Arc<ClockControl>,
     ack_policy_atomic: Arc<AtomicU8>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     promotion: Option<u64>,
@@ -1474,8 +1489,10 @@ where
     // which becomes the sole steady-state producer. No cloning required.
     // The sequencer clock travels with it, so every event the node
     // journals is stamped by the one clock.
-    let mut input_producer =
-        StampingProducer::new(input_producer, config.sequencer_clock(time_floor));
+    let mut input_producer = StampingProducer::new(
+        input_producer,
+        config.sequencer_clock(time_floor, Arc::clone(&clock_control)),
+    );
 
     // Spawn pipeline OS threads.
     let cores = config.cores;
@@ -1781,6 +1798,7 @@ where
         &response_utilization,
         &shutdown,
         &raft_status,
+        &clock_control,
     )?;
 
     // Promotion fencing: a node that reached primary via promotion injects
@@ -2278,6 +2296,7 @@ where
         let control = crate::replication::ReplicaControlPlane::new();
         let promotion_request = control.promote.clone();
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+        let clock_control = Arc::new(ClockControl::new());
         let _admin_handle = config
             .admin_bind
             .map(|addr| {
@@ -2286,6 +2305,7 @@ where
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
                     Some(Arc::clone(&ack_policy_atomic)),
+                    Arc::clone(&clock_control),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -2432,6 +2452,7 @@ where
                     authorized_keys,
                     false,
                     rotate_flag,
+                    clock_control,
                     ack_policy_atomic,
                     fence_state,
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
@@ -2586,9 +2607,13 @@ where
     // Seed events flow through the disruptor like regular events. The input
     // ring is single-producer: main publishes seeds, then moves the
     // producer into the DPDK poll thread. No cloning required. The
-    // sequencer clock travels with it.
-    let mut input_producer =
-        StampingProducer::new(input_producer, config.sequencer_clock(time_floor));
+    // sequencer clock travels with it; the admin and health endpoints
+    // share its control.
+    let clock_control = Arc::new(ClockControl::new());
+    let mut input_producer = StampingProducer::new(
+        input_producer,
+        config.sequencer_clock(time_floor, Arc::clone(&clock_control)),
+    );
 
     // The DPDK poll thread also generates the application's clock ticks via
     // a wall-clock comparison between NIC bursts (see `run_dpdk_poll`). The
@@ -2644,6 +2669,7 @@ where
                 None,
                 rotate_flag.clone(),
                 Some(Arc::clone(&ack_policy_atomic)),
+                Arc::clone(&clock_control),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -2915,6 +2941,7 @@ where
         &response_utilization,
         &shutdown,
         &raft_status,
+        &clock_control,
     )?;
 
     info!(
@@ -3312,6 +3339,7 @@ fn spawn_health_endpoint(
     response_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
     shutdown: &Arc<AtomicBool>,
     raft_status: &Option<Arc<melin_transport_core::health::RaftStatus>>,
+    clock_control: &Arc<ClockControl>,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
     let Some(health_addr) = config.health_bind else {
         return Ok(None);
@@ -3351,6 +3379,7 @@ fn spawn_health_endpoint(
             matching_utilization: Arc::clone(matching_utilization),
             response_utilization: Arc::clone(response_utilization),
             raft: raft_status.clone(),
+            clock: Some(Arc::clone(clock_control)),
         },
         Arc::clone(shutdown),
     )?))
