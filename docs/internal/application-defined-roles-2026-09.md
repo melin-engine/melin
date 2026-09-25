@@ -178,9 +178,12 @@ an index into the application's table:
   file makes one, so every `RoleId` indexes a real table. Never
   persisted or sent (decision 1).
 - **`KeyRole`**, what the keys table maps a key to: `Replication`, or
-  `Client(ClientRole<RoleId>)`. `may_connect_as_client()` and
-  `is_replication()` move here from `Permission`, since that is where
-  `Replication` now lives. The admin endpoint, the replication
+  `Client(ClientRole<RoleId>)`. `is_replication()` moves here from
+  `Permission`, since that is where `Replication` now lives, and
+  `client()` gives a key's client role, `None` for a replication key: the
+  client listener's rule, in one place. `may_connect_as_client()` is
+  dropped rather than moved (`client().is_some()` says the same). The
+  admin endpoint, the replication
   handshake, `melin-raft`'s peer handshake, the client listener and the
   exchange's subscriber handshake all decide on `KeyRole` and never
   need the application's type.
@@ -232,8 +235,8 @@ replication handshake and raft driver). It type-checks the same things
 at the application boundary, but it puts a parameter on every runtime
 component that touches the keys table, none of which looks at an
 application role, and it changes
-`EventPublisherFn`'s signature for a publisher that only needs
-`may_connect_as_client`.
+`EventPublisherFn`'s signature for a publisher that only needs the
+client listener's rule.
 
 ### 4. The examples speak their own vocabulary
 
@@ -257,8 +260,9 @@ One commit per step, each reviewable on its own.
    (`melin-app`, `server-runtime`, `melin-raft`): the keys table maps a
    key to `KeyRole { Replication, Client(Permission) }`, and
    `Permission` loses its `Replication` variant (decision 2 without the
-   rename, which comes next). `may_connect_as_client()` and
-   `is_replication()` move to `KeyRole`. The admin endpoint, the
+   rename, which comes next). `is_replication()` moves to `KeyRole`,
+   `client()` is added there, and `may_connect_as_client()` is dropped.
+   The admin endpoint, the
    replication handshake, `melin-raft`'s peer handshake and the client
    listener decide on `KeyRole`, and the handshake logs name a key's
    role by its token. The tokens and the decoder signature are
@@ -319,14 +323,19 @@ One commit per step, each reviewable on its own.
    here what an application author writes.
 4. **Docs:** `building-an-application.md`'s roles section rewritten
    around declaring a role type (the runtime's two roles, what the
-   decoder receives, how the table is validated); `melin-client`'s `authorized_keys_line` doc, which lists the
-   runtime's roles; CHANGELOG under Unreleased (`Permission` renamed
-   `ClientRole` with its variants replaced, and `decode`'s parameter,
-   under **Changed**; `can_trade` and `can_manage_funds` under
-   **Removed**; `may_connect_as_client` moving to `KeyRole` and the new
-   types under **Added**); the S6 note in
+   decoder receives, how the table is validated); `melin-client`'s
+   `authorized_keys_line` doc, which lists the runtime's roles; the S6
+   note in
    [application-api-review-2026-09.md](application-api-review-2026-09.md);
    remove the roadmap entry.
+
+The CHANGELOG is not left to step 4: each step keeps the Unreleased
+section accurate for what it changes, so every commit's changelog
+matches its code. Step 1 adds `KeyRole` and records `Permission` losing
+`Replication`; step 2 rewrites those entries for `ClientRole` (the
+rename and its new variants, and `decode`'s parameter, under
+**Changed**; `can_trade` and `can_manage_funds` under **Removed**; the
+new types under **Added**); step 3 records the examples' new tokens.
 
 No journal format, replication protocol or client protocol bump: roles
 are never journaled or sent over any wire.
@@ -343,7 +352,8 @@ Changed, in one commit on its side, ready to land as soon as this merges
   `can_trade` and `can_manage_funds` moving onto `ExchangeRole` or into
   the match. Its tests move from `Permission::Trader` to
   `ClientRole::App(ExchangeRole::Trader)`.
-- `event_publisher.rs`: `verify_subscriber` decides on `KeyRole`, and
+- `event_publisher.rs`: `verify_subscriber` decides on `KeyRole`
+  through `client()` (in place of `may_connect_as_client()`), and
   `SubscriberAuthError::RoleRefused` carries one.
 - `replication-bench` parses its keys with `NoRoles`.
 - `message.rs`'s docs on `requires_operator` and fund management name

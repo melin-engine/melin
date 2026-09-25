@@ -1,6 +1,6 @@
 //! Connection-level permission model for application access control,
 //! plus the `authorized_keys` file loader that maps Ed25519 public
-//! keys to permissions.
+//! keys to roles.
 //!
 //! Both live in `melin-app` (next to [`Application`](crate::Application))
 //! because the role taxonomy ("who can do what to my app") and the
@@ -10,23 +10,28 @@
 //! lives in `melin-protocol::auth`.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-/// Permission level assigned to an authenticated connection.
+/// Permission level assigned to a connection on the client listener, and
+/// handed to the application's decoder with every request.
 ///
-/// Five specialized roles with no overlap — separation of duties:
+/// Specialized roles with no overlap — separation of duties:
 ///   Operator: exchange configuration (instruments, risk, circuit breakers)
 ///   Trader: order submission and cancellation
 ///   Custodian: fund management (deposit/withdraw)
 ///   ReadOnly: observation only (heartbeats, future market data)
-///   Replication: journal streaming between primary and replica servers
 ///
 /// No single role has full access. An organization needing both trading
 /// and admin uses separate keys for each role.
+///
+/// A key listed as `replication` has no `Permission`: it authorizes
+/// streaming between nodes, and the client listener refuses it during the
+/// handshake (see [`KeyRole`]), so no decoder ever sees one.
 ///
 /// Checked on the reader thread (cold per-request check) with zero
 /// cost on the matching engine hot path.
@@ -44,13 +49,19 @@ pub enum Permission {
     Custodian,
     /// Heartbeats only. Future: market data subscriptions.
     ReadOnly,
-    /// Replication only. Authorizes a replica to connect and receive
-    /// journal streams. Cannot trade, manage funds, or configure the
-    /// exchange. Infrastructure role, not client-facing.
-    Replication,
 }
 
 impl Permission {
+    /// The token naming this role in the `authorized_keys` file.
+    pub fn token(self) -> &'static str {
+        match self {
+            Permission::Operator => "operator",
+            Permission::Trader => "trader",
+            Permission::Custodian => "custodian",
+            Permission::ReadOnly => "readonly",
+        }
+    }
+
     /// Whether this permission level allows trading operations
     /// (submit order, cancel order, cancel all, cancel-replace).
     pub fn can_trade(self) -> bool {
@@ -69,31 +80,91 @@ impl Permission {
     pub fn can_manage_funds(self) -> bool {
         matches!(self, Permission::Custodian)
     }
+}
 
-    /// Whether this permission level authorizes replication connections
-    /// (journal streaming between primary and replica).
-    pub fn is_replication(self) -> bool {
-        matches!(self, Permission::Replication)
-    }
-
-    /// Whether a key with this permission may connect to the client
-    /// listener at all. A replication key authorizes journal streaming
-    /// between nodes and nothing else, so the runtime refuses it there
-    /// during the handshake: no request of its reaches the application's
-    /// decoder, and no application has to remember to refuse it.
-    pub fn may_connect_as_client(self) -> bool {
-        !self.is_replication()
+impl fmt::Display for Permission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.token())
     }
 }
 
-/// Maps Ed25519 public keys to permission levels.
+/// What the `authorized_keys` file grants a key: streaming between nodes,
+/// or a connection to the client listener under a [`Permission`].
+///
+/// Every handshake decides on this — the client listener, the admin
+/// endpoint, the replication and control-plane handshakes, and any
+/// listener of the application's own that admits the same keys — and
+/// only the client listener's hands the [`Permission`] on to the decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRole {
+    /// Journal streaming between primary and replica, and the
+    /// control-plane mesh. Refused on the client listener.
+    Replication,
+    /// A client connection with this permission.
+    Client(Permission),
+}
+
+impl KeyRole {
+    /// Every role a keys file can name, in the order an unknown-role error
+    /// lists them: the runtime's own first. An array rather than a map:
+    /// the set is fixed and small, and it is walked only while a keys file
+    /// is parsed, once at startup.
+    const ALL: [KeyRole; 5] = [
+        KeyRole::Client(Permission::Operator),
+        KeyRole::Replication,
+        KeyRole::Client(Permission::Trader),
+        KeyRole::Client(Permission::Custodian),
+        KeyRole::Client(Permission::ReadOnly),
+    ];
+
+    /// The token naming this role in the `authorized_keys` file.
+    pub fn token(self) -> &'static str {
+        match self {
+            KeyRole::Replication => "replication",
+            KeyRole::Client(permission) => permission.token(),
+        }
+    }
+
+    /// The role named by `token`, if the keys file format has one.
+    fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.token() == token)
+    }
+
+    /// Whether this key authorizes replication connections (journal
+    /// streaming between primary and replica, and the control-plane mesh).
+    pub fn is_replication(self) -> bool {
+        matches!(self, KeyRole::Replication)
+    }
+
+    /// The permission a connection with this key gets on the client
+    /// listener, or `None` if the key may not connect there at all. A
+    /// replication key authorizes streaming between nodes and nothing
+    /// else, so the runtime refuses it during the handshake: no request of
+    /// its reaches the application's decoder, and no application has to
+    /// remember to refuse it. A listener of the application's own that
+    /// admits the same keys applies the same rule through this.
+    pub fn client(self) -> Option<Permission> {
+        match self {
+            KeyRole::Replication => None,
+            KeyRole::Client(permission) => Some(permission),
+        }
+    }
+}
+
+impl fmt::Display for KeyRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.token())
+    }
+}
+
+/// Maps Ed25519 public keys to the role each is listed under.
 ///
 /// HashMap for O(1) lookup by public key bytes. Loaded once at server
 /// startup and shared (immutably) across threads via `Arc`.
 #[derive(Debug)]
 pub struct AuthorizedKeys {
-    /// Public key bytes (32 bytes) → permission level.
-    keys: HashMap<[u8; 32], Permission>,
+    /// Public key bytes (32 bytes) → the role the file lists it under.
+    keys: HashMap<[u8; 32], KeyRole>,
 }
 
 impl AuthorizedKeys {
@@ -101,7 +172,7 @@ impl AuthorizedKeys {
     ///
     /// File format (one entry per line):
     /// ```text
-    /// # <permission> <base64-encoded-public-key> <optional-comment>
+    /// # <role> <base64-encoded-public-key> <optional-comment>
     /// operator AAAA...base64... ops-team
     /// trader BBBB...base64... desk-1
     /// readonly DDDD...base64... monitoring
@@ -127,27 +198,21 @@ impl AuthorizedKeys {
             }
 
             let mut parts = line.split_whitespace();
-            let perm_str = parts
+            let role_token = parts
                 .next()
-                .ok_or_else(|| format!("line {}: missing permission", line_num + 1))?;
+                .ok_or_else(|| format!("line {}: missing role", line_num + 1))?;
             let key_b64 = parts
                 .next()
                 .ok_or_else(|| format!("line {}: missing public key", line_num + 1))?;
 
-            let permission = match perm_str {
-                "operator" => Permission::Operator,
-                "trader" => Permission::Trader,
-                "custodian" => Permission::Custodian,
-                "readonly" => Permission::ReadOnly,
-                "replication" => Permission::Replication,
-                other => {
-                    return Err(format!(
-                        "line {}: unknown permission '{}' (expected operator/trader/custodian/readonly/replication)",
-                        line_num + 1,
-                        other
-                    ));
-                }
-            };
+            let role = KeyRole::from_token(role_token).ok_or_else(|| {
+                let expected: Vec<&str> = KeyRole::ALL.iter().map(|role| role.token()).collect();
+                format!(
+                    "line {}: unknown role '{role_token}' (expected {})",
+                    line_num + 1,
+                    expected.join(", ")
+                )
+            })?;
 
             let key_bytes = BASE64
                 .decode(key_b64)
@@ -163,7 +228,7 @@ impl AuthorizedKeys {
 
             let mut key = [0u8; 32];
             key.copy_from_slice(&key_bytes);
-            if keys.insert(key, permission).is_some() {
+            if keys.insert(key, role).is_some() {
                 return Err(format!(
                     "line {}: public key already listed on an earlier line",
                     line_num + 1
@@ -174,9 +239,9 @@ impl AuthorizedKeys {
         Ok(Self { keys })
     }
 
-    /// Look up the permission for a public key. Returns `None` if the
-    /// key is not authorized.
-    pub fn lookup(&self, public_key: &[u8; 32]) -> Option<Permission> {
+    /// Look up the role a public key is listed under. Returns `None` if
+    /// the key is not authorized.
+    pub fn lookup(&self, public_key: &[u8; 32]) -> Option<KeyRole> {
         self.keys.get(public_key).copied()
     }
 
@@ -195,13 +260,15 @@ impl AuthorizedKeys {
 mod tests {
     use super::*;
 
+    /// The key used by the single-line fixtures below: 32 zero bytes.
+    const ZERO_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
     #[test]
     fn permission_can_trade() {
         assert!(!Permission::Operator.can_trade());
         assert!(Permission::Trader.can_trade());
         assert!(!Permission::Custodian.can_trade());
         assert!(!Permission::ReadOnly.can_trade());
-        assert!(!Permission::Replication.can_trade());
     }
 
     #[test]
@@ -210,7 +277,6 @@ mod tests {
         assert!(!Permission::Trader.is_operator());
         assert!(!Permission::Custodian.is_operator());
         assert!(!Permission::ReadOnly.is_operator());
-        assert!(!Permission::Replication.is_operator());
     }
 
     #[test]
@@ -219,25 +285,46 @@ mod tests {
         assert!(!Permission::Trader.can_manage_funds());
         assert!(Permission::Custodian.can_manage_funds());
         assert!(!Permission::ReadOnly.can_manage_funds());
-        assert!(!Permission::Replication.can_manage_funds());
     }
 
     #[test]
-    fn only_replication_may_not_connect_as_client() {
-        assert!(Permission::Operator.may_connect_as_client());
-        assert!(Permission::Trader.may_connect_as_client());
-        assert!(Permission::Custodian.may_connect_as_client());
-        assert!(Permission::ReadOnly.may_connect_as_client());
-        assert!(!Permission::Replication.may_connect_as_client());
+    fn only_replication_has_no_client_permission() {
+        assert_eq!(KeyRole::Replication.client(), None);
+        assert!(KeyRole::Replication.is_replication());
+        for permission in [
+            Permission::Operator,
+            Permission::Trader,
+            Permission::Custodian,
+            Permission::ReadOnly,
+        ] {
+            let role = KeyRole::Client(permission);
+            assert_eq!(role.client(), Some(permission));
+            assert!(!role.is_replication());
+        }
     }
 
+    /// Every role parses from the token it displays as, so a log line or
+    /// an error naming a role names what the operator wrote in the file.
     #[test]
-    fn permission_is_replication() {
-        assert!(!Permission::Operator.is_replication());
-        assert!(!Permission::Trader.is_replication());
-        assert!(!Permission::Custodian.is_replication());
-        assert!(!Permission::ReadOnly.is_replication());
-        assert!(Permission::Replication.is_replication());
+    fn every_role_round_trips_through_its_token() {
+        for role in KeyRole::ALL {
+            let keys = AuthorizedKeys::parse(&format!("{role} {ZERO_KEY} test\n")).unwrap();
+            assert_eq!(keys.lookup(&[0u8; 32]), Some(role));
+            assert_eq!(role.to_string(), role.token());
+        }
+        assert_eq!(
+            KeyRole::Client(Permission::ReadOnly).to_string(),
+            "readonly"
+        );
+        assert_eq!(Permission::ReadOnly.to_string(), "readonly");
+        assert_eq!(KeyRole::Replication.to_string(), "replication");
+    }
+
+    /// Matching is exact: the file's tokens are lowercase.
+    #[test]
+    fn a_token_in_another_case_is_unknown() {
+        let err = AuthorizedKeys::parse(&format!("Trader {ZERO_KEY} test\n")).unwrap_err();
+        assert!(err.contains("unknown role 'Trader'"), "{err}");
     }
 
     // --- AuthorizedKeys ---
@@ -258,7 +345,7 @@ readonly AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI= monitoring
             .unwrap();
         let mut k = [0u8; 32];
         k.copy_from_slice(&admin_key);
-        assert_eq!(keys.lookup(&k), Some(Permission::Operator));
+        assert_eq!(keys.lookup(&k), Some(KeyRole::Client(Permission::Operator)));
     }
 
     #[test]
@@ -273,12 +360,16 @@ operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
         assert_eq!(keys.len(), 1);
     }
 
+    /// The error names every role the file may use, the runtime's own
+    /// first, so the operator can see what was meant.
     #[test]
-    fn parse_rejects_unknown_permission() {
-        let content = "superuser AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test\n";
-        let result = AuthorizedKeys::parse(content);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown permission"));
+    fn parse_rejects_unknown_role_naming_every_valid_one() {
+        let err = AuthorizedKeys::parse(&format!("superuser {ZERO_KEY} test\n")).unwrap_err();
+        assert_eq!(
+            err,
+            "line 1: unknown role 'superuser' \
+             (expected operator, replication, trader, custodian, readonly)"
+        );
     }
 
     #[test]
@@ -293,22 +384,6 @@ operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
     fn lookup_missing_key_returns_none() {
         let keys = AuthorizedKeys::parse("").unwrap();
         assert!(keys.lookup(&[0u8; 32]).is_none());
-    }
-
-    #[test]
-    fn replication_key_parsed_from_file() {
-        let content = "replication AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= replica-1\n";
-        let keys = AuthorizedKeys::parse(content).unwrap();
-        let pub_key = [0u8; 32];
-        assert_eq!(keys.lookup(&pub_key), Some(Permission::Replication));
-    }
-
-    #[test]
-    fn custodian_key_parsed_from_file() {
-        let content = "custodian AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= treasury\n";
-        let keys = AuthorizedKeys::parse(content).unwrap();
-        let pub_key = [0u8; 32];
-        assert_eq!(keys.lookup(&pub_key), Some(Permission::Custodian));
     }
 
     /// Two roles for one key is an operator mistake with no safe reading

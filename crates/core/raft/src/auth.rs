@@ -6,7 +6,7 @@
 //!
 //! Trust model (parity with replication): the **initiator proves identity**;
 //! the responder verifies against the operator's `authorized_keys` table and
-//! requires `Replication` permission — control-plane peers live in the same
+//! requires the `replication` role — control-plane peers live in the same
 //! trust domain as the data-plane replication links, distinct from operator
 //! admin keys. The responder additionally returns the verified public key so
 //! the caller can pin the connection to a configured peer id.
@@ -63,12 +63,12 @@ fn verify_challenge_response_identified(
     let (signature_bytes, pubkey_bytes) = decode_challenge_response(response_payload)
         .map_err(|e| io::Error::other(format!("bad challenge response: {e}")))?;
 
-    let permission = authorized_keys
+    let role = authorized_keys
         .lookup(&pubkey_bytes)
         .ok_or_else(|| io::Error::other("unknown control-plane key"))?;
-    if !permission.is_replication() {
+    if !role.is_replication() {
         return Err(io::Error::other(format!(
-            "key has {permission:?} permission, expected Replication"
+            "key listed as {role}, expected replication"
         )));
     }
 
@@ -191,7 +191,10 @@ mod tests {
         let key = SigningKey::from_bytes(&[0x44; 32]);
         let table = keys_for(&key, "operator");
         let (server, client) = run_handshake(key, table).await;
-        assert!(server.unwrap_err().to_string().contains("Replication"));
+        assert_eq!(
+            server.unwrap_err().to_string(),
+            "key listed as operator, expected replication"
+        );
         assert!(client.is_err());
     }
 }

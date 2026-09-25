@@ -1610,7 +1610,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use std::os::unix::net::UnixStream;
 
-        // Key exists but has Trader permission, not Replication.
+        // Key exists but is listed as trader, not replication.
         let key = SigningKey::from_bytes(&[0xCC; 32]);
         let pub_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -1635,7 +1635,10 @@ mod tests {
         let mut conn = primary_stream;
         let result = authenticate_replica(&mut conn, &authorized_keys);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Replication"));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "key listed as trader, expected replication"
+        );
 
         let replica_result = replica_handle.join().unwrap();
         assert!(replica_result.is_err());

@@ -8,7 +8,7 @@
 use std::fmt;
 
 use ed25519_dalek::{Signature, SignatureError, Verifier, VerifyingKey};
-use melin_app::auth::{AuthorizedKeys, Permission};
+use melin_app::auth::{AuthorizedKeys, KeyRole, Permission};
 
 /// Why the client listener refused a challenge response.
 #[derive(Debug)]
@@ -16,8 +16,8 @@ pub(crate) enum ClientAuthError {
     /// The key is not in the authorized keys file.
     UnknownKey,
     /// The key is listed, under a role that may not open a client
-    /// connection (see [`Permission::may_connect_as_client`]).
-    RoleRefused(Permission),
+    /// connection (see [`KeyRole::client`]).
+    RoleRefused(KeyRole),
     /// The listed bytes are not a valid Ed25519 public key.
     InvalidKey(SignatureError),
     /// The signature over the nonce does not verify.
@@ -28,9 +28,7 @@ impl fmt::Display for ClientAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownKey => f.write_str("unknown public key"),
-            Self::RoleRefused(permission) => {
-                write!(f, "{permission:?} key refused on the client listener")
-            }
+            Self::RoleRefused(role) => write!(f, "{role} key refused on the client listener"),
             Self::InvalidKey(e) => write!(f, "invalid public key: {e}"),
             Self::BadSignature(e) => write!(f, "signature verification failed: {e}"),
         }
@@ -51,12 +49,10 @@ pub(crate) fn verify_client(
     public_key: &[u8; 32],
     signature: &[u8; 64],
 ) -> Result<Permission, ClientAuthError> {
-    let permission = authorized_keys
+    let role = authorized_keys
         .lookup(public_key)
         .ok_or(ClientAuthError::UnknownKey)?;
-    if !permission.may_connect_as_client() {
-        return Err(ClientAuthError::RoleRefused(permission));
-    }
+    let permission = role.client().ok_or(ClientAuthError::RoleRefused(role))?;
     let verifying_key =
         VerifyingKey::from_bytes(public_key).map_err(ClientAuthError::InvalidKey)?;
     verifying_key
@@ -116,10 +112,14 @@ mod tests {
     fn a_replication_key_is_refused() {
         let err = verify(&keys_listing("replication", &key()), &key()).unwrap_err();
         assert!(
-            matches!(err, ClientAuthError::RoleRefused(Permission::Replication)),
+            matches!(err, ClientAuthError::RoleRefused(KeyRole::Replication)),
             "{err}"
         );
-        assert!(err.to_string().contains("client listener"), "{err}");
+        // Named by its token, as the operator wrote it in the keys file.
+        assert_eq!(
+            err.to_string(),
+            "replication key refused on the client listener"
+        );
     }
 
     /// A keys file can list any 32 bytes; ones that are not a point on

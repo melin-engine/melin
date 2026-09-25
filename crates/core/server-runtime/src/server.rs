@@ -3456,7 +3456,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     debug!(
         connection_id = connection_id.0,
         addr = %addr,
-        permission = ?permission,
+        role = %permission,
         "authenticated"
     );
 
