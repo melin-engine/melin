@@ -1180,7 +1180,7 @@ impl<E: AppEvent> Sequencer<E> {
                     let next_read = self.consumer.next_read();
                     self.core.submit_batch(next_read)?;
                 }
-                self.drain_remaining();
+                self.drain_remaining()?;
                 self.core
                     .utilization
                     .busy
@@ -1458,6 +1458,12 @@ impl<E: AppEvent> Sequencer<E> {
 
     /// Drain any remaining entries from the ring buffer on shutdown.
     ///
+    /// A failure (hand-off claim, encode, submit) stops the stage with
+    /// the error, as it does in the steady-state loop. Returning quietly
+    /// instead would hand `finish` an encoder that has moved past entries
+    /// its disk never received, which a promoted primary would then
+    /// flush as a run of zeros.
+    ///
     /// Replica-mode caveat (accepted race): pending stream marks are
     /// NOT applied here, so a shutdown racing a primary rotation can
     /// journal post-boundary entries into the pre-boundary segment.
@@ -1465,9 +1471,9 @@ impl<E: AppEvent> Sequencer<E> {
     /// are intact and the reconnect handshake detects the framing
     /// mismatch (segment-scoped chains differ), archiving the journal
     /// and re-seeding from the primary. Honoring marks here would need
-    /// the full barrier machinery on a path that must never fail;
-    /// self-healing via resync is the safer trade.
-    fn drain_remaining(&mut self) {
+    /// the full barrier machinery on the shutdown path; self-healing via
+    /// resync is the safer trade.
+    fn drain_remaining(&mut self) -> Result<(), JournalError> {
         loop {
             // Borrowed in place, like the steady-state loop. A run that
             // stops at the ring's wrap point just means one extra
@@ -1493,25 +1499,19 @@ impl<E: AppEvent> Sequencer<E> {
                 } else {
                     self.core.encoder.allocate_sequence()
                 };
-                if let Err(e) = self.core.claim_slot() {
-                    tracing::error!(error = %e, "journal hand-off failed on drain");
-                    return;
-                }
+                self.core.claim_slot()?;
                 let chunk = self.core.claim.as_mut().expect("claimed above");
-                if let Err(e) = self.core.encoder.encode_event(
+                // Stops the stage, as in the steady-state loop: skipping
+                // the entry would leave its sequence unwritten, and a
+                // quiet return would strand the entries encoded before it
+                // (see the function docs).
+                self.core.encoder.encode_event(
                     chunk.bytes_mut(),
                     seq,
                     slot.timestamp,
                     &slot.event,
                     slot.key_hash,
-                ) {
-                    // Stop, as the steady-state loop does: skipping the
-                    // entry would leave its sequence unwritten and every
-                    // later entry past a hole (and a refused stamp would
-                    // be followed by entries judged against it).
-                    tracing::error!(error = %e, seq, "journal encode error on drain");
-                    return;
-                }
+                )?;
                 let journal_slice = self
                     .core
                     .encoder
@@ -1522,11 +1522,9 @@ impl<E: AppEvent> Sequencer<E> {
             // Hand the batch over exactly as the steady-state path
             // does — replication frame first, then the slot carrying
             // the cursors. `finish` waits for it to become durable.
-            if let Err(e) = self.core.submit_batch(read_end) {
-                tracing::error!(error = %e, "journal hand-off failed on drain");
-                return;
-            }
+            self.core.submit_batch(read_end)?;
         }
+        Ok(())
     }
 
     /// Wait for everything submitted to land, stop the disk thread, and

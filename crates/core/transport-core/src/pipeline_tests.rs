@@ -896,6 +896,39 @@ fn journal_stage_stops_on_a_regressing_stamp_with_its_type() {
     }
 }
 
+/// The shutdown drain stops the stage on a refused entry, as the
+/// steady-state loop does, instead of returning a writer. Quietly
+/// finishing would hand back an encoder that has moved past the entries
+/// encoded before the refusal, which its disk never received; a promoted
+/// primary would flush that batch as a run of zeros.
+#[test]
+fn the_shutdown_drain_stops_on_a_regressing_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("drain_regression.journal");
+    let writer = Writer::create(&path).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build(WaitStrategy::SpinThenYield);
+    let stage = JournalStage::new(
+        writer,
+        consumers.pop().unwrap(),
+        Duration::ZERO,
+        MAX_JOURNAL_BATCH,
+        WaitStrategy::SpinThenYield,
+    );
+    producer.publish(add_slot(1, 2_000));
+    producer.publish(add_slot(2, 2_000));
+
+    // Shutdown already requested: the stage's first iteration hands
+    // every published slot to the drain.
+    let shutdown = AtomicBool::new(true);
+    match stage.run(&shutdown) {
+        Err(melin_journal::JournalError::TimestampRegression { sequence: 2, .. }) => {}
+        Err(other) => panic!("expected TimestampRegression, got {other}"),
+        Ok(_) => panic!("the drain must not hand back a writer past a refused entry"),
+    }
+}
+
 /// Verify the JournalStage uses pre-assigned sequences and timestamps
 /// when `InputSlot.sequence != 0` (replica mode). The encoded journal
 /// entries must carry the primary's sequence numbers, not locally
