@@ -7,7 +7,7 @@
 //! The wire framing and message encoders/decoders live in
 //! `melin_transport_core::replication::protocol`; this module is the
 //! runtime-side glue that pairs the generic auth flow with the
-//! operator-managed `AuthorizedKeys` permission table.
+//! operator-managed `AuthorizedKeys` table of keys and their roles.
 
 use std::io::{self, Read, Write};
 
@@ -245,7 +245,7 @@ pub(super) fn step_authentication<T: AuthTransport>(
         FrameResult::Complete(payload_start, frame_end) => {
             // Shared verification with the kernel-TCP path — the
             // security-critical step (decode, authorized-keys lookup,
-            // Replication-permission check, Ed25519 verify over the nonce).
+            // replication-role check, Ed25519 verify over the nonce).
             let verdict = verify_challenge_response(
                 &challenge.nonce,
                 &recv_buf[payload_start..frame_end],

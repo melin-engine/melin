@@ -440,7 +440,7 @@ Your decoder names the type as its `Role`, and receives a `ClientRole`: `ClientR
 
 A node checks your table every time it loads the keys file, and refuses to start on a bad one, naming the token: a token is lowercase ASCII letters, digits, `-` and `_`, starting with a letter; it is not `operator` or `replication`; and no token or role appears twice. Tokens in the file match exactly — `Writer` is not `writer` — and a file naming a role your type does not declare is refused at startup, with every valid role listed. A key is listed once; a node refuses to load a file that lists the same key twice.
 
-A role never reaches the journal: it is decided before an event is sequenced. Moving a key to another role, or renaming, adding or reordering roles between two builds, changes nothing a node reads back.
+A role never reaches the journal: it is decided before an event is sequenced. Moving a key to another role, adding or reordering roles, or renaming a variant of your type changes nothing a node reads back. Renaming a token is different: every keys file that names it must change with it, or the node refuses to start.
 
 **List every role in an access check.** Match the role with every case written out — no `_` arm, and no `==` or `!=` against one role — so that a role you add later is a compile error at every check that must decide about it, rather than silently inheriting whatever the other case allows. `ClientRole` is exhaustive for the same reason: were the runtime to add a role, your decoder would not compile until you decided what it may do.
 

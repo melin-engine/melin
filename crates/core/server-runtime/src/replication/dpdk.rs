@@ -420,7 +420,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         };
 
         // Issue the auth challenge immediately (non-blocking): the replica
-        // must sign this nonce with a key carrying Replication permission
+        // must sign this nonce with a key listed under the `replication` role
         // before we process its handshake. The response is verified across
         // ticks in the `Authenticating` arm — we never block the poll thread
         // on a silent replica. Mirrors the kernel-TCP sender's

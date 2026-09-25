@@ -227,7 +227,7 @@ pub struct ServerConfig {
     /// Path to the Ed25519 private key for replication authentication.
     /// Required in replica mode (`--replica-of`). The corresponding
     /// public key must be listed in the primary's authorized_keys file
-    /// with permission `replication`.
+    /// under the `replication` role.
     #[arg(long)]
     pub replication_key: Option<std::path::PathBuf>,
 
@@ -358,8 +358,9 @@ pub struct ServerConfig {
 
     /// Address for the output event publisher. Subscribers connect here
     /// to receive a real-time stream of the application's reports, as the
-    /// application's publisher encodes them. Ed25519 auth required
-    /// (ReadOnly or above).
+    /// application's publisher encodes them. Ed25519 auth against the
+    /// node's authorized_keys; which keys may subscribe, and what each may
+    /// see, is the application's publisher's decision.
     /// Omit to disable (ring has 1 consumer — identical to before).
     #[arg(long)]
     pub event_bind: Option<SocketAddr>,

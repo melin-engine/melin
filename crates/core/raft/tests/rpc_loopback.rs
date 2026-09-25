@@ -57,12 +57,12 @@ impl RaftApi for MockApi {
 struct Harness {
     addr: String,
     shutdown: Arc<AtomicBool>,
-    /// The key node 2 uses to authenticate (listed with Replication
-    /// permission and mapped to peer id 2).
+    /// The key node 2 uses to authenticate (listed under the
+    /// `replication` role and mapped to peer id 2).
     client_key: SigningKey,
-    /// Listed with Replication permission but NOT in the peer-id table.
+    /// Listed under the `replication` role but NOT in the peer-id table.
     unlisted_peer_key: SigningKey,
-    /// Listed with Operator permission.
+    /// Listed under the `operator` role.
     operator_key: SigningKey,
 }
 
