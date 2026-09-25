@@ -505,7 +505,7 @@ One commit per step, each reviewable on its own.
    it, at the cost of a public API break for every application's `tick`
    and every reader of `now_ns`.
 
-   Lands with the property test that proves the runtime's half of
+   Guarded by the property test that proves the runtime's half of
    determinism: the sequence of calls into the application depends on
    the journal alone. A recording test application logs every call it
    receives (`tick` with its time, `apply` with its time, key and an
@@ -516,15 +516,14 @@ One commit per step, each reviewable on its own.
    runs through the live pipeline, through recovery, and through a
    snapshot restore at every anchor followed by replay of the rest; for
    each anchor, the calls after it must equal the live run's calls
-   after the same anchor. Write it before step 1 and confirm it fails on
-   today's code, by generating runs of equal stamps across an anchor
-   (the snapshot-inside-a-batch divergence above). Done before step 1:
-   it failed, shrinking to two writes sharing a stamp with the snapshot
-   between them, where the restored node calls `tick` once more than
-   the live one. It enters history in
-   this step, the first where it passes. The failing run has to happen
-   up front: from step 3 the encoder refuses the equal stamps that
-   reproduce the bug.
+   after the same anchor. It was written before step 1 and seen failing
+   on the code before this item, with runs of equal stamps across an
+   anchor (the snapshot-inside-a-batch divergence above): it shrank to
+   two writes sharing a stamp with the snapshot between them, where the
+   restored node calls `tick` once more than the live one. With strictly
+   increasing stamps it passes, so it entered history at the start of
+   step 2, guarding steps 2 to 4; this step must keep it passing while
+   the watermark goes.
 5. **Operator surface:** the seeding and running lead warnings, the
    offset gauge, the jump counter, `CLOCK-ACCEPT`, and the sync-state
    warning at seeding.
