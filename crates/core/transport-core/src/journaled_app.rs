@@ -219,6 +219,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             crate::clock::SystemClocks,
             crate::clock::DEFAULT_JUMP_LIMIT,
             writer.last_timestamp(),
+            std::sync::Arc::new(crate::clock::ClockControl::new()),
         );
         Self {
             app,

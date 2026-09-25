@@ -1333,7 +1333,9 @@ mod tests {
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::{self, DisruptorBuilder};
-    use melin_transport_core::clock::{DEFAULT_JUMP_LIMIT, SequencerClock, SystemClocks};
+    use melin_transport_core::clock::{
+        ClockControl, DEFAULT_JUMP_LIMIT, SequencerClock, SystemClocks,
+    };
     use melin_transport_core::pipeline::InputSlot;
     use melin_wire_protocol::control_codec::{
         TAG_APP, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_RESPONSE_HEARTBEAT,
@@ -1518,6 +1520,7 @@ mod tests {
                 SystemClocks,
                 DEFAULT_JUMP_LIMIT,
                 melin_app::SequencerTime::default(),
+                Arc::new(ClockControl::new()),
             ),
         )
     }
@@ -1565,6 +1568,7 @@ mod tests {
             FixedClocks,
             DEFAULT_JUMP_LIMIT,
             melin_app::SequencerTime::default(),
+            Arc::new(ClockControl::new()),
         );
 
         Fixture {

@@ -38,7 +38,24 @@
 //!
 //! The guard protects a running node only. The first reading has nothing
 //! to compare against and is taken as it is, so a restart accepts a wall
-//! clock the guard was refusing.
+//! clock the guard was refusing. So does the operator, with `CLOCK-ACCEPT`
+//! on the admin endpoint ([`ClockControl::request_accept`](crate::clock::ClockControl::request_accept)),
+//! which the clock honours at its next read.
+//!
+//! ## Held time, and what the operator sees
+//!
+//! Time is never wound back, so when the wall clock is behind the last
+//! stamp (a step back, a failover onto a slower clock) the clock holds
+//! stamps one nanosecond apart until the wall clock catches up, and the
+//! application's time stands still. The clock says so: a `warn!` when it
+//! is seeded more than [`LEAD_WARNING`](crate::clock::LEAD_WARNING) behind
+//! the journal's floor, the same `warn!` once each time a running clock
+//! crosses that lead (re-armed below half of it), and the signed offset
+//! it publishes on every read through its
+//! [`ClockControl`](crate::clock::ClockControl), which the health endpoint
+//! serves beside the count of refused jumps. Seeding also asks the kernel
+//! whether the wall clock is synchronized and warns if not; it only warns,
+//! since time daemons do not all report their state to the kernel.
 //!
 //! ## Ticks
 //!
@@ -47,6 +64,8 @@
 //! than a separate thread doing it: the input ring stays single-producer
 //! and the tick goes through the same clock as everything else.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use melin_app::{AppEvent, SequencerTime};
@@ -64,6 +83,20 @@ use crate::trace::mono_trace_ns;
 /// jump can cause once the wall clock is corrected.
 pub const DEFAULT_JUMP_LIMIT: Duration = Duration::from_secs(5);
 
+/// How far the clock's time may lead the wall clock before it warns that
+/// time is held. A constant, not a setting: in steady state the lead is a
+/// batch's worth of nanoseconds, and after a failover the skew between
+/// two disciplined clocks, so this much means the clocks have a problem.
+/// Low enough to catch a one-second leap-second step. A finer line
+/// belongs on the offset gauge.
+pub const LEAD_WARNING: Duration = Duration::from_millis(100);
+
+/// [`LEAD_WARNING`] in signed nanoseconds, the offset's unit.
+const LEAD_WARNING_NS: i64 = 100_000_000;
+/// The running warning re-arms once the lead falls back under this, so a
+/// lead hovering at the threshold does not warn on every batch.
+const LEAD_REARM_NS: i64 = LEAD_WARNING_NS / 2;
+
 /// Where the clock reads time from. A type parameter rather than a trait
 /// object, so the system clocks cost no indirect call on the ingress path
 /// while tests drive the clock by hand.
@@ -73,6 +106,22 @@ pub trait TimeSource {
     /// Nanoseconds on a clock that never jumps and counts time spent
     /// suspended (`CLOCK_BOOTTIME`). Only differences are meaningful.
     fn boot_ns(&self) -> u64;
+    /// Whether the wall clock is disciplined, as far as the source can
+    /// tell. Asked once, when the clock is seeded.
+    fn sync_state(&self) -> SyncState {
+        SyncState::Unknown
+    }
+}
+
+/// The kernel's view of whether the wall clock is synchronized. Advisory:
+/// a daemon that disciplines the clock without reporting to the kernel
+/// (phc2sys, for one) leaves it reading unsynchronized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncState {
+    Synchronized,
+    Unsynchronized,
+    /// The source cannot tell (a test clock, or the query failed).
+    Unknown,
 }
 
 /// The system's clocks: `CLOCK_REALTIME` and `CLOCK_BOOTTIME`, both vDSO
@@ -103,6 +152,102 @@ impl TimeSource for SystemClocks {
         // since boot outlast any uptime.
         (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
     }
+
+    /// Asks `adjtimex` without changing anything (`modes` zero, which
+    /// needs no privilege).
+    fn sync_state(&self) -> SyncState {
+        // SAFETY: `timex` is plain old data; all zeroes is a valid value,
+        // and zero `modes` makes the call a read-only query.
+        let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+        // SAFETY: `tx` is a valid, writable timex for the duration of the
+        // call.
+        let state = unsafe { libc::adjtimex(&mut tx) };
+        if state < 0 {
+            // A sandbox may refuse the call. The check is advisory, so the
+            // clock seeds as usual.
+            SyncState::Unknown
+        } else if state == libc::TIME_ERROR || tx.status & libc::STA_UNSYNC != 0 {
+            SyncState::Unsynchronized
+        } else {
+            SyncState::Synchronized
+        }
+    }
+}
+
+/// The sequencer clock's operator surface, shared with the admin and
+/// health endpoints: the offset and refusal count the clock publishes on
+/// every read, and the operator's request to accept the wall clock
+/// (`CLOCK-ACCEPT`), which the clock takes up on its next read.
+///
+/// Created once per process, before the admin endpoint, so the endpoint a
+/// replica starts with already holds the handle its clock attaches to on
+/// promotion. Plain atomics, each meaningful on its own, so a reader never
+/// coordinates with the ingress thread.
+#[derive(Debug, Default)]
+pub struct ClockControl {
+    /// Whether a clock has attached: the node is a primary. Until then
+    /// there is nothing to accept.
+    attached: AtomicBool,
+    accept_requested: AtomicBool,
+    /// The time the clock issues next minus the wall clock, at its last
+    /// read. Signed, since a refused jump leaves the clock behind; `i64`
+    /// nanoseconds span 292 years either way.
+    offset_ns: AtomicI64,
+    /// Forward jumps refused, one per episode. A count that cannot wrap.
+    jumps_refused: AtomicU64,
+}
+
+impl ClockControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An attached control already reporting `offset_ns` and
+    /// `jumps_refused`, for the health endpoint's tests.
+    #[cfg(test)]
+    pub(crate) fn reporting(offset_ns: i64, jumps_refused: u64) -> Self {
+        Self {
+            attached: AtomicBool::new(true),
+            accept_requested: AtomicBool::new(false),
+            offset_ns: AtomicI64::new(offset_ns),
+            jumps_refused: AtomicU64::new(jumps_refused),
+        }
+    }
+
+    /// Whether a sequencer clock runs on this node (it is a primary).
+    pub fn is_attached(&self) -> bool {
+        self.attached.load(Ordering::Relaxed)
+    }
+
+    /// Ask the clock to accept the wall clock at its next read: the next
+    /// batch of writes, or the next tick. Returns `false`, requesting
+    /// nothing, when no clock is attached.
+    pub fn request_accept(&self) -> bool {
+        if !self.is_attached() {
+            return false;
+        }
+        self.accept_requested.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// The clock's time minus the wall clock at its last read, in
+    /// nanoseconds: positive while stamps are held ahead of the wall
+    /// clock, negative while a refused jump leaves the clock behind.
+    pub fn offset_ns(&self) -> i64 {
+        self.offset_ns.load(Ordering::Relaxed)
+    }
+
+    /// Forward jumps the clock has refused since the process started.
+    pub fn jumps_refused(&self) -> u64 {
+        self.jumps_refused.load(Ordering::Relaxed)
+    }
+}
+
+/// `a - b`, saturated to `i64`: real times never come near the bounds,
+/// but a nonsense reading must not wrap the gauge.
+fn signed_diff(a: u64, b: u64) -> i64 {
+    // In range after the clamp, so the cast cannot truncate.
+    (i128::from(a) - i128::from(b)).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 /// A wall-clock reading that has passed the jump guard, taken once per
@@ -141,6 +286,9 @@ pub struct SequencerClock<S = SystemClocks> {
     reference: Option<Reference>,
     /// Readings are being refused. Warns once per episode, not per batch.
     refusing: bool,
+    /// The lead warning has fired and not yet re-armed.
+    lead_warned: bool,
+    control: Arc<ClockControl>,
 }
 
 impl<S: TimeSource> SequencerClock<S> {
@@ -149,7 +297,35 @@ impl<S: TimeSource> SequencerClock<S> {
     /// journal holds, whatever the wall clock reads. That is what carries
     /// strictly increasing time across a restart, a snapshot boot and a
     /// promotion.
-    pub fn new(source: S, jump_limit: Duration, floor: SequencerTime) -> Self {
+    ///
+    /// Attaches to `control`, and warns if the floor leads the wall clock
+    /// by more than [`LEAD_WARNING`] or the kernel reports the wall clock
+    /// unsynchronized (see the module docs).
+    pub fn new(
+        source: S,
+        jump_limit: Duration,
+        floor: SequencerTime,
+        control: Arc<ClockControl>,
+    ) -> Self {
+        let wall_ns = source.wall_ns();
+        // No overflow before the year 2554 (see `last`).
+        let lead_ns = signed_diff(wall_ns.max(floor.as_ns() + 1), wall_ns);
+        let lead_warned = lead_ns > LEAD_WARNING_NS;
+        if lead_warned {
+            warn!(
+                lead_ms = lead_ns / 1_000_000,
+                "the journal's last stamp leads the wall clock; time is held, \
+                 advancing one nanosecond per event, until the wall clock catches up"
+            );
+        }
+        if source.sync_state() == SyncState::Unsynchronized {
+            warn!(
+                "the kernel reports the wall clock unsynchronized; expected if the time \
+                 daemon does not report to the kernel (phc2sys), otherwise check it"
+            );
+        }
+        control.offset_ns.store(lead_ns, Ordering::Relaxed);
+        control.attached.store(true, Ordering::Relaxed);
         Self {
             source,
             last: floor,
@@ -157,14 +333,27 @@ impl<S: TimeSource> SequencerClock<S> {
             jump_limit_ns: u64::try_from(jump_limit.as_nanos()).unwrap_or(u64::MAX),
             reference: None,
             refusing: false,
+            lead_warned,
+            control,
         }
     }
 
-    /// Read the wall clock through the jump guard.
+    /// Read the wall clock through the jump guard, taking up an operator's
+    /// accept first, and publish the offset the reading leaves.
     pub fn read(&mut self) -> ClockReading {
         let wall_ns = self.source.wall_ns();
         let boot_ns = self.source.boot_ns();
-        ClockReading(self.guard(wall_ns, boot_ns))
+        // A load before the swap, so the batch path only reads a line the
+        // admin endpoint rarely writes.
+        if self.control.accept_requested.load(Ordering::Relaxed)
+            && self.control.accept_requested.swap(false, Ordering::Relaxed)
+        {
+            self.accept(wall_ns, boot_ns);
+        }
+        let reading = self.guard(wall_ns, boot_ns);
+        // No overflow before the year 2554 (see `last`).
+        self.observe_offset(signed_diff(reading.max(self.last.as_ns() + 1), wall_ns));
+        ClockReading(reading)
     }
 
     /// The next stamp: `reading`, or one nanosecond past the last stamp
@@ -211,11 +400,13 @@ impl<S: TimeSource> SequencerClock<S> {
         if ahead_ns > self.jump_limit_ns {
             if !self.refusing {
                 self.refusing = true;
+                self.control.jumps_refused.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     jump_ms = ahead_ns / 1_000_000,
                     limit_ms = self.jump_limit_ns / 1_000_000,
                     "wall clock jumped forward past the jump limit; issuing time \
-                     from the boot clock until it comes back within the limit"
+                     from the boot clock until it comes back within the limit, \
+                     or CLOCK-ACCEPT on the admin endpoint accepts it"
                 );
             }
             // Keep the reference: the expected time advances at the boot
@@ -228,6 +419,37 @@ impl<S: TimeSource> SequencerClock<S> {
         }
         self.reference = Some(Reference { wall_ns, boot_ns });
         wall_ns
+    }
+
+    /// The operator's `CLOCK-ACCEPT`: make this reading the reference, so
+    /// the guard follows it and judges later readings from it.
+    fn accept(&mut self, wall_ns: u64, boot_ns: u64) {
+        info!(
+            refusing = self.refusing,
+            offset_ms = self.control.offset_ns() / 1_000_000,
+            "operator accepted the wall clock (CLOCK-ACCEPT)"
+        );
+        self.refusing = false;
+        self.reference = Some(Reference { wall_ns, boot_ns });
+    }
+
+    /// Publish `offset_ns`, the time the clock issues next minus the wall
+    /// clock, and warn once each time its lead crosses [`LEAD_WARNING`].
+    fn observe_offset(&mut self, offset_ns: i64) {
+        self.control.offset_ns.store(offset_ns, Ordering::Relaxed);
+        if self.lead_warned {
+            if offset_ns < LEAD_REARM_NS {
+                self.lead_warned = false;
+                info!("sequencer time no longer held ahead of the wall clock");
+            }
+        } else if offset_ns > LEAD_WARNING_NS {
+            self.lead_warned = true;
+            warn!(
+                lead_ms = offset_ns / 1_000_000,
+                "the wall clock is behind the last stamp; time is held, \
+                 advancing one nanosecond per event, until the wall clock catches up"
+            );
+        }
     }
 }
 
@@ -408,10 +630,11 @@ mod tests {
 
     fn clock_at(wall_ns: u64) -> (ManualClocks, SequencerClock<ManualClocks>) {
         let clocks = ManualClocks::at(wall_ns);
-        (
-            clocks.clone(),
-            SequencerClock::new(clocks, LIMIT, SequencerTime::default()),
-        )
+        (clocks.clone(), seeded(clocks, SequencerTime::default()))
+    }
+
+    fn seeded(clocks: ManualClocks, floor: SequencerTime) -> SequencerClock<ManualClocks> {
+        SequencerClock::new(clocks, LIMIT, floor, Arc::new(ClockControl::new()))
     }
 
     /// Read the clock and issue one stamp, in nanoseconds.
@@ -432,10 +655,10 @@ mod tests {
     #[test]
     fn the_first_stamp_is_past_the_floor_the_clock_was_seeded_at() {
         let floor = SequencerTime::from_ns(T0 + 1_000_000);
-        let mut behind = SequencerClock::new(ManualClocks::at(T0), LIMIT, floor);
+        let mut behind = seeded(ManualClocks::at(T0), floor);
         assert_eq!(behind.now().as_ns(), T0 + 1_000_001, "held past the floor");
 
-        let mut ahead = SequencerClock::new(ManualClocks::at(T0 + 2_000_000), LIMIT, floor);
+        let mut ahead = seeded(ManualClocks::at(T0 + 2_000_000), floor);
         assert_eq!(
             ahead.now().as_ns(),
             T0 + 2_000_000,
@@ -561,6 +784,141 @@ mod tests {
         assert_eq!(clock.stamp_at(T0).as_ns(), ahead + 1);
     }
 
+    const HOUR_NS: u64 = 3_600_000_000_000;
+    const HOUR_NS_I: i64 = 3_600_000_000_000;
+
+    /// Seeding attaches the clock and publishes the lead the journal's
+    /// floor holds over the wall clock, warning past the threshold: a
+    /// failover onto a slower clock is visible before the first write.
+    #[test]
+    fn seeding_publishes_the_floors_lead_and_attaches() {
+        let control = Arc::new(ClockControl::new());
+        assert!(!control.is_attached());
+        let floor = SequencerTime::from_ns(T0 + 200_000_000);
+        let clock = SequencerClock::new(ManualClocks::at(T0), LIMIT, floor, Arc::clone(&control));
+        assert!(control.is_attached());
+        assert_eq!(
+            control.offset_ns(),
+            200_000_001,
+            "the first stamp minus the wall clock"
+        );
+        assert!(clock.lead_warned, "past the threshold at seeding");
+
+        let (_, clock) = clock_at(T0);
+        assert_eq!(
+            clock.control.offset_ns(),
+            0,
+            "a floor behind the wall clock"
+        );
+        assert!(!clock.lead_warned);
+    }
+
+    /// A step back holds time: the offset turns positive by the step,
+    /// warns once, and re-arms as the wall clock catches up.
+    #[test]
+    fn a_step_back_shows_as_a_positive_offset_until_the_wall_clock_catches_up() {
+        let (clocks, mut clock) = clock_at(T0);
+        clock.now();
+        clocks.step_wall(T0 - HOUR_NS);
+        clock.now();
+        assert_eq!(clock.control.offset_ns(), HOUR_NS_I + 1);
+        assert!(clock.lead_warned);
+        clocks.advance(HOUR_NS);
+        clock.now();
+        assert_eq!(clock.control.offset_ns(), 2, "held two stamps past T0");
+        assert!(!clock.lead_warned, "re-armed");
+    }
+
+    /// The warning fires once per crossing: a lead that hovers between
+    /// half the threshold and the threshold neither re-warns nor re-arms.
+    #[test]
+    fn the_lead_warning_rearms_only_below_half_the_threshold() {
+        let (_, mut clock) = clock_at(T0);
+        let mut warned = |offset_ns: i64| {
+            clock.observe_offset(offset_ns);
+            clock.lead_warned
+        };
+        assert!(!warned(LEAD_WARNING_NS), "at the threshold: not past it");
+        assert!(warned(LEAD_WARNING_NS + 1));
+        assert!(warned(LEAD_REARM_NS), "not under half");
+        assert!(warned(LEAD_WARNING_NS + 1), "still the same crossing");
+        assert!(!warned(LEAD_REARM_NS - 1), "re-armed");
+        assert!(warned(LEAD_WARNING_NS + 1), "a new crossing");
+    }
+
+    /// A refused jump leaves the clock behind the wall clock, which the
+    /// offset shows as negative, and counts once per episode.
+    #[test]
+    fn a_refused_jump_shows_as_a_negative_offset_and_counts_once_per_episode() {
+        let (clocks, mut clock) = clock_at(T0);
+        clock.now();
+        clocks.step_wall(T0 + HOUR_NS);
+        clock.now();
+        assert_eq!(clock.control.offset_ns(), -(HOUR_NS_I - 1));
+        clock.now();
+        assert_eq!(
+            clock.control.jumps_refused(),
+            1,
+            "one episode, however many reads"
+        );
+
+        // Back within the limit ends the episode; the next jump is another.
+        clocks.step_wall(clock.last().as_ns());
+        clock.now();
+        assert_eq!(clock.control.offset_ns(), 1);
+        clocks.step_wall(clock.last().as_ns() + HOUR_NS);
+        clock.now();
+        assert_eq!(clock.control.jumps_refused(), 2);
+    }
+
+    /// `CLOCK-ACCEPT` makes the next read follow the wall clock the guard
+    /// was refusing, and later readings are judged from it.
+    #[test]
+    fn an_accepted_jump_is_followed_from_the_next_read() {
+        let (clocks, mut clock) = clock_at(T0);
+        clock.now();
+        clocks.step_wall(T0 + HOUR_NS);
+        clocks.advance(1_000);
+        assert_eq!(now_ns(&mut clock), T0 + 1_000, "refused");
+
+        assert!(clock.control.request_accept());
+        assert_eq!(now_ns(&mut clock), T0 + HOUR_NS + 1_000, "accepted");
+        assert_eq!(clock.control.offset_ns(), 0, "in step with the wall clock");
+        clocks.advance(1_000);
+        assert_eq!(
+            now_ns(&mut clock),
+            T0 + HOUR_NS + 2_000,
+            "followed from there"
+        );
+        assert_eq!(
+            clock.control.jumps_refused(),
+            1,
+            "an accept is not a refusal"
+        );
+    }
+
+    /// An accept with nothing refused changes nothing, and is consumed:
+    /// it does not wait to wave through a later jump.
+    #[test]
+    fn an_accept_is_consumed_by_the_next_read() {
+        let (clocks, mut clock) = clock_at(T0);
+        clock.now();
+        assert!(clock.control.request_accept());
+        clocks.advance(1_000);
+        assert_eq!(now_ns(&mut clock), T0 + 1_000);
+        clocks.step_wall(T0 + HOUR_NS);
+        assert_eq!(now_ns(&mut clock), T0 + 1_001, "the later jump is refused");
+    }
+
+    /// No clock, nothing to accept: the admin endpoint tells a replica's
+    /// operator so rather than latching a request for a later promotion.
+    #[test]
+    fn an_accept_needs_an_attached_clock() {
+        let control = ClockControl::new();
+        assert!(!control.request_accept());
+        assert!(!control.accept_requested.load(Ordering::Relaxed));
+    }
+
     type Slot = InputSlot<TestEvent>;
 
     fn producer_at(
@@ -573,7 +931,7 @@ mod tests {
         let (producer, mut consumers) = DisruptorBuilder::<Slot>::new(capacity)
             .add_consumer()
             .build(WaitStrategy::SpinThenYield);
-        let clock = SequencerClock::new(ManualClocks::at(wall_ns), LIMIT, SequencerTime::default());
+        let clock = seeded(ManualClocks::at(wall_ns), SequencerTime::default());
         (
             StampingProducer::new(producer, clock),
             consumers.pop().unwrap(),

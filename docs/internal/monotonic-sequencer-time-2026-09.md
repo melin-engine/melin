@@ -559,6 +559,13 @@ One commit per step, each reviewable on its own.
 5. **Operator surface:** the seeding and running lead warnings, the
    offset gauge, the jump counter, `CLOCK-ACCEPT`, and the sync-state
    warning at seeding.
+   One `ClockControl` per process, created beside the rotation flag
+   before the admin endpoint, so a replica's endpoint holds the handle
+   its clock attaches to on promotion; until then `CLOCK-ACCEPT` answers
+   `ERR` rather than latching a request. The offset is the time the
+   clock issues next minus the wall clock, measured at each read (a
+   batch or a tick), so with ticks disabled an idle primary's gauge
+   holds its last value.
 6. **Acceptance tests**, each asserting the same `tick` sequence on the
    live, replay and snapshot-restore paths:
    - a restart across a clock step back;
@@ -584,7 +591,8 @@ One commit per step, each reviewable on its own.
    limit (the timestamp field in `docs/journal.md`, and the timestamp and
    scheduler clock in `docs/pipeline-architecture.md`, were corrected in
    step 4, where they became false); `CLOCK-ACCEPT` beside the other
-   admin commands in
+   admin commands, and `melin_sequencer_clock_offset_seconds` and
+   `melin_clock_jumps_refused_total` beside the other metrics, in
    `docs/replication.md`; CHANGELOG under
    Unreleased (the format-15 and protocol-5 entries become 16 and 6);
    the note in
