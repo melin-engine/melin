@@ -13,8 +13,7 @@ use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
 use melin_app::{AppEvent, Application};
 use melin_journal::JournalEvent;
-use melin_pipeline::ring;
-use melin_transport_core::pipeline::InputSlot;
+use melin_transport_core::clock::{ClockReading, StampingProducer, TimeSource};
 use melin_transport_core::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_wire_protocol::control_codec::{TAG_APP, TAG_LEN};
 
@@ -70,6 +69,10 @@ pub(crate) enum FrameAction {
 /// Returns [`FrameAction`] so the caller can handle transport-specific
 /// side effects (ServerBusy write, transport close, control events).
 ///
+/// `reading` is the clock reading the caller took once for its whole
+/// batch of receives. The producer stamps each published write from it;
+/// nothing here writes a time.
+///
 /// `recv_ts` is the trace timestamp the caller captured once, at the
 /// moment the kernel handed it this recv's bytes (the io_uring CQE /
 /// DPDK `recv_into_vec` site). Every slot published from `parse_buf`
@@ -79,16 +82,16 @@ pub(crate) enum FrameAction {
 /// forward for later frames in a multi-frame recv). `()` (zero-sized)
 /// when `latency-trace` is disabled.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn process_client_frames<A: Application>(
+pub(crate) fn process_client_frames<A: Application, S: TimeSource>(
     parse_buf: &mut Vec<u8>,
     connection_id: u64,
     key_hash: u64,
     permission: Permission,
-    producer: &mut ring::Producer<InputSlot<A::Event>>,
+    producer: &mut StampingProducer<A::Event, S>,
     decoder: &dyn RequestDecoder<Event = A::Event>,
     halt: &HaltGate,
     refusals: &mut RefusalSender<A::Report>,
-    batch_wall_ns: u64,
+    reading: ClockReading,
     recv_ts: MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
@@ -108,7 +111,7 @@ pub(crate) fn process_client_frames<A: Application>(
             return FrameAction::Disconnect;
         }
     };
-    let mut batch = producer.batch();
+    let mut batch = producer.batch(reading);
     // Writes refused in this call, counted into the gate once at the end
     // rather than with an atomic add each. Includes one shed for a full
     // refusal queue: the halt is what turned it away.
@@ -183,7 +186,6 @@ pub(crate) fn process_client_frames<A: Application>(
             continue;
         }
 
-        let ts = if event.is_query() { 0 } else { batch_wall_ns };
         let event = JournalEvent::App(event);
 
         #[cfg(feature = "latency-trace")]
@@ -195,7 +197,6 @@ pub(crate) fn process_client_frames<A: Application>(
             slot.connection_id = connection_id;
             slot.key_hash = key_hash;
             slot.sequence = 0;
-            slot.timestamp_ns = ts;
             slot.event = event;
             slot.publish_ts = publish_ts;
             slot.recv_ts = recv_ts;
@@ -217,7 +218,7 @@ pub(crate) fn process_client_frames<A: Application>(
         if batch.len() >= COMMIT_EVERY {
             refusals.flush();
             batch.commit();
-            batch = producer.batch();
+            batch = producer.batch(reading);
         }
     }
 

@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
+use melin_transport_core::clock::StampingProducer;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
     InputSlot, OutputSlot as GenericOutputSlot, Pipeline as GenericPipeline,
@@ -416,6 +417,22 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 250)]
     pub tick_interval_ms: u64,
 
+    /// How far, in milliseconds, the wall clock may jump forward on a
+    /// running primary before the sequencer clock refuses to follow it.
+    ///
+    /// Journaled time never goes backwards, so a jump the clock followed
+    /// could never be undone: time-driven work would wait for the wall
+    /// clock to catch up with it. Past this limit the clock keeps
+    /// advancing at the real rate instead (measured by a clock that cannot
+    /// jump) until the wall clock comes back within the limit. A restart
+    /// or a failover takes the wall clock as it is.
+    ///
+    /// Defaults to 5 s: above the largest step a time daemon makes on a
+    /// running node, and the cap on how long a wrongly accepted jump can
+    /// hold time-driven work once the clock is corrected. Must be positive.
+    #[arg(long, default_value_t = 5_000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub clock_jump_limit_ms: u64,
+
     /// Disable `mlockall(MCL_CURRENT | MCL_FUTURE)` at startup.
     ///
     /// By default the server locks all current and future pages into
@@ -533,6 +550,7 @@ impl Default for ServerConfig {
             snapshot_interval_ms: 3_000_000,
             snapshot_path: None,
             tick_interval_ms: 250,
+            clock_jump_limit_ms: 5_000,
             no_mlock: false,
             raft_bind: None,
             raft_node_id: None,
@@ -583,6 +601,15 @@ impl ServerConfig {
         } else {
             Some(std::time::Duration::from_millis(self.tick_interval_ms))
         }
+    }
+
+    /// The primary's sequencer clock, with the configured jump limit.
+    /// Starts from zero: nothing is carried over from the journal yet.
+    pub fn sequencer_clock(&self) -> melin_transport_core::clock::SequencerClock {
+        melin_transport_core::clock::SequencerClock::new(
+            melin_transport_core::clock::SystemClocks,
+            std::time::Duration::from_millis(self.clock_jump_limit_ms),
+        )
     }
 
     /// The per-thread layout this node actually runs — see
@@ -1439,7 +1466,9 @@ where
     // the normal pipeline. The input ring is single-producer: main publishes
     // them through `input_producer`, then moves it into the reader thread
     // which becomes the sole steady-state producer. No cloning required.
-    let mut input_producer = input_producer;
+    // The sequencer clock travels with it, so every event the node
+    // journals is stamped by the one clock.
+    let mut input_producer = StampingProducer::new(input_producer, config.sequencer_clock());
 
     // Spawn pipeline OS threads.
     let cores = config.cores;
@@ -1765,9 +1794,7 @@ where
     // promotions from different elections always allocate distinct
     // epochs — the newer one fences the older.
     if let Some(requested_epoch) = promotion {
-        use melin_app::unix_epoch_nanos;
         use melin_journal::JournalEvent;
-        use melin_transport_core::trace::mono_trace_ns;
 
         let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
         // Re-validate the term↔epoch alignment at the moment the epoch is
@@ -1794,15 +1821,7 @@ where
             new_epoch,
             requested_epoch, "promotion: injecting epoch bump"
         );
-        input_producer.publish(InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            sequence: 0,
-            timestamp_ns: unix_epoch_nanos(),
-            event: JournalEvent::EpochBump { epoch: new_epoch },
-            publish_ts: mono_trace_ns(),
-            recv_ts: mono_trace_ns(),
-        });
+        input_producer.publish_internal(JournalEvent::EpochBump { epoch: new_epoch });
         // Wait until the matching stage observes the bump (epoch raised) so
         // the node advertises `new_epoch` on the very first handshake. Bounded
         // by the shutdown flag so a stuck pipeline can't wedge startup.
@@ -2556,8 +2575,9 @@ where
 
     // Seed events flow through the disruptor like regular events. The input
     // ring is single-producer: main publishes seeds, then moves the
-    // producer into the DPDK poll thread. No cloning required.
-    let mut input_producer = input_producer;
+    // producer into the DPDK poll thread. No cloning required. The
+    // sequencer clock travels with it.
+    let mut input_producer = StampingProducer::new(input_producer, config.sequencer_clock());
 
     // The DPDK poll thread also generates the application's clock ticks via
     // a wall-clock comparison between NIC bursts (see `run_dpdk_poll`). The
@@ -2970,15 +2990,13 @@ where
 fn journal_startup_events<E: melin_app::AppEvent>(
     genesis: Vec<E>,
     on_primary: Vec<E>,
-    input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
+    input_producer: &mut StampingProducer<E>,
     journal_cursor: &melin_pipeline::padding::Sequence,
     matching_cursor: &melin_pipeline::padding::Sequence,
     replication_ring_progress: &Option<melin_transport_core::pipeline::ReplicationRingProgress>,
     shutdown: &AtomicBool,
 ) {
-    use melin_app::unix_epoch_nanos;
     use melin_journal::JournalEvent;
-    use melin_transport_core::trace::mono_trace_ns;
 
     let (genesis_count, on_primary_count) = (genesis.len(), on_primary.len());
     // Nothing published: the cursors never advance past a target, so
@@ -2988,20 +3006,11 @@ fn journal_startup_events<E: melin_app::AppEvent>(
     }
     let start = std::time::Instant::now();
 
-    // `sequence: 0` — the journal stage allocates sequences in disruptor
-    // cursor order at encode time. The runtime wraps each application
-    // event as `JournalEvent::App` and stamps transport-level metadata.
+    // The journal stage allocates sequences in disruptor cursor order at
+    // encode time; the producer stamps each event's time.
     let mut last_published_seq = 0u64;
     for event in genesis.into_iter().chain(on_primary) {
-        last_published_seq = input_producer.publish(InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            sequence: 0,
-            timestamp_ns: unix_epoch_nanos(),
-            event: JournalEvent::App(event),
-            publish_ts: mono_trace_ns(),
-            recv_ts: mono_trace_ns(),
-        });
+        last_published_seq = input_producer.publish_internal(JournalEvent::App(event));
     }
     let publish_elapsed = start.elapsed();
 

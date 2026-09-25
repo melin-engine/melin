@@ -139,6 +139,40 @@ impl WireSeq {
     }
 }
 
+/// Time as the sequencer assigns it: nanoseconds since the Unix epoch,
+/// strictly increasing from one journaled event to the next, on every node
+/// and across restarts. Derived from the primary's wall clock but not equal
+/// to it: the clock holds it one nanosecond past the last stamp while the
+/// wall clock is behind, and refuses a runaway jump ahead. The newtype
+/// exists so a stamp cannot be mixed with a raw wall-clock reading, which
+/// carries none of those guarantees. Defined here, beside [`WireSeq`], so
+/// the journal and the runtime above it share one type.
+///
+/// Made by the primary's sequencer clock, and by the decoders that read a
+/// stamp back from the journal or the replication stream. The default,
+/// zero, is no time: a query, which is never journaled, or a slot not yet
+/// stamped.
+///
+/// `#[repr(transparent)]` so it is layout-identical to `u64`.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash, Debug)]
+pub struct SequencerTime(u64);
+
+impl SequencerTime {
+    /// A stamp from its nanoseconds since the Unix epoch.
+    #[inline]
+    pub const fn from_ns(ns: u64) -> Self {
+        Self(ns)
+    }
+
+    /// Nanoseconds since the Unix epoch — for encoding, arithmetic and
+    /// display, where the value leaves the type system.
+    #[inline]
+    pub const fn as_ns(self) -> u64 {
+        self.0
+    }
+}
+
 /// What a journaled event is applied under, beside the event itself.
 ///
 /// Every field is journaled with the event, so replay, a replica and the

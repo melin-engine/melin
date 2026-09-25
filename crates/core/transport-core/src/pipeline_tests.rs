@@ -17,6 +17,7 @@ use std::time::Duration;
 use melin_journal::replication::REPLICATION_RING_CAPACITY;
 // Only the journal-reading tests touch these, and those are gated off
 // under no-persist (every read needs a really-persisted journal file).
+use melin_app::SequencerTime;
 #[cfg(not(feature = "no-persist"))]
 use melin_journal::JournalReader;
 use melin_journal::{BufferedWriter, JournalEvent};
@@ -102,7 +103,7 @@ fn add_slot(n: u64, timestamp_ns: u64) -> TestInput {
         connection_id: 1,
         key_hash: 0,
         sequence: 0,
-        timestamp_ns,
+        timestamp: SequencerTime::from_ns(timestamp_ns),
         event: JournalEvent::App(TestEvent::Add(n)),
         publish_ts: mono_trace_ns(),
         recv_ts: mono_trace_ns(),
@@ -320,7 +321,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
             connection_id: conn_id,
             key_hash: 0,
             sequence: 0,
-            timestamp_ns: 0,
+            timestamp: SequencerTime::default(),
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -465,7 +466,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
             connection_id: 1,
             key_hash: 1,
             sequence: 0,
-            timestamp_ns: 1_000_000_000 + published,
+            timestamp: SequencerTime::from_ns(1_000_000_000 + published),
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -592,7 +593,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
             connection_id: 1,
             key_hash: 1,
             sequence: 0,
-            timestamp_ns: 1_000_000_000 + made,
+            timestamp: SequencerTime::from_ns(1_000_000_000 + made),
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -1313,7 +1314,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
                         connection_id: 0,
                         key_hash: slot.key_hash,
                         sequence: slot.sequence,
-                        timestamp_ns: slot.timestamp_ns,
+                        timestamp: slot.timestamp,
                         event: slot.event,
                         publish_ts: mono_trace_ns(),
                         recv_ts: mono_trace_ns(),
@@ -1495,7 +1496,7 @@ fn journal_stage_rotates_on_manual_request() {
             connection_id: 1,
             key_hash: 1,
             sequence: 0,
-            timestamp_ns: 1_000_000_000 + published,
+            timestamp: SequencerTime::from_ns(1_000_000_000 + published),
             event: JournalEvent::App(TestEvent::Add(amount)),
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -2658,7 +2659,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
                             connection_id: 0,
                             key_hash: slot.key_hash,
                             sequence: slot.sequence,
-                            timestamp_ns: slot.timestamp_ns,
+                            timestamp: slot.timestamp,
                             event: slot.event,
                             publish_ts: mono_trace_ns(),
                             recv_ts: mono_trace_ns(),
@@ -2945,7 +2946,7 @@ fn journal_stage_rotates_on_size_threshold() {
         connection_id: 1,
         key_hash: 1,
         sequence: 0,
-        timestamp_ns: 1_000_000_000,
+        timestamp: SequencerTime::from_ns(1_000_000_000),
         event: JournalEvent::App(TestEvent::Add(42)),
         publish_ts: mono_trace_ns(),
         recv_ts: mono_trace_ns(),
@@ -3426,7 +3427,7 @@ fn rotate_storm_collapses_to_single_rotation() {
             connection_id: 1,
             key_hash: 1,
             sequence: 0,
-            timestamp_ns: 1_000_000 + published,
+            timestamp: SequencerTime::from_ns(1_000_000 + published),
             event: JournalEvent::App(TestEvent::Add(amount)),
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -3506,7 +3507,7 @@ fn post_rotation_events_land_in_live_not_archive() {
             connection_id: 1,
             key_hash: 1,
             sequence: 0,
-            timestamp_ns: 1_000_000 + published,
+            timestamp: SequencerTime::from_ns(1_000_000 + published),
             event: JournalEvent::App(TestEvent::Add(amount)),
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -3609,7 +3610,7 @@ fn pipeline_journals_every_event_in_order() {
             connection_id: 1,
             key_hash: 0,
             sequence: 0,
-            timestamp_ns: 1_000_000_000 + amount,
+            timestamp: SequencerTime::from_ns(1_000_000_000 + amount),
             event: JournalEvent::App(TestEvent::Add(amount)),
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -3655,7 +3656,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
             connection_id: 1,
             key_hash: 0,
             sequence: 0,
-            timestamp_ns: 0,
+            timestamp: SequencerTime::default(),
             event,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -3816,7 +3817,7 @@ fn a_query_changes_no_matching_stage_state() {
         connection_id: 1,
         key_hash: KEY,
         sequence: 0,
-        timestamp_ns,
+        timestamp: SequencerTime::from_ns(timestamp_ns),
         event,
         publish_ts: mono_trace_ns(),
         recv_ts: mono_trace_ns(),
@@ -4018,7 +4019,7 @@ fn a_wide_event_app_survives_a_full_batch_with_a_replica_attached() {
     let total = 2 * MAX_JOURNAL_BATCH as u64;
     for i in 0..total {
         producer.publish(InputSlot::<WideEvent> {
-            timestamp_ns: 1_000_000_000 + i,
+            timestamp: SequencerTime::from_ns(1_000_000_000 + i),
             event: melin_journal::JournalEvent::App(WideEvent(0xAB)),
             ..Default::default()
         });

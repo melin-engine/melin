@@ -47,7 +47,7 @@ fn slot(sequence: u64) -> InputSlot<TestEvent> {
         connection_id: 0,
         key_hash: 0,
         sequence,
-        timestamp_ns: 0,
+        timestamp: melin_app::SequencerTime::default(),
         event: JournalEvent::App(TestEvent::Add(sequence)),
         publish_ts: Default::default(),
         recv_ts: Default::default(),

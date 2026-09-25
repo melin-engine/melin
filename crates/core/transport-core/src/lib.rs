@@ -20,6 +20,9 @@
 /// Application-agnostic — the operator-facing CLI enum that picks
 /// between named policies lives with the consuming application.
 pub mod ack_policy;
+/// The sequencer clock and the stamping producer: every event the primary
+/// journals is stamped once, strictly later than the one before it.
+pub mod clock;
 /// Named sequence-space cursors (`WireSeq` / `RingPos` / `PipelineCursors`).
 /// Bundles the journal-progress atomics behind space-typed accessors so the
 /// compiler rejects mixing wire-seq and ring-index values.
@@ -55,7 +58,6 @@ pub mod snapshot;
 /// workspace; activate via `[dev-dependencies]` only.
 #[cfg(feature = "test-utils")]
 pub mod test_ports;
-pub mod tick;
 pub mod trace;
 
 #[cfg(test)]

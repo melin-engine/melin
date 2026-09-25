@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use crate::dispatch::dispatch;
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
-use melin_app::{AppEvent, Application, ApplyCtx, QueryCtx};
+use melin_app::{AppEvent, Application, ApplyCtx, QueryCtx, SequencerTime};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::encoder::JournalEncoder;
@@ -312,10 +312,10 @@ pub struct InputSlot<E: AppEvent> {
     /// journal stage uses that value verbatim. Also zero for non-journaled
     /// events (queries) which the journal stage skips.
     pub sequence: u64,
-    /// Wall-clock timestamp (nanoseconds since epoch), assigned at
-    /// publish time alongside the sequence. Zero only for non-journaled
-    /// events (queries).
-    pub timestamp_ns: u64,
+    /// The event's time. On a primary the stamping producer assigns it at
+    /// publish (see [`crate::clock`]); on a replica the receiver copies
+    /// the primary's. Zero only for non-journaled events (queries).
+    pub timestamp: SequencerTime,
     /// The journaled event (an application write, a tick, an epoch
     /// bump, etc.).
     pub event: melin_journal::JournalEvent<E>,
@@ -338,7 +338,7 @@ impl<E: AppEvent> Default for InputSlot<E> {
             connection_id: 0,
             key_hash: 0,
             sequence: 0,
-            timestamp_ns: 0,
+            timestamp: SequencerTime::default(),
             event: melin_journal::JournalEvent::Tick { now_ns: 0 },
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -1278,7 +1278,7 @@ impl<E: AppEvent> Sequencer<E> {
                             .encode_event(
                                 chunk.bytes_mut(),
                                 seq,
-                                slot.timestamp_ns,
+                                slot.timestamp.as_ns(),
                                 &slot.event,
                                 slot.key_hash,
                             )
@@ -1499,7 +1499,7 @@ impl<E: AppEvent> Sequencer<E> {
                 if let Err(e) = self.core.encoder.encode_event(
                     chunk.bytes_mut(),
                     seq,
-                    slot.timestamp_ns,
+                    slot.timestamp.as_ns(),
                     &slot.event,
                     slot.key_hash,
                 ) {
@@ -2485,7 +2485,7 @@ pub struct MatchingStage<A: Application> {
     /// Shared busy/idle counters for health endpoint monitoring.
     utilization: Arc<StageUtilization>,
     /// Highest event timestamp the scheduler has drained against. Each event
-    /// (including non-Tick events) advances this whenever its `slot.timestamp_ns`
+    /// (including non-Tick events) advances this whenever its `slot.timestamp`
     /// is newer, so the scheduler fires due tasks at every-event resolution under
     /// load. Tick events become a quiet-period safety net rather than the only
     /// thing that moves time forward. Derived state — not snapshotted; recovery
@@ -2704,7 +2704,7 @@ impl<A: Application> MatchingStage<A> {
                         &mut self.app,
                         slot.event,
                         &ApplyCtx {
-                            now_ns: slot.timestamp_ns,
+                            now_ns: slot.timestamp.as_ns(),
                             key_hash: slot.key_hash,
                         },
                         &mut self.last_drain_ns,
@@ -2886,7 +2886,7 @@ impl<A: Application> MatchingStage<A> {
                 &mut self.app,
                 slot.event,
                 &ApplyCtx {
-                    now_ns: slot.timestamp_ns,
+                    now_ns: slot.timestamp.as_ns(),
                     key_hash: slot.key_hash,
                 },
                 &mut self.last_drain_ns,

@@ -1,6 +1,6 @@
 # Monotonic sequencer time (plan)
 
-Status: **proposed, not started** (2026-09). Implements the roadmap item
+Status: **in progress** (2026-09). Implements the roadmap item
 "Monotonic sequencer time, derived from the journal"
 ([roadmap.md](roadmap.md)); read that entry for the problem statement.
 This document records what the code actually looks like against that
@@ -152,6 +152,18 @@ keeps the raw producer, since its slots carry the primary's stamps.
 The clock reads its time through a source chosen at compile time (a
 type parameter, defaulting to the system clocks), so the acceptance
 tests can drive it (step 6) without an indirect call on the hot path.
+
+A stamp is a `SequencerTime`, a newtype in `melin-app` beside `WireSeq`,
+not a bare `u64`. Three u64 time spaces meet in this item: a raw
+wall-clock read, a reading that has passed the jump guard
+(`ClockReading`), and an issued stamp, and only the last carries the
+guarantees. The floor, `TimeFloor::After`, `FsyncState` and the
+snapshot's stamp (steps 2 and 3) all take the type, so handing a raw
+reading where a stamp belongs fails to compile. It enters from the
+clock, and from the decoders that read a stamp back from the journal or
+the replication stream. Whether `ApplyCtx::now_ns` and
+`Application::tick` take it too is a public API question, open until
+step 4 (below).
 
 The test-only helpers `apply_journaled` and `tick_journaled` stamp
 through the same clock rather than a test-only variant, so two calls
@@ -485,19 +497,31 @@ One commit per step, each reviewable on its own.
    increasing, the same calls on every path, and time that may stand
    still while the clock is held) and `ApplyCtx::now_ns`. Confirm the
    microbenchmark in the real pipeline before merging (decision 2).
+   `dispatch` must return before the clock step for a `Shutdown` slot:
+   the matching stage's shutdown drain hands it the pipeline sentinel,
+   whose zero time would otherwise reach `tick`.
+   Decide here whether the application sees `SequencerTime` (decision 1):
+   the type would carry the contract where application authors read
+   it, at the cost of a public API break for every application's `tick`
+   and every reader of `now_ns`.
 
    Lands with the property test that proves the runtime's half of
    determinism: the sequence of calls into the application depends on
    the journal alone. A recording test application logs every call it
-   receives (`tick` with its time, `apply` with its sequence, time and
-   key, `on_epoch` with its epoch). A generated journal (application
+   receives (`tick` with its time, `apply` with its time, key and an
+   identifier its event carries, since `ApplyCtx` has no sequence; an
+   epoch bump reaches the fence, not the application, but still moves
+   the clock). A generated journal (application
    events, `Tick` and `EpochBump` entries, rotations at random points)
    runs through the live pipeline, through recovery, and through a
    snapshot restore at every anchor followed by replay of the rest; for
    each anchor, the calls after it must equal the live run's calls
    after the same anchor. Write it before step 1 and confirm it fails on
    today's code, by generating runs of equal stamps across an anchor
-   (the snapshot-inside-a-batch divergence above). It enters history in
+   (the snapshot-inside-a-batch divergence above). Done before step 1:
+   it failed, shrinking to two writes sharing a stamp with the snapshot
+   between them, where the restored node calls `tick` once more than
+   the live one. It enters history in
    this step, the first where it passes. The failing run has to happen
    up front: from step 3 the encoder refuses the equal stamps that
    reproduce the bug.

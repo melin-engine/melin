@@ -39,9 +39,7 @@ use melin_app::decoder::RequestDecoder;
 /// the `dyn RequestDecoder<Event = …>` spelling at call sites that thread
 /// the decoder through several functions.
 pub type RequestDecoderArc<A> = Arc<dyn RequestDecoder<Event = <A as Application>::Event>>;
-use melin_app::unix_epoch_nanos;
-use melin_pipeline::ring;
-use melin_transport_core::pipeline::InputSlot;
+use melin_transport_core::clock::{ClockReading, StampingProducer, TimeSource};
 
 /// Size of each provided buffer. 4 KiB accommodates multiple frames per
 /// recv (frames are typically <100 bytes).
@@ -195,13 +193,14 @@ impl<R> UringReaderHandle<R> {
 /// deadline even when no client traffic is flowing, then publishes a
 /// `JournalEvent::Tick { now_ns }` onto the same input ring it uses for
 /// client requests. Pass `None` to disable the tick (useful for benchmarks
-/// that don't exercise time-driven features).
+/// that don't exercise time-driven features). Ticks and client writes are
+/// stamped by the same producer, so their times interleave strictly.
 ///
 /// While `halt` refuses writes, the reader answers them through
 /// `refusals` instead of publishing them — see [`crate::halt`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
-    producer: ring::Producer<InputSlot<A::Event>>,
+    producer: StampingProducer<A::Event>,
     decoder: Arc<dyn RequestDecoder<Event = A::Event>>,
     halt: HaltGate,
     refusals: RefusalSender<A::Report>,
@@ -383,7 +382,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // the descriptor alive for as long as it is armed in the ring, and
     // releases it by dropping the `Arc` rather than by closing the fd.
     wakeup_fd: Arc<OwnedFd>,
-    mut producer: ring::Producer<InputSlot<A::Event>>,
+    mut producer: StampingProducer<A::Event>,
     decoder: &dyn RequestDecoder<Event = A::Event>,
     halt: &HaltGate,
     mut refusals: RefusalSender<A::Report>,
@@ -490,10 +489,9 @@ fn reader_loop<A: Application, R: AsRawFd>(
     let mut stale: Vec<usize> = Vec::new();
 
     // Tick generator state. `next_tick_deadline` is the monotonic instant the
-    // next `JournalEvent::Tick` should fire. `last_tick_ns` enforces strict
-    // monotonicity on the wall-clock timestamps published in those events
-    // (NTP can step the wall clock backwards). `tick_armed` tracks whether
-    // an `IORING_OP_TIMEOUT` SQE is currently pending; we keep at most one.
+    // next `JournalEvent::Tick` should fire; the producer's clock stamps it.
+    // `tick_armed` tracks whether an `IORING_OP_TIMEOUT` SQE is currently
+    // pending; we keep at most one.
     //
     // `tick_ts` lives across loop iterations because the kernel reads its
     // bytes via the SQE's addr field at submit time, not at push time. If
@@ -504,7 +502,6 @@ fn reader_loop<A: Application, R: AsRawFd>(
     let tick_enabled = tick_cadence.is_some();
     let cadence = tick_cadence.unwrap_or(Duration::ZERO);
     let mut next_tick_deadline = Instant::now() + cadence;
-    let mut last_tick_ns: u64 = 0;
     let mut tick_armed = false;
     // Arm the very first timeout here, before entering the loop. This both
     // (a) makes the initial `tick_ts` value actually read by the kernel
@@ -541,10 +538,9 @@ fn reader_loop<A: Application, R: AsRawFd>(
         if tick_enabled {
             let now = Instant::now();
             if now >= next_tick_deadline {
-                let raw_now_ns = unix_epoch_nanos();
-                let now_ns = melin_transport_core::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
-                last_tick_ns = now_ns;
-                melin_transport_core::tick::publish_tick(&mut producer, now_ns);
+                // Dropped on a full ring rather than blocking ingress; the
+                // next tick carries a later time (see `try_publish_tick`).
+                let _ = producer.try_publish_tick();
                 // Catch up rather than burst-emit if we fell badly behind.
                 let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
                 next_tick_deadline = if elapsed > cadence {
@@ -623,21 +619,19 @@ fn reader_loop<A: Application, R: AsRawFd>(
         );
 
         let batch_now = Instant::now();
-        // One wall-clock read per CQE batch instead of per request: at
-        // peak request rates a per-request `unix_epoch_nanos()` (vDSO
-        // `clock_gettime(CLOCK_REALTIME)`) showed up in the primary's
-        // profile. All requests in the same batch share the timestamp —
-        // precision loss is bounded by the CQE-drain cadence. The timestamp
-        // drives the application's clock but orders nothing (the pipeline
-        // orders by sequence), so that resolution is enough.
-        let batch_wall_ns = unix_epoch_nanos();
+        // One clock read per CQE batch instead of per request: at peak
+        // request rates a per-request `clock_gettime` (vDSO) showed up in
+        // the primary's profile. Every request in the batch is stamped
+        // from this reading, each strictly after the one before, so the
+        // precision lost is bounded by the CQE-drain cadence.
+        let reading = producer.read_clock();
 
         for &(token, result, flags) in &cqes {
             // ── Tick timeout ──
             // The CQE is just a wakeup signal — the actual tick emission
             // happens at the top of the next loop iteration via the
             // deadline check, so the time the tick is stamped with reflects
-            // unix_epoch_nanos at fire time, not at submit time.
+            // the clock at fire time, not at submit time.
             if token == TICK_TIMEOUT_TOKEN {
                 tick_armed = false;
                 continue;
@@ -838,14 +832,14 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     .extend_from_slice(&buffer_pool[buf_start..buf_start + n]);
 
                 // Extract and publish complete frames.
-                let drop_conn = process_frames::<A, R>(
+                let drop_conn = process_frames::<A, R, _>(
                     entry,
                     &mut producer,
                     decoder,
                     halt,
                     &mut refusals,
                     control_tx,
-                    batch_wall_ns,
+                    reading,
                     recv_ts,
                     #[cfg(feature = "latency-trace")]
                     &mut publish_rec,
@@ -1255,27 +1249,26 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
 /// and publish to the disruptor. Returns `true` if the connection should be
 /// dropped (e.g., oversized frame).
 /// Extract complete frames from `conn.parse_buf` and publish them as
-/// `InputSlot`s. `batch_wall_ns` is the wall-clock timestamp captured
-/// once per CQE batch by the caller (see `reader_loop`); all non-query
-/// requests published in this call share it, sparing the reader a
-/// per-request `clock_gettime(CLOCK_REALTIME)` on the hot path. Returns
-/// `true` if the connection should be dropped.
+/// `InputSlot`s. `reading` is the clock reading taken once per CQE batch
+/// by the caller (see `reader_loop`); every write published in this call
+/// is stamped from it, sparing the reader a per-request clock read on the
+/// hot path. Returns `true` if the connection should be dropped.
 #[allow(clippy::too_many_arguments)]
-fn process_frames<A: Application, R>(
+fn process_frames<A: Application, R, S: TimeSource>(
     conn: &mut ConnectionEntry<R>,
-    producer: &mut ring::Producer<InputSlot<A::Event>>,
+    producer: &mut StampingProducer<A::Event, S>,
     decoder: &dyn RequestDecoder<Event = A::Event>,
     halt: &HaltGate,
     refusals: &mut RefusalSender<A::Report>,
     control_tx: &mpsc::Sender<ControlEvent>,
-    batch_wall_ns: u64,
+    reading: ClockReading,
     recv_ts: melin_transport_core::trace::MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) -> bool {
     use crate::client_frames::{FrameAction, process_client_frames};
 
-    let action = process_client_frames::<A>(
+    let action = process_client_frames::<A, S>(
         &mut conn.parse_buf,
         conn.connection_id,
         conn.key_hash,
@@ -1284,7 +1277,7 @@ fn process_frames<A: Application, R>(
         decoder,
         halt,
         refusals,
-        batch_wall_ns,
+        reading,
         recv_ts,
         #[cfg(feature = "latency-trace")]
         publish_rec,
@@ -1334,7 +1327,9 @@ mod tests {
     use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
     use melin_journal::JournalEvent;
-    use melin_pipeline::ring::DisruptorBuilder;
+    use melin_pipeline::ring::{self, DisruptorBuilder};
+    use melin_transport_core::clock::{DEFAULT_JUMP_LIMIT, SequencerClock, SystemClocks};
+    use melin_transport_core::pipeline::InputSlot;
     use melin_wire_protocol::control_codec::{
         TAG_APP, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_RESPONSE_HEARTBEAT,
     };
@@ -1488,12 +1483,40 @@ mod tests {
         ((MAX_FRAME_SIZE as u32) + 1).to_le_bytes()
     }
 
+    /// The wall clock every fixture reads: fixed, so a test can name the
+    /// exact stamps the producer issues from it.
+    const WALL_NS: u64 = 0xDEAD_BEEF;
+
+    /// Clocks that stand still at [`WALL_NS`].
+    struct FixedClocks;
+
+    impl TimeSource for FixedClocks {
+        fn wall_ns(&self) -> u64 {
+            WALL_NS
+        }
+        fn boot_ns(&self) -> u64 {
+            0
+        }
+    }
+
+    type TestProducer = StampingProducer<TestEvent, FixedClocks>;
+
+    /// A producer on the system clocks, as `spawn_reader` takes one.
+    fn system_stamped(
+        producer: ring::Producer<InputSlot<TestEvent>>,
+    ) -> StampingProducer<TestEvent> {
+        StampingProducer::new(
+            producer,
+            SequencerClock::new(SystemClocks, DEFAULT_JUMP_LIMIT),
+        )
+    }
+
     /// Test fixture bundle. Grouped into a struct rather than returned as a
     /// 4-tuple to keep clippy happy (`type_complexity`) and to give each
     /// field a name at call sites.
     struct Fixture {
         conn: ConnectionEntry<UnixStream>,
-        producer: ring::Producer<InputSlot<TestEvent>>,
+        producer: TestProducer,
         consumer: ring::Consumer<InputSlot<TestEvent>>,
         /// Client-side end of the socket pair — read from this to inspect
         /// any `ServerBusy` bytes the function under test writes.
@@ -1527,10 +1550,11 @@ mod tests {
                 .add_consumer()
                 .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let consumer = consumers.pop().expect("consumer present");
+        let clock = SequencerClock::new(FixedClocks, DEFAULT_JUMP_LIMIT);
 
         Fixture {
             conn: entry,
-            producer,
+            producer: StampingProducer::new(producer, clock),
             consumer,
             peer,
         }
@@ -1546,7 +1570,7 @@ mod tests {
     /// assertions read the channel, not the peer.
     fn run_process_frames(
         conn: &mut ConnectionEntry<UnixStream>,
-        producer: &mut ring::Producer<InputSlot<TestEvent>>,
+        producer: &mut TestProducer,
     ) -> (bool, mpsc::Receiver<ControlEvent>) {
         let (mut refusals, _queue) = refusal_channel();
         run_process_frames_with(conn, producer, &gate(None, false), &mut refusals)
@@ -1592,7 +1616,7 @@ mod tests {
     /// [`run_process_frames`] against a given halt gate and refusal queue.
     fn run_process_frames_with(
         conn: &mut ConnectionEntry<UnixStream>,
-        producer: &mut ring::Producer<InputSlot<TestEvent>>,
+        producer: &mut TestProducer,
         halt: &HaltGate,
         refusals: &mut RefusalSender<TestReport>,
     ) -> (bool, mpsc::Receiver<ControlEvent>) {
@@ -1605,14 +1629,15 @@ mod tests {
         let recv_ts = melin_transport_core::trace::mono_trace_ns();
 
         let (control_tx, control_rx) = mpsc::channel();
-        let disconnect = process_frames::<TestApp, UnixStream>(
+        let reading = producer.read_clock();
+        let disconnect = process_frames::<TestApp, UnixStream, _>(
             conn,
             producer,
             &ByteDecoder,
             halt,
             refusals,
             &control_tx,
-            0xDEAD_BEEF,
+            reading,
             recv_ts,
             #[cfg(feature = "latency-trace")]
             &mut publish_rec,
@@ -1683,8 +1708,9 @@ mod tests {
             assert_eq!(slot.key_hash, 0xC0FFEE_u64);
             let byte = (i + 1) as u8;
             assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(byte)));
-            // Non-query event ⇒ inherits the caller-supplied wall-clock.
-            assert_eq!(slot.timestamp_ns, 0xDEAD_BEEF);
+            // Every write is stamped from the one reading, each strictly
+            // after the one before.
+            assert_eq!(slot.timestamp.as_ns(), WALL_NS + i as u64);
         }
         // Parse buffer fully consumed.
         assert!(conn.parse_buf.is_empty());
@@ -1854,7 +1880,7 @@ mod tests {
         }
 
         // A recognizable sentinel the caller would have captured at the
-        // recv site; distinct from the wall-clock stamp (0xDEAD_BEEF).
+        // recv site; distinct from the wall-clock stamp (`WALL_NS`).
         const RECV_TS: u64 = 0x5EED_5EED;
 
         let mut publish_rec = melin_transport_core::trace::register_stage("test: publish recv_ts");
@@ -1863,14 +1889,15 @@ mod tests {
 
         let (control_tx, _control_rx) = mpsc::channel();
         let (mut refusals, _queue) = refusal_channel();
-        let disconnect = process_frames::<TestApp, UnixStream>(
+        let reading = producer.read_clock();
+        let disconnect = process_frames::<TestApp, UnixStream, _>(
             &mut conn,
             &mut producer,
             &ByteDecoder,
             &gate(None, false),
             &mut refusals,
             &control_tx,
-            0xDEAD_BEEF,
+            reading,
             RECV_TS,
             &mut publish_rec,
             #[cfg(feature = "tick-to-trade")]
@@ -1928,9 +1955,8 @@ mod tests {
 
     #[test]
     fn process_frames_query_event_skips_wall_clock_stamp() {
-        // `AppEvent::is_query` events bypass the journal stamp — verify
-        // the timestamp is zeroed even when a non-zero batch_wall_ns was
-        // supplied.
+        // `AppEvent::is_query` events are never journaled, so they are
+        // left unstamped (zero) even though the batch has a reading.
         let Fixture {
             mut conn,
             mut producer,
@@ -1947,7 +1973,8 @@ mod tests {
         let (_, slot) = &events[0];
         assert_eq!(slot.event, JournalEvent::App(TestEvent::Query));
         assert_eq!(
-            slot.timestamp_ns, 0,
+            slot.timestamp.as_ns(),
+            0,
             "query events must skip the wall-clock stamp"
         );
     }
@@ -2276,7 +2303,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let mut handle = spawn_reader::<TestApp, UnixStream>(
-            producer,
+            system_stamped(producer),
             Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
@@ -2390,7 +2417,7 @@ mod tests {
         let (control_tx, _control_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handle = spawn_reader::<TestApp, UnixStream>(
-            producer,
+            system_stamped(producer),
             Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
@@ -2466,7 +2493,7 @@ mod tests {
         let (control_tx, control_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handle = spawn_reader::<TestApp, UnixStream>(
-            producer,
+            system_stamped(producer),
             Arc::new(ByteDecoder),
             gate(None, false),
             refusal_channel().0,
