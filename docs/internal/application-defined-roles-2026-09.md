@@ -100,6 +100,14 @@ before it binds a port. It refuses:
   express;
 - a table longer than a `RoleId` can index (decision 3).
 
+A token the runtime claims in a later release collides with any
+application that already declared it. That is a breaking change for
+those applications, and it surfaces as this refusal at startup, naming
+the token, never as a key silently granted the runtime's role. No
+namespace is reserved in advance: a prefix every application token
+must carry would be paid on every line of every keys file for a
+collision that may never happen.
+
 Matching a token in the file is exact and case-sensitive. The likeliest
 slip, `Trader` in one place and `trader` in the other, cannot come from
 the type, whose tokens are lowercase by the rule above; from the file,
@@ -137,7 +145,14 @@ pub enum ClientRole<R> {
 
 No `Replication` variant. The client listener refuses those keys during
 the handshake, so the type says so, and no decoder writes an arm for
-it. `is_operator()` stays. `can_trade()` and `can_manage_funds()` leave
+it. `is_operator()` stays.
+
+Exhaustive on purpose: not `#[non_exhaustive]`. That attribute would
+force every decoder outside `melin-app` to write a wildcard arm, and a
+wildcard in an access check is a default grant: a role the runtime
+adds later would inherit whatever the wildcard allows, silently. As an
+exhaustive enum, a new runtime role is a compile error in every
+decoder, which is what it should be. `can_trade()` and `can_manage_funds()` leave
 the runtime; the exchange defines what its roles may do on its own
 type.
 
@@ -184,7 +199,9 @@ an index into the application's table:
 
 The conversion runs once per request on the reader thread (the DPDK
 poll loop on that transport): one bounds-checked load from a static
-table. It never runs on the business-logic thread. A failed bounds
+table. It never runs on the business-logic thread. The call into the
+decoder stays one indirect call per request, as today: the blanket
+impl calls the typed `decode` statically. A failed bounds
 check can only be a bug, never client input, and the reader thread must
 not panic on it: the erased decoder logs an `error!` naming the index
 and the table's length, and answers `PermissionDenied` without calling
@@ -291,15 +308,18 @@ One commit per step, each reviewable on its own.
      id through a table of a larger role type, the one way to reach it,
      and calls the erased decoder directly: at that layer there is no
      `TypeId` check, which lives in the runtime's entry chain);
+   - a `NoRoles` table: `operator` and `replication` parse, any other
+     token is refused, and its error lists only the runtime's two;
    - the `TypeId` mismatch refused at startup (`server-runtime`).
 3. **The examples adopt their own vocabulary** (decision 4): new role
    types, their decoders, unit tests and `round_trip.rs` key files, and
-   the `echo "trader $PUB me"` quick-start lines in `echo` and `notary`.
-   A reviewer can see here what an application author writes.
+   the `echo "trader $PUB me"` quick-start lines in `echo`, `notary` and
+   `building-an-application.md` (its quick-start runs echo, so the line
+   moves with echo's tokens rather than waiting for step 4). A reviewer can see
+   here what an application author writes.
 4. **Docs:** `building-an-application.md`'s roles section rewritten
    around declaring a role type (the runtime's two roles, what the
-   decoder receives, how the table is validated); the quick-start line
-   there; `melin-client`'s `authorized_keys_line` doc, which lists the
+   decoder receives, how the table is validated); `melin-client`'s `authorized_keys_line` doc, which lists the
    runtime's roles; CHANGELOG under Unreleased (`Permission` renamed
    `ClientRole` with its variants replaced, and `decode`'s parameter,
    under **Changed**; `can_trade` and `can_manage_funds` under
@@ -335,9 +355,20 @@ Changed, in one commit on its side, ready to land as soon as this merges
   role. An application that wants a key to hold several capabilities
   can model that inside its own role type.
 - **Scoping a key to accounts or other resources.** Operators of trading
-  venues will ask for a key restricted to certain accounts. Nothing here
-  blocks it: a later version can let the role parser read further fields
-  on the key's line. It is a separate design.
+  venues will ask for a key restricted to certain accounts. It is a
+  separate design, and this plan leaves it room, though not where it
+  might look: everything after the key on a line is a free-text comment
+  today, so new trailing fields would change the meaning of existing
+  files. The room is in the role field. The charset rule (decision 1)
+  keeps `:`, `=` and `,` out of every token, so options attached to the
+  role, in the manner of OpenSSH's `authorized_keys` options
+  (`trader:accounts=17,42`), can never be mistaken for a token someone
+  already declared.
+- **A typed role lookup outside the decoder.** The exchange's subscriber
+  handshake needs only `KeyRole`. An application that later wants to
+  gate its own listener on its roles needs `ClientRole<R>` there too: a
+  lookup generic over `R` that checks the table's `TypeId`, as the
+  runtime does. Additive, so it waits for a user.
 - **Role aliases**, for renaming a role without editing key files.
   Refused for now (decision 1); allowing them later breaks nothing.
 - **A `roles!` macro.** See decision 4.
