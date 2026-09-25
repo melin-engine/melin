@@ -172,19 +172,41 @@ side, which is what makes the three consumers agree by construction. A
 `Tick` entry calls `tick` exactly once, which removes today's double
 call.
 
-Cost: under load `tick` already fires once per batch (the batch shares
-one stamp); it now fires once per event. `Application::tick`'s rustdoc
-already asks for a cheap "nothing is due" check and says it "runs ahead
-of nearly every event"; the exchange's `tick` is
-`drain_due_scheduled_tasks`, a heap peek when nothing is due. Measure
-with echo and counter before merging.
+Cost: under load `tick` fires once per batch today (the batch shares
+one stamp); it now fires once per event. At low load, where each batch
+holds one event, it already fires on nearly every event, so the change
+only adds calls at peak throughput. The cost is the application's
+"nothing is due" check, which `Application::tick`'s rustdoc already
+asks to be cheap; the exchange's `tick` is `drain_due_scheduled_tasks`,
+a store and a heap peek when nothing is due. The default `tick` inlines
+to nothing.
 
-Fallback if it measures badly: non-decreasing stamps, with `tick`
-firing when an entry's timestamp exceeds the previous entry's. That
-"previous entry" value is derivable from the journal (and carried by
-the snapshot, see decision 3), so it stays correct, but it is state
-again. The plumbing below is the same for both; only the dispatch rule
-differs.
+Measured (2026-09, AMD Ryzen 7 5800X3D, one pinned core, a standalone
+microbenchmark of the dispatch loop, best of seven runs of 20M
+events): with the default `tick` the two rules are indistinguishable;
+with an exchange-shaped `tick` (store the time, drain a min-heap, work
+scheduled every 64th event) the per-event rule costs at most 0.4 ns
+more per event at batch sizes 16 and 64, and is slightly faster at
+batch size 1, where it drops the watermark branch. Warm caches flatter
+a microbenchmark, but `apply` touches the same state right after, so
+the pipeline should not see a different order of magnitude. Step 4
+confirms it in the real pipeline: echo and counter for the stamping and
+encoder compares (their `tick` is the default), and a pipeline
+benchmark with a scheduler-shaped test application for the per-event
+`tick`.
+
+Decided: strict. Two alternatives were weighed and rejected:
+
+- **Non-decreasing stamps**, with `tick` firing when an entry's
+  timestamp exceeds the previous entry's. That value is derivable from
+  the journal and carried by the snapshot (decision 3), so it would stay
+  correct, but the matching stage, the shadow and recovery would each
+  have to be seeded with it again, to save a fraction of a nanosecond.
+- **`tick` only on journaled `Tick` entries.** Stateless too, but due
+  work would fire at the tick cadence (250 ms by default) instead of at
+  the first event past its deadline, ticks are dropped on a full ring,
+  exactly under load, and `apply` would see times whose due work has not
+  run, pushing deadline checks into every application.
 
 ### 3. The journal owns the time floor
 
@@ -356,9 +378,17 @@ tell a bad clock from a long downtime.
   alike, and refusing to serve on that flag would turn a correctly
   disciplined node into an outage.
 
-The jump limit is a server setting (proposed default: 60 s), well above
-any correction a disciplined clock makes on a running node and far
-below the jumps that do lasting damage.
+The jump limit is a server setting, defaulting to 5 s. The two ways to
+get it wrong are not symmetric. Accepting a bad jump freezes timers for
+its whole size once the clock is corrected, and nothing undoes it.
+Refusing a legitimate one leaves the node's time running correctly but
+behind, visible on the gauge, fixed by `CLOCK-ACCEPT`, and healed by the
+next restart or failover. So the limit sits just above the largest
+legitimate step on a running node, not far above it: chrony slews and
+steps only at startup (`makestep`), ntpd steps past 128 ms, and a
+live-migration pause advances the wall clock and `CLOCK_BOOTTIME`
+together. 5 s clears those with room to spare and caps the worst freeze
+a wrongly accepted jump can cause.
 
 ### 6. Time is never wound back, so say when it is held
 
@@ -371,8 +401,13 @@ a rate limiter's refill for one. This is the intended trade (monotonic
 over accurate), but the operator and the application author must know:
 
 - **a `warn!` when the clock is seeded**, at boot or promotion, if the
-  journal's floor leads the wall clock by more than a threshold
-  (proposed default: 1 s), naming the lead;
+  journal's floor leads the wall clock by more than 100 ms, naming the
+  lead. A fixed constant, not a setting: in steady state the lead is a
+  batch's worth of nanoseconds and after a failover the skew between
+  two disciplined clocks, so 100 ms means the clocks have a problem,
+  and it catches a one-second leap-second step that a 1 s threshold
+  would miss. Operators who want a finer line set it on the gauge
+  below;
 - **the same `warn!` from the stamping wrapper on a running primary**,
   once per crossing, re-armed only after the lead falls back under half
   the threshold so it does not flap. The wrapper already holds the raw
@@ -448,8 +483,8 @@ One commit per step, each reviewable on its own.
    likely ship, and removing it afterwards costs a format bump. Restore
    the strong contract in the rustdoc of `Application::tick` (strictly
    increasing, the same calls on every path, and time that may stand
-   still while the clock is held) and `ApplyCtx::now_ns`. Measure
-   before merging (decision 2).
+   still while the clock is held) and `ApplyCtx::now_ns`. Confirm the
+   microbenchmark in the real pipeline before merging (decision 2).
 
    Lands with the property test that proves the runtime's half of
    determinism: the sequence of calls into the application depends on
@@ -509,15 +544,6 @@ Read, not changed:
 - The exchange's rate limiter reads the clock `tick` stamps, so it
   stops refilling while the sequencer clock is held (decision 6). Worth
   a line in its own docs; no code change.
-
-## Open decisions
-
-- Strict (recommended: the only variant with no consuming-side state,
-  which is the point of the item) or non-decreasing, i.e. whether a
-  `tick` per event is acceptable once measured.
-- The clock-lead warning threshold, shared by the seeding and the
-  running warnings.
-- The forward-jump limit (proposed: 60 s).
 
 ## Not part of this item
 
