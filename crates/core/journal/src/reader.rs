@@ -1182,12 +1182,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            // Continue from sequence 100 — header records 100.
+            // Continue from sequence 100; the header records 100. No history
+            // precedes it on disk, in sequence or in time.
             let mut writer = BufferedWriter::<TestEvent>::create_continuing(
                 &path,
                 100,
                 [0u8; 32],
-                crate::TimeFloor::Unknown,
+                crate::TimeFloor::Genesis,
             )
             .unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
