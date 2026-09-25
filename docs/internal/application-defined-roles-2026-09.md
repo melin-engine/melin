@@ -70,7 +70,7 @@ pub trait Role: Copy + Eq + Debug + Send + Sync + 'static {
 ```
 
 `RequestDecoder` gains `type Role: Role`, and `decode` receives
-`Permission<Self::Role>` (decision 2). The exchange declares
+`ClientRole<Self::Role>` (decision 2). The exchange declares
 `trader`, `custodian` and `readonly`, so its key files keep working
 unchanged. A payments system declares `payer` and `auditor`.
 
@@ -106,10 +106,10 @@ runtime's own tests, and tools that only authenticate replicas (the
 exchange's `replication-bench`). It is not a default access model: an
 application on `NoRoles` admits operator keys only.
 
-### 2. The decoder sees `Permission<R>`: `Operator` or `App(R)`
+### 2. The decoder sees `ClientRole<R>`: `Operator` or `App(R)`
 
 ```rust
-pub enum Permission<R> {
+pub enum ClientRole<R> {
     Operator,
     App(R),
 }
@@ -121,9 +121,15 @@ it. `is_operator()` stays. `can_trade()` and `can_manage_funds()` leave
 the runtime; the exchange defines what its roles may do on its own
 type.
 
-The name `Permission` and the `permission` parameter are kept: the
-roadmap entry uses them, and the type still answers "what may this
-connection do". Only its contents change.
+`Permission` is renamed `ClientRole`, and `decode`'s `permission`
+parameter `role`. The value now says who the connection is, not what it
+may do: deciding that is the decoder's job, and a refusal is still
+`Decoded::PermissionDenied`. The keys file, the operator docs and the
+new `Role`, `RoleId` and `KeyRole` all speak of roles, and
+`Permission<ExchangeRole>` would read as a permission holding a role.
+The rename adds no call site to the migration, since every decoder's
+signature and every named variant change in step 1 anyway; done later,
+it would be a second breaking change for every application.
 
 ### 3. Typed at the edge, erased inside the runtime
 
@@ -137,7 +143,7 @@ an index into the application's table:
   parsing a keys file makes one, so every `RoleId` indexes a real
   table.
 - **`KeyRole`**, what the keys table maps a key to: `Replication`, or
-  `Client(Permission<RoleId>)`. `may_connect_as_client()` and
+  `Client(ClientRole<RoleId>)`. `may_connect_as_client()` and
   `is_replication()` move here from `Permission`, since that is where
   `Replication` now lives. The admin endpoint, the replication
   handshake, `melin-raft`'s peer handshake, the client listener and the
@@ -149,7 +155,7 @@ an index into the application's table:
   an index, and it records `TypeId::of::<R>()`.
 - **The runtime holds an erased decoder.** A sealed, object-safe
   `ErasedDecoder<E>` in `melin_app::decoder`, blanket-implemented for
-  every `D: RequestDecoder<Event = E>`, takes `Permission<RoleId>`,
+  every `D: RequestDecoder<Event = E>`, takes `ClientRole<RoleId>`,
   turns `App(id)` back into `D::Role` through `D::Role::ROLES`, and
   calls the typed `decode`. It also loads the keys table for its role
   type, so the runtime gets the table from the decoder and the two are
@@ -204,13 +210,13 @@ One commit per step, each reviewable on its own.
    `melin-raft`, the three examples, the doc-tested
    `building-an-application.md`): the
    `Role` trait with table validation, `NoRoles`, `RoleId`, `KeyRole`,
-   the generic `Permission<R>`, `AuthorizedKeys::parse::<R>` /
+   `ClientRole<R>` replacing `Permission`, `AuthorizedKeys::parse::<R>` /
    `load::<R>` recording the role type, `RequestDecoder::Role`, and
    `ErasedDecoder` with its blanket impl. The runtime moves to
    `KeyRole` in the admin endpoint, the replication handshake,
    `melin-raft`'s peer handshake and the client listener (tests that
    build a table for replication keys only parse it with `NoRoles`),
-   stores `Permission<RoleId>` per connection, loads
+   stores `ClientRole<RoleId>` per connection, loads
    the table through the decoder in one helper with the `TypeId` check,
    and logs roles by token. The examples declare a role type that keeps
    today's tokens (`trader`, `readonly`, and the rest they use), so
@@ -239,10 +245,11 @@ One commit per step, each reviewable on its own.
    around declaring a role type (the runtime's two roles, what the
    decoder receives, how the table is validated); the quick-start line
    there; `melin-client`'s `authorized_keys_line` doc, which lists the
-   runtime's roles; CHANGELOG under Unreleased (`Permission`'s variants
-   and helpers under **Changed** and **Removed**,
-   `may_connect_as_client` moving to `KeyRole` and the new types under
-   **Added**); the S6 note in
+   runtime's roles; CHANGELOG under Unreleased (`Permission` renamed
+   `ClientRole` with its variants replaced, and `decode`'s parameter,
+   under **Changed**; `can_trade` and `can_manage_funds` under
+   **Removed**; `may_connect_as_client` moving to `KeyRole` and the new
+   types under **Added**); the S6 note in
    [application-api-review-2026-09.md](application-api-review-2026-09.md);
    remove the roadmap entry.
 
@@ -257,10 +264,10 @@ Changed, in one commit on its side, ready to land as soon as this merges
 - `ExchangeRole { Trader, Custodian, ReadOnly }` with the tokens
   `trader`, `custodian`, `readonly`: existing key files load unchanged.
 - `RequestDecoder` declares `type Role = ExchangeRole`;
-  `check_permission` matches on `Permission<ExchangeRole>`, with
+  `check_permission` matches on `ClientRole<ExchangeRole>`, with
   `can_trade` and `can_manage_funds` moving onto `ExchangeRole` or into
   the match. Its tests move from `Permission::Trader` to
-  `Permission::App(ExchangeRole::Trader)`.
+  `ClientRole::App(ExchangeRole::Trader)`.
 - `event_publisher.rs`: `verify_subscriber` decides on `KeyRole`, and
   `SubscriberAuthError::RoleRefused` carries one.
 - `replication-bench` parses its keys with `NoRoles`.
