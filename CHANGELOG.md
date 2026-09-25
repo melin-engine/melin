@@ -14,24 +14,52 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
-- **`melin_app::auth::KeyRole`**, what `authorized_keys` grants a key:
-  `Replication`, or `Client(Permission)`. `KeyRole::client` gives the
-  permission a key has on the client listener, and `None` for a
-  replication key, so a listener of an application's own that admits the
-  same keys applies the client listener's rule through it.
+- **Application-defined client roles.** An application declares its
+  roles as a type implementing `melin_app::auth::Role`, a table pairing
+  each role with the token that names it in `authorized_keys`; the
+  runtime keeps only the two roles it acts on, `operator` and
+  `replication`. `validate_roles` checks a table (tokens lowercase ASCII
+  letters, digits, `-` and `_`, starting with a letter; none of the
+  runtime's; no token or role listed twice), and every keys-file parse
+  runs it, so a node refuses a bad table before it serves. `NoRoles` is
+  the role type of an application that admits operator keys only.
+  `ClientRole<R>` is what a decoder receives: `Operator`, or `App(R)`.
+  `KeyRole` is what the keys file grants a key, `Replication` or
+  `Client(ClientRole<RoleId>)`, with `KeyRole::client` giving a key's
+  client role and `None` for a replication key, so a listener of an
+  application's own that admits the same keys applies the client
+  listener's rule through it. `AuthorizedKeys::token` names a role for a
+  log line.
+
+### Removed
+
+- **The exchange's roles and their helpers: `Permission::Trader`,
+  `Custodian`, `ReadOnly`, `can_trade` and `can_manage_funds`.** They were
+  one application's separation of duties, in the runtime every
+  application builds on. An application that used them declares them as
+  its own `Role` type (see Changed).
+- **`Permission::may_connect_as_client` and
+  `Permission::is_replication`**, added in 0.18. A replication key is a
+  `KeyRole` now, not a permission: `KeyRole::is_replication`, and
+  `KeyRole::client`, which is `None` exactly where
+  `may_connect_as_client` was false.
 
 ### Changed
 
-- **`Permission` has no `Replication` variant, and
-  `AuthorizedKeys::lookup` returns a `KeyRole`.** A decoder never sees a
-  replication key, and its type now says so. Source-breaking: match
-  `KeyRole::Replication` where code matched `Permission::Replication`,
-  call `is_replication` on the `KeyRole`, and take a client permission
-  from `KeyRole::client`, which replaces 0.18's
-  `Permission::may_connect_as_client` (`client().is_some()` says the
-  same). Errors and logs now name a role by its token in the keys file
-  (`trader`, not `Trader`), and a keys file naming an unknown role is
-  refused with `unknown role`, listing every valid one, where it said
+- **A decoder receives the application's own roles: `Permission` is
+  replaced by `ClientRole<R>`.** `RequestDecoder` gains `type Role`, and
+  `decode` takes `role: ClientRole<Self::Role>` in place of
+  `permission: Permission`. A decoder never sees a replication key, and
+  its type now says so: there is no replication variant. Source-breaking
+  for every decoder. To migrate: declare the roles your keys files use
+  (`trader`, `readonly`, …) as your own `Role` type, so existing files
+  load unchanged; set `type Role` to it; and match `ClientRole::Operator`
+  and `ClientRole::App(role)` where you matched `Permission`.
+  `AuthorizedKeys::parse` and `load` take the role type
+  (`parse::<MyRole>`), and `lookup` returns a `KeyRole`. Errors and logs
+  now name a role by its token in the keys file (`trader`, not
+  `Trader`), and a keys file naming an unknown role is refused with
+  `unknown role`, listing every valid one, where it said
   `unknown permission`.
 
 ## [0.18.0] - 2026-09-27

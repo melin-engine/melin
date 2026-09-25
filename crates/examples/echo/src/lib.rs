@@ -78,7 +78,7 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use melin_app::auth::Permission;
+use melin_app::auth::{ClientRole, Role};
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, NoQuery, RejectReason};
@@ -288,6 +288,28 @@ impl Application for Echo {
 }
 
 // ---------------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------------
+
+/// The echo's client roles, each named by a token in the node's
+/// `authorized_keys` file. Beside them, the runtime's `operator` role may
+/// echo too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EchoRole {
+    /// May echo.
+    Trader,
+    /// May not echo: an echo is journaled like any write.
+    ReadOnly,
+}
+
+impl Role for EchoRole {
+    const ROLES: &'static [(&'static str, Self)] = &[
+        ("trader", EchoRole::Trader),
+        ("readonly", EchoRole::ReadOnly),
+    ];
+}
+
+// ---------------------------------------------------------------------------
 // Request decoder
 // ---------------------------------------------------------------------------
 
@@ -301,12 +323,13 @@ pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = Payload;
+    type Role = EchoRole;
 
-    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<Payload> {
+    fn decode(&self, body: &[u8], role: ClientRole<EchoRole>) -> Decoded<Payload> {
         // An echo appends to the journal, so the read-only role is refused,
         // as it would be for any state-mutating event. (A replication key
         // never gets this far: the client listener refuses it.)
-        if permission == Permission::ReadOnly {
+        if role == ClientRole::App(EchoRole::ReadOnly) {
             return Decoded::PermissionDenied("echoing requires a writing role");
         }
         match Payload::new(body) {
@@ -480,14 +503,10 @@ mod tests {
 
     #[test]
     fn writing_roles_may_echo() {
-        for permission in [
-            Permission::Operator,
-            Permission::Trader,
-            Permission::Custodian,
-        ] {
-            match RequestDecoder.decode(b"hi", permission) {
+        for role in [ClientRole::Operator, ClientRole::App(EchoRole::Trader)] {
+            match RequestDecoder.decode(b"hi", role) {
                 Decoded::Permitted(event) => assert_eq!(event, payload(b"hi")),
-                _ => panic!("expected Permitted for {permission:?}"),
+                _ => panic!("expected Permitted for {role:?}"),
             }
         }
     }
@@ -495,16 +514,21 @@ mod tests {
     #[test]
     fn read_only_role_may_not_echo() {
         assert!(matches!(
-            RequestDecoder.decode(b"hi", Permission::ReadOnly),
+            RequestDecoder.decode(b"hi", ClientRole::App(EchoRole::ReadOnly)),
             Decoded::PermissionDenied(_)
         ));
+    }
+
+    #[test]
+    fn the_role_table_is_valid() {
+        melin_app::auth::validate_roles::<EchoRole>().unwrap();
     }
 
     #[test]
     fn the_payload_is_the_whole_body() {
         for len in [0, 3, MAX_PAYLOAD] {
             let bytes = vec![0x5A; len];
-            match RequestDecoder.decode(&bytes, Permission::Trader) {
+            match RequestDecoder.decode(&bytes, ClientRole::App(EchoRole::Trader)) {
                 Decoded::Permitted(event) => assert_eq!(event.as_bytes(), bytes),
                 _ => panic!("expected Permitted for {len} bytes"),
             }
@@ -515,7 +539,7 @@ mod tests {
     fn decoder_refuses_what_it_cannot_carry() {
         let too_long = vec![0; MAX_PAYLOAD + 1];
         assert!(matches!(
-            RequestDecoder.decode(&too_long, Permission::Trader),
+            RequestDecoder.decode(&too_long, ClientRole::App(EchoRole::Trader)),
             Decoded::DecodeError(_)
         ));
     }

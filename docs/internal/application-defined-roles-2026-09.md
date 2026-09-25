@@ -195,7 +195,9 @@ an index into the application's table:
   `ErasedDecoder<E>` in `melin_app::decoder`, blanket-implemented for
   every `D: RequestDecoder<Event = E>`, takes `ClientRole<RoleId>`,
   turns `App(id)` back into `D::Role` through `D::Role::ROLES`, and
-  calls the typed `decode`. It also reports its role type's `TypeId`.
+  calls the typed `decode`. It also answers whether a keys table was
+  parsed for its role type (`matches_keys`), so the `TypeId` itself
+  never leaves `melin-app`.
   The runtime's `RequestDecoderArc<A>` becomes
   `Arc<dyn ErasedDecoder<A::Event>>`, and `run` and `run_with_listener`
   take `impl RequestDecoder` exactly as today.

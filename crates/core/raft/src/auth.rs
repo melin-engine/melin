@@ -68,7 +68,8 @@ fn verify_challenge_response_identified(
         .ok_or_else(|| io::Error::other("unknown control-plane key"))?;
     if !role.is_replication() {
         return Err(io::Error::other(format!(
-            "key listed as {role}, expected replication"
+            "key listed as {}, expected replication",
+            authorized_keys.token(role)
         )));
     }
 
@@ -148,11 +149,14 @@ mod tests {
     use super::*;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
+    use melin_app::auth::NoRoles;
 
-    fn keys_for(key: &SigningKey, permission: &str) -> AuthorizedKeys {
+    /// A table listing `key` under `role`, one of the runtime's own: the
+    /// control plane needs no application roles.
+    fn keys_for(key: &SigningKey, role: &str) -> AuthorizedKeys {
         let pub_b64 =
             base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
-        AuthorizedKeys::parse(&format!("{permission} {pub_b64} test\n")).unwrap()
+        AuthorizedKeys::parse::<NoRoles>(&format!("{role} {pub_b64} test\n")).unwrap()
     }
 
     /// Drive both halves over an in-memory duplex pipe.

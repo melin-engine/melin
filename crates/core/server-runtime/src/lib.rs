@@ -29,6 +29,8 @@ pub mod response;
 mod response_frame;
 pub mod server;
 mod startup;
+#[cfg(test)]
+mod test_roles;
 mod uring_teardown;
 
 pub use startup::StartupEvents;

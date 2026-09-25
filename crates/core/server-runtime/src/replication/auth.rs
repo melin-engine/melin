@@ -63,7 +63,8 @@ pub(super) fn verify_challenge_response(
         .ok_or_else(|| io::Error::other("unknown replication key"))?;
     if !role.is_replication() {
         return Err(io::Error::other(format!(
-            "key listed as {role}, expected replication"
+            "key listed as {}, expected replication",
+            authorized_keys.token(role)
         )));
     }
 
@@ -368,13 +369,13 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::VecDeque;
 
-    /// Build an `AuthorizedKeys` table granting `permission` to `key`.
-    fn keys_for(key: &SigningKey, permission: &str) -> melin_app::auth::AuthorizedKeys {
+    /// Build an `AuthorizedKeys` table listing `key` under `role`.
+    fn keys_for(key: &SigningKey, role: &str) -> melin_app::auth::AuthorizedKeys {
         let pub_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             key.verifying_key().to_bytes(),
         );
-        melin_app::auth::AuthorizedKeys::parse(&format!("{permission} {pub_b64} test\n")).unwrap()
+        crate::test_roles::desk_keys(role, &pub_b64)
     }
 
     /// Encode a `ChallengeResponse` and return just the payload (4-byte LE

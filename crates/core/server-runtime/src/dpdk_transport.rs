@@ -40,9 +40,7 @@ use std::time::{Duration, Instant};
 use rustc_hash::FxHashMap;
 
 use melin_app::Application;
-use melin_app::auth::AuthorizedKeys;
-use melin_app::auth::Permission;
-use melin_app::decoder::RequestDecoder;
+use melin_app::auth::{AuthorizedKeys, ClientRole, KeyRole, RoleId};
 use melin_app::unix_epoch_nanos;
 use melin_dpdk::transport::DpdkTransport;
 use melin_pipeline::ring;
@@ -78,7 +76,7 @@ enum AuthState {
         accepted_at: Instant,
     },
     /// Auth completed successfully. Connection is ready for requests.
-    Authenticated { permission: Permission },
+    Authenticated { role: ClientRole<RoleId> },
 }
 
 /// Per-connection state in the DPDK poll thread.
@@ -124,7 +122,7 @@ struct ConnectionState {
 pub fn run_dpdk_poll<A: Application>(
     mut transport: DpdkTransport,
     mut producer: ring::Producer<InputSlot<A::Event>>,
-    decoder: Arc<dyn RequestDecoder<Event = A::Event>>,
+    decoder: crate::reader::RequestDecoderArc<A>,
     // While it refuses writes, they are answered through `refusals`
     // instead of published — see `crate::halt`.
     halt: HaltGate,
@@ -580,14 +578,14 @@ pub fn run_dpdk_poll<A: Application>(
                         conn_handle,
                     );
                 }
-                AuthState::Authenticated { permission } => {
+                AuthState::Authenticated { role } => {
                     use crate::client_frames::{FrameAction, process_client_frames};
-                    let permission = *permission;
+                    let role = *role;
                     let action = process_client_frames::<A>(
                         &mut conn.parse_buf,
                         conn.connection_id.0,
                         conn.key_hash,
-                        permission,
+                        role,
                         &mut producer,
                         &*decoder,
                         &halt,
@@ -737,13 +735,13 @@ fn process_auth_frame(
     };
 
     let public_key_bytes = cr.public_key;
-    let permission = match crate::client_auth::verify_client(
+    let role = match crate::client_auth::verify_client(
         authorized_keys,
         &nonce,
         &public_key_bytes,
         &cr.signature,
     ) {
-        Ok(permission) => permission,
+        Ok(role) => role,
         Err(e) => {
             debug!(
                 connection_id = conn.connection_id.0,
@@ -765,14 +763,14 @@ fn process_auth_frame(
     debug!(
         connection_id = conn.connection_id.0,
         addr = %conn.addr,
-        role = %permission,
+        role = authorized_keys.token(KeyRole::Client(role)),
         "DPDK: authenticated"
     );
 
     // Transition to authenticated state, under the identity the
     // application sees as `ApplyCtx::key_hash`.
     conn.key_hash = melin_app::key_hash(&public_key_bytes);
-    conn.auth = AuthState::Authenticated { permission };
+    conn.auth = AuthState::Authenticated { role };
 
     // Register with the response stage and ID map — before this thread
     // parses a single request of the connection, and keep it that way:
