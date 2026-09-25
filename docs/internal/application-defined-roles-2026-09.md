@@ -245,7 +245,11 @@ One commit per step, each reviewable on its own.
    replication handshake, `melin-raft`'s peer handshake and the client
    listener decide on `KeyRole`, and the handshake logs name a key's
    role by its token. The tokens and the decoder signature are
-   unchanged, so no decoder and no key file changes. This commit is
+   unchanged, so no decoder and no key file in this repo changes. It
+   already breaks Exchange Core, whose subscriber check calls
+   `may_connect_as_client()` on a `Permission` and whose tests name
+   `Permission::Replication`: the branch merges as a whole, and the
+   exchange migrates once, after the merge, not step by step. This commit is
    the handshake diff on its own, and it survives the next one, which
    only changes what `KeyRole::Client` holds.
 
@@ -284,7 +288,9 @@ One commit per step, each reviewable on its own.
      `Operator` as `Operator`;
    - an out-of-range `RoleId` through the erased decoder answers
      `PermissionDenied` without calling `decode` (the test builds the
-     id through a table of a larger role type, the one way to reach it);
+     id through a table of a larger role type, the one way to reach it,
+     and calls the erased decoder directly: at that layer there is no
+     `TypeId` check, which lives in the runtime's entry chain);
    - the `TypeId` mismatch refused at startup (`server-runtime`).
 3. **The examples adopt their own vocabulary** (decision 4): new role
    types, their decoders, unit tests and `round_trip.rs` key files, and
