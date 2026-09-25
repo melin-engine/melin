@@ -458,6 +458,9 @@ fn shadow_snapshots(dir: &Path, slots: &[InputSlot<Step>], chain: &[[u8; 32]]) -
         fsync_writer.store(FsyncState {
             journal_seq: WireSeq::new(anchor),
             chain_hash: chain[anchor as usize],
+            // The anchor entry's stamp, which recovery checks against the
+            // journal's.
+            last_timestamp: slot.timestamp,
             input_ring_seq: RingPos::new(i as u64 + 1),
         });
         producer.publish(*slot);
@@ -468,12 +471,20 @@ fn shadow_snapshots(dir: &Path, slots: &[InputSlot<Step>], chain: &[[u8; 32]]) -
         wait_for("the shadow's snapshot at an anchor", || {
             saved = crate::snapshot::load::<RecordingApp>(&shadow_path)
                 .ok()
-                .filter(|(_, seq, _, _)| *seq == anchor);
+                .filter(|loaded| loaded.sequence == anchor);
             saved.is_some()
         });
-        let (app, seq, chain_hash, epoch) = saved.unwrap();
+        let loaded = saved.unwrap();
         let path = dir.join(format!("anchor-{anchor}.snapshot"));
-        crate::snapshot::save(&app, WireSeq::new(seq), chain_hash, epoch, &path).unwrap();
+        crate::snapshot::save(
+            &loaded.app,
+            WireSeq::new(loaded.sequence),
+            loaded.chain_hash,
+            loaded.epoch,
+            loaded.floor.time(),
+            &path,
+        )
+        .unwrap();
         anchors.push(path);
     }
     shutdown.store(true, Ordering::Relaxed);

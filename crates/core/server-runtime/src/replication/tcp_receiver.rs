@@ -824,8 +824,12 @@ where
         // across rotations (bitwise mirror).
         if pipeline.is_none() && journal_writer.is_none() {
             let (lineage_start, lineage_anchor) = stream_lineage;
-            let writer =
-                BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
+            let writer = BufferedWriter::create_continuing(
+                journal_path,
+                lineage_start,
+                lineage_anchor,
+                super::fresh_replica_floor(lineage_start)?,
+            )?;
             app = Some(A::default());
             journal_writer = Some(writer);
         }
@@ -1286,6 +1290,7 @@ mod tests {
             let primary_journal = dir.path().join("primary.journal");
             let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
             let mut chain_at_4 = [0u8; 32];
+            let mut stamp_at_4 = melin_app::SequencerTime::default();
             for v in 1..=5u64 {
                 w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
                 if v == 2 {
@@ -1293,6 +1298,7 @@ mod tests {
                 }
                 if v == 4 {
                     chain_at_4 = w.chain_hash().expect("chain");
+                    stamp_at_4 = w.last_timestamp();
                 }
             }
             drop(w);
@@ -1301,6 +1307,7 @@ mod tests {
                 WireSeq::new(4),
                 chain_at_4,
                 0,
+                stamp_at_4,
                 &primary_journal.with_extension("snapshot"),
             )
             .expect("save snapshot");
@@ -1626,6 +1633,7 @@ mod tests {
             let primary_journal = dir.path().join("primary.journal");
             let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
             let mut chain_at_4 = [0u8; 32];
+            let mut stamp_at_4 = melin_app::SequencerTime::default();
             for v in 1..=5u64 {
                 w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
                 if v == 2 {
@@ -1633,6 +1641,7 @@ mod tests {
                 }
                 if v == 4 {
                     chain_at_4 = w.chain_hash().expect("chain");
+                    stamp_at_4 = w.last_timestamp();
                 }
             }
             drop(w);
@@ -1641,6 +1650,7 @@ mod tests {
                 WireSeq::new(4),
                 chain_at_4,
                 0,
+                stamp_at_4,
                 &primary_journal.with_extension("snapshot"),
             )
             .expect("save snapshot");
@@ -2257,8 +2267,12 @@ mod tests {
             let primary_journal = dir.path().join("primary.journal");
             let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
             for v in 1..=2u64 {
-                w.batch_append_with_ts(&JournalEvent::App(EvtAdd(v)), v, 0)
-                    .expect("append");
+                w.batch_append_with_ts(
+                    &JournalEvent::App(EvtAdd(v)),
+                    melin_app::SequencerTime::from_ns(v),
+                    0,
+                )
+                .expect("append");
             }
             w.flush_batch_sync().expect("flush");
             let chain_at_2 = w.chain_hash().expect("chain");

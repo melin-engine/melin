@@ -297,6 +297,7 @@ impl DurabilityCursors {
             publisher.store(FsyncState {
                 journal_seq: WireSeq::new(meta.journal_seq),
                 chain_hash: meta.chain_hash,
+                last_timestamp: meta.last_timestamp,
                 input_ring_seq: RingPos::new(meta.ring_progress),
             });
         }
@@ -558,6 +559,7 @@ mod tests {
             len: len as u32,
             journal_seq,
             chain_hash: [journal_seq as u8; 32],
+            last_timestamp: melin_app::SequencerTime::from_ns(1_000 + journal_seq),
             ring_progress: progress,
         }
     }

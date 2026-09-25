@@ -279,11 +279,16 @@ pub fn read_segment_prefix(path: &Path, through_seq: u64) -> Result<Option<Vec<u
 /// this is the only guard against a buggy or mismatched primary
 /// seeding a torn or wrong-position segment that local recovery would
 /// reject much later, at the worst possible time.
+///
+/// Returns the stamp of the seed's last entry, the entry at
+/// `through_seq`, for the caller to check against the snapshot the seed
+/// continues; `None` when the seed holds no entries (the snapshot sits at
+/// a segment boundary).
 pub fn verify_segment_prefix(
     path: &Path,
     through_seq: u64,
     expected_len: u64,
-) -> Result<(), JournalError> {
+) -> Result<Option<melin_app::SequencerTime>, JournalError> {
     let info = read_header_info(path)?;
     let mut scanner = crate::reader::RawJournalScanner::open(path)?;
     let mut buf = Vec::with_capacity(1 << 20);
@@ -311,11 +316,12 @@ pub fn verify_segment_prefix(
     if bytes != expected_len {
         return fail("segment seed byte length does not match its entries");
     }
+    let last_timestamp = scanner.last_timestamp();
     buf.clear();
     if scanner.read_raw_batch(&mut buf, 256)?.is_some() {
         return fail("segment seed carries entries past the expected sequence");
     }
-    Ok(())
+    Ok(last_timestamp)
 }
 
 /// Build the path for archive number `n`.
@@ -787,14 +793,23 @@ mod tests {
         let seed = read_segment_prefix(&live, 2).unwrap().unwrap();
         let seeded = dir.path().join("seeded.journal");
         std::fs::write(&seeded, &seed).unwrap();
-        verify_segment_prefix(&seeded, 2, seed.len() as u64).expect("real prefix verifies");
+        let seed_last =
+            verify_segment_prefix(&seeded, 2, seed.len() as u64).expect("real prefix verifies");
+        // The stamp of the seed's last entry, for the caller's check
+        // against the snapshot it continues.
+        let mut reader = crate::reader::JournalReader::<TestEvent>::open(&live).unwrap();
+        reader.next_entry().unwrap();
+        let second = reader.next_entry().unwrap().expect("entry 2");
+        assert_eq!(seed_last, Some(second.timestamp));
 
-        // Header-only prefix (snapshot exactly at the opening boundary).
+        // Header-only prefix (snapshot exactly at the opening boundary):
+        // no entry, so no stamp.
         let header_only = read_segment_prefix(&live, 0).unwrap().unwrap();
         let seeded2 = dir.path().join("seeded2.journal");
         std::fs::write(&seeded2, &header_only).unwrap();
-        verify_segment_prefix(&seeded2, 0, header_only.len() as u64)
+        let empty_last = verify_segment_prefix(&seeded2, 0, header_only.len() as u64)
             .expect("header-only prefix verifies");
+        assert_eq!(empty_last, None);
 
         // Lies: wrong end sequence, wrong length, entries past the end.
         assert!(verify_segment_prefix(&seeded, 3, seed.len() as u64).is_err());
@@ -896,7 +911,15 @@ mod tests {
         forge_gap_entry(&live, 4); // expected 3, found 4
         std::fs::rename(&live, archive_path(&live, 1)).unwrap();
         // Recreate an (empty) live so the archive isn't the last word.
-        drop(BufferedWriter::<TestEvent>::create_continuing(&live, 5, [0u8; 32]).unwrap());
+        drop(
+            BufferedWriter::<TestEvent>::create_continuing(
+                &live,
+                5,
+                [0u8; 32],
+                crate::TimeFloor::Unknown,
+            )
+            .unwrap(),
+        );
 
         let err = verify_lineage::<TestEvent>(&live).unwrap_err();
         assert!(

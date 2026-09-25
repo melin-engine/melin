@@ -78,6 +78,11 @@ pub struct FsyncState {
     /// BLAKE3 chain hash after the fsync. `[0u8; 32]` when hash-chain
     /// is disabled.
     pub chain_hash: [u8; 32],
+    /// The journal's time floor after the fsync: the stamp of the entry
+    /// at `journal_seq`. A snapshot records it beside the sequence and
+    /// chain hash, never the shadow's last slot, which may be an
+    /// unstamped query.
+    pub last_timestamp: SequencerTime,
     /// Input ring position one past the last slot `journal_seq` covers
     /// — the same value the disk thread publishes as journal-consumer
     /// progress for this batch (not the read cursor, which at a
@@ -87,15 +92,19 @@ pub struct FsyncState {
     pub input_ring_seq: RingPos,
 }
 
-// Safety: `repr(C)` over padding-free fields (`WireSeq` and `RingPos` are
-// `repr(transparent)` over `u64`, plus a byte array), with the assertion
-// below proving the size equals the sum of the field sizes — under
-// `repr(C)`, that equality rules out padding.
+// Safety: `repr(C)` over padding-free fields (`WireSeq`, `SequencerTime`
+// and `RingPos` are `repr(transparent)` over `u64`, plus a byte array),
+// with the assertion below proving the size equals the sum of the field
+// sizes: under `repr(C)`, that equality rules out padding.
 unsafe impl NoPadding for FsyncState {}
 // Compile-time proof for the impl above; fails the build if a future field
 // introduces padding.
 const _: () = assert!(
-    size_of::<FsyncState>() == size_of::<WireSeq>() + size_of::<[u8; 32]>() + size_of::<RingPos>()
+    size_of::<FsyncState>()
+        == size_of::<WireSeq>()
+            + size_of::<[u8; 32]>()
+            + size_of::<SequencerTime>()
+            + size_of::<RingPos>()
 );
 
 /// Per-stage busy/idle iteration counters for pipeline utilization monitoring.
@@ -1282,7 +1291,7 @@ impl<E: AppEvent> Sequencer<E> {
                             .encode_event(
                                 chunk.bytes_mut(),
                                 seq,
-                                slot.timestamp.as_ns(),
+                                slot.timestamp,
                                 &slot.event,
                                 slot.key_hash,
                             )
@@ -1503,7 +1512,7 @@ impl<E: AppEvent> Sequencer<E> {
                 if let Err(e) = self.core.encoder.encode_event(
                     chunk.bytes_mut(),
                     seq,
-                    slot.timestamp.as_ns(),
+                    slot.timestamp,
                     &slot.event,
                     slot.key_hash,
                 ) {
@@ -1796,6 +1805,7 @@ impl<E: AppEvent> SequencerCore<E> {
             } else {
                 [0u8; 32]
             },
+            last_timestamp: self.encoder.last_timestamp(),
             ring_progress: progress,
         };
 
@@ -3094,14 +3104,16 @@ fn build_input_disruptor<E: AppEvent + Send + 'static>(
 }
 
 /// The fsync state of `writer`'s journal before a pipeline writes to it:
-/// its last sequence and the chain hash after it, at ring position zero,
-/// since nothing has been published yet. The same pair recovery hands a
-/// replica's first handshake, so a reconnect before the stage's first
-/// fsync resumes from what the journal holds rather than from nothing.
+/// its last sequence, the chain hash and time floor after it, at ring
+/// position zero, since nothing has been published yet. The same pair
+/// recovery hands a replica's first handshake, so a reconnect before the
+/// stage's first fsync resumes from what the journal holds rather than
+/// from nothing.
 fn fsync_state_at_open<E: AppEvent>(writer: &BufferedWriter<E>) -> FsyncState {
     FsyncState {
         journal_seq: WireSeq::new(writer.next_sequence().saturating_sub(1)),
         chain_hash: writer.chain_hash().unwrap_or([0u8; 32]),
+        last_timestamp: writer.last_timestamp(),
         input_ring_seq: RingPos::new(0),
     }
 }

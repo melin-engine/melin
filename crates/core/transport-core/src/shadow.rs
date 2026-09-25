@@ -137,9 +137,9 @@ pub fn run<A: Application>(
 }
 
 /// Save a shadow snapshot if the shadow's ring cursor is aligned with
-/// the journal stage's last fsync boundary. When aligned, journal_seq
-/// and chain_hash from [`FsyncState`] correspond exactly to the
-/// shadow's app state.
+/// the journal stage's last fsync boundary. When aligned, journal_seq,
+/// chain_hash and last_timestamp from [`FsyncState`] correspond exactly
+/// to the shadow's app state.
 ///
 /// When not aligned (shadow mid-batch or journal fsynced again since
 /// shadow's last consume), the snapshot is deferred — the next timer
@@ -156,7 +156,14 @@ fn try_save_snapshot<A: Application>(
     if state.input_ring_seq.get() != consumer.next_read() {
         return;
     }
-    match snapshot::save::<A>(app, state.journal_seq, state.chain_hash, epoch, path) {
+    match snapshot::save::<A>(
+        app,
+        state.journal_seq,
+        state.chain_hash,
+        epoch,
+        state.last_timestamp,
+        path,
+    ) {
         Ok(()) => {
             info!(
                 journal_seq = state.journal_seq.get(),
@@ -240,6 +247,7 @@ mod tests {
         let (_writer, fsync_state) = seqlock::split(FsyncState {
             journal_seq: WireSeq::new(3),
             chain_hash: [0xAB; 32],
+            last_timestamp: SequencerTime::from_ns(7_000),
             input_ring_seq: RingPos::new(2),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -304,9 +312,15 @@ mod tests {
         // Verify the snapshot file was created and is loadable, and that
         // both adds are reflected in the restored app's running total.
         assert!(snap_path.exists(), "snapshot file should exist");
-        let (restored, _seq, chain, _epoch) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        assert_eq!(chain, [0xAB; 32]); // chain hash from the seqlock
-        assert_eq!(restored.total, 1500);
+        let loaded = snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_eq!(loaded.chain_hash, [0xAB; 32]); // chain hash from the seqlock
+        // The stamp too comes from the seqlock, the journal stage's, and
+        // not from the shadow's last slot (these slots carry zero).
+        assert_eq!(
+            loaded.floor,
+            melin_journal::TimeFloor::After(SequencerTime::from_ns(7_000))
+        );
+        assert_eq!(loaded.app.total, 1500);
     }
 
     /// The shadow sees queries, which the matching stage answers through
@@ -328,6 +342,7 @@ mod tests {
         let (_writer, fsync_state) = seqlock::split(FsyncState {
             journal_seq: WireSeq::new(1),
             chain_hash: [0; 32],
+            last_timestamp: SequencerTime::default(),
             input_ring_seq: RingPos::new(2),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -382,7 +397,7 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let (restored, _seq, _chain, _epoch) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let restored = snapshot::load::<TestApp>(&snap_path).unwrap().app;
         assert_eq!(restored.total, 7, "the write after the query is applied");
         assert_eq!(restored.ticks, 0, "a query must not advance the clock");
         assert!(
@@ -457,6 +472,7 @@ mod tests {
         let (mut fsync_state_writer, fsync_state) = seqlock::split(FsyncState {
             journal_seq: WireSeq::new(2),
             chain_hash: [0x11; 32],
+            last_timestamp: SequencerTime::default(),
             input_ring_seq: RingPos::new(1),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -498,7 +514,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(snap_path.exists(), "first snapshot must be written");
-        let (_, _, hash_initial, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let hash_initial = snapshot::load::<TestApp>(&snap_path).unwrap().chain_hash;
         assert_eq!(hash_initial, [0x11; 32], "first snapshot has initial hash");
 
         // Phase 2: update FsyncState (new hash + advanced ring cursor),
@@ -506,6 +522,7 @@ mod tests {
         fsync_state_writer.store(FsyncState {
             journal_seq: WireSeq::new(3),
             chain_hash: [0x22; 32],
+            last_timestamp: SequencerTime::default(),
             input_ring_seq: RingPos::new(2),
         });
         producer.publish(InputSlot {
@@ -520,8 +537,8 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok((_, _, hash, _)) = snapshot::load::<TestApp>(&snap_path)
-                && hash == [0x22; 32]
+            if let Ok(loaded) = snapshot::load::<TestApp>(&snap_path)
+                && loaded.chain_hash == [0x22; 32]
             {
                 break;
             }
@@ -554,6 +571,7 @@ mod tests {
         let (_writer, fsync_state) = seqlock::split(FsyncState {
             journal_seq: WireSeq::new(6),
             chain_hash: [0xCD; 32],
+            last_timestamp: SequencerTime::default(),
             input_ring_seq: RingPos::new(5),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -602,14 +620,14 @@ mod tests {
         // between snapshot emission and the next event arriving.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok((restored, _, _, _)) = snapshot::load::<TestApp>(&snap_path)
-                && restored.total == 150
+            if let Ok(loaded) = snapshot::load::<TestApp>(&snap_path)
+                && loaded.app.total == 150
             {
                 break;
             }
             if Instant::now() >= deadline {
                 let observed = snapshot::load::<TestApp>(&snap_path)
-                    .map(|(a, _, _, _)| a.total)
+                    .map(|loaded| loaded.app.total)
                     .unwrap_or(u64::MAX);
                 panic!("snapshot did not reach total=150 (observed={observed})");
             }

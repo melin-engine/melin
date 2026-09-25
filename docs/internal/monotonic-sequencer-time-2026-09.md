@@ -230,19 +230,26 @@ chain hash already are.
   journal stage runs on it after `into_halves` splits the writer, and
   `from_halves` hands it back when a replica is promoted, so the floor
   moves with it through both handoffs with nothing to copy.
-- **Every writer constructor takes the floor, typed, with no default.**
-  `create`, `create_continuing` and `open_append` take a `TimeFloor`,
-  threaded in beside `last_seq` with the same provenance, so one
-  parameter covers an empty segment and a resumed one alike:
-  - `Genesis`: a brand-new journal, nothing precedes it;
+- **Every writer constructor that opens partway through history takes
+  the floor, typed, with no default.** `create_continuing` and
+  `open_append` take a `TimeFloor`, threaded in beside `last_seq` with
+  the same provenance, so one parameter covers an empty segment and a
+  resumed one alike. `create` takes none: it starts a journal at
+  sequence 1, where nothing precedes it in time either.
+  - `Genesis`: a brand-new journal, nothing precedes it. Also a fresh
+    replica's journal, created from the `StreamStart` lineage with no
+    history of its own: a primary streams to such a replica only when
+    catch-up can serve it from sequence 1, so a lineage starting
+    anywhere else is refused;
   - `After(ts)`: the stamp of the last entry before the write position.
     Recovery on the live segment passes the last stamp its walk read,
     the interrupted-rotation path the last stamp seen in the walked
-    archives, and a snapshot-only boot or a resync the snapshot's stamp
-    (a resync seed ends at the snapshot's anchor entry, or holds no
-    entries when the snapshot sits at a segment boundary, so the
-    snapshot's stamp is the floor either way);
-  - `Unknown`: a v1 or v2 snapshot, which records no stamp.
+    archives, a snapshot-only boot the snapshot's stamp, and a resync
+    the stamp of the seed's last entry, which is the snapshot's anchor
+    entry, or the snapshot's stamp when the seed holds no entries (the
+    snapshot sits at a segment boundary);
+  - `Unknown`: a v1 or v2 snapshot, which records no stamp, with no
+    entry to read one from.
 
   `Genesis` and `Unknown` both behave as zero, but they are distinct at
   the call site, so every place the guarantee is waived can be found by
@@ -260,9 +267,11 @@ chain hash already are.
   snapshot's beside the existing chain check
   (`SnapshotTimestampMismatch`), and the resync path compares the seed's
   last entry with the transferred snapshot beside its chain check, the
-  stamp coming from the walk `verify_segment_prefix` already makes. A
-  wrong stamp in a snapshot is otherwise invisible until a snapshot-only
-  boot seeds a primary below its replicas' floors.
+  stamp coming from the walk `verify_segment_prefix` already makes (the
+  raw scan reads it from the entry header, no parsing added). Both are
+  fatal: retrying cannot fix a snapshot that disagrees with its own
+  journal. A wrong stamp in a snapshot is otherwise invisible until a
+  snapshot-only boot seeds a primary below its replicas' floors.
 
 `run_as_primary` (kernel TCP and DPDK) seeds the clock from the floor
 of the writer it receives.
@@ -569,6 +578,17 @@ Read, not changed here; the fixes belong to the exchange.
   clock read, and from step 3 the encoder refuses equal stamps, which
   the replication bench reaches at bench rates. They need a strictly
   increasing stamp: the stamping producer, or at least `last + 1`.
+- **Broken since step 2**, mechanical:
+  - `batch_append_with_ts` takes a `SequencerTime`:
+    `bench/src/journal_writer_bench.rs` and five calls in
+    `server/tests/journal_recovery.rs`. The bench stamps every event 0,
+    which step 3 refuses; it needs increasing stamps.
+  - `snapshot::load` returns a `LoadedSnapshot` struct instead of a
+    tuple: `server/tests/journal_recovery.rs` and
+    `server/tests/failover.rs` destructure it; `server/tests/engine_fuzz.rs`
+    discards it and compiles unchanged.
+  - `JournalEntry::timestamp_ns` is now `timestamp: SequencerTime`:
+    `server/src/bin/journal-diff.rs`.
 - `ServerApp::tick` is compatible as is; it will run once per event
   instead of once per batch.
 - `scheduler.rs`'s module doc refers to `Tick { now_ns }` and needs

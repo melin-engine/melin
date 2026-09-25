@@ -23,8 +23,8 @@
 
 use std::path::Path;
 
-use melin_app::{Application, ApplyCtx};
-use melin_journal::{JournalError, JournalReader, JournalWrite};
+use melin_app::{Application, ApplyCtx, SequencerTime};
+use melin_journal::{JournalError, JournalReader, JournalWrite, TimeFloor};
 
 use crate::dispatch::dispatch;
 use crate::snapshot;
@@ -82,6 +82,18 @@ pub enum JournaledAppError {
         first_segment_start: u64,
         required_floor: u64,
     },
+    /// The snapshot's recorded stamp at its anchor sequence does not
+    /// match the stamp of the journal's entry at that sequence. The chain
+    /// hash agreed (or hash-chain is off), so the history is the same one
+    /// and the snapshot's stamp is wrong: a bug in whatever wrote it, or
+    /// tampering. Refused because the stamp becomes the time floor of a
+    /// node booted from the snapshot alone, where a wrong one would go
+    /// unnoticed until that node's time runs behind its replicas'.
+    SnapshotTimestampMismatch {
+        snap_sequence: u64,
+        snapshot_timestamp: SequencerTime,
+        journal_timestamp: SequencerTime,
+    },
 }
 
 impl std::fmt::Display for JournaledAppError {
@@ -122,6 +134,18 @@ impl std::fmt::Display for JournaledAppError {
                  without a covering snapshot, or snapshot/journal from different points \
                  in the lineage",
             ),
+            Self::SnapshotTimestampMismatch {
+                snap_sequence,
+                snapshot_timestamp,
+                journal_timestamp,
+            } => write!(
+                f,
+                "snapshot timestamp mismatch at sequence {snap_sequence}: snapshot \
+                 recorded {} ns but the journal's entry carries {} ns; the snapshot \
+                 was written wrong or tampered with",
+                snapshot_timestamp.as_ns(),
+                journal_timestamp.as_ns(),
+            ),
         }
     }
 }
@@ -135,6 +159,7 @@ impl std::error::Error for JournaledAppError {
             Self::SnapshotAnchorMissing { .. } => None,
             Self::SnapshotChainMismatch { .. } => None,
             Self::MissingHistoryPrefix { .. } => None,
+            Self::SnapshotTimestampMismatch { .. } => None,
         }
     }
 }
@@ -180,33 +205,59 @@ pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     last_drain_ns: u64,
     /// Stamps the test-only helpers' events: the production clock, so two
     /// calls inside one nanosecond stay strictly ordered as they would
-    /// live. Starts from zero, like the primary's.
+    /// live. Seeded from the writer's time floor, as the primary's is.
     #[cfg(any(test, feature = "test-utils"))]
     clock: crate::clock::SequencerClock,
 }
 
-/// The clock behind the test-only helpers.
-#[cfg(any(test, feature = "test-utils"))]
-fn helper_clock() -> crate::clock::SequencerClock {
-    crate::clock::SequencerClock::new(crate::clock::SystemClocks, crate::clock::DEFAULT_JUMP_LIMIT)
+/// Where a restored snapshot sits in the journal: what recovery resumes
+/// from and checks the journal against.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotAnchor {
+    sequence: u64,
+    chain_hash: [u8; 32],
+    epoch: u64,
+    floor: TimeFloor,
 }
 
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
+    /// Assemble from a recovered (or fresh) application and writer.
+    fn assembled(
+        app: A,
+        writer: W,
+        recovered_epoch: u64,
+        #[cfg(any(test, feature = "test-utils"))] last_drain_ns: u64,
+    ) -> Self {
+        #[cfg(any(test, feature = "test-utils"))]
+        let clock = crate::clock::SequencerClock::new(
+            crate::clock::SystemClocks,
+            crate::clock::DEFAULT_JUMP_LIMIT,
+            writer.last_timestamp(),
+        );
+        Self {
+            app,
+            writer,
+            recovered_epoch,
+            #[cfg(any(test, feature = "test-utils"))]
+            last_drain_ns,
+            #[cfg(any(test, feature = "test-utils"))]
+            clock,
+        }
+    }
+
     /// Create a new journaled app with a fresh journal file, starting
     /// from `app` — the runtime passes the application's genesis state,
     /// `A::default()`.
     pub fn create(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
         let writer = W::create(journal_path)?;
         // Genesis node — no prior promotion, so epoch starts at 0.
-        Ok(Self {
+        Ok(Self::assembled(
             app,
             writer,
-            recovered_epoch: 0,
+            0,
             #[cfg(any(test, feature = "test-utils"))]
-            last_drain_ns: 0,
-            #[cfg(any(test, feature = "test-utils"))]
-            clock: helper_clock(),
-        })
+            0,
+        ))
     }
 
     /// Recover from an existing journal. Replays every archived segment
@@ -225,45 +276,58 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         snapshot_path: &Path,
         journal_path: &Path,
     ) -> Result<Self, JournaledAppError> {
-        let (app, snap_sequence, snap_chain_hash, snap_epoch) = snapshot::load::<A>(snapshot_path)?;
+        let loaded = snapshot::load::<A>(snapshot_path)?;
         Self::recover_inner(
-            app,
+            loaded.app,
             journal_path,
-            Some((snap_sequence, snap_chain_hash, snap_epoch)),
+            Some(SnapshotAnchor {
+                sequence: loaded.sequence,
+                chain_hash: loaded.chain_hash,
+                epoch: loaded.epoch,
+                floor: loaded.floor,
+            }),
         )
     }
 
     /// Shared multi-segment recovery driver.
     ///
-    /// `snapshot` carries `(sequence, chain_hash, epoch)` when the caller
-    /// has already restored from a snapshot; events with `seq <= sequence`
-    /// are skipped during replay but still walked so per-segment chain
-    /// validation runs. The epoch seeds the recovered-epoch accumulator.
+    /// `snapshot` is where a snapshot the caller has already restored
+    /// sits; events with `seq <= sequence` are skipped during replay but
+    /// still walked so per-segment chain validation runs. The epoch seeds
+    /// the recovered-epoch accumulator.
     ///
     /// Cross-segment continuity is enforced before each segment is
     /// replayed: its header anchor must equal the previous segment's
     /// tail chain hash ([`JournalError::SegmentChainBreak`] otherwise),
     /// and its header `starting_sequence` must continue the sequence
     /// space without gap or overlap.
+    ///
+    /// The writer reopens with the time floor the walk ends on: the stamp
+    /// of the last entry it read, including those at or below the
+    /// snapshot's anchor, or the snapshot's own when the walk read none
+    /// (every retained segment starts past the anchor and is empty).
     fn recover_inner(
         mut app: A,
         journal_path: &Path,
-        snapshot: Option<(u64, [u8; 32], u64)>,
+        snapshot: Option<SnapshotAnchor>,
     ) -> Result<Self, JournaledAppError> {
         let archives = melin_journal::segment::list_archives(journal_path)?;
         // Highest fencing epoch observed during replay. Seeded from the
         // snapshot's epoch (replay only walks entries strictly after the
         // snapshot, so an `EpochBump` folded into the snapshot is invisible
         // here) and raised by each replayed `EpochBump`.
-        let mut recovered_epoch = snapshot.map(|(_, _, e)| e).unwrap_or(0);
+        let mut recovered_epoch = snapshot.map(|s| s.epoch).unwrap_or(0);
 
         let has_snapshot = snapshot.is_some();
-        let snap_sequence = snapshot.map(|(s, _, _)| s).unwrap_or(0);
+        let snap_sequence = snapshot.map(|s| s.sequence).unwrap_or(0);
         // Expected chain hash at the snapshot's anchor sequence. Compared
-        // inside `replay_segment` when the anchor entry is observed, and
         // against a successor segment's header anchor when the snapshot
-        // is anchored exactly at a rotation boundary.
-        let snap_chain_check: Option<[u8; 32]> = snapshot.map(|(_, h, _)| h);
+        // is anchored exactly at a rotation boundary (the anchor entry
+        // itself is checked inside `replay_segment`).
+        let snap_chain_check: Option<[u8; 32]> = snapshot.map(|s| s.chain_hash);
+        // Stamp of the last entry the walk read, whatever its sequence:
+        // the time floor the writer reopens with.
+        let mut last_walked: Option<SequencerTime> = None;
 
         let mut reports: Vec<A::Report> = Vec::new();
         let mut last_drain_ns: u64 = 0;
@@ -301,10 +365,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             replay_segment(
                 &mut reader,
                 &mut app,
-                snap_sequence,
-                snap_chain_check,
+                snapshot,
                 &mut last_drain_ns,
                 &mut recovered_epoch,
+                &mut last_walked,
                 &mut reports,
                 /* allow_partial_tail = */ false,
             )?;
@@ -363,16 +427,15 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 });
             }
             let anchor = prev_tail_hash.unwrap_or([0u8; 32]);
-            let writer = W::create_continuing(journal_path, last_seq_seen + 1, anchor)?;
-            return Ok(Self {
+            let floor = walked_floor(last_walked, snapshot);
+            let writer = W::create_continuing(journal_path, last_seq_seen + 1, anchor, floor)?;
+            return Ok(Self::assembled(
                 app,
                 writer,
                 recovered_epoch,
                 #[cfg(any(test, feature = "test-utils"))]
                 last_drain_ns,
-                #[cfg(any(test, feature = "test-utils"))]
-                clock: helper_clock(),
-            });
+            ));
         }
 
         let mut reader = JournalReader::<A::Event>::open(journal_path)?;
@@ -384,10 +447,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         replay_segment(
             &mut reader,
             &mut app,
-            snap_sequence,
-            snap_chain_check,
+            snapshot,
             &mut last_drain_ns,
             &mut recovered_epoch,
+            &mut last_walked,
             &mut reports,
             /* allow_partial_tail = */ true,
         )?;
@@ -413,7 +476,12 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             });
         }
 
-        let writer = W::open_append(journal_path, last_seq, valid_end)?;
+        let writer = W::open_append(
+            journal_path,
+            last_seq,
+            valid_end,
+            walked_floor(last_walked, snapshot),
+        )?;
 
         // The writer rebuilt its chain self-containedly (header anchor +
         // raw byte re-absorption to `valid_end`); the reader accumulated
@@ -429,15 +497,13 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             "writer's rebuilt chain must equal the reader's accumulated chain"
         );
 
-        Ok(Self {
+        Ok(Self::assembled(
             app,
             writer,
             recovered_epoch,
             #[cfg(any(test, feature = "test-utils"))]
             last_drain_ns,
-            #[cfg(any(test, feature = "test-utils"))]
-            clock: helper_clock(),
-        })
+        ))
     }
 
     /// Save a snapshot of the current application state. The snapshot
@@ -455,6 +521,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             seq,
             chain_hash,
             self.recovered_epoch,
+            self.writer.last_timestamp(),
             snapshot_path,
         )?;
         Ok(())
@@ -505,17 +572,15 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// "snapshot-only" recovery path (journal missing post-rotation),
     /// which supplies the epoch read from the snapshot it loaded.
     pub fn from_parts(app: A, writer: W, recovered_epoch: u64) -> Self {
-        Self {
+        Self::assembled(
             app,
             writer,
             recovered_epoch,
             // Nothing was replayed, so there is no replayed clock: zero,
             // as the matching stage starts from at every boot.
             #[cfg(any(test, feature = "test-utils"))]
-            last_drain_ns: 0,
-            #[cfg(any(test, feature = "test-utils"))]
-            clock: helper_clock(),
-        }
+            0,
+        )
     }
 
     /// Decompose into parts for the pipeline architecture.
@@ -576,8 +641,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         timestamp: melin_app::SequencerTime,
         out: &mut Vec<A::Report>,
     ) -> Result<(), JournalError> {
-        self.writer
-            .batch_append_with_ts(&event, timestamp.as_ns(), 0)?;
+        self.writer.batch_append_with_ts(&event, timestamp, 0)?;
         self.writer.flush_batch_sync()?;
         dispatch(
             &mut self.app,
@@ -604,12 +668,16 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
 /// Replay a single segment into the application.
 ///
-/// Skips events with `seq <= snap_sequence` so a snapshot caller can
-/// share this routine with no-snapshot recovery (where `snap_sequence`
-/// is `0`, accepting all events). When `snap_chain` is supplied, the
-/// reader's chain hash is compared against it at the moment the anchor
-/// entry (`seq == snap_sequence`) is observed — every entry surfaces to
-/// this loop, so no capture machinery is needed.
+/// Skips events at or below the snapshot's anchor so a snapshot caller
+/// can share this routine with no-snapshot recovery (`snapshot` is `None`,
+/// accepting all events). With a snapshot, the anchor entry is checked
+/// against it the moment it is observed: the reader's chain hash against
+/// the snapshot's, then the entry's stamp against the snapshot's (when
+/// the snapshot records one). Every entry surfaces to this loop, so no
+/// capture machinery is needed.
+///
+/// `last_walked` is left at the stamp of the last entry read, replayed or
+/// not: the writer's time floor.
 ///
 /// `allow_partial_tail` controls how `SequenceGap` is treated: archived
 /// segments are sealed and any gap is corruption (returned as an error);
@@ -618,30 +686,22 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 fn replay_segment<A: Application>(
     reader: &mut JournalReader<A::Event>,
     app: &mut A,
-    snap_sequence: u64,
-    snap_chain: Option<[u8; 32]>,
+    snapshot: Option<SnapshotAnchor>,
     last_drain_ns: &mut u64,
     recovered_epoch: &mut u64,
+    last_walked: &mut Option<SequencerTime>,
     reports: &mut Vec<A::Report>,
     allow_partial_tail: bool,
 ) -> Result<(), JournaledAppError> {
+    let snap_sequence = snapshot.map_or(0, |s| s.sequence);
     loop {
         match reader.next_entry() {
             Ok(Some(entry)) => {
-                // Snapshot/journal cross-check at the anchor: the chain
-                // value after absorbing the anchor entry must equal what
-                // the snapshot recorded. Fires before any post-anchor
-                // event is replayed.
+                *last_walked = Some(entry.timestamp);
                 if entry.sequence == snap_sequence
-                    && let Some(expected) = snap_chain
-                    && let Some(actual) = reader.chain_hash()
-                    && actual != expected
+                    && let Some(snapshot) = snapshot
                 {
-                    return Err(JournaledAppError::SnapshotChainMismatch {
-                        snap_sequence,
-                        expected_chain_hash: expected,
-                        actual_chain_hash: actual,
-                    });
+                    check_snapshot_anchor(reader, &entry, snapshot)?;
                 }
                 if entry.sequence > snap_sequence {
                     // Replay produces no output: the client got its reply
@@ -651,7 +711,7 @@ fn replay_segment<A: Application>(
                         app,
                         entry.event,
                         &ApplyCtx {
-                            now_ns: entry.timestamp_ns,
+                            now_ns: entry.timestamp.as_ns(),
                             key_hash: entry.key_hash,
                         },
                         last_drain_ns,
@@ -677,6 +737,49 @@ fn replay_segment<A: Application>(
         }
     }
     Ok(())
+}
+
+/// Snapshot/journal cross-check at the anchor entry, before any
+/// post-anchor event is replayed. The chain value after absorbing the
+/// entry must equal what the snapshot recorded, and so must the entry's
+/// stamp: the snapshot's stamp is the time floor of a node booted from
+/// it alone, and nothing else would catch a wrong one.
+fn check_snapshot_anchor<E: melin_app::AppEvent>(
+    reader: &JournalReader<E>,
+    entry: &melin_journal::JournalEntry<E>,
+    snapshot: SnapshotAnchor,
+) -> Result<(), JournaledAppError> {
+    if let Some(actual) = reader.chain_hash()
+        && actual != snapshot.chain_hash
+    {
+        return Err(JournaledAppError::SnapshotChainMismatch {
+            snap_sequence: snapshot.sequence,
+            expected_chain_hash: snapshot.chain_hash,
+            actual_chain_hash: actual,
+        });
+    }
+    // A snapshot from before recorded stamps has nothing to compare.
+    if let TimeFloor::After(recorded) = snapshot.floor
+        && recorded != entry.timestamp
+    {
+        return Err(JournaledAppError::SnapshotTimestampMismatch {
+            snap_sequence: snapshot.sequence,
+            snapshot_timestamp: recorded,
+            journal_timestamp: entry.timestamp,
+        });
+    }
+    Ok(())
+}
+
+/// The time floor a writer reopens with after the walk: the stamp of the
+/// last entry it read, or, when it read none, the snapshot's floor (every
+/// retained segment starts past the snapshot and is empty), or genesis.
+fn walked_floor(last_walked: Option<SequencerTime>, snapshot: Option<SnapshotAnchor>) -> TimeFloor {
+    match (last_walked, snapshot) {
+        (Some(time), _) => TimeFloor::After(time),
+        (None, Some(snapshot)) => snapshot.floor,
+        (None, None) => TimeFloor::Genesis,
+    }
 }
 
 /// Verify a segment's header links it to the previous segment in the
@@ -770,19 +873,22 @@ mod tests {
     // the same JournaledApp logic without needing PLP hardware.
     type TestApp_ = JournaledApp<TestApp, BufferedWriter<TestEvent>>;
 
+    /// A stamp from its nanoseconds, for hand-encoded entries.
+    fn ns(ns: u64) -> SequencerTime {
+        SequencerTime::from_ns(ns)
+    }
+
     /// Write events with auto-allocated sequences and fsync them to disk,
-    /// each submitted under `key_hash = 1`.
+    /// each submitted under `key_hash = 1`, stamped 1 000 ns apart from
+    /// the journal's floor: the `n`th event since genesis at `1_000 * n`,
+    /// across calls.
     fn append_events(ja: TestApp_, events: &[TestEvent]) -> TestApp_ {
         let (app, mut writer) = ja.into_parts();
-        for (i, e) in events.iter().enumerate() {
+        for e in events {
             let seq = writer.allocate_sequence();
+            let stamp = SequencerTime::from_ns(writer.last_timestamp().as_ns() + 1_000);
             writer
-                .encode_event(
-                    seq,
-                    /* timestamp_ns */ 1_000 * (i as u64 + 1),
-                    &JournalEvent::App(*e),
-                    /* key_hash */ 1,
-                )
+                .encode_event(seq, stamp, &JournalEvent::App(*e), /* key_hash */ 1)
                 .unwrap();
         }
         writer.flush_batch_sync().unwrap();
@@ -842,15 +948,15 @@ mod tests {
         // then another App event — the shape a promoted primary produces.
         let s0 = writer.allocate_sequence();
         writer
-            .encode_event(s0, 1_000, &JournalEvent::App(TestEvent::Add(5)), 1)
+            .encode_event(s0, ns(1_000), &JournalEvent::App(TestEvent::Add(5)), 1)
             .unwrap();
         let s1 = writer.allocate_sequence();
         writer
-            .encode_event(s1, 2_000, &JournalEvent::EpochBump { epoch: 3 }, 0)
+            .encode_event(s1, ns(2_000), &JournalEvent::EpochBump { epoch: 3 }, 0)
             .unwrap();
         let s2 = writer.allocate_sequence();
         writer
-            .encode_event(s2, 3_000, &JournalEvent::App(TestEvent::Add(7)), 1)
+            .encode_event(s2, ns(3_000), &JournalEvent::App(TestEvent::Add(7)), 1)
             .unwrap();
         writer.flush_batch_sync().unwrap();
         drop(JournaledApp::from_parts(app, writer, 0));
@@ -989,11 +1095,17 @@ mod tests {
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
-        let (restored, seq, _chain, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        assert_eq!(restored, expected_state(&events));
+        let loaded = snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_eq!(loaded.app, expected_state(&events));
         // Sequences are 1-indexed; after N events, next_sequence = N + 1
         // and save_snapshot records the last issued sequence (next - 1) = N.
-        assert_eq!(seq, events.len() as u64);
+        assert_eq!(loaded.sequence, events.len() as u64);
+        // And the stamp of that last entry, which the recovered writer
+        // carried from the walk: `append_events` stamps the Nth at N µs.
+        assert_eq!(
+            loaded.floor,
+            TimeFloor::After(ns(1_000 * events.len() as u64))
+        );
     }
 
     #[test]
@@ -1025,6 +1137,96 @@ mod tests {
         assert_eq!(recovered.app().total, expected_state(&all).total);
     }
 
+    /// Recovery reopens the writer at the journal's time floor, the stamp
+    /// of the last entry it walked, across a rotation and whether or not
+    /// it restored from a snapshot first: the walk reads the entries at
+    /// and below the snapshot's anchor too.
+    #[test]
+    fn recovery_reopens_the_writer_at_the_last_walked_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap");
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)]);
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
+        drop(ja);
+
+        // The live segment is empty: the floor comes from the archive.
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        assert_eq!(recovered.writer.last_timestamp(), ns(2_000));
+        drop(append_events(recovered, &[TestEvent::Add(3)]));
+
+        for recovered in [
+            TestApp_::recover(TestApp::new(), &journal_path).unwrap(),
+            TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap(),
+        ] {
+            assert_eq!(recovered.writer.last_timestamp(), ns(3_000));
+        }
+    }
+
+    /// When the walk reads no entry at all, the snapshot's stamp is the
+    /// floor: a snapshot anchored at a rotation boundary, the segment
+    /// holding its anchor entry trimmed, and an empty live segment.
+    #[test]
+    fn a_walk_with_no_entries_reopens_at_the_snapshot_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap");
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)]);
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
+        drop(ja);
+        std::fs::remove_file(dir.path().join("journal.bin.000001")).unwrap();
+
+        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(recovered.next_sequence(), 3);
+        assert_eq!(recovered.writer.last_timestamp(), ns(2_000));
+    }
+
+    /// A snapshot whose stamp disagrees with its anchor entry's is
+    /// refused, even with the right chain hash: the stamp is the floor a
+    /// node booted from the snapshot alone would open with.
+    #[test]
+    fn recover_from_snapshot_rejects_a_wrong_stamp_at_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap");
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)]);
+        ja.save_snapshot(&snap_path).unwrap();
+        drop(append_events(ja, &[TestEvent::Add(3)]));
+
+        let loaded = snapshot::load::<TestApp>(&snap_path).unwrap();
+        snapshot::save::<TestApp>(
+            &loaded.app,
+            crate::cursors::WireSeq::new(loaded.sequence),
+            loaded.chain_hash,
+            loaded.epoch,
+            ns(1_500),
+            &snap_path,
+        )
+        .unwrap();
+
+        match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+            Err(JournaledAppError::SnapshotTimestampMismatch {
+                snap_sequence,
+                snapshot_timestamp,
+                journal_timestamp,
+            }) => {
+                assert_eq!(snap_sequence, 2);
+                assert_eq!(snapshot_timestamp, ns(1_500));
+                assert_eq!(journal_timestamp, ns(2_000));
+            }
+            Err(other) => panic!("expected SnapshotTimestampMismatch, got {other:?}"),
+            Ok(_) => panic!("expected SnapshotTimestampMismatch, recovery succeeded"),
+        }
+    }
+
     /// Replay hands every journaled app event to `apply` under the key
     /// that submitted it. The transport filters nothing on the way: an
     /// application that refuses repeats (a duplicate request) refuses
@@ -1043,7 +1245,12 @@ mod tests {
         for (key_hash, n) in entries {
             let seq = writer.allocate_sequence();
             writer
-                .encode_event(seq, 1_000, &JournalEvent::App(TestEvent::Add(n)), key_hash)
+                .encode_event(
+                    seq,
+                    ns(1_000 * seq),
+                    &JournalEvent::App(TestEvent::Add(n)),
+                    key_hash,
+                )
                 .unwrap();
         }
         writer.flush_batch_sync().unwrap();
@@ -1084,7 +1291,7 @@ mod tests {
         // no sequence number.
         assert_eq!(ja.next_sequence(), pre_rotate_next_seq);
         // Snapshot captures the pre-rotate state.
-        let (snap_app, _seq, _chain, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let snap_app = snapshot::load::<TestApp>(&snap_path).unwrap().app;
         assert_eq!(snap_app, pre_rotate_state);
 
         // The new journal is fresh — recovering it without the snapshot
@@ -1313,6 +1520,12 @@ mod tests {
         // The synthesized live consumes no sequence — its header records
         // the continuation point.
         assert_eq!(recovered.next_sequence(), pre_crash_seq);
+        // Nor does it lose the time floor, which the header does not
+        // record: it opens past the archive's last stamp.
+        assert_eq!(
+            recovered.writer.last_timestamp(),
+            ns(1_000 * events.len() as u64)
+        );
 
         // Append more events through the synthesized live and re-recover
         // — proves the new live is fully usable, not just a placeholder.
@@ -1494,14 +1707,16 @@ mod tests {
         std::fs::remove_file(&archive).unwrap();
 
         // Forge the snapshot's chain hash; sequence stays at the boundary.
-        let (loaded_app, snap_seq, real_hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let loaded = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_seq, real_hash) = (loaded.sequence, loaded.chain_hash);
         let bad_hash = [0xEE; 32];
         assert_ne!(real_hash, bad_hash);
         snapshot::save::<TestApp>(
-            &loaded_app,
+            &loaded.app,
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
             0,
+            loaded.floor.time(),
             &snap_path,
         )
         .unwrap();
@@ -1551,7 +1766,7 @@ mod tests {
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
-        let (_, snap_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let snap_seq = snapshot::load::<TestApp>(&snap_path).unwrap().sequence;
         assert_eq!(
             snap_seq,
             pre.len() as u64,
@@ -1737,7 +1952,7 @@ mod tests {
         ja.save_snapshot(&snap_path).unwrap();
         drop(ja);
 
-        let (_, snap_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let snap_seq = snapshot::load::<TestApp>(&snap_path).unwrap().sequence;
         assert_eq!(snap_seq, 0, "fresh snapshot anchors at sequence 0");
 
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
@@ -1876,7 +2091,7 @@ mod tests {
         ja.save_snapshot(&snap_path).unwrap();
         drop(ja);
 
-        let (_app, snap_seq, _hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let snap_seq = snapshot::load::<TestApp>(&snap_path).unwrap().sequence;
         assert!(snap_seq > 0);
 
         // Replace the journal with a stale copy that holds only the
@@ -1933,17 +2148,19 @@ mod tests {
         // sequence but a deliberately wrong chain hash. The journal
         // itself is unchanged, so recovery should compute the original
         // chain hash at the anchor sequence and detect the mismatch.
-        let (loaded_app, snap_seq, real_hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let loaded = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_seq, real_hash) = (loaded.sequence, loaded.chain_hash);
         assert_ne!(
             real_hash, [0u8; 32],
             "hash-chain feature must produce a non-sentinel hash for this test"
         );
         let bad_hash = [0xFF; 32];
         snapshot::save::<TestApp>(
-            &loaded_app,
+            &loaded.app,
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
             0,
+            loaded.floor.time(),
             &snap_path,
         )
         .unwrap();
@@ -1998,17 +2215,19 @@ mod tests {
 
         // Round-trip the snapshot with a deliberately wrong chain hash
         // at the same anchor sequence.
-        let (loaded_app, snap_seq, real_hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let loaded = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_seq, real_hash) = (loaded.sequence, loaded.chain_hash);
         assert_ne!(
             real_hash, [0u8; 32],
             "hash-chain feature must produce a non-sentinel hash for this test"
         );
         let bad_hash = [0xAA; 32];
         snapshot::save::<TestApp>(
-            &loaded_app,
+            &loaded.app,
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
             0,
+            loaded.floor.time(),
             &snap_path,
         )
         .unwrap();
@@ -2163,8 +2382,9 @@ mod tests {
         let final_seq = ja.next_sequence();
         drop(ja);
 
-        let (snap_app, snap_seq, snap_chain_hash, _) =
-            snapshot::load::<TestApp>(&snap_path).unwrap();
+        let loaded = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_app, snap_seq, snap_chain_hash) =
+            (loaded.app, loaded.sequence, loaded.chain_hash);
         let snap_total = snap_app.total;
         assert!(snap_total > 0, "snapshot must capture pre-rotation state");
 
@@ -2218,11 +2438,20 @@ mod tests {
         // ok(): best-effort cleanup; the assertion below is what
         // actually guards the path.
         std::fs::remove_file(&journal_path).ok();
-        let writer =
-            BufferedWriter::create_continuing(&journal_path, snap_seq + 1, snap_chain_hash)
-                .unwrap();
+        let writer = BufferedWriter::create_continuing(
+            &journal_path,
+            snap_seq + 1,
+            snap_chain_hash,
+            loaded.floor,
+        )
+        .unwrap();
         let je = JournaledApp::from_parts(snap_app, writer, 0);
         assert_eq!(je.app().total, snap_total);
+        assert_eq!(
+            TimeFloor::After(je.writer.last_timestamp()),
+            loaded.floor,
+            "a snapshot-only boot opens with the snapshot's time floor"
+        );
     }
 
     /// Helper for the byte-sweep crash tests: walk every entry in the
@@ -2265,7 +2494,7 @@ mod tests {
         writer
             .encode_event(
                 unflushed_seq,
-                /* timestamp_ns */ 999_000,
+                ns(999_000),
                 &JournalEvent::App(TestEvent::Add(99_999)),
                 /* key_hash */ 1,
             )

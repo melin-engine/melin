@@ -131,8 +131,8 @@ struct Reference {
 #[derive(Debug)]
 pub struct SequencerClock<S = SystemClocks> {
     source: S,
-    /// The last stamp issued; the next is strictly greater. Zero before
-    /// the first. Its u64 nanoseconds run out in 2554.
+    /// The last stamp issued, or the floor the clock was seeded at; the
+    /// next is strictly greater. Its u64 nanoseconds run out in 2554.
     last: SequencerTime,
     /// See [`DEFAULT_JUMP_LIMIT`]. Nanoseconds, to compare against
     /// readings without a conversion per batch.
@@ -144,11 +144,15 @@ pub struct SequencerClock<S = SystemClocks> {
 }
 
 impl<S: TimeSource> SequencerClock<S> {
-    /// A clock that has issued nothing yet.
-    pub fn new(source: S, jump_limit: Duration) -> Self {
+    /// A clock seeded at the journal's time floor: its first stamp is
+    /// strictly later than `floor`, the stamp of the last entry the
+    /// journal holds, whatever the wall clock reads. That is what carries
+    /// strictly increasing time across a restart, a snapshot boot and a
+    /// promotion.
+    pub fn new(source: S, jump_limit: Duration, floor: SequencerTime) -> Self {
         Self {
             source,
-            last: SequencerTime::default(),
+            last: floor,
             // A limit past u64 nanoseconds (584 years) never refuses.
             jump_limit_ns: u64::try_from(jump_limit.as_nanos()).unwrap_or(u64::MAX),
             reference: None,
@@ -186,7 +190,7 @@ impl<S: TimeSource> SequencerClock<S> {
         self.stamp(ClockReading(now_ns))
     }
 
-    /// The last stamp issued, zero before the first.
+    /// The last stamp issued, or the floor the clock was seeded at.
     pub fn last(&self) -> SequencerTime {
         self.last
     }
@@ -287,7 +291,7 @@ impl<E: AppEvent, S: TimeSource> StampingProducer<E, S> {
         self.producer.try_publish(internal_slot(tick, now))
     }
 
-    /// The last stamp issued, zero before the first.
+    /// The last stamp issued, or the floor the clock was seeded at.
     pub fn last_stamp(&self) -> SequencerTime {
         self.clock.last()
     }
@@ -406,7 +410,10 @@ mod tests {
 
     fn clock_at(wall_ns: u64) -> (ManualClocks, SequencerClock<ManualClocks>) {
         let clocks = ManualClocks::at(wall_ns);
-        (clocks.clone(), SequencerClock::new(clocks, LIMIT))
+        (
+            clocks.clone(),
+            SequencerClock::new(clocks, LIMIT, SequencerTime::default()),
+        )
     }
 
     /// Read the clock and issue one stamp, in nanoseconds.
@@ -419,6 +426,23 @@ mod tests {
         let (_, mut clock) = clock_at(T0);
         assert_eq!(clock.last(), SequencerTime::default());
         assert_eq!(now_ns(&mut clock), T0);
+    }
+
+    /// Seeded at the journal's floor, the clock's first stamp is past it
+    /// even with the wall clock behind: a restart, a snapshot boot or a
+    /// promotion onto a slower clock keeps time strictly increasing.
+    #[test]
+    fn the_first_stamp_is_past_the_floor_the_clock_was_seeded_at() {
+        let floor = SequencerTime::from_ns(T0 + 1_000_000);
+        let mut behind = SequencerClock::new(ManualClocks::at(T0), LIMIT, floor);
+        assert_eq!(behind.now().as_ns(), T0 + 1_000_001, "held past the floor");
+
+        let mut ahead = SequencerClock::new(ManualClocks::at(T0 + 2_000_000), LIMIT, floor);
+        assert_eq!(
+            ahead.now().as_ns(),
+            T0 + 2_000_000,
+            "the wall clock, past it"
+        );
     }
 
     #[test]
@@ -551,7 +575,7 @@ mod tests {
         let (producer, mut consumers) = DisruptorBuilder::<Slot>::new(capacity)
             .add_consumer()
             .build(WaitStrategy::SpinThenYield);
-        let clock = SequencerClock::new(ManualClocks::at(wall_ns), LIMIT);
+        let clock = SequencerClock::new(ManualClocks::at(wall_ns), LIMIT, SequencerTime::default());
         (
             StampingProducer::new(producer, clock),
             consumers.pop().unwrap(),

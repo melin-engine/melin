@@ -29,6 +29,7 @@ pub mod reader;
 pub mod replication;
 pub mod segment;
 pub mod segment_file;
+pub mod time_floor;
 pub mod write;
 pub mod write_ring;
 
@@ -43,6 +44,7 @@ pub use event::JournalEvent;
 pub use preparer::StagingMode;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
 pub use segment_file::SegmentFile;
+pub use time_floor::TimeFloor;
 pub use write::JournalWrite;
 
 /// Random 32-byte chain anchor for a brand-new journal. Randomness (not

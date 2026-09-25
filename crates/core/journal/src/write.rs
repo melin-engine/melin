@@ -13,11 +13,12 @@
 
 use std::path::{Path, PathBuf};
 
-use melin_app::{AppEvent, unix_epoch_nanos};
+use melin_app::{AppEvent, SequencerTime, unix_epoch_nanos};
 
 use crate::buffered_writer::BufferedWriter;
 use crate::error::JournalError;
 use crate::event::JournalEvent;
+use crate::time_floor::TimeFloor;
 
 /// Operations a journal writer must support to be drivable by the
 /// pipeline's `JournalStage`. Excludes the `append`/`batch_append`
@@ -30,22 +31,30 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     // build a writer of any concrete type without knowing which one.
     // Each implementor forwards to its inherent constructor.
 
-    /// Create a fresh journal at `path`.
+    /// Create a fresh journal at `path`, at genesis in sequence and time.
     fn create(path: &Path) -> Result<Self, JournalError>;
 
     /// Create a fresh journal that continues a previous segment's
     /// sequence numbers, anchored to `anchor_hash` (recorded in the file
-    /// header; no entries are written, no sequence consumed).
+    /// header; no entries are written, no sequence consumed). `floor` is
+    /// the time of the entry before `starting_sequence`.
     fn create_continuing(
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
+        floor: TimeFloor,
     ) -> Result<Self, JournalError>;
 
     /// Open an existing journal for appending after recovery. The hash
     /// chain rebuilds itself from the header anchor plus the raw byte
-    /// range up to `valid_end` — no chain state is threaded in.
-    fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError>;
+    /// range up to `valid_end`, so no chain state is threaded in. The
+    /// time floor is: `floor` is the stamp of the entry at `last_seq`.
+    fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        floor: TimeFloor,
+    ) -> Result<Self, JournalError>;
 
     // ---- hot-path write API ----
 
@@ -58,7 +67,7 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     fn encode_event(
         &mut self,
         seq: u64,
-        timestamp_ns: u64,
+        timestamp: SequencerTime,
         event: &JournalEvent<E>,
         key_hash: u64,
     ) -> Result<(), JournalError>;
@@ -88,6 +97,9 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     fn path(&self) -> &Path;
     /// Current chain value, `None` when the `hash-chain` feature is off.
     fn chain_hash(&self) -> Option<[u8; 32]>;
+    /// The journal's time floor: the stamp of the last entry encoded, or
+    /// the floor the writer opened with before the first.
+    fn last_timestamp(&self) -> SequencerTime;
 
     // ---- replication framing ----
 
@@ -129,10 +141,14 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     // never on the pipeline's hot path, which goes through the primitives
     // directly to avoid the extra trait dispatches on each event.
 
-    /// Encode and durably flush a single event.
+    /// Encode and durably flush a single event, stamped the way the
+    /// sequencer clock stamps one: the wall clock, or one nanosecond past
+    /// the journal's floor if that is later.
     #[inline]
     fn append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        let seq = self.batch_append_with_ts(event, unix_epoch_nanos(), 0)?;
+        let timestamp =
+            SequencerTime::from_ns(unix_epoch_nanos().max(self.last_timestamp().as_ns() + 1));
+        let seq = self.batch_append_with_ts(event, timestamp, 0)?;
         self.flush_batch_sync()?;
         Ok(seq)
     }
@@ -144,11 +160,11 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     fn batch_append_with_ts(
         &mut self,
         event: &JournalEvent<E>,
-        timestamp_ns: u64,
+        timestamp: SequencerTime,
         key_hash: u64,
     ) -> Result<u64, JournalError> {
         let seq = self.allocate_sequence();
-        self.encode_event(seq, timestamp_ns, event, key_hash)?;
+        self.encode_event(seq, timestamp, event, key_hash)?;
         Ok(seq)
     }
 }
@@ -164,13 +180,19 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
+        floor: TimeFloor,
     ) -> Result<Self, JournalError> {
-        BufferedWriter::create_continuing(path, starting_sequence, anchor_hash)
+        BufferedWriter::create_continuing(path, starting_sequence, anchor_hash, floor)
     }
 
     #[inline]
-    fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
-        BufferedWriter::open_append(path, last_seq, valid_end)
+    fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        floor: TimeFloor,
+    ) -> Result<Self, JournalError> {
+        BufferedWriter::open_append(path, last_seq, valid_end, floor)
     }
 
     #[inline]
@@ -182,11 +204,16 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     fn encode_event(
         &mut self,
         seq: u64,
-        timestamp_ns: u64,
+        timestamp: SequencerTime,
         event: &JournalEvent<E>,
         key_hash: u64,
     ) -> Result<(), JournalError> {
-        BufferedWriter::encode_event(self, seq, timestamp_ns, event, key_hash)
+        BufferedWriter::encode_event(self, seq, timestamp, event, key_hash)
+    }
+
+    #[inline]
+    fn last_timestamp(&self) -> SequencerTime {
+        BufferedWriter::last_timestamp(self)
     }
 
     #[inline]
@@ -304,10 +331,11 @@ mod tests {
         // Encode + flush one event via the trait, then verify it landed.
         let seq = writer.allocate_sequence();
         assert_eq!(seq + 1, writer.next_sequence());
-        let ts = unix_epoch_nanos();
+        let ts = SequencerTime::from_ns(unix_epoch_nanos());
         writer
             .encode_event(seq, ts, &JournalEvent::App(TestEvent(seq)), 0)
             .unwrap();
+        assert_eq!(writer.last_timestamp(), ts, "the floor follows the entry");
 
         // Replication framing slice should now be populated.
         assert!(!writer.last_user_entry_replication_slice().is_empty());
