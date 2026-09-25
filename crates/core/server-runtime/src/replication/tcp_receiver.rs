@@ -1182,7 +1182,7 @@ mod tests {
             fn query(&self, _e: EvtAdd, _ctx: &QueryCtx) -> Option<Rpt> {
                 None
             }
-            fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Rpt>) {}
+            fn tick(&mut self, _now: melin_app::SequencerTime, _out: &mut Vec<Rpt>) {}
             fn build_reject(_e: &EvtAdd, _r: RejectReason) -> Rpt {
                 Rpt
             }

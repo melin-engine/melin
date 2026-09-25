@@ -197,8 +197,9 @@ pub enum NotaryReport {
         entry: u64,
         /// When the sequencer received the leaf, in nanoseconds since
         /// the Unix epoch. Folded into `head`, so it is attested, not
-        /// merely reported. Not guaranteed to increase from one receipt
-        /// to the next (see `ApplyCtx::now_ns`): order is `entry`.
+        /// merely reported. Strictly increases from one receipt to the
+        /// next (see `ApplyCtx::now`), though it can run ahead of a wall
+        /// clock that stepped back.
         timestamp_ns: u64,
         /// Commitment before this leaf was folded in. What makes the
         /// receipt verifiable on its own:
@@ -293,10 +294,12 @@ impl Application for Notary {
                 // new request, which is supported by design: a later
                 // position and a later time are a different commitment.
                 //
-                // `now_ns` is the sequencer's dispatch clock, journaled
-                // with the entry, so replay and replicas see the same
-                // value — which is what makes folding it deterministic.
-                let timestamp_ns = ctx.now_ns;
+                // `now` is the sequencer's time for the entry, journaled
+                // with it, so replay and replicas see the same value,
+                // which is what makes folding it deterministic. It also
+                // strictly increases, so receipts are ordered in time as
+                // they are in position.
+                let timestamp_ns = ctx.now.as_ns();
                 let prev = self.head;
                 self.head = fold(&prev, &leaf, timestamp_ns);
                 // Saturating rather than wrapping: a receipt attests to a
@@ -327,7 +330,7 @@ impl Application for Notary {
     }
 
     // No `tick`: the notary has no time-driven work, and the default does
-    // nothing. Time reaches it through `ApplyCtx::now_ns` alone.
+    // nothing. Time reaches it through `ApplyCtx::now` alone.
 
     fn build_reject(_event: &Self::Event, _reason: RejectReason) -> Self::Report {
         NotaryReport::Rejected
@@ -458,7 +461,7 @@ mod tests {
 
     fn ctx_at(now_ns: u64) -> ApplyCtx {
         ApplyCtx {
-            now_ns,
+            now: melin_app::SequencerTime::from_ns(now_ns),
             key_hash: 0,
         }
     }

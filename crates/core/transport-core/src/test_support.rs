@@ -130,7 +130,7 @@ impl Application for TestApp {
         }
     }
 
-    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {
+    fn tick(&mut self, _now: melin_app::SequencerTime, _out: &mut Vec<Self::Report>) {
         self.ticks = self.ticks.wrapping_add(1);
     }
 

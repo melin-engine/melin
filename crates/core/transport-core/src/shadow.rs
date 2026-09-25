@@ -65,9 +65,6 @@ pub fn run<A: Application>(
     // Track whether any events have been consumed. Prevents snapshotting
     // empty state before the first event arrives.
     let mut has_events = false;
-    // Highest event timestamp the shadow's scheduler has drained against.
-    // See `dispatch::dispatch` for the per-event drain rationale.
-    let mut last_drain_ns: u64 = 0;
     // Fencing epoch as of the shadow's consumed position. Seeded from the
     // recovered epoch (the live pipeline's starting epoch) because the
     // shadow only sees events published *after* boot — any `EpochBump`
@@ -100,9 +97,8 @@ pub fn run<A: Application>(
         waiter.reset();
         has_events = true;
 
-        // Replay each event on the shadow app. last_drain_ns lives
-        // outside the loop so the per-event drain stays monotonic across
-        // batches.
+        // Replay each event on the shadow app, through the same stateless
+        // dispatch as the matching stage and recovery.
         for slot in &batch[..count] {
             // The shadow reads the input ring before the journal stage
             // drops queries, so it sees them. The matching stage answers
@@ -119,10 +115,9 @@ pub fn run<A: Application>(
                 &mut app,
                 slot.event,
                 &ApplyCtx {
-                    now_ns: slot.timestamp.as_ns(),
+                    now: slot.timestamp,
                     key_hash: slot.key_hash,
                 },
-                &mut last_drain_ns,
                 |epoch| crate::fence::observe_into(&mut shadow_epoch, epoch),
                 &mut reports,
             );
@@ -399,7 +394,10 @@ mod tests {
 
         let restored = snapshot::load::<TestApp>(&snap_path).unwrap().app;
         assert_eq!(restored.total, 7, "the write after the query is applied");
-        assert_eq!(restored.ticks, 0, "a query must not advance the clock");
+        assert_eq!(
+            restored.ticks, 1,
+            "one tick for the write; a query must not advance the clock"
+        );
         assert!(
             restored.per_key_total.is_empty(),
             "a query must not reach apply under its key"
@@ -556,9 +554,7 @@ mod tests {
     fn multi_batch_replay_accumulates_into_snapshot() {
         // End-to-end: events arriving across multiple consume_batch
         // iterations all reach the shadow app and the eventual snapshot
-        // reflects the running total. last_drain_ns persists across
-        // batches in the run loop, but the test focuses on the
-        // accumulated app-event side — Add semantics make the sum
+        // reflects the running total. Add semantics make the sum
         // load-bearing and easy to assert.
         let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
             .add_consumer()

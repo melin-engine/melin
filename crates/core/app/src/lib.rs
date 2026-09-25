@@ -146,7 +146,8 @@ impl WireSeq {
 /// wall clock is behind, and refuses a runaway jump ahead. The newtype
 /// exists so a stamp cannot be mixed with a raw wall-clock reading, which
 /// carries none of those guarantees. Defined here, beside [`WireSeq`], so
-/// the journal and the runtime above it share one type.
+/// the journal, the runtime and the application share one type: it is the
+/// time [`Application::tick`] and [`ApplyCtx::now`] hand the application.
 ///
 /// Made by the primary's sequencer clock, and by the decoders that read a
 /// stamp back from the journal or the replication stream. The default,
@@ -185,19 +186,19 @@ impl SequencerTime {
 /// by `&ApplyCtx` on the hot path.
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyCtx {
-    /// Wall-clock time the primary stamped on this event when it read it
-    /// from the client, in nanoseconds since the Unix epoch. Journaled
-    /// with the event, so the primary, every replica and every replay see
-    /// the same value.
+    /// The event's time, as the sequencer assigned it when it read the
+    /// event (see [`SequencerTime`]). Journaled with the event, so the
+    /// primary, every replica and every replay see the same value.
     ///
-    /// Not monotonic from one event to the next, and not unique. Events
-    /// read together share one stamp; a rare race between the node's
-    /// producers can sequence an event slightly out of stamp order; and a
-    /// clock step on the primary, or a failover to a node whose clock is
-    /// behind, moves it backwards. Order is the sequence, never this. An
-    /// application that reports or attests to this time should not
-    /// promise its readers that it increases.
-    pub now_ns: u64,
+    /// Strictly increasing from one event to the next, across restarts,
+    /// snapshots and failovers: no two events share an instant and none
+    /// goes back. It follows the primary's wall clock but is not it: while
+    /// the wall clock is behind the journal (after a step back, or a
+    /// failover to a node whose clock runs slow) time advances one
+    /// nanosecond per event until the wall clock catches up. An
+    /// application that reports this time can promise its readers that it
+    /// increases, not that it matches a wall clock to the nanosecond.
+    pub now: SequencerTime,
     /// [`key_hash`] of the public key that authenticated the connection
     /// that submitted this event. `0` for events the node journals on its own
     /// behalf, which carry no client identity. Journaled with the event,
@@ -466,32 +467,33 @@ pub trait Application: Sized + Default {
         None
     }
 
-    /// Advance the application's wall-clock without applying a business
-    /// event, to fire whatever time-driven work has come due (expiries,
-    /// session transitions). Reports go into `out`, as from `apply`.
+    /// Advance the application's clock to `now` without applying a
+    /// business event, to fire whatever time-driven work has come due
+    /// (expiries, session transitions). Reports go into `out`, as from
+    /// `apply`.
     ///
-    /// The transport calls it before [`apply`](Application::apply)
-    /// whenever an event's timestamp is past the latest time it has
-    /// handed the application, and for each journaled clock tick, which
-    /// keeps time moving while no client traffic arrives. Live, on
-    /// replay and on a replica, the calls follow the same rules from the
-    /// same journaled times.
+    /// The transport calls it once for every journaled entry, before the
+    /// entry itself, with the entry's time: before
+    /// [`apply`](Application::apply) for an application event, and alone
+    /// for a journaled clock tick, which keeps time moving while no client
+    /// traffic arrives. `now` is therefore strictly greater at every call
+    /// (see [`SequencerTime`]), and the sequence of calls is a function of
+    /// the journal alone: live, on replay, on a replica and after a
+    /// restore from any snapshot, the application receives the same calls
+    /// in the same order. Due work fires at the first entry past its
+    /// deadline, whatever path the node took to get there.
     ///
-    /// `now_ns` is wall-clock time, so do not assume it strictly
-    /// increases: the same value may arrive more than once, and a tick
-    /// may carry a time earlier than one already seen — after the
-    /// primary's clock steps back, or after a failover to a node whose
-    /// clock runs behind. In that case a node that restarted may also
-    /// make calls a node that kept running did not, since the latest
-    /// time handed out is not carried across a restart. So a call for a
-    /// time already passed must change nothing — no due work fires
-    /// again, no state records the earlier time — and elapsed-time
-    /// arithmetic must saturate.
+    /// Time may stand still. While the primary's wall clock is behind the
+    /// journal (after a step back, or a failover to a node whose clock runs
+    /// slow), `now` advances one nanosecond per entry until the wall clock
+    /// catches up: work that falls due inside that window waits, and
+    /// anything measured in `now` windows, a rate limiter's refill for
+    /// one, stops moving.
     ///
     /// Default: nothing, right for an application with no time-driven
-    /// work. Under load it runs ahead of nearly every event, so an
-    /// override should make "nothing is due" a cheap check.
-    fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
+    /// work. It runs before every entry, so an override should make
+    /// "nothing is due" a cheap check.
+    fn tick(&mut self, _now: SequencerTime, _out: &mut Vec<Self::Report>) {}
 
     /// Synthesise a rejection report for a transport-originated reject.
     /// No access to `&self` — the reject must be constructible from the

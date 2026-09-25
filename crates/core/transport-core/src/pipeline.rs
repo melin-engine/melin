@@ -348,7 +348,7 @@ impl<E: AppEvent> Default for InputSlot<E> {
             key_hash: 0,
             sequence: 0,
             timestamp: SequencerTime::default(),
-            event: melin_journal::JournalEvent::Tick { now_ns: 0 },
+            event: melin_journal::JournalEvent::Tick,
             publish_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
         }
@@ -2489,13 +2489,6 @@ pub struct MatchingStage<A: Application> {
     wait: WaitStrategy,
     /// Shared busy/idle counters for health endpoint monitoring.
     utilization: Arc<StageUtilization>,
-    /// Highest event timestamp the scheduler has drained against. Each event
-    /// (including non-Tick events) advances this whenever its `slot.timestamp`
-    /// is newer, so the scheduler fires due tasks at every-event resolution under
-    /// load. Tick events become a quiet-period safety net rather than the only
-    /// thing that moves time forward. Derived state — not snapshotted; recovery
-    /// catches up at the first replayed event with a non-zero timestamp.
-    last_drain_ns: u64,
     /// Wire-seq counter shadowing the journal stage's allocator. Stamped
     /// into `OutputSlot.wire_seq` so the response stage's durability gate
     /// can compare against replica metrics in the same space. Initialised
@@ -2532,7 +2525,6 @@ impl<A: Application> MatchingStage<A> {
             fence_state,
             wait,
             utilization: Arc::new(StageUtilization::new()),
-            last_drain_ns: 0,
             next_wire_seq: starting_wire_seq,
         }
     }
@@ -2709,10 +2701,9 @@ impl<A: Application> MatchingStage<A> {
                         &mut self.app,
                         slot.event,
                         &ApplyCtx {
-                            now_ns: slot.timestamp.as_ns(),
+                            now: slot.timestamp,
                             key_hash: slot.key_hash,
                         },
-                        &mut self.last_drain_ns,
                         |epoch| {
                             self.fence_state.observe_epoch(epoch);
                         },
@@ -2734,7 +2725,7 @@ impl<A: Application> MatchingStage<A> {
                     if elapsed_ns > 1_000_000 {
                         let event_kind: &'static str = match &slot.event {
                             melin_journal::JournalEvent::App(_) => "app",
-                            melin_journal::JournalEvent::Tick { .. } => "tick",
+                            melin_journal::JournalEvent::Tick => "tick",
                             melin_journal::JournalEvent::EpochBump { .. } => "epoch_bump",
                             melin_journal::JournalEvent::Shutdown => "shutdown",
                         };
@@ -2891,10 +2882,9 @@ impl<A: Application> MatchingStage<A> {
                 &mut self.app,
                 slot.event,
                 &ApplyCtx {
-                    now_ns: slot.timestamp.as_ns(),
+                    now: slot.timestamp,
                     key_hash: slot.key_hash,
                 },
-                &mut self.last_drain_ns,
                 |epoch| {
                     self.fence_state.observe_epoch(epoch);
                 },

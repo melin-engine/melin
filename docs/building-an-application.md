@@ -154,7 +154,7 @@ Four things to get right here:
 use std::io::{self, Read, Write};
 
 use counter_server::{CounterEvent, CounterQuery, CounterReport};
-use melin_app::{Application, ApplyCtx, QueryCtx, RejectReason};
+use melin_app::{Application, ApplyCtx, QueryCtx, RejectReason, SequencerTime};
 
 /// A single number, zero before the first event.
 #[derive(Default)]
@@ -215,7 +215,7 @@ impl Application for Counter {
 
 let mut counter = Counter::default();
 let mut reports = Vec::new();
-let ctx = ApplyCtx { now_ns: 1, key_hash: 7 };
+let ctx = ApplyCtx { now: SequencerTime::from_ns(1), key_hash: 7 };
 counter.apply(CounterEvent::Increment { amount: 5 }, &ctx, &mut reports);
 assert!(matches!(reports[..], [CounterReport::Ack { new_value: 5 }]));
 ```
@@ -223,7 +223,7 @@ assert!(matches!(reports[..], [CounterReport::Ack { new_value: 5 }]));
 - **`Default` is the state before the first event**, on every node. A fresh node, a replica catching up from the start and a restart with no snapshot all begin there.
 - **`apply` is the only way state changes.** What it pushes into `out` is the reply the client receives, in order. When state says no, as an increment that would overflow does, `apply` changes nothing and says so in a report: the event stays in the journal with its refusal, and replay refuses it again.
 - **`query` reads state and cannot change it.** It takes `&self`: a query is never journaled, so a change it made would happen on one node and nowhere else. An application with no queries can leave it out, since the default answers nothing. It can also set `QueryResponse` to `melin_app::NoQuery`, a type with no values, so its encoder's `encode_query` is an empty `match` (the echo example does this).
-- **`tick` is time passing.** The runtime calls it as time advances, so an application can expire, time out or schedule things. It is optional: the counter leaves it out, and the default does nothing.
+- **`tick` is time passing.** The runtime calls it before every journaled event, with that event's time, and on a periodic clock tick while no traffic arrives, so an application can expire, time out or schedule things. It is optional: the counter leaves it out, and the default does nothing.
 - **`build_reject` answers a request the runtime refused on its own.** Today that happens in one case: a node that has lost its last replica refuses writes rather than acknowledge them without the copies the policy demands. The rejection is built from the event alone, because the event never reached `apply`.
 - **`snapshot` and `restore` must round-trip exactly**, and `APP_VERSION` names the layout `snapshot` writes. `restore` must read every byte `snapshot` wrote: a node refuses a snapshot whose `restore` leaves bytes unread.
 
@@ -359,14 +359,14 @@ RUST_LOG=info cargo run --release --bin counter-server -- --standalone --ack-pol
 
 Your application runs many times over the same events: on the primary, on each replica, on every restart, and in the background copy that takes snapshots. Replicas and recovery are only worth anything if every one of those runs reaches the same state. So `apply`, `tick` and `restore` must be a pure function of their inputs. None of this is checked by the compiler, and breaking it does not fail loudly — the nodes simply disagree.
 
-- **No I/O, no clocks, no randomness, no threads.** Nothing an application reads may differ between nodes or between runs. Time comes from `ApplyCtx::now_ns` and `tick`, which carry the time the primary recorded in the journal; randomness, if you need it, comes from a seed carried in an event.
+- **No I/O, no clocks, no randomness, no threads.** Nothing an application reads may differ between nodes or between runs. Time comes from `ApplyCtx::now` and `tick`, which carry the time the primary recorded in the journal; randomness, if you need it, comes from a seed carried in an event.
 - **Never let a hash map's iteration order decide anything.** The standard `HashMap` is seeded randomly per process, and even with a fixed hasher the order depends on capacity, which a node's memory sizing changes. If what you do depends on the order you visit entries — which one fills first, which report comes first — use an ordered structure (`BTreeMap`, a `Vec` kept sorted) for that decision.
 - **Prefer integers to floating point** for anything that decides. The same binary on the same architecture gives the same float results, but a replica on a different CPU or build may not; fixed-point integers never differ.
 - **`apply` must never panic.** Every event is journaled whether or not your application can handle it. An event that makes `apply` panic stops the primary — and then every replica that applies it, and every restart that replays it. Validate in the decoder, use checked or saturating arithmetic, and handle every case in `apply` by producing a report.
 - **Your starting state is `Default`, and it depends on nothing local.** Not a flag, not the environment, not a file. Whatever the operator configures reaches the application as events, below.
 - **Operator configuration is journaled.** Reference data a deployment starts with, and limits an operator sets, go in `StartupEvents`: `genesis` is journaled once, when a node creates the journal; `on_primary` is journaled every time a node becomes primary. Replicas then apply the primary's values, not their own, and replay reproduces every decision made under them. Applying a value already in force must change nothing.
 - **Memory sizing is not state.** `Sizing`, passed to `Application::prefault` on every node, may reserve and pre-fault memory, and nothing else: every decision `apply` makes must come out the same whatever the sizing.
-- **Time can repeat and can go backwards.** `now_ns` is wall-clock time recorded by the primary. It may arrive more than once, and it may be earlier than a time already seen — after the primary's clock steps back, or after a failover to a node whose clock is behind. Firing what is due at a given time must be idempotent, a call for a time already passed must change nothing, and elapsed-time arithmetic must saturate.
+- **Time only moves forward, but it can stand still.** Every event carries its own time, strictly later than the one before it, on every node and across restarts, snapshots and failovers, and `tick` runs before each event with that time. It follows the primary's wall clock, but it is not the wall clock: while that clock is behind the journal, after it steps back or after a failover to a node whose clock runs slow, time advances by one nanosecond per event until the wall clock catches up. Work that falls due during that window waits, and anything measured in time windows (a rate limiter's refill, say) stops moving.
 
 ## Designing events
 
@@ -519,18 +519,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use counter_server::{Counter, CounterEvent};
-use melin_app::{Application, ApplyCtx};
+use melin_app::{Application, ApplyCtx, SequencerTime};
 
 /// Apply `events` in order, advancing the clock the way the runtime does:
-/// before an event whose time is past the latest one handed out.
+/// `tick` at each event's time, then the event.
 fn apply_all<A: Application>(app: &mut A, events: &[(A::Event, ApplyCtx)]) {
     let mut reports = Vec::new();
-    let mut clock = 0;
     for (event, ctx) in events {
-        if ctx.now_ns > clock {
-            clock = ctx.now_ns;
-            app.tick(clock, &mut reports);
-        }
+        app.tick(ctx.now, &mut reports);
         app.apply(*event, ctx, &mut reports);
         reports.clear();
     }
@@ -544,12 +540,13 @@ fn state<A: Application>(app: &A) -> Vec<u8> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Mixed clients, times that repeat and go backwards: the inputs a
-    // deployment produces, not the tidy ones.
+    // Mixed clients, and times that bunch up one nanosecond apart the way
+    // a held clock issues them: the inputs a deployment produces, not the
+    // tidy ones.
     let events: Vec<(CounterEvent, ApplyCtx)> = (1..=1_000u64)
         .map(|i| {
-            let ctx = ApplyCtx { now_ns: 1_000 * (i % 97), key_hash: i % 5 };
-            (CounterEvent::Increment { amount: i }, ctx)
+            let now = SequencerTime::from_ns(1_000 * (i / 97) + i);
+            (CounterEvent::Increment { amount: i }, ApplyCtx { now, key_hash: i % 5 })
         })
         .collect();
     let (before, after) = events.split_at(400);
@@ -571,7 +568,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-When the three disagree, which pair differs says where to look: the restored run points at `snapshot` and `restore`, the replay at something in `apply` or `tick` that is not a function of its inputs. Comparing snapshot bytes works when your snapshot is written in a deterministic order; if it iterates a hash map, compare what `query` answers instead. Feed it the inputs a real deployment produces — many clients, timestamps that repeat or step backwards — and consider generating them with a property-testing library.
+When the three disagree, which pair differs says where to look: the restored run points at `snapshot` and `restore`, the replay at something in `apply` or `tick` that is not a function of its inputs. Comparing snapshot bytes works when your snapshot is written in a deterministic order; if it iterates a hash map, compare what `query` answers instead. Feed it the inputs a real deployment produces (many clients, times that crawl one nanosecond at a time while the clock is held) and consider generating them with a property-testing library.
 
 **Test end to end.** Start a node in the test on a free port, talk to it through `melin-client`, and check the replies. The counter's [round-trip test](../crates/examples/counter/tests/round_trip.rs) does exactly that, and is a template to copy; [echo's](../crates/examples/echo/tests/round_trip.rs) also reads the journal back from disk, and [notary's](../crates/examples/notary/tests/round_trip.rs) fails a primary over to a replica.
 

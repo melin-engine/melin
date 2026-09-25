@@ -1372,7 +1372,7 @@ mod tests {
             key_hash: 0,
             sequence: end_sequence,
             timestamp: melin_app::SequencerTime::default(),
-            event: melin_journal::JournalEvent::Tick { now_ns: 0 },
+            event: melin_journal::JournalEvent::Tick,
             publish_ts: Default::default(),
             recv_ts: Default::default(),
         };

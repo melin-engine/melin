@@ -41,6 +41,8 @@ pub const MSG_INPUT_BATCH: u8 = 0x21;
 // Slot tags 0x01 (`GenesisHash`) and 0x02 (`Checkpoint`) are retired —
 // chain metadata never rides in the entry stream; divergence checks use
 // dedicated chain frames instead. Do not reuse the values.
+/// Clock tick. No payload: its time is the slot's timestamp, as in the
+/// journal codec's `TAG_TICK`.
 pub const SLOT_TAG_TICK: u8 = 0x03;
 /// Replication fencing epoch bump (see [`JournalEvent::EpochBump`]).
 /// Payload is the 8-byte little-endian epoch — kept in lockstep with the
@@ -138,10 +140,8 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
     buf.resize(header_start + SLOT_HEADER_LEN, 0);
 
     let tag = match &slot.event {
-        JournalEvent::Tick { now_ns } => {
-            buf.extend_from_slice(&now_ns.to_le_bytes());
-            SLOT_TAG_TICK
-        }
+        // No payload: a tick's time is the slot's timestamp.
+        JournalEvent::Tick => SLOT_TAG_TICK,
         JournalEvent::EpochBump { epoch } => {
             buf.extend_from_slice(&epoch.to_le_bytes());
             SLOT_TAG_EPOCH_BUMP
@@ -265,15 +265,10 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
 
         let event = match header.event_tag {
             SLOT_TAG_TICK => {
-                if event_payload.len() < 8 {
-                    return Err(io::Error::other("Tick payload too short"));
+                if !event_payload.is_empty() {
+                    return Err(io::Error::other("Tick slot carries a payload"));
                 }
-                let now_ns = u64::from_le_bytes(
-                    event_payload[..8]
-                        .try_into()
-                        .expect("8-byte slice into [u8; 8]"),
-                );
-                JournalEvent::Tick { now_ns }
+                JournalEvent::Tick
             }
             SLOT_TAG_EPOCH_BUMP => {
                 if event_payload.len() < 8 {
@@ -408,7 +403,7 @@ mod tests {
 
     #[test]
     fn roundtrip_transport_variants() {
-        let slots = vec![sample_slot(10, JournalEvent::Tick { now_ns: 12_345_678 })];
+        let slots = vec![sample_slot(10, JournalEvent::Tick)];
 
         let mut buf = Vec::new();
         encode_input_batch(&slots, &mut buf);
@@ -429,10 +424,11 @@ mod tests {
             assert_eq!(dec.connection_id, 0);
         }
 
-        match decoded[0].event {
-            JournalEvent::Tick { now_ns } => assert_eq!(now_ns, 12_345_678),
-            ref other => panic!("expected Tick, got {other:?}"),
-        }
+        assert!(
+            matches!(decoded[0].event, JournalEvent::Tick),
+            "expected Tick, got {:?}",
+            decoded[0].event
+        );
     }
 
     #[test]
@@ -485,7 +481,7 @@ mod tests {
         // shape), not the post-length payload — verify it skips the frame
         // header and reads the first slot, ignoring later slots.
         let slots = vec![
-            sample_slot(6_932_801, JournalEvent::Tick { now_ns: 1 }),
+            sample_slot(6_932_801, JournalEvent::Tick),
             sample_slot(6_932_802, JournalEvent::App(TestEvent(2))),
             sample_slot(6_932_803, JournalEvent::App(TestEvent(3))),
         ];
@@ -554,7 +550,7 @@ mod tests {
         // round-trip, and the sentinel must be silently dropped.
         let mut buf = Vec::new();
         init_input_batch(&mut buf);
-        let s1 = sample_slot(1, JournalEvent::Tick { now_ns: 111 });
+        let s1 = sample_slot(1, JournalEvent::Tick);
         append_input_slot(&mut buf, &s1, s1.sequence);
         let sentinel = sample_slot(2, JournalEvent::Shutdown);
         append_input_slot(&mut buf, &sentinel, sentinel.sequence);
@@ -584,17 +580,31 @@ mod tests {
 
     #[test]
     fn rejects_truncated_slot_payload() {
-        let slots = vec![sample_slot(1, JournalEvent::Tick { now_ns: 0 })];
+        let slots = vec![sample_slot(1, JournalEvent::EpochBump { epoch: 3 })];
         let mut buf = Vec::new();
         encode_input_batch(&slots, &mut buf);
         let payload = &buf[4..buf.len() - 1];
         assert!(try_decode_input_batch::<TestEvent>(payload).is_err());
     }
 
+    /// A tick's time is the slot's timestamp; bytes behind the tick tag
+    /// are a malformed frame, not a second copy of the time.
+    #[test]
+    fn rejects_a_tick_slot_with_a_payload() {
+        let slots = vec![sample_slot(1, JournalEvent::EpochBump { epoch: 3 })];
+        let mut buf = Vec::new();
+        encode_input_batch(&slots, &mut buf);
+        // Re-tag the epoch bump as a tick, keeping its 8-byte payload.
+        let tag_at = FRAME_HEADER_LEN + SLOT_HEADER_LEN - 1;
+        assert_eq!(buf[tag_at], SLOT_TAG_EPOCH_BUMP);
+        buf[tag_at] = SLOT_TAG_TICK;
+        assert!(try_decode_input_batch::<TestEvent>(&buf[4..]).is_err());
+    }
+
     #[test]
     fn streaming_api_matches_one_shot() {
         let slots = vec![
-            sample_slot(20, JournalEvent::Tick { now_ns: 100 }),
+            sample_slot(20, JournalEvent::Tick),
             sample_slot(21, JournalEvent::App(TestEvent(42))),
         ];
 
@@ -624,9 +634,7 @@ mod tests {
             key_hash: 0x0807_0605_0403_0201,
             sequence: 0x2827_2625_2423_2221,
             timestamp: SequencerTime::from_ns(0x3837_3635_3433_3231),
-            event: JournalEvent::Tick {
-                now_ns: 0x4847_4645_4443_4241,
-            },
+            event: JournalEvent::Tick,
             publish_ts: Default::default(),
             recv_ts: Default::default(),
         };
@@ -634,25 +642,23 @@ mod tests {
         let mut buf = Vec::new();
         encode_input_batch(&[slot], &mut buf);
 
-        // Total = FrameHeader(7) + SlotHeader(27) + Tick payload(8) = 42.
-        // FrameHeader.length = total - 4 (the length field itself) = 38 = 0x26.
-        // SlotHeader.length = ENTRY_META_SIZE(9) + payload(8) = 17 = 0x11.
+        // Total = FrameHeader(7) + SlotHeader(27), no Tick payload = 34.
+        // FrameHeader.length = total - 4 (the length field itself) = 30 = 0x1E.
+        // SlotHeader.length = ENTRY_META_SIZE(9) + no payload = 9.
         let expected: &[u8] = &[
             // FrameHeader: length(u32) + type(u8) + count(u16)
-            0x26, 0x00, 0x00, 0x00, // length = 38
+            0x1E, 0x00, 0x00, 0x00, // length = 30
             0x21, // MSG_INPUT_BATCH
             0x01, 0x00, // count = 1
             // SlotHeader: length(u16) + sequence(u64) + timestamp_ns(u64)
             //           + key_hash(u64) + event_tag(u8)
-            0x11, 0x00, // length = 17 (matches journal's length: 9 + 8)
+            0x09, 0x00, // length = 9 (matches journal's length)
             0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // sequence
             0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // timestamp_ns
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // key_hash
-            0x03, // SLOT_TAG_TICK
-            // Tick payload: now_ns(u64)
-            0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+            0x03, // SLOT_TAG_TICK, and no payload: its time is timestamp_ns
         ];
         assert_eq!(buf, expected, "wire format byte layout must not change");
-        assert_eq!(buf.len(), 42);
+        assert_eq!(buf.len(), 34);
     }
 }

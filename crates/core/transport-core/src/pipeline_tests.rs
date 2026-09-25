@@ -334,7 +334,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     publish(JournalEvent::App(TestEvent::Query));
     publish(JournalEvent::App(TestEvent::Add(2)));
     publish(JournalEvent::App(TestEvent::Add(3)));
-    publish(JournalEvent::Tick { now_ns: 1 });
+    publish(JournalEvent::Tick);
     publish(JournalEvent::EpochBump { epoch: 7 });
 
     // Drain six output slots — one per input event under the
@@ -481,7 +481,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     publish(JournalEvent::App(TestEvent::Add(100)));
     publish(JournalEvent::App(TestEvent::Add(200)));
     publish(JournalEvent::App(TestEvent::Query));
-    publish(JournalEvent::Tick { now_ns: 1 });
+    publish(JournalEvent::Tick);
 
     // Wait until the pre-rotation entries are durably in the live
     // segment (last_seq is published post-fsync) so the rotation
@@ -704,7 +704,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     // Then two allocations continue the space: 5 and 6.
     input_producer.publish(make_slot(JournalEvent::App(TestEvent::Query)));
     input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(5))));
-    input_producer.publish(make_slot(JournalEvent::Tick { now_ns: 1 }));
+    input_producer.publish(make_slot(JournalEvent::Tick));
 
     let mut outputs: Vec<TestOutput> = Vec::with_capacity(3);
     let mut spins = 0u32;
@@ -3919,9 +3919,11 @@ fn a_query_changes_no_matching_stage_state() {
         publish_ts: mono_trace_ns(),
         recv_ts: mono_trace_ns(),
     };
-    input_producer.publish(slot(JournalEvent::App(TestEvent::Add(1)), 0));
+    // The query carries a stamp past both writes', so a query that drove
+    // the clock would show as an extra tick.
+    input_producer.publish(slot(JournalEvent::App(TestEvent::Add(1)), 1));
     input_producer.publish(slot(JournalEvent::App(TestEvent::Query), 1_000));
-    input_producer.publish(slot(JournalEvent::App(TestEvent::Add(2)), 0));
+    input_producer.publish(slot(JournalEvent::App(TestEvent::Add(2)), 2));
 
     let mut payloads = Vec::new();
     let mut spins = 0u32;
@@ -3949,7 +3951,10 @@ fn a_query_changes_no_matching_stage_state() {
     shutdown.store(true, Ordering::Relaxed);
     let _writer = t_journal.join().unwrap();
     let app = t_matching.join().unwrap();
-    assert_eq!(app.ticks, 0, "a query must not drive the scheduler clock");
+    assert_eq!(
+        app.ticks, 2,
+        "one tick per journaled write; a query must not drive the clock"
+    );
     assert_eq!(
         app.per_key_total,
         std::collections::HashMap::from([(KEY, 3)]),

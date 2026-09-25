@@ -330,7 +330,7 @@ mod tests {
     fn apply_increment() {
         let mut counter = Counter { value: 0 };
         let ctx = ApplyCtx {
-            now_ns: 0,
+            now: melin_app::SequencerTime::default(),
             key_hash: 0,
         };
         let mut reports = Vec::new();
@@ -352,7 +352,7 @@ mod tests {
             value: u64::MAX - 1,
         };
         let ctx = ApplyCtx {
-            now_ns: 0,
+            now: melin_app::SequencerTime::default(),
             key_hash: 0,
         };
         let mut reports = Vec::new();

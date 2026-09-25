@@ -29,11 +29,11 @@ use melin_app::AppEvent;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalEvent<E: AppEvent> {
     /// Internal clock tick. Published by the ingress thread at the
-    /// configured cadence and journaled like any other input event.
-    /// Carries the wall-clock time the application uses to fire due
-    /// scheduled tasks. Replay feeds the recorded `now_ns` back,
-    /// preserving determinism.
-    Tick { now_ns: u64 },
+    /// configured cadence and journaled like any other input event, so
+    /// time keeps moving while no client traffic arrives. It carries no
+    /// payload: its time is the entry's own timestamp, the one every
+    /// entry carries, and a second copy could only disagree with it.
+    Tick,
     /// Replication fencing epoch bump. Written as the first journaled
     /// entry of a node's primary tenure — genesis primaries never emit
     /// it (epoch stays 0); a promoted replica emits `EpochBump { prior

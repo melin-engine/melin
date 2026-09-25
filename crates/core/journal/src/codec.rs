@@ -90,12 +90,13 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// (17 → 9 bytes). The runtime never read it; an application that needs
 /// a request sequence carries it in its own event payload.
 ///
-/// v15 → v16: no layout change; the entry timestamp became the
-/// sequencer's time, strictly increasing across the journal, and the
-/// reader refuses an entry whose stamp is not later than the one before
-/// it. Journals written before that break the rule as a matter of course
-/// (a batch shared one stamp), so they are refused by version rather
-/// than read as a regression.
+/// v15 → v16: the entry timestamp became the sequencer's time, strictly
+/// increasing across the journal, and the reader refuses an entry whose
+/// stamp is not later than the one before it. Journals written before
+/// that break the rule as a matter of course (a batch shared one stamp),
+/// so they are refused by version rather than read as a regression.
+/// `Tick` lost its 8-byte `now_ns` payload: its time is the entry's
+/// timestamp.
 pub const FORMAT_VERSION: u16 = 16;
 
 /// Entry magic bytes for corruption/misalignment detection.
@@ -225,13 +226,14 @@ pub const ENTRY_FRAMING_SIZE: usize = ENTRY_HEADER_SIZE + ENTRY_META_SIZE + CRC_
 
 const _: () = assert!(ENTRY_FRAMING_SIZE == 33);
 
-/// Payload width of the transport-intrinsic variants — `Tick`'s `now_ns`
-/// and `EpochBump`'s `epoch`, both a `u64`.
+/// Payload width of the widest transport-intrinsic variant: `EpochBump`'s
+/// `epoch`, a `u64` (`Tick` carries none).
 ///
 /// The journal writes these whatever `E` is, so an entry's true ceiling is
 /// this *or* the app's declared bound, whichever is larger. An application
-/// narrower than 8 bytes that reserved only its own width would leave a
-/// tick a hole too small to land in — see [`crate::encoder::entry_size`].
+/// narrower than 8 bytes that reserved only its own width would leave an
+/// epoch bump a hole too small to land in (see
+/// [`crate::encoder::entry_size`]).
 pub const TRANSPORT_PAYLOAD_SIZE: usize = 8;
 
 const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 52);
@@ -397,11 +399,8 @@ pub fn encode<E: AppEvent>(
     }
 
     let event_tag = match event {
-        JournalEvent::Tick { now_ns } => {
-            le::put_u64(&mut buf[pos..], *now_ns);
-            pos += 8;
-            TAG_TICK
-        }
+        // No payload: a tick's time is the entry's timestamp.
+        JournalEvent::Tick => TAG_TICK,
         JournalEvent::EpochBump { epoch } => {
             le::put_u64(&mut buf[pos..], *epoch);
             pos += 8;
@@ -551,15 +550,13 @@ pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> 
 
     let event = match event_tag {
         TAG_TICK => {
-            if event_payload.len() < 8 {
+            if !event_payload.is_empty() {
                 return Err(JournalError::CorruptEntry {
                     sequence,
-                    reason: "Tick payload too short",
+                    reason: "Tick carries a payload",
                 });
             }
-            JournalEvent::Tick {
-                now_ns: le::get_u64(event_payload),
-            }
+            JournalEvent::Tick
         }
         TAG_EPOCH_BUMP => {
             if event_payload.len() < 8 {
@@ -672,9 +669,34 @@ mod tests {
 
     #[test]
     fn round_trip_tick() {
-        round_trip(JournalEvent::Tick {
-            now_ns: 1_700_000_000_000_000_000,
-        });
+        round_trip(JournalEvent::Tick);
+    }
+
+    /// A tick's time is its entry's timestamp; bytes after its tag are a
+    /// malformed entry, not a second copy of the time.
+    #[test]
+    fn a_tick_with_a_payload_is_corrupt() {
+        let mut buf = [0u8; 256];
+        let n = encode(
+            1,
+            5,
+            0,
+            &JournalEvent::<TestEvent>::EpochBump { epoch: 9 },
+            &mut buf,
+        )
+        .expect("encode");
+        // Re-tag the epoch bump as a tick: same framing, an 8-byte payload
+        // behind the tick tag, CRC recomputed so only the tag check fails.
+        buf[ENTRY_HEADER_SIZE + 8] = TAG_TICK;
+        let crc = crc32c::crc32c(&buf[..n - CRC_SIZE]);
+        le::put_u32(&mut buf[n - CRC_SIZE..], crc);
+        assert!(matches!(
+            decode::<TestEvent>(&buf[..n]),
+            Err(JournalError::CorruptEntry {
+                reason: "Tick carries a payload",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -988,9 +1010,7 @@ mod tests {
     /// before it can break compatibility with journals on disk.
     #[test]
     fn entry_layout_is_byte_pinned() {
-        let event = JournalEvent::Tick::<TestEvent> {
-            now_ns: 0x4847_4645_4443_4241,
-        };
+        let event = JournalEvent::Tick::<TestEvent>;
         let mut buf = [0u8; 256];
         let n = encode(
             0x2827_2625_2423_2221, // sequence
@@ -1001,24 +1021,22 @@ mod tests {
         )
         .expect("encode");
 
-        // Body: EntryHeader(20) + EntryMetadata(9) + Tick payload(8) = 37.
-        // Total = 37 + CRC(4) = 41. length field = 9 + 8 = 17 = 0x11.
+        // Body: EntryHeader(20) + EntryMetadata(9), no Tick payload = 29.
+        // Total = 29 + CRC(4) = 33. length field = 9 = 0x09.
         let mut expected: Vec<u8> = vec![
             // EntryHeader: magic(u16) + length(u16) + sequence(u64) + timestamp_ns(u64)
             0x45, 0x4A, // ENTRY_MAGIC = 0x4A45
-            0x11, 0x00, // length = 17
+            0x09, 0x00, // length = 9
             0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // sequence
             0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // timestamp_ns
             // EntryMetadata: key_hash(u64) + event_tag(u8)
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // key_hash
-            0x03, // TAG_TICK
-            // Tick payload: now_ns(u64)
-            0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+            0x03, // TAG_TICK, and no payload: the tick's time is timestamp_ns
         ];
         let crc = crc32c::crc32c(&expected);
         expected.extend_from_slice(&crc.to_le_bytes());
 
-        assert_eq!(n, 41);
+        assert_eq!(n, 33);
         assert_eq!(
             &buf[..n],
             expected.as_slice(),

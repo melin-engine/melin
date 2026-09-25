@@ -37,7 +37,7 @@ Offset  Size  Field           Description
 0       2     entry_magic     0x4A45 — misalignment / corruption detection
 2       2     length          byte count of (key_hash + event_tag + payload)
 4       8     sequence        monotonically increasing, starts at 1, no gaps
-12      8     timestamp_ns    wall-clock nanoseconds since Unix epoch (see Timestamps)
+12      8     timestamp_ns    sequencer time, ns since Unix epoch, strictly increasing (see Timestamps)
 20      8     key_hash        hash of the client's signing key (0 for server-internal events)
 28      1     event_tag       which kind of event (see below)
 29      var   payload         the event's fields (see below)
@@ -50,7 +50,7 @@ Total entry size: `20 + length + 4` bytes. The first entry's `sequence` must equ
 
 | `event_tag` | Event | Payload |
 |-------------|-------|---------|
-| `0x03` | Tick | `now_ns` (u64) — the clock reading the runtime journals so the application's time-driven work replays identically |
+| `0x03` | Tick | none: a tick's time is the entry's timestamp. The runtime journals ticks so the application's time-driven work advances while no traffic arrives, and replays identically |
 | `0x04` | Epoch bump | `epoch` (u64) — the fencing epoch a newly promoted primary starts under (see [replication.md](replication.md)); never delivered to the application |
 | `0x80` | Application event | the application's own encoding of one event, exactly as it wrote it |
 
@@ -360,7 +360,11 @@ Sequences are `u64`, starting at 1, monotonically increasing, with no gaps. At 1
 
 ### Timestamps
 
-The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`, read on the primary when the event enters the pipeline. The journal never uses it for ordering — sequence numbers do that — but it is the time the application is handed with the event, live and on every replay, so replay reproduces any decision the application based on it. If the system clock jumps (an NTP step), or a failover hands the primary role to a node whose clock is behind, consecutive timestamps may go backwards, and so may the time the application's time-driven work is advanced to. An application must not assume either only increases.
+The `timestamp_ns` field is the sequencer's time: nanoseconds since the Unix epoch, assigned on the primary when the event enters the pipeline, and strictly later than the entry before it, across the whole journal, restarts, snapshots and failovers. Sequence numbers still order the journal, but the timestamp is the time the application is handed with the event, live and on every replay, so replay reproduces any decision the application based on it.
+
+It follows the primary's wall clock (`CLOCK_REALTIME`) but is not the wall clock. When the wall clock steps back, or a failover hands the primary role to a node whose clock runs behind, timestamps advance by one nanosecond per event until the wall clock catches up, rather than go backwards. A forward jump of the wall clock beyond the jump limit is not followed on a running primary: time keeps advancing at the real rate instead (`--clock-jump-limit-ms`).
+
+The rule is enforced where the journal is written and read: an entry whose timestamp is not later than the one before it is refused when written, and a journal holding one fails recovery.
 
 ### Error Handling
 

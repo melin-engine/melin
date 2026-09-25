@@ -53,8 +53,10 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// 2 = fencing epochs (epoch on handshake/StreamStart) + this field;
 /// 3 = primary-driven rotation (`Rotate`) + chain validation (`ChainCheck`);
 /// 4 = primary ack policy on `StreamStart` and `Heartbeat`;
-/// 5 = `request_seq` dropped from the `InputBatch` slot header.
-pub const REPL_PROTOCOL_VERSION: u16 = 5;
+/// 5 = `request_seq` dropped from the `InputBatch` slot header;
+/// 6 = `Tick` slots carry no payload (their time is the slot timestamp),
+///     and stamps strictly increase, which a replica enforces.
+pub const REPL_PROTOCOL_VERSION: u16 = 6;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).

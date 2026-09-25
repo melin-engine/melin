@@ -5,7 +5,7 @@
 //!
 //! - **Inbound**: `rx_burst` → smoltcp → frame decode → disruptor publish
 //! - **Outbound**: response SPSC → per-connection TX queue → smoltcp → `tx_burst`
-//! - **Tick**: cadence comparison between bursts → `JournalEvent::Tick { now_ns }`
+//! - **Tick**: cadence comparison between bursts → `JournalEvent::Tick`
 //!   onto the same input ring (see `run_dpdk_poll` for the single-poll-thread
 //!   invariant assumed here).
 //!

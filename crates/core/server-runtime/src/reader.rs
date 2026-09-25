@@ -191,7 +191,7 @@ impl<R> UringReaderHandle<R> {
 /// `tick_cadence: Some(d)` makes the reader the clock-tick generator: it
 /// arms an `IORING_OP_TIMEOUT` so `submit_and_wait` returns at the tick
 /// deadline even when no client traffic is flowing, then publishes a
-/// `JournalEvent::Tick { now_ns }` onto the same input ring it uses for
+/// `JournalEvent::Tick` onto the same input ring it uses for
 /// client requests. Pass `None` to disable the tick (useful for benchmarks
 /// that don't exercise time-driven features). Ticks and client writes are
 /// stamped by the same producer, so their times interleave strictly.
@@ -1420,7 +1420,7 @@ mod tests {
         fn query(&self, _event: TestEvent, _ctx: &QueryCtx) -> Option<()> {
             unreachable!()
         }
-        fn tick(&mut self, _now_ns: u64, _out: &mut Vec<TestReport>) {
+        fn tick(&mut self, _now: melin_app::SequencerTime, _out: &mut Vec<TestReport>) {
             unreachable!()
         }
         fn build_reject(event: &TestEvent, reason: RejectReason) -> TestReport {
