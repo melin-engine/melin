@@ -623,8 +623,10 @@ fn reader_loop<A: Application, R: AsRawFd>(
         // request rates a per-request `clock_gettime` (vDSO) showed up in
         // the primary's profile. Every request in the batch is stamped
         // from this reading, each strictly after the one before, so the
-        // precision lost is bounded by the CQE-drain cadence.
-        let reading = producer.read_clock();
+        // precision lost is bounded by the CQE-drain cadence. Deferred to
+        // the first received bytes, so a batch of tick timeouts, wakeups
+        // and send completions reads no clock.
+        let mut reading: Option<ClockReading> = None;
 
         for &(token, result, flags) in &cqes {
             // ── Tick timeout ──
@@ -832,6 +834,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     .extend_from_slice(&buffer_pool[buf_start..buf_start + n]);
 
                 // Extract and publish complete frames.
+                let reading = *reading.get_or_insert_with(|| producer.read_clock());
                 let drop_conn = process_frames::<A, R, _>(
                     entry,
                     &mut producer,

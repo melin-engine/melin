@@ -409,8 +409,8 @@ pub struct ServerConfig {
     /// exercise time-driven features).
     ///
     /// Defaults to 250 ms. Under load the matching stage advances the
-    /// application's clock at every-event resolution from `slot.timestamp_ns`
-    /// (microsecond precision), so the tick is only the safety net for
+    /// application's clock at every-event resolution from each event's
+    /// journaled time, so the tick is only the safety net for
     /// quiet periods. 250 ms keeps time-driven work in quiet periods within
     /// a quarter-second of their deadline at a cost of ~4 events/sec of
     /// journal traffic.

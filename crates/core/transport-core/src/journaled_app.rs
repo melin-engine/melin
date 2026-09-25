@@ -534,7 +534,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// Journal an event and apply it to the inner application in one
     /// call, as the node's own (key hash 0), stamped by the sequencer
-    /// clock from the current wall-clock time. Test-only primitive —
+    /// clock from the current wall-clock time. Test-only primitive:
     /// production drives events through the disruptor pipeline (journal
     /// stage + matching stage on separate threads), and never
     /// journals-then-applies on the same thread.

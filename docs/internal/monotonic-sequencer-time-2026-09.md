@@ -559,8 +559,17 @@ Steps 1 to 5 ship in one release. After that, the replay rule and the
 
 ## Downstream impact (Exchange Core)
 
-Read, not changed:
+Read, not changed here; the fixes belong to the exchange.
 
+- **Broken since step 1.** Two bench binaries build `InputSlot`s by
+  hand and publish them straight to the ring, bypassing the stamping
+  producer: `crates/exchange/server/src/bin/replication-bench.rs` (two
+  publish sites) and `crates/exchange/bench/src/main.rs` (one). The
+  field is now `timestamp: SequencerTime`, so they no longer compile.
+  Renaming the field is not enough: both stamp each event from a raw
+  clock read, and from step 3 the encoder refuses equal stamps, which
+  the replication bench reaches at bench rates. They need a strictly
+  increasing stamp: the stamping producer, or at least `last + 1`.
 - `ServerApp::tick` is compatible as is; it will run once per event
   instead of once per batch.
 - `scheduler.rs`'s module doc refers to `Tick { now_ns }` and needs
