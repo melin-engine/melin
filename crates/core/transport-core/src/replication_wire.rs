@@ -26,7 +26,7 @@
 
 use std::io;
 
-use melin_app::AppEvent;
+use melin_app::{AppEvent, SequencerTime};
 use melin_journal::JournalEvent;
 use melin_journal::codec::ENTRY_META_SIZE;
 use zerocopy::little_endian::{U16, U32, U64};
@@ -183,7 +183,7 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
         .expect("SLOT_HEADER_LEN slice matches struct size");
     header.length = U16::new(length);
     header.sequence = U64::new(seq);
-    header.timestamp_ns = U64::new(slot.timestamp_ns);
+    header.timestamp_ns = U64::new(slot.timestamp.as_ns());
     header.key_hash = U64::new(slot.key_hash);
     header.event_tag = tag;
 }
@@ -300,7 +300,8 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
             connection_id: 0,
             key_hash: header.key_hash.get(),
             sequence: header.sequence.get(),
-            timestamp_ns: header.timestamp_ns.get(),
+            // The primary's stamp, carried verbatim.
+            timestamp: SequencerTime::from_ns(header.timestamp_ns.get()),
             event,
             publish_ts: Default::default(),
             recv_ts: Default::default(),
@@ -398,7 +399,7 @@ mod tests {
             connection_id: 0,
             key_hash: 0xabcd_ef00_1234_5678,
             sequence,
-            timestamp_ns: 1_700_000_000_000_000_000,
+            timestamp: SequencerTime::from_ns(1_700_000_000_000_000_000),
             event,
             publish_ts: Default::default(),
             recv_ts: Default::default(),
@@ -423,7 +424,7 @@ mod tests {
 
         for (orig, dec) in slots.iter().zip(decoded.iter()) {
             assert_eq!(dec.sequence, orig.sequence);
-            assert_eq!(dec.timestamp_ns, orig.timestamp_ns);
+            assert_eq!(dec.timestamp, orig.timestamp);
             assert_eq!(dec.key_hash, orig.key_hash);
             assert_eq!(dec.connection_id, 0);
         }
@@ -622,7 +623,7 @@ mod tests {
             connection_id: 0,
             key_hash: 0x0807_0605_0403_0201,
             sequence: 0x2827_2625_2423_2221,
-            timestamp_ns: 0x3837_3635_3433_3231,
+            timestamp: SequencerTime::from_ns(0x3837_3635_3433_3231),
             event: JournalEvent::Tick {
                 now_ns: 0x4847_4645_4443_4241,
             },

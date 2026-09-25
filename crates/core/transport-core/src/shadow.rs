@@ -119,7 +119,7 @@ pub fn run<A: Application>(
                 &mut app,
                 slot.event,
                 &ApplyCtx {
-                    now_ns: slot.timestamp_ns,
+                    now_ns: slot.timestamp.as_ns(),
                     key_hash: slot.key_hash,
                 },
                 &mut last_drain_ns,
@@ -181,6 +181,7 @@ mod tests {
     use crate::cursors::{RingPos, WireSeq};
     use crate::pipeline::InputSlot;
     use crate::test_support::{TestApp, TestEvent};
+    use melin_app::SequencerTime;
     use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_pipeline::seqlock;
@@ -272,7 +273,7 @@ mod tests {
             connection_id: 0,
             key_hash: 0,
             sequence: 0,
-            timestamp_ns: 0,
+            timestamp: SequencerTime::default(),
             event: JournalEvent::App(TestEvent::Add(1000)),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
@@ -281,7 +282,7 @@ mod tests {
             connection_id: 0,
             key_hash: 0,
             sequence: 0,
-            timestamp_ns: 0,
+            timestamp: SequencerTime::default(),
             event: JournalEvent::App(TestEvent::Add(500)),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
@@ -358,7 +359,7 @@ mod tests {
             connection_id: 1,
             key_hash: KEY,
             sequence: 0,
-            timestamp_ns: 1_000,
+            timestamp: SequencerTime::from_ns(1_000),
             event: JournalEvent::App(TestEvent::Query),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
@@ -367,7 +368,7 @@ mod tests {
             connection_id: 0,
             key_hash: 0,
             sequence: 0,
-            timestamp_ns: 0,
+            timestamp: SequencerTime::default(),
             event: JournalEvent::App(TestEvent::Add(7)),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
@@ -486,7 +487,7 @@ mod tests {
             connection_id: 0,
             key_hash: 0,
             sequence: 0,
-            timestamp_ns: 0,
+            timestamp: SequencerTime::default(),
             event: JournalEvent::App(TestEvent::Add(1)),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
@@ -511,7 +512,7 @@ mod tests {
             connection_id: 0,
             key_hash: 0,
             sequence: 0,
-            timestamp_ns: 0,
+            timestamp: SequencerTime::default(),
             event: JournalEvent::App(TestEvent::Add(1)),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
@@ -587,7 +588,7 @@ mod tests {
                     connection_id: 0,
                     key_hash: 0,
                     sequence: 0,
-                    timestamp_ns: 0,
+                    timestamp: SequencerTime::default(),
                     event: JournalEvent::App(TestEvent::Add(n)),
                     publish_ts: Default::default(),
                     recv_ts: Default::default(),

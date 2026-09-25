@@ -1012,7 +1012,7 @@ mod tests {
             connection_id: 0,
             key_hash: tag,
             sequence: primary_seq,
-            timestamp_ns: 0,
+            timestamp: melin_app::SequencerTime::default(),
             event: JournalEvent::App(TestEvent(tag as u8)),
             publish_ts: Default::default(),
             recv_ts: Default::default(),

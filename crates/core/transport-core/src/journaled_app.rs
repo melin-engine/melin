@@ -178,6 +178,17 @@ pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     /// field exists only where the helpers do.
     #[cfg(any(test, feature = "test-utils"))]
     last_drain_ns: u64,
+    /// Stamps the test-only helpers' events: the production clock, so two
+    /// calls inside one nanosecond stay strictly ordered as they would
+    /// live. Starts from zero, like the primary's.
+    #[cfg(any(test, feature = "test-utils"))]
+    clock: crate::clock::SequencerClock,
+}
+
+/// The clock behind the test-only helpers.
+#[cfg(any(test, feature = "test-utils"))]
+fn helper_clock() -> crate::clock::SequencerClock {
+    crate::clock::SequencerClock::new(crate::clock::SystemClocks, crate::clock::DEFAULT_JUMP_LIMIT)
 }
 
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
@@ -193,6 +204,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             recovered_epoch: 0,
             #[cfg(any(test, feature = "test-utils"))]
             last_drain_ns: 0,
+            #[cfg(any(test, feature = "test-utils"))]
+            clock: helper_clock(),
         })
     }
 
@@ -357,6 +370,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 recovered_epoch,
                 #[cfg(any(test, feature = "test-utils"))]
                 last_drain_ns,
+                #[cfg(any(test, feature = "test-utils"))]
+                clock: helper_clock(),
             });
         }
 
@@ -420,6 +435,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             recovered_epoch,
             #[cfg(any(test, feature = "test-utils"))]
             last_drain_ns,
+            #[cfg(any(test, feature = "test-utils"))]
+            clock: helper_clock(),
         })
     }
 
@@ -496,6 +513,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             // as the matching stage starts from at every boot.
             #[cfg(any(test, feature = "test-utils"))]
             last_drain_ns: 0,
+            #[cfg(any(test, feature = "test-utils"))]
+            clock: helper_clock(),
         }
     }
 
@@ -514,51 +533,57 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 #[cfg(any(test, feature = "test-utils"))]
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// Journal an event and apply it to the inner application in one
-    /// call, as the node's own (key hash 0) at the current wall-clock
-    /// time. Test-only primitive — production drives events through the
-    /// disruptor pipeline (journal stage + matching stage on separate
-    /// threads), and never journals-then-applies on the same thread.
+    /// call, as the node's own (key hash 0), stamped by the sequencer
+    /// clock from the current wall-clock time. Test-only primitive —
+    /// production drives events through the disruptor pipeline (journal
+    /// stage + matching stage on separate threads), and never
+    /// journals-then-applies on the same thread.
     pub fn apply_journaled(
         &mut self,
         event: A::Event,
         out: &mut Vec<A::Report>,
     ) -> Result<(), JournalError> {
-        self.dispatch_journaled(
-            melin_journal::JournalEvent::App(event),
-            melin_app::unix_epoch_nanos(),
-            out,
-        )
+        let timestamp = self.clock.now();
+        self.dispatch_journaled(melin_journal::JournalEvent::App(event), timestamp, out)
     }
 
     /// Journal a tick at `now_ns` and dispatch it to the inner
-    /// application. Mirrors `apply_journaled` for the tick path.
+    /// application. Mirrors `apply_journaled` for the tick path, with the
+    /// time given by the caller instead of read: the tick is stamped
+    /// `now_ns`, or one nanosecond past the helpers' last stamp if that is
+    /// later, as the sequencer clock would stamp it.
     pub fn tick_journaled(
         &mut self,
         now_ns: u64,
         out: &mut Vec<A::Report>,
     ) -> Result<(), JournalError> {
-        self.dispatch_journaled(melin_journal::JournalEvent::Tick { now_ns }, now_ns, out)
+        let timestamp = self.clock.stamp_at(now_ns);
+        let tick = melin_journal::JournalEvent::Tick {
+            now_ns: timestamp.as_ns(),
+        };
+        self.dispatch_journaled(tick, timestamp, out)
     }
 
-    /// Journal `event` under `timestamp_ns`, durably, then dispatch it
-    /// under the same timestamp through the sequence replay uses. One
-    /// timestamp and one dispatch path are what make a run through these
-    /// helpers and a replay of the journal it wrote the same run: a
-    /// second clock read, or a call to `apply` that skips the clock step,
-    /// would fire due scheduled work at different points on the two.
+    /// Journal `event` under `timestamp`, durably, then dispatch it under
+    /// the same timestamp through the sequence replay uses. One timestamp
+    /// and one dispatch path are what make a run through these helpers
+    /// and a replay of the journal it wrote the same run: a second clock
+    /// read, or a call to `apply` that skips the clock step, would fire
+    /// due scheduled work at different points on the two.
     fn dispatch_journaled(
         &mut self,
         event: melin_journal::JournalEvent<A::Event>,
-        timestamp_ns: u64,
+        timestamp: melin_app::SequencerTime,
         out: &mut Vec<A::Report>,
     ) -> Result<(), JournalError> {
-        self.writer.batch_append_with_ts(&event, timestamp_ns, 0)?;
+        self.writer
+            .batch_append_with_ts(&event, timestamp.as_ns(), 0)?;
         self.writer.flush_batch_sync()?;
         dispatch(
             &mut self.app,
             event,
             &ApplyCtx {
-                now_ns: timestamp_ns,
+                now_ns: timestamp.as_ns(),
                 key_hash: 0,
             },
             &mut self.last_drain_ns,
@@ -926,8 +951,9 @@ mod tests {
 
         let mut ja = TestApp_::create(TestApp::new(), &path).unwrap();
         ja.apply_journaled(TestEvent::Add(3), &mut reports).unwrap();
-        // A tick a minute ahead of the wall clock: the event after it is
-        // older than the clock it set, so it must not fire due work.
+        // A tick a minute ahead of the wall clock. The event after it is
+        // stamped one nanosecond past the tick, not behind it: the helpers
+        // stamp through the sequencer clock, as the primary does.
         let ahead = melin_app::unix_epoch_nanos() + 60_000_000_000;
         ja.tick_journaled(ahead, &mut reports).unwrap();
         ja.apply_journaled(TestEvent::Add(4), &mut reports).unwrap();
@@ -939,9 +965,9 @@ mod tests {
         drop(ja);
 
         // One firing for the first event, two for the tick (the clock
-        // step, then the tick itself), none for the event behind the
-        // clock.
-        assert_eq!((live.total, live.ticks), (7, 3));
+        // step, then the tick itself), and one for the event after it,
+        // whose stamp is past the tick's.
+        assert_eq!((live.total, live.ticks), (7, 4));
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(

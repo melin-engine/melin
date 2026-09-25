@@ -1250,7 +1250,7 @@ mod drain_into_contiguity_tests {
             connection_id: 0,
             key_hash: 0,
             sequence: seq,
-            timestamp_ns: 0,
+            timestamp: melin_app::SequencerTime::default(),
             event: JournalEvent::App(TestEvent::Add(seq)),
             publish_ts: Default::default(),
             recv_ts: Default::default(),

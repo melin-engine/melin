@@ -41,10 +41,8 @@ use rustc_hash::FxHashMap;
 
 use melin_app::Application;
 use melin_app::auth::{AuthorizedKeys, ClientRole, KeyRole, RoleId};
-use melin_app::unix_epoch_nanos;
 use melin_dpdk::transport::DpdkTransport;
-use melin_pipeline::ring;
-use melin_transport_core::pipeline::InputSlot;
+use melin_transport_core::clock::{ClockReading, StampingProducer};
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control::ConnectionId;
@@ -121,7 +119,7 @@ struct ConnectionState {
 #[allow(clippy::too_many_arguments)]
 pub fn run_dpdk_poll<A: Application>(
     mut transport: DpdkTransport,
-    mut producer: ring::Producer<InputSlot<A::Event>>,
+    mut producer: StampingProducer<A::Event>,
     decoder: crate::reader::RequestDecoderArc<A>,
     // While it refuses writes, they are answered through `refusals`
     // instead of published — see `crate::halt`.
@@ -211,7 +209,6 @@ pub fn run_dpdk_poll<A: Application>(
     let tick_enabled = tick_cadence.is_some();
     let cadence = tick_cadence.unwrap_or(Duration::ZERO);
     let mut next_tick_deadline = Instant::now() + cadence;
-    let mut last_tick_ns: u64 = 0;
     let mut tick_check_counter: u32 = 0;
     const TICK_CHECK_INTERVAL: u32 = 4096;
 
@@ -270,11 +267,10 @@ pub fn run_dpdk_poll<A: Application>(
                 tick_check_counter = 0;
                 let now = Instant::now();
                 if now >= next_tick_deadline {
-                    let raw_now_ns = unix_epoch_nanos();
-                    let now_ns =
-                        melin_transport_core::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
-                    last_tick_ns = now_ns;
-                    melin_transport_core::tick::publish_tick(&mut producer, now_ns);
+                    // Dropped on a full ring rather than blocking ingress;
+                    // the next tick carries a later time (see
+                    // `try_publish_tick`).
+                    let _ = producer.try_publish_tick();
                     let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
                     next_tick_deadline = if elapsed > cadence {
                         Instant::now() + cadence
@@ -398,13 +394,12 @@ pub fn run_dpdk_poll<A: Application>(
         // full connection iteration to complete.
         const POLL_EVERY_N_CONNS: usize = 4;
 
-        // One wall-clock read per outer poll iteration, reused for
-        // every request stamped in this pass. Sub-microsecond precision
-        // loss at DPDK poll rates; the timestamp drives the application's
-        // clock but orders nothing (the pipeline orders by sequence).
+        // One clock read per outer poll iteration, reused for every
+        // request stamped in this pass, each strictly after the one
+        // before. Sub-microsecond precision loss at DPDK poll rates.
         // Deferred until we actually stamp a frame — `clock_gettime`
         // dominates the profile on idle polls with no traffic.
-        let mut batch_wall_ns: Option<u64> = None;
+        let mut reading: Option<ClockReading> = None;
 
         slow_check_counter = slow_check_counter.wrapping_add(1);
         let do_slow_checks = slow_check_counter.is_multiple_of(SLOW_CHECK_INTERVAL);
@@ -581,7 +576,8 @@ pub fn run_dpdk_poll<A: Application>(
                 AuthState::Authenticated { role } => {
                     use crate::client_frames::{FrameAction, process_client_frames};
                     let role = *role;
-                    let action = process_client_frames::<A>(
+                    let reading = *reading.get_or_insert_with(|| producer.read_clock());
+                    let action = process_client_frames::<A, _>(
                         &mut conn.parse_buf,
                         conn.connection_id.0,
                         conn.key_hash,
@@ -590,7 +586,7 @@ pub fn run_dpdk_poll<A: Application>(
                         &*decoder,
                         &halt,
                         &mut refusals,
-                        *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
+                        reading,
                         recv_ts,
                         #[cfg(feature = "latency-trace")]
                         &mut publish_rec,

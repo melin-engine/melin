@@ -725,7 +725,8 @@ pub fn decode_journal_to_input_slots<E: AppEvent>(
             connection_id: 0,
             key_hash,
             sequence,
-            timestamp_ns,
+            // The primary's stamp, as its journal recorded it.
+            timestamp: melin_app::SequencerTime::from_ns(timestamp_ns),
             event,
             publish_ts: Default::default(),
             recv_ts: Default::default(),
