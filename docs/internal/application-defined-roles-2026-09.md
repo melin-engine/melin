@@ -1,10 +1,11 @@
 # Application-defined client roles (plan)
 
-Status: **proposed, not started** (2026-09). Implements the roadmap item
-"Application-defined client roles" ([roadmap.md](roadmap.md)); read that
-entry for the problem statement. This document records what the code
-actually looks like against that entry, the design decisions, and the
-order of work.
+Status: **implemented** (2026-09). Implemented the roadmap item
+"Application-defined client roles", since removed from the roadmap; its
+problem statement is S6 of
+[application-api-review-2026-09.md](application-api-review-2026-09.md).
+This document records what the code looked like against that item, the
+design decisions, and the order of work.
 
 The one-line goal: **the runtime owns the roles it acts on, and the
 application owns every other one.** `operator` and `replication` stay the
