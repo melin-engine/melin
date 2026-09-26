@@ -59,6 +59,11 @@ struct Node {
     start_seq: u64,
     /// Slots published this run, every one journaled (no queries here).
     published: u64,
+    /// Entries surely past the last boundary: counted from this run's
+    /// start or its last rotation, not counting the tick a rotation
+    /// straddles. The journal stage skips a rotation of an empty live
+    /// segment, so [`Node::rotate`] needs one.
+    past_boundary: u64,
     /// Archives expected once every requested rotation has happened.
     archives: usize,
     next_id: u64,
@@ -116,6 +121,7 @@ impl Node {
             matching_progress: pipeline.cursors.matching_ring_arc(),
             start_seq,
             published: 0,
+            past_boundary: 0,
             archives,
             next_id: start_seq + 1,
             shutdown,
@@ -146,11 +152,13 @@ impl Node {
         }
         batch.commit();
         self.published += n;
+        self.past_boundary += n;
     }
 
     fn tick(&mut self) {
         self.producer.try_publish_tick().expect("the ring has room");
         self.published += 1;
+        self.past_boundary += 1;
     }
 
     /// A promotion's epoch bump, published as `run_as_primary` publishes
@@ -159,6 +167,7 @@ impl Node {
         self.producer
             .publish_internal(JournalEvent::EpochBump { epoch });
         self.published += 1;
+        self.past_boundary += 1;
     }
 
     /// Rotate the journal, across a tick. The journal stage acts on a
@@ -167,6 +176,10 @@ impl Node {
     /// slot (the live segment must hold an entry), and the tick after it
     /// may land on either side of the boundary.
     fn rotate(&mut self) {
+        assert!(
+            self.past_boundary > 0,
+            "journal an entry before rotating: the journal stage skips an empty live segment"
+        );
         let published = self.published;
         let progress = Arc::clone(&self.journal_progress);
         wait_for("the journal stage to take every published slot", || {
@@ -174,6 +187,7 @@ impl Node {
         });
         self.rotate.store(true, Ordering::Release);
         self.tick();
+        self.past_boundary = 0;
         self.archives += 1;
         let (journal, archives) = (self.journal.clone(), self.archives);
         wait_for("a rotation", || {
@@ -187,6 +201,11 @@ impl Node {
     /// Wait for every published slot to be durable and applied, stop the
     /// stages, and return the application. A journal stage that stopped on
     /// its own (it refused an entry) fails the test with its error.
+    ///
+    /// The writer the journal stage hands back must report the last stamp
+    /// as its floor: it is the writer a promotion takes over when a
+    /// replica's pipeline is torn down, and the new primary's clock is
+    /// seeded from it.
     fn stop(self) -> RecordingApp {
         let target = self.start_seq + self.published;
         wait_for("the journal to reach the last entry", || {
@@ -200,10 +219,17 @@ impl Node {
             self.matching_progress.get().load(Ordering::Acquire) == self.published
         });
         self.shutdown.store(true, Ordering::Relaxed);
-        self.t_journal
+        let writer = self
+            .t_journal
             .join()
             .unwrap()
             .expect("the journal stage stops cleanly");
+        // Every stamp the clock issued here was journaled (no queries).
+        assert_eq!(
+            writer.last_timestamp(),
+            self.producer.last_stamp(),
+            "the writer handed back at teardown lost the time floor"
+        );
         self.t_matching.join().unwrap()
     }
 }
