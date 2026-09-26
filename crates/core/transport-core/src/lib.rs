@@ -69,6 +69,9 @@ mod pipeline_tests;
 #[cfg(test)]
 mod call_trace_tests;
 
+#[cfg(test)]
+mod clock_acceptance_tests;
+
 pub use cursors::{
     AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, ReplicaSlotCursors, RingPos,
     SlotAcked, WireSeq,

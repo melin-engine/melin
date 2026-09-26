@@ -581,52 +581,13 @@ impl<E: AppEvent, S: TimeSource> StampingBatch<'_, E, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestEvent;
+    use crate::test_support::{ManualClocks, TestEvent};
     use melin_pipeline::ring::DisruptorBuilder;
     use melin_pipeline::wait::WaitStrategy;
-    use std::cell::Cell;
-    use std::rc::Rc;
 
     const LIMIT: Duration = Duration::from_secs(5);
     const LIMIT_NS: u64 = 5_000_000_000;
     const T0: u64 = 1_700_000_000_000_000_000;
-
-    /// Clocks the test sets by hand. `Rc<Cell>` so the test keeps a
-    /// handle while the clock owns the source.
-    #[derive(Clone, Default)]
-    struct ManualClocks {
-        wall: Rc<Cell<u64>>,
-        boot: Rc<Cell<u64>>,
-    }
-
-    impl ManualClocks {
-        fn at(wall_ns: u64) -> Self {
-            let clocks = Self::default();
-            clocks.wall.set(wall_ns);
-            clocks
-        }
-
-        /// Real time passes: both clocks advance together.
-        fn advance(&self, ns: u64) {
-            self.wall.set(self.wall.get() + ns);
-            self.boot.set(self.boot.get() + ns);
-        }
-
-        /// The wall clock is set to `wall_ns`; the boot clock does not
-        /// move.
-        fn step_wall(&self, wall_ns: u64) {
-            self.wall.set(wall_ns);
-        }
-    }
-
-    impl TimeSource for ManualClocks {
-        fn wall_ns(&self) -> u64 {
-            self.wall.get()
-        }
-        fn boot_ns(&self) -> u64 {
-            self.boot.get()
-        }
-    }
 
     fn clock_at(wall_ns: u64) -> (ManualClocks, SequencerClock<ManualClocks>) {
         let clocks = ManualClocks::at(wall_ns);

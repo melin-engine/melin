@@ -7,11 +7,54 @@
 //! submitting key reaches `apply` on every path. Kept deliberately small
 //! — the transport doesn't care about semantics, only about byte-exact
 //! round-trips.
+//!
+//! Also [`ManualClocks`], the time source tests drive the sequencer
+//! clock with.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::rc::Rc;
 
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
+
+use crate::clock::TimeSource;
+
+/// Clocks the test sets by hand. `Rc<Cell>` so the test keeps a handle
+/// while the clock owns the source; the clock stays on the test's thread.
+#[derive(Clone, Default)]
+pub struct ManualClocks {
+    wall: Rc<Cell<u64>>,
+    boot: Rc<Cell<u64>>,
+}
+
+impl ManualClocks {
+    pub fn at(wall_ns: u64) -> Self {
+        let clocks = Self::default();
+        clocks.wall.set(wall_ns);
+        clocks
+    }
+
+    /// Real time passes: both clocks advance together.
+    pub fn advance(&self, ns: u64) {
+        self.wall.set(self.wall.get() + ns);
+        self.boot.set(self.boot.get() + ns);
+    }
+
+    /// The wall clock is set to `wall_ns`; the boot clock does not move.
+    pub fn step_wall(&self, wall_ns: u64) {
+        self.wall.set(wall_ns);
+    }
+}
+
+impl TimeSource for ManualClocks {
+    fn wall_ns(&self) -> u64 {
+        self.wall.get()
+    }
+    fn boot_ns(&self) -> u64 {
+        self.boot.get()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestEvent {

@@ -13,6 +13,10 @@
 //!
 //! This is the runtime's half only. That identical calls build identical
 //! state is the application's half, and depends on the application.
+//!
+//! The recording application and the replay checks are shared with the
+//! clock's acceptance tests (`clock_acceptance_tests`), which drive the
+//! same comparison through clock scenarios the generator does not produce.
 
 #![cfg(all(test, not(feature = "no-persist")))]
 
@@ -45,7 +49,7 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An application event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Step {
+pub(crate) enum Step {
     /// A write, carrying an identifier unique within the history, which
     /// the recording names `apply` calls by (`ApplyCtx` carries no
     /// sequence).
@@ -103,7 +107,7 @@ impl AppEvent for Step {
 
 /// One call the runtime made into the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Call {
+pub(crate) enum Call {
     Tick { now_ns: u64 },
     Apply { id: u64, now_ns: u64, key_hash: u64 },
 }
@@ -111,9 +115,9 @@ enum Call {
 /// Records every call it receives, and snapshots the record, so a
 /// restored instance carries the calls made before its anchor.
 #[derive(Debug, Default)]
-struct RecordingApp {
+pub(crate) struct RecordingApp {
     // Vec: calls are only appended and compared in order.
-    calls: Vec<Call>,
+    pub(crate) calls: Vec<Call>,
 }
 
 impl RecordingApp {
@@ -250,7 +254,7 @@ fn planned() -> impl Strategy<Value = Planned> {
     (op, 1u64..=3).prop_map(|(op, stamp_gap_ns)| Planned { op, stamp_gap_ns })
 }
 
-type Writer = BufferedWriter<Step>;
+pub(crate) type Writer = BufferedWriter<Step>;
 
 /// Turn a plan into the input slots a primary's producer would publish,
 /// and the indices (into those slots) after which a rotation is asked
@@ -303,7 +307,7 @@ fn journaled_count(slots: &[InputSlot<Step>]) -> u64 {
 
 /// Poll `done` until it holds, panicking with `what` past the deadline.
 #[track_caller]
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+pub(crate) fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
         assert!(
@@ -395,7 +399,7 @@ fn run_live(journal: &Path, slots: &[InputSlot<Step>], rotate_after: &[usize]) -
 
 /// The chain hash after each journaled entry, indexed by sequence
 /// (index 0 unused), walking the archives and then the live segment.
-fn chain_after_each_entry(journal: &Path) -> Vec<[u8; 32]> {
+pub(crate) fn chain_after_each_entry(journal: &Path) -> Vec<[u8; 32]> {
     let mut chain = vec![[0u8; 32]];
     let mut segments: Vec<PathBuf> = melin_journal::segment::list_archives(journal)
         .unwrap()
@@ -424,7 +428,11 @@ fn chain_after_each_entry(journal: &Path) -> Vec<[u8; 32]> {
 /// query itself would repeat the previous anchor's sequence and state,
 /// indistinguishable from it, so a query only moves the ring position of
 /// the anchors after it.
-fn shadow_snapshots(dir: &Path, slots: &[InputSlot<Step>], chain: &[[u8; 32]]) -> Vec<PathBuf> {
+pub(crate) fn shadow_snapshots(
+    dir: &Path,
+    slots: &[InputSlot<Step>],
+    chain: &[[u8; 32]],
+) -> Vec<PathBuf> {
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot<Step>>::new(64)
         .add_consumer()
         .build(WaitStrategy::SpinThenYield);
@@ -495,7 +503,7 @@ fn shadow_snapshots(dir: &Path, slots: &[InputSlot<Step>], chain: &[[u8; 32]]) -
 }
 
 /// Where two call traces part, for a readable failure.
-fn first_difference(a: &[Call], b: &[Call]) -> String {
+pub(crate) fn first_difference(a: &[Call], b: &[Call]) -> String {
     let at = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     format!(
         "first difference at call {at}: live {:?}, other {:?} (lengths {} and {})",

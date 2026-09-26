@@ -584,6 +584,14 @@ One commit per step, each reviewable on its own.
    the application's half (identical calls give identical state), not
    the runtime's.
 
+   They live in `clock_acceptance_tests.rs` and share the recording
+   application and the every-anchor restore check with the property
+   test. Each primary there is seeded from its writer's floor as
+   `run_as_primary` seeds it; the resynced replica installs the snapshot
+   and a header-only seed as the receiver does, then is promoted before
+   any entry arrives, the case where the snapshot's stamp is the only
+   floor it has.
+
    Also the merge gate deferred from step 4: the pipeline benchmark with
    `tick` before every entry, on the bench fleet, its result recorded in
    decision 2 with the date and the hardware.
