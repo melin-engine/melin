@@ -473,7 +473,7 @@ assert!(matches!(permit(reader, CounterEvent::GetValue), Decoded::Permitted(_)))
 
 **A reply is a batch.** Each request gets the reports `apply` pushed for it, in order, then an end-of-batch marker. A batch may hold none — the request changed state but had nothing to say — or several: an acknowledgement and the effects it caused. A query's reply is its one response, or an empty batch if `query` returned `None`.
 
-**Beyond the client that asked**, an application can also stream its reports to subscribers through an event publisher, a consumer of its own it passes to `server::run`. Most applications need none.
+**Beyond the client that asked**, an application can also stream its reports to subscribers through an event publisher, a consumer of its own it passes to `server::run`. Most applications need none. One that does is handed the node's keys table: to authenticate a subscriber, call `melin_server_runtime::client_auth::verify_client`, which admits exactly the keys the client listener does and checks the signature over the nonce you sent, rather than writing the check again.
 
 ## Retries and duplicates
 

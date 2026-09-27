@@ -4010,7 +4010,10 @@ mod tests {
         assert_eq!(resp, TAG_AUTH_FAILED);
 
         let err = handle.join().unwrap().unwrap_err();
-        assert!(err.contains("client listener"), "unexpected error: {err}");
+        assert!(
+            err.contains("may not connect as a client"),
+            "unexpected error: {err}"
+        );
     }
 }
 

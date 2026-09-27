@@ -211,7 +211,9 @@ impl KeyRole {
     /// refuses it during the handshake: no request of its reaches the
     /// application's decoder, and no application has to remember to refuse
     /// it. A listener of the application's own that admits the same keys
-    /// applies the same rule through this.
+    /// should call the server runtime's `client_auth::verify_client`, which
+    /// applies this rule and also checks the key's signature, rather than
+    /// rebuild the check from this.
     pub fn client(self) -> Option<ClientRole<RoleId>> {
         match self {
             KeyRole::Replication => None,

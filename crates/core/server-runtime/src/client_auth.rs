@@ -38,7 +38,7 @@ impl fmt::Display for ClientAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReplicationKeyRefused => {
-                f.write_str("replication key refused on the client listener")
+                f.write_str("replication key may not connect as a client")
             }
             Self::UnknownKey => f.write_str("unknown public key"),
             Self::InvalidKey(e) => write!(f, "invalid public key: {e}"),
@@ -173,7 +173,7 @@ mod tests {
         // Named by its token, as the operator wrote it in the keys file.
         assert_eq!(
             err.to_string(),
-            "replication key refused on the client listener"
+            "replication key may not connect as a client"
         );
         assert!(std::error::Error::source(&err).is_none());
     }
