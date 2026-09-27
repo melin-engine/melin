@@ -272,7 +272,12 @@ fi
 # looks maintained. `### ` rather than any text, because the link definitions
 # at the foot of the file would otherwise read as content when Unreleased is
 # the only section.
-if ! sed -n '/^## \[Unreleased\]$/,/^## \[/p' CHANGELOG.md | grep -q '^### '; then
+#
+# Not `grep -q`: it exits at the first match, and `sed` still writing the
+# rest of a large section then dies of SIGPIPE, which `pipefail` reports as
+# a failed check. Reading the whole stream keeps the pipeline's status
+# grep's own.
+if ! sed -n '/^## \[Unreleased\]$/,/^## \[/p' CHANGELOG.md | grep '^### ' >/dev/null; then
     echo "error: the '## [Unreleased]' section is empty; nothing to release" >&2
     exit 1
 fi
