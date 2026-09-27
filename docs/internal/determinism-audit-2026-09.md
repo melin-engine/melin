@@ -601,6 +601,19 @@ calls `tick(96)` and fires the timer before applying the event.
 idempotent against a stored clock, restore `ticks` to the recovery
 assertions, and add a tick-driven example.
 
+**Status.** The runtime half is fixed by the monotonic-time plan
+([monotonic-sequencer-time-2026-09.md](monotonic-sequencer-time-2026-09.md)):
+timestamps strictly increase across the journal, and `dispatch` keeps no
+watermark, calling `tick` once before every journaled entry and once for
+a journaled `Tick`, so a repeated or backwards tick no longer happens and
+counting calls, as `TestApp` does, is deterministic. A property test
+checks that the application's calls, times included, are the same live,
+on recovery and on a restore at every snapshot anchor, and
+`recover_from_snapshot_applies_post_snapshot_delta` now stamps strictly
+increasing times. The guide describes strict time and time that stands
+still. Still open: no example implements `tick`. The stale comments this
+audit lists about `tick.rs` and a producer race went with that code.
+
 ### 18. A ServerBusy reply can overtake replies to earlier requests
 
 **Medium. Confirmed.** Kernel TCP only.

@@ -39,6 +39,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   node's client keys, an event publisher's subscribers say, calls it and
   applies exactly the client listener's rule, instead of keeping a copy
   of it in step.
+- **Clock operation for the sequencer's time:** the `--clock-jump-limit-ms`
+  flag, the admin command `CLOCK-ACCEPT`, and the
+  `melin_sequencer_clock_offset_seconds` gauge and
+  `melin_clock_jumps_refused_total` counter on a primary's `/metrics`. See
+  the time entry under Changed, and "Clocks" in `docs/replication.md`.
 
 ### Removed
 
@@ -55,6 +60,63 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **Time is assigned the way sequence is: strictly increasing, and the
+  application's clock depends on the journal alone.** One clock on the
+  primary stamps every event it journals (client writes, ticks, startup
+  events, the promotion epoch bump), each strictly later than the one
+  before, and it starts past the journal's last timestamp at boot, on a
+  snapshot boot and at promotion. Timestamps therefore strictly increase
+  across the whole journal, on every node and across restarts, snapshots
+  and failovers, and the journal checks it where it is written and where it
+  is read (`JournalError::TimestampRegression`). The runtime calls `tick`
+  before every journaled event with that event's time, and once for a
+  journaled tick, and keeps no clock state of its own. This closes a
+  silent divergence: for the same journal, a node restored from a snapshot
+  or restarted after the wall clock stepped back could call `tick` a
+  different number of times than the live node and its replicas did. With
+  good clocks a snapshot falling inside a batch of writes that shared a
+  timestamp was enough. A journaled tick also called `tick` twice.
+  - **Time can stand still.** While a primary's wall clock is behind its
+    journal (a step back, or a failover to a node whose clock is slower),
+    time advances one nanosecond per event until the clock catches up, so
+    time-driven work falling due in that window waits. A node warns when
+    its time leads the wall clock by more than 100 ms, at startup or while
+    running, and `melin_sequencer_clock_offset_seconds` shows the lead.
+  - **A running primary refuses a forward jump of its wall clock** past
+    `--clock-jump-limit-ms` (default 5 s): time keeps advancing at the real
+    rate, the node warns and counts the jump in
+    `melin_clock_jumps_refused_total`, and `CLOCK-ACCEPT` on the admin
+    endpoint accepts a deliberate correction. A restart or failover starts
+    from the wall clock as it is. Every node that can become primary needs
+    a disciplined clock; see "Clocks" in `docs/replication.md`.
+  - **Under load `tick` runs once per event, where it ran about once per
+    batch.** Keep its nothing-due path cheap, as its documentation asks.
+  - **Journal format 16.** A node refuses a format-15 journal, as 0.18
+    writes, with `UnsupportedVersion`: its timestamps may repeat or go
+    backwards, and its tick entries carry a payload format 16 drops.
+    Upgrade through a snapshot, as for any format change: snapshot on the
+    old version, deploy, start on a fresh journal.
+  - **Replication protocol 6.** A replica and primary on different versions
+    refuse each other at the handshake; upgrade the cluster together.
+  - **Snapshot framing 3**, which records the timestamp of the snapshot's
+    anchor entry. A snapshot written by 0.18 or earlier still loads, but a
+    node started from it on a fresh journal, as the upgrade does, warns and
+    takes its first timestamp from its own clock, with nothing to hold it
+    past the old journal's last: check the node's clock before that first
+    start.
+  - **Source.** `ApplyCtx::now_ns: u64` becomes `ApplyCtx::now:
+    SequencerTime`, and `Application::tick` takes `now: SequencerTime`;
+    `SequencerTime::as_ns` gives the nanoseconds. `JournalEvent::Tick`
+    carries no time: the entry's timestamp is its time. In
+    `melin-journal`, `JournalEntry::timestamp_ns` becomes `timestamp`,
+    `encode_event` and `batch_append_with_ts` take a `SequencerTime`,
+    `create_continuing` and `open_append` take a `TimeFloor`, and
+    `JournalWrite` requires `last_timestamp`. In `melin-transport-core`,
+    `InputSlot::timestamp_ns` becomes `timestamp`, `snapshot::save` takes
+    the anchor entry's timestamp, `snapshot::load` returns a
+    `LoadedSnapshot`, recovery can fail with
+    `JournaledAppError::SnapshotTimestampMismatch`, and the `tick` module
+    gives way to `clock`.
 - **A decoder receives the application's own roles: `Permission` is
   replaced by `ClientRole<R>`.** `RequestDecoder` gains `type Role`, and
   `decode` takes `role: ClientRole<Self::Role>` in place of

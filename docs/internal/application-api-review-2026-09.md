@@ -63,8 +63,9 @@ under way overlaps three findings. The roadmap now carries S3 ("Record
 the application's event-encoding version in the journal"); it carried
 S6's application-defined roles until they landed (see
 [application-defined-roles-2026-09.md](application-defined-roles-2026-09.md)); the
-`ApplyCtx::now_ns` item left in S9 belongs with "Monotonic sequencer
-time, derived from the journal". The runtime refactor that stripped out
+`ApplyCtx::now_ns` item left in S9 belonged with "Monotonic sequencer
+time, derived from the journal", which has since resolved it. The
+runtime refactor that stripped out
 the exchange fixed the rest of S9. The new application guide
 (`docs/building-an-application.md`) takes a position on S1; see there.
 
@@ -290,6 +291,12 @@ remains:
   will assume are ordered in time. `Application::tick`'s doc now carries
   the warning; the fix itself belongs with the roadmap's "Monotonic
   sequencer time, derived from the journal".
+  **Resolved** by that item
+  ([plan](monotonic-sequencer-time-2026-09.md)): the field is now
+  `ApplyCtx::now`, a `SequencerTime` strictly later than the previous
+  event's on every node and every path, and the rustdoc of `ApplyCtx` and
+  `Application::tick` states that contract, including that time may
+  stand still while the clock is held.
 - The crate-level doc of `melin-app` still lists "trading engines,
   bespoke matchers" as the applications it serves.
 

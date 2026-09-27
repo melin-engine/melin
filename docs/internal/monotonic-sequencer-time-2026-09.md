@@ -1,10 +1,51 @@
 # Monotonic sequencer time (plan)
 
-Status: **in progress** (2026-09). Implements the roadmap item
-"Monotonic sequencer time, derived from the journal"
-([roadmap.md](roadmap.md)); read that entry for the problem statement.
-This document records what the code actually looks like against that
+Status: **implemented** (2026-09), steps 1 to 7; merging waits on the
+pipeline benchmark deferred from step 4 (step 6). Implements the roadmap
+item "Monotonic sequencer time, derived from the journal", removed from
+[roadmap.md](roadmap.md) at step 7; its problem statement is kept below.
+This document records what the code actually looked like against that
 entry, the design decisions, and the order of work.
+
+## The problem, as the roadmap stated it
+
+The application's clock was assembled from pieces that each held a
+different invariant, and they had drifted apart. The tick generator
+clamped each tick only against the previous *tick*
+(`transport-core/src/tick.rs`), and its last value reset when the reader
+started. Event timestamps were stamped at ingress and could arrive out
+of order (the "rare producer race" `dispatch.rs` documented). `dispatch`
+advanced `Application::tick` through a watermark for event timestamps
+but called it *unconditionally* for journaled ticks, so every tick fired
+`tick` twice and a tick below the watermark moved the application's
+clock backwards: after an NTP step, after that producer race, or after a
+failover to a node whose clock is behind. Worse, the watermark was
+per-process state, not derived from the journal: it started at 0 in the
+live matching stage at boot even after replay (`pipeline.rs`), on
+snapshot restore (`journaled_app.rs`) and in the shadow stage
+(`shadow.rs`). So a primary restarting after a clock step back called
+`tick` for events that a continuously-following replica skipped, and a
+snapshot taken inside such a window restored to a node that made calls
+the live one did not: the same journal driving different application
+state on different nodes, with nothing to detect it (the hash chain
+covers the journal's bytes, not the application's state). Rare, since it
+needed a clock regression across a restart, snapshot or failover, but it
+is exactly the silent divergence the product promises cannot happen; the
+exchange's `tick`, for one, stamps the clock its rate limiter reads, so
+it is not idempotent against a rewind. A one-line guard on the tick path
+would have fixed the double call and the backwards tick but not the
+watermark reset, and would have read as solved.
+
+Direction: **the sequencer assigns time the way it assigns sequence,
+strictly monotonic by construction.** Every timestamp a primary issues,
+tick or event, is clamped against one last-issued value seeded from the
+recovered journal tail at boot and at promotion; journaled timestamps
+are then strictly increasing on disk, replicas inherit them from the
+primary's stream, the dispatch watermark stops being state (an
+assertion, not a variable), and `ApplyCtx`'s time becomes monotonic too.
+Acceptance: tests for a restart across a clock step back, a snapshot
+inside a regression window and a failover to a slower clock, each
+asserting the same `tick` sequence on every path.
 
 The one-line goal: **the sequencer assigns time the way it assigns
 sequence, strictly monotonic by construction.** Every journaled
@@ -35,7 +76,8 @@ Findings that confirm, sharpen or correct the roadmap entry.
   `next_sequence` and `chain_hash` across that handoff for the same
   reason. Seeding inside `run_as_primary` covers boot, snapshot boot
   and promotion with one code path.
-- **Format 15 and protocol 5 are unreleased, but not unused.** Both sit
+- **Format 15 and protocol 5 are unreleased, but not unused** (as of
+  planning; 0.18.0 has since released them, see decision 7). Both sat
   under `[Unreleased]` in the CHANGELOG, and the journal reader accepts
   only `FORMAT_VERSION`, so there is no released journal to replay under
   the new rule. But `main` has been writing format 15 all along (bench
@@ -470,10 +512,13 @@ The new replay rule refuses what format-15 journals written by `main`
 contain, and the `Tick` layout changes in both the journal and the
 replication stream (step 4). Format 16 and protocol 6 turn a misleading
 failure into the refusal an older build's journal or peer should get
-(`UnsupportedVersion`, a handshake refusal). Released users are
-unaffected: 0.17 writes format 14, so they cross 14 to 16 in the one
-migration the CHANGELOG already describes (snapshot on the old version,
-deploy, start on a fresh journal).
+(`UnsupportedVersion`, a handshake refusal). When this was
+decided, released users were unaffected: 0.17 wrote format 14, and the
+bump would ride the unreleased move to format 15. 0.18.0 then shipped
+format 15 and protocol 5 before this item merged, so format 16 is a
+migration of its own for 0.18 users: snapshot on 0.18, deploy, start on
+a fresh journal, from a framing-2 snapshot that records no stamp
+(`TimeFloor::Unknown`, which warns). The CHANGELOG says so.
 
 ## Order of work
 
@@ -605,10 +650,21 @@ One commit per step, each reviewable on its own.
    for the clock's next read (a batch or a tick), so on a quiet node
    with ticks disabled `CLOCK-ACCEPT` takes effect at the next write;
    CHANGELOG under
-   Unreleased (the format-15 and protocol-5 entries become 16 and 6);
+   Unreleased (the format-15 and protocol-5 entries become 16 and 6;
+   since 0.18.0 released those, 16 and 6 are entries of their own);
    the note in
    [application-api-review-2026-09.md](application-api-review-2026-09.md);
    remove the roadmap entry.
+   Done, with a "Clocks" section in `docs/replication.md` carrying the
+   operator notes. Beyond the list, `docs/journal.md` still described
+   format 15 and snapshot framing 2 (the snapshot's timestamp, its
+   recovery check, the framing's compatibility rules and the
+   `TimestampRegression` error were missing), and the `InputSlot` table in
+   `docs/pipeline-architecture.md` still named `timestamp_ns`. The notary's
+   failover test also asserts strictly increasing receipt times across
+   the promotion; on one host both nodes read the same wall clock, so it
+   pins the end-to-end rule but cannot tell a seeded clock from an
+   unseeded one, which the acceptance tests do.
 
 Steps 1 to 5 ship in one release. After that, the replay rule and the
 `Tick` layout each need their own version bump again.
@@ -653,6 +709,8 @@ Read, not changed here; the fixes belong to the exchange.
 - The exchange's rate limiter reads the clock `tick` stamps, so it
   stops refilling while the sequencer clock is held (decision 6). Worth
   a line in its own docs; no code change.
+- Steps 5 to 7 break nothing further: the exchange constructs no
+  `SequencerClock`, spawns no admin endpoint and builds no `HealthState`.
 
 ## Not part of this item
 

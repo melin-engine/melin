@@ -988,6 +988,12 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
             let receipt = receipt_of(&request(&mut stream, KIND_NOTARIZE, &leaf));
             expected = fold(&expected, &leaf, receipt.timestamp_ns);
             assert_eq!(receipt.head, expected, "primary head at entry {}", i + 1);
+            if let Some(previous) = &last {
+                assert!(
+                    receipt.timestamp_ns > previous.timestamp_ns,
+                    "receipt times strictly increase"
+                );
+            }
             last = Some(receipt);
         }
     }
@@ -1018,6 +1024,15 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
         "the first receipt after failover must chain onto the last before it"
     );
     assert_eq!(receipt.head, fold(&last.head, &leaf, receipt.timestamp_ns));
+    // Time keeps increasing across the promotion. Both nodes read this
+    // host's wall clock, which has moved on since the last receipt, so
+    // this pins the end-to-end rule without telling a clock seeded from
+    // the journal from one that is not; the runtime's clock acceptance
+    // tests drive a promoted node's clock behind its journal for that.
+    assert!(
+        receipt.timestamp_ns > last.timestamp_ns,
+        "the first receipt after failover must be later than the last before it"
+    );
 
     drop(stream);
     replica.stop();

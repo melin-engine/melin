@@ -21,7 +21,7 @@ This document describes the write-ahead journal, snapshot system, crash recovery
 ```
 Offset  Size  Field              Value
 0       4     file_magic         0x4A4F5552 ("JOUR")
-4       2     format_version     15
+4       2     format_version     16
 6       2     sector_size        4096
 8       8     starting_sequence  sequence carried by this segment's first entry
 16      32    anchor_hash        chain anchor (random salt or previous segment's tail hash)
@@ -96,7 +96,9 @@ recover(journal_path):
         must continue the sequence space exactly. Checked BEFORE any
         replay — a foreign or tampered segment never reaches the application.
      c. Read entries sequentially:
-        - Validate entry_magic (0x4A45), CRC32C, sequence continuity.
+        - Validate entry_magic (0x4A45), CRC32C, sequence continuity,
+          and a timestamp later than the previous entry's (carried
+          across segment boundaries).
         - Absorb the entry's raw bytes into the segment hash chain.
         - Apply it to the application.
         - If entry_magic is 0x0000 → end of data (pre-allocated space). Stop.
@@ -120,12 +122,16 @@ recover(journal_path):
 
 ```
 recover_from_snapshot(snapshot_path, journal_path):
-  1. Load snapshot → (application state, snapshot_sequence, snapshot_chain_hash).
+  1. Load snapshot → (application state, snapshot_sequence, snapshot_chain_hash,
+     snapshot_timestamp).
   2. Walk segments as above. Skip events with sequence <= snapshot_sequence
      (still validated and absorbed into the chain).
   3. At the snapshot's anchor sequence, verify the journal's chain hash at
-     that point matches the snapshot's recorded chain hash. Mismatch aborts
-     recovery before any post-snapshot events are replayed.
+     that point matches the snapshot's recorded chain hash, and the anchor
+     entry's timestamp matches the snapshot's. Mismatch aborts recovery
+     before any post-snapshot events are replayed. When the anchor entry is
+     no longer on disk, the first entry after it must be later than the
+     snapshot's timestamp.
   4. Replay only entries after the snapshot.
   5. Truncate and reopen writer as above.
 ```
@@ -141,12 +147,13 @@ The chain-hash cross-check at the anchor sequence ensures the snapshot and the j
 ```
 Offset  Size  Field              Value
 0       4     file_magic         0x534E4150 ("SNAP")
-4       2     transport_version  2 — this framing's version
+4       2     transport_version  3, this framing's version
 6       2     app_version        the application's snapshot version at save time
 8       8     sequence           journal sequence number at snapshot time
 16      32    chain_hash         BLAKE3 hash chain state at that sequence
 48      8     epoch              fencing epoch at snapshot time
-56      var   app_payload        the application's state, in its own encoding
+56      8     timestamp_ns       timestamp of the entry at that sequence
+64      var   app_payload        the application's state, in its own encoding
 EOF-4   4     crc32c             CRC32C of everything from offset 0 through EOF-4
 ```
 
@@ -255,7 +262,7 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 
 ## Format Versioning
 
-Both the journal and snapshot have independent `format_version` fields. Current journal version: **15**. Current snapshot version: **12**.
+The journal and the snapshot framing are versioned independently. Current journal version: **16**. Current snapshot framing version: **3**.
 
 ### Journal Version History
 
@@ -266,6 +273,7 @@ Both the journal and snapshot have independent `format_version` fields. Current 
 | 13 | Entry offset fixed at 4096 regardless of device sector size. Journals stay interchangeable across devices, and across the writer change that followed — the since-retired O_DIRECT writer produced this same layout |
 | 14 | Chain metadata moved out of the entry stream: file header gained `starting_sequence`, `anchor_hash`, and a header CRC; `GenesisHash` and `Checkpoint` entry tags retired. The chain is anchored per segment and schedule-free; sequence numbers are dense over real events |
 | 15 | Per-entry `request_seq` removed; an application that sequences requests carries the sequence in its own event payload |
+| 16 | Timestamps strictly increase: an entry not later than the one before it is refused when written and fails recovery when read. The tick entry carries no payload; its time is the entry's timestamp |
 
 ### Snapshot Framing History
 
@@ -275,11 +283,13 @@ The framing's `transport_version` changes only with the runtime; the application
 |---------|--------|
 | 1 | Initial framing |
 | 2 | Added the fencing `epoch` after `chain_hash` |
+| 3 | Added the anchor entry's `timestamp_ns` after `epoch` |
 
 ### Compatibility Rules
 
 - **Pre-production policy:** the journal reader accepts only the current format version. Older versions are rejected with `UnsupportedVersion`; migrate via the snapshot-boundary procedure below.
-- The snapshot reader accepts both framing versions: a version-1 snapshot predates any promotion, so it loads with epoch 0.
+- The snapshot reader accepts all three framing versions. A version-1 snapshot predates any promotion, so it loads with epoch 0.
+- A version-1 or version-2 snapshot records no timestamp. A node started from one on a fresh journal, as the upgrade procedure below does, logs a warning and takes its first timestamp from its own wall clock, with nothing to hold it past the old journal's last one. Check that the node's clock is disciplined before that first start; every snapshot it writes afterwards records its timestamp.
 - A snapshot loads only into the application version that wrote it: an `app_version` other than the running application's is refused before the application sees the payload.
 - The journal records no application version. Entries written by one version of an application are decoded by whichever version replays them — see [Changing the Application's Encoding](#changing-the-applications-encoding).
 
@@ -362,7 +372,7 @@ Sequences are `u64`, starting at 1, monotonically increasing, with no gaps. At 1
 
 The `timestamp_ns` field is the sequencer's time: nanoseconds since the Unix epoch, assigned on the primary when the event enters the pipeline, and strictly later than the entry before it, across the whole journal, restarts, snapshots and failovers. Sequence numbers still order the journal, but the timestamp is the time the application is handed with the event, live and on every replay, so replay reproduces any decision the application based on it.
 
-It follows the primary's wall clock (`CLOCK_REALTIME`) but is not the wall clock. When the wall clock steps back, or a failover hands the primary role to a node whose clock runs behind, timestamps advance by one nanosecond per event until the wall clock catches up, rather than go backwards. A forward jump of the wall clock beyond the jump limit is not followed on a running primary: time keeps advancing at the real rate instead (`--clock-jump-limit-ms`).
+It follows the primary's wall clock (`CLOCK_REALTIME`) but is not the wall clock. When the wall clock steps back, or a failover hands the primary role to a node whose clock runs behind, timestamps advance by one nanosecond per event until the wall clock catches up, rather than go backwards. A forward jump of the wall clock beyond the jump limit is not followed on a running primary: time keeps advancing at the real rate instead (`--clock-jump-limit-ms`). What a held or refused clock means for a deployment, and how to accept a deliberate jump, is in [Clocks](replication.md#clocks).
 
 The rule is enforced where the journal is written and read: an entry whose timestamp is not later than the one before it is refused when written, and a journal holding one fails recovery.
 
@@ -376,6 +386,7 @@ The rule is enforced where the journal is written and read: an entry whose times
 | `ChecksumMismatch` | CRC32C validation failed (entry or file header) | Bit rot or partial write — investigate storage |
 | `SequenceGap` | Non-contiguous sequence numbers, or a segment's first entry disagreeing with its header | Corruption, file truncation, or a misplaced segment — investigate |
 | `SequenceDuplicate` | A sequence number repeated | Writer bug or storage anomaly — investigate |
+| `TimestampRegression` | An entry's timestamp is not later than the one before it | Never a torn write, so a bug or tampering. Recovery refuses the journal rather than dropping the tail; on a replica it stops the node instead of resyncing, since the primary would resend the same entry. Investigate before restarting |
 | `TruncatedEntry` | Incomplete entry at EOF | Normal crash recovery — entry is discarded |
 | `SegmentChainBreak` | A segment's header anchor does not equal the previous segment's tail chain hash | Tampered archive, missing segment, or foreign segment spliced in — investigate before trusting the history |
 | `MissingHistoryPrefix` | The oldest surviving segment starts after the history start recovery requires (sequence 1, or the snapshot's anchor + 1) | Archives trimmed without a covering snapshot — restore the trimmed segments or a snapshot that covers them; recovery refuses to build partial state |

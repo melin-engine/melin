@@ -150,7 +150,7 @@ The simplified diagram above shows the primary-side request path. The picture be
 
 | Thread / stage              | Ingress                                 | Egress                                                |
 |----------------------------|-----------------------------------------|-------------------------------------------------------|
-| Reader (primary)           | Client TCP/DPDK + cadence wakeup (wall-clock-cadenced, monotonic-clamped) | Client requests AND `JournalEvent::Tick` into the same input ring |
+| Reader (primary)           | Client TCP/DPDK + cadence wakeup (wall-clock-cadenced, stamped by the sequencer clock) | Client requests AND `JournalEvent::Tick` into the same input ring |
 | Startup events (primary, boot or promotion) | The application's genesis and on-primary events | Application events into the input ring, applied before the first client is served |
 | Journal stage              | Input ring                              | Journal file; batch bytes into each replication ring  |
 | Matching stage             | Input ring                              | Application reports into output ring                  |
@@ -203,7 +203,7 @@ Because the journal and matching consumers are gated only on the producer, they 
 | `connection_id: u64` | Originating client connection |
 | `key_hash: u64` | Hash of the client's public key; 0 for events the node journals on its own behalf |
 | `sequence: u64` | Journal sequence; assigned by the journal stage on a primary, carried from the primary's stream on a replica |
-| `timestamp_ns: u64` | Wall-clock time stamped at ingress; zero for queries |
+| `timestamp: SequencerTime` | The sequencer's time, stamped at ingress by the primary's clock, strictly later than the last journaled slot; carried from the primary's stream on a replica; zero for queries |
 | `event: JournalEvent` | An application event, or one the runtime journals itself (a tick, an epoch bump) |
 | `publish_ts: TraceTimestamp` | Disruptor publish timestamp (zero-sized when `latency-trace` disabled) |
 | `recv_ts: TraceTimestamp` | Wire receive timestamp (zero-sized when `latency-trace` disabled) |

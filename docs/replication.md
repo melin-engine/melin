@@ -571,8 +571,9 @@ requiring the full journal history.
 | `--standalone` | No | `false` | Explicitly disable replication. Requires `--ack-policy disk`. |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary. |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` under the `replication` role. |
-| `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `ACK-POLICY <policy>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
+| `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, `ACK-POLICY <policy>`, and `CLOCK-ACCEPT` (see "Clocks"). Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
 | `--ack-policy <policy>` | Primary | `disk+ram` | Active ack policy at startup: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Can be swapped at runtime via admin `ACK-POLICY`. |
+| `--clock-jump-limit-ms <ms>` | No | `5000` | How far ahead of where the wall clock should be a reading may land before a running primary refuses it (see "Clocks"). Takes effect on a replica once promoted, so give failover candidates the primary's value. Must be positive. |
 | `--dpdk-peer-mac <mac>` | Replica on DPDK | derived | Ethernet address of the primary named by `--replica-of`. Only consulted when replicating over DPDK. See below. |
 
 ### Addressing the primary over DPDK
@@ -693,6 +694,81 @@ guaranteed to hold the acked frontier (by contract two nodes had each
 acked event on disk), so the top two journals being tied is the
 normal-case post-recovery state.
 
+## Clocks
+
+Every event a primary journals carries the sequencer's time, strictly
+later than the event before it, on every node and across restarts,
+snapshots and failovers (see [Timestamps](journal.md#timestamps)). That
+time follows the primary's wall clock, so every node that can become
+primary needs a disciplined clock (chrony, ntpd, or PTP), and the
+failover candidates' clocks should agree closely with one another.
+
+### A clock behind the journal holds time
+
+Time never goes backwards. When a primary's wall clock steps back, or a
+failover hands the primary role to a node whose clock runs behind the
+old primary's, the node advances time by one nanosecond per event until
+its wall clock passes the last timestamp in its journal. While time is
+held:
+
+- time-driven work that falls due in the window waits (work already due
+  keeps running), and anything an application measures in time windows,
+  a rate limiter's refill for one, stops moving;
+- a node that starts, or is promoted, more than 100 ms behind its
+  journal logs a warning naming the lead, and a running primary logs the
+  same warning each time its lead crosses 100 ms;
+- `melin_sequencer_clock_offset_seconds` reads the lead, positive.
+
+Nothing needs undoing: once the wall clock catches up, time follows it
+again. A failover between two disciplined clocks holds time for their
+skew only.
+
+### The jump guard refuses a runaway clock
+
+A forward jump would be permanent: time never goes back, so every later
+timestamp would stay at least as far ahead, and scheduled work would
+wait for the real clock to catch up, for as long as the jump was large.
+A running primary therefore refuses a wall-clock reading more than the
+jump limit ahead of where the clock should be (`--clock-jump-limit-ms`,
+default 5 s), judged against a clock that cannot jump
+(`CLOCK_BOOTTIME`, which also counts time a suspended VM spent paused).
+While refusing, the node:
+
+- keeps time advancing at the real rate from before the jump, so
+  time-driven work keeps running on schedule;
+- logs a warning once, naming the jump, and counts it in
+  `melin_clock_jumps_refused_total`;
+- reads behind the wall clock, which `melin_sequencer_clock_offset_seconds`
+  shows as a negative value;
+- follows the wall clock again as soon as a reading comes back within
+  the limit, as when the clock is corrected.
+
+If the jump was a deliberate correction, send `CLOCK-ACCEPT` over the
+admin connection (operator key, as for `PROMOTE`). The node follows the
+wall clock from its next batch of client writes or its next tick; with
+ticks disabled (`--tick-interval-ms 0`), a quiet node takes it at its
+next write, so the gauge moves then too. A replica stamps nothing and
+answers `ERR`. A restart or a failover also starts from the wall clock
+as it is.
+
+The guard protects a running primary only. Starting up, a node has
+nothing to judge a reading against, so a restart or failover accepts a
+jump the guard was refusing, and a clock already wrong at startup is not
+caught. What startup does is ask the kernel whether the wall clock is
+synchronized and warn if not. Only warn: some time daemons (phc2sys, for
+one) discipline the clock without reporting to the kernel, and the
+warning fires on those healthy nodes too.
+
+Setting the limit weighs two mistakes. Accepting a runaway jump holds
+time-driven work for the jump's whole size once the clock is corrected,
+and nothing undoes it. Refusing a legitimate correction leaves the node
+running at the right rate but behind the wall clock, visible on the
+gauge, fixed by `CLOCK-ACCEPT`, and healed by the next restart or
+failover. So keep the limit just above the largest step your time
+daemon makes on a running node: ntpd steps corrections past 128 ms,
+chrony as usually configured steps only at startup, and a live
+migration advances the wall clock and the boot clock together.
+
 ## Upgrade and rollback notes
 
 - **Upgrade primaries and replicas together.** The replication
@@ -748,6 +824,18 @@ normal-case post-recovery state.
   return to target.
 - Every admin `ACK-POLICY` swap emits an info-level audit log with
   the `prev → next` transition.
+- `melin_sequencer_clock_offset_seconds` (Prometheus gauge): the
+  sequencer's time minus the wall clock on a primary: positive while
+  time is held ahead of a clock that is behind the journal, negative
+  while a refused jump leaves it behind the wall clock, near zero
+  otherwise (see "Clocks"). Measured at each batch of writes or tick, so
+  with ticks disabled an idle primary's gauge keeps its last value.
+  Alert on its absolute value past your tolerance.
+- `melin_clock_jumps_refused_total` (Prometheus counter): forward
+  wall-clock jumps a primary refused, one per episode. Any increase
+  needs an operator: fix the clock, or accept a deliberate correction
+  with `CLOCK-ACCEPT`. Replicas stamp nothing and export neither clock
+  series.
 - On raft-enabled nodes, the `melin_raft_node_id` / `melin_raft_term` /
   `melin_raft_leader_id` / `melin_raft_role` / `melin_raft_is_leader` /
   `melin_raft_driver_running` gauges expose control-plane election
