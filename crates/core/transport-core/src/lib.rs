@@ -64,6 +64,9 @@ mod test_support;
 #[cfg(test)]
 mod pipeline_tests;
 
+#[cfg(all(test, feature = "determinism-repro"))]
+mod repro_determinism;
+
 pub use cursors::{
     AdvertisedJournalTip, DurableWireSeqCursor, PipelineCursors, ReplicaSlotCursors, RingPos,
     SlotAcked, WireSeq,

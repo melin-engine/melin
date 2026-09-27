@@ -18,6 +18,9 @@ path = "src/lib.rs"
 
 [features]
 default = ["hash-chain"]
+## Failing reproductions from docs/internal/determinism-audit-2026-09.md.
+## Off by default so the suite stays green; enable to reproduce.
+determinism-repro = []
 ## BLAKE3 tamper-evident hash chain, **on by default**. Hashes every
 ## journal entry into a per-segment chain anchored in the segment header
 ## and verified at segment boundaries and snapshot anchors. Catches

@@ -14,6 +14,9 @@ workspace = true
 
 [features]
 default = ["hash-chain"]
+## Failing reproductions from docs/internal/determinism-audit-2026-09.md.
+## Off by default so the suite stays green; enable to reproduce.
+determinism-repro = []
 ## Compile out debug! and trace! at build time. Eliminates the tracing
 ## filter check (~5-10 ns) on every call site in the hot path.
 release-tracing = ["tracing/max_level_info"]

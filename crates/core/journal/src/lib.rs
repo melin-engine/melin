@@ -35,6 +35,9 @@ pub mod write_ring;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
+#[cfg(all(test, feature = "determinism-repro"))]
+mod repro_replication;
+
 pub use buffered_writer::BufferedWriter;
 pub use codec::FileHeaderInfo;
 pub use encoder::JournalEncoder;

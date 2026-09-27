@@ -18,6 +18,9 @@ path = "src/lib.rs"
 
 [features]
 default = ["hash-chain"]
+## Failing reproductions from docs/internal/determinism-audit-2026-09.md.
+## Off by default so the suite stays green; enable to reproduce.
+determinism-repro = []
 ## Record per-stage latency histograms on shutdown. Adds ~20 ns of clock
 ## overhead per event. Not for production.
 latency-trace = ["dep:hdrhistogram"]
