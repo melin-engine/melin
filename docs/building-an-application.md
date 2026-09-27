@@ -442,6 +442,8 @@ A node checks your table every time it loads the keys file, and refuses to start
 
 A role never reaches the journal: it is decided before an event is sequenced. Moving a key to another role, adding or reordering roles, or renaming a variant of your type changes nothing a node reads back. Renaming a token is different: every keys file that names it must change with it, or the node refuses to start.
 
+**Order role changes across a cluster.** Each node loads its keys file when it starts, and refuses a token its build does not declare. When you add a role, upgrade every node before any keys file lists a key under it: an old-build node that restarts — a replica catching up mid-upgrade, say — would otherwise refuse to start. When you remove one, take its keys out of every node's file before deploying the build that drops it.
+
 **List every role in an access check.** Match the role with every case written out — no `_` arm, and no `==` or `!=` against one role — so that a role you add later is a compile error at every check that must decide about it, rather than silently inheriting whatever the other case allows. `ClientRole` is exhaustive for the same reason: were the runtime to add a role, your decoder would not compile until you decided what it may do.
 
 ```rust

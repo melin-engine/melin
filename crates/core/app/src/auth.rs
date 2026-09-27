@@ -249,8 +249,8 @@ impl AuthorizedKeys {
     /// ```text
     /// # <role> <base64-encoded-public-key> <optional-comment>
     /// operator AAAA...base64... ops-team
-    /// trader BBBB...base64... desk-1
-    /// readonly DDDD...base64... monitoring
+    /// writer BBBB...base64... desk-1
+    /// reader DDDD...base64... monitoring
     /// ```
     ///
     /// A role is `operator`, `replication`, or a token of `R`. Lines

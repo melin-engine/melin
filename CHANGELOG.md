@@ -29,7 +29,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   client role and `None` for a replication key, so a listener of an
   application's own that admits the same keys applies the client
   listener's rule through it. `AuthorizedKeys::token` names a role for a
-  log line.
+  log line. `RoleId` is an application role as the runtime carries it,
+  an index into the role table, and `ErasedDecoder` the decoder as the
+  runtime holds it, implemented for every `RequestDecoder`.
 
 ### Removed
 
@@ -60,7 +62,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   now name a role by its token in the keys file (`trader`, not
   `Trader`), and a keys file naming an unknown role is refused with
   `unknown role`, listing every valid one, where it said
-  `unknown permission`.
+  `unknown permission`. In `melin-server-runtime`,
+  `reader::ReaderRegistration`'s `permission` field is now
+  `role: ClientRole<RoleId>`, and `reader::RequestDecoderArc`, the
+  decoder `spawn_reader` and `run_dpdk_poll` take, is now
+  `Arc<dyn ErasedDecoder<E>>`.
 - **The examples declare roles of their own.** The counter and echo
   examples admit `writer` and `reader` keys, the notary `submitter` and
   `auditor`, in place of the exchange's `trader` and `readonly`: a keys

@@ -108,7 +108,6 @@ pub trait ErasedDecoder<E: AppEvent>: sealed::Sealed + Send + Sync {
 }
 
 impl<D: RequestDecoder> ErasedDecoder<D::Event> for D {
-    #[inline]
     fn decode_erased(&self, body: &[u8], role: ClientRole<RoleId>) -> Decoded<D::Event> {
         let role = match role {
             ClientRole::Operator => ClientRole::Operator,
