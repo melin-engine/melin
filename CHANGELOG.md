@@ -32,6 +32,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   log line. `RoleId` is an application role as the runtime carries it,
   an index into the role table, and `ErasedDecoder` the decoder as the
   runtime holds it, implemented for every `RequestDecoder`.
+- **`melin_server_runtime::client_auth::verify_client`**, the client
+  listener's check on a challenge response (key listed, not a
+  replication key, signature over the nonce valid), with its
+  `ClientAuthError`. A listener of an application's own that admits the
+  node's client keys, an event publisher's subscribers say, calls it and
+  applies exactly the client listener's rule, instead of keeping a copy
+  of it in step.
 
 ### Removed
 

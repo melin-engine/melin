@@ -355,9 +355,13 @@ Changed, in one commit on its side, ready to land as soon as this merges
   `can_trade` and `can_manage_funds` moving onto `ExchangeRole` or into
   the match. Its tests move from `Permission::Trader` to
   `ClientRole::App(ExchangeRole::Trader)`.
-- `event_publisher.rs`: `verify_subscriber` decides on `KeyRole`
-  through `client()` (in place of `may_connect_as_client()`), and
-  `SubscriberAuthError::RoleRefused` carries one.
+- `event_publisher.rs`: `verify_subscriber` and `SubscriberAuthError`,
+  a copy of the client listener's check, go: the subscriber handshake
+  calls `melin_server_runtime::client_auth::verify_client`, public for
+  this, and applies exactly the client listener's rule. Their unit tests
+  go with them, since the runtime's cover the rule; the end-to-end test
+  refusing a replication key on a live feed stays, as it checks the
+  exchange's wiring.
 - `replication-bench` parses its keys with `NoRoles`.
 - `message.rs`'s docs on `requires_operator` and fund management name
   the new types.

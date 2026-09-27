@@ -4,6 +4,11 @@
 //! own sockets, but decide it here, so the two cannot disagree about which
 //! keys may connect as a client. The DPDK path cannot be exercised without
 //! the hardware; this is how its decision is tested all the same.
+//!
+//! Public for a listener of the application's own that admits the node's
+//! client keys, an event publisher's subscribers say: calling
+//! [`verify_client`] applies the client listener's rule exactly, rather
+//! than a copy of it that has to be kept in step by hand.
 
 use std::fmt;
 
@@ -11,8 +16,12 @@ use ed25519_dalek::{Signature, SignatureError, Verifier, VerifyingKey};
 use melin_app::auth::{AuthorizedKeys, ClientRole, RoleId};
 
 /// Why the client listener refused a challenge response.
+///
+/// `#[non_exhaustive]`: a refusal reason may be added. This is an error to
+/// report, not an access check to match exhaustively.
 #[derive(Debug)]
-pub(crate) enum ClientAuthError {
+#[non_exhaustive]
+pub enum ClientAuthError {
     /// The key is listed as `replication`, which authorizes streaming
     /// between nodes and may not open a client connection (see
     /// [`KeyRole::client`](melin_app::auth::KeyRole::client)).
@@ -38,16 +47,53 @@ impl fmt::Display for ClientAuthError {
     }
 }
 
-impl std::error::Error for ClientAuthError {}
+impl std::error::Error for ClientAuthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidKey(e) | Self::BadSignature(e) => Some(e),
+            Self::ReplicationKeyRefused | Self::UnknownKey => None,
+        }
+    }
+}
 
 /// Decide a client's challenge response: the key must be listed, under a
 /// role that may connect as a client, and must have signed `nonce`.
-/// Returns the connection's role, as the runtime carries it.
+/// Returns the connection's role, as the runtime carries it: the operator,
+/// or an application role as its index in the role table.
+///
+/// `nonce` must be the one this listener sent the client for this
+/// connection, fresh from a cryptographic random source: a nonce reused
+/// across connections lets a recorded response be replayed.
 ///
 /// The role is checked before the signature, so a refused key costs no
 /// verification; the answer the client sees is the same failure either
 /// way.
-pub(crate) fn verify_client(
+///
+/// ```
+/// use base64::Engine;
+/// use ed25519_dalek::{Signer, SigningKey};
+/// use melin_app::auth::{AuthorizedKeys, NoRoles};
+/// use melin_server_runtime::client_auth::{ClientAuthError, verify_client};
+///
+/// let client = SigningKey::from_bytes(&[7; 32]);
+/// let public_key = client.verifying_key().to_bytes();
+/// let listed = base64::engine::general_purpose::STANDARD.encode(public_key);
+/// let keys = AuthorizedKeys::parse::<NoRoles>(&format!("operator {listed} ops\n")).unwrap();
+///
+/// // The listener sent this nonce; the client signed it.
+/// let nonce = [0x5A; 32];
+/// let signature = client.sign(&nonce).to_bytes();
+///
+/// let role = verify_client(&keys, &nonce, &public_key, &signature).unwrap();
+/// assert!(role.is_operator());
+///
+/// let impostor = SigningKey::from_bytes(&[8; 32]).sign(&nonce).to_bytes();
+/// assert!(matches!(
+///     verify_client(&keys, &nonce, &public_key, &impostor),
+///     Err(ClientAuthError::BadSignature(_))
+/// ));
+/// ```
+pub fn verify_client(
     authorized_keys: &AuthorizedKeys,
     nonce: &[u8; 32],
     public_key: &[u8; 32],
@@ -129,6 +175,7 @@ mod tests {
             err.to_string(),
             "replication key refused on the client listener"
         );
+        assert!(std::error::Error::source(&err).is_none());
     }
 
     /// A keys file can list any 32 bytes; ones that are not a point on
@@ -152,5 +199,7 @@ mod tests {
         let impostor = SigningKey::from_bytes(&[0x33; 32]);
         let err = verify(&keys_listing("operator", &key()), &impostor).unwrap_err();
         assert!(matches!(err, ClientAuthError::BadSignature(_)), "{err}");
+        // The verifier's own error stays reachable for a caller's report.
+        assert!(std::error::Error::source(&err).is_some());
     }
 }
