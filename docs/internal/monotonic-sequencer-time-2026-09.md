@@ -425,8 +425,8 @@ tell a bad clock from a long downtime.
   reading, the clock reads `CLOCK_BOOTTIME` and keeps the pair from its
   last accepted reading. The expected wall time is that reading plus
   the boot-time elapsed since. `CLOCK_BOOTTIME` rather than
-  `CLOCK_MONOTONIC` (what `Instant` reads), so a suspended VM that
-  resumes is not taken for a jump. It is read once per batch beside the
+  `CLOCK_MONOTONIC` (what `Instant` reads), so a resume from system
+  suspend is not taken for a jump. It is read once per batch beside the
   wall clock (the reader and the DPDK loop already make one wall-clock
   read per batch), and once per tick: one more vDSO read per batch,
   never per event.
@@ -464,10 +464,17 @@ Refusing a legitimate one leaves the node's time running correctly but
 behind, visible on the gauge, fixed by `CLOCK-ACCEPT`, and healed by the
 next restart or failover. So the limit sits just above the largest
 legitimate step on a running node, not far above it: chrony slews and
-steps only at startup (`makestep`), ntpd steps past 128 ms, and a
-live-migration pause advances the wall clock and `CLOCK_BOOTTIME`
-together. 5 s clears those with room to spare and caps the worst freeze
-a wrongly accepted jump can cause.
+steps only at startup (`makestep`), and ntpd steps past 128 ms. 5 s
+clears those with room to spare and caps the worst freeze a wrongly
+accepted jump can cause.
+
+A live-migration pause depends on the hypervisor, and was not tested
+here. Under KVM (kvmclock) the guest's wall clock and `CLOCK_BOOTTIME`
+advance together across the pause, so the guard sees no jump. A
+hypervisor that freezes the guest's clocks leaves the wall clock behind,
+and the time daemon's later correction is a forward step judged against
+a boot clock that did not move; past the limit it is refused, the
+recoverable mistake, fixed by `CLOCK-ACCEPT`.
 
 ### 6. Time is never wound back, so say when it is held
 

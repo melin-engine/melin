@@ -26,9 +26,14 @@
 //! future time can be wound back. So a reading more than the jump limit
 //! ahead of both where the wall clock should be and the last stamp is
 //! refused. "Where it should be" comes from `CLOCK_BOOTTIME`, which never
-//! jumps (and, unlike `CLOCK_MONOTONIC`, keeps counting while a VM is
-//! suspended, so a resume is not taken for a jump): the last accepted wall
-//! reading plus the boot time elapsed since. While refused, the clock
+//! jumps (and, unlike `CLOCK_MONOTONIC`, keeps counting through system
+//! suspend, so a resume is not taken for a jump): the last accepted wall
+//! reading plus the boot time elapsed since. A VM paused by its hypervisor
+//! is another matter. Under KVM (kvmclock) both clocks advance across the
+//! pause, but a hypervisor that freezes the guest's clocks leaves the wall
+//! clock to be stepped forward afterwards against a boot clock that did
+//! not move, and a step past the limit is refused until the operator
+//! accepts it. While refused, the clock
 //! issues that expected time, so time keeps flowing at the real rate, and
 //! it follows the wall clock again as soon as a reading comes back within
 //! the limit. A step back is accepted; the `last + 1` rule then holds

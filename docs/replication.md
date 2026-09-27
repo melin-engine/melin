@@ -716,7 +716,9 @@ held:
   a rate limiter's refill for one, stops moving;
 - a node that starts, or is promoted, more than 100 ms behind its
   journal logs a warning naming the lead, and a running primary logs the
-  same warning each time its lead crosses 100 ms;
+  same warning when its lead crosses 100 ms, then stays quiet until the
+  lead has fallen back below 50 ms, so a lead hovering near the
+  threshold warns once;
 - `melin_sequencer_clock_offset_seconds` reads the lead, positive.
 
 Nothing needs undoing: once the wall clock catches up, time follows it
@@ -731,8 +733,8 @@ wait for the real clock to catch up, for as long as the jump was large.
 A running primary therefore refuses a wall-clock reading more than the
 jump limit ahead of where the clock should be (`--clock-jump-limit-ms`,
 default 5 s), judged against a clock that cannot jump
-(`CLOCK_BOOTTIME`, which also counts time a suspended VM spent paused).
-While refusing, the node:
+(`CLOCK_BOOTTIME`, which also counts time the machine spent in system
+suspend, so a resume is not taken for a jump). While refusing, the node:
 
 - keeps time advancing at the real rate from before the jump, so
   time-driven work keeps running on schedule;
@@ -765,9 +767,17 @@ and nothing undoes it. Refusing a legitimate correction leaves the node
 running at the right rate but behind the wall clock, visible on the
 gauge, fixed by `CLOCK-ACCEPT`, and healed by the next restart or
 failover. So keep the limit just above the largest step your time
-daemon makes on a running node: ntpd steps corrections past 128 ms,
-chrony as usually configured steps only at startup, and a live
-migration advances the wall clock and the boot clock together.
+daemon makes on a running node: ntpd steps corrections past 128 ms, and
+chrony as usually configured steps only at startup.
+
+Virtual machines add one case. Under KVM (kvmclock), a guest paused for a
+live migration resumes with its wall clock and its boot clock advanced
+together, so the guard sees no jump. A hypervisor that freezes the
+guest's clocks during the pause leaves the wall clock behind instead, and
+the time daemon's correction afterwards is a forward step the guard
+judges against a boot clock that did not move. If that step exceeds the
+limit it is refused: the recoverable mistake, the one `CLOCK-ACCEPT` is
+for.
 
 ## Upgrade and rollback notes
 
