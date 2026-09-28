@@ -2003,6 +2003,205 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // The resume point a reconnecting replica hands the primary, end to
+    // end against a scripted primary. Needs real persistence: the claim
+    // is the journal's durable position.
+    // -----------------------------------------------------------------
+    #[cfg(not(feature = "no-persist"))]
+    mod reconnect_resume {
+        use super::super::super::auth::authenticate_replica;
+        use super::scripted::*;
+        use super::*;
+        use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+        use melin_transport_core::replication::catchup::lineage_origin;
+        use melin_transport_core::replication::protocol::encode_stream_start;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        /// A primary journal holding one entry: its path and lineage
+        /// identity, for the `StreamStart` a replica accepts.
+        fn primary_journal(dir: &std::path::Path) -> (std::path::PathBuf, (u64, [u8; 32])) {
+            let path = dir.join("primary.journal");
+            let mut w = BufferedWriter::<EvtAdd>::create(&path).expect("create");
+            w.append(&JournalEvent::App(EvtAdd(1))).expect("append");
+            drop(w);
+            let lineage = lineage_origin(&path).expect("lineage");
+            (path, lineage)
+        }
+
+        /// Run the receiver against `addr` on `dir/replica.journal`,
+        /// under `group_commit_delay`, until `shutdown`.
+        fn spawn_replica(
+            dir: &std::path::Path,
+            addr: std::net::SocketAddr,
+            group_commit_delay: Duration,
+            shutdown: &Arc<AtomicBool>,
+        ) -> std::thread::JoinHandle<Result<bool, String>> {
+            let journal = dir.join("replica.journal");
+            let snapshot = dir.join("replica.snapshot");
+            let shutdown = Arc::clone(shutdown);
+            std::thread::spawn(move || -> Result<bool, String> {
+                run_receiver::<App>(
+                    addr,
+                    &journal,
+                    &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                    &shutdown,
+                    &crate::replication::ReplicaControlPlane::new(),
+                    3_600_000,
+                    snapshot,
+                    crate::layout::PipelineCores::unpinned(),
+                    melin_journal::StagingMode::ZeroFill,
+                    group_commit_delay,
+                    64,
+                    Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                    &(),
+                )
+                // ReceiverResult's error is !Send: stringify for join().
+                .map(|state| state.is_none())
+                .map_err(|e| e.to_string())
+            })
+        }
+
+        /// Accept the replica's next connection, authenticate it and
+        /// return its handshake with the open stream.
+        fn next_handshake(
+            listener: &std::net::TcpListener,
+        ) -> (TcpStream, TcpStream, crate::replication::Handshake) {
+            let mut s = accept_within(listener, 30);
+            let mut sr = s.try_clone().expect("clone");
+            authenticate_replica(&mut sr, &replica_auth()).expect("auth");
+            match read_replica_msg(&mut s) {
+                ReplicaMessage::Handshake(h) => (s, sr, h),
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+        }
+
+        /// Answer a handshake: stream from `start` on the given lineage.
+        fn stream_start(stream: &mut TcpStream, start: u64, (origin, anchor): (u64, [u8; 32])) {
+            let mut buf = Vec::new();
+            encode_stream_start(start, origin, anchor, 0, 1, &mut buf);
+            stream.write_all(&buf).expect("StreamStart");
+        }
+
+        /// One streamed entry at `sequence`, as the primary frames it.
+        fn entry(sequence: u64) -> InputSlot<EvtAdd> {
+            InputSlot::<EvtAdd> {
+                connection_id: 0,
+                key_hash: 0,
+                sequence,
+                timestamp_ns: sequence,
+                event: JournalEvent::App(EvtAdd(sequence)),
+                publish_ts: Default::default(),
+                recv_ts: Default::default(),
+            }
+        }
+
+        fn send_entries(stream: &mut TcpStream, sequences: &[u64]) {
+            let slots: Vec<_> = sequences.iter().map(|&s| entry(s)).collect();
+            let mut buf = Vec::new();
+            melin_transport_core::replication_wire::encode_input_batch(&slots, &mut buf);
+            stream.write_all(&buf).expect("InputBatch");
+        }
+
+        fn stop(replica: std::thread::JoinHandle<Result<bool, String>>, shutdown: &AtomicBool) {
+            shutdown.store(true, Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !replica.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "receiver did not exit after shutdown"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let result = replica.join().expect("replica thread panicked");
+            assert_eq!(result, Ok(true), "receiver must exit cleanly via shutdown");
+        }
+
+        /// A session ends on a stream gap with two received entries still
+        /// unwritten: the group-commit delay holds them past the reconnect
+        /// backoff. The next handshake claims them, once written, rather
+        /// than the older durable position, from which the primary would
+        /// resend them and the replica would take them a second time.
+        #[test]
+        fn a_reconnect_claims_entries_received_before_the_drop() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_, lineage) = primary_journal(dir.path());
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            // Longer than the 1 s backoff after a stream gap, with room
+            // to spare: without the wait, the reconnect lands while
+            // entries 2 and 3 are still unwritten.
+            let delay = Duration::from_millis(2_500);
+            let replica = spawn_replica(
+                dir.path(),
+                listener.local_addr().expect("addr"),
+                delay,
+                &shutdown,
+            );
+
+            let (mut s1, _s1r, h1) = next_handshake(&listener);
+            assert_eq!(h1.last_sequence, 0, "fresh replica handshake");
+            stream_start(&mut s1, 0, lineage);
+            // Entry 1 made durable first, so the durable position the
+            // handshake could wrongly claim is 1, not the fresh zero.
+            send_entries(&mut s1, &[1]);
+            wait_for_ack(&mut s1, 1);
+            // Entries 2 and 3 are taken, then 5 breaks contiguity: the
+            // session ends without waiting for the ones it took.
+            send_entries(&mut s1, &[2, 3, 5]);
+
+            let (mut s2, _s2r, h2) = next_handshake(&listener);
+            assert_eq!(
+                h2.last_sequence, 3,
+                "the reconnect must claim the entries received before the drop"
+            );
+            // Streaming again, so shutdown finds the receiver in a session
+            // rather than waiting on the primary's answer.
+            stream_start(&mut s2, h2.last_sequence, lineage);
+            stop(replica, &shutdown);
+        }
+
+        /// A replica built over a journal that already holds an entry
+        /// reconnects after a session that journaled nothing (a quiet
+        /// primary). Its handshake claims that journal, exactly as the
+        /// first one did, not an empty one.
+        #[test]
+        fn a_reconnect_after_a_quiet_session_claims_the_recovered_journal() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (primary, lineage) = primary_journal(dir.path());
+            // The replica holds what the primary holds.
+            std::fs::copy(&primary, dir.path().join("replica.journal")).expect("copy");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let replica = spawn_replica(
+                dir.path(),
+                listener.local_addr().expect("addr"),
+                Duration::ZERO,
+                &shutdown,
+            );
+
+            let (mut s1, s1r, h1) = next_handshake(&listener);
+            assert_eq!(h1.last_sequence, 1, "recovered replica handshake");
+            stream_start(&mut s1, 1, lineage);
+            // Nothing streamed: the primary goes away.
+            drop(s1);
+            drop(s1r);
+
+            let (mut s2, _s2r, h2) = next_handshake(&listener);
+            assert_eq!(
+                (h2.last_sequence, h2.chain_hash),
+                (h1.last_sequence, h1.chain_hash),
+                "the reconnect must claim the journal the pipeline was built over"
+            );
+            // Streaming again, so shutdown finds the receiver in a session.
+            stream_start(&mut s2, h2.last_sequence, lineage);
+            stop(replica, &shutdown);
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Boundary adoption under both staging modes — end to end against a
     // scripted primary. Needs hash-chain (the boundary announce carries
     // a chain value the replica verifies before rotating) and real
