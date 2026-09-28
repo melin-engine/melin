@@ -384,22 +384,17 @@ pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
 ///
 /// Shared between the kernel-TCP and DPDK receivers; both build pipelines
 /// with the same shape (journal / matching / drain / optional shadow), and
-/// both refresh handshake state from `last_seq` + `chain_hash_lock` at
+/// both take the next handshake from [`Self::settled_resume_point`] at
 /// reconnect time.
 pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     pub(super) input_producer: melin_pipeline::ring::Producer<InputSlot<A::Event>>,
     pub(super) journal_cursor: Arc<melin_pipeline::padding::Sequence>,
-    /// Highest wire seq durably persisted, published by JournalStage after
-    /// each fsync. Read by the orchestrator to fill in the reconnect
-    /// handshake without owning the writer. Typed so the handshake's resume
-    /// point can never be sourced from a ring-space counter (the adjacent
-    /// `journal_cursor` resets to ~0 every process start).
-    pub(super) last_seq: melin_transport_core::DurableWireSeqCursor,
-    /// Seqlock-published fsync state (chain hash + journal seq + ring
-    /// cursor), read half. Option to mirror the primary-side pattern;
-    /// always Some on replicas now.
+    /// Seqlock-published fsync state (journal seq + chain hash + ring
+    /// position), read half: the reconnect handshake's resume point, read
+    /// without owning the writer. Seeded with the journal the pipeline
+    /// was built over, so it is never behind what is on disk.
     pub(super) chain_hash_lock:
-        Option<melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>>,
+        melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>,
     /// Primary-announced rotation hand-off: the receiver thread pushes
     /// `Rotate` boundaries here (in stream order), the journal stage
     /// pops and rotates at exactly those sequences. Replicas have no
@@ -419,6 +414,43 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     pub(super) matching_handle: std::thread::JoinHandle<A>,
     pub(super) drain_handle: std::thread::JoinHandle<()>,
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl<A: Application, W: Send + 'static> ReplicaPipelineHandles<A, W> {
+    /// The next handshake's resume point: the fsync state, once it covers
+    /// every slot published into the input ring.
+    ///
+    /// A session publishes ahead of durability, so when it ends the ring
+    /// can still hold entries the journal has not made durable. A
+    /// handshake at the durable position taken before they land has the
+    /// primary resend them, and the next session's contiguity gate, which
+    /// starts at that position, publishes them a second time: the journal
+    /// stage rewinds its sequence over them and the matching stage applies
+    /// them twice. Once the fsync state covers the ring, its position is
+    /// exactly what the replica holds.
+    ///
+    /// Stops waiting, returning the state as it stands, when the journal
+    /// stage has failed (nothing more will be journaled, and the next
+    /// session exits on the same latch before publishing) or `interrupted`
+    /// returns true (shutdown, promotion: the caller handles both before
+    /// any handshake).
+    pub(super) fn settled_resume_point(
+        &self,
+        interrupted: impl Fn() -> bool,
+    ) -> melin_transport_core::pipeline::FsyncState {
+        // Only this thread publishes into the ring, and it is here.
+        let published = self.input_producer.peek_cursor();
+        let mut state = self.chain_hash_lock.load();
+        // Yielding, whatever the ingress strategy: this is the reconnect
+        // path, and what it waits out is a disk stall.
+        melin_pipeline::wait::WaitStrategy::SpinThenYield.wait_until(|| {
+            state = self.chain_hash_lock.load();
+            state.input_ring_seq.get() >= published
+                || self.journal_failed.load(Ordering::Acquire)
+                || interrupted()
+        });
+        state
+    }
 }
 
 /// [`ReplicaPipelineHandles`] over the journal's writer — the only
@@ -566,11 +598,7 @@ where
 
     let shadow_handle = if let Some(shadow_cons) = pipeline.shadow_consumer {
         let snap_path = snapshot_path;
-        let chain_lock = pipeline
-            .chain_hash_lock
-            .as_ref()
-            .expect("chain hash lock with shadow")
-            .clone();
+        let chain_lock = pipeline.chain_hash_lock.clone();
         let ps = Arc::clone(&pipeline_shutdown);
         let shadow = cores.shadow;
         Some(
@@ -598,7 +626,6 @@ where
     Ok(ReplicaPipelineHandles {
         input_producer: pipeline.input_producer,
         journal_cursor: pipeline.cursors.journal_ring_arc(),
-        last_seq: pipeline.cursors.durable_wire_seq(),
         chain_hash_lock: pipeline.chain_hash_lock,
         stream_marks,
         journal_failed,
@@ -2728,6 +2755,35 @@ mod tests {
         ReplicaPipelineHandles<counter_server::Counter, u32>,
         melin_pipeline::ring::Consumer<InputSlot>,
     ) {
+        handles_fixture(capacity, fsync_state_at(0, 0).1)
+    }
+
+    /// A seqlock holding fsync state at `journal_seq` and ring position
+    /// `ring_pos`, as the journal stage would publish it.
+    fn fsync_state_at(
+        journal_seq: u64,
+        ring_pos: u64,
+    ) -> (
+        melin_pipeline::seqlock::SeqLockWriter<melin_transport_core::pipeline::FsyncState>,
+        melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>,
+    ) {
+        melin_pipeline::seqlock::split(melin_transport_core::pipeline::FsyncState {
+            journal_seq: melin_transport_core::WireSeq::new(journal_seq),
+            chain_hash: [0u8; 32],
+            input_ring_seq: melin_transport_core::cursors::RingPos::new(ring_pos),
+        })
+    }
+
+    /// [`teardown_fixture`] reading the given fsync state.
+    fn handles_fixture(
+        capacity: usize,
+        chain_hash_lock: melin_pipeline::seqlock::SeqLockReader<
+            melin_transport_core::pipeline::FsyncState,
+        >,
+    ) -> (
+        ReplicaPipelineHandles<counter_server::Counter, u32>,
+        melin_pipeline::ring::Consumer<InputSlot>,
+    ) {
         let (input_producer, mut consumers) =
             melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(capacity)
                 .add_consumer()
@@ -2736,10 +2792,7 @@ mod tests {
         let handles = ReplicaPipelineHandles {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
-            last_seq: melin_transport_core::DurableWireSeqCursor::detached(
-                melin_transport_core::WireSeq::new(0),
-            ),
-            chain_hash_lock: None,
+            chain_hash_lock,
             stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
@@ -2771,6 +2824,54 @@ mod tests {
             "published slot must be the sentinel"
         );
         assert!(consumer.try_consume().is_none(), "exactly one sentinel");
+    }
+
+    /// A session left three slots in the ring that the journal has not
+    /// made durable. The resume point waits for the fsync that covers
+    /// them rather than handing the handshake the older durable position,
+    /// from which the primary would resend them and the next session
+    /// would publish them a second time.
+    #[test]
+    fn resume_point_waits_for_the_journal_to_cover_the_ring() {
+        let (mut fsync, reader) = fsync_state_at(10, 0);
+        let (mut handles, _consumer) = handles_fixture(8, reader);
+        for _ in 0..3 {
+            handles.input_producer.publish(InputSlot::default());
+        }
+        let journal = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            fsync.store(melin_transport_core::pipeline::FsyncState {
+                journal_seq: melin_transport_core::WireSeq::new(13),
+                chain_hash: [0u8; 32],
+                input_ring_seq: melin_transport_core::cursors::RingPos::new(3),
+            });
+        });
+        let state = handles.settled_resume_point(|| false);
+        journal.join().unwrap();
+        assert_eq!(state.journal_seq.get(), 13, "resumes past the ring's slots");
+    }
+
+    /// Nothing published since the fsync state was last updated (here,
+    /// its seed): the resume point is that state, at once.
+    #[test]
+    fn resume_point_with_nothing_in_flight_is_immediate() {
+        let (_fsync, reader) = fsync_state_at(10, 0);
+        let (handles, _consumer) = handles_fixture(8, reader);
+        assert_eq!(handles.settled_resume_point(|| false).journal_seq.get(), 10);
+    }
+
+    /// A failed journal stage never covers the ring, and neither does one
+    /// the node is abandoning: the wait gives up on either, returning the
+    /// state as it stands for the caller to act on.
+    #[test]
+    fn resume_point_gives_up_on_a_failed_journal_or_an_interrupt() {
+        let (_fsync, reader) = fsync_state_at(10, 0);
+        let (mut handles, _consumer) = handles_fixture(8, reader);
+        handles.input_producer.publish(InputSlot::default());
+
+        assert_eq!(handles.settled_resume_point(|| true).journal_seq.get(), 10);
+        handles.journal_failed.store(true, Ordering::Release);
+        assert_eq!(handles.settled_resume_point(|| false).journal_seq.get(), 10);
     }
 
     /// Drive `handle_session_exit` through one `Disconnected` exit with
@@ -2855,10 +2956,7 @@ mod tests {
         let handles = ReplicaPipelineHandles {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
-            last_seq: melin_transport_core::DurableWireSeqCursor::detached(
-                melin_transport_core::WireSeq::new(0),
-            ),
-            chain_hash_lock: None,
+            chain_hash_lock: fsync_state_at(0, 0).1,
             stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),

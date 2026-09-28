@@ -620,14 +620,13 @@ where
             // we claim. Reading the sequence and the hash from two
             // separate sources would tear under load, and a torn pair
             // is indistinguishable from divergence (false resync of a
-            // healthy replica).
-            if let Some(ref lock) = p.chain_hash_lock {
-                let fsync_state = lock.load();
-                last_sequence = fsync_state.journal_seq.get();
-                chain_hash = fsync_state.chain_hash;
-            } else {
-                last_sequence = p.last_seq.load().get();
-            }
+            // healthy replica). Taken once the journal covers what the
+            // last session published (see `settled_resume_point`).
+            let fsync_state = p.settled_resume_point(|| {
+                shutdown.load(Ordering::Relaxed) || promote.is_requested()
+            });
+            last_sequence = fsync_state.journal_seq.get();
+            chain_hash = fsync_state.chain_hash;
         }
 
         // Sole authority for shutdown/promote while disconnected: every

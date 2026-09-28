@@ -79,6 +79,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `auditor`, in place of the exchange's `trader` and `readonly`: a keys
   file written for an example needs its role tokens renamed.
 
+### Fixed
+
+- **A reconnecting replica could take entries it already held a second
+  time.** A replica reconnects from the position its journal has made
+  durable, but a session publishes ahead of durability, so when the link
+  dropped its pipeline could still hold entries not yet written. If they
+  were still unwritten when it reconnected (a disk stall longer than the
+  reconnect backoff), the primary resent them and the replica journaled
+  and applied them twice. A replica that reconnected without having
+  written anything since its pipeline was built (a quiet primary, or a
+  link that dropped straight after the first handshake) did worse: it
+  reported an empty journal, and the primary either resent history the
+  replica held or sent it a snapshot it did not need. The replica now
+  waits for its journal to catch up with everything it received before
+  reconnecting, and reports the journal it was built over from the start.
+
 ## [0.18.0] - 2026-09-27
 
 ### Added

@@ -743,6 +743,46 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     assert_eq!(report.entries, 6, "six allocated events across both phases");
 }
 
+/// A replica pipeline built over a journal that already holds entries
+/// publishes that journal's position as its fsync state from the start,
+/// before any fsync of its own. The reconnect handshake reads it: left at
+/// zero, a session that journaled nothing (a quiet primary) would have
+/// the next handshake claim an empty journal, and the primary would
+/// stream history the replica already holds.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn replica_fsync_state_starts_at_the_journal_it_was_built_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replica_seeded.journal");
+    let mut writer = Writer::create_continuing(&path, 1, [0xB7u8; 32]).unwrap();
+    for n in 1..=3u64 {
+        let seq = writer.allocate_sequence();
+        writer
+            .encode_event(seq, 1_000 * n, &JournalEvent::App(TestEvent::Add(n)), 1)
+            .unwrap();
+    }
+    writer.flush_batch_sync().unwrap();
+    let chain_hash = writer.chain_hash().expect("hash-chain is on");
+
+    let replica = build_replica_pipeline(
+        TestApp::new(),
+        writer,
+        MAX_JOURNAL_BATCH,
+        Duration::ZERO,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let state = replica.chain_hash_lock.load();
+    assert_eq!(state.journal_seq, WireSeq::new(3));
+    assert_eq!(state.chain_hash, chain_hash);
+    assert_eq!(
+        state.input_ring_seq.get(),
+        0,
+        "nothing published into the ring yet"
+    );
+}
+
 /// Replica half of the sequence-space invariant: the replica's ack
 /// cursors (`last_seq` feeds the reconnect handshake and, through
 /// `FsyncState`, the durable ack the primary's gate counts) must track

@@ -60,9 +60,13 @@ use crate::replication_wire::{finalize_input_batch, init_input_batch};
 /// write. The seqlock guarantees all fields are read atomically —
 /// no TOCTOU between `journal_seq` and `chain_hash`.
 ///
+/// Seeded, before the stage starts, with the journal as the pipeline
+/// found it (its last sequence and chain hash, at ring position zero),
+/// so it never describes less than what is already on disk.
+///
 /// Read by the shadow snapshot stage (`journal_seq` + `chain_hash` for
 /// the snapshot header, `input_ring_seq` for alignment) and by
-/// replication receivers (`chain_hash` for handshake validation).
+/// replication receivers (the reconnect handshake's resume point).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct FsyncState {
@@ -2988,12 +2992,14 @@ pub struct ReplicaPipeline<A: Application> {
     pub matching_stage: MatchingStage<A>,
     pub drain_consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
-    /// Journal-progress cursors, space-typed. On a replica the orchestrator
-    /// reads `durable_wire_seq` for reconnect handshakes (last journal sequence
-    /// durably persisted); the replica slot cursors stay disengaged
-    /// (no downstream replica). Updated by `JournalStage` after each fsync.
+    /// Journal-progress cursors, space-typed. The replica slot cursors
+    /// stay disengaged (no downstream replica). Updated by `JournalStage`
+    /// after each fsync. The reconnect handshake reads `chain_hash_lock`
+    /// instead, whose sequence and hash come from one publication.
     pub cursors: PipelineCursors,
-    pub chain_hash_lock: Option<SeqLockReader<FsyncState>>,
+    /// Fsync state, read half. Always present on a replica, shadow or
+    /// not: it is the reconnect handshake's resume point.
+    pub chain_hash_lock: SeqLockReader<FsyncState>,
 }
 
 /// Handles for monitoring replication ring drain progress.
@@ -3087,25 +3093,33 @@ fn build_input_disruptor<E: AppEvent + Send + 'static>(
     }
 }
 
-/// If shadow snapshots are enabled, allocate a seqlock for publishing the
-/// BLAKE3 chain hash to the shadow stage and move the writer half into
-/// `journal_stage`. Returns the reader half (so the caller can return it
-/// through its pipeline handle struct) or `None` when shadow is disabled —
-/// zero overhead in that case.
+/// The fsync state of `writer`'s journal before a pipeline writes to it:
+/// its last sequence and the chain hash after it, at ring position zero,
+/// since nothing has been published yet. The same pair recovery hands a
+/// replica's first handshake, so a reconnect before the stage's first
+/// fsync resumes from what the journal holds rather than from nothing.
+fn fsync_state_at_open<E: AppEvent>(writer: &BufferedWriter<E>) -> FsyncState {
+    FsyncState {
+        journal_seq: WireSeq::new(writer.next_sequence().saturating_sub(1)),
+        chain_hash: writer.chain_hash().unwrap_or([0u8; 32]),
+        input_ring_seq: RingPos::new(0),
+    }
+}
+
+/// Allocate a seqlock for publishing fsync state, holding `initial` until
+/// the first fsync, and move the writer half into `journal_stage`.
+/// Returns the reader half, for the caller to return through its pipeline
+/// handle struct.
 ///
 /// The journal stage taking the only writer handle is what makes it
 /// impossible for a second thread to publish fsync state.
 fn setup_chain_hash_publisher<E: AppEvent>(
     journal_stage: &mut JournalStage<E>,
-    enable_shadow: bool,
-) -> Option<SeqLockReader<FsyncState>> {
-    if enable_shadow {
-        let (writer, reader) = melin_pipeline::seqlock::split(FsyncState::default());
-        journal_stage.set_chain_hash_lock(writer);
-        Some(reader)
-    } else {
-        None
-    }
+    initial: FsyncState,
+) -> SeqLockReader<FsyncState> {
+    let (writer, reader) = melin_pipeline::seqlock::split(initial);
+    journal_stage.set_chain_hash_lock(writer);
+    reader
 }
 
 /// How each thread the pipeline builders wire up waits on the thread it
@@ -3203,6 +3217,7 @@ where
     // replica metrics — that's what makes the response gate sound under
     // recovery from a non-trivial journal (`starting_sequence > 1`).
     let starting_wire_seq = writer.next_sequence();
+    let fsync_at_open = fsync_state_at_open(&writer);
 
     // Bundle the journal-progress cursors behind space-typed accessors and
     // wire every stage from it. The durable cursor starts at
@@ -3280,7 +3295,10 @@ where
         (None, None)
     };
 
-    let chain_hash_lock = setup_chain_hash_publisher(&mut journal_stage, enable_shadow);
+    // Only the shadow reads fsync state on a primary: without it, no
+    // seqlock and no publish.
+    let chain_hash_lock =
+        enable_shadow.then(|| setup_chain_hash_publisher(&mut journal_stage, fsync_at_open));
 
     // Connected replica count: when replication is enabled, starts at 0
     // (no replicas yet). The replication sender increments on connect,
@@ -3375,6 +3393,7 @@ where
     // path where the replica's matching stamps wire seqs locally) the
     // counter is positioned correctly.
     let starting_wire_seq = writer.next_sequence();
+    let fsync_at_open = fsync_state_at_open(&writer);
 
     // Journal stage: same as primary (encode mode). Pre-assigned sequences
     // in each InputSlot keep the replica's journal aligned with the primary.
@@ -3392,19 +3411,16 @@ where
     // pair against its own chain — a replica without this lock would
     // present a stale hash next to a fresh sequence and be falsely
     // judged divergent.
-    let chain_hash_lock = setup_chain_hash_publisher(&mut journal_stage, true);
+    let chain_hash_lock = setup_chain_hash_publisher(&mut journal_stage, fsync_at_open);
 
     // Bundle the journal-progress cursors (mirrors the primary builder).
-    // The durable cursor is always published on replicas: the orchestrator
-    // reads it for reconnect handshakes without owning the writer (the
-    // writer lives inside `journal_stage` for the lifetime of the
-    // pipeline). Initialise from the writer's pre-pipeline state so the
-    // handshake reflects what's already on disk even before the first
-    // fsync nudges the cursor — a fresh writer here returns
-    // `starting_wire_seq == 1` (no genesis yet) or `>= 2` (post-genesis),
-    // so `saturating_sub(1)` yields the correct "highest wire seq durable"
-    // reading at boot. The replica slot cursors stay disengaged for the
-    // lifetime of the pipeline (no downstream replica).
+    // Initialise the durable cursor from the writer's pre-pipeline state
+    // so it reflects what's already on disk even before the first fsync
+    // nudges it. A fresh writer here returns `starting_wire_seq == 1`
+    // (no genesis yet) or `>= 2` (post-genesis), so `saturating_sub(1)`
+    // yields the correct "highest wire seq durable" reading at boot. The
+    // replica slot cursors stay disengaged for the lifetime of the
+    // pipeline (no downstream replica).
     let cursors = PipelineCursors::new(
         WireSeq::new(starting_wire_seq.saturating_sub(1)),
         journal_cursor,
