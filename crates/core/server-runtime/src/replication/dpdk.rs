@@ -1200,15 +1200,14 @@ where
         // FsyncState snapshot — a torn pair read from two sources while
         // the journal stage keeps flushing trips the primary's
         // handshake chain validation (false divergence; see the
-        // kernel-TCP receiver).
+        // kernel-TCP receiver). Taken once the journal covers what the
+        // last session published (see `settled_resume_point`).
         if let Some(p) = pipeline.as_ref() {
-            if let Some(ref lock) = p.chain_hash_lock {
-                let fsync_state = lock.load();
-                last_sequence = fsync_state.journal_seq.get();
-                chain_hash = fsync_state.chain_hash;
-            } else {
-                last_sequence = p.last_seq.load().get();
-            }
+            let fsync_state = p.settled_resume_point(|| {
+                shutdown.load(Ordering::Relaxed) || promote.is_requested()
+            });
+            last_sequence = fsync_state.journal_seq.get();
+            chain_hash = fsync_state.chain_hash;
         }
 
         // Sole authority for shutdown/promote while disconnected: every
