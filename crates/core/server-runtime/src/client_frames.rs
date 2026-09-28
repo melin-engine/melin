@@ -2,15 +2,15 @@
 //!
 //! Both the kernel (io_uring) and DPDK client readers parse the same
 //! length-prefixed wire format, decode through the same
-//! [`RequestDecoder`], and publish [`InputSlot`]s to the same disruptor
+//! [`ErasedDecoder`], and publish [`InputSlot`]s to the same disruptor
 //! ring with identical batching semantics. This module extracts that
 //! shared logic into [`process_client_frames`] so both backends call a
 //! single implementation.
 
 use tracing::debug;
 
-use melin_app::auth::Permission;
-use melin_app::decoder::{Decoded, RequestDecoder};
+use melin_app::auth::{ClientRole, RoleId};
+use melin_app::decoder::{Decoded, ErasedDecoder};
 use melin_app::{AppEvent, Application};
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
@@ -83,9 +83,9 @@ pub(crate) fn process_client_frames<A: Application>(
     parse_buf: &mut Vec<u8>,
     connection_id: u64,
     key_hash: u64,
-    permission: Permission,
+    role: ClientRole<RoleId>,
     producer: &mut ring::Producer<InputSlot<A::Event>>,
-    decoder: &dyn RequestDecoder<Event = A::Event>,
+    decoder: &dyn ErasedDecoder<A::Event>,
     halt: &HaltGate,
     refusals: &mut RefusalSender<A::Report>,
     batch_wall_ns: u64,
@@ -154,7 +154,7 @@ pub(crate) fn process_client_frames<A: Application>(
             }
         };
 
-        let event = match decoder.decode(body, permission) {
+        let event = match decoder.decode_erased(body, role) {
             Decoded::Filter => continue,
             Decoded::PermissionDenied(reason) => {
                 debug!(connection_id, reason, "permission denied, dropping request");

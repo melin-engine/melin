@@ -12,6 +12,73 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **Application-defined client roles.** An application declares its
+  roles as a type implementing `melin_app::auth::Role`, a table pairing
+  each role with the token that names it in `authorized_keys`; the
+  runtime keeps only the two roles it acts on, `operator` and
+  `replication`. `validate_roles` checks a table (tokens lowercase ASCII
+  letters, digits, `-` and `_`, starting with a letter; none of the
+  runtime's; no token or role listed twice), and every keys-file parse
+  runs it, so a node refuses a bad table before it serves. `NoRoles` is
+  the role type of an application that admits operator keys only.
+  `ClientRole<R>` is what a decoder receives: `Operator`, or `App(R)`.
+  `KeyRole` is what the keys file grants a key, `Replication` or
+  `Client(ClientRole<RoleId>)`, with `KeyRole::client` giving a key's
+  client role and `None` for a replication key, so a listener of an
+  application's own that admits the same keys applies the client
+  listener's rule through it. `AuthorizedKeys::token` names a role for a
+  log line. `RoleId` is an application role as the runtime carries it,
+  an index into the role table, and `ErasedDecoder` the decoder as the
+  runtime holds it, implemented for every `RequestDecoder`.
+- **`melin_server_runtime::client_auth::verify_client`**, the client
+  listener's check on a challenge response (key listed, not a
+  replication key, signature over the nonce valid), with its
+  `ClientAuthError`. A listener of an application's own that admits the
+  node's client keys, an event publisher's subscribers say, calls it and
+  applies exactly the client listener's rule, instead of keeping a copy
+  of it in step.
+
+### Removed
+
+- **The exchange's roles and their helpers: `Permission::Trader`,
+  `Custodian`, `ReadOnly`, `can_trade` and `can_manage_funds`.** They were
+  one application's separation of duties, in the runtime every
+  application builds on. An application that used them declares them as
+  its own `Role` type (see Changed).
+- **`Permission::may_connect_as_client` and
+  `Permission::is_replication`**, added in 0.18. A replication key is a
+  `KeyRole` now, not a permission: `KeyRole::is_replication`, and
+  `KeyRole::client`, which is `None` exactly where
+  `may_connect_as_client` was false.
+
+### Changed
+
+- **A decoder receives the application's own roles: `Permission` is
+  replaced by `ClientRole<R>`.** `RequestDecoder` gains `type Role`, and
+  `decode` takes `role: ClientRole<Self::Role>` in place of
+  `permission: Permission`. A decoder never sees a replication key, and
+  its type now says so: there is no replication variant. Source-breaking
+  for every decoder. To migrate: declare the roles your keys files use
+  (`trader`, `readonly`, …) as your own `Role` type, so existing files
+  load unchanged; set `type Role` to it; and match `ClientRole::Operator`
+  and `ClientRole::App(role)` where you matched `Permission`.
+  `AuthorizedKeys::parse` and `load` take the role type
+  (`parse::<MyRole>`), and `lookup` returns a `KeyRole`. Errors and logs
+  now name a role by its token in the keys file (`trader`, not
+  `Trader`), and a keys file naming an unknown role is refused with
+  `unknown role`, listing every valid one, where it said
+  `unknown permission`. In `melin-server-runtime`,
+  `reader::ReaderRegistration`'s `permission` field is now
+  `role: ClientRole<RoleId>`, and `reader::RequestDecoderArc`, the
+  decoder `spawn_reader` and `run_dpdk_poll` take, is now
+  `Arc<dyn ErasedDecoder<E>>`.
+- **The examples declare roles of their own.** The counter and echo
+  examples admit `writer` and `reader` keys, the notary `submitter` and
+  `auditor`, in place of the exchange's `trader` and `readonly`: a keys
+  file written for an example needs its role tokens renamed.
+
 ## [0.18.0] - 2026-09-27
 
 ### Added

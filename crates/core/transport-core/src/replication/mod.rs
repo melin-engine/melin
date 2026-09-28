@@ -6,9 +6,9 @@
 //!
 //! The consuming server owns its own connection orchestration (TCP
 //! listener, replica connect loop, pipeline factory, app cloning) and
-//! key authorization — those still live in the application's server
-//! crate because they depend on concrete `Application` types and the
-//! application's permission model.
+//! key authorization against the node's `authorized_keys` — those live
+//! in the server runtime, which builds the pipeline for the concrete
+//! `Application` and holds the keys table.
 
 pub mod ack_queue;
 pub mod archive;

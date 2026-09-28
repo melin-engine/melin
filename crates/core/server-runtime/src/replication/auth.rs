@@ -7,7 +7,7 @@
 //! The wire framing and message encoders/decoders live in
 //! `melin_transport_core::replication::protocol`; this module is the
 //! runtime-side glue that pairs the generic auth flow with the
-//! operator-managed `AuthorizedKeys` permission table.
+//! operator-managed `AuthorizedKeys` table of keys and their roles.
 
 use std::io::{self, Read, Write};
 
@@ -40,8 +40,8 @@ pub(super) fn generate_challenge_nonce() -> io::Result<[u8; 32]> {
 }
 
 /// Verify a replica's `ChallengeResponse` against the `nonce` we issued and
-/// the operator's `AuthorizedKeys`: the key must be listed, carry
-/// `Replication` permission, and produce a valid Ed25519 signature over the
+/// the operator's `AuthorizedKeys`: the key must be listed under the
+/// `replication` role, and produce a valid Ed25519 signature over the
 /// nonce. `response_frame` is the decoded frame payload (length prefix
 /// stripped).
 ///
@@ -58,12 +58,13 @@ pub(super) fn verify_challenge_response(
     let (signature_bytes, pubkey_bytes) = decode_challenge_response(response_frame)
         .map_err(|e| io::Error::other(format!("bad challenge response: {e}")))?;
 
-    let permission = authorized_keys
+    let role = authorized_keys
         .lookup(&pubkey_bytes)
         .ok_or_else(|| io::Error::other("unknown replication key"))?;
-    if !permission.is_replication() {
+    if !role.is_replication() {
         return Err(io::Error::other(format!(
-            "key has {permission:?} permission, expected Replication"
+            "key listed as {}, expected replication",
+            authorized_keys.token(role)
         )));
     }
 
@@ -81,9 +82,9 @@ pub(super) fn verify_challenge_response(
 /// kernel-TCP sender and tests).
 ///
 /// Sends a 32-byte nonce challenge, verifies the replica's Ed25519
-/// signature, and checks that the key has `Replication` permission. Must
-/// complete within the stream's existing read timeout. The DPDK sender runs
-/// the same exchange non-blocking on its poll loop, reusing
+/// signature, and checks that the key is listed under the `replication`
+/// role. Must complete within the stream's existing read timeout. The DPDK
+/// sender runs the same exchange non-blocking on its poll loop, reusing
 /// [`generate_challenge_nonce`] and [`verify_challenge_response`].
 pub(super) fn authenticate_replica<S: Read + Write>(
     stream: &mut S,
@@ -244,7 +245,7 @@ pub(super) fn step_authentication<T: AuthTransport>(
         FrameResult::Complete(payload_start, frame_end) => {
             // Shared verification with the kernel-TCP path — the
             // security-critical step (decode, authorized-keys lookup,
-            // Replication-permission check, Ed25519 verify over the nonce).
+            // replication-role check, Ed25519 verify over the nonce).
             let verdict = verify_challenge_response(
                 &challenge.nonce,
                 &recv_buf[payload_start..frame_end],
@@ -368,13 +369,13 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::VecDeque;
 
-    /// Build an `AuthorizedKeys` table granting `permission` to `key`.
-    fn keys_for(key: &SigningKey, permission: &str) -> melin_app::auth::AuthorizedKeys {
+    /// Build an `AuthorizedKeys` table listing `key` under `role`.
+    fn keys_for(key: &SigningKey, role: &str) -> melin_app::auth::AuthorizedKeys {
         let pub_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             key.verifying_key().to_bytes(),
         );
-        melin_app::auth::AuthorizedKeys::parse(&format!("{permission} {pub_b64} test\n")).unwrap()
+        crate::test_roles::desk_keys(role, &pub_b64)
     }
 
     /// Encode a `ChallengeResponse` and return just the payload (4-byte LE
@@ -417,7 +418,10 @@ mod tests {
         let nonce = [0x42; 32];
         let err =
             verify_challenge_response(&nonce, &response_payload(&key, &nonce), &keys).unwrap_err();
-        assert!(err.to_string().contains("Replication"));
+        assert_eq!(
+            err.to_string(),
+            "key listed as trader, expected replication"
+        );
     }
 
     #[test]

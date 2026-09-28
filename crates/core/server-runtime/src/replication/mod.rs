@@ -1545,7 +1545,9 @@ mod tests {
             repl_key.verifying_key().to_bytes(),
         );
         let keys_content = format!("replication {pub_b64} test-replica\n");
-        let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys =
+            melin_app::auth::AuthorizedKeys::parse::<melin_app::auth::NoRoles>(&keys_content)
+                .unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream
@@ -1580,7 +1582,9 @@ mod tests {
             authorized_key.verifying_key().to_bytes(),
         );
         let keys_content = format!("replication {pub_b64} authorized-replica\n");
-        let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys =
+            melin_app::auth::AuthorizedKeys::parse::<melin_app::auth::NoRoles>(&keys_content)
+                .unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream
@@ -1610,14 +1614,13 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use std::os::unix::net::UnixStream;
 
-        // Key exists but has Trader permission, not Replication.
+        // Key exists but is listed as trader, not replication.
         let key = SigningKey::from_bytes(&[0xCC; 32]);
         let pub_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             key.verifying_key().to_bytes(),
         );
-        let keys_content = format!("trader {pub_b64} wrong-role\n");
-        let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys = crate::test_roles::desk_keys("trader", &pub_b64);
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream
@@ -1635,7 +1638,10 @@ mod tests {
         let mut conn = primary_stream;
         let result = authenticate_replica(&mut conn, &authorized_keys);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Replication"));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "key listed as trader, expected replication"
+        );
 
         let replica_result = replica_handle.join().unwrap();
         assert!(replica_result.is_err());
@@ -1655,7 +1661,9 @@ mod tests {
             correct_key.verifying_key().to_bytes(),
         );
         let keys_content = format!("replication {pub_b64} test-replica\n");
-        let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys =
+            melin_app::auth::AuthorizedKeys::parse::<melin_app::auth::NoRoles>(&keys_content)
+                .unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream

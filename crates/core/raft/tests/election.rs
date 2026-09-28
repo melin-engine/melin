@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use ed25519_dalek::SigningKey;
-use melin_app::auth::AuthorizedKeys;
+use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_raft::driver::{RaftConfig, RaftHandles, RaftPeer, spawn};
 use melin_raft::recency::TipSource;
 use melin_transport_core::cursors::AdvertisedJournalTip;
@@ -64,7 +64,7 @@ fn start_cluster_with_tips(tips: &[u64]) -> Cluster {
             )
         })
         .collect();
-    let authorized_keys = Arc::new(AuthorizedKeys::parse(&table).unwrap());
+    let authorized_keys = Arc::new(AuthorizedKeys::parse::<NoRoles>(&table).unwrap());
 
     // Identical peer list on every node, self included — the production
     // configuration shape.

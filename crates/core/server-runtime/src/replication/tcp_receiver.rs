@@ -1202,8 +1202,10 @@ mod tests {
                 &base64::engine::general_purpose::STANDARD,
                 key.verifying_key().to_bytes(),
             );
-            melin_app::auth::AuthorizedKeys::parse(&format!("replication {pub_b64} test-replica\n"))
-                .expect("parse keys")
+            melin_app::auth::AuthorizedKeys::parse::<melin_app::auth::NoRoles>(&format!(
+                "replication {pub_b64} test-replica\n"
+            ))
+            .expect("parse keys")
         }
 
         /// Read one length-prefixed `ReplicaMessage` frame.

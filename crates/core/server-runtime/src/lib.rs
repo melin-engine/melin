@@ -15,7 +15,7 @@
 pub mod ack_policy;
 pub mod admin;
 mod buf_ring;
-mod client_auth;
+pub mod client_auth;
 mod client_frames;
 pub mod halt;
 pub mod layout;
@@ -29,6 +29,8 @@ pub mod response;
 mod response_frame;
 pub mod server;
 mod startup;
+#[cfg(test)]
+mod test_roles;
 mod uring_teardown;
 
 pub use startup::StartupEvents;

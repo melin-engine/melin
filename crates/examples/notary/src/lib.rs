@@ -68,7 +68,7 @@
 
 use std::io::{self, Read, Write};
 
-use melin_app::auth::Permission;
+use melin_app::auth::{ClientRole, Role};
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
@@ -353,6 +353,28 @@ impl Application for Notary {
 }
 
 // ---------------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------------
+
+/// The notary's client roles, each named by a token in the node's
+/// `authorized_keys` file. Beside them, the runtime's `operator` role may
+/// notarize too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotaryRole {
+    /// Submits digests to be notarized, and may read the head.
+    Submitter,
+    /// Checks the chain: may read the head only.
+    Auditor,
+}
+
+impl Role for NotaryRole {
+    const ROLES: &'static [(&'static str, Self)] = &[
+        ("submitter", NotaryRole::Submitter),
+        ("auditor", NotaryRole::Auditor),
+    ];
+}
+
+// ---------------------------------------------------------------------------
 // Request decoder
 // ---------------------------------------------------------------------------
 
@@ -364,18 +386,24 @@ pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = NotaryEvent;
+    type Role = NotaryRole;
 
-    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<NotaryEvent> {
+    fn decode(&self, body: &[u8], role: ClientRole<NotaryRole>) -> Decoded<NotaryEvent> {
         let Some((&kind, fields)) = body.split_first() else {
             return Decoded::DecodeError("empty request");
         };
         match kind {
             KIND_NOTARIZE => {
-                // Notarizing appends to the log, so the read-only role is
-                // refused. (A replication key never gets this far: the
-                // client listener refuses it.)
-                if permission == Permission::ReadOnly {
-                    return Decoded::PermissionDenied("notarizing requires a writing role");
+                // Notarizing appends to the log, so an auditor is refused.
+                // Matched exhaustively rather than with a wildcard: a role
+                // added later is a compile error here, not a silent grant.
+                // (A replication key never gets this far: the client
+                // listener refuses it.)
+                match role {
+                    ClientRole::Operator | ClientRole::App(NotaryRole::Submitter) => {}
+                    ClientRole::App(NotaryRole::Auditor) => {
+                        return Decoded::PermissionDenied("notarizing requires a writing role");
+                    }
                 }
                 match leaf_from(fields) {
                     Ok(leaf) => Decoded::Permitted(NotaryEvent::Notarize { leaf }),
@@ -733,22 +761,21 @@ mod tests {
     #[test]
     fn decoder_accepts_notarize_from_writing_roles() {
         let l = leaf(0x5A);
-        for permission in [
-            Permission::Operator,
-            Permission::Trader,
-            Permission::Custodian,
-        ] {
-            match RequestDecoder.decode(&request(KIND_NOTARIZE, &l), permission) {
+        for role in [ClientRole::Operator, ClientRole::App(NotaryRole::Submitter)] {
+            match RequestDecoder.decode(&request(KIND_NOTARIZE, &l), role) {
                 Decoded::Permitted(event) => assert_eq!(event, NotaryEvent::Notarize { leaf: l }),
-                _ => panic!("expected Permitted for {permission:?}"),
+                _ => panic!("expected Permitted for {role:?}"),
             }
         }
     }
 
     #[test]
-    fn decoder_denies_notarize_from_the_read_only_role() {
+    fn decoder_denies_notarize_from_an_auditor() {
         assert!(matches!(
-            RequestDecoder.decode(&request(KIND_NOTARIZE, &leaf(1)), Permission::ReadOnly),
+            RequestDecoder.decode(
+                &request(KIND_NOTARIZE, &leaf(1)),
+                ClientRole::App(NotaryRole::Auditor)
+            ),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -757,17 +784,21 @@ mod tests {
     /// at the handshake and never reach the decoder.
     #[test]
     fn decoder_allows_queries_from_every_client_role() {
-        for permission in [
-            Permission::Operator,
-            Permission::Trader,
-            Permission::Custodian,
-            Permission::ReadOnly,
+        for role in [
+            ClientRole::Operator,
+            ClientRole::App(NotaryRole::Submitter),
+            ClientRole::App(NotaryRole::Auditor),
         ] {
             assert!(matches!(
-                RequestDecoder.decode(&[KIND_GET_HEAD], permission),
+                RequestDecoder.decode(&[KIND_GET_HEAD], role),
                 Decoded::Permitted(NotaryEvent::GetHead)
             ));
         }
+    }
+
+    #[test]
+    fn the_role_table_is_valid() {
+        melin_app::auth::validate_roles::<NotaryRole>().unwrap();
     }
 
     #[test]
@@ -775,7 +806,10 @@ mod tests {
         for fields in [vec![0u8; LEAF_LEN - 1], vec![0u8; LEAF_LEN + 1], Vec::new()] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(&request(KIND_NOTARIZE, &fields), Permission::Trader),
+                    RequestDecoder.decode(
+                        &request(KIND_NOTARIZE, &fields),
+                        ClientRole::App(NotaryRole::Submitter)
+                    ),
                     Decoded::DecodeError(_)
                 ),
                 "a {}-byte leaf must be refused",
@@ -787,11 +821,11 @@ mod tests {
     #[test]
     fn decoder_rejects_empty_and_unknown_kind() {
         assert!(matches!(
-            RequestDecoder.decode(&[], Permission::Trader),
+            RequestDecoder.decode(&[], ClientRole::App(NotaryRole::Submitter)),
             Decoded::DecodeError("empty request")
         ));
         assert!(matches!(
-            RequestDecoder.decode(&[0x7F], Permission::Trader),
+            RequestDecoder.decode(&[0x7F], ClientRole::App(NotaryRole::Submitter)),
             Decoded::DecodeError("unknown kind")
         ));
     }

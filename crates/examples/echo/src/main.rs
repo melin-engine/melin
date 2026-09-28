@@ -6,7 +6,7 @@
 //! # 1. Generate an Ed25519 keypair and write an authorized_keys file:
 //! openssl genpkey -algorithm ed25519 -out /tmp/echo-key.pem
 //! PUB=$(openssl pkey -in /tmp/echo-key.pem -pubout -outform DER | tail -c 32 | base64)
-//! echo "trader $PUB me" > /tmp/authorized_keys
+//! echo "writer $PUB me" > /tmp/authorized_keys
 //!
 //! # 2. Start the echo server (in release: a floor measured on a debug build is not one):
 //! cargo run --release --bin echo-server -- --standalone --ack-policy disk --authorized-keys /tmp/authorized_keys --journal /tmp/echo.journal

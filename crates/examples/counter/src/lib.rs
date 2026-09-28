@@ -23,7 +23,7 @@ use std::io::{self, Read, Write};
 #[doc = include_str!("../../../../docs/building-an-application.md")]
 pub struct ApplicationGuide;
 
-use melin_app::auth::Permission;
+use melin_app::auth::{ClientRole, Role};
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
@@ -221,6 +221,35 @@ impl Application for Counter {
 }
 
 // ---------------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------------
+
+/// The counter's client roles, each named by a token in the node's
+/// `authorized_keys` file:
+///
+/// ```text
+/// writer AAAA... desk-1
+/// reader BBBB... monitoring
+/// ```
+///
+/// Beside them, the runtime's `operator` role may do anything a client
+/// can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterRole {
+    /// May increment the counter and read it.
+    Writer,
+    /// May read the counter only.
+    Reader,
+}
+
+impl Role for CounterRole {
+    const ROLES: &'static [(&'static str, Self)] = &[
+        ("writer", CounterRole::Writer),
+        ("reader", CounterRole::Reader),
+    ];
+}
+
+// ---------------------------------------------------------------------------
 // Request decoder
 // ---------------------------------------------------------------------------
 
@@ -232,18 +261,24 @@ pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = CounterEvent;
+    type Role = CounterRole;
 
-    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<CounterEvent> {
+    fn decode(&self, body: &[u8], role: ClientRole<CounterRole>) -> Decoded<CounterEvent> {
         let Some((&kind, fields)) = body.split_first() else {
             return Decoded::DecodeError("empty request");
         };
         match kind {
             KIND_INCREMENT => {
-                // An increment changes state, so a read-only key may not
-                // send one. (A replication key never gets this far: the
-                // client listener refuses it.)
-                if permission == Permission::ReadOnly {
-                    return Decoded::PermissionDenied("incrementing requires a writing role");
+                // An increment changes state, so a reader may not send one.
+                // Matched exhaustively rather than with a wildcard: a role
+                // added later is a compile error here, not a silent grant.
+                // (A replication key never gets this far: the client
+                // listener refuses it.)
+                match role {
+                    ClientRole::Operator | ClientRole::App(CounterRole::Writer) => {}
+                    ClientRole::App(CounterRole::Reader) => {
+                        return Decoded::PermissionDenied("incrementing requires a writing role");
+                    }
                 }
                 match amount_from(fields) {
                     Ok(amount) => Decoded::Permitted(CounterEvent::Increment {
@@ -454,7 +489,7 @@ mod tests {
     fn decoder_increment() {
         let body = increment_request(100);
         assert_eq!(body[..], message(KIND_INCREMENT, &100u64.to_le_bytes()));
-        match RequestDecoder.decode(&body, Permission::Operator) {
+        match RequestDecoder.decode(&body, ClientRole::Operator) {
             Decoded::Permitted(event) => {
                 assert!(matches!(event, CounterEvent::Increment { amount: 100 }));
             }
@@ -464,7 +499,7 @@ mod tests {
 
     #[test]
     fn decoder_get_value() {
-        match RequestDecoder.decode(&GET_VALUE_REQUEST, Permission::Operator) {
+        match RequestDecoder.decode(&GET_VALUE_REQUEST, ClientRole::Operator) {
             Decoded::Permitted(event) => {
                 assert!(matches!(event, CounterEvent::GetValue));
                 assert!(event.is_query());
@@ -476,13 +511,13 @@ mod tests {
     #[test]
     fn decoder_refuses_empty_short_long_and_unknown() {
         assert!(matches!(
-            RequestDecoder.decode(&[], Permission::Operator),
+            RequestDecoder.decode(&[], ClientRole::Operator),
             Decoded::DecodeError("empty request")
         ));
         for amount in [&[0u8; 7][..], &[0u8; 9][..]] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(&message(KIND_INCREMENT, amount), Permission::Operator),
+                    RequestDecoder.decode(&message(KIND_INCREMENT, amount), ClientRole::Operator),
                     Decoded::DecodeError(_)
                 ),
                 "a {}-byte amount must be refused",
@@ -490,39 +525,41 @@ mod tests {
             );
         }
         assert!(matches!(
-            RequestDecoder.decode(&message(KIND_GET_VALUE, &[0]), Permission::Operator),
+            RequestDecoder.decode(&message(KIND_GET_VALUE, &[0]), ClientRole::Operator),
             Decoded::DecodeError(_)
         ));
         assert!(matches!(
-            RequestDecoder.decode(&[0x7F], Permission::Operator),
+            RequestDecoder.decode(&[0x7F], ClientRole::Operator),
             Decoded::DecodeError("unknown kind")
         ));
     }
 
-    /// A read-only key may read the counter but not change it.
+    /// A reader may read the counter but not change it.
     #[test]
-    fn decoder_refuses_increments_from_the_read_only_role() {
+    fn decoder_refuses_increments_from_a_reader() {
+        let reader = ClientRole::App(CounterRole::Reader);
         assert!(matches!(
-            RequestDecoder.decode(&increment_request(1), Permission::ReadOnly),
+            RequestDecoder.decode(&increment_request(1), reader),
             Decoded::PermissionDenied(_)
         ));
         assert!(matches!(
-            RequestDecoder.decode(&GET_VALUE_REQUEST, Permission::ReadOnly),
+            RequestDecoder.decode(&GET_VALUE_REQUEST, reader),
             Decoded::Permitted(CounterEvent::GetValue)
         ));
-        for permission in [
-            Permission::Operator,
-            Permission::Trader,
-            Permission::Custodian,
-        ] {
+        for role in [ClientRole::Operator, ClientRole::App(CounterRole::Writer)] {
             assert!(
                 matches!(
-                    RequestDecoder.decode(&increment_request(1), permission),
+                    RequestDecoder.decode(&increment_request(1), role),
                     Decoded::Permitted(CounterEvent::Increment { amount: 1 })
                 ),
-                "{permission:?} may increment"
+                "{role:?} may increment"
             );
         }
+    }
+
+    #[test]
+    fn the_role_table_is_valid() {
+        melin_app::auth::validate_roles::<CounterRole>().unwrap();
     }
 
     #[test]
