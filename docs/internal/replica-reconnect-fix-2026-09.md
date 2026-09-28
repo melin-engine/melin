@@ -70,6 +70,14 @@ code is unchanged since the audited commit.
    describes everything the replica holds, and the primary's existing
    handshake validation checks the chain at exactly that point.
 
+   The pair must also be durable, not merely encoded. The primary takes
+   the handshake's `last_sequence` as the replica's stream base and
+   seeds that replica's acked and in-memory ack cursors from it
+   (`seed_on_handshake`), so whatever the replica claims counts as
+   already on its disk. That rules out a cheaper variant that publishes
+   an encoded-but-not-durable pair from the journal-seq thread to avoid
+   waiting on the disk.
+
    The audit's first suggestion, carrying the accepted position across
    the reconnect and anchoring the gate at the larger of it and the
    handshake position, is rejected. The handshake would still claim the
@@ -93,8 +101,23 @@ code is unchanged since the audited commit.
    `JournalWrite` trait if nothing else calls it. The encoder keeps
    `last_encoded_seq` in every build and returns an error from
    `encode_event` on `seq <= last_encoded_seq`: one comparison per entry.
-   `begin_segment` stops resetting it; the monotonic-time plan needs the
-   same for its timestamp floor, which will sit beside this check.
+   It updates `last_encoded_seq` only after the capacity check, unlike
+   today's debug code, so that a refused entry still leaves the encoder
+   able to re-encode it, as its docs promise. `begin_segment` stops
+   resetting it; the monotonic-time plan needs the same for its timestamp
+   floor, which will sit beside this check.
+
+   The shutdown drain logs an encode error and moves on to the next slot
+   today. A sequence refusal there must stop the drain instead: skipping
+   one entry and encoding the next after it is exactly the corruption
+   this check exists to prevent.
+
+   `JournalError` is not `#[non_exhaustive]`, so a new variant is a
+   breaking change for a published crate. Neither this workspace nor
+   exchange-core matches on it exhaustively, and exchange-core does not
+   implement `JournalWrite`, so nothing breaks today. Mark the enum
+   `#[non_exhaustive]` in the same change: the monotonic-time plan adds
+   `TimestampRegression` next, and this takes the break once.
 
 4. **A sequence refusal stops the process.** The error routes through
    `SessionExit::Fatal`, and `handle_session_exit` returns it rather than
@@ -102,6 +125,12 @@ code is unchanged since the audited commit.
    `ReplicaChainDivergence`. A refusal means a bug in this node, not a
    fork from the primary, and the refused entry never reached disk, so a
    restart recovers a clean journal.
+
+   The matching stage is gated on the producer, not on the journal, so
+   it may already have applied the refused entry in memory when the
+   journal stage stops. That state dies with the process. The shadow is
+   gated on journal progress, which never covers the refused entry, so
+   it never reads it and no snapshot can hold it.
 
 ## Order of work
 
@@ -116,14 +145,19 @@ Each step lands as its own commit with its tests.
      it.
    - Add one shared helper in `replication/mod.rs` that waits for
      coverage and returns the pair, and call it from both receivers'
-     reconnect loops. On `journal_failed` it hands off to the existing
-     `Fatal` teardown instead of handshaking with a dead pipeline.
+     reconnect loops. On `journal_failed` it does not handshake with a
+     dead pipeline: the loop feeds a synthetic `StreamingResult` with
+     `exit: Fatal` and `heard_from_primary: false` into
+     `handle_session_exit`. Only that arm inspects the teardown outcome,
+     so a `ReplicaChainDivergence` that lands while disconnected still
+     takes the in-process resync.
    - Update the comments that say a reconnect resumes "from the durable
      position" (`handle_session_exit`'s `StreamGap` arm among them).
 2. **Release-mode sequence enforcement** (decisions 3 and 4). Tests
    that feed a replica stage non-contiguous sequences, if any, get fixed
    rather than the check loosened.
-3. **Docs.** A `Fixed` entry under `[Unreleased]` in the CHANGELOG, and a
+3. **Docs.** A `Fixed` entry under `[Unreleased]` in the CHANGELOG, a
+   `Changed` entry for `JournalError` becoming `#[non_exhaustive]`, and a
    status line on findings 1, 2 and 37 in the audit. The audit text stays
    as the record.
 
@@ -138,11 +172,15 @@ ordinary tests beside the code they cover.
   sequences 1 to 3 again is refused, the journal still holds a single 1
   to 3, and it recovers.
 - **journal, encoder:** a backward or repeated sequence is an error in
-  release builds too, including after `begin_segment`.
+  release builds too, including after `begin_segment`. An entry refused
+  for lack of space can then be encoded into a fresh destination.
+- **transport-core, shutdown drain:** a refused sequence stops the drain;
+  no later slot is encoded.
 - **server-runtime, wait helper:** with slots published and the journal
   stage held back, the helper does not return; once the stage runs, it
   returns the pair covering every published slot. It returns promptly on
-  `journal_failed`, shutdown and promotion.
+  `journal_failed`, shutdown and promotion, and a journal failure during
+  the wait reaches `handle_session_exit`'s `Fatal` arm.
 - **server-runtime, end to end:** the counter scenario from the audit
   (primary under `two-disks` plus one replica, increments 1, 2 and 4,
   restart the replica, restart the idle primary, promote the replica,
