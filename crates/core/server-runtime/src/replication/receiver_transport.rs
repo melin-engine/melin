@@ -741,9 +741,9 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     let mut last_committed_primary_seq: u64 = initial_sequence;
 
     // The session resume point covers this node's holdings (post-recovery
-    // journal, or the just-installed snapshot); `advance` (not a store) so
-    // a reconnect whose handshake read the journal before the ring settled
-    // cannot regress the tip below data already accepted.
+    // journal, the just-installed snapshot, or a live pipeline whose
+    // journal covers its ring); `advance` (not a store) so the tip never
+    // regresses below what an earlier session already advertised.
     journal_tip.advance(melin_transport_core::WireSeq::new(initial_sequence));
 
     let mut heard_from_primary = false;

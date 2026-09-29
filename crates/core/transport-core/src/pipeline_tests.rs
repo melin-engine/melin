@@ -31,7 +31,7 @@ use crate::cursors::{DurableWireSeqCursor, WireSeq};
 #[cfg(not(feature = "no-persist"))]
 use crate::journaled_app::JournaledApp;
 use crate::pipeline::StageWaits;
-#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[cfg(not(feature = "no-persist"))]
 use crate::pipeline::build_replica_pipeline;
 // Only the hash-chain mark tests touch these.
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
@@ -4215,5 +4215,100 @@ fn a_repeated_request_reaches_apply_on_live_replay_and_shadow() {
     assert_eq!(
         shadow, live,
         "the shadow's snapshot must apply every submission as live did"
+    );
+}
+
+/// A journal of `Add(1)` to `Add(last)`, recovered the way a restarting
+/// node recovers it: the (app, writer) pair a pipeline is then built
+/// around, and the chain hash recovery reports.
+#[cfg(not(feature = "no-persist"))]
+fn recovered_journal(path: &std::path::Path, last: u64) -> (TestApp, Writer, [u8; 32]) {
+    let mut writer = Writer::create(path).unwrap();
+    for seq in 1..=last {
+        writer
+            .encode_event(seq, 1_000 * seq, &JournalEvent::App(TestEvent::Add(seq)), 1)
+            .unwrap();
+    }
+    writer.flush_batch_sync().unwrap();
+    drop(writer);
+    let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), path).unwrap();
+    // Zero with `hash-chain` compiled out, as the pipeline publishes it.
+    let chain = engine.chain_hash().unwrap_or([0u8; 32]);
+    let (app, writer) = engine.into_parts();
+    (app, writer, chain)
+}
+
+/// Audit finding 1: a replica's reconnect handshake reads its pair from
+/// the fsync-state seqlock. Before the pipeline's first durable batch,
+/// that pair must already describe the journal the pipeline was built
+/// on, not a fresh replica at sequence 0 with a zero chain hash — a
+/// replica claiming that is streamed the whole history again.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn replica_fsync_state_is_seeded_from_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replica_seed.journal");
+    let (app, writer, chain) = recovered_journal(&path, 3);
+
+    let replica = build_replica_pipeline(
+        app,
+        writer,
+        MAX_JOURNAL_BATCH,
+        Duration::ZERO,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let state = replica.chain_hash_lock.load();
+    assert_eq!(
+        (state.journal_seq.get(), state.chain_hash),
+        (3, chain),
+        "the handshake pair before the first durable batch"
+    );
+    assert_eq!(
+        state.input_ring_seq.get(),
+        0,
+        "the seed covers no ring slot: nothing has been published yet"
+    );
+    assert_eq!(
+        replica.cursors.durable_wire_seq().load().get(),
+        3,
+        "the seqlock and the durable cursor start from the same position"
+    );
+}
+
+/// The primary's seqlock (present with shadow snapshots) starts from the
+/// same seed, so one type means one thing whichever builder made it.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn primary_fsync_state_is_seeded_from_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("primary_seed.journal");
+    let (app, writer, chain) = recovered_journal(&path, 3);
+
+    let primary = build_pipeline_with_replication(
+        app,
+        writer,
+        Duration::ZERO,
+        Arc::new(AtomicU64::new(0)),
+        false,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        true,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let state = primary
+        .chain_hash_lock
+        .expect("shadow snapshots enabled")
+        .load();
+    assert_eq!(
+        (
+            state.journal_seq.get(),
+            state.chain_hash,
+            state.input_ring_seq.get()
+        ),
+        (3, chain, 0)
     );
 }

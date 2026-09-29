@@ -384,22 +384,17 @@ pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
 ///
 /// Shared between the kernel-TCP and DPDK receivers; both build pipelines
 /// with the same shape (journal / matching / drain / optional shadow), and
-/// both refresh handshake state from `last_seq` + `chain_hash_lock` at
-/// reconnect time.
+/// both refresh handshake state from `chain_hash_lock` at reconnect time.
 pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     pub(super) input_producer: melin_pipeline::ring::Producer<InputSlot<A::Event>>,
     pub(super) journal_cursor: Arc<melin_pipeline::padding::Sequence>,
-    /// Highest wire seq durably persisted, published by JournalStage after
-    /// each fsync. Read by the orchestrator to fill in the reconnect
-    /// handshake without owning the writer. Typed so the handshake's resume
-    /// point can never be sourced from a ring-space counter (the adjacent
-    /// `journal_cursor` resets to ~0 every process start).
-    pub(super) last_seq: melin_transport_core::DurableWireSeqCursor,
     /// Seqlock-published fsync state (chain hash + journal seq + ring
-    /// cursor), read half. Option to mirror the primary-side pattern;
-    /// always Some on replicas now.
+    /// cursor), read half. The reconnect handshake takes its pair from
+    /// here, through [`wait_for_handshake_pair`]. Seeded from the writer
+    /// when the pipeline is built, so it is truthful before the first
+    /// durable batch.
     pub(super) chain_hash_lock:
-        Option<melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>>,
+        melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState>,
     /// Primary-announced rotation hand-off: the receiver thread pushes
     /// `Rotate` boundaries here (in stream order), the journal stage
     /// pops and rotates at exactly those sequences. Replicas have no
@@ -566,11 +561,7 @@ where
 
     let shadow_handle = if let Some(shadow_cons) = pipeline.shadow_consumer {
         let snap_path = snapshot_path;
-        let chain_lock = pipeline
-            .chain_hash_lock
-            .as_ref()
-            .expect("chain hash lock with shadow")
-            .clone();
+        let chain_lock = pipeline.chain_hash_lock.clone();
         let ps = Arc::clone(&pipeline_shutdown);
         let shadow = cores.shadow;
         Some(
@@ -598,7 +589,6 @@ where
     Ok(ReplicaPipelineHandles {
         input_producer: pipeline.input_producer,
         journal_cursor: pipeline.cursors.journal_ring_arc(),
-        last_seq: pipeline.cursors.durable_wire_seq(),
         chain_hash_lock: pipeline.chain_hash_lock,
         stream_marks,
         journal_failed,
@@ -717,6 +707,118 @@ where
     fence_state.observe_epoch(engine.recovered_epoch());
     let (app, writer) = engine.into_parts();
     Ok((Some(app), Some(writer), last, hash))
+}
+
+/// How long [`wait_for_handshake_pair`] waits before it says so in the
+/// log. A healthy replica journal covers the ring within one group-commit
+/// delay; this long means the local disk is stalled or far behind.
+const HANDSHAKE_WAIT_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Outcome of [`wait_for_handshake_pair`].
+pub(super) enum HandshakePair {
+    /// The pair to handshake with. It covers every slot the pipeline's
+    /// input ring holds, and all of it is durable.
+    Ready {
+        last_sequence: u64,
+        chain_hash: [u8; 32],
+    },
+    /// The journal stage died, so the pipeline can never cover its ring.
+    /// The caller routes [`journal_failed_while_disconnected`] through
+    /// [`handle_session_exit`].
+    JournalFailed,
+    /// Shutdown or promotion was requested while waiting. The reconnect
+    /// loop's own checks handle both; nothing is handshaked.
+    Interrupted,
+}
+
+/// Read the reconnect handshake pair from a live pipeline, once its
+/// journal covers everything the previous session published.
+///
+/// The pair must describe exactly what the replica holds, and all of it
+/// must be durable:
+///
+/// - The matching stage applies every slot in the input ring whether or
+///   not the journal has written it yet. A pair behind the ring makes
+///   the primary stream that tail again, and the replica applies it a
+///   second time. The contiguity gate cannot drop the re-delivery safely
+///   instead: after a failover the new primary's entries in that range
+///   can differ from the ones already applied, and only a handshake at
+///   the true position lets the primary's chain check catch the fork.
+/// - The primary seeds this replica's ack cursors from the handshake
+///   position, so a pair ahead of the disk would count entries as
+///   durable that are not.
+///
+/// So this waits until the published [`FsyncState`] reaches the input
+/// producer's cursor, then takes both values from that one load. The
+/// disk thread stores journal progress before the seqlock, which is why
+/// the check reads the seqlock's own ring position rather than the
+/// journal cursor.
+///
+/// A replica whose disk is stalled cannot reconnect until it catches up;
+/// it could not ack anything in that state either. The wait ends early
+/// on journal failure, shutdown and promotion, so it cannot wedge the
+/// reconnect loop.
+///
+/// [`FsyncState`]: melin_transport_core::pipeline::FsyncState
+pub(super) fn wait_for_handshake_pair<A: Application, W: Send + 'static>(
+    pipeline: &ReplicaPipelineHandles<A, W>,
+    shutdown: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
+) -> HandshakePair {
+    // The receiver thread that published into the ring has been joined,
+    // so the cursor is final for this wait.
+    let published = pipeline.input_producer.peek_cursor();
+    let started = std::time::Instant::now();
+    let mut warned = false;
+    loop {
+        let state = pipeline.chain_hash_lock.load();
+        if state.input_ring_seq.get() == published {
+            if warned {
+                tracing::info!(
+                    last_sequence = state.journal_seq.get(),
+                    waited_ms = started.elapsed().as_millis(),
+                    "replica journal caught up — reconnecting"
+                );
+            }
+            return HandshakePair::Ready {
+                last_sequence: state.journal_seq.get(),
+                chain_hash: state.chain_hash,
+            };
+        }
+        if pipeline.journal_failed.load(Ordering::Acquire) {
+            return HandshakePair::JournalFailed;
+        }
+        if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
+            return HandshakePair::Interrupted;
+        }
+        if !warned && started.elapsed() >= HANDSHAKE_WAIT_WARN_AFTER {
+            tracing::warn!(
+                durable_sequence = state.journal_seq.get(),
+                unjournaled_slots = published.saturating_sub(state.input_ring_seq.get()),
+                "replica journal has not caught up with the entries already received — \
+                 waiting before reconnecting"
+            );
+            warned = true;
+        }
+        // The reconnect path, not the hot path: a short sleep hands the
+        // CPU to the journal threads whatever the node's wait policy.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The session result a reconnect loop feeds to [`handle_session_exit`]
+/// when [`wait_for_handshake_pair`] finds the journal stage dead. Going
+/// through the `Fatal` arm, rather than returning an error directly,
+/// keeps a chain divergence detected while disconnected on the same
+/// in-process resync path as one detected mid-stream. Nothing was heard
+/// from a primary, so the backoff stays escalated.
+pub(in crate::replication) fn journal_failed_while_disconnected() -> StreamingResult {
+    StreamingResult {
+        exit: SessionExit::Fatal(
+            "replica journal stage failed while disconnected — tearing down for resync".into(),
+        ),
+        heard_from_primary: false,
+    }
 }
 
 /// Reconnect backoff cap shared by both receivers — exponential from
@@ -868,10 +970,10 @@ where
         SessionExit::StreamGap(e) => {
             // The primary's stream skipped past what we hold; the
             // contiguous prefix is committed and the journal stage keeps
-            // flushing it, so re-handshaking at the durable position
-            // (re-read from `FsyncState` at the top of the reconnect
-            // loop, after the backoff) lets the primary re-stream the
-            // hole. The primary evidently spoke, so the backoff resets
+            // flushing it, so re-handshaking once the journal covers
+            // that prefix (`wait_for_handshake_pair`, at the top of the
+            // reconnect loop, after the backoff) lets the primary
+            // re-stream the hole. The primary evidently spoke, so the backoff resets
             // exactly as a heard-from disconnect does. Not a resync:
             // nothing on disk is wrong.
             close();
@@ -2710,6 +2812,13 @@ mod tests {
         ));
     }
 
+    /// A fsync-state read half with no journal stage behind it: the
+    /// writer half is dropped, so it reports its initial value forever.
+    fn detached_fsync_state()
+    -> melin_pipeline::seqlock::SeqLockReader<melin_transport_core::pipeline::FsyncState> {
+        melin_pipeline::seqlock::split(melin_transport_core::pipeline::FsyncState::default()).1
+    }
+
     /// `ReplicaPipelineHandles` over a real input ring (one gate
     /// consumer) with immediately-returning stage threads — just enough
     /// structure for `teardown_replica_pipeline` to run for real. The
@@ -2728,10 +2837,7 @@ mod tests {
         let handles = ReplicaPipelineHandles {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
-            last_seq: melin_transport_core::DurableWireSeqCursor::detached(
-                melin_transport_core::WireSeq::new(0),
-            ),
-            chain_hash_lock: None,
+            chain_hash_lock: detached_fsync_state(),
             stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
@@ -2847,10 +2953,7 @@ mod tests {
         let handles = ReplicaPipelineHandles {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
-            last_seq: melin_transport_core::DurableWireSeqCursor::detached(
-                melin_transport_core::WireSeq::new(0),
-            ),
-            chain_hash_lock: None,
+            chain_hash_lock: detached_fsync_state(),
             stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
@@ -2901,6 +3004,241 @@ mod tests {
         if let Some(p) = pipeline.take() {
             let _ = teardown_replica_pipeline::<counter_server::Counter, Writer>(p);
         }
+    }
+
+    type CounterWriter = melin_journal::BufferedWriter<CounterEvent>;
+
+    /// A real replica pipeline over a fresh journal, whose journal stage
+    /// runs only once the returned sender fires (or is dropped): the
+    /// "local disk behind the ring" state `wait_for_handshake_pair` must
+    /// wait out. Every test releases it before teardown.
+    fn held_replica_pipeline(
+        dir: &std::path::Path,
+    ) -> (
+        ReplicaHandles<counter_server::Counter>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let writer = CounterWriter::create(&dir.join("held.journal")).expect("create journal");
+        let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
+            counter_server::Counter::default(),
+            writer,
+            4096,
+            std::time::Duration::ZERO,
+            melin_transport_core::pipeline::StageWaits::uniform(
+                melin_pipeline::wait::WaitStrategy::SpinThenYield,
+            ),
+            false,
+            Arc::new(melin_transport_core::fence::FenceState::new(0)),
+        );
+        let pipeline_shutdown = Arc::new(AtomicBool::new(false));
+        let sequencer = pipeline.journal_stage.start().expect("start journal stage");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let ps = Arc::clone(&pipeline_shutdown);
+        let journal_handle = std::thread::spawn(move || {
+            // A dropped sender releases the stage as well, so a test that
+            // fails before releasing it cannot wedge its own teardown.
+            let _ = released.recv();
+            sequencer.run(&ps)
+        });
+        let matching_stage = pipeline.matching_stage;
+        let ps = Arc::clone(&pipeline_shutdown);
+        let matching_handle = std::thread::spawn(move || matching_stage.run(&ps));
+        // Nothing reads the output ring: the few slots these tests
+        // publish fit in it.
+        drop(pipeline.drain_consumer);
+        let handles = ReplicaPipelineHandles {
+            input_producer: pipeline.input_producer,
+            journal_cursor: pipeline.cursors.journal_ring_arc(),
+            chain_hash_lock: pipeline.chain_hash_lock,
+            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            journal_failed: Arc::new(AtomicBool::new(false)),
+            pipeline_shutdown,
+            journal_handle,
+            matching_handle,
+            drain_handle: std::thread::spawn(|| {}),
+            shadow_handle: None,
+        };
+        (handles, release)
+    }
+
+    /// An increment as the replica receiver publishes it: stamped with
+    /// the primary's sequence.
+    fn increment_slot(sequence: u64) -> InputSlot {
+        InputSlot {
+            connection_id: 0,
+            key_hash: 1,
+            sequence,
+            timestamp_ns: sequence,
+            event: melin_journal::JournalEvent::App(CounterEvent::Increment { amount: 1 }),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        }
+    }
+
+    /// Audit finding 2: a session can end with slots in the input ring
+    /// that the journal has not written. The matching stage applies them
+    /// regardless, so the handshake must not claim less; and the primary
+    /// counts the claimed position as on the replica's disk, so it must
+    /// not claim what is not durable either. The wait returns only once
+    /// the durable pair covers every published slot.
+    #[test]
+    fn handshake_pair_waits_for_the_journal_to_cover_the_ring() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut handles, release) = held_replica_pipeline(dir.path());
+        let shutdown = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
+
+        // Nothing published: the seed covers the ring as it stands.
+        match wait_for_handshake_pair(&handles, &shutdown, &promote) {
+            HandshakePair::Ready { last_sequence, .. } => assert_eq!(last_sequence, 0),
+            _ => panic!("an empty ring is covered by the seed"),
+        }
+
+        for seq in 1..=3 {
+            handles.input_producer.publish(increment_slot(seq));
+        }
+        let (last_sequence, chain_hash) = std::thread::scope(|s| {
+            let waiter = s.spawn(|| wait_for_handshake_pair(&handles, &shutdown, &promote));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                !waiter.is_finished(),
+                "the handshake pair must wait while the journal is behind the ring"
+            );
+            release.send(()).expect("journal thread waiting");
+            match waiter.join().expect("waiter panicked") {
+                HandshakePair::Ready {
+                    last_sequence,
+                    chain_hash,
+                } => (last_sequence, chain_hash),
+                _ => panic!("the journal caught up; the wait must end with a pair"),
+            }
+        });
+        assert_eq!(last_sequence, 3, "the pair covers every published slot");
+
+        match teardown_replica_pipeline::<counter_server::Counter, CounterWriter>(handles) {
+            TeardownOutcome::Clean(_, writer) => {
+                assert_eq!(writer.next_sequence(), 4);
+                assert_eq!(
+                    chain_hash,
+                    writer.chain_hash().unwrap_or([0u8; 32]),
+                    "the pair's hash is the journal's chain at that sequence"
+                );
+            }
+            _ => panic!("expected a clean teardown"),
+        }
+    }
+
+    /// The wait cannot wedge the reconnect loop: a dead journal stage,
+    /// a shutdown and a promotion each end it, whatever the ring holds.
+    #[test]
+    fn handshake_pair_wait_ends_on_journal_failure_shutdown_and_promotion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut handles, release) = held_replica_pipeline(dir.path());
+        handles.input_producer.publish(increment_slot(1));
+        let shutdown = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
+
+        handles.journal_failed.store(true, Ordering::Release);
+        assert!(matches!(
+            wait_for_handshake_pair(&handles, &shutdown, &promote),
+            HandshakePair::JournalFailed
+        ));
+        handles.journal_failed.store(false, Ordering::Release);
+
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            wait_for_handshake_pair(&handles, &shutdown, &promote),
+            HandshakePair::Interrupted
+        ));
+        shutdown.store(false, Ordering::Relaxed);
+
+        assert!(promote.request(1), "promotion request accepted");
+        assert!(matches!(
+            wait_for_handshake_pair(&handles, &shutdown, &promote),
+            HandshakePair::Interrupted
+        ));
+
+        release.send(()).expect("journal thread waiting");
+        assert!(matches!(
+            teardown_replica_pipeline::<counter_server::Counter, CounterWriter>(handles),
+            TeardownOutcome::Clean(..)
+        ));
+    }
+
+    /// Run [`journal_failed_while_disconnected`] through
+    /// `handle_session_exit` over a pipeline whose journal stage exited
+    /// with `error`, as the reconnect loop does when the wait finds the
+    /// stage dead.
+    fn exit_after_journal_failure(
+        error: melin_journal::JournalError,
+    ) -> (AfterSession<counter_server::Counter, CounterWriter>, u32) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (input_producer, mut consumers) =
+            melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(4)
+                .add_consumer()
+                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+        let _consumer = consumers.pop().expect("one consumer");
+        let handles = ReplicaPipelineHandles {
+            input_producer,
+            journal_cursor: Arc::new(make_journal_cursor(0)),
+            chain_hash_lock: detached_fsync_state(),
+            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            journal_failed: Arc::new(AtomicBool::new(true)),
+            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
+            journal_handle: std::thread::spawn(move || -> Result<CounterWriter, _> { Err(error) }),
+            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            drain_handle: std::thread::spawn(|| {}),
+            shadow_handle: None,
+        };
+        let mut pipeline = Some(handles);
+        let mut divergence_resyncs = 0u32;
+        let mut backoff = MAX_BACKOFF;
+        let shutdown = AtomicBool::new(false);
+        let promote = crate::promotion::PromotionRequest::new();
+        let after = handle_session_exit::<counter_server::Counter, CounterWriter>(
+            journal_failed_while_disconnected(),
+            &mut pipeline,
+            &mut divergence_resyncs,
+            &mut backoff,
+            0,
+            &dir.path().join("r.journal"),
+            &dir.path().join("r.snapshot"),
+            &melin_transport_core::fence::FenceState::new(0),
+            &shutdown,
+            &promote,
+            || {},
+            &(),
+        );
+        assert!(pipeline.is_none(), "the dead pipeline is torn down");
+        (after, divergence_resyncs)
+    }
+
+    /// A chain divergence the journal stage reports while the replica is
+    /// disconnected must take the same in-process resync as one reported
+    /// mid-stream; any other journal failure stops the process, as it
+    /// does mid-stream.
+    #[test]
+    fn journal_failure_while_disconnected_takes_the_fatal_arm() {
+        let (after, resyncs) =
+            exit_after_journal_failure(melin_journal::JournalError::ReplicaChainDivergence {
+                sequence: 7,
+                expected: [1u8; 32],
+                actual: [2u8; 32],
+            });
+        assert!(
+            matches!(after, AfterSession::Resync { .. }),
+            "a divergence found while disconnected is repaired in-process"
+        );
+        assert_eq!(resyncs, 1);
+
+        let (after, resyncs) = exit_after_journal_failure(melin_journal::JournalError::Io(
+            std::io::Error::other("disk gone"),
+        ));
+        assert!(
+            matches!(after, AfterSession::Return(Err(_))),
+            "any other journal failure stops the replica"
+        );
+        assert_eq!(resyncs, 0);
     }
 
     /// With the journal-failure latch set and the ring full — the state

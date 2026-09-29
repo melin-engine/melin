@@ -27,10 +27,11 @@ use super::receiver_transport::{
 };
 use super::validation_worker::ValidationWorker;
 use super::{
-    AfterSession, ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles,
-    ReplicationMetrics, ResyncDecision, SentHighWater, build_replica_pipeline_with_threads,
-    handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_then_double_backoff,
-    take_pipeline_for_promotion, teardown_replica_pipeline,
+    AfterSession, HandshakePair, ReceiverResult, ReplicaCursors, ReplicaGate,
+    ReplicaPipelineHandles, ReplicationMetrics, ResyncDecision, SentHighWater,
+    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
+    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
+    take_pipeline_for_promotion, teardown_replica_pipeline, wait_for_handshake_pair,
 };
 use melin_app::auth::AuthorizedKeys;
 use melin_transport_core::replication::catchup::{
@@ -1195,19 +1196,51 @@ where
         // driver may auto-promote from here on if it wins an election.
         primary_link_up.store(false, Ordering::Release);
 
-        // Refresh handshake state from the running pipeline, if any.
-        // The (last_sequence, chain_hash) pair must come from ONE
-        // FsyncState snapshot — a torn pair read from two sources while
-        // the journal stage keeps flushing trips the primary's
-        // handshake chain validation (false divergence; see the
-        // kernel-TCP receiver).
+        // Refresh handshake state from the running pipeline, if any, once
+        // its journal covers everything the previous session published
+        // (see `wait_for_handshake_pair` and the kernel-TCP receiver).
         if let Some(p) = pipeline.as_ref() {
-            if let Some(ref lock) = p.chain_hash_lock {
-                let fsync_state = lock.load();
-                last_sequence = fsync_state.journal_seq.get();
-                chain_hash = fsync_state.chain_hash;
-            } else {
-                last_sequence = p.last_seq.load().get();
+            match wait_for_handshake_pair(p, shutdown, promote) {
+                HandshakePair::Ready {
+                    last_sequence: seq,
+                    chain_hash: hash,
+                } => {
+                    last_sequence = seq;
+                    chain_hash = hash;
+                }
+                // The shutdown and promotion checks below take it from here.
+                HandshakePair::Interrupted => {}
+                HandshakePair::JournalFailed => match handle_session_exit(
+                    journal_failed_while_disconnected(),
+                    &mut pipeline,
+                    &mut divergence_resyncs,
+                    &mut backoff,
+                    last_sequence,
+                    journal_path,
+                    &snapshot_path,
+                    &fence_state,
+                    shutdown,
+                    promote,
+                    // The previous session's socket was closed when it
+                    // ended; no new one is open yet.
+                    || {},
+                    sizing,
+                ) {
+                    AfterSession::Return(r) => return r,
+                    AfterSession::Resync {
+                        app: ex,
+                        journal_writer: wr,
+                        last_sequence: seq,
+                        chain_hash: hash,
+                    } => {
+                        app = ex;
+                        journal_writer = wr;
+                        last_sequence = seq;
+                        chain_hash = hash;
+                        continue;
+                    }
+                    AfterSession::Reconnect => {}
+                },
             }
         }
 
