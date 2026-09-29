@@ -765,12 +765,20 @@ pub(super) fn wait_for_handshake_pair<A: Application, W: Send + 'static>(
     shutdown: &AtomicBool,
     promote: &crate::promotion::PromotionRequest,
 ) -> HandshakePair {
-    // The receiver thread that published into the ring has been joined,
-    // so the cursor is final for this wait.
+    // Only a streaming session publishes into the ring, and the previous
+    // one has ended (kernel TCP joined its thread; DPDK ran it on this
+    // one), so the cursor is final for this wait.
     let published = pipeline.input_producer.peek_cursor();
     let started = std::time::Instant::now();
     let mut warned = false;
     loop {
+        // First, even when the ring is covered: a stage that died after
+        // its last durable batch would otherwise hand out a ready pair,
+        // and the loop would dial the primary and hold one of its replica
+        // slots only for the session to fail on its first iteration.
+        if pipeline.journal_failed.load(Ordering::Acquire) {
+            return HandshakePair::JournalFailed;
+        }
         let state = pipeline.chain_hash_lock.load();
         if state.input_ring_seq.get() == published {
             if warned {
@@ -784,9 +792,6 @@ pub(super) fn wait_for_handshake_pair<A: Application, W: Send + 'static>(
                 last_sequence: state.journal_seq.get(),
                 chain_hash: state.chain_hash,
             };
-        }
-        if pipeline.journal_failed.load(Ordering::Acquire) {
-            return HandshakePair::JournalFailed;
         }
         if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
             return HandshakePair::Interrupted;
@@ -3130,15 +3135,23 @@ mod tests {
 
     /// The wait cannot wedge the reconnect loop: a dead journal stage,
     /// a shutdown and a promotion each end it, whatever the ring holds.
+    /// A dead stage wins even over a covered ring, so the loop tears the
+    /// pipeline down instead of dialing the primary with it.
     #[test]
     fn handshake_pair_wait_ends_on_journal_failure_shutdown_and_promotion() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut handles, release) = held_replica_pipeline(dir.path());
-        handles.input_producer.publish(increment_slot(1));
         let shutdown = AtomicBool::new(false);
         let promote = crate::promotion::PromotionRequest::new();
 
+        // Nothing published: the seed covers the ring, yet the stage is dead.
         handles.journal_failed.store(true, Ordering::Release);
+        assert!(matches!(
+            wait_for_handshake_pair(&handles, &shutdown, &promote),
+            HandshakePair::JournalFailed
+        ));
+
+        handles.input_producer.publish(increment_slot(1));
         assert!(matches!(
             wait_for_handshake_pair(&handles, &shutdown, &promote),
             HandshakePair::JournalFailed
