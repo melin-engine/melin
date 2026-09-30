@@ -22,10 +22,9 @@ use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
 use super::{
-    AfterSession, HandshakePair, ReplicaPipelineHandles, ResyncDecision,
-    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
-    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
-    take_pipeline_for_promotion, teardown_replica_pipeline, wait_for_handshake_pair,
+    AfterSession, ReplicaPipelineHandles, ResyncDecision, build_replica_pipeline_with_threads,
+    handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_then_double_backoff,
+    take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_transport_core::replication::protocol::{
@@ -613,55 +612,6 @@ where
         // driver may auto-promote from here on if it wins an election.
         primary_link_up.store(false, Ordering::Release);
 
-        // A live pipeline carries over from the previous session: the
-        // handshake pair comes from it, once its journal covers
-        // everything that session published (see
-        // `wait_for_handshake_pair`). With no pipeline the pair is the
-        // one recovery or the resync just produced.
-        if let Some(p) = pipeline.as_ref() {
-            match wait_for_handshake_pair(p, shutdown, promote) {
-                HandshakePair::Ready {
-                    last_sequence: seq,
-                    chain_hash: hash,
-                } => {
-                    last_sequence = seq;
-                    chain_hash = hash;
-                }
-                // The shutdown and promotion checks below take it from here.
-                HandshakePair::Interrupted => {}
-                HandshakePair::JournalFailed => match handle_session_exit(
-                    journal_failed_while_disconnected(),
-                    &mut pipeline,
-                    &mut divergence_resyncs,
-                    &mut backoff,
-                    last_sequence,
-                    journal_path,
-                    &snapshot_path,
-                    &fence_state,
-                    shutdown,
-                    promote,
-                    // No session is open, so there is nothing to close.
-                    || {},
-                    sizing,
-                ) {
-                    AfterSession::Return(r) => return r,
-                    AfterSession::Resync {
-                        app: ex,
-                        journal_writer: wr,
-                        last_sequence: seq,
-                        chain_hash: hash,
-                    } => {
-                        app = ex;
-                        journal_writer = wr;
-                        last_sequence = seq;
-                        chain_hash = hash;
-                        continue;
-                    }
-                    AfterSession::Reconnect => {}
-                },
-            }
-        }
-
         // Sole authority for shutdown/promote while disconnected: every
         // backoff arm just sleeps (the sleep observes both flags) and
         // continues back here, so teardown/promotion handling exists
@@ -940,10 +890,15 @@ where
             &fence_state,
             shutdown,
             promote,
-            // Kernel TCP needs no explicit close — the `TcpStream` is
-            // dropped on the next loop turn when a fresh connection
-            // replaces it.
-            || {},
+            // The `TcpStream` would only be dropped on the next loop
+            // turn, after the backoff and the wait for the journal. Shut
+            // it down now so a primary whose connection is still up (a
+            // stream gap) frees our slot at once.
+            || {
+                // Best effort: the socket is usually dead already, and
+                // the drop on the next turn closes it regardless.
+                let _ = tcp_writer.shutdown(std::net::Shutdown::Both);
+            },
             sizing,
         ) {
             AfterSession::Return(r) => return r,
@@ -959,7 +914,14 @@ where
                 chain_hash = hash;
                 continue;
             }
-            AfterSession::Reconnect => {}
+            AfterSession::Reconnect(resume) => {
+                // `None` keeps the current pair: shutdown or promotion
+                // cut the wait short, and the loop top acts on both.
+                if let Some(point) = resume {
+                    last_sequence = point.last_sequence;
+                    chain_hash = point.chain_hash;
+                }
+            }
         }
     }
 }

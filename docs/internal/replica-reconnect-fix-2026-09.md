@@ -143,14 +143,16 @@ Each step lands as its own commit with its tests.
      `ReplicaPipelineHandles`, and delete the dead fallback in both
      receivers. Drop the handles' `last_seq` field if nothing else reads
      it.
-   - Add one shared helper in `replication/mod.rs` that waits for
-     coverage and returns the pair, and call it from both receivers'
-     reconnect loops. On `journal_failed` it does not handshake with a
-     dead pipeline: the loop feeds a synthetic `StreamingResult` with
-     `exit: Fatal` and `heard_from_primary: false` into
-     `handle_session_exit`. Only that arm inspects the teardown outcome,
-     so a `ReplicaChainDivergence` that lands while disconnected still
-     takes the in-process resync.
+   - Add one helper in `replication/mod.rs` that waits for coverage and
+     returns the pair, and run it inside `handle_session_exit`'s two
+     reconnecting arms (`Disconnected` and `StreamGap`), after the
+     backoff: they are the only exits that keep the pipeline, and
+     nothing publishes into its ring until the next session, so the
+     pair stays exact across failed connects. `AfterSession::Reconnect`
+     carries it back to the receiver. A journal stage found dead while
+     waiting takes the same teardown as the `Fatal` arm (one shared
+     function), so a `ReplicaChainDivergence` that lands while
+     disconnected still takes the in-process resync.
    - Update the comments that say a reconnect resumes "from the durable
      position" (`handle_session_exit`'s `StreamGap` arm among them).
 2. **Release-mode sequence enforcement** (decisions 3 and 4). Tests

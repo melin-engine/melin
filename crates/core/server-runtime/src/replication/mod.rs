@@ -714,17 +714,20 @@ where
 /// delay; this long means the local disk is stalled or far behind.
 const HANDSHAKE_WAIT_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The reconnect handshake pair: the highest sequence the replica holds,
+/// and its journal's chain hash at that sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ResumePoint {
+    pub(super) last_sequence: u64,
+    pub(super) chain_hash: [u8; 32],
+}
+
 /// Outcome of [`wait_for_handshake_pair`].
-pub(super) enum HandshakePair {
+enum HandshakePair {
     /// The pair to handshake with. It covers every slot the pipeline's
     /// input ring holds, and all of it is durable.
-    Ready {
-        last_sequence: u64,
-        chain_hash: [u8; 32],
-    },
+    Ready(ResumePoint),
     /// The journal stage died, so the pipeline can never cover its ring.
-    /// The caller routes [`journal_failed_while_disconnected`] through
-    /// [`handle_session_exit`].
     JournalFailed,
     /// Shutdown or promotion was requested while waiting. The reconnect
     /// loop's own checks handle both; nothing is handshaked.
@@ -760,7 +763,7 @@ pub(super) enum HandshakePair {
 /// reconnect loop.
 ///
 /// [`FsyncState`]: melin_transport_core::pipeline::FsyncState
-pub(super) fn wait_for_handshake_pair<A: Application, W: Send + 'static>(
+fn wait_for_handshake_pair<A: Application, W: Send + 'static>(
     pipeline: &ReplicaPipelineHandles<A, W>,
     shutdown: &AtomicBool,
     promote: &crate::promotion::PromotionRequest,
@@ -795,10 +798,10 @@ pub(super) fn wait_for_handshake_pair<A: Application, W: Send + 'static>(
                     "replica journal caught up — reconnecting"
                 );
             }
-            return HandshakePair::Ready {
+            return HandshakePair::Ready(ResumePoint {
                 last_sequence: state.journal_seq.get(),
                 chain_hash: state.chain_hash,
-            };
+            });
         }
         if shutdown.load(Ordering::Relaxed) || promote.is_requested() {
             return HandshakePair::Interrupted;
@@ -818,19 +821,6 @@ pub(super) fn wait_for_handshake_pair<A: Application, W: Send + 'static>(
     }
 }
 
-/// The session result a reconnect loop feeds to [`handle_session_exit`]
-/// when [`wait_for_handshake_pair`] finds the journal stage dead. Going
-/// through the `Fatal` arm, rather than returning an error directly,
-/// keeps a chain divergence detected while disconnected on the same
-/// in-process resync path as one detected mid-stream. Nothing was heard
-/// from a primary, so the backoff stays escalated.
-pub(in crate::replication) fn journal_failed_while_disconnected() -> StreamingResult {
-    StreamingResult {
-        exit: SessionExit::Fatal("replica journal stage failed while disconnected".into()),
-        heard_from_primary: false,
-    }
-}
-
 /// Reconnect backoff cap shared by both receivers — exponential from
 /// 1 s, clamped here so a long outage settles to one attempt every 30 s
 /// without hammering a flapping primary. Reset to 1 s only when a
@@ -846,10 +836,10 @@ pub(in crate::replication) enum AfterSession<A, W> {
     /// (`Ok(None)`), a promotion hand-off (`Ok(Some(state))`), or a
     /// fatal error.
     Return(ReceiverResult<A, W>),
-    /// A mid-stream divergence was repaired in-process: the recovered
-    /// on-disk state is the new handshake position. The caller adopts it
-    /// and reconnects; the primary's `HashMismatch` verdict then routes
-    /// the replica through archive + re-seed.
+    /// A chain divergence was repaired in-process: the recovered on-disk
+    /// state is the new handshake position. The caller adopts it and
+    /// reconnects; the primary's `HashMismatch` verdict then routes the
+    /// replica through archive + re-seed.
     Resync {
         app: Option<A>,
         journal_writer: Option<W>,
@@ -858,8 +848,11 @@ pub(in crate::replication) enum AfterSession<A, W> {
     },
     /// A plain disconnect or a stream contiguity break — backoff has
     /// already been applied (and the flags checked); the caller
-    /// reconnects, reusing the still-live pipeline.
-    Reconnect,
+    /// reconnects, reusing the still-live pipeline, from this resume
+    /// point. `None` keeps the caller's current pair: there is no
+    /// pipeline, or shutdown or promotion cut the wait short, and the
+    /// reconnect loop's own checks act on those before any handshake.
+    Reconnect(Option<ResumePoint>),
 }
 
 /// Dispatch a finished streaming session — shared by the kernel-TCP and
@@ -869,17 +862,20 @@ pub(in crate::replication) enum AfterSession<A, W> {
 /// receiver loops (and had drifted — the copies reset the post-resync
 /// writer differently, a latent corruption bug): the
 /// `Shutdown`/`Promote`/`Fatal` teardown (including the once-per-process
-/// in-process divergence-resync policy) and the `Disconnected` reconnect
-/// backoff. The shutdown-sentinel publish lives in
-/// [`teardown_replica_pipeline`].
+/// in-process divergence-resync policy), the `Disconnected` reconnect
+/// backoff, and the wait for the pair the next handshake claims (see
+/// [`reconnect_from_live_pipeline`]). The shutdown-sentinel publish
+/// lives in [`teardown_replica_pipeline`].
 ///
 /// `close` runs any transport-specific teardown that must precede a
 /// reconnect — the DPDK receiver closes its smoltcp socket so the
 /// primary's slot and the local socket-set entry are freed; the
-/// kernel-TCP receiver passes a no-op (its `TcpStream` is dropped by the
-/// caller on the next loop turn). It is invoked only on the
-/// reconnecting paths (in-process resync, plain disconnect, stream
-/// gap), never on a terminal return.
+/// kernel-TCP receiver shuts its socket down for the same reason (its
+/// `TcpStream` is only dropped on the next loop turn, after the backoff
+/// and the wait). It is invoked on the reconnecting
+/// exits (plain disconnect, stream gap) before their backoff, and on a
+/// fatal exit only when it resyncs in-process; never on shutdown or
+/// promotion.
 // Twelve arguments is a lot, but each is a distinct piece of the
 // receiver loop's state; bundling them would only move the noise.
 #[allow(clippy::too_many_arguments)]
@@ -925,64 +921,28 @@ where
         }),
 
         SessionExit::Fatal(e) => {
-            let outcome = match pipeline.take() {
-                Some(p) => teardown_replica_pipeline::<A, W>(p),
-                // Fatal implies a streaming session, which implies a
-                // pipeline — but don't turn a missing one into a resync.
-                None => return AfterSession::Return(Err(e)),
-            };
-            // Mid-stream chain divergence is repairable in-process: the
-            // on-disk journal is self-consistent (merely forked from the
-            // primary's history), so re-derive the handshake state from
-            // disk and reconnect — the primary judges the recovered
-            // position divergent and the next session takes the
-            // HashMismatch → archive → reseed path, no restart needed.
-            // Every other fatal exits as before: protocol violations and
-            // journal I/O death (ENOSPC, RO-FS) would fail the same way
-            // after a resync.
-            let TeardownOutcome::JournalFailed(
-                je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
-            ) = outcome
-            else {
-                return AfterSession::Return(Err(e));
-            };
-
-            *divergence_resyncs += 1;
-            let attempt = *divergence_resyncs;
-            if attempt > MAX_INPROCESS_DIVERGENCE_RESYNCS {
-                return AfterSession::Return(Err(format!(
-                    "mid-stream chain divergence recurred {attempt} times — giving up on \
-                     in-process resync (each cycle archives the local journal and re-seeds \
-                     from the primary; recurrence at this rate means the primary keeps \
-                     streaming history that forks from what it announces): {je}"
-                )
-                .into()));
-            }
-            tracing::warn!(
-                error = %je,
-                attempt,
-                max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
-                "mid-stream chain divergence — re-deriving local state for in-process resync"
+            let after = teardown_after_fatal(
+                e,
+                pipeline,
+                divergence_resyncs,
+                journal_path,
+                snapshot_path,
+                fence_state,
+                sizing,
             );
-            // Transport-specific teardown before reconnecting.
-            close();
-            match recover_replica_state::<A, W>(journal_path, snapshot_path, fence_state, sizing) {
-                Ok((app, journal_writer, seq, hash)) => AfterSession::Resync {
-                    app,
-                    journal_writer,
-                    last_sequence: seq,
-                    chain_hash: hash,
-                },
-                Err(e) => AfterSession::Return(Err(e)),
+            // Transport-specific teardown, only when the loop goes on to
+            // reconnect.
+            if matches!(after, AfterSession::Resync { .. }) {
+                close();
             }
+            after
         }
 
         SessionExit::StreamGap(e) => {
             // The primary's stream skipped past what we hold; the
             // contiguous prefix is committed and the journal stage keeps
             // flushing it, so re-handshaking once the journal covers
-            // that prefix (`wait_for_handshake_pair`, at the top of the
-            // reconnect loop, after the backoff) lets the primary
+            // that prefix (below, after the backoff) lets the primary
             // re-stream the hole. The primary evidently spoke, so the
             // backoff resets exactly as a heard-from disconnect does.
             // Not a resync: nothing on disk is wrong.
@@ -994,7 +954,16 @@ where
                 "replication stream broke contiguity — reconnecting from the durable position"
             );
             sleep_then_double_backoff(backoff, shutdown, promote);
-            AfterSession::Reconnect
+            reconnect_from_live_pipeline(
+                pipeline,
+                divergence_resyncs,
+                journal_path,
+                snapshot_path,
+                fence_state,
+                shutdown,
+                promote,
+                sizing,
+            )
         }
 
         SessionExit::Disconnected => {
@@ -1019,8 +988,130 @@ where
                 "reconnecting to primary"
             );
             sleep_then_double_backoff(backoff, shutdown, promote);
-            AfterSession::Reconnect
+            reconnect_from_live_pipeline(
+                pipeline,
+                divergence_resyncs,
+                journal_path,
+                snapshot_path,
+                fence_state,
+                shutdown,
+                promote,
+                sizing,
+            )
         }
+    }
+}
+
+/// Tear the pipeline down after a fatal session exit, and decide whether
+/// the replica can repair itself in-process.
+///
+/// A chain divergence is repairable: the on-disk journal is
+/// self-consistent (merely forked from the primary's history), so this
+/// re-derives the handshake state from disk and the caller reconnects —
+/// the primary judges the recovered position divergent and the next
+/// session takes the HashMismatch → archive → reseed path, no restart
+/// needed. Every other fatal is terminal: protocol violations and
+/// journal I/O death (ENOSPC, RO-FS) would fail the same way after a
+/// resync.
+fn teardown_after_fatal<A, W>(
+    error: Box<dyn std::error::Error + Send + Sync>,
+    pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
+    divergence_resyncs: &mut u32,
+    journal_path: &std::path::Path,
+    snapshot_path: &std::path::Path,
+    fence_state: &melin_transport_core::fence::FenceState,
+    sizing: &A::Sizing,
+) -> AfterSession<A, W>
+where
+    A: Application + Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+{
+    let outcome = match pipeline.take() {
+        Some(p) => teardown_replica_pipeline::<A, W>(p),
+        // Fatal implies a streaming session, which implies a
+        // pipeline — but don't turn a missing one into a resync.
+        None => return AfterSession::Return(Err(error)),
+    };
+    let TeardownOutcome::JournalFailed(
+        je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
+    ) = outcome
+    else {
+        return AfterSession::Return(Err(error));
+    };
+
+    *divergence_resyncs += 1;
+    let attempt = *divergence_resyncs;
+    if attempt > MAX_INPROCESS_DIVERGENCE_RESYNCS {
+        return AfterSession::Return(Err(format!(
+            "chain divergence recurred {attempt} times — giving up on in-process resync \
+             (each cycle archives the local journal and re-seeds from the primary; \
+             recurrence at this rate means the primary keeps streaming history that forks \
+             from what it announces): {je}"
+        )
+        .into()));
+    }
+    tracing::warn!(
+        error = %je,
+        attempt,
+        max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
+        "chain divergence — re-deriving local state for in-process resync"
+    );
+    match recover_replica_state::<A, W>(journal_path, snapshot_path, fence_state, sizing) {
+        Ok((app, journal_writer, seq, hash)) => AfterSession::Resync {
+            app,
+            journal_writer,
+            last_sequence: seq,
+            chain_hash: hash,
+        },
+        Err(e) => AfterSession::Return(Err(e)),
+    }
+}
+
+/// End a reconnecting session exit: once the live pipeline's journal
+/// covers everything the session published, reconnect from that pair
+/// (see [`wait_for_handshake_pair`]).
+///
+/// This is the place for the wait because only these exits keep the
+/// pipeline, and between them and the next session nothing publishes
+/// into its ring: a failed connect or a refused handshake loops round
+/// without streaming, so the pair stays exact until the next session.
+///
+/// A journal stage found dead while waiting takes the same teardown as
+/// one failing mid-stream, so a chain divergence detected while
+/// disconnected is repaired in-process too. The caller has already
+/// closed the transport.
+// One argument per piece of receiver-loop state the fatal teardown may
+// need, as for `handle_session_exit`.
+#[allow(clippy::too_many_arguments)]
+fn reconnect_from_live_pipeline<A, W>(
+    pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
+    divergence_resyncs: &mut u32,
+    journal_path: &std::path::Path,
+    snapshot_path: &std::path::Path,
+    fence_state: &melin_transport_core::fence::FenceState,
+    shutdown: &AtomicBool,
+    promote: &crate::promotion::PromotionRequest,
+    sizing: &A::Sizing,
+) -> AfterSession<A, W>
+where
+    A: Application + Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+{
+    let Some(p) = pipeline.as_ref() else {
+        return AfterSession::Reconnect(None);
+    };
+    match wait_for_handshake_pair(p, shutdown, promote) {
+        HandshakePair::Ready(point) => AfterSession::Reconnect(Some(point)),
+        HandshakePair::Interrupted => AfterSession::Reconnect(None),
+        HandshakePair::JournalFailed => teardown_after_fatal(
+            "replica journal stage failed while disconnected".into(),
+            pipeline,
+            divergence_resyncs,
+            journal_path,
+            snapshot_path,
+            fence_state,
+            sizing,
+        ),
     }
 }
 
@@ -2912,7 +3003,7 @@ mod tests {
             || {},
             &(),
         );
-        assert!(matches!(after, AfterSession::Reconnect));
+        assert!(matches!(after, AfterSession::Reconnect(None)));
         backoff
     }
 
@@ -2960,14 +3051,23 @@ mod tests {
                 .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
         let _consumer = consumers.pop().expect("one consumer");
         let writer_path = dir.path().join("w.journal");
+        let pipeline_shutdown = Arc::new(AtomicBool::new(false));
+        let ps = Arc::clone(&pipeline_shutdown);
         let handles = ReplicaPipelineHandles {
             input_producer,
             journal_cursor: Arc::new(make_journal_cursor(0)),
             chain_hash_lock: detached_fsync_state(),
             stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             journal_failed: Arc::new(AtomicBool::new(false)),
-            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
-            journal_handle: std::thread::spawn(move || Writer::create(&writer_path)),
+            pipeline_shutdown,
+            // Alive until teardown, as a real journal stage is: the
+            // reconnect's wait reads a finished journal thread as dead.
+            journal_handle: std::thread::spawn(move || {
+                while !ps.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Writer::create(&writer_path)
+            }),
             matching_handle: std::thread::spawn(counter_server::Counter::default),
             drain_handle: std::thread::spawn(|| {}),
             shadow_handle: None,
@@ -2996,9 +3096,16 @@ mod tests {
             || closed = true,
             &(),
         );
-        assert!(
-            matches!(after, AfterSession::Reconnect),
-            "a stream gap must reconnect, not return an error"
+        assert_eq!(
+            match after {
+                AfterSession::Reconnect(resume) => resume,
+                _ => panic!("a stream gap must reconnect, not return an error"),
+            },
+            Some(ResumePoint {
+                last_sequence: 0,
+                chain_hash: [0u8; 32],
+            }),
+            "the reconnect resumes from the pipeline's covering pair"
         );
         assert!(
             pipeline.is_some(),
@@ -3100,7 +3207,7 @@ mod tests {
 
         // Nothing published: the seed covers the ring as it stands.
         match wait_for_handshake_pair(&handles, &shutdown, &promote) {
-            HandshakePair::Ready { last_sequence, .. } => assert_eq!(last_sequence, 0),
+            HandshakePair::Ready(point) => assert_eq!(point.last_sequence, 0),
             _ => panic!("an empty ring is covered by the seed"),
         }
 
@@ -3116,10 +3223,7 @@ mod tests {
             );
             release.send(()).expect("journal thread waiting");
             match waiter.join().expect("waiter panicked") {
-                HandshakePair::Ready {
-                    last_sequence,
-                    chain_hash,
-                } => (last_sequence, chain_hash),
+                HandshakePair::Ready(point) => (point.last_sequence, point.chain_hash),
                 _ => panic!("the journal caught up; the wait must end with a pair"),
             }
         });
@@ -3228,13 +3332,17 @@ mod tests {
         ));
     }
 
-    /// Run [`journal_failed_while_disconnected`] through
-    /// `handle_session_exit` over a pipeline whose journal stage exited
-    /// with `error`, as the reconnect loop does when the wait finds the
-    /// stage dead.
+    /// End a session with a plain disconnect over a pipeline whose journal
+    /// stage exited with `error`, so the reconnect's wait finds the stage
+    /// dead. Returns the dispatch, the divergence-resync count, and how
+    /// many times the transport was closed.
     fn exit_after_journal_failure(
         error: melin_journal::JournalError,
-    ) -> (AfterSession<counter_server::Counter, CounterWriter>, u32) {
+    ) -> (
+        AfterSession<counter_server::Counter, CounterWriter>,
+        u32,
+        u32,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let (input_producer, mut consumers) =
             melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(4)
@@ -3256,10 +3364,16 @@ mod tests {
         let mut pipeline = Some(handles);
         let mut divergence_resyncs = 0u32;
         let mut backoff = MAX_BACKOFF;
-        let shutdown = AtomicBool::new(false);
+        // Latched so the backoff sleep returns at once; the wait still
+        // checks the journal before the flags.
+        let shutdown = AtomicBool::new(true);
         let promote = crate::promotion::PromotionRequest::new();
+        let mut closes = 0u32;
         let after = handle_session_exit::<counter_server::Counter, CounterWriter>(
-            journal_failed_while_disconnected(),
+            StreamingResult {
+                exit: SessionExit::Disconnected,
+                heard_from_primary: false,
+            },
             &mut pipeline,
             &mut divergence_resyncs,
             &mut backoff,
@@ -3269,20 +3383,21 @@ mod tests {
             &melin_transport_core::fence::FenceState::new(0),
             &shutdown,
             &promote,
-            || {},
+            || closes += 1,
             &(),
         );
         assert!(pipeline.is_none(), "the dead pipeline is torn down");
-        (after, divergence_resyncs)
+        (after, divergence_resyncs, closes)
     }
 
     /// A chain divergence the journal stage reports while the replica is
     /// disconnected must take the same in-process resync as one reported
     /// mid-stream; any other journal failure stops the process, as it
-    /// does mid-stream.
+    /// does mid-stream. Either way the transport is closed exactly once,
+    /// by the disconnect itself.
     #[test]
-    fn journal_failure_while_disconnected_takes_the_fatal_arm() {
-        let (after, resyncs) =
+    fn journal_failure_found_by_the_reconnect_wait_takes_the_fatal_path() {
+        let (after, resyncs, closes) =
             exit_after_journal_failure(melin_journal::JournalError::ReplicaChainDivergence {
                 sequence: 7,
                 expected: [1u8; 32],
@@ -3292,16 +3407,16 @@ mod tests {
             matches!(after, AfterSession::Resync { .. }),
             "a divergence found while disconnected is repaired in-process"
         );
-        assert_eq!(resyncs, 1);
+        assert_eq!((resyncs, closes), (1, 1));
 
-        let (after, resyncs) = exit_after_journal_failure(melin_journal::JournalError::Io(
+        let (after, resyncs, closes) = exit_after_journal_failure(melin_journal::JournalError::Io(
             std::io::Error::other("disk gone"),
         ));
         assert!(
             matches!(after, AfterSession::Return(Err(_))),
             "any other journal failure stops the replica"
         );
-        assert_eq!(resyncs, 0);
+        assert_eq!((resyncs, closes), (0, 1));
     }
 
     /// With the journal-failure latch set and the ring full — the state
