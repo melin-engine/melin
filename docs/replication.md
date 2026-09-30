@@ -251,8 +251,13 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
 - Does not accept client connections.
 
 If the primary disconnects or evicts the replica, the receiver
-reconnects with exponential backoff (1 s → 30 s cap), recovers its own
-state on its own journal, and resumes from its last durable sequence.
+reconnects with exponential backoff (1 s → 30 s cap), keeping the state
+it already holds. Before each reconnect it waits until its own journal
+holds everything it had received, then resumes from there: never behind
+what it has applied, and never claiming an entry that is not yet on its
+disk. A replica whose disk is stalled therefore reconnects only once
+the disk catches up, and logs a warning if that takes more than a few
+seconds.
 Periodic snapshots are taken on a dedicated thread so a crash doesn't
 require replaying from genesis.
 

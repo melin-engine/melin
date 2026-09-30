@@ -776,7 +776,14 @@ pub(super) fn wait_for_handshake_pair<A: Application, W: Send + 'static>(
         // its last durable batch would otherwise hand out a ready pair,
         // and the loop would dial the primary and hold one of its replica
         // slots only for the session to fail on its first iteration.
-        if pipeline.journal_failed.load(Ordering::Acquire) {
+        //
+        // The latch covers a stage that returned an error. A finished
+        // thread covers one that panicked, which never reaches the latch
+        // (only in a build that unwinds; release aborts on panic). The
+        // journal thread exits only through teardown, so a finished one
+        // is always a dead one.
+        if pipeline.journal_failed.load(Ordering::Acquire) || pipeline.journal_handle.is_finished()
+        {
             return HandshakePair::JournalFailed;
         }
         let state = pipeline.chain_hash_lock.load();
@@ -819,9 +826,7 @@ pub(super) fn wait_for_handshake_pair<A: Application, W: Send + 'static>(
 /// from a primary, so the backoff stays escalated.
 pub(in crate::replication) fn journal_failed_while_disconnected() -> StreamingResult {
     StreamingResult {
-        exit: SessionExit::Fatal(
-            "replica journal stage failed while disconnected — tearing down for resync".into(),
-        ),
+        exit: SessionExit::Fatal("replica journal stage failed while disconnected".into()),
         heard_from_primary: false,
     }
 }
@@ -978,9 +983,9 @@ where
             // flushing it, so re-handshaking once the journal covers
             // that prefix (`wait_for_handshake_pair`, at the top of the
             // reconnect loop, after the backoff) lets the primary
-            // re-stream the hole. The primary evidently spoke, so the backoff resets
-            // exactly as a heard-from disconnect does. Not a resync:
-            // nothing on disk is wrong.
+            // re-stream the hole. The primary evidently spoke, so the
+            // backoff resets exactly as a heard-from disconnect does.
+            // Not a resync: nothing on disk is wrong.
             close();
             *backoff = std::time::Duration::from_secs(1);
             tracing::warn!(
@@ -3175,6 +3180,51 @@ mod tests {
         assert!(matches!(
             teardown_replica_pipeline::<counter_server::Counter, CounterWriter>(handles),
             TeardownOutcome::Clean(..)
+        ));
+    }
+
+    /// A journal thread that panicked never sets the failure latch, yet
+    /// it can never cover the ring either: the wait must still end, not
+    /// spin until shutdown.
+    #[test]
+    fn handshake_pair_wait_ends_when_the_journal_thread_panicked() {
+        let (mut input_producer, mut consumers) =
+            melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(4)
+                .add_consumer()
+                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+        let _consumer = consumers.pop().expect("one consumer");
+        // One slot the dead stage will never cover.
+        input_producer.publish(increment_slot(1));
+        let journal_handle =
+            std::thread::spawn(|| -> Result<CounterWriter, melin_journal::JournalError> {
+                panic!("journal stage died without reaching the latch")
+            });
+        while !journal_handle.is_finished() {
+            std::thread::yield_now();
+        }
+        let handles: ReplicaHandles<counter_server::Counter> = ReplicaPipelineHandles {
+            input_producer,
+            journal_cursor: Arc::new(make_journal_cursor(0)),
+            chain_hash_lock: detached_fsync_state(),
+            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            journal_failed: Arc::new(AtomicBool::new(false)),
+            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
+            journal_handle,
+            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            drain_handle: std::thread::spawn(|| {}),
+            shadow_handle: None,
+        };
+        assert!(matches!(
+            wait_for_handshake_pair(
+                &handles,
+                &AtomicBool::new(false),
+                &crate::promotion::PromotionRequest::new()
+            ),
+            HandshakePair::JournalFailed
+        ));
+        assert!(matches!(
+            teardown_replica_pipeline::<counter_server::Counter, CounterWriter>(handles),
+            TeardownOutcome::Panicked
         ));
     }
 
