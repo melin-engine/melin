@@ -177,6 +177,17 @@ fn journal_sequences(path: &std::path::Path) -> String {
 
 #[test]
 fn a_replica_reconnecting_before_its_first_durable_batch_does_not_reapply_history() {
+    // Opt-in diagnostics: with RUST_LOG set, capture both nodes' tracing
+    // output (they run in this process), so a reconnect that stalls
+    // shows why. No-op when RUST_LOG is unset.
+    if std::env::var_os("RUST_LOG").is_some() {
+        // Error dropped deliberately: try_init fails only when a
+        // subscriber is already installed, which is the state we want.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    }
     let tmp = tempfile::tempdir().expect("tempdir");
     let primary_key = SigningKey::from_bytes(&[0x81; 32]);
     let replica_key = SigningKey::from_bytes(&[0x82; 32]);
@@ -235,7 +246,11 @@ fn a_replica_reconnecting_before_its_first_durable_batch_does_not_reapply_histor
         replication_key: Some(primary_key_path.clone()),
         ..ServerConfig::default()
     };
-    let replica_config = || ServerConfig {
+    // Only the restarted replica, the one promoted at the end, gets an
+    // admin listener. A stopped node's admin thread can outlive its `run`
+    // for a poll interval, still holding the port, so a restart on the
+    // same admin address can fail to bind.
+    let replica_config = |admin_bind: Option<SocketAddr>| ServerConfig {
         bind: replica_client,
         journal: replica_journal.clone(),
         authorized_keys: auth_path.clone(),
@@ -245,7 +260,7 @@ fn a_replica_reconnecting_before_its_first_durable_batch_does_not_reapply_histor
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        admin_bind: Some(replica_admin),
+        admin_bind,
         replica_of: Some(replication_addr),
         replication_key: Some(replica_key_path.clone()),
         ..ServerConfig::default()
@@ -255,7 +270,7 @@ fn a_replica_reconnecting_before_its_first_durable_batch_does_not_reapply_histor
     let primary_shutdown = Arc::new(AtomicBool::new(false));
     let primary = spawn_node(primary_config(), &primary_shutdown);
     let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica = spawn_node(replica_config(), &replica_shutdown);
+    let replica = spawn_node(replica_config(None), &replica_shutdown);
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     {
         let mut conn = connect(primary_client, &client_key);
@@ -273,7 +288,7 @@ fn a_replica_reconnecting_before_its_first_durable_batch_does_not_reapply_histor
     stop_node(replica, &replica_shutdown, replica_client);
     wait_for_gauge(primary_health, "melin_replicas_connected", 0);
     let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica = spawn_node(replica_config(), &replica_shutdown);
+    let replica = spawn_node(replica_config(Some(replica_admin)), &replica_shutdown);
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
 
     // --- The primary restarts: the replica's session ends before its
