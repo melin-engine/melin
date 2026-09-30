@@ -2086,11 +2086,11 @@ mod tests {
     // whose sequence skips ahead of the last accepted one must end the
     // session, never be silently applied. (The journal stage refuses one
     // that got past it anyway, but by then the matching stage has
-    // applied it, so the node can only stop.) Regression: the 2026-06-07 LAN bench shipped a
-    // reconnecting replica a stream with a 212-entry hole (catch-up →
-    // live handoff race on the primary); the replica accepted it, acked
-    // past the hole, and its journal failed lineage verification only
-    // at post-run audit.
+    // applied it, so the node can only stop.) Regression: the 2026-06-07
+    // LAN bench shipped a reconnecting replica a stream with a 212-entry
+    // hole (catch-up → live handoff race on the primary); the replica
+    // accepted it, acked past the hole, and its journal failed lineage
+    // verification only at post-run audit.
     //
     // Pinned semantics, mirroring TCP-style cumulative delivery:
     //   seq <= accum      → skip (idempotent re-delivery: the first

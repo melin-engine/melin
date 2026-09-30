@@ -3393,8 +3393,10 @@ mod tests {
     /// A chain divergence the journal stage reports while the replica is
     /// disconnected must take the same in-process resync as one reported
     /// mid-stream; any other journal failure stops the process, as it
-    /// does mid-stream. Either way the transport is closed exactly once,
-    /// by the disconnect itself.
+    /// does mid-stream. That includes a refused sequence: it means a bug
+    /// in this node, not a fork from the primary, so resyncing would
+    /// archive a healthy journal and hide the bug. Either way the
+    /// transport is closed exactly once, by the disconnect itself.
     #[test]
     fn journal_failure_found_by_the_reconnect_wait_takes_the_fatal_path() {
         let (after, resyncs, closes) =
@@ -3415,6 +3417,17 @@ mod tests {
         assert!(
             matches!(after, AfterSession::Return(Err(_))),
             "any other journal failure stops the replica"
+        );
+        assert_eq!((resyncs, closes), (0, 1));
+
+        let (after, resyncs, closes) =
+            exit_after_journal_failure(melin_journal::JournalError::ReplicaSequenceMismatch {
+                expected: 4,
+                actual: 1,
+            });
+        assert!(
+            matches!(after, AfterSession::Return(Err(_))),
+            "a refused sequence stops the replica rather than resyncing"
         );
         assert_eq!((resyncs, closes), (0, 1));
     }
