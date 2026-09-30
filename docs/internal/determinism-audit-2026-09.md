@@ -11,9 +11,12 @@ rings and seqlock, response gate and ack policy, and the shipped
 applications. The most serious findings were then re-read and, where
 practical, reproduced with failing tests.
 
-Status: **open**. Nothing below is fixed. Every reference is to commit
-`0fa03c79` (2026-09-25). Line numbers drift, so re-locate each site before
-working on it.
+Status: **open**. Findings 1, 2 and 24, and the sequence checks of
+finding 37, are fixed (see
+[replica-reconnect-fix-2026-09.md](replica-reconnect-fix-2026-09.md));
+each says so in its section. The rest is open. Every reference is to
+commit `0fa03c79` (2026-09-25). Line numbers drift, so re-locate each site
+before working on it.
 
 ## Evidence levels
 
@@ -50,8 +53,8 @@ Severity is a judgement from code reading.
 
 | # | Finding | Severity | Evidence |
 | --- | --- | --- | --- |
-| 1 | A replica reconnecting before its first durable batch re-applies the primary's history | **Critical** | Reproduced |
-| 2 | A replica reconnecting while its journal lags re-applies the unjournaled tail | High | Confirmed |
+| 1 | A replica reconnecting before its first durable batch re-applies the primary's history | **Critical** | Reproduced; fixed |
+| 2 | A replica reconnecting while its journal lags re-applies the unjournaled tail | High | Confirmed; fixed |
 | 3 | A snapshot-only boot journals genesis a second time | High | Reproduced |
 | 4 | A first boot that fails after creating the journal loses genesis for good | High | Reproduced |
 | 5 | A sequence gap in the live segment truncates durable entries | High | Reproduced |
@@ -73,7 +76,7 @@ Severity is a judgement from code reading.
 | 21 | The resync archive is not atomic, and a lone snapshot is ignored | Medium | Confirmed |
 | 22 | Snapshot paths are resolved three ways, and a served snapshot is barely checked | Medium | Confirmed |
 | 23 | Without the hash chain, an ahead-of-tip replica is credited by the ack gate | Medium | Confirmed |
-| 24 | The shutdown drain skips a failed encode after allocating its sequence | Low | Confirmed |
+| 24 | The shutdown drain skips a failed encode after allocating its sequence | Low | Confirmed; fixed |
 | 25 | A crash inside a snapshot save leaves no snapshot under its name | Low | Confirmed |
 | 26 | The application codec contract is unenforced | Low | Confirmed |
 | 27 | The DPDK response stage drops a connection without closing it | Low | Reported |
@@ -86,7 +89,7 @@ Severity is a judgement from code reading.
 | 34 | Two primaries can ack before the new epoch is visible | Low | Reported |
 | 35 | Shadow snapshots can slip by an interval under load | Low | Reported |
 | 36 | The mark barrier aliases released ring slots, and `RingBuffer` is too loosely `Sync` | Low | Reported |
-| 37 | Journal invariants are checked only in debug builds | Low | Confirmed in part |
+| 37 | Journal invariants are checked only in debug builds | Low | Confirmed in part; sequence checks fixed |
 | 38 | Filesystem edge cases in the journal | Low | Reported |
 | 39 | Archive bookkeeping edge cases | Low | Reported |
 | 40 | Races that cost a reconnect or a failed resync | Low | Reported |
@@ -100,6 +103,11 @@ matches the code, follow the findings.
 ### 1. A replica reconnecting before its first durable batch re-applies the primary's history
 
 **Critical. Reproduced.** Breaks promises 1, 3 and 7.
+
+**Status: fixed.** The seqlock is seeded from the writer when the
+pipeline is built, and the reproduction is a regression test
+(`tests/replica_reconnect.rs` in server-runtime, and the seed and
+refusal tests in transport-core's `pipeline_tests.rs`).
 
 - `transport-core/src/pipeline.rs:3098-3109`: `setup_chain_hash_publisher`
   creates the `FsyncState` seqlock as `FsyncState::default()`, which is
@@ -147,6 +155,12 @@ non-contiguous stamped sequence a hard error in release (finding 37).
 ### 2. A replica reconnecting while its journal lags re-applies the unjournaled tail
 
 **High. Confirmed.** Breaks promises 1, 3 and 7. Same family as finding 1.
+
+**Status: fixed**, by the second fix direction below, not the first:
+the reconnect waits until the journal covers every slot the previous
+session published, then handshakes from that one `FsyncState` load.
+Anchoring the gate higher would let the re-delivery rule hide a fork
+after a failover. The plan records why.
 
 The handshake sends `FsyncState.journal_seq`, the durable position, and
 the session anchor equals it. The input ring can still hold entries the
@@ -755,6 +769,8 @@ every build.
     entries are journaled after a hole, and finding 5 truncates them on
     restart. The matching stage has already applied the skipped event. The
     steady-state path fails closed on the same error. Confirmed.
+    **Fixed:** the drain now fails closed on any failure, as the
+    steady-state path does.
 25. **A crash inside a snapshot save leaves no snapshot under its name.**
     `snapshot.rs:304-331` renames the old snapshot to `.prev` before
     publishing the new one, and boot never looks at `.prev`. Recovery
@@ -829,6 +845,9 @@ every build.
     reported: `from_halves` with a non-empty batch, `resume` and
     `begin_segment` sequence agreement, and a format-15 header whose
     `sector_size` is not 4096. Each is cheap to enforce in release.
+    **Sequence checks fixed:** a replica adopts only the next sequence,
+    and the encoder refuses one at or below the last it wrote, in every
+    build. The other checks listed here are unchanged.
 38. **Filesystem edge cases in the journal.** A short `read` mid-segment on
     NFS or FUSE reads as end of data. No `flock` stops two processes
     recovering one journal. A crash inside `create_continuing` can leave a
@@ -882,6 +901,16 @@ Not determinism, but each one defeats failover or stalls a node.
   segment on each retry. Reported.
 - **DPDK allows several authentication attempts on one connection**, where
   kernel TCP drops the connection on the first failure. Reported.
+- **A stopped node's admin listener outlives it.** `admin::spawn` hands
+  the bound listener to a thread the server never joins (`_admin_handle`
+  in `server.rs`), and that thread polls the shutdown flag every 100 ms.
+  A node restarted on the same admin address within the same process
+  (tests, or an embedder calling `run_with_listener`) can fail to bind
+  with "address in use" while the old thread lingers. A process restart
+  is unaffected: exit closes the socket. Joining needs its own stop
+  signal, since error exits do not set the shutdown flag. Found while
+  fixing findings 1 and 2, where it made the reconnect test flaky under
+  load. Confirmed.
 
 ## Documentation that no longer matches the code
 
@@ -954,10 +983,13 @@ Recorded so a later audit can start past them.
 
 ## Reproductions
 
-Written on a scratch branch and not committed. Each description is enough
-to rebuild the test as a regression test beside its fix. Each asserts the
-documented behaviour, so it fails until the defect is fixed; the results
-were observed on 2026-09-25 at `0fa03c79`.
+The tests live on branch `scratch/determinism-repro`, behind the opt-in
+`determinism-repro` feature. Each description is enough to rebuild the
+test as a regression test beside its fix. Each asserts the documented
+behaviour, so it fails until the defect is fixed; the results were
+observed on 2026-09-25 at `0fa03c79`. The replica pipeline tests and the
+replica end-to-end scenario are now regression tests beside the fix for
+findings 1 and 2.
 
 **Journal recovery** (`transport-core` unit tests over `JournaledApp` and
 `BufferedWriter`, `TestApp` events `Add(seq)`):
@@ -994,11 +1026,13 @@ real sockets, ticks and snapshots as noted):
 
 1. Findings 1, 2 and 37 together: seed the replica's handshake state,
    anchor the gate at the accepted position, and make backward sequences a
-   release-mode error. Small, and the highest risk.
+   release-mode error. Small, and the highest risk. **Done**, with the
+   reconnect waiting for the journal instead of anchoring the gate (see
+   finding 2), and finding 24 fixed along the way.
 2. Findings 3 and 4: genesis. Small.
-3. Findings 5, 6, 7, 16, 19 and 24: one recovery policy. Tolerate only a
-   bounded, all-zero tail, preserve whatever is discarded, cap entry
-   length, and make the shutdown drain fail like the steady state.
+3. Findings 5, 6, 7, 16 and 19: one recovery policy. Tolerate only a
+   bounded, all-zero tail, preserve whatever is discarded, and cap entry
+   length. (Finding 24, the shutdown drain, is already fixed.)
 4. Findings 8 and 11: wire integrity and the DPDK sender.
 5. Findings 10, 12, 13, 14 and 15: failover correctness.
 6. Finding 9: an API decision, gating the publisher or documenting it.

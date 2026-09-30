@@ -1,8 +1,12 @@
 # Replica reconnect re-applying history (plan)
 
-Status: **proposed, not started** (2026-09). Fixes findings 1 and 2 of
-the [determinism audit](determinism-audit-2026-09.md), plus the
-sequence half of finding 37, as the audit's suggested order groups them.
+Status: **done** (2026-09), on branch `fix/replica-reconnect-reapply`.
+Fixes findings 1 and 2 of the
+[determinism audit](determinism-audit-2026-09.md), plus the sequence
+half of finding 37, as the audit's suggested order groups them, and
+finding 24 along the way. "What the code shows" describes the code
+before the fix; the decisions and the order of work describe what
+landed.
 Part of the roadmap item "Fix the determinism and durability audit
 findings" ([roadmap.md](roadmap.md)). Read the audit entries for the
 reproductions; this document records the design decision and the order

@@ -12,6 +12,44 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Changed
+
+- **`JournalError` gains `ReplicaSequenceMismatch` and
+  `SequenceRegression`,** for the sequence refusals under Fixed.
+  Source-breaking for code that matches on `JournalError` exhaustively.
+
+### Removed
+
+- **`set_next_sequence`, from `JournalWrite`, `BufferedWriter` and
+  `JournalEncoder`.** It moved a writer's sequence counter anywhere,
+  backwards included. `JournalEncoder::adopt_sequence` replaces it for a
+  replica taking the primary's numbering, and accepts only the next
+  sequence.
+
+### Fixed
+
+- **A replica that reconnected could apply the primary's history a
+  second time.** A replica rebuilds its pipeline at every start and after
+  every snapshot resync. One that lost its connection before that
+  pipeline's first journal write told the primary it held nothing, and
+  the primary streamed its whole history again on top of the state the
+  replica already had. A replica whose disk was behind what it had
+  received did the same for the entries not yet written. Either way it
+  served state the primary never had after a promotion, and in a release
+  build its journal then refused to recover. A replica now reconnects
+  from exactly what it holds: it waits until its own journal holds
+  everything it received, then resumes from there. A replica whose disk
+  is stalled therefore reconnects once the disk catches up, and logs a
+  warning if that takes more than a few seconds.
+- **A journal could be written out of order in a release build.** The
+  checks that refuse a repeated or backward sequence ran only in debug
+  builds. Every build now refuses one before writing it; on a replica,
+  anything but the next sequence stops the node, with its journal intact.
+- **The shutdown drain skipped an entry it failed to journal**, and
+  journaled the next one after it, leaving a hole behind an entry the
+  application had already applied. It now fails as the steady-state path
+  does, so a promotion refuses to proceed on that state.
+
 ## [0.18.0] - 2026-09-27
 
 ### Added
