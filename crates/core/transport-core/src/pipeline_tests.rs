@@ -4277,6 +4277,117 @@ fn replica_fsync_state_is_seeded_from_the_writer() {
     );
 }
 
+/// The sequences in a journal's live segment, in order.
+#[cfg(not(feature = "no-persist"))]
+fn journal_sequences(path: &std::path::Path) -> Vec<u64> {
+    let mut reader = JournalReader::<TestEvent>::open(path).unwrap();
+    let mut seqs = Vec::new();
+    while let Some(entry) = reader.next_entry().unwrap() {
+        seqs.push(entry.sequence);
+    }
+    seqs
+}
+
+/// A replica journal stage over a journal recovered at sequence 3, with
+/// its input producer; the matching stage is dropped (it would apply the
+/// slots whatever the journal decides, which is not under test here).
+#[cfg(not(feature = "no-persist"))]
+fn replica_stage_at_3(
+    path: &std::path::Path,
+) -> (ring::Producer<TestInput>, JournalStage<TestEvent>) {
+    let (app, writer, _) = recovered_journal(path, 3);
+    let replica = build_replica_pipeline(
+        app,
+        writer,
+        MAX_JOURNAL_BATCH,
+        Duration::ZERO,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    (replica.input_producer, replica.journal_stage)
+}
+
+/// Audit findings 1 and 37: a session anchored below what the replica
+/// holds re-sends the primary's entries under their original sequences.
+/// The journal stage used to adopt them verbatim, so a release build
+/// appended 1, 2, 3 after the tail and the journal then refused to
+/// recover. It must refuse the first one, and write nothing of them.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn replica_journal_refuses_a_restreamed_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restream.journal");
+    let (mut producer, journal_stage) = replica_stage_at_3(&path);
+
+    let shutdown = AtomicBool::new(false);
+    let outcome = std::thread::scope(|s| {
+        let journal = s.spawn(|| journal_stage.run(&shutdown));
+        for seq in 1..=3 {
+            producer.publish(add_slot_with_seq(seq, seq, 1_000 * seq));
+        }
+        producer.publish(InputSlot::shutdown_sentinel());
+        journal.join().expect("journal thread panicked")
+    });
+    assert!(
+        matches!(
+            outcome,
+            Err(melin_journal::JournalError::ReplicaSequenceMismatch {
+                expected: 4,
+                actual: 1
+            })
+        ),
+        "the stage must refuse the first re-sent entry, got {:?}",
+        outcome.map(|_| ())
+    );
+    assert_eq!(
+        journal_sequences(&path),
+        [1, 2, 3],
+        "nothing re-sent was written"
+    );
+    let recovered = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path)
+        .expect("the journal still recovers");
+    assert_eq!(recovered.next_sequence(), 4);
+}
+
+/// Audit finding 24, and the same refusal on the shutdown path: the drain
+/// used to log a failed entry and journal the next one after it, leaving
+/// a hole behind a sequence the matching stage had applied. It must stop
+/// at the first refusal and fail the stage, so a teardown reports a
+/// failed journal rather than a clean one.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn shutdown_drain_stops_at_a_refused_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("drain.journal");
+    let (mut producer, journal_stage) = replica_stage_at_3(&path);
+
+    // 4 is next and valid; 2 is a repeat; 5 would follow 4 if the drain
+    // skipped the repeat, leaving the hole this test pins down.
+    for seq in [4, 2, 5] {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000 * seq));
+    }
+    // Latched before the stage starts, so it goes straight to the drain.
+    let shutdown = AtomicBool::new(true);
+    let outcome = journal_stage.run(&shutdown);
+    assert!(
+        matches!(
+            outcome,
+            Err(melin_journal::JournalError::ReplicaSequenceMismatch {
+                expected: 5,
+                actual: 2
+            })
+        ),
+        "the drain must fail at the repeat, got {:?}",
+        outcome.map(|_| ())
+    );
+    assert_eq!(
+        journal_sequences(&path),
+        [1, 2, 3],
+        "nothing after the refusal was journaled"
+    );
+}
+
 /// The primary's seqlock (present with shadow snapshots) starts from the
 /// same seed, so one type means one thing whichever builder made it.
 #[cfg(not(feature = "no-persist"))]

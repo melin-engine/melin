@@ -951,7 +951,7 @@ where
             tracing::warn!(
                 error = %e,
                 last_sequence,
-                "replication stream broke contiguity — reconnecting from the durable position"
+                "replication stream broke contiguity — reconnecting from what this replica holds"
             );
             sleep_then_double_backoff(backoff, shutdown, promote);
             reconnect_from_live_pipeline(

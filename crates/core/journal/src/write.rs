@@ -79,9 +79,6 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// rotating an empty live segment, and replicas detect an
     /// already-adopted rotation boundary.
     fn segment_starting_sequence(&self) -> u64;
-    /// Force the next allocated sequence number — used by replicas to
-    /// adopt the primary's numbering.
-    fn set_next_sequence(&mut self, seq: u64);
     /// File offset of the last byte known to be durable on disk.
     fn valid_end(&self) -> u64;
     /// On-disk path of the active segment.
@@ -210,11 +207,6 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     }
 
     #[inline]
-    fn set_next_sequence(&mut self, seq: u64) {
-        BufferedWriter::set_next_sequence(self, seq)
-    }
-
-    #[inline]
     fn valid_end(&self) -> u64 {
         BufferedWriter::valid_end(self)
     }
@@ -314,11 +306,6 @@ mod tests {
 
         writer.flush_batch_sync().unwrap();
         assert!(writer.valid_end() > initial_valid_end);
-
-        // set_next_sequence overrides the counter — proves the setter
-        // routes through the trait, not just past it.
-        writer.set_next_sequence(42);
-        assert_eq!(writer.next_sequence(), 42);
 
         // chain_hash() is feature-gated; we just assert it doesn't
         // panic regardless of the cfg state.

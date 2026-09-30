@@ -112,12 +112,10 @@ code is unchanged since the audited commit.
    one entry and encoding the next after it is exactly the corruption
    this check exists to prevent.
 
-   `JournalError` is not `#[non_exhaustive]`, so a new variant is a
-   breaking change for a published crate. Neither this workspace nor
-   exchange-core matches on it exhaustively, and exchange-core does not
-   implement `JournalWrite`, so nothing breaks today. Mark the enum
-   `#[non_exhaustive]` in the same change: the monotonic-time plan adds
-   `TimestampRegression` next, and this takes the break once.
+   A new `JournalError` variant is a breaking change for a published
+   crate. Neither this workspace nor exchange-core matches on it
+   exhaustively, and exchange-core does not implement `JournalWrite`,
+   so nothing breaks today; the CHANGELOG records the change.
 
 4. **A sequence refusal stops the process.** The error routes through
    `SessionExit::Fatal`, and `handle_session_exit` returns it rather than
@@ -157,10 +155,12 @@ Each step lands as its own commit with its tests.
      position" (`handle_session_exit`'s `StreamGap` arm among them).
 2. **Release-mode sequence enforcement** (decisions 3 and 4). Tests
    that feed a replica stage non-contiguous sequences, if any, get fixed
-   rather than the check loosened.
+   rather than the check loosened. The shutdown drain fails closed on
+   any failure, not only a refused sequence, as the steady-state loop
+   does; that also fixes audit finding 24.
 3. **Docs.** A `Fixed` entry under `[Unreleased]` in the CHANGELOG, a
-   `Changed` entry for `JournalError` becoming `#[non_exhaustive]`, and a
-   status line on findings 1, 2 and 37 in the audit. The audit text stays
+   `Changed` entry for the new `JournalError` variants, and a status
+   line on findings 1, 2 and 37 in the audit. The audit text stays
    as the record.
 
 ## Tests
