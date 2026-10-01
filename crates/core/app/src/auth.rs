@@ -1,7 +1,7 @@
 //! Connection-level role model for application access control, plus the
 //! `authorized_keys` file loader that maps Ed25519 public keys to roles.
 //!
-//! Both live in `melin-app` (next to [`Application`](crate::Application))
+//! Both live in `melin-app` (next to the [`Application` trait](crate::Application))
 //! because the role taxonomy ("who can do what to my app") and the
 //! deployment-time mapping of operator-managed keys to roles are
 //! application-shaped concerns, not wire-format concerns. The
