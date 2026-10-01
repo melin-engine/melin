@@ -51,8 +51,8 @@ Severity is a judgement from code reading.
 
 | # | Finding | Severity | Evidence |
 | --- | --- | --- | --- |
-| 1 | A replica reconnecting before its first durable batch re-applies the primary's history | **Critical** | Reproduced |
-| 2 | A replica reconnecting while its journal lags re-applies the unjournaled tail | High | Confirmed |
+| 1 | A replica reconnecting before its first durable batch re-applies the primary's history | **Critical** | Reproduced (fixed) |
+| 2 | A replica reconnecting while its journal lags re-applies the unjournaled tail | High | Confirmed (fixed) |
 | 3 | A snapshot-only boot journals genesis a second time | High | Reproduced |
 | 4 | A first boot that fails after creating the journal loses genesis for good | High | Reproduced |
 | 5 | A sequence gap in the live segment truncates durable entries | High | Reproduced |
@@ -74,7 +74,7 @@ Severity is a judgement from code reading.
 | 21 | The resync archive is not atomic, and a lone snapshot is ignored | Medium | Confirmed |
 | 22 | Snapshot paths are resolved three ways, and a served snapshot is barely checked | Medium | Confirmed |
 | 23 | Without the hash chain, an ahead-of-tip replica is credited by the ack gate | Medium | Confirmed |
-| 24 | The shutdown drain skips a failed encode after allocating its sequence | Low | Confirmed |
+| 24 | The shutdown drain skips a failed encode after allocating its sequence | Low | Confirmed (fixed) |
 | 25 | A crash inside a snapshot save leaves no snapshot under its name | Low | Confirmed |
 | 26 | The application codec contract is unenforced | Low | Confirmed |
 | 27 | The DPDK response stage drops a connection without closing it | Low | Reported |
@@ -87,7 +87,7 @@ Severity is a judgement from code reading.
 | 34 | Two primaries can ack before the new epoch is visible | Low | Reported |
 | 35 | Shadow snapshots can slip by an interval under load | Low | Reported |
 | 36 | The mark barrier aliases released ring slots, and `RingBuffer` is too loosely `Sync` | Low | Reported |
-| 37 | Journal invariants are checked only in debug builds | Low | Confirmed in part |
+| 37 | Journal invariants are checked only in debug builds | Low | Confirmed in part (sequence checks fixed) |
 | 38 | Filesystem edge cases in the journal | Low | Reported |
 | 39 | Archive bookkeeping edge cases | Low | Reported |
 | 40 | Races that cost a reconnect or a failed resync | Low | Reported |
@@ -145,6 +145,28 @@ journal and forces a full resync.
 `has_events` guard and alignment check keep that safe. Make a backward or
 non-contiguous stamped sequence a hard error in release (finding 37).
 
+**Status: fixed** as directed above.
+
+- `build_replica_pipeline` (and the primary's builder, when it has a
+  shadow) seeds the `FsyncState` seqlock from the writer
+  (`fsync_state_at_open`): `(next_sequence - 1, chain hash)`, ring
+  position 0. A reconnect before the first durable batch now claims the
+  journal the pipeline was built over. Pinned by
+  `replica_fsync_state_starts_at_the_journal_it_was_built_over`
+  (`pipeline_tests.rs`) and, end to end against a scripted primary,
+  `a_reconnect_after_a_quiet_session_claims_the_recovered_journal`
+  (`tcp_receiver.rs`).
+- The backstop is finding 37's fix: the replica's journal stage adopts a
+  stamped sequence only if it is the next one
+  (`JournalEncoder::adopt_sequence`, `ReplicaSequenceMismatch`), in every
+  build, before anything is written; `set_next_sequence` is gone. A
+  re-sent prefix now stops the replica with its journal intact
+  (`replica_journal_refuses_a_restreamed_prefix`) instead of appending
+  sequence 1 onwards after the tail. The refusal is a journal-stage
+  error, so it takes the fatal teardown, not the divergence resync: it
+  means a bug in this node, and a resync would archive a healthy journal
+  and hide it.
+
 ### 2. A replica reconnecting while its journal lags re-applies the unjournaled tail
 
 **High. Confirmed.** Breaks promises 1, 3 and 7. Same family as finding 1.
@@ -182,6 +204,28 @@ position. Alternatively, wait (abortable on journal failure) until the
 journal's ring progress reaches the producer cursor before reading the
 handshake pair. Progress alone is not enough, because the disk thread
 stores progress before the seqlock.
+
+**Status: fixed**, by the second direction above, not the first.
+
+- `ReplicaPipelineHandles::settled_resume_point` (`replication/mod.rs`)
+  reads the producer cursor, then waits until one `FsyncState` load has
+  `input_ring_seq` at or past it, and the handshake takes that load's
+  pair. It waits on the seqlock itself, so the progress-before-seqlock
+  ordering cannot tear it. Both receivers call it at the top of the
+  reconnect loop (`tcp_receiver.rs`, `dpdk.rs`). Anchoring the gate at
+  the larger of two positions was not taken: the re-delivery rule would
+  then hide a fork after a failover.
+- The wait ends early on a dead journal stage or on shutdown or
+  promotion, and says which. A dead journal is checked first, even with
+  the ring covered, and the loop dispatches it as a fatal session exit
+  (`journal_failed_while_disconnected`) instead of dialing the primary
+  with a pipeline that cannot take the session. The journal thread's
+  wrapper (`run_journal_stage`) latches `journal_failed` on a panic as
+  well as on an error, so the wait cannot spin on a panicked stage in a
+  build that unwinds.
+- Pinned by the `resume_point_*` tests in `replication/mod.rs` and, end
+  to end, `a_reconnect_claims_entries_received_before_the_drop`
+  (`tcp_receiver.rs`), which fails with the wait removed.
 
 ## Genesis
 
@@ -791,6 +835,11 @@ every build.
     entries are journaled after a hole, and finding 5 truncates them on
     restart. The matching stage has already applied the skipped event. The
     steady-state path fails closed on the same error. Confirmed.
+    **Status: fixed.** `drain_remaining` returns the first failure (a
+    refused sequence, a failed claim, encode or hand-off) and the stage
+    fails with it, as the steady-state loop does, so the teardown reports
+    a failed journal and a promotion refuses to build on that state.
+    Pinned by `shutdown_drain_stops_at_a_refused_sequence`.
 25. **A crash inside a snapshot save leaves no snapshot under its name.**
     `snapshot.rs:304-331` renames the old snapshot to `.prev` before
     publishing the new one, and boot never looks at `.prev`. Recovery
@@ -865,6 +914,18 @@ every build.
     reported: `from_halves` with a non-empty batch, `resume` and
     `begin_segment` sequence agreement, and a format-15 header whose
     `sector_size` is not 4096. Each is cheap to enforce in release.
+    **Status: sequence checks fixed.** The encoder keeps
+    `last_encoded_seq` in every build and refuses a sequence at or below
+    it (`SequenceRegression`), leaving its batch and chain untouched; the
+    guard starts below the segment's first sequence and carries across
+    `begin_segment`. A replica's journal stage adopts a stamped sequence
+    only if it is the next one (`adopt_sequence`,
+    `ReplicaSequenceMismatch`), replacing `set_next_sequence`. Either
+    refusal fails the journal stage, which stops the replica with an
+    `error!`; nothing is written. The cost is one compare per entry.
+    Pinned by the encoder's unit tests and the
+    `replica_journal_refuses_*` tests in `pipeline_tests.rs`. The chain
+    equality at recovery and the other checks listed here are unchanged.
 38. **Filesystem edge cases in the journal.** A short `read` mid-segment on
     NFS or FUSE reads as end of data. No `flock` stops two processes
     recovering one journal. A crash inside `create_continuing` can leave a
@@ -1030,11 +1091,13 @@ real sockets, ticks and snapshots as noted):
 
 1. Findings 1, 2 and 37 together: seed the replica's handshake state,
    anchor the gate at the accepted position, and make backward sequences a
-   release-mode error. Small, and the highest risk.
+   release-mode error. Small, and the highest risk. **Done**, with the
+   reconnect waiting for the journal instead of anchoring the gate (see
+   finding 2), and finding 24 fixed along the way.
 2. Findings 3 and 4: genesis. Small.
-3. Findings 5, 6, 7, 16, 19 and 24: one recovery policy. Tolerate only a
-   bounded, all-zero tail, preserve whatever is discarded, cap entry
-   length, and make the shutdown drain fail like the steady state.
+3. Findings 5, 6, 7, 16 and 19: one recovery policy. Tolerate only a
+   bounded, all-zero tail, preserve whatever is discarded, and cap entry
+   length. (Finding 24, the shutdown drain, is already fixed.)
 4. Findings 8 and 11: wire integrity and the DPDK sender.
 5. Findings 10, 12, 13, 14 and 15: failover correctness.
 6. Finding 9: an API decision, gating the publisher or documenting it.

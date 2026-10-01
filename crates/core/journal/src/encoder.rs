@@ -104,9 +104,10 @@ pub struct JournalEncoder<E: AppEvent> {
     starting_sequence: u64,
     #[cfg(feature = "hash-chain")]
     hash_chain: SegmentChain,
-    // Debug-only monotonicity guard: every fresh seq must strictly
-    // exceed this. Excluded from release builds — zero hot-path cost.
-    #[cfg(debug_assertions)]
+    // Monotonicity guard, in every build: each encoded seq must strictly
+    // exceed this. One compare per entry buys a journal that cannot be
+    // written out of order, which recovery would otherwise refuse
+    // (audit finding 37). `u64` like every sequence.
     last_encoded_seq: u64,
     // Byte range of the most-recent user entry within the destination
     // buffer — `replication_slice` ships it to replication without a
@@ -149,8 +150,8 @@ impl<E: AppEvent> JournalEncoder<E> {
             starting_sequence,
             #[cfg(feature = "hash-chain")]
             hash_chain: SegmentChain::new(anchor_hash),
-            #[cfg(debug_assertions)]
-            last_encoded_seq: 0,
+            // Nothing below the segment's first sequence belongs in it.
+            last_encoded_seq: starting_sequence.saturating_sub(1),
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
         }
@@ -189,7 +190,6 @@ impl<E: AppEvent> JournalEncoder<E> {
                 ENTRY_OFFSET,
                 valid_end,
             )?,
-            #[cfg(debug_assertions)]
             last_encoded_seq: last_seq,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
@@ -201,7 +201,8 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// and the batch is empty.
     ///
     /// No sequence is consumed — the next event still gets
-    /// `starting_sequence`.
+    /// `starting_sequence`. The monotonicity guard carries over: a new
+    /// segment continues the sequence, it does not restart it.
     pub fn begin_segment(&mut self, starting_sequence: u64, anchor_hash: [u8; 32]) {
         self.starting_sequence = starting_sequence;
         self.batch_len = 0;
@@ -210,10 +211,6 @@ impl<E: AppEvent> JournalEncoder<E> {
         #[cfg(feature = "hash-chain")]
         {
             self.hash_chain = SegmentChain::new(anchor_hash);
-        }
-        #[cfg(debug_assertions)]
-        {
-            self.last_encoded_seq = 0;
         }
         // Silences the unused-parameter warning when the chain is
         // compiled out; the anchor has no other consumer here.
@@ -229,15 +226,40 @@ impl<E: AppEvent> JournalEncoder<E> {
         seq
     }
 
+    /// Take a sequence assigned elsewhere — a replica adopting the
+    /// primary's numbering — and advance the counter past it, exactly as
+    /// [`allocate_sequence`](Self::allocate_sequence) would have.
+    ///
+    /// It must be the next sequence. A replica's stream is contiguous,
+    /// so anything else means entries sent twice or skipped upstream;
+    /// journaling them would duplicate history or leave a hole, and the
+    /// counter would move with them. Refused in every build with
+    /// [`JournalError::ReplicaSequenceMismatch`], the counter left where
+    /// it was.
+    #[inline]
+    pub fn adopt_sequence(&mut self, seq: u64) -> Result<u64, JournalError> {
+        if seq != self.next_sequence {
+            return Err(JournalError::ReplicaSequenceMismatch {
+                expected: self.next_sequence,
+                actual: seq,
+            });
+        }
+        Ok(self.allocate_sequence())
+    }
+
     /// Encode a single event with a pre-assigned sequence number into
     /// `dst`, appending at the batch's current offset.
     ///
     /// Does not advance the internal sequence counter — the caller
     /// owns sequencing (via [`allocate_sequence`](Self::allocate_sequence)
-    /// on the primary or [`set_next_sequence`](Self::set_next_sequence)
-    /// on a replica). The entry's raw bytes are absorbed into the
-    /// segment hash chain; nothing else is emitted — the chain has no
-    /// in-stream metadata.
+    /// on the primary or [`adopt_sequence`](Self::adopt_sequence) on a
+    /// replica). The entry's raw bytes are absorbed into the segment
+    /// hash chain; nothing else is emitted — the chain has no in-stream
+    /// metadata.
+    ///
+    /// `seq` must exceed every sequence encoded before it, or the entry
+    /// is refused with [`JournalError::SequenceRegression`]: written, it
+    /// would make the journal unrecoverable.
     ///
     /// `dst` must have [`entry_size::<E>()`](entry_size) bytes free past
     /// [`batch_len`](Self::batch_len) — the encoder cannot grow a
@@ -245,6 +267,9 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// and is refused rather than silently truncated. It must also be
     /// the same buffer used for the rest of the batch (see the type
     /// docs).
+    ///
+    /// A refused entry, for either reason, leaves the encoder exactly as
+    /// it was, so the caller can retry it.
     pub fn encode_event(
         &mut self,
         dst: &mut [u8],
@@ -253,15 +278,11 @@ impl<E: AppEvent> JournalEncoder<E> {
         event: &JournalEvent<E>,
         key_hash: u64,
     ) -> Result<(), JournalError> {
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                seq > self.last_encoded_seq,
-                "encode_event: seq {seq} <= last_encoded_seq {} — \
-                 this would emit a duplicate/backward sequence",
-                self.last_encoded_seq
-            );
-            self.last_encoded_seq = seq;
+        if seq <= self.last_encoded_seq {
+            return Err(JournalError::SequenceRegression {
+                sequence: seq,
+                last_encoded: self.last_encoded_seq,
+            });
         }
 
         let written = codec::encode(seq, timestamp_ns, key_hash, event, &mut self.buffer)?;
@@ -291,6 +312,8 @@ impl<E: AppEvent> JournalEncoder<E> {
         dst[offset..offset + written].copy_from_slice(&self.buffer[..written]);
         self.last_user_entry_len = written;
         self.batch_len += written;
+        // Only now: an entry refused above must stay encodable.
+        self.last_encoded_seq = seq;
 
         Ok(())
     }
@@ -319,17 +342,6 @@ impl<E: AppEvent> JournalEncoder<E> {
     /// call will return.
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
-    }
-
-    /// Set the next sequence number — used by the replica receiver to
-    /// keep the counter aligned with primary-assigned sequences.
-    pub fn set_next_sequence(&mut self, seq: u64) {
-        debug_assert!(
-            seq >= self.next_sequence,
-            "set_next_sequence({seq}) moves counter backward from {}",
-            self.next_sequence
-        );
-        self.next_sequence = seq;
     }
 
     /// First sequence of the active segment (the header's
@@ -507,5 +519,138 @@ mod tests {
     #[test]
     fn narrow_events_reserve_far_less_than_the_ceiling() {
         assert!(entry_size::<VarEvent>() < MAX_ENTRY_SIZE / 4);
+    }
+
+    const EVENT: JournalEvent<TinyEvent> = JournalEvent::App(TinyEvent);
+
+    fn encoder_from(first: u64) -> JournalEncoder<TinyEvent> {
+        JournalEncoder::new(first, [7u8; 32])
+    }
+
+    /// Room for a few entries: the destination a caller reserves.
+    fn destination() -> Vec<u8> {
+        vec![0u8; 4 * entry_size::<TinyEvent>()]
+    }
+
+    /// Audit finding 37: the guard used to be a `debug_assert!`, so a
+    /// release build journaled a repeated or backward sequence and the
+    /// journal then refused to recover. Refused in every build now, and
+    /// the refusal writes nothing.
+    #[test]
+    fn a_repeated_or_backward_sequence_is_refused() {
+        let mut encoder = encoder_from(1);
+        let mut dst = destination();
+        encoder.encode_event(&mut dst, 1, 0, &EVENT, 0).unwrap();
+        encoder.encode_event(&mut dst, 2, 0, &EVENT, 0).unwrap();
+        let before = (encoder.batch_len(), encoder.chain_hash());
+        let bytes_before = dst.clone();
+        for seq in [2, 1, 0] {
+            assert!(
+                matches!(
+                    encoder.encode_event(&mut dst, seq, 0, &EVENT, 0),
+                    Err(JournalError::SequenceRegression { sequence, last_encoded: 2 })
+                        if sequence == seq
+                ),
+                "sequence {seq} after 2"
+            );
+        }
+        assert_eq!(
+            (encoder.batch_len(), encoder.chain_hash()),
+            before,
+            "a refused entry leaves the batch and the chain untouched"
+        );
+        assert_eq!(dst, bytes_before, "a refused entry writes nothing");
+        encoder
+            .encode_event(&mut dst, 3, 0, &EVENT, 0)
+            .expect("the next sequence still encodes");
+    }
+
+    /// The guard starts below the segment's first sequence, not at zero,
+    /// and a new segment continues it rather than resetting it: rotation
+    /// continues the sequence.
+    #[test]
+    fn the_guard_starts_at_the_first_sequence_and_survives_rotation() {
+        let mut encoder = encoder_from(5);
+        let mut dst = destination();
+        assert!(matches!(
+            encoder.encode_event(&mut dst, 4, 0, &EVENT, 0),
+            Err(JournalError::SequenceRegression {
+                sequence: 4,
+                last_encoded: 4
+            })
+        ));
+        encoder.encode_event(&mut dst, 5, 0, &EVENT, 0).unwrap();
+        encoder.clear_batch();
+
+        encoder.begin_segment(6, [9u8; 32]);
+        assert!(matches!(
+            encoder.encode_event(&mut dst, 5, 0, &EVENT, 0),
+            Err(JournalError::SequenceRegression {
+                sequence: 5,
+                last_encoded: 5
+            })
+        ));
+        encoder
+            .encode_event(&mut dst, 6, 0, &EVENT, 0)
+            .expect("the new segment's first sequence encodes");
+    }
+
+    /// A resumed encoder guards from the recovered tail, not from zero.
+    #[test]
+    fn a_resumed_encoder_guards_from_the_recovered_tail() {
+        let entry_offset = crate::codec::ENTRY_OFFSET;
+        // An empty entry range: the chain rebuild reads nothing (the file
+        // need not exist), so the guard is all this exercises.
+        let path = std::path::Path::new("/nonexistent/resume.journal");
+        let mut encoder =
+            JournalEncoder::<TinyEvent>::resume(path, 1, [7u8; 32], 9, entry_offset).unwrap();
+        assert!(matches!(
+            encoder.encode_event(&mut destination(), 9, 0, &EVENT, 0),
+            Err(JournalError::SequenceRegression {
+                sequence: 9,
+                last_encoded: 9
+            })
+        ));
+        encoder
+            .encode_event(&mut destination(), 10, 0, &EVENT, 0)
+            .expect("the sequence after the tail encodes");
+    }
+
+    /// The guard advances only once an entry is actually encoded: an
+    /// entry refused for lack of room must still encode, under the same
+    /// sequence, into a destination that has room.
+    #[test]
+    fn an_entry_refused_for_space_stays_encodable() {
+        let mut encoder = encoder_from(1);
+        let mut short = vec![0u8; 1];
+        assert!(matches!(
+            encoder.encode_event(&mut short, 1, 0, &EVENT, 0),
+            Err(JournalError::Io(_))
+        ));
+        encoder
+            .encode_event(&mut destination(), 1, 0, &EVENT, 0)
+            .expect("the same sequence encodes into a destination with room");
+    }
+
+    /// A replica adopts the primary's sequence only if it is the next
+    /// one. A repeat, a step back and a skip ahead are all refused, and
+    /// none of them moves the counter.
+    #[test]
+    fn adopting_a_sequence_requires_the_next_one() {
+        let mut encoder = encoder_from(3);
+        assert_eq!(encoder.adopt_sequence(3).unwrap(), 3);
+        assert_eq!(encoder.next_sequence(), 4);
+        for seq in [3, 2, 5] {
+            assert!(
+                matches!(
+                    encoder.adopt_sequence(seq),
+                    Err(JournalError::ReplicaSequenceMismatch { expected: 4, actual })
+                        if actual == seq
+                ),
+                "sequence {seq} when 4 is next"
+            );
+            assert_eq!(encoder.next_sequence(), 4, "a refusal leaves the counter");
+        }
+        assert_eq!(encoder.adopt_sequence(4).unwrap(), 4);
     }
 }

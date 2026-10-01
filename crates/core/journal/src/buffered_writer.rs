@@ -138,11 +138,11 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// Encode a single event with a pre-assigned sequence number.
     ///
     /// Does not advance the internal sequence counter — the caller
-    /// owns sequencing (via [`allocate_sequence`](Self::allocate_sequence)
-    /// on the primary or [`set_next_sequence`](Self::set_next_sequence)
-    /// on a replica). The entry's raw bytes are absorbed into the
-    /// segment hash chain; nothing else is emitted — the chain has no
-    /// in-stream metadata.
+    /// owns sequencing, via [`allocate_sequence`](Self::allocate_sequence).
+    /// A sequence at or below one already encoded is refused (see
+    /// [`JournalEncoder::encode_event`](crate::encoder::JournalEncoder::encode_event)).
+    /// The entry's raw bytes are absorbed into the segment hash chain;
+    /// nothing else is emitted — the chain has no in-stream metadata.
     pub fn encode_event(
         &mut self,
         seq: u64,
@@ -200,12 +200,6 @@ impl<E: AppEvent> BufferedWriter<E> {
 
     pub fn next_sequence(&self) -> u64 {
         self.encoder.next_sequence()
-    }
-
-    /// Set the next sequence number — used by the replica receiver to
-    /// keep the writer's counter aligned with primary-assigned sequences.
-    pub fn set_next_sequence(&mut self, seq: u64) {
-        self.encoder.set_next_sequence(seq);
     }
 
     /// Current byte offset of the next entry. Always equal to

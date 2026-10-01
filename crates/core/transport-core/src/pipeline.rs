@@ -1175,7 +1175,7 @@ impl<E: AppEvent> Sequencer<E> {
                     let next_read = self.consumer.next_read();
                     self.core.submit_batch(next_read)?;
                 }
-                self.drain_remaining();
+                self.drain_remaining()?;
                 self.core
                     .utilization
                     .busy
@@ -1238,8 +1238,12 @@ impl<E: AppEvent> Sequencer<E> {
                 // on the primary: when `slot.sequence == 0` (every primary-
                 // side input) we allocate at encode time in disruptor cursor
                 // order. On replicas the replication receiver stamps the
-                // primary's sequence onto `slot.sequence` before publish, and
-                // we use it verbatim (also syncing the writer's counter).
+                // primary's sequence onto `slot.sequence` before publish,
+                // and we adopt it: it must be exactly the next one, or the
+                // stage fails before writing it (`adopt_sequence`) — a
+                // replica must never journal an entry twice or leave a
+                // hole, whatever the session upstream did. One compare
+                // per entry, in every build (audit finding 37).
                 // Encoding always runs — under no-persist the bytes still
                 // populate `batch_buf` so replication can publish them, and
                 // sequence allocation must happen so downstream stages see
@@ -1267,8 +1271,7 @@ impl<E: AppEvent> Sequencer<E> {
                             continue;
                         }
                         let seq = if slot.sequence != 0 {
-                            self.core.encoder.set_next_sequence(slot.sequence + 1);
-                            slot.sequence
+                            self.core.encoder.adopt_sequence(slot.sequence)?
                         } else {
                             self.core.encoder.allocate_sequence()
                         };
@@ -1286,10 +1289,12 @@ impl<E: AppEvent> Sequencer<E> {
                                 &slot.event,
                                 slot.key_hash,
                             )
-                            .map_err(|e| {
-                                JournalError::Io(std::io::Error::other(format!(
-                                    "journal encode (sequencer, seq {seq}): {e}"
-                                )))
+                            .map_err(|e| match e {
+                                // Already names the sequence; kept typed.
+                                JournalError::SequenceRegression { .. } => e,
+                                other => JournalError::Io(std::io::Error::other(format!(
+                                    "journal encode (sequencer, seq {seq}): {other}"
+                                ))),
                             })?;
                         let journal_slice = self
                             .core
@@ -1466,10 +1471,20 @@ impl<E: AppEvent> Sequencer<E> {
     /// That misframes the local journal but loses nothing — the entries
     /// are intact and the reconnect handshake detects the framing
     /// mismatch (segment-scoped chains differ), archiving the journal
-    /// and re-seeding from the primary. Honoring marks here would need
-    /// the full barrier machinery on a path that must never fail;
-    /// self-healing via resync is the safer trade.
-    fn drain_remaining(&mut self) {
+    /// and re-seeding from the primary. Honoring marks here would bring
+    /// the full barrier machinery (mid-batch splits, quiesced rotation,
+    /// adoption retries) into a teardown path, for a race the resync
+    /// already heals; self-healing via resync is the simpler trade.
+    ///
+    /// Fails closed, as the steady-state loop does: the first entry that
+    /// cannot be claimed, adopted or encoded, or a batch that cannot be
+    /// handed over, stops the drain with that error. The matching stage
+    /// has already applied every slot, so skipping one and journaling
+    /// the rest after it would leave a hole in the journal that the
+    /// application's state does not have (audit finding 24). As an
+    /// error, it reaches the teardown as a failed journal, so a
+    /// promotion refuses to build a primary on the resulting state.
+    fn drain_remaining(&mut self) -> Result<(), JournalError> {
         loop {
             // Borrowed in place, like the steady-state loop. A run that
             // stops at the ring's wrap point just means one extra
@@ -1479,7 +1494,7 @@ impl<E: AppEvent> Sequencer<E> {
             // drain encodes into a claimed chunk too.
             let slots = self.consumer.read_contiguous(Self::MAX_BATCH);
             if slots.is_empty() {
-                break;
+                return Ok(());
             }
             let read_end = read_start + slots.len() as u64;
             for slot in slots {
@@ -1489,27 +1504,21 @@ impl<E: AppEvent> Sequencer<E> {
                     // before the sentinel was consumed — skip it.
                     continue;
                 }
+                // Same sequencing as the steady-state loop.
                 let seq = if slot.sequence != 0 {
-                    self.core.encoder.set_next_sequence(slot.sequence + 1);
-                    slot.sequence
+                    self.core.encoder.adopt_sequence(slot.sequence)?
                 } else {
                     self.core.encoder.allocate_sequence()
                 };
-                if let Err(e) = self.core.claim_slot() {
-                    tracing::error!(error = %e, "journal hand-off failed on drain");
-                    return;
-                }
+                self.core.claim_slot()?;
                 let chunk = self.core.claim.as_mut().expect("claimed above");
-                if let Err(e) = self.core.encoder.encode_event(
+                self.core.encoder.encode_event(
                     chunk.bytes_mut(),
                     seq,
                     slot.timestamp_ns,
                     &slot.event,
                     slot.key_hash,
-                ) {
-                    tracing::error!(error = %e, "journal encode error on drain");
-                    continue;
-                }
+                )?;
                 let journal_slice = self
                     .core
                     .encoder
@@ -1520,10 +1529,7 @@ impl<E: AppEvent> Sequencer<E> {
             // Hand the batch over exactly as the steady-state path
             // does — replication frame first, then the slot carrying
             // the cursors. `finish` waits for it to become durable.
-            if let Err(e) = self.core.submit_batch(read_end) {
-                tracing::error!(error = %e, "journal hand-off failed on drain");
-                return;
-            }
+            self.core.submit_batch(read_end)?;
         }
     }
 

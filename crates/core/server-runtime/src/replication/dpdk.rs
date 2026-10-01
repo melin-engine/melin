@@ -27,10 +27,11 @@ use super::receiver_transport::{
 };
 use super::validation_worker::ValidationWorker;
 use super::{
-    AfterSession, ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles,
-    ReplicationMetrics, ResyncDecision, SentHighWater, build_replica_pipeline_with_threads,
-    handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_then_double_backoff,
-    take_pipeline_for_promotion, teardown_replica_pipeline,
+    ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles, ReplicationMetrics,
+    ResumePoint, ResyncDecision, SentHighWater, build_replica_pipeline_with_threads,
+    handle_resync_verdict, handle_session_exit, journal_failed_while_disconnected,
+    recover_replica_state, sleep_then_double_backoff, take_pipeline_for_promotion,
+    teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
 use melin_transport_core::replication::catchup::{
@@ -1203,11 +1204,48 @@ where
         // kernel-TCP receiver). Taken once the journal covers what the
         // last session published (see `settled_resume_point`).
         if let Some(p) = pipeline.as_ref() {
-            let fsync_state = p.settled_resume_point(|| {
-                shutdown.load(Ordering::Relaxed) || promote.is_requested()
-            });
-            last_sequence = fsync_state.journal_seq.get();
-            chain_hash = fsync_state.chain_hash;
+            match p
+                .settled_resume_point(|| shutdown.load(Ordering::Relaxed) || promote.is_requested())
+            {
+                ResumePoint::Settled(fsync_state) => {
+                    last_sequence = fsync_state.journal_seq.get();
+                    chain_hash = fsync_state.chain_hash;
+                }
+                // Handled just below, before any handshake.
+                ResumePoint::Interrupted => {}
+                // Torn down here rather than dialing the primary with a
+                // pipeline that cannot take the session — as the
+                // kernel-TCP receiver does.
+                ResumePoint::JournalFailed => {
+                    let after = handle_session_exit(
+                        journal_failed_while_disconnected(),
+                        &mut pipeline,
+                        &mut divergence_resyncs,
+                        &mut backoff,
+                        last_sequence,
+                        journal_path,
+                        &snapshot_path,
+                        &fence_state,
+                        shutdown,
+                        promote,
+                        // No session is open: the last one's socket was
+                        // closed by its own exit dispatch.
+                        || {},
+                        sizing,
+                    );
+                    // A fatal exit never keeps the pipeline, so going
+                    // round again dials only after a resync or not at all.
+                    if let Some(r) = after.adopt(
+                        &mut app,
+                        &mut journal_writer,
+                        &mut last_sequence,
+                        &mut chain_hash,
+                    ) {
+                        return r;
+                    }
+                    continue;
+                }
+            }
         }
 
         // Sole authority for shutdown/promote while disconnected: every
@@ -1597,7 +1635,7 @@ where
         };
 
         primary_link_up.store(false, Ordering::Release);
-        match handle_session_exit(
+        let after = handle_session_exit(
             result,
             &mut pipeline,
             &mut divergence_resyncs,
@@ -1618,21 +1656,14 @@ where
             // fresh one, so skipping it leaks one entry per disconnect.
             || transport.close(handle),
             sizing,
+        );
+        if let Some(r) = after.adopt(
+            &mut app,
+            &mut journal_writer,
+            &mut last_sequence,
+            &mut chain_hash,
         ) {
-            AfterSession::Return(r) => return r,
-            AfterSession::Resync {
-                app: ex,
-                journal_writer: wr,
-                last_sequence: seq,
-                chain_hash: hash,
-            } => {
-                app = ex;
-                journal_writer = wr;
-                last_sequence = seq;
-                chain_hash = hash;
-                continue;
-            }
-            AfterSession::Reconnect => {}
+            return r;
         }
     }
 }

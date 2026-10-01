@@ -22,9 +22,10 @@ use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
 use super::{
-    AfterSession, ReplicaPipelineHandles, ResyncDecision, build_replica_pipeline_with_threads,
-    handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_then_double_backoff,
-    take_pipeline_for_promotion, teardown_replica_pipeline,
+    ReplicaPipelineHandles, ResumePoint, ResyncDecision, build_replica_pipeline_with_threads,
+    handle_resync_verdict, handle_session_exit, journal_failed_while_disconnected,
+    recover_replica_state, sleep_then_double_backoff, take_pipeline_for_promotion,
+    teardown_replica_pipeline,
 };
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_transport_core::replication::protocol::{
@@ -622,11 +623,46 @@ where
             // is indistinguishable from divergence (false resync of a
             // healthy replica). Taken once the journal covers what the
             // last session published (see `settled_resume_point`).
-            let fsync_state = p.settled_resume_point(|| {
-                shutdown.load(Ordering::Relaxed) || promote.is_requested()
-            });
-            last_sequence = fsync_state.journal_seq.get();
-            chain_hash = fsync_state.chain_hash;
+            match p
+                .settled_resume_point(|| shutdown.load(Ordering::Relaxed) || promote.is_requested())
+            {
+                ResumePoint::Settled(fsync_state) => {
+                    last_sequence = fsync_state.journal_seq.get();
+                    chain_hash = fsync_state.chain_hash;
+                }
+                // Handled just below, before any handshake.
+                ResumePoint::Interrupted => {}
+                // Torn down here rather than dialing the primary with a
+                // pipeline that cannot take the session.
+                ResumePoint::JournalFailed => {
+                    let after = handle_session_exit(
+                        journal_failed_while_disconnected(),
+                        &mut pipeline,
+                        &mut divergence_resyncs,
+                        &mut backoff,
+                        last_sequence,
+                        journal_path,
+                        &snapshot_path,
+                        &fence_state,
+                        shutdown,
+                        promote,
+                        // No session is open.
+                        || {},
+                        sizing,
+                    );
+                    // A fatal exit never keeps the pipeline, so going
+                    // round again dials only after a resync or not at all.
+                    if let Some(r) = after.adopt(
+                        &mut app,
+                        &mut journal_writer,
+                        &mut last_sequence,
+                        &mut chain_hash,
+                    ) {
+                        return r;
+                    }
+                    continue;
+                }
+            }
         }
 
         // Sole authority for shutdown/promote while disconnected: every
@@ -896,7 +932,7 @@ where
         };
 
         primary_link_up.store(false, Ordering::Release);
-        match handle_session_exit(
+        let after = handle_session_exit(
             result,
             &mut pipeline,
             &mut divergence_resyncs,
@@ -912,21 +948,14 @@ where
             // replaces it.
             || {},
             sizing,
+        );
+        if let Some(r) = after.adopt(
+            &mut app,
+            &mut journal_writer,
+            &mut last_sequence,
+            &mut chain_hash,
         ) {
-            AfterSession::Return(r) => return r,
-            AfterSession::Resync {
-                app: ex,
-                journal_writer: wr,
-                last_sequence: seq,
-                chain_hash: hash,
-            } => {
-                app = ex;
-                journal_writer = wr;
-                last_sequence = seq;
-                chain_hash = hash;
-                continue;
-            }
-            AfterSession::Reconnect => {}
+            return r;
         }
     }
 }
@@ -2165,6 +2194,69 @@ mod tests {
             // Streaming again, so shutdown finds the receiver in a session
             // rather than waiting on the primary's answer.
             stream_start(&mut s2, h2.last_sequence, lineage);
+            stop(replica, &shutdown);
+        }
+
+        /// The journal stage dies after a session has ended, while the
+        /// reconnect waits for it to cover the ring: entries 2 and 3 are
+        /// held by the group-commit delay past the backoff that follows a
+        /// stream gap, and the chain check announced between them carries
+        /// a hash the replica's chain cannot match, so the stage fails
+        /// before any of them is handed to the disk. The loop must take
+        /// the fatal path there (here, the in-process divergence resync)
+        /// before dialing, so the next session runs on the pipeline
+        /// rebuilt from disk and journals what it is sent. Dialing with
+        /// the dead pipeline instead would claim the same position (entry
+        /// 1 was durable before the failure) but hand the session a
+        /// journal stage that can take nothing: it would exit at once and
+        /// never acknowledge entry 2.
+        #[cfg(feature = "hash-chain")]
+        #[test]
+        fn a_journal_that_dies_while_disconnected_is_torn_down_before_dialing() {
+            use melin_transport_core::replication::protocol::encode_chain_check;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_, lineage) = primary_journal(dir.path());
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            // Longer than the 1 s backoff after a stream gap, with room
+            // to spare, so the failure lands inside the reconnect's wait.
+            let delay = Duration::from_millis(2_500);
+            let replica = spawn_replica(
+                dir.path(),
+                listener.local_addr().expect("addr"),
+                delay,
+                &shutdown,
+            );
+
+            let (mut s1, _s1r, h1) = next_handshake(&listener);
+            assert_eq!(h1.last_sequence, 0, "fresh replica handshake");
+            stream_start(&mut s1, 0, lineage);
+            send_entries(&mut s1, &[1]);
+            wait_for_ack(&mut s1, 1);
+            // Entry 2, a chain check at 2 no replica chain can match,
+            // entry 3, then 5: the gap ends the session at once, with 2
+            // and 3 still unwritten.
+            send_entries(&mut s1, &[2]);
+            let mut buf = Vec::new();
+            encode_chain_check(2, &[0xEE; 32], &mut buf);
+            s1.write_all(&buf).expect("ChainCheck");
+            send_entries(&mut s1, &[3]);
+            send_entries(&mut s1, &[5]);
+
+            let (mut s2, _s2r, h2) = next_handshake(&listener);
+            assert_eq!(
+                h2.last_sequence, 1,
+                "the first dial after the journal died claims what is on disk"
+            );
+            // The discriminating step: only a rebuilt pipeline journals
+            // and acknowledges entry 2 (after the group-commit delay).
+            // The dead one would end the session unacknowledged, failing
+            // the read below on EOF or its timeout.
+            stream_start(&mut s2, h2.last_sequence, lineage);
+            send_entries(&mut s2, &[2]);
+            wait_for_ack(&mut s2, 2);
             stop(replica, &shutdown);
         }
 
