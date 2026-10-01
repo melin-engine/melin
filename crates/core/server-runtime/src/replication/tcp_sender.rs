@@ -669,10 +669,11 @@ fn handle_replica_connection<A: Application>(
     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
 
     // Signal that this replica is ready to consume from the replication
-    // ring. The main thread waits on this before seeding test data.
-    // Must happen AFTER catch-up and overlap drain complete — otherwise
-    // seeding fills the replication ring faster than we can drain it,
-    // deadlocking the journal stage.
+    // ring. A primary that began a new history waits on this (its
+    // bring-up gate) before serving clients, so it must be set only
+    // AFTER catch-up and overlap drain complete: the first client write
+    // then finds a replica streaming live rather than one still catching
+    // up.
     replica_ready.store(true, Ordering::Release);
 
     let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);

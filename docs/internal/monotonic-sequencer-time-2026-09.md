@@ -18,10 +18,16 @@ Findings that confirm, sharpen or correct the roadmap entry.
 
 - **The input ring has one producer at a time, handed off in sequence.**
   On a primary, `run_as_primary` publishes the promotion `EpochBump` and
-  then the startup events (`journal_startup_events`) through
-  `input_producer`, then moves that producer into the reader thread
-  (`spawn_reader`) or the DPDK poll loop (`run_dpdk_poll`). Nothing
-  publishes concurrently. The roadmap's open design question (how the
+  then the `on_primary` startup events (`journal_on_primary_events`)
+  through `input_producer`, then moves that producer into the reader
+  thread (`spawn_reader`) or the DPDK poll loop (`run_dpdk_poll`).
+  Nothing publishes concurrently. Genesis is the one exception to "every
+  journaled event goes through the producer": `init_engine` writes it
+  into a new journal before the pipeline exists
+  (`journaled_app::write_genesis_journal`), every event stamped with one
+  wall-clock read, so the clock's design must cover it separately: its
+  stamps are the first of the lineage, and the floor the primary's clock
+  is later seeded from (step 2) starts at them. The roadmap's open design question (how the
   producers other than the reader share one last-issued value) therefore
   has a simple answer: the clock travels with the producer.
 - **Client events are published through the ring's batch API.**
@@ -446,8 +452,11 @@ One commit per step, each reviewable on its own.
    `SequencerClock` with its compile-time time source and the jump
    guard (decision 5, without the admin command yet), and the producer
    wrapper over `publish`, `try_publish` and the batch API. The reader,
-   the DPDK poll loop, `journal_startup_events`, the epoch bump and the
-   test helpers publish through it, and the frame decoder stops
+   the DPDK poll loop, `journal_on_primary_events`, the epoch bump and
+   the test helpers publish through it (genesis, written by
+   `write_genesis_journal` before the producer exists, takes the clock's
+   rule directly: equal stamps within it must become strictly
+   increasing), and the frame decoder stops
    stamping. Replaces the separate tick clamp state in `tick.rs`,
    `reader.rs` and `dpdk_transport.rs`. Seeded at zero for now, so the
    only behaviour changes are strict increase within one process

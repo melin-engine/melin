@@ -56,8 +56,8 @@ The simplified diagram above shows the primary-side request path. The picture be
  |  Ticks)        |  the deadline passes     |
  +-------+--------+                          |
          |                                   |
-         | client requests + Tick{now_ns}    |  genesis /
-         |                                   |  on-primary events
+         | client requests + Tick{now_ns}    |  on-primary
+         |                                   |  events
          v                                   v
  +---------------------------------------------+
  |  INPUT RING -- disruptor, 1M InputSlot      |
@@ -151,7 +151,7 @@ The simplified diagram above shows the primary-side request path. The picture be
 | Thread / stage              | Ingress                                 | Egress                                                |
 |----------------------------|-----------------------------------------|-------------------------------------------------------|
 | Reader (primary)           | Client TCP/DPDK + cadence wakeup (wall-clock-cadenced, monotonic-clamped) | Client requests AND `JournalEvent::Tick` into the same input ring |
-| Startup events (primary, boot or promotion) | The application's genesis and on-primary events | Application events into the input ring, applied before the first client is served |
+| Startup events (primary, boot or promotion) | The application's on-primary events (genesis is written into a new journal as it is created, before the pipeline starts) | Application events into the input ring, applied before the first client is served |
 | Journal stage              | Input ring                              | Journal file; batch bytes into each replication ring  |
 | Matching stage             | Input ring                              | Application reports into output ring                  |
 | Shadow stage               | Input ring (gated on journal)           | Periodic `.snapshot` files                            |

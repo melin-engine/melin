@@ -3,7 +3,7 @@
 /// Events the runtime journals as a node takes up the primary role,
 /// before it serves its first client.
 ///
-/// They go through the journal like any client event, and that is the
+/// They go into the journal like any client event, and that is the
 /// point: replicas receive them in the stream, and every replay — from
 /// genesis, from a snapshot, on a promoted replica — applies them again,
 /// in order. Nothing the application's state depends on bypasses the
@@ -14,9 +14,19 @@
 pub struct StartupEvents<E> {
     /// The first events of the history: what every node's state starts
     /// from (reference data, initial balances, ...). Journaled once, by
-    /// the node that creates the journal as primary. A node that recovers
-    /// an existing journal, or follows a primary, already has them in its
-    /// history.
+    /// the node that creates the journal as primary, as part of creating
+    /// it: the journal appears complete with its genesis or not at all,
+    /// so a first boot that fails or crashes never leaves a history that
+    /// lacks it, and a replica can only copy one that has it. A node that
+    /// recovers an existing journal or restores a snapshot, or follows a
+    /// primary, already has them in its history, and journals nothing
+    /// from this field — changing it after the first boot changes
+    /// nothing.
+    ///
+    /// The exception is a journal with no entry at all — left by an
+    /// earlier release's refused first boot, or by a replica restarted on
+    /// a primary's flags before it received any entry: nothing was ever
+    /// served from it, so it gets this genesis.
     pub genesis: Vec<E>,
     /// Journaled every time a node becomes primary — after `genesis` on a
     /// new journal, on recovering an existing journal as primary, and

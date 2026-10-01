@@ -105,9 +105,11 @@ If no archives exist *and* no live segment exists, recovery falls through to the
 
 ### 4. Neither snapshot nor any journal file exists
 
-**Recovery flow:** Create a fresh live journal at sequence 1; journal the application's genesis events (its initial reference data) ahead of any client request.
+**Recovery flow:** Create a fresh live journal at sequence 1 with the application's genesis events (its initial reference data) already in it: the journal is written under a temporary name and renamed into place only once the genesis is on disk, so it never exists without its genesis. Then replay it like any other journal.
 
-**When:** First-ever startup.
+**When:** First-ever startup, including a retry after a first boot that failed or crashed before its journal was in place.
+
+A snapshot with no journal segment at all (the standard upgrade's layout) is not this case: the snapshot's state already includes the genesis, so the new segment continues from the snapshot and journals no genesis.
 
 ### 5. Crash during snapshot write
 

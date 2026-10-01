@@ -5,6 +5,9 @@
 //! the startup paths a server cares about:
 //!
 //! - [`create`](JournaledApp::create): fresh journal, fresh app.
+//! - [`write_genesis_journal`]: a fresh journal installed with its
+//!   genesis already in it, for [`recover`](JournaledApp::recover) to
+//!   replay — what the runtime does on a first boot.
 //! - [`recover`](JournaledApp::recover): replay the journal into a fresh
 //!   app.
 //! - [`recover_from_snapshot`](JournaledApp::recover_from_snapshot):
@@ -511,6 +514,124 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     }
 }
 
+/// Where [`write_genesis_journal`] builds a journal before installing it:
+/// `<live>.genesis-staging`, a sibling of the live segment, so the
+/// install is a same-directory rename. Not an archive name (archives
+/// are `<live>.NNNNNN`), so recovery never mistakes it for history.
+pub fn genesis_staging_path(live: &Path) -> std::path::PathBuf {
+    // `OsString::push`, not `with_extension`: the live path normally has
+    // an extension already, which `with_extension` would replace.
+    let mut s = live.as_os_str().to_owned();
+    s.push(".genesis-staging");
+    std::path::PathBuf::from(s)
+}
+
+/// Remove the [`genesis_staging_path`] file of the journal at
+/// `journal_path`, if there is one.
+///
+/// A staging file is what a first boot that crashed mid-genesis leaves.
+/// It was never installed, so nothing was served from it and no replica
+/// copied it: it is never history, whatever else is on disk. The runtime
+/// calls this on every boot, so an orphan does not outlive a later boot
+/// that takes another path (a snapshot dropped in, say) and never
+/// journals a genesis; [`write_genesis_journal`] calls it too, before it
+/// starts over.
+pub fn discard_genesis_staging(journal_path: &Path) -> Result<(), JournaledAppError> {
+    let staging = genesis_staging_path(journal_path);
+    match std::fs::remove_file(&staging) {
+        Ok(()) => {
+            tracing::warn!(
+                staging = %staging.display(),
+                "discarded the partial journal of an interrupted first boot"
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Create the journal at `journal_path` with `genesis` as its first
+/// entries, so that the journal appears at that path complete or not at
+/// all.
+///
+/// The journal is built at [`genesis_staging_path`], every genesis
+/// event is written and made durable there, and only then is the file
+/// renamed onto `journal_path` and the directory synced. A journal at
+/// the live path therefore always begins with the whole genesis: a boot
+/// that fails or crashes before the rename leaves no journal (a stale
+/// staging file, which the next attempt discards), and a boot that fails
+/// after it has nothing left to journal. That is what lets the runtime
+/// decide "genesis already journaled" from the journal's existence, and
+/// what keeps a replica, which can only copy an installed journal, from
+/// ever holding part of a genesis.
+///
+/// `anchor` is the chain anchor for the header: `None` for a brand-new
+/// lineage (random salt, as [`JournalWrite::create`]), `Some` to keep
+/// the anchor of an existing empty journal this one replaces, so any
+/// copy of that empty journal still chains to it.
+///
+/// Every entry is stamped with one timestamp, read once: genesis is the
+/// lineage's starting point, not a sequence of moments, and one value
+/// cannot run backwards inside it. Entries carry key hash 0, the node's
+/// own, as the runtime's other startup events do.
+///
+/// Writes nothing into an application: the caller recovers the installed
+/// journal, so genesis reaches the state through replay, the same path
+/// every later boot takes.
+pub fn write_genesis_journal<E, W>(
+    journal_path: &Path,
+    anchor: Option<[u8; 32]>,
+    genesis: Vec<E>,
+) -> Result<(), JournaledAppError>
+where
+    E: melin_app::AppEvent,
+    W: JournalWrite<E>,
+{
+    discard_genesis_staging(journal_path)?;
+    let staging = genesis_staging_path(journal_path);
+
+    let mut writer = match anchor {
+        None => W::create(&staging)?,
+        Some(anchor) => W::create_continuing(&staging, 1, anchor)?,
+    };
+    // Flushed in batches no larger than the pipeline's own, which the
+    // writer's batch buffer is sized for. Durability matters only at
+    // the end — the file is not installed before then — but each flush
+    // syncs: one sync per pipeline-sized batch, at first boot only.
+    let batch = crate::pipeline::max_journal_batch::<E>();
+    let timestamp_ns = melin_app::unix_epoch_nanos();
+    // `usize`: a count of in-memory events, bounded by the `Vec`'s length.
+    let mut count: usize = 0;
+    for event in genesis {
+        // A query changes nothing and the journal stage never writes one;
+        // replay assumes every entry is an `apply`. Skip it the same way.
+        if event.is_query() {
+            continue;
+        }
+        writer.batch_append_with_ts(&melin_journal::JournalEvent::App(event), timestamp_ns, 0)?;
+        count += 1;
+        if count.is_multiple_of(batch) {
+            writer.flush_batch_sync()?;
+        }
+    }
+    writer.flush_batch_sync()?;
+    drop(writer);
+
+    // The install. `rename` replaces an existing empty journal in one
+    // step, so a crash leaves either the old file or the complete new
+    // one; the directory sync makes the new name durable before anything
+    // is served from it.
+    std::fs::rename(&staging, journal_path)?;
+    melin_journal::segment::fsync_parent_dir(journal_path)?;
+    tracing::info!(
+        journal = %journal_path.display(),
+        genesis_events = count,
+        "journal created with its genesis"
+    );
+    Ok(())
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// Journal an event and apply it to the inner application in one
@@ -796,6 +917,89 @@ mod tests {
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(*recovered.app(), TestApp::new());
+    }
+
+    /// A genesis larger than one journal batch lands whole, in order,
+    /// under one timestamp and the node's key hash, and recovers into the
+    /// state it describes. Queries are skipped, as the journal stage
+    /// skips them.
+    #[test]
+    fn genesis_journal_holds_every_event_across_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.journal");
+        let n = 3 * crate::pipeline::max_journal_batch::<TestEvent>() as u64 + 7;
+        let mut genesis: Vec<TestEvent> = (1..=n).map(TestEvent::Add).collect();
+        genesis.insert(1, TestEvent::Query);
+
+        write_genesis_journal::<TestEvent, BufferedWriter<TestEvent>>(&path, None, genesis)
+            .unwrap();
+        assert!(!genesis_staging_path(&path).exists());
+
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        let mut seen = Vec::new();
+        // A set: only the number of distinct timestamps matters.
+        let mut stamps = std::collections::HashSet::new();
+        while let Some(entry) = reader.next_entry().unwrap() {
+            assert_eq!(entry.key_hash, 0, "genesis is the node's own");
+            stamps.insert(entry.timestamp_ns);
+            match entry.event {
+                JournalEvent::App(TestEvent::Add(k)) => seen.push(k),
+                other => panic!("unexpected entry {other:?}"),
+            }
+        }
+        assert_eq!(seen, (1..=n).collect::<Vec<_>>());
+        assert_eq!(stamps.len(), 1, "one timestamp for the whole genesis");
+
+        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        assert_eq!(recovered.app().total, n * (n + 1) / 2);
+        assert_eq!(recovered.next_sequence(), n + 1);
+    }
+
+    /// A staging file left by an interrupted attempt is discarded, and an
+    /// existing journal is replaced in one rename, keeping the anchor the
+    /// caller passes.
+    #[test]
+    fn genesis_journal_replaces_staging_leftovers_and_keeps_a_given_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.journal");
+        let staging = genesis_staging_path(&path);
+        let mut stale = BufferedWriter::<TestEvent>::create(&staging).unwrap();
+        stale
+            .append(&JournalEvent::App(TestEvent::Add(999)))
+            .unwrap();
+        drop(stale);
+        drop(BufferedWriter::<TestEvent>::create(&path).unwrap());
+        let anchor = melin_journal::segment::read_header_info(&path)
+            .unwrap()
+            .anchor_hash;
+
+        write_genesis_journal::<TestEvent, BufferedWriter<TestEvent>>(
+            &path,
+            Some(anchor),
+            vec![TestEvent::Add(2), TestEvent::Add(3)],
+        )
+        .unwrap();
+
+        assert!(!staging.exists());
+        let info = melin_journal::segment::read_header_info(&path).unwrap();
+        assert_eq!(info.anchor_hash, anchor);
+        assert_eq!(info.starting_sequence, 1);
+        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        assert_eq!(recovered.app().total, 5, "the stale prefix is gone");
+        assert_eq!(recovered.next_sequence(), 3);
+    }
+
+    /// The staging name is never read as an archive.
+    #[test]
+    fn genesis_staging_is_not_an_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.journal");
+        std::fs::write(genesis_staging_path(&path), b"").unwrap();
+        assert!(
+            melin_journal::segment::list_archives(&path)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A promoted primary writes an `EpochBump` as a journaled event. On

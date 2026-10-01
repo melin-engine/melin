@@ -423,6 +423,11 @@ Manual `PROMOTE` remains available at all times, including during a
 control-plane outage; whichever request is filed first wins, and a
 later duplicate cannot retarget an in-flight promotion.
 
+Whichever way it is requested, a promotion is refused, and the node
+exits with an error, when the replica holds less than the application's
+whole genesis — its primary was lost before it had copied it. See
+"Creating a Journal" in [journal.md](journal.md) for the recovery.
+
 Under auto-promotion the raft peer mesh also becomes an additional
 fencing channel: a serving primary whose peers advertise a higher
 fencing epoch self-fences and shuts down immediately, without waiting

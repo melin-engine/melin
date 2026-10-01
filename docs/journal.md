@@ -134,6 +134,21 @@ This avoids replaying the entire journal from genesis. Recovery time is proporti
 
 The chain-hash cross-check at the anchor sequence ensures the snapshot and the journal share the same history: it rejects a snapshot paired with another cluster's journal, a divergent history, or a journal whose entries up to the anchor were tampered with. A snapshot anchored exactly at a rotation boundary is verified against the successor segment's header anchor (which *is* the chain value at that boundary) — so the check holds even when the segment holding the anchor entry has been moved to cold storage.
 
+### Creating a Journal
+
+On its first boot, a primary creates the journal with the application's genesis events (its initial reference data) already in it. The journal is built under a temporary name next to the journal path (`<journal>.genesis-staging`), synced to disk, and only then renamed into place, so a journal at the configured path always begins with the complete genesis:
+
+- A first boot that fails or crashes before the rename leaves no journal. The next boot is still a first boot: it discards the temporary file and journals the genesis whole.
+- A first boot that fails after the rename (a port already in use, say) leaves a journal that already holds its genesis. The next boot recovers it and journals nothing more.
+
+Genesis is journaled only when a node starts a new history: no journal, archive or snapshot on disk. A node that recovers a journal or restores a snapshot already has the genesis in its state and never journals it again, whatever genesis it is configured with. The one exception is a journal holding no entry at all — which an earlier release could leave behind after a refused first boot, and which a replica holds if it is restarted as a primary before receiving anything from its primary: nothing was ever served from it, so the node journals its genesis into it (keeping its chain anchor) and logs a warning.
+
+A primary booting from a history that holds fewer entries than its genesis takes refuses to start, with an error naming both counts. A complete history never does: it holds the whole genesis at least. A shorter one holds only part of it — a first boot that crashed in the middle of its genesis under an earlier release, or a replica's journal copied before it had the whole genesis and then started with a primary's flags — and serving it would serve a state the application never configured. Start again from a new history — remove the journal, its archives and its snapshots, since a snapshot taken from the partial history holds the partial genesis too — or restart the node as a replica of a primary holding the whole history. The same refusal also catches a genesis configuration grown, since the history began, to more events than the whole history holds; changing the genesis of a running deployment has no effect, so set it back. A leftover `<journal>.genesis-staging` file is removed on every boot.
+
+Configuration a primary cannot run under, such as `--standalone` with an ack policy other than `disk`, is refused before the journal directory is touched. A replica's configuration is checked the same way at boot, since it is also the configuration it serves under once promoted.
+
+A replica copies the genesis from its primary like the rest of the history, entry by entry, so for a while after it first connects it holds only part of it. If the primary is lost before the replica has the whole genesis, the replica refuses promotion (`PROMOTE` or a raft election win) and exits with an error rather than serve a state the application never configured. Recover by restarting the original primary, whose journal holds the whole genesis; if it is gone, no node holds a complete history, and the cluster starts again from a new journal. The check compares the replica's history length against its own configured genesis, so every node of a cluster must run with the same genesis configuration — which a cluster needs anyway. For the same reason, a genesis configuration grown since the history began to more events than the whole history holds is refused too, even though no copy is partial: set the configuration back.
+
 ## Snapshots
 
 ### File Format
@@ -292,6 +307,8 @@ When changing the journal format (bumping `format_version`) or the application's
 1. **Take a snapshot** with the current (old) version. This captures the full application state at a known journal sequence.
 2. **Deploy the new version.**
 3. **Start fresh**: the new version creates a new journal file (new format) and loads the snapshot.
+   - The application's genesis is not journaled again: the snapshot's state already includes it, and the new journal continues from the snapshot with no entry of its own.
+   - The restarted node continues a history rather than beginning one, so it serves clients immediately, as after any restart. With replication enabled and an acknowledgement policy that requires a replica, it refuses writes until a replica reconnects.
    - The snapshot must be one the new version accepts. If the application's snapshot layout changed, the new version refuses the old `app_version`, and a one-time migration tool must convert the snapshot.
    - When *only* the snapshot layout changed — the journal format and the application's event encoding did not — and the journal is retained from sequence 1, this procedure is not needed: move the old snapshot aside and start the new version on the existing journal, which it replays from the start to rebuild its state.
 4. **Archive the old journal** for audit purposes. It can only be replayed by the old version.

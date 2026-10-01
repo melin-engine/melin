@@ -86,6 +86,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`JournalError` gains `ReplicaSequenceMismatch` and
   `SequenceRegression`,** for the sequence refusals under Fixed.
   Source-breaking for code that matches on `JournalError` exhaustively.
+- **Genesis is journaled as the journal is created, not through the
+  pipeline** (see the genesis fixes under Fixed). Visible effects: the
+  first replica of a new cluster copies the genesis by catch-up, as it
+  copies the rest of the history, rather than live — a new primary still
+  holds its clients until that replica attaches, but the genesis is
+  durable before it waits; every genesis event carries the same
+  timestamp, the moment the journal was created; the genesis reaches the
+  application by replay, so a new primary's `Application::prefault` runs
+  before the genesis and again before it serves, as on a recovering
+  primary; and the genesis's reports are not published on the event
+  feed. In `melin-transport-core`, `journaled_app::write_genesis_journal`
+  creates a journal this way, `journaled_app::genesis_staging_path`
+  names its temporary file and `journaled_app::discard_genesis_staging`
+  removes one an interrupted boot left behind.
 
 ### Fixed
 
@@ -156,6 +170,40 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   before the stack sees them, and frames it leaves unchecked are verified
   in software. The policy is `melin_dpdk::rx_checksum`, built without
   `dpdk-sys` too; `DpdkDevice::rx_checksum_drops` counts the drops.
+- **Starting from a snapshot alone applied the genesis twice.** A node
+  with a snapshot and no journal segment — the layout the standard
+  upgrade (snapshot, deploy, fresh journal) produces — restored the
+  snapshot, whose state already held the genesis, and then journaled the
+  genesis again; replicas followed. Only a node with nothing on disk now
+  journals genesis.
+- **A first boot that failed after creating the journal lost the
+  genesis for good.** The journal was created before the boot checked
+  its configuration, bound its listeners and journaled the genesis, and
+  the next boot took the journal's existence to mean the genesis was in
+  it. A refused `--standalone` (under any ack policy but `disk`), a port
+  in use, a shutdown while a fresh primary waited for its first replica,
+  or a crash in the middle of the genesis left a node serving without
+  its genesis, or with part of it, with no error, and replicas — and a
+  replica promoted later — followed it. The journal is now created with
+  the genesis already in it: written under a temporary name and renamed
+  into place once it is on disk, so it exists complete or not at all,
+  and a boot that fails before the rename is retried as a first boot; a
+  shutdown while a new primary waits for its first replica now finds the
+  genesis already durable.
+  Configuration a primary cannot run under is refused before the journal
+  directory is touched, on replicas too, which serve under it once
+  promoted. A replica whose primary was lost before it had copied the
+  whole genesis now refuses promotion, and exits with an error, instead
+  of serving a genesis prefix, and a primary booting from a history
+  shorter than its genesis — an earlier release's first boot that
+  crashed mid-genesis, or a replica's partial copy started on a
+  primary's flags — refuses to start. A journal with no entry at all,
+  which an earlier release left after such a failure (or a replica
+  restarted on a primary's flags before receiving anything), gets its
+  genesis on the next boot, with a warning; a journal holding at least as many
+  entries as the genesis is recovered as it is. A temporary genesis file
+  left by an interrupted first boot is removed on the next boot,
+  whichever way it starts.
 
 ## [0.18.0] - 2026-09-27
 
