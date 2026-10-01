@@ -92,7 +92,16 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 pub const FORMAT_VERSION: u16 = 15;
 
 /// Entry magic bytes for corruption/misalignment detection.
-const ENTRY_MAGIC: u16 = 0x4A45;
+///
+/// Public because the entry CRC covers it: replication ships each entry
+/// without its magic but with its CRC, and a receiver that wants to tell
+/// whether the bytes it holds are the ones that CRC was computed over has
+/// to put the magic back in front of them.
+pub const ENTRY_MAGIC: u16 = 0x4A45;
+
+/// Width of [`ENTRY_MAGIC`] at the head of every entry — what replication
+/// strips from an entry to form its wire slot.
+pub const ENTRY_MAGIC_SIZE: usize = core::mem::size_of::<u16>();
 
 // --- Wire structs ---
 //
@@ -204,8 +213,9 @@ pub(crate) const ENTRY_HEADER_SIZE: usize = core::mem::size_of::<EntryHeader>();
 /// wire) need this constant.
 pub const ENTRY_META_SIZE: usize = core::mem::size_of::<EntryMetadata>();
 
-/// CRC32C checksum size in bytes.
-pub(crate) const CRC_SIZE: usize = 4;
+/// CRC32C checksum size in bytes. Public because the entry CRC also
+/// rides each replication slot (see [`ENTRY_MAGIC`]).
+pub const CRC_SIZE: usize = 4;
 
 /// Bytes every entry costs regardless of its payload: header (20) +
 /// metadata (9) + CRC (4) = 33.

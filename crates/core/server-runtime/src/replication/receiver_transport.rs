@@ -19,7 +19,8 @@ use melin_app::AppEvent;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
-    Ack, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message, try_decode_input_batch_into,
+    Ack, InputBatchError, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
+    try_decode_input_batch_into,
 };
 
 use super::{PendingAckQueue, try_flush_dual_track};
@@ -226,10 +227,11 @@ fn queue_stream_mark(
 
 /// Why [`process_streaming_frames`] stopped consuming frames.
 ///
-/// Two outcomes that both end the session but must not be handled the
-/// same way: a contiguity break is a *stream* problem the replica
-/// recovers from by re-handshaking at its durable position, whereas a
-/// protocol violation or journal death is unrecoverable in-process.
+/// Outcomes that all end the session but must not be handled the same
+/// way: a contiguity break or a damaged frame is a *stream* problem the
+/// replica recovers from by re-handshaking at its durable position,
+/// whereas a protocol violation or journal death is unrecoverable
+/// in-process.
 #[derive(Debug)]
 pub(super) enum FrameError {
     /// The wire stream skipped past the contiguous prefix — a slot at
@@ -237,6 +239,15 @@ pub(super) enum FrameError {
     /// stream position. Everything before the gap is committed; the
     /// local journal is intact. Reconnect and re-handshake.
     SequenceGap(Box<dyn std::error::Error + Send + Sync>),
+    /// An `InputBatch` frame was damaged on the way: a slot's bytes are
+    /// not the ones the primary journaled, or the frame's structure no
+    /// longer holds together ([`InputBatchError::is_transit_damage`]).
+    /// The whole frame is refused —
+    /// nothing in it reaches the input ring, so nothing in it is applied,
+    /// journaled or acknowledged — and everything before it is committed.
+    /// The primary still holds the intact entries, so the cure is the
+    /// same as for a gap: reconnect and have them sent again.
+    Corrupted(Box<dyn std::error::Error + Send + Sync>),
     /// Anything else — malformed/oversized frames, an unexpected
     /// primary message, or the journal stage dying mid-publish.
     Fatal(Box<dyn std::error::Error + Send + Sync>),
@@ -275,8 +286,9 @@ pub(super) struct StreamingFrameOutcome {
     /// [`StreamingResult::heard_from_primary`].
     pub heard_from_primary: bool,
     /// Why frame processing stopped, if it did — the caller maps a
-    /// `SequenceGap` to `SessionExit::StreamGap` (reconnect) and a
-    /// `Fatal` to `SessionExit::Fatal`.
+    /// `SequenceGap` to `SessionExit::StreamGap` and a `Corrupted` to
+    /// `SessionExit::Corrupted` (both reconnect), and a `Fatal` to
+    /// `SessionExit::Fatal`.
     pub frame_err: Option<FrameError>,
     /// The primary's ack policy as advertised by the last `Heartbeat`
     /// in this cycle, if any — the caller folds it into the
@@ -323,6 +335,21 @@ pub(super) struct StreamingFrameOutcome {
 ///   `SessionExit::StreamGap`, and the receiver reconnects and
 ///   re-handshakes from its durable position — the local journal is
 ///   intact, so this is a reconnect, not a restart.
+///
+/// # Entry integrity
+///
+/// Every slot is checked against the CRC the primary journaled it with
+/// while the frame is decoded, before any of the frame's slots is pushed
+/// (see `melin_transport_core::replication_wire`). A frame that fails is
+/// refused whole:
+///
+/// - damaged in transit, a slot or the frame's structure →
+///   [`FrameError::Corrupted`]: the contiguous prefix is committed, the
+///   session ends and the receiver reconnects, exactly as for a gap;
+/// - intact but not decoded or not reproduced by the application codec →
+///   a [`FrameError::Fatal`]: the same entry would fail on every reconnect,
+///   and a replica that cannot journal what its primary journaled must
+///   not keep following it.
 pub(super) fn process_streaming_frames<E: AppEvent>(
     recv_buf: &[u8],
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
@@ -433,7 +460,8 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                             }
                         }
                     }
-                    Err(_) => match decode_primary_message(payload) {
+                    Err(InputBatchError::NotInputBatch(_)) => match decode_primary_message(payload)
+                    {
                         Ok(PrimaryMessage::Heartbeat {
                             sequence,
                             ack_policy,
@@ -503,6 +531,21 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                             break;
                         }
                     },
+                    Err(e) => {
+                        // The frame is refused whole: whatever prefix the
+                        // decoder left behind must never be published.
+                        slot_buf.clear();
+                        // Damage, to a slot or to the frame's structure, is
+                        // cured by a resend; a codec that does not round-trip,
+                        // or a slot that does not decode although intact,
+                        // fails the same way every time.
+                        frame_err = Some(if e.is_transit_damage() {
+                            FrameError::Corrupted(Box::new(e))
+                        } else {
+                            FrameError::Fatal(Box::new(e))
+                        });
+                        break;
+                    }
                 }
                 consumed += frame_end;
                 if published_this_cycle >= MAX_SLOTS_PER_CYCLE {
@@ -547,7 +590,8 @@ pub(super) struct DrainFrameOutcome {
 /// Drain pass: extract every `InputBatch` frame from `recv_buf` and
 /// publish slots under a single batch. Non-input frames are silently
 /// skipped — the promotion sequence only cares about flushing pending
-/// data, not validating the wire.
+/// data — but every `InputBatch` passes the same integrity check as on
+/// the streaming path, and the drain stops at the first that fails.
 ///
 /// Sequence contiguity is enforced exactly as in
 /// [`process_streaming_frames`] — these slots feed the journal the
@@ -574,46 +618,74 @@ pub(super) fn process_drain_frames<E: AppEvent>(
         match try_extract_frame(remaining, MAX_DATA_FRAME) {
             FrameResult::Complete(ps, fe) => {
                 let payload = &remaining[ps..fe];
-                if let Ok(()) = try_decode_input_batch_into(payload, slot_buf) {
-                    for slot in slot_buf.drain(..) {
-                        let primary_seq = slot.sequence;
-                        if primary_seq <= pending_accum {
-                            // Duplicate from handoff chunk overlap.
-                            continue;
-                        }
-                        if primary_seq != pending_accum + 1 {
+                match try_decode_input_batch_into(payload, slot_buf) {
+                    Ok(()) => {}
+                    Err(InputBatchError::NotInputBatch(_)) => {
+                        consumed += fe;
+                        continue 'frames;
+                    }
+                    Err(e) => {
+                        // A frame that fails its integrity check holds
+                        // nothing this node may journal, and everything
+                        // after it would sit past a hole: stop here, as
+                        // at a gap.
+                        slot_buf.clear();
+                        // Damage is the network's (or hardware's) doing;
+                        // anything else is a codec or protocol bug.
+                        if e.is_transit_damage() {
                             tracing::warn!(
-                                expected = pending_accum + 1,
-                                got = primary_seq,
-                                "sequence gap in promotion drain — stopping at the \
-                                 last contiguous slot"
+                                error = %e,
+                                "refused InputBatch in promotion drain — stopping at the \
+                                 last verified slot"
+                            );
+                        } else {
+                            tracing::error!(
+                                error = %e,
+                                "refused InputBatch in promotion drain — stopping at the \
+                                 last verified slot"
+                            );
+                        }
+                        break 'frames;
+                    }
+                }
+                for slot in slot_buf.drain(..) {
+                    let primary_seq = slot.sequence;
+                    if primary_seq <= pending_accum {
+                        // Duplicate from handoff chunk overlap.
+                        continue;
+                    }
+                    if primary_seq != pending_accum + 1 {
+                        tracing::warn!(
+                            expected = pending_accum + 1,
+                            got = primary_seq,
+                            "sequence gap in promotion drain — stopping at the \
+                             last contiguous slot"
+                        );
+                        break 'frames;
+                    }
+                    // Abortable for the same reason as the streaming
+                    // path: a journal stage that dies mid-promotion
+                    // freezes its gate cursor, and a blocked push
+                    // would wedge the drain forever. Stopping here
+                    // matches the gap semantics — everything after
+                    // the stall is unreachable anyway.
+                    match batch.push_with_or_abort(
+                        |s| *s = slot,
+                        || journal_failed.load(Ordering::Relaxed),
+                    ) {
+                        // Slot index → journal-cursor space (index + 1),
+                        // as in `process_streaming_frames`.
+                        Ok(index) => last_target = index + 1,
+                        Err(_full) => {
+                            tracing::warn!(
+                                "journal stage failed during promotion drain — \
+                                 stopping at the last contiguous slot"
                             );
                             break 'frames;
                         }
-                        // Abortable for the same reason as the streaming
-                        // path: a journal stage that dies mid-promotion
-                        // freezes its gate cursor, and a blocked push
-                        // would wedge the drain forever. Stopping here
-                        // matches the gap semantics — everything after
-                        // the stall is unreachable anyway.
-                        match batch.push_with_or_abort(
-                            |s| *s = slot,
-                            || journal_failed.load(Ordering::Relaxed),
-                        ) {
-                            // Slot index → journal-cursor space (index + 1),
-                            // as in `process_streaming_frames`.
-                            Ok(index) => last_target = index + 1,
-                            Err(_full) => {
-                                tracing::warn!(
-                                    "journal stage failed during promotion drain — \
-                                     stopping at the last contiguous slot"
-                                );
-                                break 'frames;
-                            }
-                        }
-                        pending_accum = primary_seq;
-                        any_published = true;
                     }
+                    pending_accum = primary_seq;
+                    any_published = true;
                 }
                 consumed += fe;
             }
@@ -646,6 +718,13 @@ pub(super) enum SessionExit {
     /// reason, since it is the primary's stream, not the network, that
     /// misbehaved.
     StreamGap(Box<dyn std::error::Error + Send + Sync>),
+    /// An `InputBatch` failed its integrity check (see
+    /// [`FrameError::Corrupted`]). Nothing from it was published, the
+    /// prefix before it is committed, and the primary still holds the
+    /// intact entries: reconnect and re-handshake from the durable
+    /// position, like a gap — but logged as damage, since it points at
+    /// the network, a NIC or memory rather than at the primary's stream.
+    Corrupted(Box<dyn std::error::Error + Send + Sync>),
     /// Unrecoverable in this process (protocol violation, journal
     /// death); mid-stream chain divergence is the one fatal the exit
     /// handler repairs by in-process resync.
@@ -907,6 +986,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
 
         match outcome.frame_err {
             Some(FrameError::SequenceGap(e)) => break SessionExit::StreamGap(e),
+            Some(FrameError::Corrupted(e)) => break SessionExit::Corrupted(e),
             Some(FrameError::Fatal(e)) => break SessionExit::Fatal(e),
             None => {}
         }
@@ -1020,7 +1100,7 @@ mod tests {
     }
 
     fn append_input_batch_frame(out: &mut Vec<u8>, slots: &[InputSlot<TestEvent>]) {
-        encode_input_batch(slots, out);
+        encode_input_batch(slots, out).expect("encode InputBatch");
     }
 
     fn drain(
@@ -2299,6 +2379,250 @@ mod tests {
                 ack.in_memory_sequence,
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Entry integrity: a slot whose bytes are not the ones the primary
+    // journaled never reaches the input ring — so it is never applied,
+    // journaled or acknowledged.
+    // ---------------------------------------------------------------
+
+    /// One `InputBatch` frame for `slots`, with a bit flipped in the
+    /// last slot's payload. `TestEvent` decodes any byte, so the damage
+    /// yields a valid, different event: only the CRC can tell.
+    fn damaged_frame(slots: &[InputSlot<TestEvent>]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        append_input_batch_frame(&mut frame, slots);
+        let last_payload_byte = frame.len() - melin_journal::codec::CRC_SIZE - 1;
+        frame[last_payload_byte] ^= 0x01;
+        frame
+    }
+
+    #[test]
+    fn streaming_refuses_a_damaged_frame_whole() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(10, 0xA0), slot(11, 0xA1)]);
+        // Slot 12 is intact, slot 13 is damaged: the frame goes whole.
+        buf.extend_from_slice(&damaged_frame(&[slot(12, 0xA2), slot(13, 0xA3)]));
+
+        let (outcome, mut acks) = stream_frames(
+            &buf,
+            &mut producer,
+            9,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+
+        assert!(
+            matches!(outcome.frame_err, Some(FrameError::Corrupted(_))),
+            "a damaged slot must end the session as Corrupted (reconnect): {:?}",
+            outcome.frame_err
+        );
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(
+            published,
+            vec![10, 11],
+            "nothing from the damaged frame — not even its intact slot — may \
+             reach the input ring"
+        );
+        assert_eq!(outcome.accum_end_sequence, 11, "in-memory ack stops at 11");
+        assert_eq!(
+            acks.pop_all_blocking(
+                &journal_cursor(u64::MAX),
+                WaitStrategy::SpinThenYield,
+                &AtomicBool::new(false)
+            ),
+            Some(11),
+            "no persisted-ack target may name the damaged frame"
+        );
+    }
+
+    /// Damage to a frame's structure, which no slot CRC covers, is a
+    /// reconnect like damage to a slot, never a process exit.
+    #[test]
+    fn streaming_refuses_a_frame_with_damaged_framing_and_reconnects() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(10, 0xA0)]);
+        let damaged_at = buf.len();
+        append_input_batch_frame(&mut buf, &[slot(11, 0xA1)]);
+        // Raise the second frame's slot count (the `u16` after its length
+        // prefix and type byte) to name a slot it does not hold.
+        buf[damaged_at + 5..damaged_at + 7].copy_from_slice(&2u16.to_le_bytes());
+
+        let (outcome, _acks) = stream_frames(
+            &buf,
+            &mut producer,
+            9,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+
+        assert!(
+            matches!(outcome.frame_err, Some(FrameError::Corrupted(_))),
+            "framing damage must end the session as Corrupted (reconnect): {:?}",
+            outcome.frame_err
+        );
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(published, vec![10], "nothing from the damaged frame");
+        assert_eq!(outcome.accum_end_sequence, 10);
+    }
+
+    /// Loop-level: the session ends as `Corrupted` and no ack, persisted
+    /// or in-memory, ever names the damaged entry.
+    #[test]
+    fn streaming_loop_damaged_entry_ends_session_and_is_never_acked() {
+        let (mut producer, mut consumer) = ring(16);
+        let cursor = journal_cursor(u64::MAX);
+        let shutdown = AtomicBool::new(false);
+        let control = control();
+        let mut transport = MockTransport::new();
+
+        let mut data1 = Vec::new();
+        append_input_batch_frame(&mut data1, &[slot(1, 0x01), slot(2, 0x02)]);
+        transport.push_data(data1);
+        transport.push_data(damaged_frame(&[slot(3, 0x03)]));
+        // Would be accepted on its own; must not be reached past the damage.
+        let mut data3 = Vec::new();
+        append_input_batch_frame(&mut data3, &[slot(4, 0x04)]);
+        transport.push_data(data3);
+        transport.disconnect_after_data();
+
+        let result = streaming_loop::<MockTransport, TestEvent>(
+            &mut transport,
+            &mut producer,
+            &cursor,
+            &shutdown,
+            &control,
+            4,
+            WaitStrategy::SpinThenYield,
+            0,
+            Vec::new(),
+            None,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+
+        assert!(
+            matches!(result.exit, SessionExit::Corrupted(_)),
+            "a damaged entry must end the session as Corrupted (reconnect)"
+        );
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(published, vec![1, 2]);
+        for ack in &transport.sent_acks {
+            assert!(
+                ack.acked_sequence <= 2 && ack.in_memory_sequence <= 2,
+                "ack ({}, {}) names the damaged entry",
+                ack.acked_sequence,
+                ack.in_memory_sequence,
+            );
+        }
+    }
+
+    #[test]
+    fn drain_stops_at_a_damaged_frame() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(10, 0xD0)]);
+        buf.extend_from_slice(&damaged_frame(&[slot(11, 0xD1)]));
+        append_input_batch_frame(&mut buf, &[slot(12, 0xD2)]);
+
+        // These slots feed the journal the about-to-be-primary serves
+        // from: a damaged entry accepted here would become history.
+        let outcome = process_drain_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            9,
+            &mut slot_buf,
+            &AtomicBool::new(false),
+        );
+
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(published, vec![10]);
+        assert_eq!(outcome.accum_end_sequence, 10);
+    }
+
+    /// An application codec whose decode→encode is not byte-identical:
+    /// `decode` drops the top bit.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LossyEvent(u8);
+
+    impl AppEvent for LossyEvent {
+        const MAX_ENCODED_SIZE: usize = 1;
+
+        fn encoded_size(&self) -> usize {
+            1
+        }
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[0] = self.0;
+            1
+        }
+        fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+            Ok(LossyEvent(buf[0] & 0x7F))
+        }
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    /// The bytes arrive intact, but the replica would apply and journal
+    /// an event other than the primary's. Reconnecting would hit the same
+    /// entry again, so it is fatal — and nothing is published.
+    #[test]
+    fn streaming_codec_that_does_not_round_trip_is_fatal() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<LossyEvent>>::new(16)
+            .add_consumer()
+            .build(WaitStrategy::SpinThenYield);
+        let mut consumer = consumers.pop().expect("consumer present");
+        let mut slot_buf = Vec::new();
+
+        let lossy = |seq: u64, v: u8| InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            sequence: seq,
+            timestamp_ns: 0,
+            event: JournalEvent::App(LossyEvent(v)),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        };
+        let mut buf = Vec::new();
+        encode_input_batch(&[lossy(1, 0x10)], &mut buf).expect("encode");
+        encode_input_batch(&[lossy(2, 0x90)], &mut buf).expect("encode");
+
+        let mut acks = PendingAckQueue::new(16);
+        let outcome = process_streaming_frames::<LossyEvent>(
+            &buf,
+            &mut producer,
+            0,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+            &mut acks,
+        );
+
+        match &outcome.frame_err {
+            Some(FrameError::Fatal(e)) => assert!(
+                e.to_string()
+                    .contains("does not survive the application codec"),
+                "{e}"
+            ),
+            other => panic!("expected a fatal codec error, got {other:?}"),
+        }
+        let mut published = Vec::new();
+        while let Some((_seq, slot)) = consumer.try_consume() {
+            published.push(slot.sequence);
+        }
+        assert_eq!(published, vec![1], "the entry that round-trips is accepted");
+        assert_eq!(outcome.accum_end_sequence, 1);
     }
 
     /// The contiguity gate must anchor at the session's resume point, not

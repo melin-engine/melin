@@ -11,7 +11,8 @@ rings and seqlock, response gate and ack policy, and the shipped
 applications. The most serious findings were then re-read and, where
 practical, reproduced with failing tests.
 
-Status: **open**. Nothing below is fixed. Every reference is to commit
+Status: **open**. A finding is fixed only where its section says so
+under **Status**; the rest are not. Every reference is to commit
 `0fa03c79` (2026-09-25). Line numbers drift, so re-locate each site before
 working on it.
 
@@ -57,7 +58,7 @@ Severity is a judgement from code reading.
 | 5 | A sequence gap in the live segment truncates durable entries | High | Reproduced |
 | 6 | A zeroed range in the live segment reads as end of data | Medium | Reproduced |
 | 7 | A flipped bit in an entry's length field bypasses the CRC | Medium | Reproduced |
-| 8 | Replicated entries have no end-to-end integrity; DPDK verifies no checksum on receive | High | Confirmed |
+| 8 | Replicated entries have no end-to-end integrity; DPDK verifies no checksum on receive | High | Confirmed (fixed) |
 | 9 | The event publisher broadcasts reports before they are durable | High | Confirmed |
 | 10 | A runtime ack-policy change never reaches replicas while data flows | High | Confirmed |
 | 11 | The DPDK replication sender skips a batch that does not fit its transmit queue | High | Reproduced |
@@ -367,6 +368,41 @@ ring. That also catches an application codec that does not round-trip
 (finding 26). On DPDK, drop mbufs flagged bad and verify in software when
 the NIC reports the status as unknown. This keeps the symmetric re-encode
 the deferred "Verbatim byte-path journaling" item settled on.
+
+**Status: fixed** as directed above.
+
+- A slot is now the journal entry minus its magic only; the CRC rides
+  along (`replication_wire.rs`). The live path ships the journal stage's
+  own bytes, so the primary computes nothing extra. Catch-up ships the
+  entries as they are on disk (`encode_input_batch_from_journal`) instead
+  of decoding and re-encoding them, so the replica compares against what
+  the primary journaled even when the codec does not round-trip.
+- The check runs in the receiver's decode (`try_decode_input_batch_into`),
+  before any slot of the frame is pushed: the matching stage consumes the
+  input ring in parallel with the journal stage, and the in-memory ack is
+  issued at publish, so the journal stage's own encode comes too late to
+  be the check. The receiver therefore runs the journal codec once more
+  per slot and compares the CRC trailer; the journal stage is unchanged.
+  On a mismatch it CRCs the bytes as received to name the cause:
+  damaged (`InputBatchError::Corrupted`, the frame is refused whole and
+  the session ends as `SessionExit::Corrupted`, a reconnect from the
+  durable position with a `warn!`) or intact but not reproduced by the
+  codec (`NotRoundTrip`, fatal: it would fail on every reconnect). The
+  frame's slot count and slot lengths sit outside every slot CRC; a
+  frame whose structure does not hold together, trailing bytes
+  included, is `InputBatchError::Framing` and takes the damage path,
+  since without a frame-level checksum it cannot be told from damage. A
+  slot that matches its CRC but does not decode stays fatal
+  (`Malformed`). The promotion drain applies the same check and stops at
+  the first refused frame. This also turns finding 26's non-round-tripping codec from a
+  silent fork into a refused entry on replicas.
+- `REPL_PROTOCOL_VERSION` is 6; the handshake's equality check refuses
+  v5 peers in both directions.
+- DPDK: the device screens every received mbuf against its `ol_flags`
+  (`melin_dpdk::rx_checksum`, ungated and unit-tested): bad IP or L4
+  verdict → dropped, `UNKNOWN` → verified in software, `GOOD`/`NONE` →
+  passed. Checked only for the checksums whose offload is on, i.e. those
+  smoltcp skips. Client ingress shares the path.
 
 ### 9. The event publisher broadcasts reports before they are durable
 

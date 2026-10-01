@@ -3929,8 +3929,8 @@ impl melin_app::AppEvent for WideEvent {
 }
 
 /// Bytes `last_user_entry_replication_slice` trims from each entry: the
-/// 2-byte magic at the front and the 4-byte CRC at the back.
-const REPLICATION_SLICE_TRIM: usize = 6;
+/// 2-byte magic at the front (the CRC trailer rides along).
+const REPLICATION_SLICE_TRIM: usize = melin_journal::codec::ENTRY_MAGIC_SIZE;
 
 /// The invariant the sequencer depends on: it encodes a whole batch into
 /// one claimed chunk with no mid-batch byte cut, so a full batch must fit.
@@ -3953,7 +3953,7 @@ fn a_full_batch_always_fits_both_rings() {
             melin_journal::write_ring::CHUNK_SIZE
         );
 
-        // Each entry reaches replication with its magic and CRC stripped
+        // Each entry reaches replication with its magic stripped
         // (`last_user_entry_replication_slice`), under one frame header.
         let repl_bytes =
             crate::replication_wire::FRAME_HEADER_LEN + batch * (entry - REPLICATION_SLICE_TRIM);

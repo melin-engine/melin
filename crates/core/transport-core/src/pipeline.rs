@@ -252,9 +252,9 @@ pub const MAX_JOURNAL_BATCH: usize = 4096;
 ///
 /// So the batch is bounded by the **smaller** of the two. Dividing by the
 /// full [`entry_size`](melin_journal::encoder::entry_size) is deliberately
-/// conservative for the replication side, which strips 6 bytes of magic
-/// and CRC from each entry: the ~2% of batch length that costs is not
-/// worth a second, subtly different divisor.
+/// conservative for the replication side, which strips each entry's
+/// 2-byte magic: the sliver of batch length that costs is not worth a
+/// second, subtly different divisor.
 ///
 /// Bounding the *count* rather than growing either chunk is what keeps
 /// ring memory independent of event width: the rings stay 40 MiB and
@@ -1567,7 +1567,8 @@ impl<E: AppEvent> SequencerCore<E> {
     /// buffer. `journal_slice` comes from
     /// `BufferedWriter::last_user_entry_replication_slice` and is laid
     /// out exactly as the on-the-wire slot — the journal codec's frame
-    /// minus its 2-byte magic and 4-byte CRC. No re-encode on the
+    /// minus its 2-byte magic, CRC trailer kept so the replica can verify
+    /// its own re-encode against it. No re-encode and no extra CRC on the
     /// hot path; the hand-off is a single `extend_from_slice`.
     ///
     /// No-op when no replication producers are active (standalone mode).

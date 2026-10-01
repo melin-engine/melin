@@ -147,7 +147,7 @@ fn handoff_must_not_skip_entries_journaled_before_ring_activation() {
     // chunk this test publishes.
     let (mut producer, mut consumers) = build_replication_ring(1, 8, WaitStrategy::SpinThenYield);
     let mut chunk = Vec::new();
-    encode_input_batch(&[slot(13), slot(14)], &mut chunk);
+    encode_input_batch(&[slot(13), slot(14)], &mut chunk).expect("encode");
     producer.publish(&chunk, 14);
     let mut consumer = consumers.pop().expect("ring built with one consumer");
 
@@ -234,7 +234,7 @@ fn bridge_with_no_window_traffic_is_a_plain_drain() {
     }
     let (mut producer, mut consumers) = build_replication_ring(1, 8, WaitStrategy::SpinThenYield);
     let mut chunk = Vec::new();
-    encode_input_batch(&[slot(11), slot(12)], &mut chunk);
+    encode_input_batch(&[slot(11), slot(12)], &mut chunk).expect("encode");
     producer.publish(&chunk, 12);
     let mut consumer = consumers.pop().expect("ring built with one consumer");
 

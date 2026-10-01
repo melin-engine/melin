@@ -111,6 +111,8 @@ impl Port {
         // Query NIC capabilities and enable hardware checksum offloads
         // where supported. Checksum offload eliminates per-packet software
         // checksum computation in smoltcp — the NIC computes/verifies instead.
+        // On receive the NIC only *reports* a bad checksum, it does not drop
+        // the frame: the device acts on that report (see `rx_checksum`).
         let rx_cksum_wanted = unsafe { ffi::dpdk_rx_offload_checksum() };
         let tx_cksum_wanted = unsafe { ffi::dpdk_tx_offload_checksum() };
 

@@ -536,6 +536,63 @@ from a node that was ever a primary may contain a fork and deserves
 the same care as a `.divergent.<n>` one. These directories are never
 cleaned up automatically — reclaim the space once reconciled.
 
+## Entry integrity in transit
+
+Every replicated entry carries the CRC32C its primary journaled it
+with, and a replica checks each one **before** the entry can be
+applied, journaled or acknowledged: it rebuilds the journal entry it
+is about to write and compares checksums. A match means the replica
+journals exactly the bytes its primary did. The check covers live
+streaming, catch-up from the primary's journal and the promotion
+drain alike; catch-up ships entries exactly as they sit on the
+primary's disk, so the comparison is always against what the primary
+actually journaled.
+
+This does not lean on the transport. TCP's own checksum is 16 bits
+and misses a fraction of errors, and nothing in TCP covers a frame
+damaged in a NIC, a switch buffer or host memory. A damaged entry
+usually still decodes — as a different, perfectly valid event — so
+without this check a replica would apply it, journal it with a fresh
+and valid checksum, and acknowledge it, and the primary would count
+that copy toward its ack policy. The periodic chain check would find
+the fork later, but a failover in between would serve the corrupted
+event as acknowledged history.
+
+What happens on a mismatch depends on the cause, which the replica
+tells apart by re-checking the bytes as they arrived:
+
+- **Damaged in transit.** The batch holding the entry is refused
+  whole; everything before it is kept. The replica logs a warning
+  naming the damage, drops the connection and reconnects from its
+  durable position, and the primary sends the entries again from its
+  own journal. Nothing is lost and no operator action is needed for
+  an isolated event, but a recurring warning points at the network
+  path, a NIC or memory on either node and needs investigating. Each
+  occurrence reconnects after the minimum backoff, since the primary
+  was evidently reachable. Damage to the batch's own structure — an
+  entry count or entry length that no longer fits the batch — is
+  handled the same way: no entry checksum covers those fields, so the
+  replica cannot tell such damage from a malformed batch, and it reads
+  it as damage rather than stop over what is most likely a single
+  damaged frame.
+- **Arrived intact, but the application's codec does not reproduce
+  it.** Decoding the entry and encoding it again gives different bytes
+  (see "Building an application"), or the entry does not decode at all,
+  so the replica would hold a history its primary does not, or none.
+  Reconnecting would fail on the same entry
+  every time, so the replica stops with an error naming the entry.
+  This is an application bug: fix the codec, then restart the replica.
+
+**DPDK.** With receive checksum offload, the NIC rather than the
+userspace TCP stack verifies IPv4 and TCP checksums — and a NIC flags a
+bad checksum rather than dropping the frame. The DPDK transport acts on
+that flag: a frame the NIC marks bad is dropped before the TCP stack
+sees it (TCP retransmits it), and a frame the NIC left unchecked is
+verified in software. This covers replication and client ingress on the
+same port. Drops are logged as warnings, the first and then at each
+doubling of the count, so a steady trickle stays visible without a line
+per frame.
+
 ## Snapshot transfer
 
 When a replica is too far behind the primary's live journal and the
@@ -629,7 +686,7 @@ connection separate from the client protocol.
 | Rotate | `[len:u32][type=0x16][boundary_seq:u64][tail_hash:[u8;32]]` | Primary-driven rotation: the replica rotates its journal at exactly `boundary_seq`, after verifying its own chain at the boundary equals `tail_hash`. |
 | ChainCheck | `[len:u32][type=0x17][sequence:u64][chain_hash:[u8;32]]` | Periodic live-stream validation: the primary's chain value at `sequence`; the replica compares its own and treats a mismatch as divergence. |
 | SegmentSeedBegin | `[len:u32][type=0x18][seed_len:u64]` | Start of the post-snapshot segment seed (see "Snapshot transfer"); the body rides SnapshotChunk frames and ends with a SnapshotEnd. |
-| InputBatch | `[len:u32][type=0x21][count:u16][slot...]` | Batch of input events (sequence + timestamp + key hash + the event itself). |
+| InputBatch | `[len:u32][type=0x21][count:u16][slot...]` | Batch of input events. Each slot is the primary's journal entry without its leading magic: sequence, timestamp, key hash, the event itself, and the entry's CRC32C, which the replica verifies before accepting the entry (see "Entry integrity in transit"). |
 | Heartbeat | `[len:u32][type=0x30][sequence:u64]` | Periodic idle keepalive (5 s interval) advertising the primary's last published sequence. |
 
 ## Cluster recovery
@@ -701,6 +758,11 @@ normal-case post-recovery state.
   side is behind. Replication (and writes, under the
   replica-requiring ack policies) is down until the versions
   match, so upgrade the whole cluster in one maintenance window.
+  The release that adds per-entry checksums to replicated entries
+  (replication protocol 6) is such a change: a node running it and a
+  node running an earlier release refuse each other at the handshake,
+  in either direction, rather than stream entries the other cannot
+  verify. Journals and snapshots are unaffected.
 - **Snapshots are forward-compatible.** This release reads snapshots
   written by pre-fencing releases (their epoch is taken as 0, which
   is exact — they predate any promotion). No action needed before

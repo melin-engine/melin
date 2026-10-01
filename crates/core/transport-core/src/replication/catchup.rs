@@ -2,8 +2,9 @@
 //! reconnecting replica before live streaming resumes.
 //!
 //! Reads raw entry bytes from the primary's journal files (journal-codec
-//! format), decodes them into `InputSlot` records, and pushes them as
-//! `InputBatch` frames over the replica's transport. Does NOT consume
+//! format), validates each, and pushes them verbatim — minus each
+//! entry's magic, CRC included — as `InputBatch` frames over the
+//! replica's transport. Does NOT consume
 //! from the live replication ring during catch-up — the ring accumulates
 //! new data while this runs; the caller drains overlapping ring entries
 //! once catch-up completes.
@@ -17,8 +18,7 @@ use melin_app::AppEvent;
 use tracing::{info, warn};
 
 use super::protocol::{
-    decode_journal_to_input_slots, encode_input_batch, encode_rotate, peek_first_sequence,
-    peek_frame_tag,
+    encode_input_batch_from_journal, encode_rotate, peek_first_sequence, peek_frame_tag,
 };
 use crate::replication_wire::MSG_INPUT_BATCH;
 
@@ -156,10 +156,9 @@ pub fn can_catch_up_from_journal(
 /// frame; it receives the bytes to ship and is responsible for the
 /// actual transport write (TCP `write_all`+`flush`).
 ///
-/// Generic over `E: AppEvent` — the journal codec decodes into the
-/// application's event type, and the resulting `InputSlot<E>` records
-/// are re-encoded as `InputBatch` frames the replica's input ring
-/// expects.
+/// Generic over `E: AppEvent` — every entry is decoded before it ships,
+/// so one whose on-disk CRC fails or whose event the codec refuses stops
+/// the catch-up instead of reaching the replica.
 pub fn catch_up_from_journal_with<E: AppEvent>(
     journal_path: &std::path::Path,
     last_sequence: u64,
@@ -262,16 +261,16 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
                 break; // EOF on this file.
             };
 
-            // Decode the journal-codec bytes into InputSlots and re-encode
-            // as an `InputBatch` for the wire. Catch-up reads journal
-            // *files* (still journal-codec); the live streaming path's
-            // ring chunks are already InputBatch frames so it skips this.
-            let slots = decode_journal_to_input_slots::<E>(&batch_buf).map_err(|e| {
+            // Frame the journal entries as an `InputBatch` without
+            // re-encoding them: each slot is the entry minus its magic,
+            // so it carries the CRC on disk and the replica verifies its
+            // own re-encode against what this node actually journaled.
+            // (The live path's ring chunks are already InputBatch frames.)
+            encode_input_batch_from_journal::<E>(&batch_buf, &mut send_buf).map_err(|e| {
                 io::Error::other(format!(
                     "catch-up journal decode at seq {batch_end_seq}: {e}"
                 ))
             })?;
-            encode_input_batch(&slots, &mut send_buf);
             publisher(&send_buf)
                 .map_err(|e| io::Error::other(format!("publish catch-up batch: {e}")))?;
             send_buf.clear();
@@ -1261,7 +1260,7 @@ mod drain_into_contiguity_tests {
     fn frame(seqs: &[u64]) -> Vec<u8> {
         let slots: Vec<InputSlot<TestEvent>> = seqs.iter().map(|&s| slot(s)).collect();
         let mut buf = Vec::new();
-        encode_input_batch(&slots, &mut buf);
+        crate::replication_wire::encode_input_batch(&slots, &mut buf).expect("encode");
         buf
     }
 

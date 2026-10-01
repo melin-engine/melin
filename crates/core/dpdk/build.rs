@@ -125,6 +125,14 @@ fn generate_bindings() {
                                            uint64_t l4_len);\n\
             uint64_t dpdk_tx_offload_ipv4_cksum(void);\n\
             uint64_t dpdk_tx_offload_tcp_cksum(void);\n\
+            uint64_t dpdk_rx_ip_cksum_mask(void);\n\
+            uint64_t dpdk_rx_ip_cksum_good(void);\n\
+            uint64_t dpdk_rx_ip_cksum_bad(void);\n\
+            uint64_t dpdk_rx_ip_cksum_none(void);\n\
+            uint64_t dpdk_rx_l4_cksum_mask(void);\n\
+            uint64_t dpdk_rx_l4_cksum_good(void);\n\
+            uint64_t dpdk_rx_l4_cksum_bad(void);\n\
+            uint64_t dpdk_rx_l4_cksum_none(void);\n\
             uint64_t dpdk_rx_offload_checksum(void);\n\
             uint64_t dpdk_tx_offload_checksum(void);\n\
             uint64_t dpdk_rx_offload_vlan_strip(void);\n\
@@ -177,6 +185,14 @@ fn generate_bindings() {
         .allowlist_function("dpdk_mbuf_set_tx_offload")
         .allowlist_function("dpdk_tx_offload_ipv4_cksum")
         .allowlist_function("dpdk_tx_offload_tcp_cksum")
+        .allowlist_function("dpdk_rx_ip_cksum_mask")
+        .allowlist_function("dpdk_rx_ip_cksum_good")
+        .allowlist_function("dpdk_rx_ip_cksum_bad")
+        .allowlist_function("dpdk_rx_ip_cksum_none")
+        .allowlist_function("dpdk_rx_l4_cksum_mask")
+        .allowlist_function("dpdk_rx_l4_cksum_good")
+        .allowlist_function("dpdk_rx_l4_cksum_bad")
+        .allowlist_function("dpdk_rx_l4_cksum_none")
         .allowlist_function("dpdk_rx_offload_checksum")
         .allowlist_function("dpdk_tx_offload_checksum")
         .allowlist_function("dpdk_rx_offload_vlan_strip")

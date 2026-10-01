@@ -13,6 +13,7 @@ use smoltcp::time::Instant;
 
 use crate::ffi;
 use crate::port::ChecksumOffloads;
+use crate::rx_checksum::{RxChecksumFlags, RxChecksumPolicy};
 
 /// Maximum burst size for rx_burst / tx_burst.
 /// 64 is a throughput-tuned setting: amortizes per-call DPDK overhead
@@ -61,6 +62,14 @@ pub struct DpdkDevice {
     /// Hardware checksum offloads supported by the NIC (intersection
     /// of all ports' capabilities).
     offloads: ChecksumOffloads,
+    /// Receive checksum admission: which received frames may reach
+    /// smoltcp, judged from the NIC's per-frame verdicts. `None` when no
+    /// receive checksum is offloaded — smoltcp then verifies them all.
+    rx_checksum: Option<RxChecksumPolicy>,
+    /// Received frames dropped because a checksum failed, by the NIC's
+    /// verdict or in software. `u64`: a monotonic count that cannot wrap
+    /// in the life of a process.
+    rx_checksum_drops: u64,
     /// Cached TX offload flags (computed once at init, reused per packet).
     tx_ol_flags: u64,
     /// VLAN ID for TX insert offload. 0 = no VLAN tagging.
@@ -122,6 +131,40 @@ impl DpdkDevice {
             tracing::info!("DPDK TX checksum offload enabled (flags=0x{tx_ol_flags:x})");
         }
 
+        // Read from the headers this build was compiled against, not
+        // hard-coded: the verdict bits are DPDK ABI.
+        // SAFETY: each wrapper takes no arguments and returns a
+        // compile-time constant from the DPDK headers; no state is read.
+        let rx_flags = unsafe {
+            RxChecksumFlags {
+                ip_mask: ffi::dpdk_rx_ip_cksum_mask(),
+                ip_good: ffi::dpdk_rx_ip_cksum_good(),
+                ip_bad: ffi::dpdk_rx_ip_cksum_bad(),
+                ip_none: ffi::dpdk_rx_ip_cksum_none(),
+                l4_mask: ffi::dpdk_rx_l4_cksum_mask(),
+                l4_good: ffi::dpdk_rx_l4_cksum_good(),
+                l4_bad: ffi::dpdk_rx_l4_cksum_bad(),
+                l4_none: ffi::dpdk_rx_l4_cksum_none(),
+            }
+        };
+        if rx_flags != RxChecksumFlags::DPDK {
+            // The headers win — they are what the PMD writes — but the
+            // policy's tests were written against the documented values.
+            tracing::warn!(
+                ?rx_flags,
+                "DPDK RX checksum flag values differ from the documented ones"
+            );
+        }
+        let rx_checksum = RxChecksumPolicy::new(rx_flags, offloads.rx_ip, offloads.rx_tcp);
+        if rx_checksum.is_some() {
+            tracing::info!(
+                rx_ip = offloads.rx_ip,
+                rx_tcp = offloads.rx_tcp,
+                "DPDK RX checksum offload enabled: frames the NIC flags bad are dropped, \
+                 frames it leaves unchecked are verified in software"
+            );
+        }
+
         let rx_ports = port_ids
             .iter()
             .map(|&port_id| RxPort {
@@ -141,6 +184,8 @@ impl DpdkDevice {
             mempool,
             mtu: DEFAULT_MTU,
             offloads,
+            rx_checksum,
+            rx_checksum_drops: 0,
             tx_ol_flags,
             tx_vlan_id: 0,
             inject_queue: Vec::new(),
@@ -208,13 +253,31 @@ impl DpdkDevice {
                 )
             };
 
-            if count > 0 {
-                port.rx_count = count as usize;
+            // Screen the burst in place, keeping admitted frames in
+            // arrival order.
+            let mut kept = 0usize;
+            for i in 0..count as usize {
+                let mbuf = port.rx_buf[i];
+                if screen_rx(self.rx_checksum.as_ref(), mbuf, &mut self.rx_checksum_drops) {
+                    port.rx_buf[kept] = mbuf;
+                    kept += 1;
+                }
+            }
+
+            if kept > 0 {
+                port.rx_count = kept;
                 port.rx_cursor = 0;
                 self.active_rx = idx;
                 return;
             }
         }
+    }
+
+    /// Received frames dropped so far because a checksum failed — by the
+    /// NIC's verdict or in software. A count that keeps rising points at
+    /// the link, the NIC or host memory.
+    pub fn rx_checksum_drops(&self) -> u64 {
+        self.rx_checksum_drops
     }
 
     /// Set the MTU. Call before creating the smoltcp Interface so that
@@ -256,6 +319,12 @@ impl DpdkDevice {
 
             for i in 0..count as usize {
                 let mbuf = port.rx_buf[i];
+
+                // Checksum admission first: a damaged frame must neither
+                // reach the stack nor teach us a neighbour.
+                if !screen_rx(self.rx_checksum.as_ref(), mbuf, &mut self.rx_checksum_drops) {
+                    continue;
+                }
 
                 // MAC learning (same as Device::receive path).
                 let (data_ptr, data_len) = unsafe {
@@ -374,7 +443,11 @@ impl DpdkDevice {
         caps.max_burst_size = Some(BURST_SIZE);
 
         // Tell smoltcp which checksums the NIC handles in hardware.
-        // `Checksum::None` means "don't compute or verify" — the NIC does it.
+        // `Checksum::None` means "don't compute or verify" — the NIC does
+        // it. Where smoltcp skips receive verification, the device stands
+        // in for it: every frame is screened against the NIC's verdict,
+        // or verified in software when the NIC gave none, before smoltcp
+        // sees it (`screen_rx`).
         let mut checksums = ChecksumCapabilities::default();
         if self.offloads.rx_ip && self.offloads.tx_ip {
             checksums.ipv4 = Checksum::None;
@@ -687,6 +760,55 @@ fn ipv4_pseudo_header_checksum(frame: &[u8]) -> u16 {
     // Fold 32-bit sum to 16-bit.
     let folded = (sum & 0xFFFF) + (sum >> 16);
     ((folded & 0xFFFF) + (folded >> 16)) as u16
+}
+
+/// Whether a just-received mbuf may reach smoltcp, by `policy` (see
+/// [`RxChecksumPolicy`]). A refused mbuf is freed here and counted in
+/// `drops`; the caller must not touch it again. With no policy — receive
+/// checksums not offloaded, so smoltcp verifies them — everything passes.
+///
+/// Logging: a dropped frame is the network's doing (or a NIC's, or
+/// memory's), never a server bug, so it is not an `error!`. It is
+/// degraded operation worth knowing about, so the first drop and every
+/// power-of-two count after it are a `warn!` — a steady trickle stays
+/// visible without one line per frame — and the rest are `debug!`.
+fn screen_rx(policy: Option<&RxChecksumPolicy>, mbuf: *mut ffi::rte_mbuf, drops: &mut u64) -> bool {
+    let Some(policy) = policy else {
+        return true;
+    };
+    // SAFETY: `mbuf` was just returned by `rx_burst` and is owned by the
+    // caller; its data area stays valid until it is freed below, after
+    // the last use of `frame`.
+    let admitted = unsafe {
+        let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf).cast::<u8>();
+        let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
+        let len = ffi::dpdk_mbuf_data_len(mbuf) as usize;
+        let frame = std::slice::from_raw_parts(buf_addr.add(data_off), len);
+        policy.admit(ffi::dpdk_mbuf_ol_flags(mbuf), frame)
+    };
+    if admitted {
+        return true;
+    }
+    // SAFETY: the caller owns `mbuf` (fresh from `rx_burst`) and hands
+    // ownership over on refusal: `poll_rx` compacts the pointer out of
+    // its batch and `collect_rx_batch` `continue`s before pushing it, so
+    // it is freed exactly once and never touched again. `frame` above
+    // went out of scope with the block that borrowed it.
+    unsafe { ffi::dpdk_pktmbuf_free(mbuf) };
+    *drops += 1;
+    if drops.is_power_of_two() {
+        tracing::warn!(
+            drops = *drops,
+            "DPDK: dropped a received frame whose checksum failed — TCP will retransmit it; \
+             a rising count points at the link, the NIC or memory"
+        );
+    } else {
+        tracing::debug!(
+            drops = *drops,
+            "DPDK: dropped a received frame whose checksum failed"
+        );
+    }
+    false
 }
 
 /// Batch of received frames from `DpdkDevice::collect_rx_batch()`.

@@ -1373,7 +1373,8 @@ mod tests {
                     recv_ts: Default::default(),
                 }],
                 &mut buf,
-            );
+            )
+            .expect("encode InputBatch");
             s1.write_all(&buf).expect("InputBatch");
             wait_for_ack(&mut s1, 1);
 
@@ -1533,7 +1534,8 @@ mod tests {
                         recv_ts: Default::default(),
                     }],
                     buf,
-                );
+                )
+                .expect("encode InputBatch");
                 s.write_all(buf).expect("InputBatch");
             };
 
@@ -1706,7 +1708,8 @@ mod tests {
                     recv_ts: Default::default(),
                 }],
                 &mut buf,
-            );
+            )
+            .expect("encode InputBatch");
             s1.write_all(&buf).expect("InputBatch");
             wait_for_ack(&mut s1, 1);
             buf.clear();
@@ -1751,7 +1754,8 @@ mod tests {
                     recv_ts: Default::default(),
                 }],
                 &mut buf,
-            );
+            )
+            .expect("encode InputBatch");
             s2.write_all(&buf).expect("InputBatch 6");
             let mut s2_acks = s2.try_clone().expect("clone");
             wait_for_ack(&mut s2_acks, 6);
@@ -1951,7 +1955,8 @@ mod tests {
                     recv_ts: Default::default(),
                 }],
                 &mut buf,
-            );
+            )
+            .expect("encode InputBatch");
             s1.write_all(&buf).expect("InputBatch");
             wait_for_ack(&mut s1, 1);
 
@@ -2099,7 +2104,8 @@ mod tests {
         fn send_entries(stream: &mut TcpStream, sequences: &[u64]) {
             let slots: Vec<_> = sequences.iter().map(|&s| entry(s)).collect();
             let mut buf = Vec::new();
-            melin_transport_core::replication_wire::encode_input_batch(&slots, &mut buf);
+            melin_transport_core::replication_wire::encode_input_batch(&slots, &mut buf)
+                .expect("encode InputBatch");
             stream.write_all(&buf).expect("InputBatch");
         }
 
@@ -2198,6 +2204,82 @@ mod tests {
             // Streaming again, so shutdown finds the receiver in a session.
             stream_start(&mut s2, h2.last_sequence, lineage);
             stop(replica, &shutdown);
+        }
+
+        /// The audit's scenario end to end: an entry damaged on the way
+        /// still decodes — as a different event — and its CRC is the only
+        /// thing that can tell. The replica must refuse it before applying,
+        /// journaling or acknowledging it, drop the session, and reconnect
+        /// claiming only what it verified; the intact resend is what lands
+        /// in its journal.
+        #[test]
+        fn a_damaged_entry_is_refused_and_fetched_again() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_, lineage) = primary_journal(dir.path());
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let replica = spawn_replica(
+                dir.path(),
+                listener.local_addr().expect("addr"),
+                Duration::ZERO,
+                &shutdown,
+            );
+
+            let (mut s1, _s1r, h1) = next_handshake(&listener);
+            assert_eq!(h1.last_sequence, 0, "fresh replica handshake");
+            stream_start(&mut s1, 0, lineage);
+            send_entries(&mut s1, &[1]);
+            wait_for_ack(&mut s1, 1);
+
+            // Entry 2 with one payload bit flipped: `EvtAdd(2)` arrives as
+            // a perfectly decodable `EvtAdd(3)`.
+            let mut buf = Vec::new();
+            melin_transport_core::replication_wire::encode_input_batch(&[entry(2)], &mut buf)
+                .expect("encode InputBatch");
+            let payload_at = buf.len() - melin_journal::codec::CRC_SIZE - 8;
+            buf[payload_at] ^= 0x01;
+            s1.write_all(&buf).expect("damaged InputBatch");
+
+            // Nothing acknowledges entry 2 — not in memory, not on disk —
+            // before the replica drops the session.
+            loop {
+                let mut len_buf = [0u8; 4];
+                if std::io::Read::read_exact(&mut s1, &mut len_buf).is_err() {
+                    break;
+                }
+                let mut payload = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+                if std::io::Read::read_exact(&mut s1, &mut payload).is_err() {
+                    break;
+                }
+                if let Ok(ReplicaMessage::Ack(a)) = decode_replica_message(&payload) {
+                    assert!(
+                        a.in_memory_sequence < 2 && a.acked_sequence < 2,
+                        "the damaged entry was acknowledged: {a:?}"
+                    );
+                }
+            }
+
+            let (mut s2, _s2r, h2) = next_handshake(&listener);
+            assert_eq!(
+                h2.last_sequence, 1,
+                "the reconnect must claim only the entries that passed the check"
+            );
+            stream_start(&mut s2, 1, lineage);
+            send_entries(&mut s2, &[2]);
+            wait_for_ack(&mut s2, 2);
+            stop(replica, &shutdown);
+
+            let mut reader =
+                melin_journal::JournalReader::<EvtAdd>::open(&dir.path().join("replica.journal"))
+                    .expect("open replica journal");
+            let mut journaled = Vec::new();
+            while let Some(e) = reader.next_entry().expect("read entry") {
+                if let JournalEvent::App(EvtAdd(v)) = e.event {
+                    journaled.push(v);
+                }
+            }
+            assert_eq!(journaled, vec![1, 2], "only the intact entry is journaled");
         }
     }
 
@@ -2328,7 +2410,8 @@ mod tests {
                     })
                     .collect();
                 let mut buf = Vec::new();
-                melin_transport_core::replication_wire::encode_input_batch(&slots, &mut buf);
+                melin_transport_core::replication_wire::encode_input_batch(&slots, &mut buf)
+                    .expect("encode InputBatch");
                 s.write_all(&buf).expect("InputBatch");
             };
 
