@@ -783,6 +783,171 @@ fn replica_fsync_state_starts_at_the_journal_it_was_built_over() {
     );
 }
 
+/// The sequences in a journal's live segment, in order.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+fn journal_sequences(path: &std::path::Path) -> Vec<u64> {
+    let mut reader = JournalReader::<TestEvent>::open(path).unwrap();
+    let mut seqs = Vec::new();
+    while let Some(entry) = reader.next_entry().unwrap() {
+        seqs.push(entry.sequence);
+    }
+    seqs
+}
+
+/// A replica journal stage over a journal that already holds sequences
+/// 1 to 3, with its input producer and durable cursor. The matching
+/// stage is dropped: it applies slots whatever the journal decides,
+/// which is not under test.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+fn replica_stage_at_3(
+    path: &std::path::Path,
+) -> (
+    ring::Producer<TestInput>,
+    JournalStage<TestEvent>,
+    DurableWireSeqCursor,
+) {
+    let mut writer = Writer::create_continuing(path, 1, [0xB7u8; 32]).unwrap();
+    for n in 1..=3u64 {
+        let seq = writer.allocate_sequence();
+        writer
+            .encode_event(seq, 1_000 * n, &JournalEvent::App(TestEvent::Add(n)), 1)
+            .unwrap();
+    }
+    writer.flush_batch_sync().unwrap();
+    let replica = build_replica_pipeline(
+        TestApp::new(),
+        writer,
+        MAX_JOURNAL_BATCH,
+        Duration::ZERO,
+        StageWaits::uniform(WaitStrategy::SpinThenYield),
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let durable = replica.cursors.durable_wire_seq();
+    (replica.input_producer, replica.journal_stage, durable)
+}
+
+/// Audit findings 1 and 37: a session anchored below what the replica
+/// holds re-sends the primary's entries under their original sequences.
+/// The journal stage used to adopt them verbatim, checked only by a
+/// `debug_assert!`, so a release build appended 1, 2, 3 after the tail
+/// and the journal then refused to recover. It must refuse the first
+/// one, in every build, and write nothing of them.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn replica_journal_refuses_a_restreamed_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restream.journal");
+    let (mut producer, journal_stage, _) = replica_stage_at_3(&path);
+
+    let shutdown = AtomicBool::new(false);
+    let outcome = std::thread::scope(|s| {
+        let journal = s.spawn(|| journal_stage.run(&shutdown));
+        for seq in 1..=3 {
+            producer.publish(add_slot_with_seq(seq, seq, 1_000 * seq));
+        }
+        producer.publish(InputSlot::shutdown_sentinel());
+        journal.join().expect("journal thread panicked")
+    });
+    assert!(
+        matches!(
+            outcome,
+            Err(melin_journal::JournalError::ReplicaSequenceMismatch {
+                expected: 4,
+                actual: 1
+            })
+        ),
+        "the stage must refuse the first re-sent entry, got {:?}",
+        outcome.map(|_| ())
+    );
+    assert_eq!(
+        journal_sequences(&path),
+        [1, 2, 3],
+        "nothing re-sent was written"
+    );
+    let recovered = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path)
+        .expect("the journal still recovers");
+    assert_eq!(recovered.next_sequence(), 4);
+}
+
+/// The other half of contiguity: a stamped sequence that skips ahead
+/// would leave a hole the next recovery truncates at (finding 5). The
+/// receiver's gate is meant to stop it first; the journal stage refuses
+/// it too, and journals the valid entry before it.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn replica_journal_refuses_a_skipped_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("skip.journal");
+    let (mut producer, journal_stage, durable) = replica_stage_at_3(&path);
+
+    let shutdown = AtomicBool::new(false);
+    let outcome = std::thread::scope(|s| {
+        let journal = s.spawn(|| journal_stage.run(&shutdown));
+        producer.publish(add_slot_with_seq(4, 4, 4_000));
+        // Let 4 become durable in a batch of its own, so the refusal of
+        // 6 cannot discard it along with the rest of its batch.
+        let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+        while durable.load().get() < 4 {
+            assert!(std::time::Instant::now() < deadline, "4 never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        producer.publish(add_slot_with_seq(6, 6, 6_000));
+        producer.publish(InputSlot::shutdown_sentinel());
+        journal.join().expect("journal thread panicked")
+    });
+    assert!(
+        matches!(
+            outcome,
+            Err(melin_journal::JournalError::ReplicaSequenceMismatch {
+                expected: 5,
+                actual: 6
+            })
+        ),
+        "the stage must refuse the skip, got {:?}",
+        outcome.map(|_| ())
+    );
+    assert_eq!(journal_sequences(&path), [1, 2, 3, 4]);
+}
+
+/// Audit finding 24, and the same refusal on the shutdown path: the drain
+/// used to log a failed entry and journal the next one after it, leaving
+/// a hole behind a sequence the matching stage had applied. It must stop
+/// at the first refusal and fail the stage, so a teardown reports a
+/// failed journal rather than a clean one.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn shutdown_drain_stops_at_a_refused_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("drain.journal");
+    let (mut producer, journal_stage, _) = replica_stage_at_3(&path);
+
+    // 4 is next and valid; 2 is a repeat; 5 would follow 4 if the drain
+    // skipped the repeat, leaving the hole this test pins down.
+    for seq in [4, 2, 5] {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000 * seq));
+    }
+    // Latched before the stage starts, so it goes straight to the drain.
+    let shutdown = AtomicBool::new(true);
+    let outcome = journal_stage.run(&shutdown);
+    assert!(
+        matches!(
+            outcome,
+            Err(melin_journal::JournalError::ReplicaSequenceMismatch {
+                expected: 5,
+                actual: 2
+            })
+        ),
+        "the drain must fail at the repeat, got {:?}",
+        outcome.map(|_| ())
+    );
+    assert_eq!(
+        journal_sequences(&path),
+        [1, 2, 3],
+        "nothing after the refusal was journaled"
+    );
+}
+
 /// Replica half of the sequence-space invariant: the replica's ack
 /// cursors (`last_seq` feeds the reconnect handshake and, through
 /// `FsyncState`, the durable ack the primary's gate counts) must track

@@ -2160,16 +2160,17 @@ mod tests {
     // Sequence-contiguity tests
     //
     // The wire stream is the replica's only source of truth for journal
-    // sequences — the journal stage stamps `slot.sequence` verbatim
-    // (`set_next_sequence(slot.sequence + 1)`), so anything the receiver
-    // publishes lands in the replica's journal at face value. The
-    // receiver is therefore the gate: a slot whose sequence skips ahead
-    // of the last accepted one must be a fatal protocol violation, never
-    // silently applied. Regression: the 2026-06-07 LAN bench shipped a
-    // reconnecting replica a stream with a 212-entry hole (catch-up →
-    // live handoff race on the primary); the replica accepted it, acked
-    // past the hole, and its journal failed lineage verification only
-    // at post-run audit.
+    // sequences — the journal stage adopts `slot.sequence` as the next
+    // one (`adopt_sequence`), and the matching stage applies the slot
+    // without looking at it. The receiver is therefore the gate: a slot
+    // whose sequence skips ahead of the last accepted one must end the
+    // session, never be silently applied. (The journal stage refuses one
+    // that got past it anyway, but by then the matching stage has
+    // applied it, so the node can only stop.) Regression: the 2026-06-07
+    // LAN bench shipped a reconnecting replica a stream with a 212-entry
+    // hole (catch-up → live handoff race on the primary); the replica
+    // accepted it, acked past the hole, and its journal failed lineage
+    // verification only at post-run audit.
     //
     // Pinned semantics, mirroring TCP-style cumulative delivery:
     //   seq <= accum      → skip (idempotent re-delivery: the first

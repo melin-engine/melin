@@ -401,7 +401,8 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     /// local rotation triggers.
     pub(super) stream_marks: melin_transport_core::pipeline::StreamMarkQueue,
     /// Latched by the journal thread's spawn wrapper when the stage
-    /// exits with an error (chain divergence, journal I/O failure).
+    /// exits with an error (chain divergence, journal I/O failure, a
+    /// refused sequence) or panics (see `run_journal_stage`).
     /// The streaming receiver checks it and tears the session down —
     /// without this, a dead journal stage freezes the journal cursor
     /// and the receiver wedges forever on ring backpressure or the
@@ -416,6 +417,20 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// What [`ReplicaPipelineHandles::settled_resume_point`] found.
+pub(super) enum ResumePoint {
+    /// The fsync state, covering every slot published into the input
+    /// ring: the next handshake's pair.
+    Settled(melin_transport_core::pipeline::FsyncState),
+    /// The journal stage has died. The pipeline cannot take another
+    /// session; the caller tears it down as a fatal session exit would
+    /// (see [`journal_failed_while_disconnected`]) instead of dialing.
+    JournalFailed,
+    /// Shutdown or promotion was requested; the caller handles both
+    /// before any handshake.
+    Interrupted,
+}
+
 impl<A: Application, W: Send + 'static> ReplicaPipelineHandles<A, W> {
     /// The next handshake's resume point: the fsync state, once it covers
     /// every slot published into the input ring.
@@ -424,33 +439,106 @@ impl<A: Application, W: Send + 'static> ReplicaPipelineHandles<A, W> {
     /// can still hold entries the journal has not made durable. A
     /// handshake at the durable position taken before they land has the
     /// primary resend them, and the next session's contiguity gate, which
-    /// starts at that position, publishes them a second time: the journal
-    /// stage rewinds its sequence over them and the matching stage applies
-    /// them twice. Once the fsync state covers the ring, its position is
-    /// exactly what the replica holds.
+    /// starts at that position, publishes them a second time: the matching
+    /// stage applies them twice, and the journal stage refuses them,
+    /// stopping the replica. Once the fsync state covers the ring, its
+    /// position is exactly what the replica holds.
     ///
-    /// Stops waiting, returning the state as it stands, when the journal
-    /// stage has failed (nothing more will be journaled, and the next
-    /// session exits on the same latch before publishing) or `interrupted`
-    /// returns true (shutdown, promotion: the caller handles both before
-    /// any handshake).
-    pub(super) fn settled_resume_point(
-        &self,
-        interrupted: impl Fn() -> bool,
-    ) -> melin_transport_core::pipeline::FsyncState {
-        // Only this thread publishes into the ring, and it is here.
+    /// Stops waiting when the journal stage has failed (nothing more will
+    /// be journaled) or `interrupted` returns true.
+    pub(super) fn settled_resume_point(&self, interrupted: impl Fn() -> bool) -> ResumePoint {
+        // Only a streaming session publishes into the ring, and the
+        // previous one has ended (kernel TCP joined its thread; DPDK ran
+        // it on this one), so the cursor is final for this wait.
         let published = self.input_producer.peek_cursor();
-        let mut state = self.chain_hash_lock.load();
+        let mut outcome = ResumePoint::Interrupted;
         // Yielding, whatever the ingress strategy: this is the reconnect
         // path, and what it waits out is a disk stall.
         melin_pipeline::wait::WaitStrategy::SpinThenYield.wait_until(|| {
-            state = self.chain_hash_lock.load();
-            state.input_ring_seq.get() >= published
-                || self.journal_failed.load(Ordering::Acquire)
-                || interrupted()
+            // First, even when the ring is covered: a stage that died
+            // after its last durable batch would otherwise hand out a
+            // ready pair, and the loop would dial the primary and take
+            // one of its replica slots only for the session to fail on
+            // its first iteration.
+            if self.journal_failed.load(Ordering::Acquire) {
+                outcome = ResumePoint::JournalFailed;
+                return true;
+            }
+            let state = self.chain_hash_lock.load();
+            if state.input_ring_seq.get() >= published {
+                outcome = ResumePoint::Settled(state);
+                return true;
+            }
+            interrupted()
         });
-        state
+        outcome
     }
+}
+
+/// The session exit a reconnect loop dispatches when
+/// [`ReplicaPipelineHandles::settled_resume_point`] finds the journal
+/// stage dead: the same fatal teardown a streaming session takes when it
+/// sees the latch. A chain divergence is repaired in-process; anything
+/// else stops the replica. Nothing was heard from a primary, so the
+/// backoff stays escalated.
+pub(in crate::replication) fn journal_failed_while_disconnected() -> StreamingResult {
+    StreamingResult {
+        exit: SessionExit::Fatal("replica journal stage failed while disconnected".into()),
+        heard_from_primary: false,
+    }
+}
+
+/// Run the replica's journal stage on its thread, latching `failed` (and
+/// clearing `healthy`) if it stops for any reason other than a clean
+/// teardown: an error, or a panic.
+///
+/// Every wait on the journal's progress — the streaming loop's
+/// backpressure and ack waits, the reconnect's resume-point wait, the
+/// teardown's sentinel publish — gives up on that latch. A panic never
+/// returns an error, so without the guard below it would leave them all
+/// spinning on a cursor that will never move. (A release build aborts on
+/// panic; this matters wherever the profile unwinds.)
+fn run_journal_stage<W, E: std::fmt::Display>(
+    run: impl FnOnce() -> Result<W, E>,
+    failed: &AtomicBool,
+    healthy: &AtomicBool,
+) -> Result<W, E> {
+    /// Latches on drop unless defused: dropped during unwinding, it
+    /// reports the panic the result never will.
+    struct PanicLatch<'a> {
+        failed: &'a AtomicBool,
+        healthy: &'a AtomicBool,
+        armed: bool,
+    }
+    impl Drop for PanicLatch<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                self.failed.store(true, Ordering::Release);
+                self.healthy.store(false, Ordering::Release);
+                tracing::error!("replica journal stage panicked — session teardown");
+            }
+        }
+    }
+    let mut guard = PanicLatch {
+        failed,
+        healthy,
+        armed: true,
+    };
+    let result = run();
+    guard.armed = false;
+    if let Err(ref e) = result {
+        // Latch before logging so the receiver reacts even if logging
+        // stalls. A dead journal stage freezes the journal cursor; every
+        // downstream wait on it (ring backpressure, ack durability) would
+        // spin forever — the streaming loop polls this latch and tears
+        // the session down instead.
+        failed.store(true, Ordering::Release);
+        // Mirror into the process-lifetime gauge the replica health
+        // endpoint serves.
+        healthy.store(false, Ordering::Release);
+        tracing::error!(error = %e, "replica journal stage failed — session teardown");
+    }
+    result
 }
 
 /// [`ReplicaPipelineHandles`] over the journal's writer — the only
@@ -541,21 +629,11 @@ where
         .name("journal-seq".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("journal-seq", journal_core);
-            let result = sequencer.run(&ps);
-            if let Err(ref e) = result {
-                // Latch before logging so the receiver reacts even if
-                // logging stalls. A dead journal stage freezes the
-                // journal cursor; every downstream wait on it (ring
-                // backpressure, ack durability) would spin forever —
-                // the streaming loop polls this latch and tears the
-                // session down instead.
-                journal_failed_latch.store(true, Ordering::Release);
-                // Mirror into the process-lifetime gauge the replica
-                // health endpoint serves.
-                pipeline_healthy.store(false, Ordering::Release);
-                tracing::error!(error = %e, "replica journal stage failed — session teardown");
-            }
-            result
+            run_journal_stage(
+                || sequencer.run(&ps),
+                &journal_failed_latch,
+                &pipeline_healthy,
+            )
         })
         .expect("spawn journal thread");
 
@@ -777,6 +855,37 @@ pub(in crate::replication) enum AfterSession<A, W> {
     Reconnect,
 }
 
+impl<A, W> AfterSession<A, W> {
+    /// Fold this outcome into the reconnect loop's state: the result
+    /// `run_receiver*` must return, or `None` to go round the loop again
+    /// (having adopted a resync's recovered state). One copy for every
+    /// dispatch site in both receivers, so they cannot drift apart.
+    pub(in crate::replication) fn adopt(
+        self,
+        app: &mut Option<A>,
+        journal_writer: &mut Option<W>,
+        last_sequence: &mut u64,
+        chain_hash: &mut [u8; 32],
+    ) -> Option<ReceiverResult<A, W>> {
+        match self {
+            AfterSession::Return(r) => Some(r),
+            AfterSession::Resync {
+                app: recovered_app,
+                journal_writer: recovered_writer,
+                last_sequence: recovered_sequence,
+                chain_hash: recovered_hash,
+            } => {
+                *app = recovered_app;
+                *journal_writer = recovered_writer;
+                *last_sequence = recovered_sequence;
+                *chain_hash = recovered_hash;
+                None
+            }
+            AfterSession::Reconnect => None,
+        }
+    }
+}
+
 /// Dispatch a finished streaming session — shared by the kernel-TCP and
 /// DPDK receivers.
 ///
@@ -854,12 +963,18 @@ where
             // HashMismatch → archive → reseed path, no restart needed.
             // Every other fatal exits as before: protocol violations and
             // journal I/O death (ENOSPC, RO-FS) would fail the same way
-            // after a resync.
-            let TeardownOutcome::JournalFailed(
-                je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
-            ) = outcome
-            else {
-                return AfterSession::Return(Err(e));
+            // after a resync. The journal's own error names the cause; the
+            // exit's message alone may not (the reconnect wait's does not).
+            let je = match outcome {
+                TeardownOutcome::JournalFailed(
+                    je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
+                ) => je,
+                TeardownOutcome::JournalFailed(je) => {
+                    return AfterSession::Return(Err(format!("{e}: {je}").into()));
+                }
+                TeardownOutcome::Clean(..) | TeardownOutcome::Panicked => {
+                    return AfterSession::Return(Err(e));
+                }
             };
 
             *divergence_resyncs += 1;
@@ -2877,9 +2992,12 @@ mod tests {
                 input_ring_seq: melin_transport_core::cursors::RingPos::new(3),
             });
         });
-        let state = handles.settled_resume_point(|| false);
+        let outcome = handles.settled_resume_point(|| false);
         journal.join().unwrap();
-        assert_eq!(state.journal_seq.get(), 13, "resumes past the ring's slots");
+        assert!(
+            matches!(outcome, ResumePoint::Settled(s) if s.journal_seq.get() == 13),
+            "resumes past the ring's slots"
+        );
     }
 
     /// Nothing published since the fsync state was last updated (here,
@@ -2888,21 +3006,172 @@ mod tests {
     fn resume_point_with_nothing_in_flight_is_immediate() {
         let (_fsync, reader) = fsync_state_at(10, 0);
         let (handles, _consumer) = handles_fixture(8, reader);
-        assert_eq!(handles.settled_resume_point(|| false).journal_seq.get(), 10);
+        assert!(matches!(
+            handles.settled_resume_point(|| false),
+            ResumePoint::Settled(s) if s.journal_seq.get() == 10
+        ));
     }
 
     /// A failed journal stage never covers the ring, and neither does one
-    /// the node is abandoning: the wait gives up on either, returning the
-    /// state as it stands for the caller to act on.
+    /// the node is abandoning: the wait gives up on either, and says
+    /// which.
     #[test]
     fn resume_point_gives_up_on_a_failed_journal_or_an_interrupt() {
         let (_fsync, reader) = fsync_state_at(10, 0);
         let (mut handles, _consumer) = handles_fixture(8, reader);
         handles.input_producer.publish(InputSlot::default());
 
-        assert_eq!(handles.settled_resume_point(|| true).journal_seq.get(), 10);
+        assert!(matches!(
+            handles.settled_resume_point(|| true),
+            ResumePoint::Interrupted
+        ));
         handles.journal_failed.store(true, Ordering::Release);
-        assert_eq!(handles.settled_resume_point(|| false).journal_seq.get(), 10);
+        assert!(matches!(
+            handles.settled_resume_point(|| false),
+            ResumePoint::JournalFailed
+        ));
+    }
+
+    /// A journal stage that died after its last durable batch leaves the
+    /// ring covered. The wait must still report it dead, ahead of the
+    /// covered state: handed that state, the reconnect loop would dial
+    /// the primary and take one of its replica slots with a pipeline that
+    /// cannot take the session.
+    #[test]
+    fn resume_point_reports_a_dead_journal_even_when_the_ring_is_covered() {
+        let (_fsync, reader) = fsync_state_at(10, 0);
+        let (handles, _consumer) = handles_fixture(8, reader);
+        handles.journal_failed.store(true, Ordering::Release);
+        assert!(matches!(
+            handles.settled_resume_point(|| false),
+            ResumePoint::JournalFailed
+        ));
+    }
+
+    /// A journal thread that panics returns no error, so the stage's
+    /// wrapper must latch the failure on the way out: otherwise every
+    /// wait on the journal's progress, the reconnect's included, spins on
+    /// a cursor that will never move.
+    #[test]
+    fn a_panicked_journal_stage_latches_the_failure() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let journal_handle = {
+            let (failed, healthy) = (Arc::clone(&failed), Arc::clone(&healthy));
+            std::thread::spawn(move || {
+                run_journal_stage(
+                    || -> Result<u32, melin_journal::JournalError> {
+                        panic!("journal stage died without returning an error")
+                    },
+                    &failed,
+                    &healthy,
+                )
+            })
+        };
+        // The thread's panic is the point; joining reports it.
+        assert!(journal_handle.join().is_err(), "the stage panicked");
+        assert!(failed.load(Ordering::Acquire), "the failure is latched");
+        assert!(
+            !healthy.load(Ordering::Acquire),
+            "the node reports unhealthy"
+        );
+    }
+
+    /// End to end over the handles: a slot the panicked stage will never
+    /// cover is in the ring, and the reconnect's wait must end anyway
+    /// rather than spin until shutdown.
+    #[test]
+    fn resume_point_ends_when_the_journal_thread_panicked() {
+        let (_fsync, reader) = fsync_state_at(10, 0);
+        let (mut handles, _consumer) = handles_fixture(8, reader);
+        handles.input_producer.publish(InputSlot::default());
+        let failed = Arc::clone(&handles.journal_failed);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let dead = std::thread::spawn(move || {
+            run_journal_stage(
+                || -> Result<u32, melin_journal::JournalError> { panic!("journal stage died") },
+                &failed,
+                &healthy,
+            )
+        });
+        assert!(dead.join().is_err(), "the stage panicked");
+
+        // Bounded, so a regression fails instead of hanging the suite.
+        let give_up = AtomicBool::new(false);
+        let outcome = std::thread::scope(|s| {
+            let wait = s.spawn(|| handles.settled_resume_point(|| give_up.load(Ordering::Relaxed)));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !wait.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            give_up.store(true, Ordering::Relaxed);
+            wait.join().expect("wait thread")
+        });
+        assert!(
+            matches!(outcome, ResumePoint::JournalFailed),
+            "the wait must end on the panicked stage, not on the test's give-up"
+        );
+    }
+
+    /// The reconnect loop's dispatch for a journal found dead by the
+    /// wait: the fatal teardown, never a reconnect with the dead
+    /// pipeline. Its error stops the replica; the pipeline is gone.
+    #[test]
+    fn a_journal_found_dead_by_the_wait_takes_the_fatal_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let (input_producer, mut consumers) =
+            melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(4)
+                .add_consumer()
+                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+        let _consumer = consumers.pop().expect("one consumer");
+        let handles = ReplicaPipelineHandles {
+            input_producer,
+            journal_cursor: Arc::new(make_journal_cursor(0)),
+            chain_hash_lock: fsync_state_at(0, 0).1,
+            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            journal_failed: Arc::new(AtomicBool::new(true)),
+            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
+            journal_handle: std::thread::spawn(
+                || -> Result<Writer, melin_journal::JournalError> {
+                    Err(melin_journal::JournalError::ReplicaSequenceMismatch {
+                        expected: 4,
+                        actual: 1,
+                    })
+                },
+            ),
+            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            drain_handle: std::thread::spawn(|| {}),
+            shadow_handle: None,
+        };
+        let mut pipeline = Some(handles);
+        let mut divergence_resyncs = 0u32;
+        let mut backoff = MAX_BACKOFF;
+        let mut closes = 0;
+        let after = handle_session_exit::<counter_server::Counter, Writer>(
+            journal_failed_while_disconnected(),
+            &mut pipeline,
+            &mut divergence_resyncs,
+            &mut backoff,
+            0,
+            &dir.path().join("r.journal"),
+            &dir.path().join("r.snapshot"),
+            &melin_transport_core::fence::FenceState::new(0),
+            &AtomicBool::new(false),
+            &crate::promotion::PromotionRequest::new(),
+            || closes += 1,
+            &(),
+        );
+        let AfterSession::Return(Err(err)) = after else {
+            panic!("a refused sequence stops the replica rather than reconnecting or resyncing");
+        };
+        assert!(
+            err.to_string()
+                .contains("refused to journal sequence 1: the next sequence is 4"),
+            "the returned error names the journal's cause, got: {err}"
+        );
+        assert!(pipeline.is_none(), "the dead pipeline was torn down");
+        assert_eq!((divergence_resyncs, closes), (0, 0));
     }
 
     /// Drive `handle_session_exit` through one `Disconnected` exit with

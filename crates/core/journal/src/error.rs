@@ -74,6 +74,17 @@ pub enum JournalError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
+    /// A replica was handed a primary-assigned sequence that is not the
+    /// next one its journal expects. Nothing was written. A replica's
+    /// stream is contiguous by construction, so this is a bug upstream of
+    /// the journal (a session re-sending entries the replica already
+    /// holds, or skipping some), never corruption on disk.
+    ReplicaSequenceMismatch { expected: u64, actual: u64 },
+    /// The encoder was asked to write a sequence at or below the last one
+    /// it wrote. Nothing was written. Refused in every build: journaled
+    /// out of order, the entry would make the journal unrecoverable
+    /// (`SequenceDuplicate` at the next start).
+    SequenceRegression { sequence: u64, last_encoded: u64 },
 }
 
 impl fmt::Display for JournalError {
@@ -129,6 +140,19 @@ impl fmt::Display for JournalError {
                  snapshot resync required",
                 hex_prefix(actual),
                 hex_prefix(expected)
+            ),
+            Self::ReplicaSequenceMismatch { expected, actual } => write!(
+                f,
+                "replica refused to journal sequence {actual}: the next sequence is \
+                 {expected}"
+            ),
+            Self::SequenceRegression {
+                sequence,
+                last_encoded,
+            } => write!(
+                f,
+                "refused to journal sequence {sequence}: sequence {last_encoded} is \
+                 already journaled"
             ),
         }
     }

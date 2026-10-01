@@ -52,6 +52,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `KeyRole` now, not a permission: `KeyRole::is_replication`, and
   `KeyRole::client`, which is `None` exactly where
   `may_connect_as_client` was false.
+- **`set_next_sequence`, from `JournalWrite`, `BufferedWriter` and
+  `JournalEncoder`.** It moved a writer's sequence counter anywhere,
+  backwards included. `JournalEncoder::adopt_sequence` replaces it for a
+  replica taking its primary's numbering, and accepts only the next
+  sequence.
 
 ### Changed
 
@@ -78,6 +83,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   examples admit `writer` and `reader` keys, the notary `submitter` and
   `auditor`, in place of the exchange's `trader` and `readonly`: a keys
   file written for an example needs its role tokens renamed.
+- **`JournalError` gains `ReplicaSequenceMismatch` and
+  `SequenceRegression`,** for the sequence refusals under Fixed.
+  Source-breaking for code that matches on `JournalError` exhaustively.
 
 ### Fixed
 
@@ -94,6 +102,26 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   replica held or sent it a snapshot it did not need. The replica now
   waits for its journal to catch up with everything it received before
   reconnecting, and reports the journal it was built over from the start.
+- **A journal could be written out of order in a release build.** The
+  checks that refuse a repeated or backward sequence ran only in debug
+  builds, so a release build journaled such an entry and the journal then
+  refused to recover. Every build now refuses one before writing it. On
+  a replica, any sequence but the next one stops the node with an error,
+  its journal intact and recoverable, rather than duplicating history or
+  leaving a hole.
+- **The shutdown drain skipped an entry it failed to journal** and
+  journaled the next one after it, leaving a hole behind an entry the
+  application had already applied. It now fails as the steady-state path
+  does, so the teardown reports a failed journal and a promotion refuses
+  to proceed on that state.
+- **A replica whose journal had failed while it was disconnected
+  connected to its primary anyway**, taking one of the primary's replica
+  slots for a session that ended at once. It now acts on the failure
+  before connecting: a divergent journal is resynced in-process as
+  before, and any other failure stops the node. A journal stage that
+  panicked (only possible in a build that unwinds on panic; release
+  builds abort) is now treated as failed too, instead of leaving the
+  replica waiting for it indefinitely.
 - **A replicated entry damaged in transit was applied, journaled and
   acknowledged.** Replicated entries carried no checksum of their own:
   the replica decoded each one and journaled it under a fresh CRC, so an

@@ -251,10 +251,25 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
 - Does not accept client connections.
 
 If the primary disconnects or evicts the replica, the receiver
-reconnects with exponential backoff (1 s → 30 s cap), recovers its own
-state on its own journal, and resumes from its last durable sequence.
+reconnects with exponential backoff (1 s → 30 s cap), keeping the state
+it already holds. Before each reconnect it waits until its own journal
+holds everything it had received, then resumes from there: never behind
+what it has applied, and never claiming an entry that is not yet on its
+disk. A replica whose disk is stalled therefore reconnects only once
+the disk catches up. A replica whose journal has failed does not
+reconnect with it: it stops with an error, or, if the failure is a
+divergence from the primary's history, re-seeds itself from the
+primary as for any other divergence (see "Divergence repair is
+automatic" below).
 Periodic snapshots are taken on a dedicated thread so a crash doesn't
 require replaying from genesis.
+
+A replica journals each entry under the sequence its primary assigned,
+and only ever the next one: an entry repeated or skipped by the stream
+is refused before it is written, in every build, and stops the replica
+with an error. The stream is contiguous by construction, so this means
+a bug rather than a network fault; the journal is left intact and the
+replica recovers from it on restart.
 
 ### Fault isolation between replica slots
 
