@@ -104,6 +104,42 @@ uint64_t dpdk_tx_offload_tcp_cksum(void) {
     return RTE_MBUF_F_TX_TCP_CKSUM;
 }
 
+/* --- RX checksum verdict flags ---
+ * With RX checksum offload on, the NIC does not drop a frame whose
+ * checksum fails: it delivers it and records the verdict in ol_flags,
+ * under these masks. Within each mask, zero means UNKNOWN (not checked). */
+uint64_t dpdk_rx_ip_cksum_mask(void) {
+    return RTE_MBUF_F_RX_IP_CKSUM_MASK;
+}
+
+uint64_t dpdk_rx_ip_cksum_good(void) {
+    return RTE_MBUF_F_RX_IP_CKSUM_GOOD;
+}
+
+uint64_t dpdk_rx_ip_cksum_bad(void) {
+    return RTE_MBUF_F_RX_IP_CKSUM_BAD;
+}
+
+uint64_t dpdk_rx_ip_cksum_none(void) {
+    return RTE_MBUF_F_RX_IP_CKSUM_NONE;
+}
+
+uint64_t dpdk_rx_l4_cksum_mask(void) {
+    return RTE_MBUF_F_RX_L4_CKSUM_MASK;
+}
+
+uint64_t dpdk_rx_l4_cksum_good(void) {
+    return RTE_MBUF_F_RX_L4_CKSUM_GOOD;
+}
+
+uint64_t dpdk_rx_l4_cksum_bad(void) {
+    return RTE_MBUF_F_RX_L4_CKSUM_BAD;
+}
+
+uint64_t dpdk_rx_l4_cksum_none(void) {
+    return RTE_MBUF_F_RX_L4_CKSUM_NONE;
+}
+
 /* --- RX/TX ethdev offload capability constants --- */
 uint64_t dpdk_rx_offload_checksum(void) {
     return RTE_ETH_RX_OFFLOAD_IPV4_CKSUM |

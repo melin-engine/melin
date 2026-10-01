@@ -142,10 +142,11 @@ let len = CounterEvent::Increment { amount: 42 }.encode(&mut buf);
 assert!(matches!(CounterEvent::decode(&buf[..len]), Ok(CounterEvent::Increment { amount: 42 })));
 ```
 
-Four things to get right here:
+Five things to get right here:
 
 - **`MAX_ENCODED_SIZE` is a bound, `encoded_size` is exact.** The journal reserves the bound for every entry and sizes its batches from it; each entry then takes only its exact size on disk. A bound too small stops the node at the first event that exceeds it, before that event is journaled; a bound past what the journal can carry fails the build (on `cargo build` and `cargo test` — not on `cargo check`). `encode` must return exactly `encoded_size`: an event whose two figures disagree stops the node the same way, since its entry would otherwise hold a truncated event. Both are bugs to catch in your tests, not conditions a cluster rides out: a client that retries the event against the next primary stops that node too.
 - **Decode exactly.** The journal hands `decode` one event and nothing else, so a byte too few or too many means the entry is not what this build wrote. Refuse it rather than read what you can.
+- **Encoding what you decoded gives back the same bytes.** A replica decodes each entry it receives and journals it by encoding it again, and it checks the result against the checksum its primary journaled. A codec that normalises, drops or reorders anything on the way through fails that check: the replica refuses the entry and stops rather than hold a history its primary does not. The assertion above, run over every variant and edge value, is the test that catches it.
 - **The encoding is permanent.** Every event you journal is decoded again by every future version of your application that replays it. See [Snapshots and upgrades](#snapshots-and-upgrades).
 - **A query is an event too.** `is_query` sends it to `Application::query` instead of `apply`, and keeps it out of the journal.
 

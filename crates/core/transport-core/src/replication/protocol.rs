@@ -5,11 +5,8 @@
 
 use std::io::{self, Read};
 
-use melin_app::AppEvent;
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
-
-use crate::pipeline::InputSlot;
 
 // Wire format for `MSG_INPUT_BATCH` lives alongside in
 // `crate::replication_wire` so the journal stage can encode directly
@@ -17,8 +14,8 @@ use crate::pipeline::InputSlot;
 // Re-export the helpers at replication scope so existing
 // `replication::protocol::{...}` imports keep working.
 pub use crate::replication_wire::{
-    encode_input_batch, peek_first_sequence, peek_frame_tag, try_decode_input_batch,
-    try_decode_input_batch_into,
+    InputBatchError, encode_input_batch, encode_input_batch_from_journal, peek_first_sequence,
+    peek_frame_tag, try_decode_input_batch, try_decode_input_batch_into,
 };
 
 // --- Wire protocol message tags ---
@@ -53,8 +50,11 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// 2 = fencing epochs (epoch on handshake/StreamStart) + this field;
 /// 3 = primary-driven rotation (`Rotate`) + chain validation (`ChainCheck`);
 /// 4 = primary ack policy on `StreamStart` and `Heartbeat`;
-/// 5 = `request_seq` dropped from the `InputBatch` slot header.
-pub const REPL_PROTOCOL_VERSION: u16 = 5;
+/// 5 = `request_seq` dropped from the `InputBatch` slot header;
+/// 6 = each `InputBatch` slot carries its journal entry's CRC32C, which
+/// the replica verifies before accepting the entry. A v5 node would read
+/// the trailer as the next slot, so mixed pairs must not stream.
+pub const REPL_PROTOCOL_VERSION: u16 = 6;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -693,43 +693,4 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
             "unknown primary message type: 0x{other:02x}"
         ))),
     }
-}
-
-// --- Catch-up helper: journal-codec bytes → InputSlot records ---
-//
-// The replication ring no longer carries journal-codec bytes (Phase 3
-// switched it to wire-ready `InputBatch` frames produced by the journal
-// stage). Catch-up still reads journal *files* — which are journal-codec
-// — and decodes them into `InputSlot` records before re-encoding as
-// `InputBatch` for the wire.
-
-/// Decode a journal-codec byte stream into `InputSlot` records. Used by
-/// the catch-up paths (`catchup.rs` for TCP, the DPDK catch-up loop) to
-/// turn journal-file bytes into wire-ready `InputBatch` frames.
-///
-/// Generic over `E: AppEvent` — the journal codec decodes into the
-/// application's event type, and the resulting `InputSlot<E>` records
-/// are what the receiver's input ring expects.
-pub fn decode_journal_to_input_slots<E: AppEvent>(
-    journal_bytes: &[u8],
-) -> io::Result<Vec<InputSlot<E>>> {
-    let mut slots = Vec::with_capacity(64);
-    let mut offset = 0;
-    while offset < journal_bytes.len() {
-        let (consumed, sequence, timestamp_ns, key_hash, event) =
-            melin_journal::codec::decode::<E>(&journal_bytes[offset..]).map_err(|e| {
-                io::Error::other(format!("journal decode at offset {offset}: {e:?}"))
-            })?;
-        offset += consumed;
-        slots.push(InputSlot {
-            connection_id: 0,
-            key_hash,
-            sequence,
-            timestamp_ns,
-            event,
-            publish_ts: Default::default(),
-            recv_ts: Default::default(),
-        });
-    }
-    Ok(slots)
 }

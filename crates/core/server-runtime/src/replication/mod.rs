@@ -912,6 +912,37 @@ where
             AfterSession::Reconnect
         }
 
+        SessionExit::Corrupted(e) => {
+            // A replicated entry arrived damaged and was refused before
+            // anything could apply, journal or acknowledge it; the frames
+            // before it are committed. The primary still holds the intact
+            // entries, so re-handshaking at the durable position has them
+            // sent again. Not a resync: nothing local is wrong.
+            //
+            // The backoff resets, exactly as for a stream gap: frames
+            // arrived, so the primary evidently spoke, and nothing else
+            // resets the backoff after a long clean session — leaving it
+            // to escalate would make one isolated bit flip, days after a
+            // start-up that escalated it, cost a `MAX_BACKOFF` stall
+            // (writes blocked under a replica-requiring ack policy). A
+            // link that keeps damaging frames is redialled at the floor
+            // rate, each time logged below; every redial re-streams
+            // useful data, so that costs nothing the primary cannot bear.
+            // `warn!`, not `error!`: the server is working as designed —
+            // what needs attention is the path between the nodes.
+            close();
+            *backoff = std::time::Duration::from_secs(1);
+            tracing::warn!(
+                error = %e,
+                last_sequence,
+                backoff_secs = backoff.as_secs(),
+                "replicated entry failed its integrity check — refused, reconnecting to \
+                 fetch it again; recurrence points at the network, a NIC or memory"
+            );
+            sleep_then_double_backoff(backoff, shutdown, promote);
+            AfterSession::Reconnect
+        }
+
         SessionExit::Disconnected => {
             // Transport-specific teardown before reconnecting (smoltcp
             // socket reclaim on DPDK; no-op on kernel TCP).
@@ -1263,7 +1294,7 @@ mod tests {
             publish_ts: Default::default(),
             recv_ts: Default::default(),
         };
-        encode_input_batch(&[slot], buf);
+        encode_input_batch(&[slot], buf).expect("encode InputBatch");
     }
 
     #[test]
@@ -2881,6 +2912,11 @@ mod tests {
     /// loop top would handle it on the next turn); the journal and fence
     /// arguments are inert on the `Disconnected` path.
     fn backoff_after_disconnect(heard_from_primary: bool) -> std::time::Duration {
+        backoff_after_exit(SessionExit::Disconnected, heard_from_primary)
+    }
+
+    /// As [`backoff_after_disconnect`], for any reconnecting exit.
+    fn backoff_after_exit(exit: SessionExit, heard_from_primary: bool) -> std::time::Duration {
         let dir = tempfile::tempdir().expect("tempdir");
         type Writer = melin_journal::BufferedWriter<CounterEvent>;
         let mut pipeline: Option<ReplicaPipelineHandles<counter_server::Counter, Writer>> = None;
@@ -2890,7 +2926,7 @@ mod tests {
         let promote = crate::promotion::PromotionRequest::new();
         let after = handle_session_exit::<counter_server::Counter, Writer>(
             StreamingResult {
-                exit: SessionExit::Disconnected,
+                exit,
                 heard_from_primary,
             },
             &mut pipeline,
@@ -2930,6 +2966,18 @@ mod tests {
     #[test]
     fn disconnect_keeps_escalated_backoff_when_primary_silent() {
         assert_eq!(backoff_after_disconnect(false), MAX_BACKOFF);
+    }
+
+    /// A damaged replicated entry proves the primary spoke, so it resets
+    /// the backoff: one bit flip after a long clean session (with a
+    /// backoff escalated at start-up and never reset since) must not
+    /// cost a `MAX_BACKOFF` stall before the entry is fetched again.
+    #[test]
+    fn corrupted_entry_resets_backoff() {
+        assert_eq!(
+            backoff_after_exit(SessionExit::Corrupted("damaged slot".into()), true),
+            std::time::Duration::from_secs(2)
+        );
     }
 
     /// A stream contiguity break is a reconnect, never a process exit:

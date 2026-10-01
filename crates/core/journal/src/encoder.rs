@@ -362,16 +362,17 @@ impl<E: AppEvent> JournalEncoder<E> {
     }
 
     /// Slice of the most-recent user entry within `dst`, with the
-    /// 2-byte magic stripped from the front and the 4-byte CRC stripped
-    /// from the back — exact wire shape consumed by the replication
-    /// stage.
+    /// 2-byte magic stripped from the front and the CRC trailer kept —
+    /// exact wire shape consumed by the replication stage. The CRC is the
+    /// one this entry is journaled with, so a replica can prove the entry
+    /// it is about to journal is byte-identical to this one.
     pub fn last_user_entry_replication_slice<'a>(&self, dst: &'a [u8]) -> &'a [u8] {
         if self.last_user_entry_len == 0 {
             return &[];
         }
         let start = self.last_user_entry_offset;
         let end = start + self.last_user_entry_len;
-        &dst[start + 2..end - 4]
+        &dst[start + codec::ENTRY_MAGIC_SIZE..end]
     }
 }
 

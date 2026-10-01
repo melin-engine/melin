@@ -94,6 +94,40 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   replica held or sent it a snapshot it did not need. The replica now
   waits for its journal to catch up with everything it received before
   reconnecting, and reports the journal it was built over from the start.
+- **A replicated entry damaged in transit was applied, journaled and
+  acknowledged.** Replicated entries carried no checksum of their own:
+  the replica decoded each one and journaled it under a fresh CRC, so an
+  entry corrupted past TCP's checksum — or in a NIC, a switch buffer or
+  memory — that still decoded was taken as a different, valid event,
+  acknowledged in memory and on disk, and counted toward the primary's
+  ack policy. Each replicated entry now carries the CRC32C its primary
+  journaled it with, and the replica checks the entry it is about to
+  journal against it before applying or acknowledging anything. A
+  damaged batch is refused whole and the replica reconnects to fetch it
+  again, with a warning (damage to the batch's framing itself, which is
+  indistinguishable from a protocol violation, stops the replica
+  instead); an entry that arrives intact but that the
+  application's codec does not reproduce byte for byte stops the replica
+  with an error, since it could never hold its primary's history.
+  Catch-up now ships entries exactly as they are on the primary's disk
+  rather than re-encoding them. **Breaking on the wire:** the replication
+  protocol is now version 6 and refuses version 5 peers in either
+  direction, so upgrade primaries and replicas together. In
+  `melin-transport-core`, `try_decode_input_batch` and
+  `try_decode_input_batch_into` return the new `InputBatchError`,
+  `encode_input_batch` and `append_input_slot` return a `Result`, and
+  `decode_journal_to_input_slots` is replaced by
+  `encode_input_batch_from_journal`; in `melin-journal`, `CRC_SIZE`,
+  `ENTRY_MAGIC` and the new `ENTRY_MAGIC_SIZE` are public and
+  `last_user_entry_replication_slice` keeps the CRC trailer.
+- **DPDK verified no TCP or IPv4 checksum on receive.** With receive
+  checksum offload enabled the userspace TCP stack skips verification,
+  but a NIC flags a bad checksum rather than dropping the frame, and
+  nothing read the flag: a corrupted segment reached replication and
+  client ingress unverified. Frames the NIC flags bad are now dropped
+  before the stack sees them, and frames it leaves unchecked are verified
+  in software. The policy is `melin_dpdk::rx_checksum`, built without
+  `dpdk-sys` too; `DpdkDevice::rx_checksum_drops` counts the drops.
 
 ## [0.18.0] - 2026-09-27
 

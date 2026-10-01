@@ -257,8 +257,8 @@ impl<E: AppEvent> BufferedWriter<E> {
     }
 
     /// Slice of the most-recent user entry, with the 2-byte magic
-    /// stripped from the front and the 4-byte CRC stripped from the
-    /// back — exact wire shape consumed by the replication stage.
+    /// stripped from the front and the CRC trailer kept — exact wire
+    /// shape consumed by the replication stage.
     pub fn last_user_entry_replication_slice(&self) -> &[u8] {
         self.encoder
             .last_user_entry_replication_slice(&self.batch_buf)
@@ -847,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn last_user_entry_replication_slice_excludes_magic_and_crc() {
+    fn last_user_entry_replication_slice_strips_magic_and_keeps_crc() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
@@ -855,11 +855,24 @@ mod tests {
         writer.batch_append_with_ts(&sample(42), 0, 0).unwrap();
 
         // The full encoded entry is [magic(2) | header | payload | CRC(4)].
-        // The replication slice strips the leading magic and trailing CRC.
+        // The replication slice strips the leading magic and keeps the
+        // CRC: it is the replica's proof that what it journals is this.
         let full = writer.encoder.last_user_entry_bytes(&writer.batch_buf);
         let repl = writer.last_user_entry_replication_slice();
-        assert_eq!(repl.len(), full.len() - 6);
-        assert_eq!(repl, &full[2..full.len() - 4]);
+        assert_eq!(repl.len(), full.len() - crate::codec::ENTRY_MAGIC_SIZE);
+        assert_eq!(repl, &full[crate::codec::ENTRY_MAGIC_SIZE..]);
+        assert_eq!(&full[..2], &crate::codec::ENTRY_MAGIC.to_le_bytes());
+        // The trailer is the CRC of magic + slice body, so a receiver can
+        // re-derive it from the slice alone.
+        let body = &repl[..repl.len() - crate::codec::CRC_SIZE];
+        let crc = crc32c::crc32c_append(
+            crc32c::crc32c(&crate::codec::ENTRY_MAGIC.to_le_bytes()),
+            body,
+        );
+        assert_eq!(
+            &repl[repl.len() - crate::codec::CRC_SIZE..],
+            &crc.to_le_bytes()
+        );
     }
 
     /// Garbage past `valid_end` from a torn pre-crash write must not
