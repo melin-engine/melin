@@ -563,22 +563,23 @@ tells apart by re-checking the bytes as they arrived:
 
 - **Damaged in transit.** The batch holding the entry is refused
   whole; everything before it is kept. The replica logs a warning
-  naming the entry, drops the connection and reconnects from its
+  naming the damage, drops the connection and reconnects from its
   durable position, and the primary sends the entries again from its
   own journal. Nothing is lost and no operator action is needed for
   an isolated event, but a recurring warning points at the network
   path, a NIC or memory on either node and needs investigating. Each
   occurrence reconnects after the minimum backoff, since the primary
-  was evidently reachable. One case is stricter: damage that lands on
-  the batch's framing itself (an entry or entry count that no longer
-  fits the batch) cannot be told apart from a protocol violation, so
-  the replica stops with an error instead of reconnecting. No damaged
-  entry is kept in either case; restart the replica once the cause is
-  understood.
+  was evidently reachable. Damage to the batch's own structure — an
+  entry count or entry length that no longer fits the batch — is
+  handled the same way: no entry checksum covers those fields, so the
+  replica cannot tell such damage from a malformed batch, and it reads
+  it as damage rather than stop over what is most likely a single
+  damaged frame.
 - **Arrived intact, but the application's codec does not reproduce
   it.** Decoding the entry and encoding it again gives different bytes
-  (see "Building an application"), so the replica would hold a history
-  its primary does not. Reconnecting would fail on the same entry
+  (see "Building an application"), or the entry does not decode at all,
+  so the replica would hold a history its primary does not, or none.
+  Reconnecting would fail on the same entry
   every time, so the replica stops with an error naming the entry.
   This is an application bug: fix the codec, then restart the replica.
 

@@ -44,6 +44,12 @@
 //! longer match it, [`InputBatchError::NotRoundTrip`] if they do. That
 //! second CRC is computed on the failure path only.
 //!
+//! The frame's own structure — its slot count and each slot's length —
+//! sits outside every slot CRC: damage there leaves no CRC to check, and
+//! is reported as [`InputBatchError::Framing`]. Without a frame-level
+//! checksum it cannot be told apart from damage in transit, so it is
+//! treated as such (see [`InputBatchError::is_transit_damage`]).
+//!
 //! `connection_id`, `publish_ts`, `recv_ts` from `InputSlot` are not on
 //! the wire (primary-internal bookkeeping); the receiver reconstructs
 //! them with `Default::default()`.
@@ -147,10 +153,16 @@ pub enum InputBatchError {
     /// The frame's type byte is not [`MSG_INPUT_BATCH`]. Not a fault: the
     /// receive loop takes it as its cue to decode a control message.
     NotInputBatch(u8),
-    /// An `InputBatch` that does not parse, with nothing marking its
-    /// bytes as damaged: truncated, a slot tag this build does not know,
-    /// or an event the application codec refuses although its bytes are
-    /// the ones the primary journaled.
+    /// The frame's structure does not hold together: its slot count or a
+    /// slot's length runs past the frame, falls short of it, or is below
+    /// the smallest entry. No slot CRC covers these fields, so damage to
+    /// them cannot be told from a sender bug; it is treated as damage.
+    /// `&'static str` because each reason is a fixed site in the decoder.
+    Framing(&'static str),
+    /// A slot whose bytes match the CRC the primary shipped, but that does
+    /// not decode: a slot tag this build does not know, or an event the
+    /// application codec refuses. The bytes are the primary's, so every
+    /// attempt fails the same way.
     Malformed(String),
     /// A slot's bytes are not the ones the primary journaled: the CRC
     /// over them as received disagrees with the CRC the primary shipped.
@@ -171,12 +183,30 @@ pub enum InputBatchError {
     },
 }
 
+impl InputBatchError {
+    /// Whether fetching the frame again can cure this: the bytes, or the
+    /// frame structure around them, changed on the way. The other refusals
+    /// are properties of bytes the primary really sent, and fail the same
+    /// way on every attempt.
+    pub fn is_transit_damage(&self) -> bool {
+        matches!(
+            self,
+            InputBatchError::Corrupted { .. } | InputBatchError::Framing(_)
+        )
+    }
+}
+
 impl fmt::Display for InputBatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InputBatchError::NotInputBatch(tag) => write!(
                 f,
                 "expected InputBatch (0x{MSG_INPUT_BATCH:02x}), got 0x{tag:02x}"
+            ),
+            InputBatchError::Framing(reason) => write!(
+                f,
+                "InputBatch framing does not hold together ({reason}): damaged in transit, \
+                 or a sender bug"
             ),
             InputBatchError::Malformed(reason) => write!(f, "malformed InputBatch: {reason}"),
             InputBatchError::Corrupted {
@@ -399,10 +429,10 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
     match payload.first() {
         Some(&MSG_INPUT_BATCH) => {}
         Some(&other) => return Err(InputBatchError::NotInputBatch(other)),
-        None => return Err(InputBatchError::Malformed("empty frame".into())),
+        None => return Err(InputBatchError::Framing("empty frame")),
     }
     let (preamble, mut rest) = BatchPreamble::ref_from_prefix(payload)
-        .map_err(|_| InputBatchError::Malformed("header truncated".into()))?;
+        .map_err(|_| InputBatchError::Framing("header truncated"))?;
     let count = preamble.count.get() as usize;
     slots.clear();
     if slots.capacity() < count {
@@ -416,17 +446,17 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
 
     for _ in 0..count {
         let (header, after_header) = SlotHeader::ref_from_prefix(rest)
-            .map_err(|_| InputBatchError::Malformed("slot header truncated".into()))?;
+            .map_err(|_| InputBatchError::Framing("slot header truncated"))?;
 
         let length = header.length.get() as usize;
         if length < ENTRY_META_SIZE {
-            return Err(InputBatchError::Malformed(
-                "slot length below ENTRY_META_SIZE".into(),
+            return Err(InputBatchError::Framing(
+                "slot length below ENTRY_META_SIZE",
             ));
         }
         let payload_size = length - ENTRY_META_SIZE;
         if after_header.len() < payload_size + CRC_SIZE {
-            return Err(InputBatchError::Malformed("slot truncated".into()));
+            return Err(InputBatchError::Framing("slot truncated"));
         }
         // Everything the CRC covers bar the magic: header and payload.
         let slot_body = &rest[..SLOT_HEADER_LEN + payload_size];
@@ -490,6 +520,12 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
             publish_ts: Default::default(),
             recv_ts: Default::default(),
         });
+    }
+
+    // A sender fills the frame exactly, so leftover bytes mean the count
+    // shrank on the way: the slots it no longer names were never checked.
+    if !rest.is_empty() {
+        return Err(InputBatchError::Framing("bytes past the last slot"));
     }
 
     Ok(())
@@ -883,7 +919,7 @@ mod tests {
         let payload = [MSG_INPUT_BATCH];
         assert!(matches!(
             try_decode_input_batch::<TestEvent>(&payload),
-            Err(InputBatchError::Malformed(_))
+            Err(InputBatchError::Framing(_))
         ));
     }
 
@@ -896,8 +932,52 @@ mod tests {
         let payload = &buf[4..buf.len() - 1];
         assert!(matches!(
             try_decode_input_batch::<TestEvent>(payload),
-            Err(InputBatchError::Malformed(_))
+            Err(InputBatchError::Framing(_))
         ));
+    }
+
+    /// The slot count is outside every slot CRC. Raised, it names a slot
+    /// the frame does not hold; lowered, it would leave the slots past it
+    /// unread and unchecked. Both are refused as framing damage.
+    #[test]
+    fn a_damaged_slot_count_is_refused_as_framing() {
+        let buf = frame(&[
+            sample_slot(5, JournalEvent::App(TestEvent(1))),
+            sample_slot(6, JournalEvent::App(TestEvent(2))),
+        ]);
+        // The count is the `u16` right after the type byte.
+        let count_at = 4 + 1;
+        for count in [1u16, 3] {
+            let mut damaged = buf.clone();
+            damaged[count_at..count_at + 2].copy_from_slice(&count.to_le_bytes());
+            let err = try_decode_input_batch::<TestEvent>(&damaged[4..]).unwrap_err();
+            assert!(
+                matches!(err, InputBatchError::Framing(_)),
+                "count {count}: {err:?}"
+            );
+            assert!(err.is_transit_damage());
+        }
+    }
+
+    /// Which refusals a resend can cure: damage to a slot or to the frame,
+    /// never a property of the primary's own bytes.
+    #[test]
+    fn only_damage_is_transit_damage() {
+        let corrupted = InputBatchError::Corrupted {
+            sequence: 1,
+            shipped_crc: 1,
+            received_crc: 2,
+        };
+        let not_round_trip = InputBatchError::NotRoundTrip {
+            sequence: 1,
+            shipped_crc: 1,
+            reencoded_crc: 2,
+        };
+        assert!(corrupted.is_transit_damage());
+        assert!(InputBatchError::Framing("slot truncated").is_transit_damage());
+        assert!(!not_round_trip.is_transit_damage());
+        assert!(!InputBatchError::Malformed("unknown slot tag".into()).is_transit_damage());
+        assert!(!InputBatchError::NotInputBatch(0x30).is_transit_damage());
     }
 
     #[test]
@@ -957,10 +1037,10 @@ mod tests {
                 let at = FIRST_SLOT + offset;
                 match decode_flipped::<TestEvent>(&buf, at, mask) {
                     Err(InputBatchError::Corrupted { .. }) => {}
-                    // A damaged length field can leave the slot running
-                    // off the end of the frame, which is caught before
-                    // there is a CRC to read.
-                    Err(InputBatchError::Malformed(_)) if offset < 2 => {}
+                    // A damaged length field leaves the slot running off
+                    // the end of the frame or short of it, which is caught
+                    // before there is a CRC to read.
+                    Err(InputBatchError::Framing(_)) if offset < 2 => {}
                     other => panic!("flip {mask:#04x} at slot byte {offset}: {other:?}"),
                 }
             }
@@ -1019,6 +1099,7 @@ mod tests {
         let buf = frame(&[sample_slot(3, JournalEvent::App(OneWayEvent))]);
         let err = try_decode_input_batch::<OneWayEvent>(&buf[4..]).unwrap_err();
         assert!(matches!(err, InputBatchError::Malformed(_)), "{err:?}");
+        assert!(!err.is_transit_damage());
     }
 
     // --- Catch-up: journal bytes → frame ---

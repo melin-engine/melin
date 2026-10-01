@@ -388,8 +388,13 @@ the deferred "Verbatim byte-path journaling" item settled on.
   the session ends as `SessionExit::Corrupted`, a reconnect from the
   durable position with a `warn!`) or intact but not reproduced by the
   codec (`NotRoundTrip`, fatal: it would fail on every reconnect). The
-  promotion drain applies the same check and stops at the first refused
-  frame. This also turns finding 26's non-round-tripping codec from a
+  frame's slot count and slot lengths sit outside every slot CRC; a
+  frame whose structure does not hold together, trailing bytes
+  included, is `InputBatchError::Framing` and takes the damage path,
+  since without a frame-level checksum it cannot be told from damage. A
+  slot that matches its CRC but does not decode stays fatal
+  (`Malformed`). The promotion drain applies the same check and stops at
+  the first refused frame. This also turns finding 26's non-round-tripping codec from a
   silent fork into a refused entry on replicas.
 - `REPL_PROTOCOL_VERSION` is 6; the handshake's equality check refuses
   v5 peers in both directions.

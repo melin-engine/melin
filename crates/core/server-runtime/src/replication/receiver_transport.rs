@@ -239,9 +239,10 @@ pub(super) enum FrameError {
     /// stream position. Everything before the gap is committed; the
     /// local journal is intact. Reconnect and re-handshake.
     SequenceGap(Box<dyn std::error::Error + Send + Sync>),
-    /// An `InputBatch` slot failed its integrity check: the bytes that
-    /// arrived are not the ones the primary journaled
-    /// ([`InputBatchError::Corrupted`]). The whole frame is refused —
+    /// An `InputBatch` frame was damaged on the way: a slot's bytes are
+    /// not the ones the primary journaled, or the frame's structure no
+    /// longer holds together ([`InputBatchError::is_transit_damage`]).
+    /// The whole frame is refused —
     /// nothing in it reaches the input ring, so nothing in it is applied,
     /// journaled or acknowledged — and everything before it is committed.
     /// The primary still holds the intact entries, so the cure is the
@@ -342,11 +343,11 @@ pub(super) struct StreamingFrameOutcome {
 /// (see `melin_transport_core::replication_wire`). A frame that fails is
 /// refused whole:
 ///
-/// - damaged in transit → [`FrameError::Corrupted`]: the contiguous
-///   prefix is committed, the session ends and the receiver reconnects,
-///   exactly as for a gap;
-/// - intact but not reproduced by the application codec → a
-///   [`FrameError::Fatal`]: the same entry would fail on every reconnect,
+/// - damaged in transit, a slot or the frame's structure →
+///   [`FrameError::Corrupted`]: the contiguous prefix is committed, the
+///   session ends and the receiver reconnects, exactly as for a gap;
+/// - intact but not decoded or not reproduced by the application codec →
+///   a [`FrameError::Fatal`]: the same entry would fail on every reconnect,
 ///   and a replica that cannot journal what its primary journaled must
 ///   not keep following it.
 pub(super) fn process_streaming_frames<E: AppEvent>(
@@ -534,10 +535,11 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                         // The frame is refused whole: whatever prefix the
                         // decoder left behind must never be published.
                         slot_buf.clear();
-                        // Damage is cured by a resend; a codec that does
-                        // not round-trip, or a frame that does not parse
-                        // although intact, fails the same way every time.
-                        frame_err = Some(if matches!(e, InputBatchError::Corrupted { .. }) {
+                        // Damage, to a slot or to the frame's structure, is
+                        // cured by a resend; a codec that does not round-trip,
+                        // or a slot that does not decode although intact,
+                        // fails the same way every time.
+                        frame_err = Some(if e.is_transit_damage() {
                             FrameError::Corrupted(Box::new(e))
                         } else {
                             FrameError::Fatal(Box::new(e))
@@ -630,7 +632,7 @@ pub(super) fn process_drain_frames<E: AppEvent>(
                         slot_buf.clear();
                         // Damage is the network's (or hardware's) doing;
                         // anything else is a codec or protocol bug.
-                        if matches!(e, InputBatchError::Corrupted { .. }) {
+                        if e.is_transit_damage() {
                             tracing::warn!(
                                 error = %e,
                                 "refused InputBatch in promotion drain — stopping at the \
@@ -2437,6 +2439,40 @@ mod tests {
             Some(11),
             "no persisted-ack target may name the damaged frame"
         );
+    }
+
+    /// Damage to a frame's structure, which no slot CRC covers, is a
+    /// reconnect like damage to a slot, never a process exit.
+    #[test]
+    fn streaming_refuses_a_frame_with_damaged_framing_and_reconnects() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(10, 0xA0)]);
+        let damaged_at = buf.len();
+        append_input_batch_frame(&mut buf, &[slot(11, 0xA1)]);
+        // Raise the second frame's slot count (the `u16` after its length
+        // prefix and type byte) to name a slot it does not hold.
+        buf[damaged_at + 5..damaged_at + 7].copy_from_slice(&2u16.to_le_bytes());
+
+        let (outcome, _acks) = stream_frames(
+            &buf,
+            &mut producer,
+            9,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+        );
+
+        assert!(
+            matches!(outcome.frame_err, Some(FrameError::Corrupted(_))),
+            "framing damage must end the session as Corrupted (reconnect): {:?}",
+            outcome.frame_err
+        );
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(published, vec![10], "nothing from the damaged frame");
+        assert_eq!(outcome.accum_end_sequence, 10);
     }
 
     /// Loop-level: the session ends as `Corrupted` and no ack, persisted

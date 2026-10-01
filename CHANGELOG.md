@@ -103,12 +103,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   ack policy. Each replicated entry now carries the CRC32C its primary
   journaled it with, and the replica checks the entry it is about to
   journal against it before applying or acknowledging anything. A
-  damaged batch is refused whole and the replica reconnects to fetch it
-  again, with a warning (damage to the batch's framing itself, which is
-  indistinguishable from a protocol violation, stops the replica
-  instead); an entry that arrives intact but that the
-  application's codec does not reproduce byte for byte stops the replica
-  with an error, since it could never hold its primary's history.
+  damaged batch, whether in an entry or in the batch's own entry count
+  and lengths, is refused whole and the replica reconnects to fetch it
+  again, with a warning; an entry that arrives intact but that the
+  application's codec does not reproduce byte for byte, or cannot
+  decode, stops the replica with an error, since it could never hold its
+  primary's history.
   Catch-up now ships entries exactly as they are on the primary's disk
   rather than re-encoding them. **Breaking on the wire:** the replication
   protocol is now version 6 and refuses version 5 peers in either
