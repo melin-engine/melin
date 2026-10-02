@@ -97,13 +97,6 @@ heartbeated at the next scan. io_uring stamps `Instant::now()`.
 
 ## Replication
 
-### TCP sender over-counts evictions
-
-`replication/tcp_sender.rs`, supervisor loop. `evictions_total` is incremented
-on every 50 ms pass while the evicted flag is set and the handler hasn't been
-joined yet. A handler whose exit (uring drain) takes more than 50 ms is
-counted several times. DPDK counts once.
-
 ### DPDK sender `Handshaking` state has no deadline
 
 `replication/dpdk.rs`. `AUTH_TIMEOUT` covers `Authenticating` only. An
