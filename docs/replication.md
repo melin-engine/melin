@@ -801,7 +801,11 @@ Most failures resolve without operator action:
   `ACK-POLICY disk` after promotion if the new primary is standalone;
   restore the target policy once new replicas attach.
 - **A node exits with status 74**: its journal's device refused a
-  write or a sync. Do not restart it in place, and keep your
+  write or a sync. A replica being re-seeded from the primary also
+  stops this way, rather than retrying the transfer, when its device
+  refuses to store the snapshot or journal it receives; a storage
+  failure it cannot write past at all (a file it cannot create or
+  install) stops it with status 1. Do not restart it in place, and keep your
   supervisor from doing so (systemd: `RestartPreventExitStatus=74`).
   If it was the primary, fail over as for a crash. Then either re-seed
   it as a replica, with its journal moved aside, or reboot its host
