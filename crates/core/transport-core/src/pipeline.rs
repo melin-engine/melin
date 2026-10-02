@@ -939,8 +939,23 @@ impl<E: AppEvent> JournalStage<E> {
     /// be stranded on the wrong side of the boundary.
     fn into_sequencer(self) -> Result<Sequencer<E>, JournalError> {
         let (encoder, segment) = self.writer.into_halves()?;
+        // `DEFAULT_CAPACITY` is load-bearing: recovery's torn-tail bound
+        // (`MAX_UNSYNCED_BYTES`) is one drain of a ring this deep.
         let (batches, batch_consumer) =
             build_journal_write_ring(melin_journal::write_ring::DEFAULT_CAPACITY, self.wait);
+        // A real assert, not a debug one: this runs once per pipeline
+        // build, and a deeper ring reaching production would let a crash
+        // tear more than recovery accepts as a torn tail, so the node
+        // would refuse to boot after it. The per-drain check in the disk
+        // thread is debug-only because it sits on the durability path;
+        // this one pins the same bound for release builds.
+        assert!(
+            batches
+                .capacity()
+                .saturating_mul(melin_journal::write_ring::CHUNK_SIZE as u64)
+                <= melin_journal::write_ring::MAX_UNSYNCED_BYTES,
+            "the journal write ring is deeper than recovery's unsynced bound"
+        );
         let control = Arc::new(DiskControl::new());
         let segment_bytes = segment.valid_end();
         // Decided once, here, because this is the only place that still

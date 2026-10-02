@@ -301,17 +301,15 @@ receivers. That is a replication protocol change for a convenience.
     reconnect and resync, logs an `error!` naming the sequence and both
     stamps, and leaves the journal as it is for inspection.
 - **The reader applies the same rule on replay and catch-up, within a
-  segment, as a hard error.** Unlike `SequenceGap`, which recovery
-  treats as a torn tail on the live segment and truncates at, a
-  CRC-valid entry whose stamp regresses is not a torn write: it is a bug
-  or tampering, and recovery fails on it rather than silently dropping
-  the tail. The timestamp check runs after the sequence checks
-  (`SequenceGap`, `SequenceDuplicate`), so stale bytes past the tail
-  still take the truncate-at-gap path and never reach it. That relies
-  on `open_append` scrubbing past `valid_end`, so no stale entry can
-  carry the next expected sequence; a test pins that a CRC-valid
-  regressing entry in the live tail fails recovery rather than
-  truncating it.
+  segment, as a hard error.** Like `SequenceGap` (which recovery no
+  longer treats as a torn tail: see the journal reader's recovery rule
+  and audit finding 5), a CRC-valid entry whose stamp regresses is not a
+  torn write: it is a bug or tampering, and recovery fails on it rather
+  than silently dropping the tail. The timestamp check runs after the
+  sequence checks (`SequenceGap`, `SequenceDuplicate`). No stale entry
+  can sit past the tail, because `open_append` scrubs past `valid_end`;
+  a test pins that a CRC-valid regressing entry in the live tail fails
+  recovery rather than truncating it.
 - **On replay the segment boundary is checked by recovery, not by the
   reader.** With no floor in the header (decision 3) a reader opened on
   a segment cannot judge its first entry, so recovery carries the last

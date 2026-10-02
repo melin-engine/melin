@@ -1,13 +1,34 @@
 //! Journal reader — sequential read with CRC and sequence validation.
 //!
-//! Reads entries one at a time. On crash recovery:
-//! - Truncated entry at EOF → `Ok(None)` (last partial write, safe to ignore)
-//! - CRC mismatch mid-stream → `Err(CorruptEntry)` (real corruption)
+//! Reads entries one at a time, and decides where a segment's entries
+//! end. That decision is the journal's whole recovery rule, so it lives
+//! here, in one place:
+//!
+//! - **Whole entries are never a torn write.** An entry whose CRC
+//!   verifies was written in full by the writer, so anything wrong with
+//!   it — a sequence gap or duplicate, a first entry off the header's
+//!   `starting_sequence`, an event the codec refuses — is corruption, as
+//!   is a `length` wider than any entry of its type (a torn write leaves
+//!   bytes as written or as zeros, so it can only shrink a length).
+//! - **A malformed entry** (zero or bad magic, a CRC mismatch, an entry
+//!   running past EOF) **ends the entries** — if what follows allows it.
+//!   In the [`SegmentKind::Live`] segment, a crash can leave at most one
+//!   unsynced drain ([`crate::write_ring::MAX_UNSYNCED_BYTES`]) half
+//!   written, in any pattern of written and unwritten sectors, after the
+//!   last synced byte. So the stop is a torn, never-acknowledged tail when
+//!   every non-zero byte from the stopping entry's start lies within that
+//!   span, and only zeros follow to the end of the file. Anything else is
+//!   [`JournalError::UnrecoverableTail`]. An [`SegmentKind::Archived`]
+//!   segment was synced in full before it was archived, so nothing but
+//!   zeros (allocation padding a compaction did not trim) may follow its
+//!   last entry.
+//!
+//! Recovery that accepts a torn tail logs it (`warn!`) with its extent.
 
 use std::fs::File;
 use std::io::Read;
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use melin_app::AppEvent;
 
@@ -15,9 +36,64 @@ use zerocopy::FromBytes;
 
 #[cfg(test)]
 use super::codec::ENTRY_OFFSET;
-use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, EntryHeader, FILE_HEADER_SIZE};
+use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, ENTRY_MAGIC, EntryHeader, FILE_HEADER_SIZE};
 use super::error::JournalError;
 use super::event::JournalEvent;
+use crate::write_ring::MAX_UNSYNCED_BYTES;
+
+/// Which end-of-entries rule a [`JournalReader`] applies (see the module
+/// docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentKind {
+    /// The segment being appended to: it may end in one torn,
+    /// never-synced write.
+    Live,
+    /// An archived segment, synced in full before it was archived: its
+    /// entries may be followed by zeros only.
+    Archived,
+}
+
+/// A torn write the reader stopped at and recovery discards: the bytes
+/// from `offset` (where the last whole entry ends) through the last
+/// non-zero byte, `len` bytes in all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TornTail {
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Width of the zero runs the end-of-entries scan compares against.
+/// Comparing `u8` slices is a `memcmp`, which keeps the scan of a
+/// preallocated tail at memory speed even in unoptimised builds; a
+/// per-byte loop does not. 64 KiB: a `static` of zeros, so it costs
+/// address space, not memory.
+const ZERO_RUN: usize = 64 * 1024;
+static ZEROS: [u8; ZERO_RUN] = [0; ZERO_RUN];
+
+/// Offset of the first non-zero byte of `bytes`.
+fn first_nonzero(bytes: &[u8]) -> Option<usize> {
+    let mut base = 0;
+    for run in bytes.chunks(ZERO_RUN) {
+        if run != &ZEROS[..run.len()] {
+            return run.iter().position(|b| *b != 0).map(|i| base + i);
+        }
+        base += run.len();
+    }
+    None
+}
+
+/// Offset of the last non-zero byte of `bytes`.
+fn last_nonzero(bytes: &[u8]) -> Option<usize> {
+    let mut end = bytes.len();
+    for run in bytes.rchunks(ZERO_RUN) {
+        let base = end - run.len();
+        if run != &ZEROS[..run.len()] {
+            return run.iter().rposition(|b| *b != 0).map(|i| base + i);
+        }
+        end = base;
+    }
+    None
+}
 
 /// Initial read buffer size. Sized to amortize `read()` syscall and
 /// per-call compaction overhead across many entries — at ~50–250 bytes
@@ -92,6 +168,15 @@ pub struct JournalReader<E: AppEvent> {
     /// Byte offset in the file of the end of the last successfully decoded entry.
     /// Used by recovery to know where to truncate trailing garbage.
     valid_file_end: u64,
+    /// Which end-of-entries rule applies.
+    kind: SegmentKind,
+    /// The segment's path, for [`JournalError::UnrecoverableTail`].
+    path: PathBuf,
+    /// Set once the entries have ended (cleanly or at a torn tail), so
+    /// later calls return `Ok(None)` without scanning the file again.
+    ended: bool,
+    /// The torn write the entries ended at, if they ended at one.
+    torn_tail: Option<TornTail>,
     /// Byte offset where entries begin (one header reservation). Decoded
     /// from the file header at open time.
     sector_size: usize,
@@ -111,8 +196,21 @@ pub struct JournalReader<E: AppEvent> {
 }
 
 impl<E: AppEvent> JournalReader<E> {
-    /// Open a journal file for reading. Validates the file header.
+    /// Open a live segment for reading (see [`SegmentKind::Live`]).
+    /// Validates the file header.
     pub fn open(path: &Path) -> Result<Self, JournalError> {
+        Self::open_segment(path, SegmentKind::Live)
+    }
+
+    /// Open an archived segment for reading (see
+    /// [`SegmentKind::Archived`]). Validates the file header.
+    pub fn open_archived(path: &Path) -> Result<Self, JournalError> {
+        Self::open_segment(path, SegmentKind::Archived)
+    }
+
+    /// Open a segment of either kind for reading. Validates the file
+    /// header.
+    pub fn open_segment(path: &Path, kind: SegmentKind) -> Result<Self, JournalError> {
         use std::io::Seek;
         let mut file = File::open(path)?;
         advise_sequential(&file);
@@ -138,6 +236,10 @@ impl<E: AppEvent> JournalReader<E> {
             valid: 0,
             last_sequence: None,
             valid_file_end: info.sector_size as u64,
+            kind,
+            path: path.to_path_buf(),
+            ended: false,
+            torn_tail: None,
             sector_size: info.sector_size,
             starting_sequence: info.starting_sequence,
             genesis_entries: info.genesis_entries,
@@ -148,161 +250,165 @@ impl<E: AppEvent> JournalReader<E> {
 
     /// Read the next journal entry.
     ///
-    /// Returns `Ok(Some(entry))` for each valid entry.
-    /// Returns `Ok(None)` at EOF, on a truncated final entry (crash recovery),
-    /// or when reaching zero-filled pre-allocated (fallocated) space.
-    /// Returns `Err` on corruption (CRC mismatch, sequence gap, etc.).
+    /// Returns `Ok(Some(entry))` for each valid entry, and `Ok(None)` once
+    /// the entries end: at EOF, at zeros, or at a torn write the module's
+    /// rule accepts (see [`torn_tail`](Self::torn_tail)). Returns `Err` on
+    /// corruption — a whole entry that is wrong (sequence gap or
+    /// duplicate, an undecodable event, an over-long length) or a stop
+    /// the rule does not accept ([`JournalError::UnrecoverableTail`]).
     pub fn next_entry(&mut self) -> Result<Option<JournalEntry<E>>, JournalError> {
+        if self.ended {
+            return Ok(None);
+        }
         // Ensure we have data to work with.
         self.fill_buffer()?;
-
-        let available = self.valid - self.pos;
-        if available == 0 {
-            return Ok(None);
+        if self.valid == self.pos {
+            // EOF exactly at an entry boundary.
+            return self.end_of_entries(None);
         }
 
-        // Zero magic bytes indicate pre-allocated (fallocated) space.
-        // Entry magic is always 0x4A45, so zero bytes can never start a
-        // valid entry — treat as end-of-data.
-        if available >= 2 && self.buffer[self.pos] == 0 && self.buffer[self.pos + 1] == 0 {
-            return Ok(None);
+        // Zero magic: no entry starts here (the magic is never zero).
+        // Whether that is the end is decided from what follows.
+        if self.zero_magic() {
+            return self.end_of_entries(None);
         }
 
-        let data = &self.buffer[self.pos..self.valid];
+        let mut decoded = codec::decode(&self.buffer[self.pos..self.valid]);
+        // A partial entry in the buffer: read more and decode again, until
+        // the entry is whole or the file has nothing more to give. Looping
+        // (rather than retrying once) keeps a short `read()` — legal on
+        // any file, seen on FUSE/NFS — from passing a whole mid-file
+        // entry to the torn-tail rule as one running past EOF. Each pass
+        // reads at least one byte, so the loop ends at EOF.
+        while matches!(decoded, Err(JournalError::TruncatedEntry)) && self.try_extend_buffer()? {
+            if self.zero_magic() {
+                return self.end_of_entries(None);
+            }
+            decoded = codec::decode(&self.buffer[self.pos..self.valid]);
+        }
 
-        match codec::decode(data) {
+        match decoded {
             Ok((consumed, sequence, timestamp_ns, key_hash, event)) => {
                 self.validate_and_advance(consumed, sequence, timestamp_ns, key_hash, event)
             }
-            Err(JournalError::TruncatedEntry) => {
-                // Could be a partial entry at EOF or we need more data.
-                if self.try_extend_buffer()? {
-                    // Got more data, try again.
-                    let data = &self.buffer[self.pos..self.valid];
-
-                    // Re-check for zero magic after extending — the buffer
-                    // may now contain pre-allocated zeros.
-                    if data.len() >= 2 && data[0] == 0 && data[1] == 0 {
-                        return Ok(None);
-                    }
-
-                    match codec::decode(data) {
-                        Ok((consumed, sequence, timestamp_ns, key_hash, event)) => self
-                            .validate_and_advance(
-                                consumed,
-                                sequence,
-                                timestamp_ns,
-                                key_hash,
-                                event,
-                            ),
-                        // Truly truncated — crash recovery case.
-                        Err(JournalError::TruncatedEntry) => Ok(None),
-                        Err(e) => self.classify_decode_error(e),
-                    }
-                } else {
-                    // No more data available — truncated at EOF.
-                    Ok(None)
-                }
-            }
-            Err(e) => self.classify_decode_error(e),
+            Err(e) if self.is_torn_shape(&e) => self.end_of_entries(Some(e)),
+            Err(e) => Err(e),
         }
     }
 
-    /// Defense in depth: distinguish "walked into a partially-initialised
-    /// region of a preallocated segment" from real corruption / data loss.
-    ///
-    /// Bytes past the writer's last fully-durable entry may legitimately
-    /// look entry-shaped under specific failure modes (e.g. an in-flight
-    /// async write whose CQE has not yet arrived, or a torn write where
-    /// the header sectors landed but the trailing CRC sector did not). In
-    /// every such case the CRC slot on disk reads as `0x00000000` — the
-    /// preallocation pattern — because no write ever placed real CRC
-    /// bytes there. Treat that signature as end-of-data **only** when the
-    /// rest of the file is genuinely preallocation zeros: a zero-CRC in
-    /// the middle of a file with more entry-shaped bytes after it is a
-    /// hole, i.e. *data loss*, and must surface as corruption so recovery
-    /// halts loudly instead of silently truncating the journal.
-    ///
-    /// We only apply the heuristic past the first entry (`last_sequence`
-    /// is set) — at the very start of a file, a zero CRC genuinely
-    /// indicates corruption of the first entry.
-    ///
-    /// The log line is `warn` so the event is always visible: a
-    /// CRC-32C of valid data CAN coincidentally equal zero (≈1 in 2^32),
-    /// in which case we'd silently drop one real entry. The warning lets
-    /// operators audit every occurrence.
-    fn classify_decode_error(
-        &self,
-        err: JournalError,
+    /// Whether the buffered bytes at the read position begin with two
+    /// zero bytes where an entry's magic would be.
+    fn zero_magic(&self) -> bool {
+        self.valid - self.pos >= 2 && self.buffer[self.pos] == 0 && self.buffer[self.pos + 1] == 0
+    }
+
+    /// Whether a decode failure is one a torn write can produce: the
+    /// entry runs past EOF, its CRC does not match, or its magic is
+    /// wrong. All three are decided before the entry is trusted. Every
+    /// other failure is of a check that runs on bytes a torn write cannot
+    /// produce — a length wider than any entry of its type (checked once
+    /// the magic is right), or anything checked after the CRC verified.
+    fn is_torn_shape(&self, err: &JournalError) -> bool {
+        match err {
+            JournalError::TruncatedEntry | JournalError::ChecksumMismatch { .. } => true,
+            // `decode` checks the magic first: with the right magic, a
+            // `CorruptEntry` is the length cap or a post-CRC check.
+            JournalError::CorruptEntry { .. } => {
+                let bytes = &self.buffer[self.pos..self.valid];
+                bytes.len() < 2 || u16::from_le_bytes([bytes[0], bytes[1]]) != ENTRY_MAGIC
+            }
+            _ => false,
+        }
+    }
+
+    /// The entries have stopped at `valid_file_end` — on zeros or EOF
+    /// (`cause` `None`), or on a malformed entry (`cause`). Decide from
+    /// the rest of the file whether that is the end of the segment's
+    /// data (see the module docs) or corruption.
+    fn end_of_entries(
+        &mut self,
+        cause: Option<JournalError>,
     ) -> Result<Option<JournalEntry<E>>, JournalError> {
-        if let JournalError::ChecksumMismatch { expected, .. } = &err
-            && *expected == 0
-            && self.last_sequence.is_some()
-            && self.tail_is_all_zero_past_suspect()?
-        {
-            tracing::warn!(
-                last_sequence = ?self.last_sequence,
-                valid_file_end = self.valid_file_end,
-                "journal reader stopped on suspected pre-allocated tail \
-                 (CRC slot is zero and rest of file is all zeros); \
-                 treating as end-of-data"
-            );
-            return Ok(None);
+        use std::io::Seek;
+        let offset = self.valid_file_end;
+        // How far from the stop a byte may be written and not synced.
+        let reach = match self.kind {
+            SegmentKind::Live => offset.saturating_add(MAX_UNSYNCED_BYTES),
+            SegmentKind::Archived => offset,
+        };
+        let scan = self.scan_tail(offset, reach);
+        // The scan reused the read buffer. Drop what it held and put the
+        // cursor back at the stop, so that a call after an error reads
+        // the same bytes and reaches the same verdict, never a clean end.
+        self.pos = 0;
+        self.valid = 0;
+        self.file.seek(std::io::SeekFrom::Start(offset))?;
+        let (last_within, beyond) = scan?;
+        if let Some(nonzero_at) = beyond {
+            return Err(JournalError::UnrecoverableTail {
+                path: self.path.clone(),
+                offset,
+                last_sequence: self.last_sequence,
+                nonzero_at,
+                cause: cause.map(Box::new),
+            });
         }
-        Err(err)
+        self.ended = true;
+        if let Some(last) = last_within {
+            let torn = TornTail {
+                offset,
+                len: last + 1 - offset,
+            };
+            // `warn`: handled, but the operator should know a write was
+            // torn — and an entry whose valid CRC happens to be zero (one
+            // in 2^32) would also end up here.
+            tracing::warn!(
+                path = %self.path.display(),
+                offset,
+                discarded_bytes = torn.len,
+                last_sequence = ?self.last_sequence,
+                cause = %cause.as_ref().map_or_else(|| "zeros".to_string(), |e| e.to_string()),
+                "journal segment ends in a torn write that was never acknowledged; \
+                 recovery discards it"
+            );
+            self.torn_tail = Some(torn);
+        }
+        Ok(None)
     }
 
-    /// True iff every byte strictly past the suspect entry is zero — i.e.
-    /// the only non-zero bytes left in the file are the malformed entry
-    /// itself, sitting at the writer's last-claimed-durable boundary.
-    ///
-    /// The suspect entry's own bytes are skipped (it's the partial write
-    /// pattern we're choosing to treat as preallocated tail). What we
-    /// must guard against is a *hole*: a CRC=0 entry with real entries
-    /// after it. That signature is data loss and must surface as a hard
-    /// error so recovery halts instead of silently truncating.
-    ///
-    /// Reads are positioned via `read_at` (pread) so they don't disturb
-    /// the buffered reader cursor; chunked so a multi-MB tail doesn't
-    /// allocate a matching buffer.
-    fn tail_is_all_zero_past_suspect(&self) -> Result<bool, JournalError> {
+    /// Scan the file from `from` to EOF. Returns the offset of the last
+    /// non-zero byte before `reach`, and of the first one at or after it
+    /// (the scan stops there). Positioned reads (`pread`), so the scan
+    /// does not move the file cursor; it reuses the read buffer, which
+    /// nothing reads once the entries have ended.
+    fn scan_tail(
+        &mut self,
+        from: u64,
+        reach: u64,
+    ) -> Result<(Option<u64>, Option<u64>), JournalError> {
         use std::os::unix::fs::FileExt;
-        // Recover the suspect entry's total on-disk size from its own
-        // header bytes (which decode parsed cleanly — only the CRC was
-        // wrong). The bytes are still in `self.buffer[self.pos..]`.
-        let data = &self.buffer[self.pos..self.valid];
-        if data.len() < ENTRY_HEADER_SIZE {
-            // Header not fully buffered — be conservative and refuse to
-            // treat as EOF; the caller will surface the original error.
-            return Ok(false);
-        }
-        let (header, _) =
-            EntryHeader::ref_from_prefix(data).map_err(|_| JournalError::TruncatedEntry)?;
-        let payload_len = header.length.get() as usize;
-        let suspect_entry_end =
-            self.valid_file_end + (ENTRY_HEADER_SIZE + payload_len + CRC_SIZE) as u64;
-
         let file_end = self.file.metadata()?.len();
-        if suspect_entry_end > file_end {
-            // The "entry" claims to extend past EOF — definitely garbage,
-            // and nothing after it to worry about. Safe to treat as EOF.
-            return Ok(true);
-        }
-
-        let mut offset = suspect_entry_end;
-        let mut scratch = [0u8; 8192];
+        let mut last_within = None;
+        let mut offset = from;
         while offset < file_end {
-            let want = ((file_end - offset) as usize).min(scratch.len());
-            let n = self.file.read_at(&mut scratch[..want], offset)?;
-            if n == 0 {
-                break;
+            let want = (file_end - offset).min(self.buffer.len() as u64) as usize;
+            let n = match self.file.read_at(&mut self.buffer[..want], offset) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let split = reach.saturating_sub(offset).min(n as u64) as usize;
+            let (within, beyond) = self.buffer[..n].split_at(split);
+            if let Some(i) = last_nonzero(within) {
+                last_within = Some(offset + i as u64);
             }
-            if scratch[..n].iter().any(|b| *b != 0) {
-                return Ok(false);
+            if let Some(i) = first_nonzero(beyond) {
+                return Ok((last_within, Some(offset + (split + i) as u64)));
             }
             offset += n as u64;
         }
-        Ok(true)
+        Ok((last_within, None))
     }
 
     /// Validate sequence continuity, update the hash chain, and advance
@@ -384,6 +490,14 @@ impl<E: AppEvent> JournalReader<E> {
         self.last_sequence
     }
 
+    /// The torn write the entries ended at, once
+    /// [`next_entry`](Self::next_entry) has returned `Ok(None)` on one;
+    /// `None` when they ended cleanly, or have not ended yet. Only a live
+    /// segment can end in one.
+    pub fn torn_tail(&self) -> Option<TornTail> {
+        self.torn_tail
+    }
+
     /// Byte offset in the file just past the last valid entry.
     /// Used by recovery to truncate trailing garbage before reopening for append.
     pub fn valid_file_end(&self) -> u64 {
@@ -460,11 +574,11 @@ impl<E: AppEvent> JournalReader<E> {
     ///
     /// Called from `next_entry`'s `TruncatedEntry` path — i.e. only
     /// when decode could not consume a full entry from the current
-    /// `[pos..valid]` window. This call must make as much free tail
-    /// room as possible so the single follow-up decode attempt
-    /// succeeds even when the underlying `read()` is short (the retry
-    /// in `next_entry` is one-shot: a second `TruncatedEntry` is
-    /// treated as EOF). Always compacting the consumed prefix here is
+    /// `[pos..valid]` window. `next_entry` calls it until the entry
+    /// decodes or this returns false (EOF), so a short `read()` costs
+    /// another pass rather than a misread end of data. Compacting
+    /// first makes as much free tail room as possible, so one pass
+    /// normally suffices. Always compacting the consumed prefix here is
     /// cheap because the function only fires once per buffer-full,
     /// not per decoded entry — the steady-state cost lives in
     /// `fill_buffer`, which stays lazy.
@@ -887,6 +1001,10 @@ mod tests {
         let _ = reader.next_entry();
     }
 
+    /// A flipped byte in an archived segment's entry: archives are synced
+    /// whole, so a CRC mismatch there is never a torn write. (In the live
+    /// segment the same bytes, with only zeros after them, cannot be told
+    /// from one.)
     #[test]
     fn appending_bad_bytes_is_detected() {
         let dir = tempfile::tempdir().unwrap();
@@ -912,9 +1030,25 @@ mod tests {
         file.seek(SeekFrom::Start(entry_offset as u64)).unwrap();
         file.write_all(&byte).unwrap();
 
-        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        let mut reader = JournalReader::<TestEvent>::open_archived(&path).unwrap();
         let err = reader.next_entry();
-        assert!(err.is_err(), "expected error, got {err:?}");
+        match err {
+            Err(JournalError::UnrecoverableTail {
+                offset,
+                last_sequence: None,
+                nonzero_at,
+                cause: Some(cause),
+                ..
+            }) => {
+                assert_eq!(offset, ENTRY_OFFSET);
+                assert_eq!(nonzero_at, ENTRY_OFFSET);
+                assert!(
+                    matches!(*cause, JournalError::ChecksumMismatch { .. }),
+                    "{cause:?}"
+                );
+            }
+            other => panic!("expected UnrecoverableTail, got {other:?}"),
+        }
     }
 
     /// A repeated sequence number mid-stream surfaces as
@@ -967,13 +1101,10 @@ mod tests {
         );
     }
 
-    /// Defense-in-depth: bytes past the writer's last durable entry can,
-    /// under specific failure modes (e.g. an in-flight async write whose
-    /// CQE hasn't arrived, or a torn multi-sector write), look entry-shaped
-    /// while the CRC slot is still preallocation zeros. The reader treats
-    /// that exact signature (`ChecksumMismatch` with stored CRC = 0, past
-    /// the first entry) as end-of-data so recovery succeeds on a journal
-    /// whose last write was only partially observable.
+    /// A torn multi-sector write can land an entry's header and payload
+    /// but not the sector holding its CRC, which then reads as
+    /// preallocation zeros. With only zeros after it, the live segment's
+    /// entries end there.
     #[test]
     fn zero_crc_past_first_entry_treated_as_end_of_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -1021,14 +1152,18 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2, "two real entries should be recoverable");
+        let torn = reader.torn_tail().expect("the torn entry is reported");
+        assert_eq!(torn.offset, valid_end);
+        assert!(torn.len > 0 && torn.len <= (entry_len - CRC_SIZE) as u64);
+        // Ended: later calls neither rescan nor change their answer.
+        assert!(reader.next_entry().unwrap().is_none());
     }
 
-    /// Inverse guard: a zero CRC at the *very first* entry
-    /// (`last_sequence == None`) still surfaces as a `ChecksumMismatch`.
-    /// We only relax the check past the first entry, so corruption of
-    /// the first entry remains visible.
+    /// The first write to a fresh segment can be torn like any other:
+    /// a zero CRC on the first entry, with only zeros after it, is a
+    /// torn tail too.
     #[test]
-    fn zero_crc_at_first_entry_still_errors() {
+    fn zero_crc_at_first_entry_is_a_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
@@ -1054,23 +1189,24 @@ mod tests {
         file.sync_all().unwrap();
 
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
-        let err = reader.next_entry();
-        assert!(
-            matches!(err, Err(JournalError::ChecksumMismatch { .. })),
-            "expected ChecksumMismatch at first entry, got {err:?}"
-        );
+        assert!(reader.next_entry().unwrap().is_none());
+        assert_eq!(reader.last_sequence(), None);
+        assert_eq!(reader.valid_file_end(), ENTRY_OFFSET);
+        assert_eq!(reader.torn_tail().map(|t| t.offset), Some(ENTRY_OFFSET));
     }
 
     /// Critical guard: a zero-CRC entry followed by more entry-shaped
-    /// bytes is a **hole** in the journal (data loss), not preallocated
-    /// tail. The reader must surface this as an error so recovery halts
-    /// instead of silently truncating the journal to the prefix.
+    /// bytes further away than one unsynced drain can reach is a
+    /// **hole** in synced data, not a torn write. The reader must refuse
+    /// so recovery halts instead of silently truncating the journal to
+    /// the prefix. (Within that reach, the same bytes are what a drain
+    /// whose sectors landed out of order leaves, and read as a torn tail.)
     ///
     /// Runs under both feature configs: the CRC mismatch on the forged
     /// entry fires inside `codec::decode`, before `validate_and_advance`
     /// (and therefore before any hash-chain check) ever runs.
     #[test]
-    fn zero_crc_with_data_after_surfaces_error() {
+    fn zero_crc_with_data_past_one_drain_surfaces_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
@@ -1115,6 +1251,8 @@ mod tests {
             .unwrap();
         file.seek(SeekFrom::Start(valid_end)).unwrap();
         file.write_all(&scratch1[..len1]).unwrap();
+        file.seek(SeekFrom::Start(valid_end + MAX_UNSYNCED_BYTES))
+            .unwrap();
         file.write_all(&scratch2[..len2]).unwrap();
         file.sync_all().unwrap();
 
@@ -1123,19 +1261,108 @@ mod tests {
         for _ in 0..2 {
             reader.next_entry().unwrap();
         }
-        // Hitting the zero-CRC entry with real data after it must
-        // surface as ChecksumMismatch, not silently stop.
+        // Hitting the zero-CRC entry with real data past one drain must
+        // be refused, not silently stop.
+        match reader.next_entry() {
+            Err(JournalError::UnrecoverableTail {
+                offset,
+                last_sequence: Some(2),
+                nonzero_at,
+                cause: Some(cause),
+                ..
+            }) => {
+                assert_eq!(offset, valid_end);
+                assert_eq!(nonzero_at, valid_end + MAX_UNSYNCED_BYTES);
+                assert!(
+                    matches!(*cause, JournalError::ChecksumMismatch { expected: 0, .. }),
+                    "{cause:?}"
+                );
+            }
+            other => panic!("expected UnrecoverableTail (data loss hole), got {other:?}"),
+        }
+    }
+
+    /// The bound is exact: a non-zero byte at the last offset one drain
+    /// can reach is a torn tail, one byte further is corruption.
+    #[test]
+    fn the_torn_tail_bound_is_one_drain_from_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        {
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+        }
+        let valid_end = ENTRY_OFFSET + (codec::ENTRY_FRAMING_SIZE + 8) as u64;
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        use std::os::unix::fs::FileExt;
+
+        let last_reachable = valid_end + MAX_UNSYNCED_BYTES - 1;
+        file.write_all_at(&[0xA5], last_reachable).unwrap();
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        assert!(reader.next_entry().unwrap().is_some());
+        assert!(reader.next_entry().unwrap().is_none());
+        assert_eq!(
+            reader.torn_tail(),
+            Some(TornTail {
+                offset: valid_end,
+                len: MAX_UNSYNCED_BYTES
+            })
+        );
+
+        file.write_all_at(&[0], last_reachable).unwrap();
+        file.write_all_at(&[0xA5], last_reachable + 1).unwrap();
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        assert!(reader.next_entry().unwrap().is_some());
+        match reader.next_entry() {
+            Err(JournalError::UnrecoverableTail {
+                nonzero_at,
+                cause: None,
+                ..
+            }) => assert_eq!(nonzero_at, last_reachable + 1),
+            other => panic!("expected UnrecoverableTail, got {other:?}"),
+        }
+    }
+
+    /// A whole entry — CRC valid — whose sequence skips ahead is
+    /// corruption wherever it sits, the live segment's tail included: a
+    /// crash leaves bytes as written or zeros, never a whole entry with
+    /// the wrong sequence.
+    #[test]
+    fn sequence_gap_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        {
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+        }
+        let valid_end = ENTRY_OFFSET + (codec::ENTRY_FRAMING_SIZE + 8) as u64;
+        let mut scratch = [0u8; 256];
+        let len = codec::encode(99, 0, 0, &JournalEvent::App(TestEvent(2)), &mut scratch).unwrap();
+        use std::os::unix::fs::FileExt;
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&scratch[..len], valid_end).unwrap();
+
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        reader.next_entry().unwrap().expect("first entry");
         let err = reader.next_entry();
         assert!(
-            matches!(err, Err(JournalError::ChecksumMismatch { .. })),
-            "expected ChecksumMismatch (data loss hole), got {err:?}"
+            matches!(
+                err,
+                Err(JournalError::SequenceGap {
+                    expected: 2,
+                    actual: 99
+                })
+            ),
+            "expected SequenceGap, got {err:?}"
         );
     }
 
+    /// Finding 7 at the reader: a length wider than any entry of the
+    /// event type is corruption before the CRC is looked at — even on the
+    /// live segment's last entry with only zeros after it, where the CRC
+    /// slot the length points at would read as zeros.
     #[test]
-    fn sequence_gap_detected() {
-        // Build a journal manually: header + two entries, then overwrite
-        // the second entry's sequence field to introduce a gap.
+    fn an_over_long_length_is_corruption_not_a_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
@@ -1143,32 +1370,75 @@ mod tests {
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
-
-        // Overwrite the sequence number of the second user entry to a
-        // skipped value. Layout: each entry = ENTRY_HEADER_SIZE(20) +
-        // payload_len + CRC_SIZE(4). For TestEvent, payload = 9
-        // (key_hash+tag) + 8 (payload) = 17. Full = 41.
-        // The layout is identical under both feature configs — chain
-        // metadata lives in the file header, not the entry stream.
-        const FIRST_ENTRY_SIZE: u64 = 20 + 17 + 4;
-        let second_seq_offset = ENTRY_OFFSET + FIRST_ENTRY_SIZE + 4;
-        let mut file = OpenOptions::new()
+        let second = ENTRY_OFFSET + (codec::ENTRY_FRAMING_SIZE + 8) as u64;
+        use std::os::unix::fs::FileExt;
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
-        use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(second_seq_offset)).unwrap();
-        // Write sequence = 99 and fix the CRC.
-        let new_seq: u64 = 99;
-        file.write_all(&new_seq.to_le_bytes()).unwrap();
+        let mut length = [0u8; 2];
+        file.read_exact_at(&mut length, second + 2).unwrap();
+        // One more byte than the widest `TestEvent` entry.
+        let widest = (codec::ENTRY_META_SIZE + TestEvent::MAX_ENCODED_SIZE) as u16;
+        assert_eq!(u16::from_le_bytes(length), widest);
+        file.write_all_at(&(widest + 1).to_le_bytes(), second + 2)
+            .unwrap();
 
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
-        // First entry decodes cleanly; second trips CRC (we didn't
-        // refix) or gap. Either is a non-Ok outcome.
-        let _ = reader.next_entry(); // first entry ok
+        reader.next_entry().unwrap().expect("first entry");
         let err = reader.next_entry();
-        assert!(err.is_err(), "expected error, got {err:?}");
+        assert!(
+            matches!(err, Err(JournalError::CorruptEntry { sequence: 2, .. })),
+            "expected CorruptEntry, got {err:?}"
+        );
+    }
+
+    /// An archived segment may end in zeros (allocation padding a
+    /// compaction did not trim) — and only in zeros.
+    #[test]
+    fn an_archived_segment_may_end_in_zeros_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        {
+            let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+        }
+        let mut reader = JournalReader::<TestEvent>::open_archived(&path).unwrap();
+        assert!(reader.next_entry().unwrap().is_some());
+        assert!(
+            reader.next_entry().unwrap().is_none(),
+            "padding is not data"
+        );
+
+        let valid_end = ENTRY_OFFSET + (codec::ENTRY_FRAMING_SIZE + 8) as u64;
+        use std::os::unix::fs::FileExt;
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&[1], valid_end + 4096).unwrap();
+        let mut reader = JournalReader::<TestEvent>::open_archived(&path).unwrap();
+        assert!(reader.next_entry().unwrap().is_some());
+        match reader.next_entry() {
+            Err(JournalError::UnrecoverableTail {
+                offset, nonzero_at, ..
+            }) => {
+                assert_eq!(offset, valid_end);
+                assert_eq!(nonzero_at, valid_end + 4096);
+            }
+            other => panic!("expected UnrecoverableTail, got {other:?}"),
+        }
+        // A refusal is not an end: asking again refuses again.
+        assert!(
+            matches!(
+                reader.next_entry(),
+                Err(JournalError::UnrecoverableTail { .. })
+            ),
+            "a second call must not read as a clean end"
+        );
+        // The same bytes in a live segment are within one drain: torn.
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        assert!(reader.next_entry().unwrap().is_some());
+        assert!(reader.next_entry().unwrap().is_none());
+        assert!(reader.torn_tail().is_some());
     }
 
     /// The header's `starting_sequence` pins the first entry: a segment

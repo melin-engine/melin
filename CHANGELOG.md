@@ -126,8 +126,39 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `JournalReader::genesis_entries`, `JournaledApp::genesis_entries`,
   `snapshot::load_with_header`, `snapshot::MAX_HEADER_SIZE`, and
   `melin_journal::fresh_anchor` is public.
+- **One rule decides where a journal segment's data ends** (see the
+  recovery fixes under Fixed). `JournalReader` applies it: `open` reads
+  a live segment, `open_archived` an archive, `open_segment` either
+  (`SegmentKind`), and `torn_tail` reports the torn write a live segment
+  ended in (`TornTail`). `JournalError` gains `UnrecoverableTail`, for a
+  segment whose entries stop early with data after them that no crash
+  can explain; source-breaking for code that matches on `JournalError`
+  exhaustively. `segment::LineageReport::live_tail_gap` is replaced by
+  `live_torn_tail`: a sequence gap is now always an error.
+  `write_ring::MAX_UNSYNCED_BYTES` names the bound the rule uses.
+  `codec::decode` refuses an entry longer than its event type allows,
+  so an application must never lower `AppEvent::MAX_ENCODED_SIZE` below
+  the width of events in a journal it replays. Recovery now reads the
+  live segment to its end, pre-allocated space included, on every start.
 
 ### Fixed
+
+- **Recovery could delete acknowledged journal entries, and could
+  refuse to start after an ordinary crash.** A sequence gap in the live
+  segment, a range of zeros, or one flipped bit in the last entry's
+  length each made recovery stop early and truncate everything after,
+  replicated entries included; the newest archive, when the live segment
+  was missing, could be cut short the same way. Yet a process killed
+  mid-write could leave a final entry cut between its two magic bytes or
+  inside its checksum, which recovery refused, keeping the node down
+  until someone edited the file. Recovery now discards only what a crash
+  can have left: a malformed final write within one unsynced write
+  (40 MiB) of the last whole entry, followed by nothing but zeros, in
+  the live segment only. Anything else — a whole entry with the wrong
+  sequence, an over-long entry length, data beyond that reach, anything
+  after an archive's last entry but zeros — stops the node with an error
+  and leaves the journal untouched (see Crash Recovery in
+  `docs/journal.md`).
 
 - **A reconnecting replica could take entries it already held a second
   time.** A replica reconnects from the position its journal has made

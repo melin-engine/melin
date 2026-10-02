@@ -41,7 +41,7 @@ pub use encoder::JournalEncoder;
 pub use error::JournalError;
 pub use event::JournalEvent;
 pub use preparer::StagingMode;
-pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
+pub use reader::{JournalEntry, JournalReader, RawJournalScanner, SegmentKind, TornTail};
 pub use segment_file::SegmentFile;
 pub use write::JournalWrite;
 
