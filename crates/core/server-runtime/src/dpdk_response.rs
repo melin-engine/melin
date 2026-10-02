@@ -25,12 +25,12 @@ use crate::halt::RefusalQueue;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::DurableWireSeqCursor;
-use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
 
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
-use crate::response_frame::{EncodeBuf, MAX_APP_FRAME, frame_app_response};
+use crate::response_frame::{EncodeBuf, MAX_APP_FRAME, encode_slot_payload, frame_app_response};
 
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
@@ -619,26 +619,7 @@ pub fn run<A: Application>(
             // Frame 1: application payload (Report / Query via encoder;
             // EngineError via codec). BatchEnd payloads carry no body —
             // the terminator below handles them via is_last_in_request.
-            let payload_result: Option<Result<usize, &'static str>> = match slot.payload {
-                OutputPayload::Report(ref report) => {
-                    Some(frame_app_response(&mut encode_buf, |body| {
-                        encoder.encode_report(report, body)
-                    }))
-                }
-                OutputPayload::QueryResponse(ref q) => {
-                    Some(frame_app_response(&mut encode_buf, |body| {
-                        encoder.encode_query(q, body)
-                    }))
-                }
-                OutputPayload::EngineError => Some(
-                    control_codec::encode_transport_response(
-                        &TransportResponse::EngineError,
-                        &mut encode_buf,
-                    )
-                    .map_err(|_| "encode error"),
-                ),
-                OutputPayload::BatchEnd => None,
-            };
+            let payload_result = encode_slot_payload(&slot.payload, &*encoder, &mut encode_buf);
 
             // The BatchEnd terminator rides in the same frame. It is
             // transport-shaped and byte-identical every time, so it is

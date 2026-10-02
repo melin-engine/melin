@@ -3,7 +3,10 @@
 //! runtime writes the `[length: u32 LE][TAG_APP]` header in front of it,
 //! so no application carries the protocol's framing.
 
-use melin_wire_protocol::control_codec::{TAG_APP, TAG_LEN};
+use melin_app::encoder::ResponseEncoder;
+use melin_transport_core::pipeline::OutputPayload;
+use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control_codec::{self, TAG_APP, TAG_LEN};
 
 /// Bound on one application response body — what a `ResponseEncoder`
 /// may write for a single report or query response.
@@ -51,9 +54,102 @@ pub(crate) fn frame_app_response(
     Ok(HEADER_LEN + len)
 }
 
+/// Encode one output slot's payload frame into `buf`.
+///
+/// Application-shaped payloads (`Report`, `QueryResponse`) go through the
+/// application's encoder and [`frame_app_response`]; `EngineError` is
+/// transport-shaped and encoded by the runtime directly. `BatchEnd` carries
+/// no body and returns `None` — the wire terminator is emitted from the
+/// slot's `is_last_in_request` flag, not from the payload.
+#[inline]
+pub(crate) fn encode_slot_payload<R: Copy, Q: Copy>(
+    payload: &OutputPayload<R, Q>,
+    encoder: &dyn ResponseEncoder<Report = R, Query = Q>,
+    buf: &mut EncodeBuf,
+) -> Option<Result<usize, &'static str>> {
+    match payload {
+        OutputPayload::Report(report) => Some(frame_app_response(buf, |body| {
+            encoder.encode_report(report, body)
+        })),
+        OutputPayload::QueryResponse(q) => Some(frame_app_response(buf, |body| {
+            encoder.encode_query(q, body)
+        })),
+        OutputPayload::EngineError => Some(
+            control_codec::encode_transport_response(&TransportResponse::EngineError, buf)
+                .map_err(|_| "encode error"),
+        ),
+        OutputPayload::BatchEnd => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes the report / query value as one byte, so a test can see
+    /// which encoder method ran.
+    struct ByteEncoder;
+
+    impl ResponseEncoder for ByteEncoder {
+        type Report = u8;
+        type Query = u16;
+
+        fn encode_report(&self, report: &u8, buf: &mut [u8]) -> Result<usize, &'static str> {
+            buf[0] = *report;
+            Ok(1)
+        }
+
+        fn encode_query(&self, query: &u16, buf: &mut [u8]) -> Result<usize, &'static str> {
+            buf[..2].copy_from_slice(&query.to_le_bytes());
+            Ok(2)
+        }
+    }
+
+    #[test]
+    fn a_report_goes_through_the_report_encoder() {
+        let mut buf = [0u8; MAX_APP_FRAME];
+        let n = encode_slot_payload(&OutputPayload::Report(7), &ByteEncoder, &mut buf);
+        assert_eq!(n, Some(Ok(6)));
+        assert_eq!(&buf[..6], &[2, 0, 0, 0, TAG_APP, 7]);
+    }
+
+    #[test]
+    fn a_query_response_goes_through_the_query_encoder() {
+        let mut buf = [0u8; MAX_APP_FRAME];
+        let n = encode_slot_payload(
+            &OutputPayload::<u8, u16>::QueryResponse(0x0201),
+            &ByteEncoder,
+            &mut buf,
+        );
+        assert_eq!(n, Some(Ok(7)));
+        assert_eq!(&buf[..7], &[3, 0, 0, 0, TAG_APP, 1, 2]);
+    }
+
+    #[test]
+    fn an_engine_error_is_the_transport_frame() {
+        let mut buf = [0u8; MAX_APP_FRAME];
+        let n = encode_slot_payload(
+            &OutputPayload::<u8, u16>::EngineError,
+            &ByteEncoder,
+            &mut buf,
+        )
+        .expect("EngineError has a body")
+        .expect("EngineError encodes");
+        let mut expected = [0u8; 16];
+        let m = control_codec::encode_transport_response(
+            &TransportResponse::EngineError,
+            &mut expected,
+        )
+        .expect("EngineError encodes");
+        assert_eq!(&buf[..n], &expected[..m]);
+    }
+
+    #[test]
+    fn a_batch_end_has_no_payload_frame() {
+        let mut buf = [0u8; MAX_APP_FRAME];
+        let n = encode_slot_payload(&OutputPayload::<u8, u16>::BatchEnd, &ByteEncoder, &mut buf);
+        assert_eq!(n, None);
+    }
 
     fn frame(
         encode: impl FnOnce(&mut [u8]) -> Result<usize, &'static str>,
