@@ -170,7 +170,6 @@ pub fn run<A: Application>(
     )
     .expect("heartbeat encodes");
 
-    let mut last_heartbeat_scan = Instant::now();
     // Gate the heartbeat scan's clock read so the count==0 spin doesn't
     // spend the response thread's CPU on `__vdso_clock_gettime`. Reads
     // the clock every ~1 M idle iterations while spinning; heartbeat
@@ -249,7 +248,7 @@ pub fn run<A: Application>(
             &control_rx,
             &mut connections,
             &active_connections,
-            last_heartbeat_scan,
+            Instant::now,
         );
 
         if slots.is_empty() {
@@ -283,7 +282,6 @@ pub fn run<A: Application>(
                     .is_some()
             {
                 let now = Instant::now();
-                last_heartbeat_scan = now;
                 let mut failed: Vec<u64> = Vec::new();
                 for (&conn_id, state) in connections.iter_mut() {
                     if now.duration_since(state.last_send) >= interval {
@@ -589,16 +587,22 @@ struct ConnectionHeartbeat {
 /// can be unit-tested: the response stage is the **sole owner** of
 /// `active_connections` decrements. The poll thread increments on auth
 /// success and sends `Disconnected`; this function handles the decrement.
+///
+/// A new connection's heartbeat clock starts at `clock()`, read at most once
+/// per call and only when a `Connected` is drained: this runs every loop
+/// iteration, and almost every drain is empty.
 fn process_control_events(
     control_rx: &mpsc::Receiver<ControlEvent>,
     connections: &mut FxHashMap<u64, ConnectionHeartbeat>,
     active_connections: &AtomicU64,
-    now: Instant,
+    clock: impl Fn() -> Instant,
 ) {
+    let mut now = None;
     while let Ok(event) = control_rx.try_recv() {
         match event {
             ControlEvent::Connected { connection_id } => {
-                connections.insert(connection_id, ConnectionHeartbeat { last_send: now });
+                let last_send = *now.get_or_insert_with(&clock);
+                connections.insert(connection_id, ConnectionHeartbeat { last_send });
             }
             ControlEvent::Disconnected { connection_id } => {
                 if connections.remove(&connection_id).is_some() {
@@ -630,14 +634,14 @@ mod tests {
         counter.fetch_add(1, Ordering::Relaxed);
         tx.send(ControlEvent::Connected { connection_id: 1 })
             .unwrap();
-        process_control_events(&rx, &mut connections, &counter, now);
+        process_control_events(&rx, &mut connections, &counter, || now);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         assert_eq!(connections.len(), 1);
 
         // Poll thread: connection closes → send Disconnected (no decrement).
         tx.send(ControlEvent::Disconnected { connection_id: 1 })
             .unwrap();
-        process_control_events(&rx, &mut connections, &counter, now);
+        process_control_events(&rx, &mut connections, &counter, || now);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
         assert_eq!(connections.len(), 0);
     }
@@ -653,7 +657,7 @@ mod tests {
 
         tx.send(ControlEvent::Disconnected { connection_id: 999 })
             .unwrap();
-        process_control_events(&rx, &mut connections, &counter, now);
+        process_control_events(&rx, &mut connections, &counter, || now);
         // Counter must stay at 0 — not wrap to u64::MAX.
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
@@ -672,14 +676,14 @@ mod tests {
             tx.send(ControlEvent::Connected { connection_id: id })
                 .unwrap();
         }
-        process_control_events(&rx, &mut connections, &counter, now);
+        process_control_events(&rx, &mut connections, &counter, || now);
         assert_eq!(counter.load(Ordering::Relaxed), 3);
         assert_eq!(connections.len(), 3);
 
         // Connection 2 disconnects.
         tx.send(ControlEvent::Disconnected { connection_id: 2 })
             .unwrap();
-        process_control_events(&rx, &mut connections, &counter, now);
+        process_control_events(&rx, &mut connections, &counter, || now);
         assert_eq!(counter.load(Ordering::Relaxed), 2);
         assert_eq!(connections.len(), 2);
 
@@ -688,7 +692,7 @@ mod tests {
             .unwrap();
         tx.send(ControlEvent::Disconnected { connection_id: 3 })
             .unwrap();
-        process_control_events(&rx, &mut connections, &counter, now);
+        process_control_events(&rx, &mut connections, &counter, || now);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
         assert_eq!(connections.len(), 0);
     }
@@ -705,15 +709,48 @@ mod tests {
         counter.fetch_add(1, Ordering::Relaxed);
         tx.send(ControlEvent::Connected { connection_id: 1 })
             .unwrap();
-        process_control_events(&rx, &mut connections, &counter, now);
+        process_control_events(&rx, &mut connections, &counter, || now);
 
         // Two Disconnected events for the same connection.
         tx.send(ControlEvent::Disconnected { connection_id: 1 })
             .unwrap();
         tx.send(ControlEvent::Disconnected { connection_id: 1 })
             .unwrap();
-        process_control_events(&rx, &mut connections, &counter, now);
+        process_control_events(&rx, &mut connections, &counter, || now);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    /// A new connection's heartbeat clock starts when its `Connected` is
+    /// drained, not at some earlier stored instant; and a drain with no
+    /// `Connected` reads no clock at all, since it runs every iteration.
+    #[test]
+    fn connected_stamps_the_clock_read_lazily_at_drain() {
+        let counter = AtomicU64::new(0);
+        let (tx, rx) = mpsc::channel();
+        let mut connections = FxHashMap::default();
+        let reads = std::cell::Cell::new(0u32);
+        let at_drain = Instant::now() + std::time::Duration::from_secs(60);
+        let clock = || {
+            reads.set(reads.get() + 1);
+            at_drain
+        };
+
+        // Empty drain, and a drain of a Disconnected only: no clock read.
+        process_control_events(&rx, &mut connections, &counter, clock);
+        tx.send(ControlEvent::Disconnected { connection_id: 9 })
+            .unwrap();
+        process_control_events(&rx, &mut connections, &counter, clock);
+        assert_eq!(reads.get(), 0);
+
+        // Two Connected in one drain: one read, both stamped with it.
+        tx.send(ControlEvent::Connected { connection_id: 1 })
+            .unwrap();
+        tx.send(ControlEvent::Connected { connection_id: 2 })
+            .unwrap();
+        process_control_events(&rx, &mut connections, &counter, clock);
+        assert_eq!(reads.get(), 1);
+        assert_eq!(connections[&1].last_send, at_drain);
+        assert_eq!(connections[&2].last_send, at_drain);
     }
 
     mod push_frame {

@@ -89,12 +89,6 @@ The DPDK heartbeat timer also omits the `past_spin_budget()` condition that
 `response.rs` explains is needed to keep the heartbeat scan from stretching to
 minutes on a nearly saturated stage.
 
-### DPDK `Connected` stamps a stale heartbeat clock (minor)
-
-`dpdk_response.rs`, `process_control_events` stamps a new connection with
-`last_heartbeat_scan` rather than now, so under sustained load it is
-heartbeated at the next scan. io_uring stamps `Instant::now()`.
-
 ## Replication
 
 ### DPDK sender `Handshaking` state has no deadline
