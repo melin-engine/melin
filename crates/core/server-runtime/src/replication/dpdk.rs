@@ -28,10 +28,10 @@ use super::receiver_transport::{
 use super::validation_worker::ValidationWorker;
 use super::{
     ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles, ReplicationMetrics,
-    ResumePoint, ResyncDecision, SentHighWater, build_replica_pipeline_with_threads,
-    handle_resync_verdict, handle_session_exit, journal_failed_while_disconnected,
-    recover_replica_state, sleep_then_double_backoff, take_pipeline_for_promotion,
-    teardown_replica_pipeline,
+    ResumePoint, ResyncDecision, SentHighWater, StreamStartVerdict,
+    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
+    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
+    take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
 use melin_transport_core::replication::catchup::{
@@ -1158,7 +1158,8 @@ where
         tip_ready,
         journal_tip,
         primary_link_up,
-        primary_ack_policy,
+        // Stored by `accept_stream_start`, which takes `control` whole.
+        primary_ack_policy: _,
         pipeline_healthy,
     } = control;
     journal_tip.advance(melin_transport_core::WireSeq::new(last_sequence));
@@ -1449,58 +1450,37 @@ where
                             epoch,
                             ack_policy,
                         } => {
-                            // Fence: refuse a primary behind our epoch — its
-                            // divergent lineage must not overwrite our more
-                            // current state. Mirrors the kernel-TCP receiver.
                             // (A resync rebase adopts the primary's epoch
                             // inside `handle_resync_verdict` instead.)
-                            let our_epoch = fence_state.epoch();
-                            if fence_state.refuses_primary(epoch) {
-                                warn!(
-                                    primary_epoch = epoch,
-                                    our_epoch,
-                                    "primary is behind our fencing epoch — refusing to follow \
-                                     stale primary (DPDK)"
-                                );
-                                // Close before sleeping — a handle left open
-                                // here leaks its smoltcp socket on every
-                                // refusal round (the reconnect allocates a
-                                // fresh one) and holds the stale primary's
-                                // connection through the backoff.
-                                transport.close(handle);
-                                sleep_then_double_backoff(&mut backoff, shutdown, promote);
-                                break 'handshake None; // caught by the None check below
+                            match super::accept_stream_start(
+                                super::StreamStart {
+                                    start_sequence,
+                                    lineage: (segment_start_sequence, anchor_hash, genesis_entries),
+                                    epoch,
+                                    ack_policy,
+                                },
+                                "dpdk",
+                                &pipeline,
+                                &mut journal_writer,
+                                &fence_state,
+                                control,
+                            ) {
+                                Ok(StreamStartVerdict::Follow(lineage)) => {
+                                    break 'handshake Some(lineage);
+                                }
+                                Ok(StreamStartVerdict::StalePrimary) => {
+                                    // Close before sleeping — a handle left
+                                    // open here leaks its smoltcp socket on
+                                    // every refusal round (the reconnect
+                                    // allocates a fresh one) and holds the
+                                    // stale primary's connection through the
+                                    // backoff.
+                                    transport.close(handle);
+                                    sleep_then_double_backoff(&mut backoff, shutdown, promote);
+                                    break 'handshake None; // caught by the None check below
+                                }
+                                Err(e) => fatal_err_dpdk!(e),
                             }
-                            // A replica with a journal already records its
-                            // lineage's genesis length; the primary's must
-                            // agree with it. Mirrors the kernel-TCP receiver.
-                            if pipeline.is_none()
-                                && let Err(e) = super::adopt_genesis_into_empty_unknown_journal(
-                                    &mut journal_writer,
-                                    (segment_start_sequence, anchor_hash, genesis_entries),
-                                )
-                            {
-                                fatal_err_dpdk!(e.into());
-                            }
-                            let local =
-                                match super::local_lineage_genesis(&pipeline, &journal_writer) {
-                                    Ok(local) => local,
-                                    Err(e) => fatal_err_dpdk!(e.into()),
-                                };
-                            if let Some(local) = local
-                                && let Err(e) =
-                                    super::check_advertised_genesis(local, genesis_entries)
-                            {
-                                fatal_err_dpdk!(e.into());
-                            }
-                            fence_state.observe_epoch(epoch);
-                            primary_ack_policy.store(ack_policy, Ordering::Release);
-                            info!(start_sequence, epoch, "streaming started (DPDK)");
-                            break 'handshake Some((
-                                segment_start_sequence,
-                                anchor_hash,
-                                genesis_entries,
-                            ));
                         }
                         ref resync @ (PrimaryMessage::NeedSnapshot
                         | PrimaryMessage::HashMismatch) => {

@@ -22,10 +22,10 @@ use super::receiver_transport::{
     ControlFrameSource, ReceiverTransport, SessionExit, streaming_loop,
 };
 use super::{
-    ReplicaPipelineHandles, ResumePoint, ResyncDecision, build_replica_pipeline_with_threads,
-    handle_resync_verdict, handle_session_exit, journal_failed_while_disconnected,
-    recover_replica_state, sleep_then_double_backoff, take_pipeline_for_promotion,
-    teardown_replica_pipeline,
+    ReplicaPipelineHandles, ResumePoint, ResyncDecision, StreamStartVerdict,
+    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
+    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
+    take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_transport_core::replication::protocol::{
@@ -577,7 +577,8 @@ where
         tip_ready,
         journal_tip,
         primary_link_up,
-        primary_ack_policy,
+        // Stored by `accept_stream_start`, which takes `control` whole.
+        primary_ack_policy: _,
         pipeline_healthy,
     } = control;
     // Recover whenever any journal segment survives — live OR archived;
@@ -784,21 +785,23 @@ where
                 genesis_entries,
                 epoch,
                 ack_policy,
-            } => {
-                // Fence: refuse to follow a primary whose epoch is behind
-                // ours — following its (divergent) lineage on top of our
-                // more-current state would corrupt the journal. Disconnect
-                // and retry with backoff; the operator's logs flag the
-                // misdirected `--replica-of`. Our handshake (already sent)
-                // carries our higher epoch, so the stale primary also fences
-                // itself on its side.
-                let our_epoch = fence_state.epoch();
-                if fence_state.refuses_primary(epoch) {
-                    warn!(
-                        primary_epoch = epoch,
-                        our_epoch,
-                        "primary is behind our fencing epoch — refusing to follow stale primary"
-                    );
+            } => match super::accept_stream_start(
+                super::StreamStart {
+                    start_sequence,
+                    lineage: (segment_start_sequence, anchor_hash, genesis_entries),
+                    epoch,
+                    ack_policy,
+                },
+                "tcp",
+                &pipeline,
+                &mut journal_writer,
+                &fence_state,
+                control,
+            )? {
+                StreamStartVerdict::Follow(lineage) => (lineage, last_sequence),
+                // Disconnect and retry with backoff; the operator's logs
+                // flag the misdirected `--replica-of`.
+                StreamStartVerdict::StalePrimary => {
                     // Drop the socket before sleeping — see the auth
                     // failure arm above.
                     drop(reader);
@@ -806,28 +809,7 @@ where
                     sleep_then_double_backoff(&mut backoff, shutdown, promote);
                     continue;
                 }
-                // A replica with a journal already records its lineage's
-                // genesis length; the primary's must agree with it.
-                if pipeline.is_none() {
-                    super::adopt_genesis_into_empty_unknown_journal(
-                        &mut journal_writer,
-                        (segment_start_sequence, anchor_hash, genesis_entries),
-                    )?;
-                }
-                if let Some(local) = super::local_lineage_genesis(&pipeline, &journal_writer)? {
-                    super::check_advertised_genesis(local, genesis_entries)?;
-                }
-                // Adopt the primary's epoch immediately; streamed `EpochBump`s
-                // keep it current thereafter. Likewise the ack policy
-                // (heartbeats keep it current mid-session).
-                fence_state.observe_epoch(epoch);
-                primary_ack_policy.store(ack_policy, Ordering::Release);
-                info!(start_sequence, epoch, ack_policy, "streaming started");
-                (
-                    (segment_start_sequence, anchor_hash, genesis_entries),
-                    last_sequence,
-                )
-            }
+            },
             ref resync @ (PrimaryMessage::NeedSnapshot | PrimaryMessage::HashMismatch) => {
                 let divergent = matches!(resync, PrimaryMessage::HashMismatch);
                 // `map_err` drops `Send + Sync` by coercion — the `?` `From`
