@@ -424,9 +424,14 @@ control-plane outage; whichever request is filed first wins, and a
 later duplicate cannot retarget an in-flight promotion.
 
 Whichever way it is requested, a promotion is refused, and the node
-exits with an error, when the replica holds less than the application's
-whole genesis — its primary was lost before it had copied it. See
-"Creating a Journal" in [journal.md](journal.md) for the recovery.
+exits with an error, when the replica holds less than the history's
+whole genesis — its primary was lost before it had copied it. The
+genesis length is the one the primary recorded when the history began,
+which the replica learned when it created its journal; the genesis the
+replica itself is configured with plays no part. See "Creating a
+Journal" in [journal.md](journal.md) for the recovery, and for
+histories begun by earlier releases, which record no genesis length and
+are promoted without the check.
 
 Under auto-promotion the raft peer mesh also becomes an additional
 fencing channel: a serving primary whose peers advertise a higher
@@ -697,7 +702,7 @@ connection separate from the client protocol.
 
 | Message | Layout | Purpose |
 |---|---|---|
-| StreamStart | `[len:u32][type=0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]][epoch:u64]` | Confirms the handshake; carries the primary's fencing epoch and the journal-segment identity (starting sequence + chain anchor) a fresh replica creates its local journal with. Segment boundaries stay aligned from then on — rotation is primary-driven (see "Journal mirroring"). |
+| StreamStart | `[len:u32][type=0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]][epoch:u64][ack_policy:u8][genesis_known:u8][genesis_entries:u64]` | Confirms the handshake; carries the primary's fencing epoch and ack policy, the journal-segment identity (starting sequence + chain anchor) a fresh replica creates its local journal with, and the history's genesis length (`genesis_known` 0 when the primary's journal records none). A fresh replica records the genesis length in its journal header; a replica with a journal refuses a primary whose recorded length differs from its own. Segment boundaries stay aligned from then on — rotation is primary-driven (see "Journal mirroring"). |
 | NeedSnapshot | `[len:u32][type=0x11]` | Replica is too far behind the live journal and archives have been purged — triggers snapshot transfer. |
 | HashMismatch | `[len:u32][type=0x12]` | The replica's journal is divergent at its reported position. The replica archives its local journal, then receives the snapshot transfer that follows on the same connection. |
 | SnapshotBegin | `[len:u32][type=0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]` | Start of snapshot transfer with metadata. |
@@ -783,10 +788,19 @@ normal-case post-recovery state.
   node running an earlier release refuse each other at the handshake,
   in either direction, rather than stream entries the other cannot
   verify. Journals and snapshots are unaffected.
+  The release that records the history's genesis length (replication
+  protocol 7) is another: its `StreamStart` hands a replica that length,
+  which a protocol-6 replica would ignore, so a node running it and a
+  node running an earlier release refuse each other at the handshake,
+  in either direction. Its journals and snapshots are read by it as
+  they are (see "Journals written by earlier releases" in
+  [journal.md](journal.md)): stop the whole cluster, deploy, and restart
+  every node on its existing files.
 - **Snapshots are forward-compatible.** This release reads snapshots
   written by pre-fencing releases (their epoch is taken as 0, which
-  is exact — they predate any promotion). No action needed before
-  upgrading.
+  is exact — they predate any promotion), and snapshots written before
+  the genesis length was recorded (they record none). No action needed
+  before upgrading.
 - **Rolling back across a promotion needs care.** Once a promotion
   has been journaled, binaries older than this release cannot replay
   that journal — they stop at the promotion marker and report the

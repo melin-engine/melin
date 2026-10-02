@@ -53,6 +53,11 @@ pub struct SegmentFile {
     // is a documented operating mode, not a regression. A `bool`, not
     // a byte offset: the property is all-or-nothing per segment.
     pre_written: bool,
+    // The lineage's genesis length, as this segment's header records it
+    // (`None`: unknown, a v15 lineage). Lineage metadata, not segment
+    // state: every segment this one rotates into is written with the
+    // same value, so it outlives any one file.
+    genesis_entries: Option<u64>,
     // Retries a failed post-rotation directory fsync until it succeeds
     // (see `crate::segment::DirFsyncRetry`). Polled from the flush
     // path — a single branch in steady state.
@@ -60,8 +65,10 @@ pub struct SegmentFile {
 }
 
 impl SegmentFile {
-    /// Create a fresh segment whose header records `starting_sequence`
-    /// and `anchor_hash`. Fails if a file already exists at `path`.
+    /// Create a fresh segment whose header records `starting_sequence`,
+    /// `anchor_hash` and the lineage's `genesis_entries` (see
+    /// [`codec::FileHeaderInfo::genesis_entries`]). Fails if a file
+    /// already exists at `path`.
     ///
     /// Deliberately does **not** clear an orphan staging file: this is
     /// also the rotation fallback path, and by then a preparer is
@@ -72,6 +79,7 @@ impl SegmentFile {
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
+        genesis_entries: Option<u64>,
     ) -> Result<Self, JournalError> {
         let file = OpenOptions::new()
             .read(true)
@@ -84,7 +92,7 @@ impl SegmentFile {
         // unwritten extents (no zero-fill cost) on the supported targets.
         let allocated_end = fallocate_chunk(&file, 0)?;
 
-        write_header(&file, starting_sequence, anchor_hash)?;
+        write_header(&file, starting_sequence, anchor_hash, genesis_entries)?;
 
         // Flush the header durably before returning. Subsequent batch
         // flushes layer on top of a known-good header — a crash before
@@ -97,6 +105,7 @@ impl SegmentFile {
             write_pos: HEADER_OFFSET,
             allocated_end,
             pre_written: false,
+            genesis_entries,
             dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
         })
     }
@@ -152,6 +161,7 @@ impl SegmentFile {
                 write_pos: valid_end,
                 allocated_end,
                 pre_written: false,
+                genesis_entries: info.genesis_entries,
                 dir_fsync_retry: crate::segment::DirFsyncRetry::new(),
             },
             info,
@@ -255,7 +265,9 @@ impl SegmentFile {
     }
 
     /// Archive the live segment and install a fresh one whose header
-    /// records `starting_sequence` and `anchor_hash`, adopting
+    /// records `starting_sequence` and `anchor_hash`, and this lineage's
+    /// genesis length unchanged (in the header layout it already has),
+    /// adopting
     /// `prepared` when the background preparer has a staged segment
     /// ready. Returns the archived path.
     ///
@@ -343,7 +355,12 @@ impl SegmentFile {
         starting_sequence: u64,
         anchor_hash: [u8; 32],
     ) -> Result<(), JournalError> {
-        let fresh = Self::create_continuing(live_path, starting_sequence, anchor_hash)?;
+        let fresh = Self::create_continuing(
+            live_path,
+            starting_sequence,
+            anchor_hash,
+            self.genesis_entries,
+        )?;
         // Commit point — nothing below can fail. Dropping the old
         // `self.file` closes the outgoing (now archived) segment's fd.
         self.file = fresh.file;
@@ -381,7 +398,7 @@ impl SegmentFile {
         // of handling as the "no live file" Phase-B case. The staging
         // file covers `[0, ENTRY_OFFSET)` too, so this pwrite lands in
         // the same kind of extent as every append after it.
-        write_header(&file, starting_sequence, anchor_hash)?;
+        write_header(&file, starting_sequence, anchor_hash, self.genesis_entries)?;
         // Commit the header durably before the rename — a crash before
         // the next user write must still leave a parseable empty
         // journal, matching `create_continuing`. `sync_data`, not
@@ -468,6 +485,7 @@ fn write_header(
     file: &File,
     starting_sequence: u64,
     anchor_hash: [u8; 32],
+    genesis_entries: Option<u64>,
 ) -> Result<(), JournalError> {
     let mut header_buf = [0u8; MAX_SECTOR_SIZE];
     codec::encode_file_header(
@@ -475,6 +493,7 @@ fn write_header(
         MAX_SECTOR_SIZE,
         starting_sequence,
         anchor_hash,
+        genesis_entries,
     );
     write_all_at(file, &header_buf, 0)
 }
@@ -606,7 +625,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("test.journal");
 
-        let mut segment = SegmentFile::create_continuing(&live, 1, [0u8; 32]).unwrap();
+        let mut segment = SegmentFile::create_continuing(&live, 1, [0u8; 32], Some(0)).unwrap();
         assert!(
             !segment.pre_written(),
             "a fresh segment is allocated, not pre-written"
@@ -663,7 +682,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("test.journal");
 
-        let mut segment = SegmentFile::create_continuing(&live, 1, [7u8; 32]).unwrap();
+        let mut segment = SegmentFile::create_continuing(&live, 1, [7u8; 32], Some(0)).unwrap();
         segment.write_batch(b"first batch").unwrap();
         segment.sync().unwrap();
         let end_before = segment.valid_end();
@@ -770,14 +789,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let one_at_a_time = dir.path().join("sequential.journal");
-        let mut a = SegmentFile::create_continuing(&one_at_a_time, 1, [5u8; 32]).unwrap();
+        let mut a = SegmentFile::create_continuing(&one_at_a_time, 1, [5u8; 32], Some(0)).unwrap();
         for part in [b"first".as_slice(), b"second", b"third"] {
             a.write_batch(part).unwrap();
         }
         a.sync().unwrap();
 
         let vectored = dir.path().join("vectored.journal");
-        let mut b = SegmentFile::create_continuing(&vectored, 1, [5u8; 32]).unwrap();
+        let mut b = SegmentFile::create_continuing(&vectored, 1, [5u8; 32], Some(0)).unwrap();
         let mut bufs = [
             IoSlice::new(b"first"),
             IoSlice::new(b"second"),
@@ -803,7 +822,7 @@ mod tests {
     fn a_vectored_write_of_nothing_leaves_the_position_alone() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("empty.journal");
-        let mut segment = SegmentFile::create_continuing(&live, 1, [0u8; 32]).unwrap();
+        let mut segment = SegmentFile::create_continuing(&live, 1, [0u8; 32], Some(0)).unwrap();
         let before = segment.valid_end();
 
         segment.write_vectored(&mut []).unwrap();
@@ -819,7 +838,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("test.journal");
 
-        let mut segment = SegmentFile::create_continuing(&live, 1, [1u8; 32]).unwrap();
+        let mut segment = SegmentFile::create_continuing(&live, 1, [1u8; 32], Some(0)).unwrap();
         segment.write_batch(b"sealed content").unwrap();
         segment.sync().unwrap();
 
@@ -835,5 +854,63 @@ mod tests {
         let info = segment.read_header_info().unwrap();
         assert_eq!(info.starting_sequence, 42);
         assert_eq!(info.anchor_hash, [2u8; 32]);
+    }
+
+    /// The genesis length is lineage metadata: every rotation writes it
+    /// into the next segment's header unchanged — through the fresh
+    /// install and through an adopted staged segment, after a reopen,
+    /// and for an unknown length (a v15 lineage keeps v15 headers).
+    #[test]
+    fn rotation_carries_the_genesis_length_forward() {
+        let _prealloc = crate::prealloc::PreallocOverrideGuard::new(64 * 1024);
+        for genesis_entries in [Some(0), Some(7), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let live = dir.path().join("test.journal");
+            let mut segment =
+                SegmentFile::create_continuing(&live, 1, [1u8; 32], genesis_entries).unwrap();
+            assert_eq!(
+                segment.read_header_info().unwrap().genesis_entries,
+                genesis_entries
+            );
+
+            segment.rotate(None, 2, [2u8; 32]).unwrap();
+            assert_eq!(
+                segment.read_header_info().unwrap().genesis_entries,
+                genesis_entries,
+                "fresh install, {genesis_entries:?}"
+            );
+
+            segment
+                .rotate(
+                    Some(staged(&live, HEADER_OFFSET + 8 * 1024, true)),
+                    3,
+                    [3u8; 32],
+                )
+                .unwrap();
+            assert_eq!(
+                segment.read_header_info().unwrap().genesis_entries,
+                genesis_entries,
+                "adopted staged segment, {genesis_entries:?}"
+            );
+
+            // Reopened: the value comes back from the header itself.
+            drop(segment);
+            let (mut reopened, info) = SegmentFile::open_append(&live, HEADER_OFFSET).unwrap();
+            assert_eq!(info.genesis_entries, genesis_entries);
+            reopened.rotate(None, 3, [4u8; 32]).unwrap();
+            assert_eq!(
+                reopened.read_header_info().unwrap().genesis_entries,
+                genesis_entries,
+                "rotation after a reopen, {genesis_entries:?}"
+            );
+            for (_, archive) in crate::segment::list_archives(&live).unwrap() {
+                assert_eq!(
+                    crate::segment::read_header_info(&archive)
+                        .unwrap()
+                        .genesis_entries,
+                    genesis_entries
+                );
+            }
+        }
     }
 }

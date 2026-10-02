@@ -85,6 +85,28 @@ pub enum JournaledAppError {
         first_segment_start: u64,
         required_floor: u64,
     },
+    /// Two consecutive segments of one lineage record different genesis
+    /// lengths in their headers. The length is fixed when the journal is
+    /// created and every later segment carries it on unchanged — a
+    /// lineage begun before the field existed carries "unknown" the same
+    /// way — so a disagreement means the directory was assembled from
+    /// different journals or a header was edited. Recovery refuses rather
+    /// than pick one: the length decides whether a history holds the
+    /// whole genesis. `index` is the later segment's (0 for the live
+    /// one); `None` is an unknown length.
+    GenesisLengthMismatch {
+        index: u32,
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+}
+
+/// A header's genesis length for an error message.
+fn describe_genesis_length(genesis_entries: Option<u64>) -> String {
+    match genesis_entries {
+        Some(n) => n.to_string(),
+        None => "unknown".to_string(),
+    }
 }
 
 impl std::fmt::Display for JournaledAppError {
@@ -125,6 +147,17 @@ impl std::fmt::Display for JournaledAppError {
                  without a covering snapshot, or snapshot/journal from different points \
                  in the lineage",
             ),
+            Self::GenesisLengthMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "journal segment {index} records a genesis length of {} but the segment \
+                 before it records {} — segments from different journals, or an edited header",
+                describe_genesis_length(*actual),
+                describe_genesis_length(*expected),
+            ),
         }
     }
 }
@@ -138,6 +171,7 @@ impl std::error::Error for JournaledAppError {
             Self::SnapshotAnchorMissing { .. } => None,
             Self::SnapshotChainMismatch { .. } => None,
             Self::MissingHistoryPrefix { .. } => None,
+            Self::GenesisLengthMismatch { .. } => None,
         }
     }
 }
@@ -280,13 +314,27 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         // `snap_sequence`) so the error reports the true observed tail
         // when a stale journal never reaches the anchor.
         let mut journal_max_seq: u64 = 0;
+        // The lineage's genesis length from the newest walked archive's
+        // header: every later segment must record the same one, and a
+        // synthesized live segment carries it on, since there is no live
+        // header to take it from. Outer `None`: no archive walked yet;
+        // inner `None`: an unknown length (a pre-v16 header).
+        let mut archived_genesis_entries: Option<Option<u64>> = None;
 
         // --- Walk each sealed archive in monotonic order ---
         for (idx, archive_path) in &archives {
             let mut reader = JournalReader::<A::Event>::open(archive_path)?;
             // Verify lineage continuity from the header alone, before
             // any of this segment's events reach the application.
-            verify_segment_link(*idx, &reader, prev_tail_hash, expected_start, history_floor)?;
+            verify_segment_link(
+                *idx,
+                &reader,
+                prev_tail_hash,
+                expected_start,
+                history_floor,
+                archived_genesis_entries,
+            )?;
+            archived_genesis_entries = Some(reader.genesis_entries());
             verify_boundary_snapshot_anchor(&reader, snap_sequence, snap_chain_check)?;
             replay_segment(
                 &mut reader,
@@ -353,7 +401,15 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 });
             }
             let anchor = prev_tail_hash.unwrap_or([0u8; 32]);
-            let writer = W::create_continuing(journal_path, last_seq_seen + 1, anchor)?;
+            // The lineage's genesis length carries on into the new
+            // segment, as a rotation would have carried it.
+            let writer = W::create_continuing(
+                journal_path,
+                last_seq_seen + 1,
+                anchor,
+                // Archives are non-empty here, so one was walked.
+                archived_genesis_entries.flatten(),
+            )?;
             return Ok(Self {
                 app,
                 writer,
@@ -364,7 +420,14 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         }
 
         let mut reader = JournalReader::<A::Event>::open(journal_path)?;
-        verify_segment_link(0, &reader, prev_tail_hash, expected_start, history_floor)?;
+        verify_segment_link(
+            0,
+            &reader,
+            prev_tail_hash,
+            expected_start,
+            history_floor,
+            archived_genesis_entries,
+        )?;
         verify_boundary_snapshot_anchor(&reader, snap_sequence, snap_chain_check)?;
         // The live segment may have a partial-tail crash: replay loop
         // tolerates `SequenceGap` by stopping early, mirroring legacy
@@ -441,9 +504,17 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             seq,
             chain_hash,
             self.recovered_epoch,
+            self.genesis_entries()?,
             snapshot_path,
         )?;
         Ok(())
+    }
+
+    /// The lineage's genesis length, read from the live segment's header
+    /// (see [`melin_journal::FileHeaderInfo::genesis_entries`]): `None`
+    /// when the lineage does not record it.
+    pub fn genesis_entries(&self) -> Result<Option<u64>, JournaledAppError> {
+        Ok(self.writer.read_header_info()?.genesis_entries)
     }
 
     /// Archive the live journal segment to its next monotonic slot
@@ -571,6 +642,14 @@ pub fn discard_genesis_staging(journal_path: &Path) -> Result<(), JournaledAppEr
 /// the anchor of an existing empty journal this one replaces, so any
 /// copy of that empty journal still chains to it.
 ///
+/// The header records how many entries the genesis occupies — the
+/// lineage's `genesis_entries`, carried by every later segment and every
+/// replica's copy. That is what lets a node tell, without reading its
+/// own configuration, whether a history holds the whole genesis: a
+/// replica that copied only part of it before its primary died refuses
+/// promotion on it. Recorded even when it is 0, so "no genesis" is
+/// known rather than unknown.
+///
 /// Every entry is stamped with one timestamp, read once: genesis is the
 /// lineage's starting point, not a sequence of moments, and one value
 /// cannot run backwards inside it. Entries carry key hash 0, the node's
@@ -591,10 +670,22 @@ where
     discard_genesis_staging(journal_path)?;
     let staging = genesis_staging_path(journal_path);
 
-    let mut writer = match anchor {
-        None => W::create(&staging)?,
-        Some(anchor) => W::create_continuing(&staging, 1, anchor)?,
+    // A query changes nothing and the journal stage never writes one;
+    // replay assumes every entry is an `apply`. Skip it the same way, and
+    // count only what is journaled: the header is written first.
+    // `u64`: a sequence count, compared against sequences.
+    let genesis_entries = genesis.iter().filter(|e| !e.is_query()).count() as u64;
+    let anchor = match anchor {
+        Some(anchor) => anchor,
+        None => melin_journal::fresh_anchor()?,
     };
+    // `create_continuing` rather than `create` (which sweeps a preparer's
+    // orphan staging file beside the path): only `create_continuing`
+    // records the genesis length, and no preparer ever runs on this
+    // staging path — it is never rotated, only renamed into place — so
+    // there is no orphan of its own to sweep. The live path's is swept
+    // when the installed journal is opened for appending.
+    let mut writer = W::create_continuing(&staging, 1, anchor, Some(genesis_entries))?;
     // Flushed in batches no larger than the pipeline's own, which the
     // writer's batch buffer is sized for. Durability matters only at
     // the end — the file is not installed before then — but each flush
@@ -604,8 +695,7 @@ where
     // `usize`: a count of in-memory events, bounded by the `Vec`'s length.
     let mut count: usize = 0;
     for event in genesis {
-        // A query changes nothing and the journal stage never writes one;
-        // replay assumes every entry is an `apply`. Skip it the same way.
+        // Skipped, and not counted in the header above.
         if event.is_query() {
             continue;
         }
@@ -616,6 +706,10 @@ where
         }
     }
     writer.flush_batch_sync()?;
+    debug_assert_eq!(
+        count as u64, genesis_entries,
+        "the header counts what was journaled"
+    );
     drop(writer);
 
     // The install. `rename` replaces an existing empty journal in one
@@ -788,6 +882,12 @@ fn replay_segment<A: Application>(
 /// records where the lineage continues from) and replay would silently
 /// reconstruct partial state.
 ///
+/// The header's genesis length must equal the previous segment's
+/// (`prev_genesis`; outer `None` when there is no predecessor), unknown
+/// included: the length is fixed at the journal's creation and carried
+/// on by every segment after it, so the segments of one lineage all
+/// record the same value.
+///
 /// `index = 0` denotes the live segment in diagnostics. The chain
 /// compare is a no-op when either side is unavailable (hash-chain off,
 /// or no predecessor in this run).
@@ -797,7 +897,17 @@ fn verify_segment_link<E: melin_app::AppEvent>(
     prev_tail: Option<[u8; 32]>,
     expected_start: Option<u64>,
     history_floor: u64,
+    prev_genesis: Option<Option<u64>>,
 ) -> Result<(), JournaledAppError> {
+    if let Some(expected) = prev_genesis
+        && expected != reader.genesis_entries()
+    {
+        return Err(JournaledAppError::GenesisLengthMismatch {
+            index,
+            expected,
+            actual: reader.genesis_entries(),
+        });
+    }
     if let (Some(expected), Some(actual)) = (prev_tail, reader.anchor())
         && expected != actual
     {
@@ -949,6 +1059,11 @@ mod tests {
         }
         assert_eq!(seen, (1..=n).collect::<Vec<_>>());
         assert_eq!(stamps.len(), 1, "one timestamp for the whole genesis");
+        assert_eq!(
+            reader.genesis_entries(),
+            Some(n),
+            "the header records the journaled entries, the query not among them"
+        );
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(recovered.app().total, n * (n + 1) / 2);
@@ -984,9 +1099,161 @@ mod tests {
         let info = melin_journal::segment::read_header_info(&path).unwrap();
         assert_eq!(info.anchor_hash, anchor);
         assert_eq!(info.starting_sequence, 1);
+        assert_eq!(info.genesis_entries, Some(2));
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(recovered.app().total, 5, "the stale prefix is gone");
         assert_eq!(recovered.next_sequence(), 3);
+    }
+
+    /// A journal begun with no genesis records a known length of 0, not
+    /// an unknown one.
+    #[test]
+    fn an_empty_genesis_is_recorded_as_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.journal");
+        write_genesis_journal::<TestEvent, BufferedWriter<TestEvent>>(
+            &path,
+            None,
+            vec![TestEvent::Query],
+        )
+        .unwrap();
+        let info = melin_journal::segment::read_header_info(&path).unwrap();
+        assert_eq!(info.genesis_entries, Some(0));
+        assert_eq!(
+            TestApp_::recover(TestApp::new(), &path)
+                .unwrap()
+                .next_sequence(),
+            1
+        );
+    }
+
+    /// The genesis length is lineage metadata: it survives a rotation,
+    /// and the archive-only recovery that synthesizes a live segment
+    /// after a crash between the rotation's rename and the new segment's
+    /// creation carries it on from the archive — known or unknown.
+    #[test]
+    fn archive_only_recovery_carries_the_genesis_length_on() {
+        for genesis_entries in [Some(2), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("genesis.journal");
+            let mut writer = BufferedWriter::<TestEvent>::create_continuing(
+                &path,
+                1,
+                [0x3C; 32],
+                genesis_entries,
+            )
+            .unwrap();
+            for k in 1..=3 {
+                writer
+                    .append(&JournalEvent::App(TestEvent::Add(k)))
+                    .unwrap();
+            }
+            writer.rotate_segment().unwrap();
+            assert_eq!(
+                writer.read_header_info().unwrap().genesis_entries,
+                genesis_entries,
+                "rotation"
+            );
+            drop(writer);
+            std::fs::remove_file(&path).unwrap();
+
+            let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+            assert_eq!(recovered.app().total, 6);
+            assert_eq!(recovered.next_sequence(), 4);
+            assert_eq!(
+                recovered.genesis_entries().unwrap(),
+                genesis_entries,
+                "synthesized live segment"
+            );
+        }
+    }
+
+    /// Every segment of a lineage records the same genesis length, so a
+    /// segment that disagrees with the one before it — swapped in from
+    /// another journal, or a header edited — is refused at recovery
+    /// even when its anchor and starting sequence link up, unknown
+    /// included in the comparison.
+    #[test]
+    fn recovery_refuses_segments_disagreeing_on_the_genesis_length() {
+        let cases = [(Some(2), None), (Some(2), Some(3)), (None, Some(2))];
+        for (lineage, swapped) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("genesis.journal");
+            let mut writer =
+                BufferedWriter::<TestEvent>::create_continuing(&path, 1, [0x5A; 32], lineage)
+                    .unwrap();
+            for k in 1..=3 {
+                writer
+                    .append(&JournalEvent::App(TestEvent::Add(k)))
+                    .unwrap();
+            }
+            writer.rotate_segment().unwrap();
+            let live = writer.read_header_info().unwrap();
+            drop(writer);
+
+            // The same live segment, but for its genesis length.
+            std::fs::remove_file(&path).unwrap();
+            drop(
+                BufferedWriter::<TestEvent>::create_continuing(
+                    &path,
+                    live.starting_sequence,
+                    live.anchor_hash,
+                    swapped,
+                )
+                .unwrap(),
+            );
+
+            let err = match TestApp_::recover(TestApp::new(), &path) {
+                Err(e) => e,
+                Ok(_) => panic!("{lineage:?} then {swapped:?}: recovery must refuse"),
+            };
+            match err {
+                JournaledAppError::GenesisLengthMismatch {
+                    index,
+                    expected,
+                    actual,
+                } => {
+                    assert_eq!(index, 0, "the live segment");
+                    assert_eq!(expected, lineage);
+                    assert_eq!(actual, swapped);
+                }
+                other => panic!("{lineage:?} then {swapped:?}: expected a mismatch, got {other}"),
+            }
+
+            // Restoring the lineage's value recovers: the refusal was
+            // the genesis length alone.
+            std::fs::remove_file(&path).unwrap();
+            drop(
+                BufferedWriter::<TestEvent>::create_continuing(
+                    &path,
+                    live.starting_sequence,
+                    live.anchor_hash,
+                    lineage,
+                )
+                .unwrap(),
+            );
+            let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+            assert_eq!(recovered.app().total, 6);
+        }
+    }
+
+    /// `save_snapshot` stamps the lineage's genesis length into the
+    /// snapshot, so a boot from the snapshot alone still knows it.
+    #[test]
+    fn a_snapshot_records_the_genesis_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.journal");
+        let snap = dir.path().join("genesis.snapshot");
+        write_genesis_journal::<TestEvent, BufferedWriter<TestEvent>>(
+            &path,
+            None,
+            vec![TestEvent::Add(1), TestEvent::Add(2), TestEvent::Add(3)],
+        )
+        .unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        recovered.save_snapshot(&snap).unwrap();
+        let (_, header) = snapshot::load_with_header::<TestApp>(&snap).unwrap();
+        assert_eq!(header.genesis_entries, Some(3));
     }
 
     /// The staging name is never read as an archive.
@@ -1680,6 +1947,7 @@ mod tests {
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
             0,
+            Some(0),
             &snap_path,
         )
         .unwrap();
@@ -2122,6 +2390,7 @@ mod tests {
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
             0,
+            Some(0),
             &snap_path,
         )
         .unwrap();
@@ -2187,6 +2456,7 @@ mod tests {
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
             0,
+            Some(0),
             &snap_path,
         )
         .unwrap();
@@ -2396,9 +2666,13 @@ mod tests {
         // ok(): best-effort cleanup; the assertion below is what
         // actually guards the path.
         std::fs::remove_file(&journal_path).ok();
-        let writer =
-            BufferedWriter::create_continuing(&journal_path, snap_seq + 1, snap_chain_hash)
-                .unwrap();
+        let writer = BufferedWriter::create_continuing(
+            &journal_path,
+            snap_seq + 1,
+            snap_chain_hash,
+            Some(0),
+        )
+        .unwrap();
         let je = JournaledApp::from_parts(snap_app, writer, 0);
         assert_eq!(je.app().total, snap_total);
     }

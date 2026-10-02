@@ -48,8 +48,10 @@ pub use write::JournalWrite;
 /// Random 32-byte chain anchor for a brand-new journal. Randomness (not
 /// zeros) guarantees two independent journal lineages can never share a
 /// chain value, so a snapshot or replica paired with the wrong cluster's
-/// journal fails its first chain comparison.
-pub(crate) fn fresh_anchor() -> Result<[u8; 32], error::JournalError> {
+/// journal fails its first chain comparison. Public for callers that
+/// begin a lineage through [`JournalWrite::create_continuing`], to give
+/// it a header [`JournalWrite::create`] does not write.
+pub fn fresh_anchor() -> Result<[u8; 32], error::JournalError> {
     let mut anchor = [0u8; 32];
     getrandom::fill(&mut anchor)
         .map_err(|e| error::JournalError::Io(std::io::Error::other(e.to_string())))?;

@@ -573,13 +573,16 @@ fn handle_replica_connection<A: Application>(
     let catchup_end = if can_catch_up {
         // The lineage origin (oldest segment's header identity) lets a
         // fresh replica create a byte-identical journal before
-        // consuming the stream. Replicas with local state ignore it.
-        let (lineage_start, lineage_anchor) =
-            melin_transport_core::replication::catchup::lineage_origin(journal_path)?;
+        // consuming the stream; replicas with local state ignore it.
+        // The lineage's genesis length, from the same header, concerns
+        // every replica: a fresh one records it, one with a journal
+        // checks it against its own.
+        let origin = melin_transport_core::replication::catchup::lineage_origin(journal_path)?;
         encode_stream_start(
             handshake.last_sequence,
-            lineage_start,
-            lineage_anchor,
+            origin.starting_sequence,
+            origin.anchor_hash,
+            origin.genesis_entries,
             fence_state.epoch(),
             ack_policy.load(Ordering::Relaxed),
             &mut send_buf,

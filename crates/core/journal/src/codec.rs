@@ -6,22 +6,33 @@
 //! ## File header (one sector, written once at creation)
 //!
 //! The header occupies the first [`ENTRY_OFFSET`] bytes on disk. The
-//! meaningful fields fit in the first 52 bytes; the remainder is
+//! meaningful fields fit in the first 60 bytes; the remainder is
 //! zero-padded.
 //!
 //! | Field             | Type     | Bytes | Purpose                             |
 //! |-------------------|----------|-------|-------------------------------------|
 //! | file_magic        | u32      | 4     | `0x4A4F5552` ("JOUR")               |
-//! | format_version    | u16      | 2     | Current version = 15                |
+//! | format_version    | u16      | 2     | Current version = 16                |
 //! | sector_size       | u16      | 2     | Always [`MAX_SECTOR_SIZE`] (4096)   |
 //! | starting_sequence | u64      | 8     | Sequence of this segment's first entry |
 //! | anchor_hash       | [u8; 32] | 32    | Chain anchor: random salt (fresh journal) or previous segment's tail hash (rotation) |
-//! | header_crc        | u32      | 4     | CRC32C of the preceding 48 bytes    |
+//! | genesis_entries   | u64      | 8     | Entries the lineage's genesis occupies (sequences `1..=genesis_entries`); 0 = no genesis |
+//! | header_crc        | u32      | 4     | CRC32C of the preceding 56 bytes    |
 //!
 //! The anchor seeds the segment's BLAKE3 hash chain (see the crate's
 //! `chain` module); chain metadata lives *only* here — the entry
 //! stream contains application events exclusively, so sequence numbers
 //! are dense over user-visible entries.
+//!
+//! `genesis_entries` is lineage metadata like the anchor: fixed when the
+//! journal is created and copied unchanged into every later segment of
+//! the lineage (rotation, recovery, replicas), so any one header says
+//! how long the lineage's genesis is.
+//!
+//! A v15 header is the same minus `genesis_entries` (52 bytes, CRC over
+//! the preceding 48). It is still read, and still written for a lineage
+//! begun under v15, whose genesis length nobody recorded: see
+//! [`FileHeaderInfo::genesis_entries`].
 //!
 //! ## Entry layout (little-endian, repeats after file header)
 //!
@@ -89,7 +100,18 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v14 → v15: per-entry `request_seq` removed from the metadata block
 /// (17 → 9 bytes). The runtime never read it; an application that needs
 /// a request sequence carries it in its own event payload.
-pub const FORMAT_VERSION: u16 = 15;
+///
+/// v15 → v16: the file header gained `genesis_entries`, the length of
+/// the lineage's genesis. Entries are unchanged, so v15 segments are
+/// still read ([`FORMAT_VERSION_V15`]); a v15 lineage's genesis length
+/// is unknown, and it keeps v15 headers when it rotates or is copied by
+/// a replica, so its segments stay bitwise mirrors of one another.
+pub const FORMAT_VERSION: u16 = 16;
+
+/// The previous format version, read alongside [`FORMAT_VERSION`]: its
+/// header lacks `genesis_entries` and its entries are identical. Written
+/// only to continue a lineage begun under it (see [`encode_file_header`]).
+pub const FORMAT_VERSION_V15: u16 = 15;
 
 /// Entry magic bytes for corruption/misalignment detection.
 ///
@@ -113,11 +135,42 @@ pub const ENTRY_MAGIC_SIZE: usize = core::mem::size_of::<u16>();
 // break compatibility with journals on disk written by older builds, so
 // we fail the compile instead.
 
-/// File header (52 bytes of meaningful fields; on disk, padded to
+/// The fields every header version begins with — enough to read the
+/// version and pick the layout.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct FileHeaderPrefix {
+    file_magic: U32,
+    format_version: U16,
+}
+
+/// v16 file header (60 bytes of meaningful fields; on disk, padded to
 /// [`ENTRY_OFFSET`]).
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct FileHeader {
+    file_magic: U32,
+    format_version: U16,
+    /// See [`FileHeaderV15::sector_size`].
+    sector_size: U16,
+    /// See [`FileHeaderV15::starting_sequence`].
+    starting_sequence: U64,
+    /// See [`FileHeaderV15::anchor_hash`].
+    anchor_hash: [u8; 32],
+    /// Entries the lineage's genesis occupies — sequences
+    /// `1..=genesis_entries`; 0 when the lineage began without one.
+    /// `u64`, the width of a sequence, which it is compared against.
+    genesis_entries: U64,
+    /// CRC32C over all preceding header bytes; see
+    /// [`FileHeaderV15::header_crc`].
+    header_crc: U32,
+}
+
+/// v15 file header (52 bytes of meaningful fields): the v16 layout
+/// without `genesis_entries`.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct FileHeaderV15 {
     file_magic: U32,
     format_version: U16,
     /// Physical sector size used when the journal was created, in bytes.
@@ -142,9 +195,9 @@ struct FileHeader {
 
 /// Decoded file-header fields returned by [`decode_file_header`].
 ///
-/// No `version` field: [`decode_file_header`] accepts only
-/// [`FORMAT_VERSION`], so the gate inside it is the single source of
-/// truth and nothing downstream branches on a version.
+/// No `version` field: the only difference between the versions
+/// [`decode_file_header`] accepts is whether `genesis_entries` is known,
+/// so nothing downstream branches on a version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileHeaderInfo {
     /// Byte offset where entries begin (one header reservation).
@@ -154,6 +207,14 @@ pub struct FileHeaderInfo {
     /// Chain anchor for this segment (zeros only for segments rotated
     /// in by a build without `hash-chain`).
     pub anchor_hash: [u8; 32],
+    /// How many entries the lineage's genesis occupies: the genesis is
+    /// sequences `1..=n`, and `Some(0)` means the lineage began without
+    /// one. `None` when unknown — a v15 header, written by a release
+    /// that did not record it (or continuing a lineage such a release
+    /// began). An `Option` rather than a sentinel `u64`, because unknown
+    /// must never read as "no genesis": callers that check a history
+    /// against its genesis skip the check on `None` and nothing else.
+    pub genesis_entries: Option<u64>,
 }
 
 /// Per-entry fixed prefix (20 bytes). `length` covers everything after
@@ -204,6 +265,9 @@ pub const ENTRY_OFFSET: u64 = MAX_SECTOR_SIZE as u64;
 /// reservation is zero-padded).
 const FILE_HEADER_FIELDS_SIZE: usize = core::mem::size_of::<FileHeader>();
 
+/// Size of the meaningful `FileHeaderV15` fields.
+const FILE_HEADER_V15_FIELDS_SIZE: usize = core::mem::size_of::<FileHeaderV15>();
+
 /// Entry header size: magic(2) + length(2) + sequence(8) + timestamp(8) = 20.
 pub(crate) const ENTRY_HEADER_SIZE: usize = core::mem::size_of::<EntryHeader>();
 
@@ -237,7 +301,8 @@ const _: () = assert!(ENTRY_FRAMING_SIZE == 33);
 /// tick a hole too small to land in — see [`crate::encoder::entry_size`].
 pub const TRANSPORT_PAYLOAD_SIZE: usize = 8;
 
-const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 52);
+const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 60);
+const _: () = assert!(FILE_HEADER_V15_FIELDS_SIZE == 52);
 const _: () = assert!(FILE_HEADER_SIZE >= FILE_HEADER_FIELDS_SIZE);
 const _: () = assert!(ENTRY_HEADER_SIZE == 20);
 const _: () = assert!(ENTRY_META_SIZE == 9);
@@ -276,12 +341,20 @@ const TAG_APP: u8 = 0x80;
 ///
 /// `starting_sequence` is the sequence the segment's first entry will
 /// carry; `anchor_hash` seeds the segment's hash chain (zeros when the
-/// `hash-chain` feature is off).
+/// `hash-chain` feature is off); `genesis_entries` is the lineage's
+/// genesis length (see [`FileHeaderInfo::genesis_entries`]).
+///
+/// A known `genesis_entries` writes a [`FORMAT_VERSION`] header. `None`
+/// writes a [`FORMAT_VERSION_V15`] one, which has no field to hold it:
+/// that is how a lineage begun under v15 continues, segment after
+/// segment and replica after replica, with the header its first segment
+/// has — byte for byte what the release that began it would write.
 pub fn encode_file_header(
     buf: &mut [u8],
     sector_size: usize,
     starting_sequence: u64,
     anchor_hash: [u8; 32],
+    genesis_entries: Option<u64>,
 ) {
     debug_assert!(
         sector_size == 512 || sector_size == 4096,
@@ -292,52 +365,83 @@ pub fn encode_file_header(
         sector_size,
         "buf must be exactly sector_size bytes"
     );
-    let header = FileHeader::mut_from_bytes(&mut buf[..FILE_HEADER_FIELDS_SIZE])
-        .expect("FILE_HEADER_FIELDS_SIZE slice matches struct size");
-    header.file_magic = U32::new(FILE_MAGIC);
-    header.format_version = U16::new(FORMAT_VERSION);
-    header.sector_size = U16::new(sector_size as u16);
-    header.starting_sequence = U64::new(starting_sequence);
-    header.anchor_hash = anchor_hash;
-    let crc_offset = FILE_HEADER_FIELDS_SIZE - CRC_SIZE;
+    let fields_size = match genesis_entries {
+        Some(genesis_entries) => {
+            let header = FileHeader::mut_from_bytes(&mut buf[..FILE_HEADER_FIELDS_SIZE])
+                .expect("FILE_HEADER_FIELDS_SIZE slice matches struct size");
+            header.file_magic = U32::new(FILE_MAGIC);
+            header.format_version = U16::new(FORMAT_VERSION);
+            header.sector_size = U16::new(sector_size as u16);
+            header.starting_sequence = U64::new(starting_sequence);
+            header.anchor_hash = anchor_hash;
+            header.genesis_entries = U64::new(genesis_entries);
+            FILE_HEADER_FIELDS_SIZE
+        }
+        None => {
+            let header = FileHeaderV15::mut_from_bytes(&mut buf[..FILE_HEADER_V15_FIELDS_SIZE])
+                .expect("FILE_HEADER_V15_FIELDS_SIZE slice matches struct size");
+            header.file_magic = U32::new(FILE_MAGIC);
+            header.format_version = U16::new(FORMAT_VERSION_V15);
+            header.sector_size = U16::new(sector_size as u16);
+            header.starting_sequence = U64::new(starting_sequence);
+            header.anchor_hash = anchor_hash;
+            FILE_HEADER_V15_FIELDS_SIZE
+        }
+    };
+    // The CRC is the last field of both layouts.
+    let crc_offset = fields_size - CRC_SIZE;
     let crc = crc32c::crc32c(&buf[..crc_offset]);
-    let header = FileHeader::mut_from_bytes(&mut buf[..FILE_HEADER_FIELDS_SIZE])
-        .expect("FILE_HEADER_FIELDS_SIZE slice matches struct size");
-    header.header_crc = U32::new(crc);
-    buf[FILE_HEADER_FIELDS_SIZE..].fill(0);
+    le::put_u32(&mut buf[crc_offset..fields_size], crc);
+    buf[fields_size..].fill(0);
 }
 
 /// Validate a file header. Returns the decoded fields on success.
+///
+/// Accepts [`FORMAT_VERSION`] and [`FORMAT_VERSION_V15`], whose entries
+/// are identical; a v15 header decodes with an unknown
+/// `genesis_entries`. Any other version is refused.
 pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
-    let header = FileHeader::ref_from_prefix(buf)
+    let prefix = FileHeaderPrefix::ref_from_prefix(buf)
         .map_err(|_| JournalError::TruncatedEntry)?
         .0;
-    if header.file_magic.get() != FILE_MAGIC {
+    if prefix.file_magic.get() != FILE_MAGIC {
         return Err(JournalError::InvalidFile);
     }
-    // Pre-production: only the current version is accepted. Older
-    // formats can be revived later as the on-disk format stabilises.
-    let version = header.format_version.get();
-    if version != FORMAT_VERSION {
-        return Err(JournalError::UnsupportedVersion { version });
-    }
-    // CRC over everything before the trailer. Validated before any field
-    // is trusted — the anchor in particular is the root of all chain
-    // verification, so a corrupted header must fail loudly rather than
-    // cascade into a bogus `SegmentChainBreak` later.
-    let crc_offset = FILE_HEADER_FIELDS_SIZE - CRC_SIZE;
-    let actual_crc = crc32c::crc32c(&buf[..crc_offset]);
-    if header.header_crc.get() != actual_crc {
-        return Err(JournalError::ChecksumMismatch {
-            sequence: 0,
-            expected: header.header_crc.get(),
-            actual: actual_crc,
-        });
-    }
-    let sector_size = match header.sector_size.get() {
+    // `(sector_size, starting_sequence, anchor_hash, genesis_entries)`,
+    // read from whichever layout the version names, each only after
+    // its CRC has verified.
+    let (raw_sector_size, starting_sequence, anchor_hash, genesis_entries) =
+        match prefix.format_version.get() {
+            FORMAT_VERSION => {
+                let header = FileHeader::ref_from_prefix(buf)
+                    .map_err(|_| JournalError::TruncatedEntry)?
+                    .0;
+                verify_header_crc(buf, FILE_HEADER_FIELDS_SIZE, header.header_crc.get())?;
+                (
+                    header.sector_size.get(),
+                    header.starting_sequence.get(),
+                    header.anchor_hash,
+                    Some(header.genesis_entries.get()),
+                )
+            }
+            FORMAT_VERSION_V15 => {
+                let header = FileHeaderV15::ref_from_prefix(buf)
+                    .map_err(|_| JournalError::TruncatedEntry)?
+                    .0;
+                verify_header_crc(buf, FILE_HEADER_V15_FIELDS_SIZE, header.header_crc.get())?;
+                (
+                    header.sector_size.get(),
+                    header.starting_sequence.get(),
+                    header.anchor_hash,
+                    None,
+                )
+            }
+            version => return Err(JournalError::UnsupportedVersion { version }),
+        };
+    let sector_size = match raw_sector_size {
         // Legacy journals written before dynamic sector detection: assume 512.
         0 => 512,
-        512 | 4096 => header.sector_size.get() as usize,
+        512 | 4096 => raw_sector_size as usize,
         // Unknown sector size: reject rather than silently falling back to 512,
         // which would cause EINVAL on the first O_DIRECT write to a 4Kn journal
         // that the caller incorrectly decoded as 512-byte.
@@ -345,9 +449,27 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
     };
     Ok(FileHeaderInfo {
         sector_size,
-        starting_sequence: header.starting_sequence.get(),
-        anchor_hash: header.anchor_hash,
+        starting_sequence,
+        anchor_hash,
+        genesis_entries,
     })
+}
+
+/// Check a header's CRC — over everything before the trailer, the last
+/// `CRC_SIZE` of its `fields_size` bytes. Validated before any field is
+/// trusted — the anchor in particular is the root of all chain
+/// verification, so a corrupted header must fail loudly rather than
+/// cascade into a bogus `SegmentChainBreak` later.
+fn verify_header_crc(buf: &[u8], fields_size: usize, stored: u32) -> Result<(), JournalError> {
+    let actual = crc32c::crc32c(&buf[..fields_size - CRC_SIZE]);
+    if stored != actual {
+        return Err(JournalError::ChecksumMismatch {
+            sequence: 0,
+            expected: stored,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 /// Encode a journal entry into `buf`.
@@ -501,8 +623,9 @@ pub type DecodedEntry<E> = (usize, u64, u64, u64, JournalEvent<E>);
 ///
 /// Returns `(bytes_consumed, sequence, timestamp_ns, key_hash, event)`.
 /// Entry layout is versioned by the file header alone —
-/// [`decode_file_header`] rejects anything but [`FORMAT_VERSION`], so by
-/// the time entries are decoded the layout is known.
+/// [`decode_file_header`] rejects any version whose entries differ from
+/// [`FORMAT_VERSION`]'s, so by the time entries are decoded the layout
+/// is known.
 pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> {
     if buf.len() < ENTRY_HEADER_SIZE + 1 + CRC_SIZE {
         return Err(JournalError::TruncatedEntry);
@@ -938,24 +1061,74 @@ mod tests {
     fn file_header_round_trip() {
         let mut buf = [0u8; FILE_HEADER_SIZE];
         let anchor = [0xab; 32];
-        encode_file_header(&mut buf, 512, 42, anchor);
-        assert_eq!(
-            decode_file_header(&buf).unwrap(),
-            FileHeaderInfo {
-                sector_size: 512,
-                starting_sequence: 42,
-                anchor_hash: anchor,
-            }
-        );
+        for genesis_entries in [Some(0), Some(3), Some(u64::MAX), None] {
+            encode_file_header(&mut buf, 512, 42, anchor, genesis_entries);
+            assert_eq!(
+                decode_file_header(&buf).unwrap(),
+                FileHeaderInfo {
+                    sector_size: 512,
+                    starting_sequence: 42,
+                    anchor_hash: anchor,
+                    genesis_entries,
+                },
+                "{genesis_entries:?}"
+            );
+        }
     }
 
     #[test]
     fn file_header_round_trip_4096() {
         let mut buf = [0u8; MAX_SECTOR_SIZE];
-        encode_file_header(&mut buf, 4096, 1, [0u8; 32]);
+        encode_file_header(&mut buf, 4096, 1, [0u8; 32], Some(5));
         let info = decode_file_header(&buf).unwrap();
         assert_eq!(info.sector_size, 4096);
         assert_eq!(info.starting_sequence, 1);
+        assert_eq!(info.genesis_entries, Some(5));
+    }
+
+    /// A known genesis length is a v16 header; an unknown one is written
+    /// as v15 — the layout a lineage of unknown genesis length began
+    /// with — so continuing such a lineage reproduces its header bytes.
+    #[test]
+    fn unknown_genesis_writes_the_v15_layout() {
+        let mut v16 = [0u8; MAX_SECTOR_SIZE];
+        encode_file_header(&mut v16, 4096, 9, [0x5a; 32], Some(2));
+        assert_eq!(u16::from_le_bytes([v16[4], v16[5]]), FORMAT_VERSION);
+        assert_eq!(FORMAT_VERSION, 16);
+        assert_eq!(le::get_u64(&v16[48..]), 2, "genesis_entries at offset 48");
+        assert!(v16[FILE_HEADER_FIELDS_SIZE..].iter().all(|&b| b == 0));
+
+        let mut v15 = [0u8; MAX_SECTOR_SIZE];
+        encode_file_header(&mut v15, 4096, 9, [0x5a; 32], None);
+        assert_eq!(u16::from_le_bytes([v15[4], v15[5]]), FORMAT_VERSION_V15);
+        assert!(v15[FILE_HEADER_V15_FIELDS_SIZE..].iter().all(|&b| b == 0));
+        // The first 48 bytes — everything but the version — agree.
+        assert_eq!(v15[6..48], v16[6..48]);
+    }
+
+    /// A header exactly as v15 wrote it (hand-built, not through the
+    /// encoder) decodes, with the genesis length unknown — the upgrade
+    /// path for every journal on disk before v16.
+    #[test]
+    fn a_v15_header_decodes_with_an_unknown_genesis() {
+        let mut buf = [0u8; MAX_SECTOR_SIZE];
+        le::put_u32(&mut buf[0..], FILE_MAGIC);
+        buf[4..6].copy_from_slice(&15u16.to_le_bytes());
+        buf[6..8].copy_from_slice(&4096u16.to_le_bytes());
+        le::put_u64(&mut buf[8..], 77);
+        buf[16..48].copy_from_slice(&[0xc3; 32]);
+        let crc = crc32c::crc32c(&buf[..48]);
+        le::put_u32(&mut buf[48..], crc);
+
+        assert_eq!(
+            decode_file_header(&buf).unwrap(),
+            FileHeaderInfo {
+                sector_size: 4096,
+                starting_sequence: 77,
+                anchor_hash: [0xc3; 32],
+                genesis_entries: None,
+            }
+        );
     }
 
     #[test]
@@ -963,9 +1136,23 @@ mod tests {
         // The anchor is the root of all chain verification — a flipped
         // bit in it must surface at header decode, not as a downstream
         // chain mismatch.
+        for genesis_entries in [Some(1), None] {
+            let mut buf = [0u8; FILE_HEADER_SIZE];
+            encode_file_header(&mut buf, 512, 7, [0x11; 32], genesis_entries);
+            buf[20] ^= 0xff; // inside anchor_hash (offset 16..48)
+            assert!(matches!(
+                decode_file_header(&buf),
+                Err(JournalError::ChecksumMismatch { .. })
+            ));
+        }
+    }
+
+    /// The genesis length is covered by the header CRC, like the anchor.
+    #[test]
+    fn file_header_rejects_corrupted_genesis_entries() {
         let mut buf = [0u8; FILE_HEADER_SIZE];
-        encode_file_header(&mut buf, 512, 7, [0x11; 32]);
-        buf[20] ^= 0xff; // inside anchor_hash (offset 16..48)
+        encode_file_header(&mut buf, 512, 7, [0x11; 32], Some(4));
+        buf[48] ^= 0x01;
         assert!(matches!(
             decode_file_header(&buf),
             Err(JournalError::ChecksumMismatch { .. })
@@ -974,14 +1161,16 @@ mod tests {
 
     #[test]
     fn file_header_rejects_wrong_version() {
-        let mut buf = [0u8; FILE_HEADER_SIZE];
-        encode_file_header(&mut buf, 512, 1, [0u8; 32]);
-        // Bump version.
-        buf[4] = buf[4].wrapping_add(1);
-        assert!(matches!(
-            decode_file_header(&buf),
-            Err(JournalError::UnsupportedVersion { .. })
-        ));
+        // One past the current version, and the one before v15.
+        for version in [FORMAT_VERSION + 1, FORMAT_VERSION_V15 - 1] {
+            let mut buf = [0u8; FILE_HEADER_SIZE];
+            encode_file_header(&mut buf, 512, 1, [0u8; 32], Some(0));
+            buf[4..6].copy_from_slice(&version.to_le_bytes());
+            assert!(matches!(
+                decode_file_header(&buf),
+                Err(JournalError::UnsupportedVersion { version: v }) if v == version
+            ));
+        }
     }
 
     /// Pins the on-disk byte layout of a Tick entry. Sentinel u64s are

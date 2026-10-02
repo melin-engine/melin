@@ -896,10 +896,12 @@ where
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode");
         // A replica receives the genesis events in the primary's history
-        // and never journals its own, promoted or not — only their count
-        // is kept, for the promotion check, and a large genesis is worth
-        // freeing.
-        let genesis_entries = genesis_entry_count(&std::mem::take(&mut startup.genesis));
+        // and never journals its own, promoted or not — nothing to hold
+        // them for, and a large genesis is worth freeing. Not even their
+        // count: the promotion check reads the genesis length the
+        // primary recorded in the lineage, which this replica's journal
+        // header holds, never this node's configuration.
+        startup.genesis = Vec::new();
 
         // Load replication signing key.
         let replication_key_path = config.replication_key.as_ref().ok_or_else(|| {
@@ -1041,7 +1043,7 @@ where
                 // Promotion! Transition to primary mode. Bump the epoch so a
                 // paused/partitioned ex-primary is fenced when it reconnects.
                 info!("replica promoted — transitioning to primary");
-                check_promoted_history_holds_genesis(writer.next_sequence(), genesis_entries)?;
+                check_promotable(&writer)?;
                 // Release --health-bind before run_as_primary rebinds it
                 // with the full primary health state.
                 replica_health.stop();
@@ -1228,15 +1230,6 @@ fn validate_primary_config(config: &ServerConfig) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// How many journal entries `genesis` occupies: every event but the
-/// queries, which are never journaled (see `write_genesis_journal`).
-///
-/// `u64`: compared against journal sequences, which are `u64`; the
-/// count of an in-memory `Vec` always fits.
-fn genesis_entry_count<E: melin_app::AppEvent>(genesis: &[E]) -> u64 {
-    genesis.iter().filter(|e| !e.is_query()).count() as u64
-}
-
 /// Refuse to promote a replica whose history does not yet hold the
 /// whole genesis.
 ///
@@ -1254,56 +1247,72 @@ fn genesis_entry_count<E: melin_app::AppEvent>(genesis: &[E]) -> u64 {
 /// `next_sequence` is the promoted writer's; the history holds entries
 /// `1..next_sequence`. A history that recovered from a snapshot counts
 /// the snapshot's entries too, which is right: the snapshot's state
-/// includes them. The check reads the node's own configured genesis,
-/// which is the cluster's: every node runs the same application
-/// configuration.
+/// includes them.
+///
+/// `genesis_entries` is the lineage's genesis length from the promoted
+/// writer's journal header — recorded by the primary that began the
+/// history and learned by this replica when it created its journal, so
+/// it is there with the primary gone, whatever genesis this node is
+/// configured with. `None` (a lineage begun before the length was
+/// recorded) skips the check.
 fn check_promoted_history_holds_genesis(
     next_sequence: u64,
-    genesis_entries: u64,
+    genesis_entries: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(held) = genesis_shortfall(next_sequence, genesis_entries) {
+    if let Some((held, genesis_entries)) = genesis_shortfall(next_sequence, genesis_entries) {
         return Err(format!(
-            "refusing promotion: this replica's history holds {held} entries but the genesis \
-             takes {genesis_entries}, so it copied only part of the genesis from a primary that \
-             stopped before finishing it (or the configured genesis has grown since the \
-             history began); restart the original primary, or start the cluster again from a \
-             new journal"
+            "refusing promotion: this replica's history holds {held} entries but the \
+             lineage's genesis takes {genesis_entries}, so it copied only part of the genesis \
+             from a primary that stopped before finishing it; restart the original primary, or \
+             start the cluster again from a new journal"
         )
         .into());
     }
     Ok(())
 }
 
+/// [`check_promoted_history_holds_genesis`] on the writer a promotion
+/// hands over: its next sequence, and the genesis length its journal
+/// header records. What both promotion paths (kernel TCP and DPDK) run
+/// before the node serves as primary.
+pub(crate) fn check_promotable<E, W>(writer: &W) -> Result<(), Box<dyn std::error::Error>>
+where
+    E: melin_app::AppEvent,
+    W: JournalWrite<E>,
+{
+    check_promoted_history_holds_genesis(
+        writer.next_sequence(),
+        writer.read_header_info()?.genesis_entries,
+    )
+}
+
 /// Refuse to serve, as a primary booting from disk, a recovered history
 /// that does not hold the whole genesis.
 ///
-/// The boot-time twin of [`check_promoted_history_holds_genesis`]. A
-/// journal this release creates always begins with its complete genesis,
-/// so a shorter history was left by something else: a journal an earlier
-/// release created and crashed in the middle of journaling its genesis,
-/// or a replica's journal holding part of the genesis that is restarted
-/// on a primary's flags instead of being promoted. Recovering it would
-/// serve a state the application never configured, and replicas would
-/// follow it. Any healthy history — this release's or an earlier one's —
-/// holds at least the genesis, so the refusal reaches only those
-/// layouts, plus one the operator chose: a genesis configuration grown
-/// past the length of the whole history since it began.
+/// The boot-time twin of [`check_promoted_history_holds_genesis`], on
+/// the same lineage-recorded length. A journal this release creates
+/// always begins with its complete genesis, so a shorter history is a
+/// replica's partial copy restarted on a primary's flags instead of
+/// being promoted. Recovering it would serve a state the application
+/// never configured, and replicas would follow it. The node's own
+/// configured genesis plays no part: a configuration changed since the
+/// history began changes nothing.
 ///
 /// `next_sequence` is the recovered writer's, after `init_engine` has
 /// given an empty journal its genesis (the one shortfall it can make
-/// good, since nothing was served from it).
+/// good, since nothing was served from it); `genesis_entries` its
+/// journal header's. `None` — a journal written by a release that did
+/// not record the length — skips the check, as those releases did.
 fn check_recovered_history_holds_genesis(
     next_sequence: u64,
-    genesis_entries: u64,
+    genesis_entries: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(held) = genesis_shortfall(next_sequence, genesis_entries) {
+    if let Some((held, genesis_entries)) = genesis_shortfall(next_sequence, genesis_entries) {
         return Err(format!(
-            "refusing to start: the recovered history holds {held} entries but the genesis \
-             takes {genesis_entries}, so it holds only part of the genesis (a first boot that \
-             stopped while journaling it under an earlier release, or a replica's partial copy \
-             started as a primary), or the configured genesis has grown since the history \
-             began; start again from a new history (remove the journal, its archives and \
-             its snapshots), or restart this node as a replica of a \
+            "refusing to start: the recovered history holds {held} entries but the lineage's \
+             genesis takes {genesis_entries}, so it holds only part of the genesis (a replica's \
+             partial copy started as a primary); start again from a new history (remove the \
+             journal, its archives and its snapshots), or restart this node as a replica of a \
              primary holding the whole history"
         )
         .into());
@@ -1311,11 +1320,13 @@ fn check_recovered_history_holds_genesis(
     Ok(())
 }
 
-/// The number of entries a history ending before `next_sequence` holds,
-/// when that is fewer than the `genesis_entries` the genesis takes.
-fn genesis_shortfall(next_sequence: u64, genesis_entries: u64) -> Option<u64> {
+/// `(held, genesis_entries)` when a history ending before
+/// `next_sequence` holds fewer entries than the genesis takes; `None`
+/// when it holds them all, or when the genesis length is unknown.
+fn genesis_shortfall(next_sequence: u64, genesis_entries: Option<u64>) -> Option<(u64, u64)> {
+    let genesis_entries = genesis_entries?;
     let held = next_sequence.saturating_sub(1);
-    (held < genesis_entries).then_some(held)
+    (held < genesis_entries).then_some((held, genesis_entries))
 }
 
 /// Load the Ed25519 replication signing key from `--replication-key` —
@@ -1496,6 +1507,9 @@ where
     let enable_replication = config.replication_bind.is_some();
     // Re-checked: a promotion reaches here without the boot-time check.
     validate_primary_config(config)?;
+    // The lineage's genesis length, read before the writer moves into
+    // the pipeline: the shadow stage stamps it into every snapshot.
+    let genesis_entries = writer.read_header_info()?.genesis_entries;
     // Clone the application for the shadow snapshot stage before the pipeline
     // consumes it. `Application` does not require `Clone`, so this goes
     // through `clone_via_snapshot` (a snapshot round-trip unless the
@@ -1861,6 +1875,7 @@ where
         &cores,
         &shutdown,
         fence_state.epoch(),
+        genesis_entries,
     )?;
 
     // Spawn the health endpoint BEFORE `journal_on_primary_events` and
@@ -2360,8 +2375,9 @@ where
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode (DPDK)");
         // As on the kernel-TCP path: a replica never journals genesis,
-        // and keeps only its count for the promotion check.
-        let genesis_entries = genesis_entry_count(&std::mem::take(&mut startup.genesis));
+        // and its promotion check reads the lineage's genesis length from
+        // its journal header, not its configuration.
+        startup.genesis = Vec::new();
 
         // Load the replication signing key — the replica signs the primary's
         // challenge with it. Mirrors the kernel-TCP replica path.
@@ -2508,7 +2524,7 @@ where
                 // Promotion! Transition to primary mode (DPDK).
                 info!("replica promoted (DPDK) — transitioning to primary");
                 // See the kernel-TCP promotion path.
-                check_promoted_history_holds_genesis(writer.next_sequence(), genesis_entries)?;
+                check_promotable(&writer)?;
                 // Release --health-bind before run_as_primary rebinds it.
                 replica_health.stop();
                 // Idempotent; see the kernel-TCP promotion path.
@@ -2596,6 +2612,9 @@ where
         std::mem::take(&mut startup.genesis),
     )?;
     <A as Application>::prefault(&mut app, &sizing);
+    // As on the kernel-TCP path: read before the writer moves into the
+    // pipeline, for the shadow stage's snapshots.
+    let genesis_entries = writer.read_header_info()?.genesis_entries;
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
@@ -2850,6 +2869,7 @@ where
         &cores,
         &shutdown,
         fence_state.epoch(),
+        genesis_entries,
     )?;
 
     // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
@@ -3221,24 +3241,40 @@ enum GenesisTarget {
 /// means the history has begun — a node that recovers a history never
 /// journals genesis into it, whatever its configured genesis says (one
 /// holding only part of it is refused by `init_engine` instead). The
-/// one exception is a history with no entry: a live segment starting at
-/// sequence 1 with nothing after its header, and no archive. Nothing was
-/// ever journaled, served or replicated from it, so beginning the
-/// history now is safe, and is what the first boot that created it
-/// would have done.
+/// one exception is a history with no entry whose header records no
+/// genesis length (`recorded` is `None`): a live segment starting at
+/// sequence 1 with nothing after its header, no archive, written by an
+/// earlier release that created the journal before its genesis — or a
+/// replica's copy of one. Nothing was ever journaled, served or
+/// replicated from it, so beginning the history now is safe, and is
+/// what the first boot that created it would have done.
+///
+/// An empty journal whose header records a length is never rewritten:
+/// the length is lineage metadata fixed when the history began. `Some(0)`
+/// is a history begun with no genesis, which a genesis configured since
+/// changes nothing for; `Some(n)` with `n > 0` is a replica's copy that
+/// received none of its primary's genesis, which `init_engine` refuses as
+/// the partial copy it is rather than fork the lineage with this node's
+/// own genesis.
 ///
 /// A genesis with nothing to journal (empty, or only queries, which are
 /// never journaled) leaves the journal as it is: rewriting it would
 /// change nothing but its file.
 ///
 /// `next_sequence` is the recovered writer's; it is 1 exactly when the
-/// live segment starts at sequence 1 and holds no entry.
+/// live segment starts at sequence 1 and holds no entry. `recorded` is
+/// the genesis length its header records.
 fn genesis_target<E: melin_app::AppEvent>(
     archives_exist: bool,
     next_sequence: u64,
+    recorded: Option<u64>,
     genesis: &[E],
 ) -> GenesisTarget {
-    if !archives_exist && next_sequence == 1 && genesis.iter().any(|e| !e.is_query()) {
+    if !archives_exist
+        && next_sequence == 1
+        && recorded.is_none()
+        && genesis.iter().any(|e| !e.is_query())
+    {
         GenesisTarget::EmptyJournal
     } else {
         GenesisTarget::None
@@ -3263,22 +3299,24 @@ pub(crate) struct InitializedEngine<A, W> {
 ///
 /// Returns the application, its journal writer, the recovered fencing
 /// epoch and whether this boot began the history ([`InitializedEngine`]).
-/// The recovery
-/// paths (snapshot+journal, snapshot only, journal only, fresh) are
-/// transport-level concerns and work uniformly for any `A: Application`
-/// via `JournaledApp<A>`. Same engine initialization the TCP / DPDK paths use.
+/// The recovery paths (snapshot+journal, snapshot only, journal only,
+/// fresh) are transport-level concerns and work uniformly for any
+/// `A: Application` via `JournaledApp<A>`. Same engine initialization the
+/// TCP / DPDK paths use.
 ///
 /// `genesis` is journaled here, and only when this node starts a new
-/// history: nothing on disk, or a journal holding no entry at all (see
-/// [`genesis_target`]). The journal is created with the genesis already
-/// in it ([`write_genesis_journal`]), so a journal at the configured path
+/// history: nothing on disk, or a journal holding no entry at all whose
+/// header records no genesis length (see [`genesis_target`]). The
+/// journal is created with the genesis already in it
+/// ([`write_genesis_journal`]), so a journal at the configured path
 /// always begins with the complete genesis, and every other layout —
 /// any surviving segment, or a snapshot, whose state already includes
 /// genesis — journals nothing. Genesis therefore reaches the returned
 /// state through replay, like the rest of the history on every later
-/// boot. A recovered history shorter than the genesis is refused
-/// ([`check_recovered_history_holds_genesis`]): it holds only part of
-/// it.
+/// boot. The journal's header records the genesis length, and a
+/// recovered history shorter than the length its header records is
+/// refused ([`check_recovered_history_holds_genesis`]): it holds only
+/// part of the genesis.
 ///
 /// `sizing` is applied to a genesis instance before a journal is replayed
 /// into it, so the history lands in reserved collections; the caller
@@ -3328,8 +3366,6 @@ where
     let journal_exists = config.journal.exists();
     let archives_exist = !melin_journal::segment::list_archives(&config.journal)?.is_empty();
     let snapshot_exists = snap_path.is_some_and(|p| p.exists());
-    // Counted before the genesis moves into the arm that journals it.
-    let genesis_entries = genesis_entry_count(&genesis);
     // An interrupted first boot's staging file is never history: sweep
     // it on every boot, not only on one that journals a genesis, so it
     // does not linger next to a history begun some other way.
@@ -3356,24 +3392,33 @@ where
                     snapshot = %snap_path.display(),
                     "recovering from snapshot only (no journal segments on disk)"
                 );
-                let (app, snap_sequence, snap_chain_hash, snap_epoch) =
-                    melin_transport_core::snapshot::load::<A>(snap_path)?;
-                let writer =
-                    W::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
-                JournaledApp::<A, W>::from_parts(app, writer, snap_epoch)
+                // The lineage's genesis length comes from the snapshot,
+                // the only record of the lineage left on disk.
+                let (app, snap) = melin_transport_core::snapshot::load_with_header::<A>(snap_path)?;
+                let writer = W::create_continuing(
+                    &config.journal,
+                    snap.sequence + 1,
+                    snap.chain_hash,
+                    snap.genesis_entries,
+                )?;
+                JournaledApp::<A, W>::from_parts(app, writer, snap.epoch)
             }
             BootstrapSource::JournalOnly => {
                 info!("recovering from journal");
                 let engine = recover_journal()?;
-                match genesis_target(archives_exist, engine.next_sequence(), &genesis) {
+                match genesis_target(
+                    archives_exist,
+                    engine.next_sequence(),
+                    engine.genesis_entries()?,
+                    &genesis,
+                ) {
                     GenesisTarget::None => engine,
                     GenesisTarget::EmptyJournal => {
-                        // An empty history is either a first boot that
-                        // stopped before journaling anything — under an
-                        // earlier release, which created the journal
-                        // before its genesis — or a replica's journal,
-                        // created by the handshake, that received no
-                        // entry before the node was restarted as a
+                        // An empty history with no recorded genesis
+                        // length is a first boot that stopped before
+                        // journaling anything under an earlier release,
+                        // which created the journal before its genesis,
+                        // or a replica's copy of one, restarted as a
                         // primary. Nothing was served or acknowledged
                         // from it either way, so starting the history now
                         // is safe. The anchor is kept, so a replica that
@@ -3384,10 +3429,9 @@ where
                             melin_journal::segment::read_header_info(&config.journal)?.anchor_hash;
                         warn!(
                             journal = %config.journal.display(),
-                            "the journal holds no entry: journaling genesis \
-                             (a first boot stopped before journaling it, or a \
-                             replica restarted as a primary before receiving \
-                             any entry)"
+                            "the journal holds no entry and records no genesis \
+                             length: journaling genesis (an earlier release's \
+                             first boot stopped before journaling it)"
                         );
                         write_genesis_journal::<A::Event, W>(
                             &config.journal,
@@ -3407,14 +3451,16 @@ where
             }
         };
 
-    // Every arm now holds the whole genesis, or a layout this release
-    // never writes (a partial genesis): refuse the latter rather than
-    // serve it. Checked before rotation, so a refused boot rotates
-    // nothing and no recorded entry is modified. Not quite side-effect
-    // free: a snapshot-only arm has already left an empty live segment
-    // continuing the snapshot, which the next boot recovers as
-    // snapshot-and-journal and refuses the same way.
-    check_recovered_history_holds_genesis(engine.next_sequence(), genesis_entries)?;
+    // Every arm now holds the whole genesis, or a layout a primary never
+    // writes (a replica's partial copy of it): refuse the latter rather
+    // than serve it, against the genesis length the lineage records —
+    // not `genesis`, this node's configuration. Checked before rotation,
+    // so a refused boot rotates nothing and no recorded entry is
+    // modified. Not quite side-effect free: a snapshot-only arm has
+    // already left an empty live segment continuing the snapshot, which
+    // the next boot recovers as snapshot-and-journal and refuses the
+    // same way.
+    check_recovered_history_holds_genesis(engine.next_sequence(), engine.genesis_entries()?)?;
 
     // Archive the live journal segment if it exceeds the configured
     // size threshold. The shadow stage owns snapshot writes; here we
@@ -3482,6 +3528,9 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
     cores: &PipelineCores,
     shutdown: &Arc<AtomicBool>,
     initial_epoch: u64,
+    // The lineage's genesis length, from the journal header — stamped
+    // into every snapshot (see `shadow::run`).
+    genesis_entries: Option<u64>,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>>
 where
     A::Event: Send + Sync + 'static,
@@ -3510,6 +3559,7 @@ where
                 &s_shadow,
                 shadow.wait,
                 shadow_initial_epoch,
+                genesis_entries,
             );
         })
         .map_err(|e| format!("spawn shadow thread: {e}"))?;
@@ -4271,9 +4321,8 @@ mod genesis_tests {
     use melin_transport_core::journaled_app::genesis_staging_path;
 
     use super::{
-        GenesisTarget, ServerConfig, check_promoted_history_holds_genesis,
-        check_recovered_history_holds_genesis, genesis_entry_count, genesis_target, init_engine,
-        validate_primary_config,
+        GenesisTarget, ServerConfig, check_promotable, check_recovered_history_holds_genesis,
+        genesis_target, init_engine, validate_primary_config,
     };
 
     type Writer = BufferedWriter<CounterEvent>;
@@ -4334,10 +4383,11 @@ mod genesis_tests {
         assert!(!began_history(&cfg, &[1_000]));
 
         // An empty journal left by an earlier release's interrupted
-        // first boot: journaling its genesis now begins the history.
+        // first boot (a v15 header, no recorded genesis length):
+        // journaling its genesis now begins the history.
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
-        drop(Writer::create(&cfg.journal).expect("empty journal"));
+        drop(Writer::create_continuing(&cfg.journal, 1, [0x15; 32], None).expect("v15 journal"));
         assert!(began_history(&cfg, &[1_000]));
         assert!(!began_history(&cfg, &[1_000]));
     }
@@ -4386,14 +4436,7 @@ mod genesis_tests {
         let cfg = config(dir.path());
         let engine =
             init_engine::<Counter, Writer>(&cfg, &(), increments(&[1_000_000])).expect("boot");
-        melin_transport_core::snapshot::save::<Counter>(
-            &engine.app,
-            melin_transport_core::WireSeq::new(engine.writer.next_sequence() - 1),
-            engine.writer.chain_hash().unwrap_or([0u8; 32]),
-            engine.recovered_epoch,
-            &cfg.journal.with_extension("snapshot"),
-        )
-        .expect("save snapshot");
+        save_snapshot(&engine, &cfg.journal.with_extension("snapshot"));
         drop(engine);
         std::fs::remove_file(&cfg.journal).expect("move the journal aside");
 
@@ -4404,6 +4447,34 @@ mod genesis_tests {
             "the new segment continues the snapshot, empty"
         );
         assert!(journaled_amounts(&cfg.journal).is_empty());
+        // The new segment's header carries the lineage's genesis length
+        // on from the snapshot, the only record of it left on disk.
+        assert_eq!(genesis_entries(&cfg.journal), Some(1));
+    }
+
+    /// Save a snapshot of a booted engine as the shadow stage would:
+    /// its state, position, chain, epoch and lineage genesis length.
+    fn save_snapshot(engine: &super::InitializedEngine<Counter, Writer>, path: &Path) {
+        melin_transport_core::snapshot::save::<Counter>(
+            &engine.app,
+            melin_transport_core::WireSeq::new(engine.writer.next_sequence() - 1),
+            engine.writer.chain_hash().unwrap_or([0u8; 32]),
+            engine.recovered_epoch,
+            engine
+                .writer
+                .read_header_info()
+                .expect("journal header")
+                .genesis_entries,
+            path,
+        )
+        .expect("save snapshot");
+    }
+
+    /// The genesis length the live segment's header at `path` records.
+    fn genesis_entries(path: &Path) -> Option<u64> {
+        melin_journal::segment::read_header_info(path)
+            .expect("journal header")
+            .genesis_entries
     }
 
     /// Finding 4, crash variant: a first boot that dies part-way through
@@ -4426,22 +4497,63 @@ mod genesis_tests {
         assert_eq!(boot(&cfg, &[1_000, 2_000, 4_000]), (7_000, 4));
         assert_eq!(journaled_amounts(&cfg.journal), vec![1_000, 2_000, 4_000]);
         assert!(!staging.exists(), "the partial journal is discarded");
+        assert_eq!(genesis_entries(&cfg.journal), Some(3));
     }
 
-    /// Finding 4, as an earlier release left it: the journal was created
-    /// before a refused boot journaled anything. Nothing was served from
-    /// it, so it gets its genesis, under the same anchor (a replica that
-    /// copied the empty journal still chains to it).
+    /// An empty journal whose header records a genesis length is never
+    /// re-genesised: the length is fixed when the history began. A
+    /// history begun with no genesis (`Some(0)`) stays one, whatever
+    /// genesis is configured since; a replica's copy that received none
+    /// of its primary's genesis (`Some(n)`, `n > 0`) is refused as the
+    /// partial copy it is, rather than forked with this node's genesis.
     #[test]
-    fn an_empty_journal_gets_its_genesis_under_the_same_anchor() {
+    fn an_empty_journal_with_a_recorded_length_is_not_rewritten() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
         drop(Writer::create(&cfg.journal).expect("empty journal"));
+        assert_eq!(genesis_entries(&cfg.journal), Some(0));
         let before = anchor(&cfg.journal);
 
-        assert_eq!(boot(&cfg, &[1_000_000]), (1_000_000, 2));
-        assert_eq!(journaled_amounts(&cfg.journal), vec![1_000_000]);
+        assert_eq!(boot(&cfg, &[1_000_000]), (0, 1));
+        assert!(journaled_amounts(&cfg.journal).is_empty());
         assert_eq!(anchor(&cfg.journal), before);
+        assert_eq!(genesis_entries(&cfg.journal), Some(0));
+
+        std::fs::remove_file(&cfg.journal).expect("move the journal aside");
+        drop(
+            Writer::create_continuing(&cfg.journal, 1, [0x2C; 32], Some(2))
+                .expect("a replica's empty copy"),
+        );
+        for configured in [&[][..], &[1_000, 2_000], &[1_000, 2_000, 4_000]] {
+            let refused = init_engine::<Counter, Writer>(&cfg, &(), increments(configured))
+                .err()
+                .expect("an empty copy of a genesis is refused");
+            assert!(
+                refused.to_string().contains("refusing to start"),
+                "{configured:?}: {refused}"
+            );
+        }
+        assert!(journaled_amounts(&cfg.journal).is_empty());
+        assert_eq!(anchor(&cfg.journal), [0x2C; 32]);
+        assert_eq!(genesis_entries(&cfg.journal), Some(2));
+    }
+
+    /// Finding 4, as an earlier release left it: the journal was created
+    /// before a refused boot journaled anything — a v15 header, genesis
+    /// length unknown. Nothing was served from it, so it gets its
+    /// genesis, under the same anchor (a replica that copied the empty
+    /// journal still chains to it), and the replacement records the
+    /// genesis it journals.
+    #[test]
+    fn an_empty_old_format_journal_gets_its_genesis_and_its_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = config(dir.path());
+        drop(Writer::create_continuing(&cfg.journal, 1, [0x15; 32], None).expect("v15 journal"));
+        assert_eq!(genesis_entries(&cfg.journal), None);
+
+        assert_eq!(boot(&cfg, &[1_000, 2_000]), (3_000, 3));
+        assert_eq!(anchor(&cfg.journal), [0x15; 32]);
+        assert_eq!(genesis_entries(&cfg.journal), Some(2));
     }
 
     /// A stale staging file is swept by a boot that journals no genesis
@@ -4472,11 +4584,9 @@ mod genesis_tests {
         assert!(!genesis_staging_path(&cfg.journal).exists());
     }
 
-    /// A journal that holds at least as many entries as the genesis has
-    /// begun its history, and is recovered as it is, whatever the
-    /// configured genesis. That covers every healthy journal written
-    /// before this change, which cannot say whether its first entries
-    /// were a whole genesis.
+    /// A journal with history is recovered as it is, whatever the
+    /// configured genesis: its header records the genesis it began with
+    /// (none, here), and the configuration plays no part.
     #[test]
     fn a_journal_with_history_never_gets_genesis() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4491,53 +4601,108 @@ mod genesis_tests {
         assert_eq!(journaled_amounts(&cfg.journal), vec![5]);
     }
 
-    /// A history holding part of the genesis — an earlier release's
-    /// first boot that crashed mid-genesis, or a replica's partial copy
-    /// started on a primary's flags — is refused, from the journal alone
-    /// or from a snapshot, and left as it was.
+    /// A replica's journal as its primary's death left it: the header
+    /// records the lineage's genesis of three entries (learned from the
+    /// primary), and only the first two arrived.
+    fn partial_replica_copy(path: &Path) {
+        let mut writer =
+            Writer::create_continuing(path, 1, [0x2B; 32], Some(3)).expect("replica journal");
+        for amount in [1_000, 2_000] {
+            writer
+                .append(&JournalEvent::App(CounterEvent::Increment { amount }))
+                .expect("genesis prefix");
+        }
+    }
+
+    /// A history holding part of the lineage's genesis — a replica's
+    /// partial copy started on a primary's flags — is refused, from the
+    /// journal alone or from a snapshot, and left as it was. Whatever
+    /// genesis the node is configured with: none, the same, or more.
     #[test]
     fn a_genesis_prefix_is_refused_at_boot() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = config(dir.path());
-        let genesis = increments(&[1_000, 2_000, 4_000]);
-        let mut writer = Writer::create(&cfg.journal).expect("journal");
-        for event in &genesis[..2] {
-            writer
-                .append(&JournalEvent::App(*event))
-                .expect("genesis prefix");
-        }
-        drop(writer);
+        partial_replica_copy(&cfg.journal);
 
-        let refused = init_engine::<Counter, Writer>(&cfg, &(), genesis.clone())
+        for configured in [&[][..], &[1_000, 2_000, 4_000], &[1, 2, 3, 4, 5]] {
+            let refused = init_engine::<Counter, Writer>(&cfg, &(), increments(configured))
+                .err()
+                .expect("a genesis prefix is refused");
+            assert!(
+                refused.to_string().contains("refusing to start"),
+                "{configured:?}: {refused}"
+            );
+        }
+        assert_eq!(journaled_amounts(&cfg.journal), vec![1_000, 2_000]);
+
+        // The same history behind a snapshot: still a prefix, whose
+        // snapshot records the genesis length too.
+        let snapshot = cfg.journal.with_extension("snapshot");
+        melin_transport_core::JournaledApp::<Counter, Writer>::recover(
+            Counter::default(),
+            &cfg.journal,
+        )
+        .expect("recover the partial copy")
+        .save_snapshot(&snapshot)
+        .expect("save snapshot");
+        init_engine::<Counter, Writer>(&cfg, &(), Vec::new())
             .err()
-            .expect("a genesis prefix is refused");
+            .expect("snapshot + journal holding a prefix is refused");
+        std::fs::remove_file(&cfg.journal).expect("move the journal aside");
+        let refused = init_engine::<Counter, Writer>(&cfg, &(), Vec::new())
+            .err()
+            .expect("a snapshot holding a prefix is refused");
         assert!(
             refused.to_string().contains("refusing to start"),
             "{refused}"
         );
-        assert_eq!(journaled_amounts(&cfg.journal), vec![1_000, 2_000]);
+    }
 
-        // The same history behind a snapshot: still a prefix.
-        let snapshot = cfg.journal.with_extension("snapshot");
-        {
-            let engine = init_engine::<Counter, Writer>(&cfg, &(), increments(&[1_000, 2_000]))
-                .expect("boot with the genesis the history holds");
-            melin_transport_core::snapshot::save::<Counter>(
-                &engine.app,
-                melin_transport_core::WireSeq::new(engine.writer.next_sequence() - 1),
-                engine.writer.chain_hash().unwrap_or([0u8; 32]),
-                engine.recovered_epoch,
-                &snapshot,
-            )
-            .expect("save snapshot");
-        }
-        init_engine::<Counter, Writer>(&cfg, &(), genesis.clone())
-            .err()
-            .expect("snapshot + journal holding a prefix is refused");
+    /// A genesis configuration grown since the history began changes
+    /// nothing: the history's own header says how long its genesis was,
+    /// and a short history holding all of it boots.
+    #[test]
+    fn a_grown_genesis_configuration_does_not_refuse_a_short_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = config(dir.path());
+        assert_eq!(boot(&cfg, &[1_000]), (1_000, 2));
+        assert_eq!(genesis_entries(&cfg.journal), Some(1));
+
+        assert_eq!(boot(&cfg, &[1_000, 2_000, 4_000, 8_000]), (1_000, 2));
+        assert_eq!(journaled_amounts(&cfg.journal), vec![1_000]);
+        assert_eq!(genesis_entries(&cfg.journal), Some(1));
+    }
+
+    /// A journal written by an earlier release records no genesis
+    /// length: it boots as it did there, with no check — even when it is
+    /// shorter than the configured genesis — stays a v15 lineage, and a
+    /// promotion from it is not checked either. The same from a v2
+    /// snapshot alone, which records no length either.
+    #[test]
+    fn an_old_format_journal_boots_without_the_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = config(dir.path());
+        let mut writer =
+            Writer::create_continuing(&cfg.journal, 1, [0x15; 32], None).expect("v15 journal");
+        writer
+            .append(&JournalEvent::App(CounterEvent::Increment { amount: 7 }))
+            .expect("one entry");
+        drop(writer);
+
+        let engine = init_engine::<Counter, Writer>(&cfg, &(), increments(&[1, 2, 3]))
+            .expect("an unknown genesis length is not checked");
+        assert_eq!(value(&engine.app), 7);
+        assert_eq!(engine.writer.next_sequence(), 2);
+        assert_eq!(genesis_entries(&cfg.journal), None, "still a v15 lineage");
+        check_promotable(&engine.writer).expect("promotion is not checked either");
+
+        // Snapshot-only: the v2 snapshot (unknown length) starts a v15
+        // segment, and the boot is not checked.
+        save_snapshot(&engine, &cfg.journal.with_extension("snapshot"));
+        drop(engine);
         std::fs::remove_file(&cfg.journal).expect("move the journal aside");
-        init_engine::<Counter, Writer>(&cfg, &(), genesis)
-            .err()
-            .expect("a snapshot holding a prefix is refused");
+        assert_eq!(boot(&cfg, &[1, 2, 3]), (7, 2));
+        assert_eq!(genesis_entries(&cfg.journal), None);
     }
 
     #[test]
@@ -4545,21 +4710,27 @@ mod genesis_tests {
         let genesis = increments(&[1]);
         let none: Vec<CounterEvent> = Vec::new();
         let queries = vec![CounterEvent::GetValue];
-        // (archives, next_sequence, genesis) → target
-        let cases: [(bool, u64, &[CounterEvent], GenesisTarget); 6] = [
-            (false, 1, &genesis, GenesisTarget::EmptyJournal),
-            (false, 2, &genesis, GenesisTarget::None),
+        // (archives, next_sequence, recorded length, genesis) → target
+        type Case<'a> = (bool, u64, Option<u64>, &'a [CounterEvent], GenesisTarget);
+        let cases: [Case<'_>; 8] = [
+            (false, 1, None, &genesis, GenesisTarget::EmptyJournal),
+            (false, 2, None, &genesis, GenesisTarget::None),
             // An empty live segment after a rotation still has history.
-            (true, 1, &genesis, GenesisTarget::None),
-            (true, 5, &genesis, GenesisTarget::None),
-            (false, 1, &none, GenesisTarget::None),
-            (false, 1, &queries, GenesisTarget::None),
+            (true, 1, None, &genesis, GenesisTarget::None),
+            (true, 5, None, &genesis, GenesisTarget::None),
+            (false, 1, None, &none, GenesisTarget::None),
+            (false, 1, None, &queries, GenesisTarget::None),
+            // A recorded length is fixed: a history begun with no
+            // genesis, or a replica's empty copy of one.
+            (false, 1, Some(0), &genesis, GenesisTarget::None),
+            (false, 1, Some(3), &genesis, GenesisTarget::None),
         ];
-        for (archives, next_sequence, genesis, expected) in cases {
+        for (archives, next_sequence, recorded, genesis, expected) in cases {
             assert_eq!(
-                genesis_target(archives, next_sequence, genesis),
+                genesis_target(archives, next_sequence, recorded, genesis),
                 expected,
-                "archives={archives} next_sequence={next_sequence} genesis={genesis:?}"
+                "archives={archives} next_sequence={next_sequence} recorded={recorded:?} \
+                 genesis={genesis:?}"
             );
         }
     }
@@ -4583,33 +4754,21 @@ mod genesis_tests {
         validate_primary_config(&accepted).expect("standalone under disk");
     }
 
-    /// The promotion check counts what the genesis journals: queries are
-    /// never journaled, so they take no sequence.
-    #[test]
-    fn genesis_entry_count_skips_queries() {
-        use melin_app::AppEvent;
-        let mut genesis = increments(&[1, 2, 3]);
-        assert_eq!(genesis_entry_count(&genesis), 3);
-        genesis.push(CounterEvent::GetValue);
-        assert!(genesis[3].is_query());
-        assert_eq!(genesis_entry_count(&genesis), 3);
-        assert_eq!(genesis_entry_count::<CounterEvent>(&[]), 0);
-    }
-
-    /// A replica that copied only part of the genesis — an empty journal
-    /// (its primary died right after the handshake) or a prefix (died
-    /// mid catch-up) — is refused promotion; one holding all of it, with
-    /// or without history after it, is promoted.
+    /// A replica that copied only part of the lineage's genesis — an
+    /// empty journal (its primary died right after the handshake) or a
+    /// prefix (died mid catch-up) — is refused promotion; one holding all
+    /// of it, with or without history after it, is promoted. The length
+    /// comes from the replica's journal header alone: no configuration
+    /// reaches the check.
     #[test]
     fn promotion_needs_the_whole_genesis() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("replica.journal");
         let genesis = increments(&[1_000, 2_000, 4_000]);
-        let entries = genesis_entry_count(&genesis);
 
-        let mut writer = Writer::create(&path).expect("replica journal");
-        let refused = check_promoted_history_holds_genesis(writer.next_sequence(), entries)
-            .expect_err("an empty history");
+        let mut writer =
+            Writer::create_continuing(&path, 1, [0x2B; 32], Some(3)).expect("replica journal");
+        let refused = check_promotable(&writer).expect_err("an empty history");
         assert!(
             refused.to_string().contains("refusing promotion"),
             "{refused}"
@@ -4619,34 +4778,46 @@ mod genesis_tests {
                 .append(&JournalEvent::App(*event))
                 .expect("genesis prefix");
         }
-        check_promoted_history_holds_genesis(writer.next_sequence(), entries)
-            .expect_err("a genesis prefix");
+        check_promotable(&writer).expect_err("a genesis prefix");
 
         writer
             .append(&JournalEvent::App(genesis[2]))
             .expect("last genesis event");
-        check_promoted_history_holds_genesis(writer.next_sequence(), entries)
-            .expect("the whole genesis");
+        check_promotable(&writer).expect("the whole genesis");
         writer
             .append(&JournalEvent::App(CounterEvent::Increment { amount: 5 }))
             .expect("client history");
-        check_promoted_history_holds_genesis(writer.next_sequence(), entries)
-            .expect("genesis and history after it");
+        check_promotable(&writer).expect("genesis and history after it");
 
         // No genesis: any history, even an empty one, is promotable.
-        check_promoted_history_holds_genesis(1, 0).expect("nothing to hold");
+        let none = dir.path().join("none.journal");
+        check_promotable(&Writer::create(&none).expect("journal")).expect("nothing to hold");
+        // Unknown (a lineage begun before the length was recorded): not
+        // checked, as before.
+        let unknown = dir.path().join("unknown.journal");
+        check_promotable(
+            &Writer::create_continuing(&unknown, 1, [0x15; 32], None).expect("journal"),
+        )
+        .expect("unknown is not checked");
         // A history continuing a snapshot counts the snapshot's entries.
-        check_promoted_history_holds_genesis(10, entries).expect("snapshot covers genesis");
+        let continued = dir.path().join("continued.journal");
+        check_promotable(
+            &Writer::create_continuing(&continued, 10, [0x2B; 32], Some(3)).expect("journal"),
+        )
+        .expect("snapshot covers genesis");
     }
 
-    /// The boot check draws the same line as the promotion check.
+    /// The boot check draws the same line as the promotion check, and
+    /// skips an unknown length.
     #[test]
     fn the_boot_check_needs_the_whole_genesis() {
-        check_recovered_history_holds_genesis(1, 3).expect_err("empty");
-        check_recovered_history_holds_genesis(3, 3).expect_err("a prefix");
-        check_recovered_history_holds_genesis(4, 3).expect("the whole genesis");
-        check_recovered_history_holds_genesis(100, 3).expect("and history after it");
-        check_recovered_history_holds_genesis(1, 0).expect("no genesis");
+        check_recovered_history_holds_genesis(1, Some(3)).expect_err("empty");
+        check_recovered_history_holds_genesis(3, Some(3)).expect_err("a prefix");
+        check_recovered_history_holds_genesis(4, Some(3)).expect("the whole genesis");
+        check_recovered_history_holds_genesis(100, Some(3)).expect("and history after it");
+        check_recovered_history_holds_genesis(1, Some(0)).expect("no genesis");
+        check_recovered_history_holds_genesis(1, None).expect("unknown: not checked");
+        check_recovered_history_holds_genesis(3, None).expect("unknown: not checked");
     }
 }
 

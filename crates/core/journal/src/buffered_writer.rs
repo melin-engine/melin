@@ -74,24 +74,33 @@ pub struct BufferedWriter<E: AppEvent> {
 const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
 impl<E: AppEvent> BufferedWriter<E> {
-    /// Create a fresh journal file. The chain anchor is random salt so
+    /// Create a fresh journal file: a new lineage with no genesis
+    /// (`genesis_entries` 0). The chain anchor is random salt so
     /// histories from different runs/clusters are never confusable.
     pub fn create(path: &Path) -> Result<Self, JournalError> {
         crate::preparer::cleanup_staging_orphan(path);
-        Self::create_continuing(path, 1, crate::fresh_anchor()?)
+        Self::create_continuing(path, 1, crate::fresh_anchor()?, Some(0))
     }
 
     /// Create a fresh journal that continues a previous segment's sequence
     /// numbers, anchored to `anchor_hash` (the prior segment's chain tip,
-    /// or random salt for a brand-new journal). Both values are recorded
+    /// or random salt for a brand-new journal), in a lineage whose
+    /// genesis occupies `genesis_entries` entries (`None`: unknown, see
+    /// [`codec::FileHeaderInfo::genesis_entries`]). All three are recorded
     /// in the file header; no entries are written.
     pub fn create_continuing(
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
+        genesis_entries: Option<u64>,
     ) -> Result<Self, JournalError> {
         Ok(Self {
-            segment: SegmentFile::create_continuing(path, starting_sequence, anchor_hash)?,
+            segment: SegmentFile::create_continuing(
+                path,
+                starting_sequence,
+                anchor_hash,
+                genesis_entries,
+            )?,
             encoder: JournalEncoder::new(starting_sequence, anchor_hash),
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
         })

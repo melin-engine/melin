@@ -781,6 +781,7 @@ where
                 start_sequence,
                 segment_start_sequence,
                 anchor_hash,
+                genesis_entries,
                 epoch,
                 ack_policy,
             } => {
@@ -805,13 +806,27 @@ where
                     sleep_then_double_backoff(&mut backoff, shutdown, promote);
                     continue;
                 }
+                // A replica with a journal already records its lineage's
+                // genesis length; the primary's must agree with it.
+                if pipeline.is_none() {
+                    super::adopt_genesis_into_empty_unknown_journal(
+                        &mut journal_writer,
+                        (segment_start_sequence, anchor_hash, genesis_entries),
+                    )?;
+                }
+                if let Some(local) = super::local_lineage_genesis(&pipeline, &journal_writer)? {
+                    super::check_advertised_genesis(local, genesis_entries)?;
+                }
                 // Adopt the primary's epoch immediately; streamed `EpochBump`s
                 // keep it current thereafter. Likewise the ack policy
                 // (heartbeats keep it current mid-session).
                 fence_state.observe_epoch(epoch);
                 primary_ack_policy.store(ack_policy, Ordering::Release);
                 info!(start_sequence, epoch, ack_policy, "streaming started");
-                ((segment_start_sequence, anchor_hash), last_sequence)
+                (
+                    (segment_start_sequence, anchor_hash, genesis_entries),
+                    last_sequence,
+                )
             }
             ref resync @ (PrimaryMessage::NeedSnapshot | PrimaryMessage::HashMismatch) => {
                 let divergent = matches!(resync, PrimaryMessage::HashMismatch);
@@ -838,8 +853,12 @@ where
                     ResyncDecision::Ready {
                         segment_start_sequence,
                         anchor_hash,
+                        genesis_entries,
                         resume_sequence,
-                    } => ((segment_start_sequence, anchor_hash), resume_sequence),
+                    } => (
+                        (segment_start_sequence, anchor_hash, genesis_entries),
+                        resume_sequence,
+                    ),
                     ResyncDecision::Retry => {
                         sleep_then_double_backoff(&mut backoff, shutdown, promote);
                         continue;
@@ -857,11 +876,18 @@ where
         // lineage began with; creating the local segment from the same
         // identity makes the replica's segment byte-identical to the
         // primary's, and adopted `Rotate` boundaries keep it that way
-        // across rotations (bitwise mirror).
+        // across rotations (bitwise mirror). The header records the
+        // lineage's genesis length too, so it survives this replica's
+        // restarts and is there to check at promotion even with the
+        // primary gone.
         if pipeline.is_none() && journal_writer.is_none() {
-            let (lineage_start, lineage_anchor) = stream_lineage;
-            let writer =
-                BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
+            let (lineage_start, lineage_anchor, lineage_genesis) = stream_lineage;
+            let writer = BufferedWriter::create_continuing(
+                journal_path,
+                lineage_start,
+                lineage_anchor,
+                lineage_genesis,
+            )?;
             app = Some(A::default());
             journal_writer = Some(writer);
         }
@@ -1330,11 +1356,16 @@ mod tests {
                 WireSeq::new(4),
                 chain_at_4,
                 0,
+                Some(0),
                 &primary_journal.with_extension("snapshot"),
             )
             .expect("save snapshot");
-            let (lineage_start, lineage_anchor) =
-                lineage_origin(&primary_journal).expect("lineage");
+            let origin = lineage_origin(&primary_journal).expect("lineage");
+            let (lineage_start, lineage_anchor, lineage_genesis) = (
+                origin.starting_sequence,
+                origin.anchor_hash,
+                origin.genesis_entries,
+            );
 
             // --- Auth: one replica key, authorized.
             let authorized_keys = replica_auth();
@@ -1387,7 +1418,15 @@ mod tests {
                 other => panic!("expected Handshake, got {other:?}"),
             }
             let mut buf = Vec::new();
-            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
+            encode_stream_start(
+                0,
+                lineage_start,
+                lineage_anchor,
+                lineage_genesis,
+                0,
+                1,
+                &mut buf,
+            );
             s1.write_all(&buf).expect("StreamStart 1");
             buf.clear();
             melin_transport_core::replication_wire::encode_input_batch(
@@ -1506,8 +1545,12 @@ mod tests {
                 w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
             }
             drop(w);
-            let (lineage_start, lineage_anchor) =
-                lineage_origin(&primary_journal).expect("lineage");
+            let origin = lineage_origin(&primary_journal).expect("lineage");
+            let (lineage_start, lineage_anchor, lineage_genesis) = (
+                origin.starting_sequence,
+                origin.anchor_hash,
+                origin.genesis_entries,
+            );
 
             let authorized_keys = replica_auth();
 
@@ -1549,7 +1592,7 @@ mod tests {
             // session and wait for its ack.
             let stream_one = |s: &mut TcpStream, buf: &mut Vec<u8>| {
                 buf.clear();
-                encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, buf);
+                encode_stream_start(0, lineage_start, lineage_anchor, lineage_genesis, 0, 1, buf);
                 s.write_all(buf).expect("StreamStart");
                 buf.clear();
                 melin_transport_core::replication_wire::encode_input_batch(
@@ -1672,11 +1715,16 @@ mod tests {
                 WireSeq::new(4),
                 chain_at_4,
                 0,
+                Some(0),
                 &primary_journal.with_extension("snapshot"),
             )
             .expect("save snapshot");
-            let (lineage_start, lineage_anchor) =
-                lineage_origin(&primary_journal).expect("lineage");
+            let origin = lineage_origin(&primary_journal).expect("lineage");
+            let (lineage_start, lineage_anchor, lineage_genesis) = (
+                origin.starting_sequence,
+                origin.anchor_hash,
+                origin.genesis_entries,
+            );
 
             let authorized_keys = replica_auth();
 
@@ -1723,7 +1771,15 @@ mod tests {
                 other => panic!("expected Handshake, got {other:?}"),
             }
             let mut buf = Vec::new();
-            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
+            encode_stream_start(
+                0,
+                lineage_start,
+                lineage_anchor,
+                lineage_genesis,
+                0,
+                1,
+                &mut buf,
+            );
             s1.write_all(&buf).expect("StreamStart 1");
             buf.clear();
             melin_transport_core::replication_wire::encode_input_batch(
@@ -1920,8 +1976,12 @@ mod tests {
             let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
             w.append(&JournalEvent::App(EvtAdd(1))).expect("append");
             drop(w);
-            let (lineage_start, lineage_anchor) =
-                lineage_origin(&primary_journal).expect("lineage");
+            let origin = lineage_origin(&primary_journal).expect("lineage");
+            let (lineage_start, lineage_anchor, lineage_genesis) = (
+                origin.starting_sequence,
+                origin.anchor_hash,
+                origin.genesis_entries,
+            );
 
             let authorized_keys = replica_auth();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1970,7 +2030,15 @@ mod tests {
                 other => panic!("expected Handshake, got {other:?}"),
             }
             let mut buf = Vec::new();
-            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
+            encode_stream_start(
+                0,
+                lineage_start,
+                lineage_anchor,
+                lineage_genesis,
+                0,
+                1,
+                &mut buf,
+            );
             s1.write_all(&buf).expect("StreamStart");
             buf.clear();
             melin_transport_core::replication_wire::encode_input_batch(
@@ -2054,7 +2122,9 @@ mod tests {
 
         /// A primary journal holding one entry: its path and lineage
         /// identity, for the `StreamStart` a replica accepts.
-        fn primary_journal(dir: &std::path::Path) -> (std::path::PathBuf, (u64, [u8; 32])) {
+        fn primary_journal(
+            dir: &std::path::Path,
+        ) -> (std::path::PathBuf, melin_journal::FileHeaderInfo) {
             let path = dir.join("primary.journal");
             let mut w = BufferedWriter::<EvtAdd>::create(&path).expect("create");
             w.append(&JournalEvent::App(EvtAdd(1))).expect("append");
@@ -2111,9 +2181,21 @@ mod tests {
         }
 
         /// Answer a handshake: stream from `start` on the given lineage.
-        fn stream_start(stream: &mut TcpStream, start: u64, (origin, anchor): (u64, [u8; 32])) {
+        fn stream_start(
+            stream: &mut TcpStream,
+            start: u64,
+            lineage: melin_journal::FileHeaderInfo,
+        ) {
             let mut buf = Vec::new();
-            encode_stream_start(start, origin, anchor, 0, 1, &mut buf);
+            encode_stream_start(
+                start,
+                lineage.starting_sequence,
+                lineage.anchor_hash,
+                lineage.genesis_entries,
+                0,
+                1,
+                &mut buf,
+            );
             stream.write_all(&buf).expect("StreamStart");
         }
 
@@ -2373,6 +2455,208 @@ mod tests {
             }
             assert_eq!(journaled, vec![1, 2], "only the intact entry is journaled");
         }
+
+        /// `lineage`, as a primary whose genesis took `genesis_entries`
+        /// entries would advertise it.
+        fn with_genesis(
+            lineage: melin_journal::FileHeaderInfo,
+            genesis_entries: Option<u64>,
+        ) -> melin_journal::FileHeaderInfo {
+            melin_journal::FileHeaderInfo {
+                genesis_entries,
+                ..lineage
+            }
+        }
+
+        fn replica_genesis(dir: &std::path::Path) -> Option<u64> {
+            melin_journal::segment::read_header_info(&dir.join("replica.journal"))
+                .expect("replica journal header")
+                .genesis_entries
+        }
+
+        /// A fresh replica writes the genesis length the primary
+        /// advertises into the journal it creates, and keeps it: a
+        /// restarted replica recovers it from its own header and follows
+        /// a primary advertising the same.
+        #[test]
+        fn a_replica_learns_the_genesis_length_and_keeps_it_across_restarts() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_, base) = primary_journal(dir.path());
+            let lineage = with_genesis(base, Some(3));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let replica = spawn_replica(dir.path(), addr, Duration::ZERO, &shutdown);
+            let (mut s1, _s1r, h1) = next_handshake(&listener);
+            assert_eq!(h1.last_sequence, 0, "fresh replica handshake");
+            stream_start(&mut s1, 0, lineage);
+            send_entries(&mut s1, &[1, 2]);
+            wait_for_ack(&mut s1, 2);
+            assert_eq!(replica_genesis(dir.path()), Some(3), "learned at creation");
+            stop(replica, &shutdown);
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let replica = spawn_replica(dir.path(), addr, Duration::ZERO, &shutdown);
+            let (mut s2, _s2r, h2) = next_handshake(&listener);
+            assert_eq!(h2.last_sequence, 2, "restarted replica handshake");
+            stream_start(&mut s2, 2, lineage);
+            send_entries(&mut s2, &[3]);
+            wait_for_ack(&mut s2, 3);
+            stop(replica, &shutdown);
+            assert_eq!(
+                replica_genesis(dir.path()),
+                Some(3),
+                "kept across a restart"
+            );
+        }
+
+        /// A replica holding an empty journal from before the genesis
+        /// length was recorded — copied from a primary that stopped
+        /// before journaling anything — learns the length when the
+        /// upgraded primary, having journaled its genesis under the same
+        /// anchor, advertises it. Left unknown, its promotion check would
+        /// be skipped for the very partial genesis it guards.
+        #[test]
+        fn an_empty_old_format_replica_journal_learns_the_genesis_length() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_, base) = primary_journal(dir.path());
+            assert_eq!(base.starting_sequence, 1);
+            drop(
+                melin_journal::BufferedWriter::<EvtAdd>::create_continuing(
+                    &dir.path().join("replica.journal"),
+                    1,
+                    base.anchor_hash,
+                    None,
+                )
+                .expect("old-format empty replica journal"),
+            );
+            assert_eq!(replica_genesis(dir.path()), None);
+            let lineage = with_genesis(base, Some(3));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let replica = spawn_replica(
+                dir.path(),
+                listener.local_addr().expect("addr"),
+                Duration::ZERO,
+                &shutdown,
+            );
+
+            let (mut s1, _s1r, h1) = next_handshake(&listener);
+            assert_eq!(h1.last_sequence, 0, "empty replica handshake");
+            stream_start(&mut s1, 0, lineage);
+            send_entries(&mut s1, &[1, 2]);
+            wait_for_ack(&mut s1, 2);
+            stop(replica, &shutdown);
+            assert_eq!(replica_genesis(dir.path()), Some(3));
+        }
+
+        /// A replica whose journal records one genesis length refuses a
+        /// primary advertising another — a lineage error, never an
+        /// overwrite — and exits with the reason.
+        #[test]
+        fn a_primary_advertising_another_genesis_length_is_refused() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (primary, lineage) = primary_journal(dir.path());
+            assert_eq!(lineage.genesis_entries, Some(0));
+            // The replica holds what the primary holds, genesis length
+            // included.
+            std::fs::copy(&primary, dir.path().join("replica.journal")).expect("copy");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let replica = spawn_replica(
+                dir.path(),
+                listener.local_addr().expect("addr"),
+                Duration::ZERO,
+                &shutdown,
+            );
+
+            let (mut s1, _s1r, h1) = next_handshake(&listener);
+            assert_eq!(h1.last_sequence, 1);
+            stream_start(&mut s1, 1, with_genesis(lineage, Some(4)));
+            let result = replica.join().expect("replica thread panicked");
+            let err = result.expect_err("the replica must refuse the lineage");
+            assert!(err.contains("refusing to follow the primary"), "{err}");
+            assert_eq!(replica_genesis(dir.path()), Some(0), "never overwritten");
+        }
+
+        /// The protected case end to end: a brand-new cluster whose
+        /// primary dies while its first replica is still copying the
+        /// genesis. The replica learned the genesis length from the
+        /// primary — it is configured with none (the receiver takes no
+        /// genesis at all) — and the promotion the operator requests next
+        /// is refused on it.
+        #[test]
+        fn a_replica_promoted_mid_genesis_is_refused() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_, base) = primary_journal(dir.path());
+            let lineage = with_genesis(base, Some(3));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let control = crate::replication::ReplicaControlPlane::new();
+            let replica = {
+                let journal = dir.path().join("replica.journal");
+                let snapshot = dir.path().join("replica.snapshot");
+                let shutdown = Arc::clone(&shutdown);
+                let control = control.clone();
+                std::thread::spawn(move || -> Result<Option<String>, String> {
+                    run_receiver::<App>(
+                        addr,
+                        &journal,
+                        &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                        &shutdown,
+                        &control,
+                        3_600_000,
+                        snapshot,
+                        crate::layout::PipelineCores::unpinned(),
+                        melin_journal::StagingMode::ZeroFill,
+                        Duration::ZERO,
+                        64,
+                        Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        &(),
+                    )
+                    // The promotion path's check, on the writer the
+                    // receiver hands over.
+                    .map(|promoted| {
+                        promoted.map(
+                            |(_, writer)| match crate::server::check_promotable(&writer) {
+                                Ok(()) => "promotable".to_string(),
+                                Err(e) => e.to_string(),
+                            },
+                        )
+                    })
+                    .map_err(|e| e.to_string())
+                })
+            };
+
+            let (mut s1, s1r, h1) = next_handshake(&listener);
+            assert_eq!(h1.last_sequence, 0, "fresh replica handshake");
+            stream_start(&mut s1, 0, lineage);
+            send_entries(&mut s1, &[1, 2]);
+            wait_for_ack(&mut s1, 2);
+            // The primary dies two entries into a three-entry genesis.
+            drop(s1);
+            drop(s1r);
+            assert!(
+                control
+                    .promote
+                    .request(crate::promotion::PromotionRequest::MANUAL),
+                "promotion filed"
+            );
+
+            let verdict = replica
+                .join()
+                .expect("replica thread panicked")
+                .expect("the receiver hands its state over")
+                .expect("promoted, not shut down");
+            assert!(verdict.contains("refusing promotion"), "{verdict}");
+            assert!(verdict.contains("holds 2 entries"), "{verdict}");
+        }
     }
 
     // -----------------------------------------------------------------
@@ -2437,8 +2721,12 @@ mod tests {
             w.flush_batch_sync().expect("flush");
             let chain_at_2 = w.chain_hash().expect("chain");
             drop(w);
-            let (lineage_start, lineage_anchor) =
-                lineage_origin(&primary_journal).expect("lineage");
+            let origin = lineage_origin(&primary_journal).expect("lineage");
+            let (lineage_start, lineage_anchor, lineage_genesis) = (
+                origin.starting_sequence,
+                origin.anchor_hash,
+                origin.genesis_entries,
+            );
 
             let authorized_keys = replica_auth();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -2485,7 +2773,15 @@ mod tests {
                 other => panic!("expected Handshake, got {other:?}"),
             }
             let mut buf = Vec::new();
-            encode_stream_start(0, lineage_start, lineage_anchor, 0, 1, &mut buf);
+            encode_stream_start(
+                0,
+                lineage_start,
+                lineage_anchor,
+                lineage_genesis,
+                0,
+                1,
+                &mut buf,
+            );
             s1.write_all(&buf).expect("StreamStart");
 
             let send_events = |s: &mut TcpStream, range: std::ops::RangeInclusive<u64>| {

@@ -323,30 +323,49 @@ journaling one.
   before catch-up ends leaves the replica empty or with a genesis prefix.
   Since sequences `1..=G` of a new lineage are the genesis's `G` journaled
   events, a promoted writer whose `next_sequence() - 1 < G` holds an
-  incomplete genesis; `check_promoted_history_holds_genesis` refuses the
-  promotion with an error on both replica paths (kernel and DPDK), the
-  node exits, and the operator restarts the original primary or starts
-  over. The replica keeps only the count of its configured genesis
-  (`genesis_entry_count`, queries excluded), so the check assumes every
-  node runs the same genesis configuration. It is a count, not a content
-  comparison: a pre-fix lineage that lost its genesis and then journaled
-  at least `G` entries of other history passes it, which is the pre-fix
-  residual below.
+  incomplete genesis; `check_promotable` refuses the promotion with an
+  error on both replica paths (kernel and DPDK), the node exits, and the
+  operator restarts the original primary or starts over.
+- `G` is lineage metadata, not configuration. A first version of this fix
+  compared against each node's own configured genesis, which is wrong by
+  design: a replica configured with no genesis lost the protection, one
+  configured with more than its primary refused a valid promotion, and a
+  genesis configuration grown since the history began refused a short
+  but complete history at boot. `G` is now the segment header's
+  `genesis_entries` (journal format v16), written by
+  `write_genesis_journal` and carried unchanged, like the anchor, by every
+  segment that continues the lineage: rotation (`SegmentFile` keeps it
+  and writes it into each new header, fresh or staged), archive-only
+  recovery's synthesized live segment, and the snapshot-only boot, which
+  takes it from the snapshot (framing v3 records it; the shadow stage
+  reads it from the writer's header). A replica learns it from the
+  primary's `StreamStart` (replication protocol v7) and writes it into
+  the journal it creates; a snapshot resync gets it in the seeded segment
+  header, cross-checked against the `StreamStart`. A replica that already
+  has a journal compares the advertised value with its own header's and
+  exits on a difference (`check_advertised_genesis`): within one lineage
+  two known values always agree, so a difference is a lineage error, and
+  overwriting either side would silently change what a later promotion
+  checks. The replica again discards its configured genesis entirely.
+- Unknown is not "no genesis". Headers written before v16 record nothing;
+  they decode with `genesis_entries: None`, and both checks skip on
+  `None`, which is exactly the pre-fix behaviour, so no existing
+  deployment stops booting or promoting. A lineage of unknown length
+  keeps writing v15 headers (and v2 snapshots) as it rotates and as
+  replicas copy it, so its segments stay bitwise mirrors across nodes;
+  the reader accepts v15 and v16, whose entries are identical. `Some(0)`
+  is a known empty genesis. In the wire frame the distinction is a flag
+  byte, not a sentinel.
 - Boot draws the same line. `init_engine`, after recovery on every arm,
-  refuses (`check_recovered_history_holds_genesis`) a history with
-  `0 < next_sequence() - 1 < G` — and an empty one it could not give its
-  genesis (a snapshot at sequence 0, or archives with no entry). That
-  catches a pre-fix first boot that crashed mid-genesis and never served
-  past the prefix, and a replica's partial copy restarted on a primary's
-  flags instead of being promoted, neither of which the promotion check
-  sees. It cannot refuse a healthy history, pre-fix or not, since any
-  such history holds at least `G` entries; the one other layout it
-  refuses is a genesis configuration grown, after the history began, past
-  the length of the whole history, which the error names. Both checks
-  share `genesis_shortfall`. The genesis staging file is also swept on
-  every boot (`discard_genesis_staging`), not only by the next
-  `write_genesis_journal`, so it cannot outlive a boot that took another
-  path.
+  refuses (`check_recovered_history_holds_genesis`) a history shorter
+  than its recorded `G` — a replica's partial copy restarted on a
+  primary's flags instead of being promoted, which the promotion check
+  does not see. It cannot refuse a healthy history, and the node's
+  configuration plays no part, so a grown genesis configuration is no
+  longer refused. Both checks share `genesis_shortfall`. The genesis
+  staging file is also swept on every boot (`discard_genesis_staging`),
+  not only by the next `write_genesis_journal`, so it cannot outlive a
+  boot that took another path.
 - The configuration is validated (`validate_primary_config`) in
   `run_impl` before the replication bind, for every role (a replica's
   configuration is the one it serves under once promoted), and before
@@ -356,30 +375,37 @@ journaling one.
   journal created whole, a failure there no longer costs the genesis.
 - A marker entry was not taken. It needed a new `JournalEvent` variant
   (journal and replication codecs, the sequence-allocation lockstep the
-  roadmap says must be unified before the next variant), a snapshot field
-  for a snapshot taken mid-genesis, and a promotion check like the one
-  above; and it still could not classify journals written before it. The
-  rename plus the count check gives the same guarantee with no format,
-  wire or snapshot change.
+  roadmap says must be unified before the next variant), and the
+  genesis's end is a fact about the lineage fixed at its birth — header
+  metadata, like the anchor (see the `JournalEvent::EpochBump` doc for the
+  header-versus-stream line) — not an event in its history. The header
+  field costs a format, snapshot and protocol bump, all backward-read.
 - Journals written before the fix: an empty one (header only, starting at
   sequence 1, no archive, no snapshot) is what this finding left behind;
   nothing was served from it, so the next boot journals the configured
-  genesis into it, keeping its chain anchor, with a `warn!`. One holding
-  fewer entries than the genesis is refused (above). One holding at least
-  as many is recovered as it is: it cannot say whether its first entries
-  were a whole genesis, and refusing every pre-fix journal would brick
-  existing deployments. The residual is a pre-fix lineage that lost all
-  or part of its genesis and then served enough client history to reach
-  `G` entries; only a content check could reach it, and no node records
-  what its genesis was.
+  genesis into it, keeping its chain anchor, with a `warn!`, and the new
+  header records its length. Any other pre-fix journal has an unknown
+  length and is recovered as it is, unchecked. The residual is a pre-fix
+  lineage that lost all or part of its genesis — a pre-fix first boot
+  that crashed mid-genesis, which the configured-count version of this
+  fix used to refuse at boot, included; only the lineage's own record
+  could tell, and pre-fix lineages have none.
 - Pinned by the `genesis_tests` module (`server.rs`: crash mid-genesis,
-  empty legacy journal with and without a genesis, a journal with history,
-  a genesis prefix refused at boot from a journal and from a snapshot,
-  the staging-file sweep, the decision table, the configuration check, the
-  promotion and boot checks on an empty journal, a genesis prefix and a
-  whole genesis), the
-  `write_genesis_journal` tests (`journaled_app.rs`), and, as the
-  reproduction above, `a_refused_first_boot_leaves_genesis_to_the_next_one`
+  empty legacy journal with and without a genesis and in the v15 format,
+  a journal with history, a genesis prefix refused at boot from a journal
+  and from a snapshot whatever the configured genesis, a grown genesis
+  configuration not refused, a v15 journal and a v2 snapshot booting and
+  promoting unchecked, the staging-file sweep, the decision table, the
+  configuration check, the promotion and boot checks); the receiver tests
+  (`tcp_receiver.rs`: the length learned at creation and kept across a
+  restart, a mismatching primary refused, a replica promoted mid-genesis
+  refused); `tests/genesis_promotion.rs` (end to end: a replica configured
+  with no genesis refusing `PROMOTE` mid-genesis against a scripted
+  primary, and one configured with a larger genesis than its primary's
+  promoted); the header, rotation, archive-only recovery, snapshot and
+  `StreamStart` round trips in the journal and transport crates; and, as
+  the reproduction above,
+  `a_refused_first_boot_leaves_genesis_to_the_next_one`
   (`tests/startup_events.rs`). `tests/sizing.rs` now expects a new primary
   to be sized twice, before and after its genesis, as a recovering one is.
 
@@ -540,8 +566,9 @@ the deferred "Verbatim byte-path journaling" item settled on.
   (`Malformed`). The promotion drain applies the same check and stops at
   the first refused frame. This also turns finding 26's non-round-tripping codec from a
   silent fork into a refused entry on replicas.
-- `REPL_PROTOCOL_VERSION` is 6; the handshake's equality check refuses
-  v5 peers in both directions.
+- `REPL_PROTOCOL_VERSION` went to 6 (7 since finding 4's genesis
+  length); the handshake's equality check refuses v5 peers in both
+  directions.
 - DPDK: the device screens every received mbuf against its `ol_flags`
   (`melin_dpdk::rx_checksum`, ungated and unit-tested): bad IP or L4
   verdict → dropped, `UNKNOWN` → verified in software, `GOOD`/`NONE` →

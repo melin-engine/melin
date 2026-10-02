@@ -16,19 +16,24 @@ This document describes the write-ahead journal, snapshot system, crash recovery
 
 ## Journal File Format
 
-### File Header (52 meaningful bytes, written once, padded to 4096)
+### File Header (60 meaningful bytes, written once, padded to 4096)
 
 ```
 Offset  Size  Field              Value
 0       4     file_magic         0x4A4F5552 ("JOUR")
-4       2     format_version     15
+4       2     format_version     16
 6       2     sector_size        4096
 8       8     starting_sequence  sequence carried by this segment's first entry
 16      32    anchor_hash        chain anchor (random salt or previous segment's tail hash)
-48      4     header_crc         CRC32C of the preceding 48 bytes
+48      8     genesis_entries    how many entries the history's genesis occupies (0: none)
+56      4     header_crc         CRC32C of the preceding 56 bytes
 ```
 
-The header is written when the journal is created and never modified. Its CRC protects the anchor — the root of all chain verification — against storage corruption. `format_version` is checked on open; only the current version is accepted (pre-production policy — see Migration below).
+The header is written when the segment is created and never modified. Its CRC protects the anchor — the root of all chain verification — and the genesis length against storage corruption.
+
+`genesis_entries` belongs to the history, like the anchor: it is fixed when the journal is created with its genesis (see [Creating a Journal](#creating-a-journal)) and copied unchanged into every later segment, every replica's journal and every snapshot. It is what lets a node tell, from its own disk alone, whether its history holds the whole genesis. Recovery refuses a segment whose genesis length differs from the segment before it, like a segment whose anchor does not continue the chain: the segments come from different journals, or a header was edited.
+
+`format_version` is checked on open. Version 16 is current; version 15 is also read — its header is the same without `genesis_entries`, and its entries are identical. A history begun by a release that wrote version 15 has no recorded genesis length, and keeps writing version-15 headers as it rotates and as replicas copy it, so its segments stay byte-for-byte identical across nodes. Any other version is refused (see Migration below).
 
 ### Entry Layout (repeats after the 4096-byte header reservation)
 
@@ -136,18 +141,26 @@ The chain-hash cross-check at the anchor sequence ensures the snapshot and the j
 
 ### Creating a Journal
 
-On its first boot, a primary creates the journal with the application's genesis events (its initial reference data) already in it. The journal is built under a temporary name next to the journal path (`<journal>.genesis-staging`), synced to disk, and only then renamed into place, so a journal at the configured path always begins with the complete genesis:
+On its first boot, a primary creates the journal with the application's genesis events (its initial reference data) already in it, and records in the journal header how many entries the genesis occupies. The journal is built under a temporary name next to the journal path (`<journal>.genesis-staging`), synced to disk, and only then renamed into place, so a journal at the configured path always begins with the complete genesis:
 
 - A first boot that fails or crashes before the rename leaves no journal. The next boot is still a first boot: it discards the temporary file and journals the genesis whole.
 - A first boot that fails after the rename (a port already in use, say) leaves a journal that already holds its genesis. The next boot recovers it and journals nothing more.
 
-Genesis is journaled only when a node starts a new history: no journal, archive or snapshot on disk. A node that recovers a journal or restores a snapshot already has the genesis in its state and never journals it again, whatever genesis it is configured with. The one exception is a journal holding no entry at all — which an earlier release could leave behind after a refused first boot, and which a replica holds if it is restarted as a primary before receiving anything from its primary: nothing was ever served from it, so the node journals its genesis into it (keeping its chain anchor) and logs a warning.
+Genesis is journaled only when a node starts a new history: no journal, archive or snapshot on disk. A node that recovers a journal or restores a snapshot already has the genesis in its state and never journals it again, whatever genesis it is configured with. The one exception is a journal written by an earlier release that holds no entry at all (see [Journals written by earlier releases](#journals-written-by-earlier-releases)). A journal begun by this release records its genesis length from the start, so even with no entry it is never given a genesis afterwards: one begun with no genesis stays that way whatever genesis is configured later, and a replica's journal that received none of its primary's genesis is refused if started with a primary's flags, like any other partial copy (below).
 
-A primary booting from a history that holds fewer entries than its genesis takes refuses to start, with an error naming both counts. A complete history never does: it holds the whole genesis at least. A shorter one holds only part of it — a first boot that crashed in the middle of its genesis under an earlier release, or a replica's journal copied before it had the whole genesis and then started with a primary's flags — and serving it would serve a state the application never configured. Start again from a new history — remove the journal, its archives and its snapshots, since a snapshot taken from the partial history holds the partial genesis too — or restart the node as a replica of a primary holding the whole history. The same refusal also catches a genesis configuration grown, since the history began, to more events than the whole history holds; changing the genesis of a running deployment has no effect, so set it back. A leftover `<journal>.genesis-staging` file is removed on every boot.
+Whether a history holds its whole genesis is judged against the genesis length recorded in the journal header when the history began — never against the genesis a node is configured with. A node's genesis configuration only matters on the boot that begins a history; changing it afterwards, on any node, changes nothing, and nodes of one cluster need not agree on it.
+
+A primary booting from a history that holds fewer entries than its recorded genesis refuses to start, with an error naming both counts. A journal a primary creates always holds its whole genesis, so a shorter history is a replica's journal copied before it had the whole genesis and then started with a primary's flags; serving it would serve a state the application never configured. Start again from a new history — remove the journal, its archives and its snapshots, since a snapshot taken from the partial history holds the partial genesis too — or restart the node as a replica of a primary holding the whole history. A leftover `<journal>.genesis-staging` file is removed on every boot.
 
 Configuration a primary cannot run under, such as `--standalone` with an ack policy other than `disk`, is refused before the journal directory is touched. A replica's configuration is checked the same way at boot, since it is also the configuration it serves under once promoted.
 
-A replica copies the genesis from its primary like the rest of the history, entry by entry, so for a while after it first connects it holds only part of it. If the primary is lost before the replica has the whole genesis, the replica refuses promotion (`PROMOTE` or a raft election win) and exits with an error rather than serve a state the application never configured. Recover by restarting the original primary, whose journal holds the whole genesis; if it is gone, no node holds a complete history, and the cluster starts again from a new journal. The check compares the replica's history length against its own configured genesis, so every node of a cluster must run with the same genesis configuration — which a cluster needs anyway. For the same reason, a genesis configuration grown since the history began to more events than the whole history holds is refused too, even though no copy is partial: set the configuration back.
+A replica learns the genesis length from its primary when it creates its journal, and records it in its own journal header, so it keeps it across restarts and still has it if the primary is lost. It copies the genesis itself like the rest of the history, entry by entry, so for a while after it first connects it holds only part of it. If the primary is lost before the replica has the whole genesis, the replica refuses promotion (`PROMOTE` or a raft election win) and exits with an error rather than serve a state the application never configured. Recover by restarting the original primary, whose journal holds the whole genesis; if it is gone, no node holds a complete history, and the cluster starts again from a new journal.
+
+A replica whose journal records one genesis length refuses to follow a primary whose journal records another, and exits with an error naming both. Within one history the two always agree, so a difference means the journals do not share one history — a damaged or hand-edited header, or a bug. The replica never overwrites its own value: inspect both journals, then resync the replica from scratch (move its journal, archives and snapshots aside) or restore the primary.
+
+#### Journals written by earlier releases
+
+A journal written before the genesis length was recorded (format version 15) has no recorded length, and neither does any snapshot taken from it. Such a history boots, replicates and promotes exactly as it did under the release that wrote it, without the genesis checks above, and keeps format-version-15 headers as it rotates; no upgrade step is needed. The checks apply to histories begun by this release or later. The one exception is a version-15 journal holding no entry at all, which an earlier release could leave behind after a refused first boot (or a replica's copy of one, restarted with a primary's flags): nothing was ever served from it, so the next boot journals the node's genesis into it, keeping its chain anchor, records the length, and logs a warning. A replica that had copied such an empty journal from its primary takes the recorded length from the primary when it next connects, so the promotion check guards it too.
 
 ## Snapshots
 
@@ -156,14 +169,17 @@ A replica copies the genesis from its primary like the rest of the history, entr
 ```
 Offset  Size  Field              Value
 0       4     file_magic         0x534E4150 ("SNAP")
-4       2     transport_version  2 — this framing's version
+4       2     transport_version  3 — this framing's version
 6       2     app_version        the application's snapshot version at save time
 8       8     sequence           journal sequence number at snapshot time
 16      32    chain_hash         BLAKE3 hash chain state at that sequence
 48      8     epoch              fencing epoch at snapshot time
-56      var   app_payload        the application's state, in its own encoding
+56      8     genesis_entries    the history's genesis length, from the journal header
+64      var   app_payload        the application's state, in its own encoding
 EOF-4   4     crc32c             CRC32C of everything from offset 0 through EOF-4
 ```
+
+`genesis_entries` lets a node that starts from a snapshot alone, with no journal segment left, record the genesis length in the journal it starts. A snapshot of a history with no recorded genesis length (see [Journals written by earlier releases](#journals-written-by-earlier-releases)) is written in the version-2 framing, which ends at `epoch`.
 
 Maximum file size enforced on load: 256 MiB (prevents OOM from corrupt/malicious files).
 
@@ -270,7 +286,7 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 
 ## Format Versioning
 
-Both the journal and snapshot have independent `format_version` fields. Current journal version: **15**. Current snapshot version: **12**.
+Both the journal and snapshot have independent `format_version` fields. Current journal version: **16**. Current snapshot framing version: **3**.
 
 ### Journal Version History
 
@@ -281,6 +297,7 @@ Both the journal and snapshot have independent `format_version` fields. Current 
 | 13 | Entry offset fixed at 4096 regardless of device sector size. Journals stay interchangeable across devices, and across the writer change that followed — the since-retired O_DIRECT writer produced this same layout |
 | 14 | Chain metadata moved out of the entry stream: file header gained `starting_sequence`, `anchor_hash`, and a header CRC; `GenesisHash` and `Checkpoint` entry tags retired. The chain is anchored per segment and schedule-free; sequence numbers are dense over real events |
 | 15 | Per-entry `request_seq` removed; an application that sequences requests carries the sequence in its own event payload |
+| 16 | File header gained `genesis_entries`, the history's genesis length. Entries unchanged; version 15 is still read |
 
 ### Snapshot Framing History
 
@@ -290,11 +307,12 @@ The framing's `transport_version` changes only with the runtime; the application
 |---------|--------|
 | 1 | Initial framing |
 | 2 | Added the fencing `epoch` after `chain_hash` |
+| 3 | Added `genesis_entries` after `epoch` |
 
 ### Compatibility Rules
 
-- **Pre-production policy:** the journal reader accepts only the current format version. Older versions are rejected with `UnsupportedVersion`; migrate via the snapshot-boundary procedure below.
-- The snapshot reader accepts both framing versions: a version-1 snapshot predates any promotion, so it loads with epoch 0.
+- **Pre-production policy:** the journal reader accepts the current format version and version 15, whose entries are identical; a version-15 journal needs no migration (see [Journals written by earlier releases](#journals-written-by-earlier-releases)). Older versions are rejected with `UnsupportedVersion`; migrate via the snapshot-boundary procedure below.
+- The snapshot reader accepts every framing version: a version-1 snapshot predates any promotion, so it loads with epoch 0; a version-1 or version-2 snapshot loads with no recorded genesis length.
 - A snapshot loads only into the application version that wrote it: an `app_version` other than the running application's is refused before the application sees the payload.
 - The journal records no application version. Entries written by one version of an application are decoded by whichever version replays them — see [Changing the Application's Encoding](#changing-the-applications-encoding).
 
@@ -307,7 +325,7 @@ When changing the journal format (bumping `format_version`) or the application's
 1. **Take a snapshot** with the current (old) version. This captures the full application state at a known journal sequence.
 2. **Deploy the new version.**
 3. **Start fresh**: the new version creates a new journal file (new format) and loads the snapshot.
-   - The application's genesis is not journaled again: the snapshot's state already includes it, and the new journal continues from the snapshot with no entry of its own.
+   - The application's genesis is not journaled again: the snapshot's state already includes it, and the new journal continues from the snapshot with no entry of its own. Its header takes the genesis length the snapshot recorded.
    - The restarted node continues a history rather than beginning one, so it serves clients immediately, as after any restart. With replication enabled and an acknowledgement policy that requires a replica, it refuses writes until a replica reconnects.
    - The snapshot must be one the new version accepts. If the application's snapshot layout changed, the new version refuses the old `app_version`, and a one-time migration tool must convert the snapshot.
    - When *only* the snapshot layout changed — the journal format and the application's event encoding did not — and the journal is retained from sequence 1, this procedure is not needed: move the old snapshot aside and start the new version on the existing journal, which it replays from the start to rebuild its state.
@@ -331,6 +349,13 @@ corruption). Upgrade the primary and all replicas together:
 Do not leave a replica on the old version expecting it to resume after the
 primary upgrades: its journal cannot continue under the new format, and the
 stream will not decode.
+
+The move from journal version 15 to 16 is the exception: version 16 reads
+version-15 journals and snapshots, so no snapshot boundary and no clean
+journal directory are needed. Stop every node, deploy the new version
+everywhere, and restart on the existing files. The replication protocol
+version changed with it, so nodes on different versions still refuse to
+replicate — see [replication.md](replication.md).
 
 ### Why This Works
 

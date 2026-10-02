@@ -99,6 +99,9 @@ pub struct JournalReader<E: AppEvent> {
     /// file header. Validated against the first decoded entry so a
     /// segment spliced in from elsewhere in the lineage fails fast.
     starting_sequence: u64,
+    /// The lineage's genesis length from the file header (see
+    /// [`codec::FileHeaderInfo::genesis_entries`]).
+    genesis_entries: Option<u64>,
     /// Segment hash chain, seeded from the header anchor and fed every
     /// entry's raw bytes. Same definition as the writers' (see
     /// [`crate::chain`]), so reader and writer values agree at every
@@ -137,6 +140,7 @@ impl<E: AppEvent> JournalReader<E> {
             valid_file_end: info.sector_size as u64,
             sector_size: info.sector_size,
             starting_sequence: info.starting_sequence,
+            genesis_entries: info.genesis_entries,
             #[cfg(feature = "hash-chain")]
             chain: crate::chain::SegmentChain::new(info.anchor_hash),
         })
@@ -423,6 +427,13 @@ impl<E: AppEvent> JournalReader<E> {
     /// header. Available before any entry is read.
     pub fn starting_sequence(&self) -> u64 {
         self.starting_sequence
+    }
+
+    /// The lineage's genesis length, from the file header: `Some(n)`
+    /// when the genesis is sequences `1..=n`, `None` when unknown (a v15
+    /// header). See [`codec::FileHeaderInfo::genesis_entries`].
+    pub fn genesis_entries(&self) -> Option<u64> {
+        self.genesis_entries
     }
 
     /// Ensure the buffer has data to decode from. Lazy: when bytes are
@@ -759,8 +770,9 @@ mod tests {
         write_sample(&path);
 
         // Header layout (see codec.rs): magic u32 | format_version u16 @4
-        // | sector_size u16 | starting_sequence u64 | anchor_hash [u8;32]
-        // | header_crc u32 @48, CRC over bytes 0..48.
+        // | ... The version is checked before the CRC, and v13 has the
+        // v15 layout (header_crc u32 @48, CRC over bytes 0..48), so the
+        // file is patched into a well-formed v13 header.
         let mut header = [0u8; 52];
         {
             let mut f = OpenOptions::new()
@@ -1170,7 +1182,8 @@ mod tests {
         {
             // Continue from sequence 100 — header records 100.
             let mut writer =
-                BufferedWriter::<TestEvent>::create_continuing(&path, 100, [0u8; 32]).unwrap();
+                BufferedWriter::<TestEvent>::create_continuing(&path, 100, [0u8; 32], Some(0))
+                    .unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
 

@@ -28,10 +28,12 @@
 //! - **Ack**: `[len:u32][0x02][acked_sequence:u64][in_memory_sequence:u64]`
 //!
 //! ### Primary → Replica
-//! - **StreamStart**: `[len:u32][0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]]`
+//! - **StreamStart**: `[len:u32][0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]][epoch:u64][ack_policy:u8][genesis_known:u8][genesis_entries:u64]`
 //!   — the segment header identity a fresh replica creates its journal
 //!   with (lineage origin for full catch-up, the seeded segment's
-//!   identity after a snapshot transfer)
+//!   identity after a snapshot transfer), and the lineage's genesis
+//!   length, which a fresh replica records and one with a journal checks
+//!   against its own
 //! - **NeedSnapshot**: `[len:u32][0x11]`
 //! - **HashMismatch**: `[len:u32][0x12]` — divergent replica journal;
 //!   the replica archives its lineage, then the snapshot flow follows
@@ -400,6 +402,14 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     /// pops and rotates at exactly those sequences. Replicas have no
     /// local rotation triggers.
     pub(super) stream_marks: melin_transport_core::pipeline::StreamMarkQueue,
+    /// The lineage's genesis length (`None`: unknown, a pre-v16 header),
+    /// read from the writer's header when the pipeline was built. Fixed
+    /// for the pipeline's life: rotation carries it forward unchanged and
+    /// anything that changes the lineage (a resync) tears the pipeline
+    /// down first. Kept here so the reconnect handshake can compare it
+    /// against the primary's without re-reading the live segment by path,
+    /// which the journal's disk thread may be renaming mid-rotation.
+    pub(super) genesis_entries: Option<u64>,
     /// Latched by the journal thread's spawn wrapper when the stage
     /// exits with an error (chain divergence, journal I/O failure, a
     /// refused sequence) or panics (see `run_journal_stage`).
@@ -592,6 +602,9 @@ where
     // Shadow snapshot seeds its epoch from the fence state's current value
     // (set from the replica's recovered journal before this builder runs).
     let shadow_initial_epoch = fence_state.epoch();
+    // The lineage's genesis length, stamped into the replica's own
+    // snapshots — the same value its journal header holds.
+    let genesis_entries = writer.read_header_info()?.genesis_entries;
     let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
         app,
         writer,
@@ -693,6 +706,7 @@ where
                         &ps,
                         shadow.wait,
                         shadow_initial_epoch,
+                        genesis_entries,
                     );
                 })
                 .expect("spawn shadow thread"),
@@ -706,6 +720,7 @@ where
         journal_cursor: pipeline.cursors.journal_ring_arc(),
         chain_hash_lock: pipeline.chain_hash_lock,
         stream_marks,
+        genesis_entries,
         journal_failed,
         pipeline_shutdown,
         journal_handle,
@@ -798,6 +813,9 @@ where
     A: Application,
     W: melin_journal::JournalWrite<A::Event>,
 {
+    // Swept every boot, like the genesis staging file: only a later adopt
+    // that meets its narrow guard would otherwise remove it.
+    remove_restamp_staging(journal_path)?;
     let lineage_exists =
         journal_path.exists() || !melin_journal::segment::list_archives(journal_path)?.is_empty();
     if !lineage_exists {
@@ -1129,6 +1147,9 @@ pub(in crate::replication) enum ResyncDecision {
     Ready {
         segment_start_sequence: u64,
         anchor_hash: [u8; 32],
+        /// The lineage's genesis length, as the seeded segment's header
+        /// (and the `StreamStart` that matched it) records it.
+        genesis_entries: Option<u64>,
         resume_sequence: u64,
     },
     /// The transfer failed network-shaped (drop / restart mid-body); the
@@ -1273,6 +1294,13 @@ where
     // Move the local lineage aside — never delete. Divergent journals are
     // audit-trail material; stale ones may be the last copy of pruned
     // history.
+    //
+    // No `check_advertised_genesis` here: a resync adopts the primary's
+    // lineage wholesale (its seed carries the primary's header) and keeps
+    // ours intact in the archive, so no recorded genesis length is
+    // overwritten — the hazard that check guards on the streaming path.
+    // The genesis length is treated like the chain anchor, which a resync
+    // also replaces.
     let reason = if divergent {
         ArchiveReason::Divergent
     } else {
@@ -1329,17 +1357,21 @@ where
             start_sequence,
             segment_start_sequence,
             anchor_hash,
+            genesis_entries,
             epoch,
             ack_policy,
         } => {
             if segment_start_sequence != seeded_info.starting_sequence
                 || anchor_hash != seeded_info.anchor_hash
+                || genesis_entries != seeded_info.genesis_entries
             {
                 return Err(format!(
-                    "post-snapshot StreamStart lineage (start {segment_start_sequence}) \
-                     disagrees with the transferred segment seed (start {}) — inconsistent \
-                     primary",
-                    seeded_info.starting_sequence
+                    "post-snapshot StreamStart lineage (start {segment_start_sequence}, genesis \
+                     {}) disagrees with the transferred segment seed (start {}, genesis {}) — \
+                     inconsistent primary",
+                    describe_genesis(genesis_entries),
+                    seeded_info.starting_sequence,
+                    describe_genesis(seeded_info.genesis_entries),
                 )
                 .into());
             }
@@ -1364,10 +1396,165 @@ where
             Ok(ResyncDecision::Ready {
                 segment_start_sequence,
                 anchor_hash,
+                genesis_entries,
                 resume_sequence: snap_sequence,
             })
         }
         other => Err(format!("expected StreamStart after snapshot, got {other:?}").into()),
+    }
+}
+
+/// A genesis length for a log line or an error: the count, or that it
+/// is unknown.
+fn describe_genesis(genesis_entries: Option<u64>) -> String {
+    match genesis_entries {
+        Some(n) => format!("{n} entries"),
+        None => "unknown".to_string(),
+    }
+}
+
+/// The genesis length this replica's journal records, for the
+/// `StreamStart` cross-check: `None` when the replica has no journal yet
+/// (nothing to compare), `Some(None)` for a lineage whose length is
+/// unknown, `Some(Some(n))` otherwise.
+///
+/// Never reads the live segment by path while a pipeline runs: the
+/// journal's disk thread owns the writer then and a rotation renames the
+/// live segment away before installing its successor, so a read in that
+/// window would find no file. The pipeline carries the value captured at
+/// build time instead.
+pub(in crate::replication) fn local_lineage_genesis<A, W>(
+    pipeline: &Option<ReplicaPipelineHandles<A, W>>,
+    journal_writer: &Option<W>,
+) -> Result<Option<Option<u64>>, melin_journal::JournalError>
+where
+    A: Application,
+    W: JournalWrite<A::Event> + Send + 'static,
+{
+    match (pipeline, journal_writer) {
+        (Some(p), _) => Ok(Some(p.genesis_entries)),
+        // No pipeline: this thread owns the writer, so the header read
+        // cannot race a rotation.
+        (None, Some(w)) => Ok(Some(w.read_header_info()?.genesis_entries)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Where [`adopt_genesis_into_empty_unknown_journal`] stages the
+/// rewritten segment before renaming it over the journal.
+fn restamp_staging_path(journal_path: &std::path::Path) -> std::path::PathBuf {
+    journal_path.with_extension("restamp.tmp")
+}
+
+/// Remove a restamp staging file left by a crash before its rename. The
+/// rename had not happened, so the live journal is the old segment and
+/// the staged copy is only debris.
+fn remove_restamp_staging(journal_path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(restamp_staging_path(journal_path)) {
+        Ok(()) => Ok(()),
+        // No leftover from an interrupted earlier attempt.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Record the primary's genesis length in this replica's journal when
+/// the journal holds no entry and its header has no length (`None`,
+/// written by a release before the field existed).
+///
+/// The case it closes: a cluster created under such a release whose
+/// primary stopped before journaling anything, after this replica copied
+/// its empty journal. The upgraded primary journals its genesis into a
+/// new header that keeps the anchor (see `genesis_target` in the server
+/// boot path), so this replica's chain still matches at sequence 0 and it
+/// streams the genesis — but, left with `None`, it would skip the
+/// promotion check for exactly the partial genesis that check exists to
+/// refuse, and its segment would no longer be a copy of the primary's.
+///
+/// Only an empty segment starting at sequence 1 with no archive and the
+/// primary's own starting sequence and anchor is rewritten: nothing was
+/// journaled, acknowledged or served from it, so replacing its header
+/// changes no history. The new segment is staged and renamed over the old
+/// one, so a crash leaves one or the other. Anything else is left alone.
+///
+/// Requires no running pipeline: the caller owns `journal_writer`. So it
+/// covers the upgrade that restarts the replica as well as the primary; a
+/// replica left running across the primary's re-genesis keeps the unknown
+/// length — the unchecked behaviour of earlier releases, never a wrong
+/// refusal.
+pub(in crate::replication) fn adopt_genesis_into_empty_unknown_journal<E, W>(
+    journal_writer: &mut Option<W>,
+    lineage: (u64, [u8; 32], Option<u64>),
+) -> Result<(), melin_journal::JournalError>
+where
+    E: melin_app::AppEvent,
+    W: JournalWrite<E>,
+{
+    let (segment_start_sequence, anchor_hash, advertised) = lineage;
+    let Some(writer) = journal_writer.as_ref() else {
+        return Ok(());
+    };
+    if advertised.is_none()
+        || segment_start_sequence != 1
+        || writer.segment_starting_sequence() != 1
+        || writer.next_sequence() != 1
+    {
+        return Ok(());
+    }
+    let info = writer.read_header_info()?;
+    if info.genesis_entries.is_some() || info.anchor_hash != anchor_hash {
+        return Ok(());
+    }
+    let journal_path = writer.path().to_path_buf();
+    if !melin_journal::segment::list_archives(&journal_path)?.is_empty() {
+        return Ok(());
+    }
+
+    let staging = restamp_staging_path(&journal_path);
+    remove_restamp_staging(&journal_path)?;
+    let staged = W::create_continuing(&staging, 1, anchor_hash, advertised)?;
+    let valid_end = staged.valid_end();
+    drop(staged);
+    // Close the old segment before its name is taken over.
+    drop(journal_writer.take());
+    std::fs::rename(&staging, &journal_path)?;
+    melin_journal::segment::fsync_parent_dir(&journal_path)?;
+    *journal_writer = Some(W::open_append(&journal_path, 0, valid_end)?);
+    tracing::info!(
+        journal = %journal_path.display(),
+        genesis_entries = ?advertised,
+        "recorded the primary's genesis length in this replica's empty journal"
+    );
+    Ok(())
+}
+
+/// Refuse to follow a primary whose lineage records a different genesis
+/// length than this replica's journal does.
+///
+/// The length is lineage metadata, fixed when the journal was created
+/// and copied into every segment and every replica's journal since, so
+/// within one lineage two known values always agree. A difference means
+/// the two journals do not share the lineage the matching chain hashes
+/// suggest — a header damaged or edited by hand, or a bug — and nothing
+/// says which side is right: overwriting ours would silently change what
+/// a later promotion checks against. Exit and let the operator decide.
+///
+/// An unknown value on either side is no conflict: it is a lineage begun
+/// before the length was recorded (or a peer that kept such a header),
+/// and it stays as it is — headers are written once.
+pub(in crate::replication) fn check_advertised_genesis(
+    local: Option<u64>,
+    advertised: Option<u64>,
+) -> Result<(), String> {
+    match (local, advertised) {
+        (Some(local), Some(advertised)) if local != advertised => Err(format!(
+            "refusing to follow the primary: its journal records a genesis of {advertised} \
+             entries but this replica's records {local} — the two journals do not share one \
+             lineage (a damaged or hand-edited journal header, or a bug); inspect both journals, \
+             then resync this replica from scratch (move its journal, archives and snapshots \
+             aside) or restore the primary"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1482,11 +1669,198 @@ mod tests {
         assert_eq!(buf.as_slice(), expected, "Ack wire layout drifted");
     }
 
+    /// Two known genesis lengths must agree; an unknown one on either
+    /// side is no conflict (a lineage begun before the length was
+    /// recorded), and nothing is ever adopted over a known one.
+    #[test]
+    fn an_advertised_genesis_length_must_match_a_known_one() {
+        check_advertised_genesis(Some(3), Some(3)).expect("the same lineage");
+        check_advertised_genesis(Some(0), Some(0)).expect("no genesis on both sides");
+        let err = check_advertised_genesis(Some(3), Some(4)).expect_err("different lengths");
+        assert!(err.contains("refusing to follow the primary"), "{err}");
+        assert!(
+            err.contains("genesis of 4") && err.contains("records 3"),
+            "{err}"
+        );
+        check_advertised_genesis(Some(0), Some(2)).expect_err("none against some");
+        check_advertised_genesis(None, Some(3)).expect("ours unknown");
+        check_advertised_genesis(Some(3), None).expect("theirs unknown");
+        check_advertised_genesis(None, None).expect("both unknown");
+    }
+
+    /// An empty journal written before the genesis length existed takes
+    /// the primary's, so the promotion check guards it; a journal that
+    /// holds an entry, already has a length, or carries another anchor is
+    /// left as it is.
+    #[test]
+    fn an_empty_unknown_journal_adopts_the_primarys_genesis_length() {
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let anchor = [9u8; 32];
+        let header = |w: &Option<Writer>| {
+            w.as_ref()
+                .expect("writer")
+                .read_header_info()
+                .expect("header")
+                .genesis_entries
+        };
+
+        // The pre-upgrade empty journal: adopted, still empty, same anchor.
+        let path = dir.path().join("empty.journal");
+        let mut w = Some(Writer::create_continuing(&path, 1, anchor, None).expect("create"));
+        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("adopt");
+        assert_eq!(header(&w), Some(3));
+        let adopted = w.as_ref().expect("writer");
+        assert_eq!(adopted.next_sequence(), 1);
+        assert_eq!(adopted.path(), path.as_path());
+        assert_eq!(
+            melin_journal::segment::read_header_info(&path)
+                .expect("on disk")
+                .anchor_hash,
+            anchor
+        );
+        assert!(!path.with_extension("restamp.tmp").exists());
+
+        // The primary's length is unknown too: nothing to adopt.
+        let path = dir.path().join("both-unknown.journal");
+        let mut w = Some(Writer::create_continuing(&path, 1, anchor, None).expect("create"));
+        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, None)).expect("no-op");
+        assert_eq!(header(&w), None);
+
+        // Another lineage's anchor: not this primary's journal.
+        let path = dir.path().join("other-anchor.journal");
+        let mut w = Some(Writer::create_continuing(&path, 1, [1; 32], None).expect("create"));
+        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("no-op");
+        assert_eq!(header(&w), None);
+
+        // A known length is never rewritten (a mismatch is refused by
+        // `check_advertised_genesis` instead).
+        let path = dir.path().join("known.journal");
+        let mut w = Some(Writer::create_continuing(&path, 1, anchor, Some(2)).expect("create"));
+        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("no-op");
+        assert_eq!(header(&w), Some(2));
+
+        // A journal holding an entry has history: its header stays.
+        let path = dir.path().join("history.journal");
+        let mut writer = Writer::create_continuing(&path, 1, anchor, None).expect("create");
+        let seq = writer.allocate_sequence();
+        writer
+            .encode_event(seq, 0, &melin_journal::JournalEvent::Tick { now_ns: 0 }, 0)
+            .expect("encode");
+        writer.flush_batch_sync().expect("flush");
+        let mut w = Some(writer);
+        adopt_genesis_into_empty_unknown_journal(&mut w, (1, anchor, Some(3))).expect("no-op");
+        assert_eq!(header(&w), None);
+
+        // No journal: nothing to do.
+        let mut none: Option<Writer> = None;
+        adopt_genesis_into_empty_unknown_journal(&mut none, (1, anchor, Some(3))).expect("no-op");
+        assert!(none.is_none());
+    }
+
+    /// A restamp staging file left by a crash before its rename is swept
+    /// at replica recovery, whatever the journal's state — not only by a
+    /// later adopt that happens to meet its guard.
+    #[test]
+    fn replica_recovery_sweeps_a_leftover_restamp_staging_file() {
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fence = melin_transport_core::fence::FenceState::new(0);
+        let journal = dir.path().join("replica.journal");
+        let snapshot = dir.path().join("replica.snapshot");
+        let staging = journal.with_extension("restamp.tmp");
+
+        // No lineage at all.
+        std::fs::write(&staging, b"debris").expect("write staging");
+        let (app, writer, _, _) = recover_replica_state::<counter_server::Counter, Writer>(
+            &journal,
+            &snapshot,
+            &fence,
+            &(),
+        )
+        .expect("recover");
+        assert!(app.is_none() && writer.is_none());
+        assert!(!staging.exists(), "swept without a journal");
+
+        // A journal that holds history, which the adopt guard never touches.
+        let mut w = Writer::create_continuing(&journal, 1, [0; 32], None).expect("create");
+        let seq = w.allocate_sequence();
+        w.encode_event(seq, 0, &melin_journal::JournalEvent::Tick { now_ns: 0 }, 0)
+            .expect("encode");
+        w.flush_batch_sync().expect("flush");
+        drop(w);
+        std::fs::write(&staging, b"debris").expect("write staging");
+        let (_, writer, last, _) = recover_replica_state::<counter_server::Counter, Writer>(
+            &journal,
+            &snapshot,
+            &fence,
+            &(),
+        )
+        .expect("recover");
+        assert!(writer.is_some());
+        assert_eq!(last, 1);
+        assert!(!staging.exists(), "swept beside a journal with history");
+    }
+
+    /// The handshake's local genesis length comes from the running
+    /// pipeline, never from the live segment's path: a rotation renames
+    /// that file away before installing its successor, and a read in the
+    /// gap would fail the session. Removing the file stands in for that
+    /// gap. Without a pipeline the writer's own header is read, and with
+    /// no journal at all there is nothing to compare.
+    #[test]
+    fn the_local_genesis_length_never_reads_the_live_segment_under_a_pipeline() {
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("replica.journal");
+
+        let writer = Writer::create_continuing(&path, 1, [7; 32], Some(5)).expect("create");
+        let mut journal_writer = Some(writer);
+        assert_eq!(
+            local_lineage_genesis::<counter_server::Counter, Writer>(&None, &journal_writer)
+                .expect("header read"),
+            Some(Some(5)),
+        );
+
+        let (input_producer, mut consumers) =
+            melin_pipeline::ring::DisruptorBuilder::<InputSlot>::new(4)
+                .add_consumer()
+                .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+        let _consumer = consumers.pop().expect("one consumer");
+        let owned = journal_writer.take().expect("writer");
+        let pipeline = Some(ReplicaPipelineHandles {
+            input_producer,
+            journal_cursor: Arc::new(make_journal_cursor(0)),
+            chain_hash_lock: fsync_state_at(0, 0).1,
+            stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            genesis_entries: Some(5),
+            journal_failed: Arc::new(AtomicBool::new(false)),
+            pipeline_shutdown: Arc::new(AtomicBool::new(false)),
+            journal_handle: std::thread::spawn(
+                move || -> Result<Writer, melin_journal::JournalError> { Ok(owned) },
+            ),
+            matching_handle: std::thread::spawn(counter_server::Counter::default),
+            drain_handle: std::thread::spawn(|| {}),
+            shadow_handle: None,
+        });
+        std::fs::remove_file(&path).expect("simulate the rotation gap");
+        assert_eq!(
+            local_lineage_genesis(&pipeline, &journal_writer).expect("no file read"),
+            Some(Some(5)),
+        );
+
+        assert_eq!(
+            local_lineage_genesis::<counter_server::Counter, Writer>(&None, &None)
+                .expect("nothing to read"),
+            None,
+        );
+    }
+
     #[test]
     fn stream_start_encode_decode_round_trip() {
         let mut buf = Vec::new();
         // Non-zero epoch/policy so a dropped/zeroed field is caught.
-        encode_stream_start(99, 42, [0xAA; 32], 5, 2, &mut buf);
+        encode_stream_start(99, 42, [0xAA; 32], Some(7), 5, 2, &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
@@ -1495,12 +1869,14 @@ mod tests {
                 start_sequence,
                 segment_start_sequence,
                 anchor_hash,
+                genesis_entries,
                 epoch,
                 ack_policy,
             } => {
                 assert_eq!(start_sequence, 99);
                 assert_eq!(segment_start_sequence, 42);
                 assert_eq!(anchor_hash, [0xAA; 32]);
+                assert_eq!(genesis_entries, Some(7));
                 assert_eq!(ack_policy, 2);
                 assert_eq!(epoch, 5);
             }
@@ -1955,7 +2331,7 @@ mod tests {
 
         // Send StreamStart.
         let mut buf = Vec::new();
-        encode_stream_start(0, 1, [0u8; 32], 0, 1, &mut buf); // fake lineage for test
+        encode_stream_start(0, 1, [0u8; 32], Some(0), 0, 1, &mut buf); // fake lineage for test
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -2052,7 +2428,7 @@ mod tests {
         ));
 
         // Send StreamStart.
-        encode_stream_start(0, 1, [0u8; 32], 0, 1, &mut buf);
+        encode_stream_start(0, 1, [0u8; 32], Some(0), 0, 1, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -2163,7 +2539,15 @@ mod tests {
         assert_eq!(handshake.chain_hash, [0xBB; 32]);
 
         // Send StreamStart echoing the replica's sequence.
-        encode_stream_start(handshake.last_sequence, 1, [0u8; 32], 0, 1, &mut buf);
+        encode_stream_start(
+            handshake.last_sequence,
+            1,
+            [0u8; 32],
+            Some(0),
+            0,
+            1,
+            &mut buf,
+        );
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -2220,6 +2604,7 @@ mod tests {
                 handshake.last_sequence,
                 1,
                 [0u8; 32],
+                Some(0),
                 STALE_EPOCH,
                 1,
                 &mut buf,
@@ -2940,6 +3325,7 @@ mod tests {
             journal_cursor: Arc::new(make_journal_cursor(0)),
             chain_hash_lock,
             stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            genesis_entries: None,
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
             journal_handle: std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> {
@@ -3130,6 +3516,7 @@ mod tests {
             journal_cursor: Arc::new(make_journal_cursor(0)),
             chain_hash_lock: fsync_state_at(0, 0).1,
             stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            genesis_entries: None,
             journal_failed: Arc::new(AtomicBool::new(true)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
             journal_handle: std::thread::spawn(
@@ -3275,6 +3662,7 @@ mod tests {
             journal_cursor: Arc::new(make_journal_cursor(0)),
             chain_hash_lock: fsync_state_at(0, 0).1,
             stream_marks: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            genesis_entries: None,
             journal_failed: Arc::new(AtomicBool::new(false)),
             pipeline_shutdown: Arc::new(AtomicBool::new(false)),
             journal_handle: std::thread::spawn(move || Writer::create(&writer_path)),

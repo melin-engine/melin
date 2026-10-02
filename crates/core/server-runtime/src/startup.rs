@@ -23,10 +23,10 @@ pub struct StartupEvents<E> {
     /// from this field — changing it after the first boot changes
     /// nothing.
     ///
-    /// The exception is a journal with no entry at all — left by an
-    /// earlier release's refused first boot, or by a replica restarted on
-    /// a primary's flags before it received any entry: nothing was ever
-    /// served from it, so it gets this genesis.
+    /// The exception is a journal with no entry at all and no recorded
+    /// genesis length — left by an earlier release's refused first boot,
+    /// or a replica's copy of one restarted on a primary's flags: nothing
+    /// was ever served from it, so it gets this genesis.
     pub genesis: Vec<E>,
     /// Journaled every time a node becomes primary — after `genesis` on a
     /// new journal, on recovering an existing journal as primary, and

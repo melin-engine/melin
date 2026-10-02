@@ -30,16 +30,20 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     // build a writer of any concrete type without knowing which one.
     // Each implementor forwards to its inherent constructor.
 
-    /// Create a fresh journal at `path`.
+    /// Create a fresh journal at `path`: a new lineage with no genesis.
     fn create(path: &Path) -> Result<Self, JournalError>;
 
     /// Create a fresh journal that continues a previous segment's
-    /// sequence numbers, anchored to `anchor_hash` (recorded in the file
-    /// header; no entries are written, no sequence consumed).
+    /// sequence numbers, anchored to `anchor_hash`, in a lineage whose
+    /// genesis occupies `genesis_entries` entries (`None`: unknown, see
+    /// [`crate::codec::FileHeaderInfo::genesis_entries`]). All three are
+    /// recorded in the file header; no entries are written, no sequence
+    /// consumed.
     fn create_continuing(
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
+        genesis_entries: Option<u64>,
     ) -> Result<Self, JournalError>;
 
     /// Open an existing journal for appending after recovery. The hash
@@ -116,7 +120,8 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     }
     /// Decoded file-header fields of the active segment (used by
     /// replication to bootstrap a fresh replica's chain anchor and
-    /// starting sequence).
+    /// starting sequence, and by the runtime to read the lineage's
+    /// genesis length).
     fn read_header_info(&self) -> Result<crate::codec::FileHeaderInfo, JournalError>;
 
     // ---- default convenience wrappers ----
@@ -161,8 +166,9 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
         path: &Path,
         starting_sequence: u64,
         anchor_hash: [u8; 32],
+        genesis_entries: Option<u64>,
     ) -> Result<Self, JournalError> {
-        BufferedWriter::create_continuing(path, starting_sequence, anchor_hash)
+        BufferedWriter::create_continuing(path, starting_sequence, anchor_hash, genesis_entries)
     }
 
     #[inline]

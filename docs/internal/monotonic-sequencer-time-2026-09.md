@@ -437,10 +437,11 @@ over accurate), but the operator and the application author must know:
 
 The new replay rule refuses what format-15 journals written by `main`
 contain, and the `Tick` layout changes in both the journal and the
-replication stream (step 4). Format 16 and protocol 6 turn a misleading
+replication stream (step 4). Format 17 and protocol 8 (the recorded
+genesis length took format 16 and protocol 7) turn a misleading
 failure into the refusal an older build's journal or peer should get
 (`UnsupportedVersion`, a handshake refusal). Released users are
-unaffected: 0.17 writes format 14, so they cross 14 to 16 in the one
+unaffected: 0.17 writes format 14, so they cross 14 to 17 in the one
 migration the CHANGELOG already describes (snapshot on the old version,
 deploy, start on a fresh journal).
 
@@ -473,7 +474,7 @@ One commit per step, each reviewable on its own.
    it), the typed error through the journal stage and the replica's
    distinct fatal exit, reader validation within a segment, and the
    boundary check in recovery carried from the walk. Bumps the journal
-   format to 16.
+   format to 17.
    Must not land before step 2: with the floor not yet carried across a
    restart, the first entry after a clock step back would be refused.
    Carries most of the test churn, since many tests hand-build slots
@@ -534,7 +535,7 @@ One commit per step, each reviewable on its own.
    reader row in `docs/pipeline-architecture.md`; the operator notes of
    decision 6; `CLOCK-ACCEPT` beside the other admin commands in
    `docs/replication.md`; CHANGELOG under
-   Unreleased (the format-15 and protocol-5 entries become 16 and 6);
+   Unreleased (the format-16 and protocol-7 entries become 17 and 8);
    the note in
    [application-api-review-2026-09.md](application-api-review-2026-09.md);
    remove the roadmap entry.

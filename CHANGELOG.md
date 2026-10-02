@@ -100,6 +100,32 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   creates a journal this way, `journaled_app::genesis_staging_path`
   names its temporary file and `journaled_app::discard_genesis_staging`
   removes one an interrupted boot left behind.
+- **The journal records the history's genesis length: journal format
+  16, snapshot framing 3, replication protocol 7.** The journal header
+  gains `genesis_entries`, how many entries the genesis occupies, written
+  when the journal is created and carried unchanged by every later
+  segment, every snapshot and every replica's journal; a replica learns
+  it from its primary's `StreamStart`. Recovery refuses a segment whose
+  recorded length differs from the segment before it
+  (`JournaledAppError::GenesisLengthMismatch`, a new variant): within one
+  history they always agree. Format-15 journals and
+  version-1/2 snapshots are still read, with the length unknown, and a
+  history begun under format 15 keeps writing format-15 headers (and
+  version-2 snapshots), so its segments stay identical across nodes: no
+  migration is needed. The replication protocol is not backward
+  compatible: nodes on protocol 6 and 7 refuse each other at the
+  handshake, so stop the cluster, upgrade every node, and restart on the
+  existing files. Source-breaking: `JournalWrite::create_continuing`,
+  `BufferedWriter::create_continuing` and `SegmentFile::create_continuing`
+  take the genesis length (`Option<u64>`, `None` for unknown), as do
+  `codec::encode_file_header`, `snapshot::save`, `shadow::run` and
+  `replication::protocol::encode_stream_start`; `FileHeaderInfo`,
+  `SnapshotHeader` and `PrimaryMessage::StreamStart` gain a
+  `genesis_entries` field; `catchup::lineage_origin` returns the oldest
+  segment's whole `FileHeaderInfo`. New: `codec::FORMAT_VERSION_V15`,
+  `JournalReader::genesis_entries`, `JournaledApp::genesis_entries`,
+  `snapshot::load_with_header`, `snapshot::MAX_HEADER_SIZE`, and
+  `melin_journal::fresh_anchor` is public.
 
 ### Fixed
 
@@ -195,15 +221,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   promoted. A replica whose primary was lost before it had copied the
   whole genesis now refuses promotion, and exits with an error, instead
   of serving a genesis prefix, and a primary booting from a history
-  shorter than its genesis — an earlier release's first boot that
-  crashed mid-genesis, or a replica's partial copy started on a
-  primary's flags — refuses to start. A journal with no entry at all,
-  which an earlier release left after such a failure (or a replica
-  restarted on a primary's flags before receiving anything), gets its
-  genesis on the next boot, with a warning; a journal holding at least as many
-  entries as the genesis is recovered as it is. A temporary genesis file
-  left by an interrupted first boot is removed on the next boot,
-  whichever way it starts.
+  shorter than its genesis — a replica's partial copy started on a
+  primary's flags — refuses to start. Both checks compare against the
+  genesis length the history records (see the format change under
+  Changed), never the node's own genesis configuration: nodes need not
+  agree on it, and changing it after the first boot changes nothing. A
+  replica whose journal records a different genesis length than its
+  primary's refuses to follow it and exits. Histories begun by an
+  earlier release record no length, and boot and promote unchecked, as
+  they did. A journal with no entry at all, which an earlier release
+  left after such a failure (or a replica's copy of it restarted on a
+  primary's flags), gets its genesis on the next boot, with a warning;
+  a replica holding an empty copy of it takes the recorded length from
+  its primary on the next connection. An empty journal begun by this
+  release keeps the length it records: it is never given a genesis
+  later. A temporary genesis file left by an interrupted first boot is
+  removed on the next boot, whichever way it starts.
 
 ## [0.18.0] - 2026-09-27
 
