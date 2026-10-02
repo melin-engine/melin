@@ -109,8 +109,7 @@ disconnects. TCP's 10 s read timeout covers it.
 StreamStart/resync negotiation returns from `run_receiver` without
 `teardown_replica_pipeline`. That includes `read_frame`, decode, the genesis
 checks, `handle_resync_verdict`, and "unexpected response". DPDK wraps the
-same cases in `fatal_err_dpdk!`, except `decode_primary_message(payload)?` in
-its handshake loop, which bypasses the macro the same way.
+same cases in `fatal_err_dpdk!`.
 
 ### TCP receiver treats a quiet primary after auth as fatal
 

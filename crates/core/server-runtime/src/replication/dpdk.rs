@@ -1456,7 +1456,10 @@ where
             match try_extract_frame(&recv_buf, MAX_CONTROL_FRAME) {
                 FrameResult::Complete(payload_start, frame_end) => {
                     let payload = &recv_buf[payload_start..frame_end];
-                    let response = decode_primary_message(payload)?;
+                    let response = match decode_primary_message(payload) {
+                        Ok(response) => response,
+                        Err(e) => fatal_err_dpdk!(e.into()),
+                    };
                     compact_recv_buf(&mut recv_buf, frame_end);
                     match response {
                         PrimaryMessage::StreamStart {
