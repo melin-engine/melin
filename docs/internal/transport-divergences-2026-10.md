@@ -97,11 +97,6 @@ heartbeated at the next scan. io_uring stamps `Instant::now()`.
 
 ## Replication
 
-### DPDK sender never sets `ack_latency_us` (likely bug)
-
-`replication/dpdk.rs`, ack handling. Only `tcp_sender.rs` updates
-`metrics.ack_latency_us[slot]`, so on DPDK `/metrics` reports 0 forever.
-
 ### TCP sender over-counts evictions
 
 `replication/tcp_sender.rs`, supervisor loop. `evictions_total` is incremented
