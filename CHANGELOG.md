@@ -148,6 +148,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `Reply` out of a `FrameDecoder`. None of it does I/O, so read
   timeouts, and the rule that a heartbeat does not extend one, stay with
   the caller.
+- **Exit status 74 for a journal write failure.** When the device
+  refuses a write or a sync of the journal, the node stops and must not
+  be restarted in place: the operating system can keep the refused data
+  in memory and present it as written to the next process on the same
+  host. `melin_server_runtime::exit::exit_code` turns what `server::run`
+  returns into the process's exit status: 74 (`EXIT_JOURNAL_IO_ERROR`,
+  `EX_IOERR`) for a journal write failure, 1 for any other error;
+  `exit::is_journal_write_failure` tests an error for it. An
+  application's `main` must propagate it (see The binary in
+  `docs/building-an-application.md`), and a supervisor must not restart
+  on it (systemd: `RestartPreventExitStatus=74`); see "When a journal
+  write fails" in `docs/journal.md` for what to do instead.
+  `JournalError::WriteFailed` is the error behind it.
+- **`melin_journal::test_utils::fail_next_sync`**, under the
+  `test-utils` feature: the next sync of a given live segment fails with
+  `EIO`, entering where the kernel's error would.
 
 ### Removed
 
@@ -183,6 +199,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `BufferTooSmall` is a request framed in place that does not fit its
   buffer, converted from `RequestFrameError`. Source-breaking for an
   exhaustive `match` on `Error`: add the arms.
+- **`JournalError` gains `WriteFailed`**, for a write or sync of the
+  live segment, or of a new segment's header, that the kernel refused,
+  which used to be `Io`.
+  Source-breaking for an exhaustive `match` on `JournalError`. A
+  refused `fallocate` and every read error remain `Io`.
+- **`server::run` reports a journal failure as itself.** A node whose
+  journal stage failed returned the bare message `pipeline failure`
+  (primary) or a formatted string (replica); it now returns an error
+  naming the journal's failure and carrying it as its `source`. A
+  replica that is shut down while its journal stage has failed, with any
+  journal error, reports the failure (exit status 1, or 74 for a write
+  failure) instead of returning as from a clean shutdown.
 - **A decoder receives the application's own roles: `Permission` is
   replaced by `ClientRole<R>`.** `RequestDecoder` gains `type Role`, and
   `decode` takes `role: ClientRole<Self::Role>` in place of

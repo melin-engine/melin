@@ -1465,8 +1465,9 @@ struct PipelineHandles<A: Send + 'static, W: Send + 'static> {
     // from inside the poll thread (via a wall-clock check between bursts).
 }
 
-/// Drain the pipeline and join every worker thread, surfacing panics
-/// and journal-stage errors as a single `pipeline failure` return.
+/// Drain the pipeline and join every worker thread. A journal-stage
+/// error is returned as itself, wrapped with context; panics alone as
+/// `pipeline failure`.
 ///
 /// `extras` is a list of pre-joined results (used by the DPDK path,
 /// which joins its poll threads before draining the pipeline).
@@ -1493,12 +1494,20 @@ fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
         }
     };
 
-    let journal_result = handles.journal.join();
-    let journal_failed = matches!(&journal_result, Ok(Err(_)));
-    if let Ok(Err(ref e)) = journal_result {
-        error!(thread = "journal-seq", error = %e, "journal stage returned error");
-    }
-    check_join("journal-seq", journal_result.map(|_| ()));
+    // The journal stage's own error, kept rather than folded into a
+    // generic failure: it is what the caller reports, and a journal
+    // write failure sets the process's exit status (see `crate::exit`).
+    let journal_error = match handles.journal.join() {
+        Ok(Ok(_writer)) => None,
+        Ok(Err(e)) => {
+            error!(thread = "journal-seq", error = %e, "journal stage returned error");
+            Some(e)
+        }
+        Err(panic) => {
+            check_join("journal-seq", Err(panic));
+            None
+        }
+    };
     check_join("matching", handles.matching.join().map(|_| ()));
     check_join("response", handles.response.join());
     for (name, r) in extras {
@@ -1521,7 +1530,14 @@ fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
     // histograms to stderr. No-op when `latency-trace` is disabled.
     melin_transport_core::trace::print_report_all();
 
-    if thread_panicked || journal_failed {
+    if let Some(e) = journal_error {
+        error!("shutdown complete (with pipeline failure)");
+        return Err(Box::new(crate::exit::JournalStageFailed::new(
+            "journal stage failed",
+            e,
+        )));
+    }
+    if thread_panicked {
         error!("shutdown complete (with pipeline failure)");
         return Err("pipeline failure".into());
     }

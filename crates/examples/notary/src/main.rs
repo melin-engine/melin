@@ -34,10 +34,12 @@
 
 use clap::Parser;
 use melin_server_runtime::StartupEvents;
+use melin_server_runtime::exit;
 use melin_server_runtime::server::{self, ServerConfig};
 use notary_server::{Notary, RequestDecoder, ResponseEncoder};
+use std::process::ExitCode;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(true)
@@ -46,12 +48,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse();
 
-    server::run::<Notary>(
+    // Status 74 on a journal write failure, so a supervisor can tell it
+    // apart: see `docs/journal.md`.
+    exit::exit_code(server::run::<Notary>(
         config,
         StartupEvents::none(),
         (),
         RequestDecoder,
         ResponseEncoder,
         None,
-    )
+    ))
 }

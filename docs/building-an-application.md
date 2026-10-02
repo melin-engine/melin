@@ -339,24 +339,28 @@ Your binary hands the four pieces to the runtime. Configuration comes from the c
 use clap::Parser;
 use counter_server::{Counter, RequestDecoder, ResponseEncoder};
 use melin_server_runtime::StartupEvents;
+use melin_server_runtime::exit;
 use melin_server_runtime::server::{self, ServerConfig};
+use std::process::ExitCode;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let config = ServerConfig::parse();
-    server::run::<Counter>(
+    exit::exit_code(server::run::<Counter>(
         config,
         StartupEvents::none(), // events journaled as the node becomes primary: none
         (),                    // the counter's `Sizing`
         RequestDecoder,
         ResponseEncoder,
         None, // no event publisher
-    )
+    ))
 }
 ```
+
+`exit::exit_code` prints the error, if any, and turns the result into the process's exit status. Your binary must propagate it: when the device refuses a journal write, the node exits with status 74 (`exit::EXIT_JOURNAL_IO_ERROR`, `EX_IOERR`), and that status is how a supervisor knows not to restart the node in place (see [When a journal write fails](journal.md#when-a-journal-write-fails)). Every other failure exits with status 1. A `main` that does more on the way out can test the error with `exit::is_journal_write_failure` and return `ExitCode::from(exit::EXIT_JOURNAL_IO_ERROR)` itself; returning the error from `main` instead exits with status 1 and loses the distinction.
 
 Run it the way the quickstart ran echo:
 
@@ -640,5 +644,6 @@ When the three disagree, which pair differs says where to look: the restored run
 - [ ] `snapshot` and `restore` round-trip exactly, and `APP_VERSION` changes whenever the snapshot layout does.
 - [ ] A determinism test runs live, snapshot-and-restore and full replay over realistic inputs, and agrees.
 - [ ] An upgrade plan exists for changing an event's encoding: see [Snapshots and upgrades](#snapshots-and-upgrades).
+- [ ] Your binary exits through `exit::exit_code`, so a journal write failure reaches the supervisor as status 74, and the supervisor does not restart on it: see [The binary](#the-binary).
 
 Where to go next: [Journal & Event Sourcing](journal.md) for what is on disk and how recovery works, [Replication](replication.md) for acknowledgement policies and failover, and [Pipeline Architecture](pipeline-architecture.md) for the threads and rings your application runs inside.

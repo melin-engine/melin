@@ -800,6 +800,14 @@ Most failures resolve without operator action:
   mandatory" above). Bring it back as a replica instead. Send
   `ACK-POLICY disk` after promotion if the new primary is standalone;
   restore the target policy once new replicas attach.
+- **A node exits with status 74**: its journal's device refused a
+  write or a sync. Do not restart it in place, and keep your
+  supervisor from doing so (systemd: `RestartPreventExitStatus=74`).
+  If it was the primary, fail over as for a crash. Then either re-seed
+  it as a replica, with its journal moved aside, or reboot its host
+  before starting it again, and investigate the storage either way.
+  See [When a journal write fails](journal.md#when-a-journal-write-fails)
+  for why a restart without a reboot is unsafe.
 - **One replica crashes, primary and other replica alive** — the
   cluster continues under the configured policy. Under `disk+ram` the
   gate is satisfied by whichever node fsyncs first plus the surviving

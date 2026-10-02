@@ -18,9 +18,11 @@
 use clap::Parser;
 use counter_server::{Counter, RequestDecoder, ResponseEncoder};
 use melin_server_runtime::StartupEvents;
+use melin_server_runtime::exit;
 use melin_server_runtime::server::{self, ServerConfig};
+use std::process::ExitCode;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(true)
@@ -29,12 +31,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse();
 
-    server::run::<Counter>(
+    // Status 74 on a journal write failure, so a supervisor can tell it
+    // apart: see `docs/journal.md`.
+    exit::exit_code(server::run::<Counter>(
         config,
         StartupEvents::none(),
         (),
         RequestDecoder,
         ResponseEncoder,
         None,
-    )
+    ))
 }

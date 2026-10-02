@@ -696,7 +696,24 @@ fn prepare_zero_filled(
         });
     }
 
-    // Fallback: physically write the zeros, paced against the DEVICE
+    write_zeros_paced(&file, bytes, shutdown)?;
+    // Cheap by construction: at most the final < 64 MiB of allocation
+    // metadata (plus timestamps) remains unforced here.
+    file.sync_all()?;
+
+    Ok(PreparedSegment {
+        file,
+        path: staging.to_path_buf(),
+        allocated_end: bytes,
+        written: true,
+    })
+}
+
+/// The zero fill's fallback when `FALLOC_FL_WRITE_ZEROES` is not
+/// available: write `[0, bytes)` of zeros through the page cache, one
+/// paced window at a time, each waited out on the device.
+fn write_zeros_paced(file: &File, bytes: u64, shutdown: &AtomicBool) -> Result<(), JournalError> {
+    // Physically write the zeros, paced against the DEVICE
     // clock. An unpaced fill saturates the journal device — the ~2 ms
     // fsync beat this mode exists to fix was measured being replaced by
     // ~10 ms fsync stalls whenever a batch fsync queued behind the
@@ -727,8 +744,11 @@ fn prepare_zero_filled(
     let zeros = vec![0u8; STAGING_WINDOW_BYTES];
     let mut last_metadata_sync: u64 = 0;
     paced_over_segment(bytes, shutdown, |offset, n| {
-        std::os::unix::fs::FileExt::write_all_at(&file, &zeros[..n], offset)?;
-        wait_for_writeback(&file, offset, n as u64);
+        std::os::unix::fs::FileExt::write_all_at(file, &zeros[..n], offset)?;
+        // A failure here fails the prepare, through the same path as a
+        // failed write: see `wait_for_writeback` for why it cannot be
+        // left to the final `sync_all`.
+        wait_for_writeback(file, offset, n as u64)?;
         // Incremental log force for the extent-allocation metadata
         // accumulated since the last force (the data is already on
         // disk chunk-by-chunk). Runs inside the window so its wall
@@ -739,16 +759,6 @@ fn prepare_zero_filled(
             last_metadata_sync = end;
         }
         Ok(())
-    })?;
-    // Cheap by construction: at most the final < 64 MiB of allocation
-    // metadata (plus timestamps) remains unforced here.
-    file.sync_all()?;
-
-    Ok(PreparedSegment {
-        file,
-        path: staging.to_path_buf(),
-        allocated_end: bytes,
-        written: true,
     })
 }
 
@@ -757,13 +767,20 @@ fn prepare_zero_filled(
 /// zero-fill's [`paced_over_segment`] window — the wait is the point:
 /// it makes the window's wall time reflect real device time and
 /// guarantees no staging IO stays in flight into the next one.
-/// Best-effort: on failure the fill just paces less accurately and the
-/// final `sync_all` remains the durability point.
-fn wait_for_writeback(file: &File, offset: u64, len: u64) {
+///
+/// Not best-effort: an error fails the prepare. With `WAIT_AFTER` the
+/// call reports a write-back error on the range, and reporting it
+/// consumes it (Linux reports each write-back error once per open file),
+/// so the final `sync_all` would then succeed on a segment whose zeros
+/// never reached the device, and the rotation would adopt it.
+fn wait_for_writeback(file: &File, offset: u64, len: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    if let Some(errno) = tests::FAIL_WRITEBACK.take() {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
     // SAFETY: plain syscall on an owned, open fd; no memory is passed.
-    // Result deliberately dropped — see the function docs.
-    let _ = unsafe {
+    let rc = unsafe {
         libc::sync_file_range(
             file.as_raw_fd(),
             offset as libc::off64_t,
@@ -773,6 +790,11 @@ fn wait_for_writeback(file: &File, offset: u64, len: u64) {
                 | libc::SYNC_FILE_RANGE_WAIT_AFTER,
         )
     };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// `FALLOC_FL_WRITE_ZEROES` — not yet in the `libc` crate; merged
@@ -883,6 +905,63 @@ pub(crate) fn staging_path(live: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// The errno the next `wait_for_writeback` on this thread fails
+        /// with. A write-back error on a range cannot be provoked without
+        /// a failing device; the seam is thread-local so it reaches only
+        /// the test that sets it, which calls the fill on its own thread.
+        /// `i32` because an errno is a `c_int`.
+        pub(super) static FAIL_WRITEBACK: std::cell::Cell<Option<i32>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The syscall's own error is returned, not dropped: on a descriptor
+    /// `sync_file_range` rejects (a pipe, `ESPIPE`) the wait fails.
+    #[test]
+    fn wait_for_writeback_reports_the_kernels_error() {
+        let (reader, _writer) = std::io::pipe().expect("pipe");
+        let file = File::from(std::os::fd::OwnedFd::from(reader));
+        let error = wait_for_writeback(&file, 0, 4096).expect_err("a pipe cannot be synced");
+        assert_eq!(error.raw_os_error(), Some(libc::ESPIPE));
+    }
+
+    /// A write-back error reported by a window's wait fails the fill, and
+    /// so the prepare: the worker logs it and backs off, and no segment
+    /// is offered for adoption. Before, the error was dropped and the
+    /// fill went on; the error, consumed by the wait, would then be
+    /// missing from the final `sync_all`, which succeeded on a segment
+    /// whose zeros were not on the device.
+    #[test]
+    fn a_writeback_error_fails_the_zero_fill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("staging"))
+            .expect("create staging");
+
+        FAIL_WRITEBACK.set(Some(libc::EIO));
+        let result = write_zeros_paced(
+            &file,
+            2 * STAGING_WINDOW_BYTES as u64,
+            &AtomicBool::new(false),
+        );
+        assert!(
+            FAIL_WRITEBACK.get().is_none(),
+            "the fill must wait for write-back"
+        );
+        match result {
+            Err(JournalError::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EIO)),
+            other => panic!("the write-back error must fail the fill, got {other:?}"),
+        }
+        assert_eq!(
+            file.metadata().expect("stat").len(),
+            STAGING_WINDOW_BYTES as u64,
+            "the fill stops at the window whose write-back failed"
+        );
+    }
 
     /// Spawning, arming, and shutdown round-trips without leaking the
     /// worker thread or the staging file.

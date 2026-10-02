@@ -19,6 +19,7 @@ pub mod client_auth;
 mod client_frames;
 pub mod connection_limit;
 mod durability_gate;
+pub mod exit;
 pub mod halt;
 pub mod layout;
 pub mod process;

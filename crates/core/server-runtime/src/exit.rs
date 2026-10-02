@@ -1,0 +1,156 @@
+//! The node's exit status, for an application's `main`.
+//!
+//! [`crate::server::run`] returns an error when the node stops on a
+//! failure. One class of failure needs a different response from
+//! whatever supervises the process, and so its own exit status: the
+//! kernel refused a write or a sync of the journal
+//! ([`melin_journal::JournalError::WriteFailed`]). After a failed write-back, Linux keeps
+//! the data in the page cache, marks it clean and reports the error once,
+//! so a node restarted in place, on the same host, reads data the device
+//! never took as if it were durable. The node has to be failed over and
+//! re-seeded, or the host rebooted first, never simply restarted.
+//!
+//! Everything else that stops a node exits with status 1, as a `main`
+//! returning the error would: configuration and bind errors, a recovery
+//! that refuses the journal it finds, a journal that cannot be read, a
+//! pipeline thread that panicked. Restarting after those cannot present
+//! unwritten data as written: a refusal is decided from what is on the
+//! device and repeats on every start, and a read error leaves nothing in
+//! the page cache that the device does not hold.
+//!
+//! ```no_run
+//! # fn run() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
+//! fn main() -> std::process::ExitCode {
+//!     // server::run::<App>(config, startup, sizing, decoder, encoder, None)
+//!     melin_server_runtime::exit::exit_code(run())
+//! }
+//! ```
+
+use std::error::Error;
+use std::fmt;
+use std::process::ExitCode;
+
+use melin_journal::JournalError;
+
+/// Exit status of a node stopped by a journal write failure: 74,
+/// `EX_IOERR` in `sysexits.h`. A supervisor must not restart the node in
+/// place on this status (systemd: `RestartPreventExitStatus=74`).
+///
+/// `u8` because that is what an exit status is (`ExitCode::from`).
+pub const EXIT_JOURNAL_IO_ERROR: u8 = 74;
+
+/// Whether `error`, or any error in its `source` chain, is a journal
+/// write failure: the failure [`EXIT_JOURNAL_IO_ERROR`] reports.
+pub fn is_journal_write_failure(error: &(dyn Error + 'static)) -> bool {
+    let mut next = Some(error);
+    while let Some(e) = next {
+        if let Some(JournalError::WriteFailed(_)) = e.downcast_ref::<JournalError>() {
+            return true;
+        }
+        next = e.source();
+    }
+    false
+}
+
+/// The exit status for what [`crate::server::run`] returned:
+/// [`EXIT_JOURNAL_IO_ERROR`] for a journal write failure, `FAILURE` (1)
+/// for any other error, `SUCCESS` for a clean shutdown. Prints the error
+/// to stderr first, with its `Display` form (a `main` returning the
+/// error would print its `Debug` form instead).
+pub fn exit_code(result: Result<(), Box<dyn Error>>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            if is_journal_write_failure(&*error) {
+                ExitCode::from(EXIT_JOURNAL_IO_ERROR)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+/// A journal stage that stopped with an error, with what the runtime was
+/// doing when it saw it. Keeps the journal's error as its `source`
+/// rather than flattening it into a message, so [`is_journal_write_failure`]
+/// finds it however many layers wrap it on the way out.
+#[derive(Debug)]
+pub(crate) struct JournalStageFailed {
+    context: String,
+    source: JournalError,
+}
+
+impl JournalStageFailed {
+    pub(crate) fn new(context: impl Into<String>, source: JournalError) -> Self {
+        Self {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+impl fmt::Display for JournalStageFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.context, self.source)
+    }
+}
+
+impl Error for JournalStageFailed {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_failure() -> JournalError {
+        JournalError::WriteFailed(std::io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    #[test]
+    fn a_write_failure_is_found_through_the_wrappers() {
+        let direct: Box<dyn Error> = Box::new(write_failure());
+        assert!(is_journal_write_failure(&*direct));
+
+        let wrapped: Box<dyn Error> = Box::new(JournalStageFailed::new(
+            "journal stage failed",
+            write_failure(),
+        ));
+        assert!(is_journal_write_failure(&*wrapped));
+        assert_eq!(
+            exit_code(Err(wrapped)),
+            ExitCode::from(EXIT_JOURNAL_IO_ERROR)
+        );
+    }
+
+    /// The failures that leave nothing unwritten behind exit as any other
+    /// error does: a plain I/O error (reading, allocating), a refused
+    /// recovery, a message.
+    #[test]
+    fn other_failures_exit_with_status_1() {
+        let others: Vec<Box<dyn Error>> = vec![
+            Box::new(JournalError::Io(std::io::Error::from_raw_os_error(
+                libc::EIO,
+            ))),
+            Box::new(JournalStageFailed::new(
+                "journal stage failed",
+                JournalError::UnrecoverableTail {
+                    path: "j.journal".into(),
+                    offset: 4096,
+                    last_sequence: None,
+                    nonzero_at: 1 << 30,
+                    cause: None,
+                },
+            )),
+            "pipeline failure".into(),
+        ];
+        for error in others {
+            assert!(!is_journal_write_failure(&*error), "{error}");
+            assert_eq!(exit_code(Err(error)), ExitCode::FAILURE);
+        }
+        assert_eq!(exit_code(Ok(())), ExitCode::SUCCESS);
+    }
+}

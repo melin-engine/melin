@@ -777,6 +777,23 @@ pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send
     )
 }
 
+/// What an operator-requested shutdown of a replica returns, given how
+/// its pipeline came down (`None`: no pipeline was running).
+///
+/// A journal that failed on the way down (its final drain's sync, say)
+/// is still a failure: it is reported rather than a clean stop, whatever
+/// the journal error, and a write failure among them decides the exit
+/// status (see `crate::exit`). A panicked stage was already logged where
+/// it unwound, and the shutdown stays clean.
+fn shutdown_result<A, W>(outcome: Option<TeardownOutcome<A, W>>) -> ReceiverResult<A, W> {
+    match outcome {
+        Some(TeardownOutcome::JournalFailed(je)) => Err(Box::new(
+            crate::exit::JournalStageFailed::new("replica journal stage failed", je),
+        )),
+        Some(TeardownOutcome::Clean(..) | TeardownOutcome::Panicked) | None => Ok(None),
+    }
+}
+
 /// How many mid-stream divergence resyncs the receiver attempts
 /// in-process (per process lifetime) before giving up. Mid-stream
 /// divergence is never expected in a healthy cluster — it means
@@ -960,17 +977,17 @@ where
     close();
 
     match exit {
-        SessionExit::Shutdown => {
-            if let Some(p) = pipeline.take() {
-                let _ = teardown_replica_pipeline::<A, W>(p);
-            }
-            AfterSession::Return(Ok(None))
-        }
+        SessionExit::Shutdown => AfterSession::Return(shutdown_result(
+            pipeline.take().map(teardown_replica_pipeline::<A, W>),
+        )),
 
         SessionExit::Promote => AfterSession::Return(match pipeline.take() {
             Some(p) => match teardown_replica_pipeline::<A, W>(p) {
                 TeardownOutcome::Clean(ex, wr) => Ok(Some((ex, wr))),
-                _ => Err("pipeline failed during promotion".into()),
+                TeardownOutcome::JournalFailed(je) => Err(Box::new(
+                    crate::exit::JournalStageFailed::new("pipeline failed during promotion", je),
+                )),
+                TeardownOutcome::Panicked => Err("pipeline failed during promotion".into()),
             },
             None => Err("pipeline missing on promote".into()),
         }),
@@ -997,7 +1014,12 @@ where
                     je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
                 ) => je,
                 TeardownOutcome::JournalFailed(je) => {
-                    return AfterSession::Return(Err(format!("{e}: {je}").into()));
+                    // The journal's error as the source, not flattened
+                    // into the message: a write failure decides the
+                    // process's exit status (see `crate::exit`).
+                    return AfterSession::Return(Err(Box::new(
+                        crate::exit::JournalStageFailed::new(e.to_string(), je),
+                    )));
                 }
                 TeardownOutcome::Clean(..) | TeardownOutcome::Panicked => {
                     return AfterSession::Return(Err(e));
@@ -1700,6 +1722,35 @@ mod tests {
         encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
         read_frame, try_decode_input_batch,
     };
+
+    /// A replica shut down by its operator reports a journal that failed
+    /// on the way down instead of a clean stop: a write failure exits
+    /// with status 74, any other journal failure with status 1. A clean
+    /// or panicked teardown, or none at all, stays a clean shutdown.
+    #[test]
+    fn a_shutdown_reports_a_journal_that_failed_on_the_way_down() {
+        type Outcome = TeardownOutcome<(), ()>;
+        let journal_failed = |e: melin_journal::JournalError| {
+            shutdown_result(Some(Outcome::JournalFailed(e))).expect_err("a failure")
+        };
+
+        let write = journal_failed(melin_journal::JournalError::WriteFailed(
+            std::io::Error::from_raw_os_error(libc::EIO),
+        ));
+        assert!(crate::exit::is_journal_write_failure(&*write));
+
+        let other = journal_failed(melin_journal::JournalError::Io(
+            std::io::Error::from_raw_os_error(libc::EIO),
+        ));
+        assert!(!crate::exit::is_journal_write_failure(&*other));
+
+        assert!(matches!(
+            shutdown_result(Some(Outcome::Clean((), ()))),
+            Ok(None)
+        ));
+        assert!(matches!(shutdown_result(Some(Outcome::Panicked)), Ok(None)));
+        assert!(matches!(shutdown_result::<(), ()>(None), Ok(None)));
+    }
 
     /// Build a wire-ready `InputBatch` frame containing a single `Tick`
     /// slot at the given sequence — the protocol-level tests don't need

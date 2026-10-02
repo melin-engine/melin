@@ -26,6 +26,22 @@ pub fn hex_prefix(hash: &[u8; 32]) -> String {
 pub enum JournalError {
     /// Underlying I/O error.
     Io(std::io::Error),
+    /// The kernel refused a write or a sync of the live segment's data:
+    /// an append's `pwrite`, its `fdatasync`, the header write and
+    /// `fsync` of a new segment, or the `fsync` that seals a reopened
+    /// segment before appends resume.
+    ///
+    /// Kept apart from [`Self::Io`] because of what it leaves behind.
+    /// After a failed write-back, Linux marks the pages clean, keeps
+    /// their contents in the page cache and reports the error once, so a
+    /// process that opens the segment again in place reads data the
+    /// device never took as if it were durable, and its next sync
+    /// succeeds. Restarting in place is unsafe until the host reboots;
+    /// a node stopped by this error says so through its exit status.
+    /// An error before anything was written (allocating space, creating
+    /// a file, reading) is [`Self::Io`]. A failed rotation is never
+    /// fatal, whatever its class: its rollback discards the new segment.
+    WriteFailed(std::io::Error),
     /// File does not start with expected magic bytes.
     InvalidFile,
     /// Journal format version is not supported by this build.
@@ -107,6 +123,11 @@ impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "journal I/O error: {e}"),
+            Self::WriteFailed(e) => write!(
+                f,
+                "journal write failed: {e} (the data may not be on the device; do not \
+                 restart this node in place without rebooting the host)"
+            ),
             Self::InvalidFile => write!(f, "invalid journal file (bad magic)"),
             Self::UnsupportedVersion { version } => {
                 write!(f, "unsupported journal format version: {version}")
@@ -203,7 +224,7 @@ impl fmt::Display for JournalError {
 impl std::error::Error for JournalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(e) => Some(e),
+            Self::Io(e) | Self::WriteFailed(e) => Some(e),
             _ => None,
         }
     }

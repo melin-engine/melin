@@ -69,7 +69,7 @@ Severity is a judgement from code reading.
 | 16 | A torn, never-acknowledged final entry can block startup | Medium | Reproduced (fixed) |
 | 17 | The tick contract is untested and has no working example | Medium | Confirmed |
 | 18 | A ServerBusy reply can overtake replies to earlier requests | Medium | Confirmed |
-| 19 | Recovery trusts the page cache after a failed fsync | Medium | Reported |
+| 19 | Recovery trusts the page cache after a failed fsync | Medium | Reported (addressed operationally) |
 | 20 | A failed directory fsync after rotation does not hold back acks | Medium | Confirmed |
 | 21 | The resync archive is not atomic, and a lone snapshot is ignored | Medium | Confirmed |
 | 22 | Snapshot paths are resolved three ways, and a served snapshot is barely checked | Medium | Confirmed |
@@ -974,6 +974,51 @@ I/O error, and drop its cached pages before reading, or read with
 until the host reboots. Treat a `sync_file_range` error as a failed
 prepare.
 
+**Addressed operationally.** The hazard needs an in-place restart on the
+same host after the kernel reported a write-back error. Melin does not
+try to manage storage health (no `O_DIRECT` recovery, no cache dropping,
+no boot-id poison marker); it signals the failure unmistakably and the
+operator documentation says what to do with it:
+
+- `JournalError::WriteFailed` is a new variant for a refused write or
+  sync of the live segment (`SegmentFile::write_batch`/`write_vectored`
+  data writes, `SegmentFile::sync`), for the header write and `sync_all`
+  of a new segment in `create_continuing` (at startup that file stays at
+  the live path, so a restart in place would read its header from the
+  page cache), and for the `sync_all` in `open_append`, the first sync to
+  see a previous run's write. Not for `fallocate` or reads, which leave
+  no unwritten data in the page cache. A rotation that fails, whatever
+  the class, stays non-fatal: its rollback discards the new segment.
+- `run` now returns the journal stage's error, chained under the
+  runtime's context, instead of the flat string "pipeline failure"
+  (primary), or a formatted message (replica fatal exit), and a replica
+  shutdown no longer drops a journal failure from its final drain.
+  `melin_server_runtime::exit::exit_code` maps a chain holding
+  `WriteFailed` to status 74 (`EX_IOERR`, `EXIT_JOURNAL_IO_ERROR`) and
+  every other error to 1; the example servers use it. A refused recovery
+  and a read error stay at 1: both are decided from what the device
+  holds and repeat on every start, so a restart cannot present unwritten
+  data as written.
+- `docs/journal.md` ("When a journal write fails") tells operators not to
+  restart in place on status 74: fail over and re-seed, or reboot the
+  host first, with `RestartPreventExitStatus=74` for systemd.
+- The preparer's `wait_for_writeback` now returns its error, failing the
+  prepare through the existing warn-and-back-off path.
+
+Regression tests: `server-runtime/tests/journal_io_failure.rs` (a primary
+and a replica whose sync fails exit 74, through an injected `EIO` at
+`SegmentFile::sync`, in front of the same classification as the kernel's
+error; a missing keys file and a refused recovery exit 1),
+`segment_file::tests::a_refused_append_is_a_write_failure` (a real
+`pwrite`/`pwritev` refusal), the replica shutdown's
+`replication::tests::a_shutdown_reports_a_journal_that_failed_on_the_way_down`,
+and `preparer::tests::a_writeback_error_fails_the_zero_fill`.
+
+A later hardening, for operators who ignore the guidance, is possible
+but not planned: recovery reads the live segment from the device
+(`O_DIRECT`, with a `posix_fadvise(DONTNEED)` fallback where `O_DIRECT`
+is unsupported) instead of through the page cache.
+
 ### 20. A failed directory fsync after rotation does not hold back acks
 
 **Medium, filesystem-dependent. Confirmed** mechanism.
@@ -1342,7 +1387,10 @@ real sockets, ticks and snapshots as noted):
    bounded, all-zero tail, preserve whatever is discarded, and cap entry
    length. (Finding 24, the shutdown drain, is already fixed.) **Done**
    for findings 5, 6, 7 and 16 (one rule in the journal reader, bounded
-   by one unsynced drain, and the length cap). Finding 19 remains.
+   by one unsynced drain, and the length cap). Finding 19 is
+   **addressed operationally**: a journal write failure exits with
+   status 74 and the operator documentation forbids an in-place restart
+   (see finding 19); recovery still reads through the page cache.
    Moving the discarded tail aside instead of truncating it is
    deferred, undecided: it only helps when storage damages acknowledged
    entries near the end of the live segment (the documented limit under
