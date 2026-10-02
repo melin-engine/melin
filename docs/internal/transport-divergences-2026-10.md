@@ -118,12 +118,6 @@ its handshake loop, which bypasses the macro the same way.
 after auth fails `run_receiver` fatally through `read_frame(...)?`. DPDK backs
 off and reconnects.
 
-### TCP receiver holds the socket through a resync-retry backoff
-
-`replication/tcp_receiver.rs`, `ResyncDecision::Retry`. The socket is kept
-open through the backoff sleep, contradicting the drop-before-sleep rule the
-same function follows elsewhere. DPDK closes it.
-
 ### DPDK ignores `queue_send` failures for the handshake and heartbeats
 
 `replication/dpdk.rs`. A dropped Handshake frame leaves both sides waiting.
