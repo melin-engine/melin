@@ -104,14 +104,17 @@ pub fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::
 /// a fresh replica must create its journal with so full catch-up
 /// produces a byte-identical segment (and the `Rotate` frames emitted
 /// at each segment transition keep it byte-identical across rotations).
-pub fn lineage_origin(journal_path: &std::path::Path) -> io::Result<(u64, [u8; 32])> {
+///
+/// The whole header: its `genesis_entries` is the lineage's genesis
+/// length, which every segment's header carries alike and the
+/// `StreamStart` hands to the replica with the identity.
+pub fn lineage_origin(journal_path: &std::path::Path) -> io::Result<melin_journal::FileHeaderInfo> {
     let files = discover_journal_files(journal_path);
     let oldest = files
         .first()
         .ok_or_else(|| io::Error::other("no journal segments on disk"))?;
-    let info = melin_journal::segment::read_header_info(oldest)
-        .map_err(|e| io::Error::other(format!("read header of {}: {e}", oldest.display())))?;
-    Ok((info.starting_sequence, info.anchor_hash))
+    melin_journal::segment::read_header_info(oldest)
+        .map_err(|e| io::Error::other(format!("read header of {}: {e}", oldest.display())))
 }
 
 /// Check if journal catch-up is possible without sending any data.
@@ -379,10 +382,10 @@ pub fn preflight_snapshot_transfer(journal_path: &std::path::Path) -> io::Result
         ));
     }
 
-    // Fixed 64-byte stack buffer: SnapshotHeader::parse needs at most
-    // HEADER_SIZE (v2, 56 bytes); reading the whole file here would pull
-    // a potentially huge body that snapshot_transfer_with reads again.
-    let mut head = [0u8; 64];
+    // Fixed stack buffer the size of the largest header version:
+    // reading the whole file here would pull a potentially huge body
+    // that snapshot_transfer_with reads again.
+    let mut head = [0u8; crate::snapshot::MAX_HEADER_SIZE];
     let mut file = std::fs::File::open(&snap_path)
         .map_err(|e| io::Error::other(format!("open snapshot {}: {e}", snap_path.display())))?;
     let mut filled = 0;
@@ -526,6 +529,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
         snap_sequence,
         seed_info.starting_sequence,
         seed_info.anchor_hash,
+        seed_info.genesis_entries,
         snap_epoch,
         ack_policy,
         &mut send_buf,
@@ -847,20 +851,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = three_segment_journal(dir.path());
 
-        let (start, anchor) = lineage_origin(&live).unwrap();
+        let origin = lineage_origin(&live).unwrap();
         let oldest =
             melin_journal::segment::read_header_info(&dir.path().join("j.journal.000001")).unwrap();
-        assert_eq!(start, 1);
-        assert_eq!(start, oldest.starting_sequence);
-        assert_eq!(anchor, oldest.anchor_hash);
+        assert_eq!(origin.starting_sequence, 1);
+        assert_eq!(origin, oldest);
 
         // Without rotations, the live segment itself is the origin.
         let solo = dir.path().join("solo.journal");
         drop(BufferedWriter::<TestEvent>::create(&solo).unwrap());
-        let (solo_start, solo_anchor) = lineage_origin(&solo).unwrap();
+        let solo_origin = lineage_origin(&solo).unwrap();
         let solo_info = melin_journal::segment::read_header_info(&solo).unwrap();
-        assert_eq!(solo_start, 1);
-        assert_eq!(solo_anchor, solo_info.anchor_hash);
+        assert_eq!(solo_origin.starting_sequence, 1);
+        assert_eq!(solo_origin, solo_info);
+        assert_eq!(solo_origin.genesis_entries, Some(0));
     }
 
     /// Catch-up probing spans the full archive set: a replica whose
@@ -908,7 +912,9 @@ mod tests {
     fn boundary_replica_of_empty_live_catches_up_with_nothing_to_send() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("resumed.journal");
-        drop(BufferedWriter::<TestEvent>::create_continuing(&live, 34, [7u8; 32]).unwrap());
+        drop(
+            BufferedWriter::<TestEvent>::create_continuing(&live, 34, [7u8; 32], Some(0)).unwrap(),
+        );
 
         assert!(can_catch_up_from_journal(&live, 33).unwrap());
 
@@ -1047,8 +1053,16 @@ mod tests {
 
         // Primary journal: [1..2] archived, [3..5] live. Snapshot taken
         // mid-live-segment at sequence 4 — the worst case for seeding
-        // (the seed must carry the live header plus entries 3..=4).
-        let mut w = melin_journal::BufferedWriter::<TestEvent>::create(&live).unwrap();
+        // (the seed must carry the live header plus entries 3..=4). The
+        // lineage records a genesis of two entries, which the seed's
+        // header and the StreamStart both carry to the replica.
+        let mut w = melin_journal::BufferedWriter::<TestEvent>::create_continuing(
+            &live,
+            1,
+            [0x5E; 32],
+            Some(2),
+        )
+        .unwrap();
         let mut chain_at_4 = [0u8; 32];
         for v in 1..=5u64 {
             w.append(&JournalEvent::App(TestEvent::Add(v))).unwrap();
@@ -1066,6 +1080,7 @@ mod tests {
             WireSeq::new(4),
             chain_at_4,
             7,
+            Some(2),
             &snap_path,
         )
         .unwrap();
@@ -1138,12 +1153,15 @@ mod tests {
                 start_sequence,
                 segment_start_sequence,
                 anchor_hash,
+                genesis_entries,
                 epoch,
                 ack_policy,
             } => {
                 assert_eq!(start_sequence, 4);
                 assert_eq!(segment_start_sequence, live_info.starting_sequence);
                 assert_eq!(anchor_hash, live_info.anchor_hash);
+                assert_eq!(genesis_entries, Some(2), "the lineage's genesis length");
+                assert_eq!(live_info.genesis_entries, Some(2));
                 assert_eq!(epoch, 7, "snapshot's epoch rides StreamStart");
                 assert_eq!(
                     ack_policy, ACK_POLICY,
@@ -1161,6 +1179,11 @@ mod tests {
         let replica_writer =
             melin_journal::BufferedWriter::<TestEvent>::open_append(&replica, 4, seed_len).unwrap();
         assert_eq!(replica_writer.chain_hash().unwrap(), chain_at_4);
+        assert_eq!(
+            replica_writer.read_header_info().unwrap().genesis_entries,
+            Some(2),
+            "the seeded journal records the lineage's genesis length"
+        );
         assert_eq!(replica_writer.segment_starting_sequence(), 3);
         assert_eq!(replica_writer.next_sequence(), 5);
     }
@@ -1212,7 +1235,10 @@ mod tests {
         // A snapshot-only restart layout: single live segment whose
         // header starts past 1 (no entries yet).
         let resumed = dir.path().join("resumed.journal");
-        drop(BufferedWriter::<TestEvent>::create_continuing(&resumed, 21, [7u8; 32]).unwrap());
+        drop(
+            BufferedWriter::<TestEvent>::create_continuing(&resumed, 21, [7u8; 32], Some(0))
+                .unwrap(),
+        );
         assert!(
             !can_catch_up_from_journal(&resumed, 0).unwrap(),
             "fresh replica must not catch up from a snapshot-anchored journal"

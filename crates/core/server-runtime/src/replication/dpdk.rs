@@ -683,12 +683,16 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         let mut catchup_end = stream_base;
                         let catchup_err = if can_catch_up {
                             slot.send_buf.clear();
+                            // As on the kernel-TCP sender: the lineage
+                            // origin's identity, and the lineage's
+                            // genesis length from the same header.
                             melin_transport_core::replication::catchup::lineage_origin(journal_path)
-                                .and_then(|(lineage_start, lineage_anchor)| {
+                                .and_then(|origin| {
                                     encode_stream_start(
                                         h.last_sequence,
-                                        lineage_start,
-                                        lineage_anchor,
+                                        origin.starting_sequence,
+                                        origin.anchor_hash,
+                                        origin.genesis_entries,
                                         fence_state.epoch(),
                                         ack_policy.load(std::sync::atomic::Ordering::Relaxed),
                                         &mut slot.send_buf,
@@ -1420,7 +1424,8 @@ where
         // error) → reconnect. `Some(lineage)` = StreamStart received (or a
         // resync that re-seeded and validated its own post-snapshot
         // StreamStart inline, via `handle_resync_verdict`).
-        let stream_lineage: Option<(u64, [u8; 32])> = 'handshake: loop {
+        // `(segment start, anchor, genesis length)`.
+        let stream_lineage: Option<(u64, [u8; 32], Option<u64>)> = 'handshake: loop {
             if shutdown.load(Ordering::Relaxed) {
                 // Route through the loop top (via the `None` check
                 // below) rather than duplicating its teardown here.
@@ -1440,6 +1445,7 @@ where
                             start_sequence,
                             segment_start_sequence,
                             anchor_hash,
+                            genesis_entries,
                             epoch,
                             ack_policy,
                         } => {
@@ -1465,10 +1471,36 @@ where
                                 sleep_then_double_backoff(&mut backoff, shutdown, promote);
                                 break 'handshake None; // caught by the None check below
                             }
+                            // A replica with a journal already records its
+                            // lineage's genesis length; the primary's must
+                            // agree with it. Mirrors the kernel-TCP receiver.
+                            if pipeline.is_none()
+                                && let Err(e) = super::adopt_genesis_into_empty_unknown_journal(
+                                    &mut journal_writer,
+                                    (segment_start_sequence, anchor_hash, genesis_entries),
+                                )
+                            {
+                                fatal_err_dpdk!(e.into());
+                            }
+                            let local =
+                                match super::local_lineage_genesis(&pipeline, &journal_writer) {
+                                    Ok(local) => local,
+                                    Err(e) => fatal_err_dpdk!(e.into()),
+                                };
+                            if let Some(local) = local
+                                && let Err(e) =
+                                    super::check_advertised_genesis(local, genesis_entries)
+                            {
+                                fatal_err_dpdk!(e.into());
+                            }
                             fence_state.observe_epoch(epoch);
                             primary_ack_policy.store(ack_policy, Ordering::Release);
                             info!(start_sequence, epoch, "streaming started (DPDK)");
-                            break 'handshake Some((segment_start_sequence, anchor_hash));
+                            break 'handshake Some((
+                                segment_start_sequence,
+                                anchor_hash,
+                                genesis_entries,
+                            ));
                         }
                         ref resync @ (PrimaryMessage::NeedSnapshot
                         | PrimaryMessage::HashMismatch) => {
@@ -1495,12 +1527,17 @@ where
                                 Ok(ResyncDecision::Ready {
                                     segment_start_sequence,
                                     anchor_hash,
+                                    genesis_entries,
                                     resume_sequence,
                                 }) => {
                                     // DPDK resumes streaming from `last_sequence`
                                     // (the TCP path uses a separate `session_start`).
                                     last_sequence = resume_sequence;
-                                    break 'handshake Some((segment_start_sequence, anchor_hash));
+                                    break 'handshake Some((
+                                        segment_start_sequence,
+                                        anchor_hash,
+                                        genesis_entries,
+                                    ));
                                 }
                                 Ok(ResyncDecision::Retry) => {
                                     transport.close(handle);
@@ -1532,7 +1569,7 @@ where
 
         // `None` means the handshake loop exited via a failure path
         // (disconnect or snapshot error) — reconnect.
-        let Some((lineage_start, lineage_anchor)) = stream_lineage else {
+        let Some((lineage_start, lineage_anchor, lineage_genesis)) = stream_lineage else {
             continue;
         };
 
@@ -1551,9 +1588,15 @@ where
         // from the same identity makes the replica's segment
         // byte-identical to the primary's, and adopted `Rotate`
         // boundaries keep it that way across rotations (bitwise mirror).
+        // The header records the lineage's genesis length too, for the
+        // promotion check (see the kernel-TCP receiver).
         if pipeline.is_none() && journal_writer.is_none() {
-            let writer =
-                BufferedWriter::create_continuing(journal_path, lineage_start, lineage_anchor)?;
+            let writer = BufferedWriter::create_continuing(
+                journal_path,
+                lineage_start,
+                lineage_anchor,
+                lineage_genesis,
+            )?;
             app = Some(A::default());
             journal_writer = Some(writer);
         }

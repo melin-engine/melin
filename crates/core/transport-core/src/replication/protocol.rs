@@ -53,8 +53,12 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// 5 = `request_seq` dropped from the `InputBatch` slot header;
 /// 6 = each `InputBatch` slot carries its journal entry's CRC32C, which
 /// the replica verifies before accepting the entry. A v5 node would read
-/// the trailer as the next slot, so mixed pairs must not stream.
-pub const REPL_PROTOCOL_VERSION: u16 = 6;
+/// the trailer as the next slot, so mixed pairs must not stream;
+/// 7 = `StreamStart` carries the lineage's genesis length, which a
+/// replica records in its journal header (and checks against the one it
+/// already has). A v6 replica would ignore it and lose the promotion
+/// check it feeds, so mixed pairs must not stream.
+pub const REPL_PROTOCOL_VERSION: u16 = 7;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -111,6 +115,15 @@ pub enum PrimaryMessage {
         /// existing local state ignore it.
         segment_start_sequence: u64,
         anchor_hash: [u8; 32],
+        /// The lineage's genesis length, from the primary's journal
+        /// header (`melin_journal::FileHeaderInfo::genesis_entries`;
+        /// `None`: unknown, a lineage begun before the length was
+        /// recorded). Unlike the segment identity it concerns every
+        /// replica: a fresh one writes it into the journal it creates, so
+        /// it survives restarts and is there to check at promotion, and
+        /// one with a journal compares it with its own header's — two
+        /// known values that differ are a lineage error.
+        genesis_entries: Option<u64>,
         /// The primary's current fencing epoch. A replica that already
         /// observed a *higher* epoch refuses to follow this (stale) primary;
         /// a replica behind it adopts the epoch as the stream's `EpochBump`s
@@ -281,6 +294,12 @@ struct StreamStartFrame {
     anchor_hash: [u8; 32],
     epoch: U64,
     ack_policy: u8,
+    /// 1 when `genesis_entries` is known, 0 when it is not. A flag byte
+    /// rather than a sentinel value, so "unknown" can never be read as a
+    /// length; any other value is refused.
+    genesis_known: u8,
+    /// The lineage's genesis length; 0 when `genesis_known` is 0.
+    genesis_entries: U64,
 }
 
 /// Shared layout for the two `(sequence, hash)` stream-control frames:
@@ -301,7 +320,7 @@ const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
 const _: () = assert!(core::mem::size_of::<SnapshotBeginFrame>() == 49);
 const _: () = assert!(core::mem::size_of::<SnapshotEndFrame>() == 5);
 const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 10);
-const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 58);
+const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 67);
 const _: () = assert!(core::mem::size_of::<SeqHashFrame>() == 41);
 const _: () = assert!(core::mem::size_of::<SegmentSeedBeginFrame>() == 9);
 
@@ -385,11 +404,13 @@ pub fn encode_auth_failed(buf: &mut Vec<u8>) {
 /// replica's segment is byte-identical to the primary's, and rotation
 /// being primary-driven (`Rotate` frames) keeps every later segment
 /// boundary aligned too: a healthy replica's journal is a bitwise
-/// mirror.
+/// mirror. `genesis_entries` is the lineage's genesis length from the
+/// same header (see [`PrimaryMessage::StreamStart`]).
 pub fn encode_stream_start(
     start_sequence: u64,
     segment_start_sequence: u64,
     anchor_hash: [u8; 32],
+    genesis_entries: Option<u64>,
     epoch: u64,
     ack_policy: u8,
     buf: &mut Vec<u8>,
@@ -401,6 +422,8 @@ pub fn encode_stream_start(
         anchor_hash,
         epoch: U64::new(epoch),
         ack_policy,
+        genesis_known: u8::from(genesis_entries.is_some()),
+        genesis_entries: U64::new(genesis_entries.unwrap_or(0)),
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -631,10 +654,20 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
                     core::mem::size_of::<StreamStartFrame>()
                 ))
             })?;
+            let genesis_entries = match frame.genesis_known {
+                0 => None,
+                1 => Some(frame.genesis_entries.get()),
+                other => {
+                    return Err(io::Error::other(format!(
+                        "StreamStart genesis flag {other} is neither 0 nor 1"
+                    )));
+                }
+            };
             Ok(PrimaryMessage::StreamStart {
                 start_sequence: frame.start_sequence.get(),
                 segment_start_sequence: frame.segment_start_sequence.get(),
                 anchor_hash: frame.anchor_hash,
+                genesis_entries,
                 epoch: frame.epoch.get(),
                 ack_policy: frame.ack_policy,
             })
@@ -692,5 +725,96 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
         other => Err(io::Error::other(format!(
             "unknown primary message type: 0x{other:02x}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream_start(genesis_entries: Option<u64>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_stream_start(9, 1, [0x77; 32], genesis_entries, 4, 2, &mut buf);
+        buf
+    }
+
+    /// The genesis length rides `StreamStart` — known, zero (known: no
+    /// genesis) and unknown each arrive as sent.
+    #[test]
+    fn stream_start_carries_the_genesis_length() {
+        for sent in [Some(0), Some(5), Some(u64::MAX), None] {
+            let frame = stream_start(sent);
+            match decode_primary_message(&frame[4..]).unwrap() {
+                PrimaryMessage::StreamStart {
+                    start_sequence,
+                    segment_start_sequence,
+                    anchor_hash,
+                    genesis_entries,
+                    epoch,
+                    ack_policy,
+                } => {
+                    assert_eq!(genesis_entries, sent);
+                    assert_eq!(
+                        (start_sequence, segment_start_sequence, anchor_hash),
+                        (9, 1, [0x77; 32])
+                    );
+                    assert_eq!((epoch, ack_policy), (4, 2));
+                }
+                other => panic!("expected StreamStart, got {other:?}"),
+            }
+        }
+    }
+
+    /// The flag byte is either 0 or 1: anything else is a malformed frame,
+    /// never a guess at whether the length is known.
+    #[test]
+    fn a_stream_start_with_a_bad_genesis_flag_is_refused() {
+        let mut frame = stream_start(Some(3));
+        let flag_at = 4 + core::mem::size_of::<StreamStartFrame>() - 9;
+        assert_eq!(frame[flag_at], 1);
+        frame[flag_at] = 2;
+        let err = decode_primary_message(&frame[4..]).expect_err("flag 2 is refused");
+        assert!(err.to_string().contains("genesis flag"), "{err}");
+    }
+
+    /// A v6 primary's `StreamStart` lacks the genesis length: refused as
+    /// too short, with the upgrade advice, rather than read as unknown.
+    #[test]
+    fn a_v6_stream_start_is_refused() {
+        let frame = stream_start(Some(3));
+        let v6_len = core::mem::size_of::<StreamStartFrame>() - 9;
+        let err = decode_primary_message(&frame[4..4 + v6_len]).expect_err("short frame");
+        assert!(
+            err.to_string()
+                .contains("incompatible replication protocol"),
+            "{err}"
+        );
+    }
+
+    /// The primary refuses a replica speaking another protocol version,
+    /// naming both — v6 in particular, which would ignore the genesis
+    /// length this version's `StreamStart` carries.
+    #[test]
+    fn a_handshake_from_another_protocol_version_is_refused() {
+        let mut buf = Vec::new();
+        encode_handshake(
+            &Handshake {
+                last_sequence: 3,
+                chain_hash: [1; 32],
+                epoch: 0,
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            decode_replica_message(&buf[4..]).unwrap(),
+            ReplicaMessage::Handshake(_)
+        ));
+        assert_eq!(REPL_PROTOCOL_VERSION, 7);
+
+        let version_at = buf.len() - 2;
+        buf[version_at..].copy_from_slice(&6u16.to_le_bytes());
+        let err = decode_replica_message(&buf[4..]).expect_err("v6 replica");
+        let msg = err.to_string();
+        assert!(msg.contains("v6") && msg.contains("v7"), "{msg}");
     }
 }

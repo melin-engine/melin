@@ -1,11 +1,12 @@
 //! The sizing contract, end to end: what a node passes as its
 //! application's sizing reaches `Application::prefault` on that node, on
 //! every instance the node builds, before the instance serves — and
-//! never anywhere else. A primary gets its own sizing once at boot, on
-//! the state it starts from; a replica gets its own, not the primary's,
-//! before the first streamed event is applied; a node recovering a
-//! journal, primary or replica, gets it before the replay, so nothing is
-//! replayed into unsized collections, and again on the recovered state.
+//! never anywhere else. A replica gets its own sizing, not the
+//! primary's, before the first streamed event is applied; a node
+//! recovering a journal, primary or replica, gets it before the replay,
+//! so nothing is replayed into unsized collections, and again on the
+//! recovered state. A new primary is one of those: its journal is
+//! created with the genesis in it and then recovered.
 //!
 //! A primary and one replica (a counter wrapped to observe its sizing,
 //! `disk` ack policy) over real TCP, then both restarted on their own
@@ -303,19 +304,26 @@ fn every_node_sizes_its_own_instances_before_serving() {
         &replica_shutdown,
     );
 
-    // --- The primary served: sized once, with its own sizing, on the
-    // genesis state — before the genesis events, which reach it through
-    // the pipeline like any other. ---
+    // --- The primary served, sized with its own sizing as a recovering
+    // primary is: its new journal is created with the genesis in it, so
+    // the genesis reaches the state by replay — sized on the genesis
+    // instance before that replay, then again on the result. ---
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let mut conn = connect(primary_client, &client_key);
     assert_eq!(value_of(&mut conn), GENESIS, "genesis applied");
     assert_eq!(
         primary_sizing.calls(),
-        vec![Sized {
-            reserve_for: PRIMARY_RESERVE,
-            value: 0,
-        }],
-        "the primary is sized once at boot, on the state it starts from"
+        vec![
+            Sized {
+                reserve_for: PRIMARY_RESERVE,
+                value: 0,
+            },
+            Sized {
+                reserve_for: PRIMARY_RESERVE,
+                value: GENESIS,
+            },
+        ],
+        "a new primary is sized before its genesis is applied and again before it serves"
     );
 
     // --- The replica streamed both events: sized once, with its own
@@ -344,7 +352,7 @@ fn every_node_sizes_its_own_instances_before_serving() {
     stop_node(primary, &primary_shutdown, primary_client);
     assert_eq!(
         primary_sizing.calls().len(),
-        1,
+        2,
         "nothing sizes the primary again while it serves"
     );
 

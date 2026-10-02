@@ -2917,7 +2917,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let tmp = dir.path().join("body.tmp");
             // A StreamStart where a chunk/end belongs.
-            let stray = payload(|b| encode_stream_start(0, 1, [0u8; 32], 0, 1, b));
+            let stray = payload(|b| encode_stream_start(0, 1, [0u8; 32], Some(0), 0, 1, b));
             let mut src = source(vec![stray]);
 
             let err = receive_chunked_body(&mut src, &tmp, 4, "snapshot").unwrap_err();

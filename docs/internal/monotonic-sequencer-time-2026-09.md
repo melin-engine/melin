@@ -18,10 +18,16 @@ Findings that confirm, sharpen or correct the roadmap entry.
 
 - **The input ring has one producer at a time, handed off in sequence.**
   On a primary, `run_as_primary` publishes the promotion `EpochBump` and
-  then the startup events (`journal_startup_events`) through
-  `input_producer`, then moves that producer into the reader thread
-  (`spawn_reader`) or the DPDK poll loop (`run_dpdk_poll`). Nothing
-  publishes concurrently. The roadmap's open design question (how the
+  then the `on_primary` startup events (`journal_on_primary_events`)
+  through `input_producer`, then moves that producer into the reader
+  thread (`spawn_reader`) or the DPDK poll loop (`run_dpdk_poll`).
+  Nothing publishes concurrently. Genesis is the one exception to "every
+  journaled event goes through the producer": `init_engine` writes it
+  into a new journal before the pipeline exists
+  (`journaled_app::write_genesis_journal`), every event stamped with one
+  wall-clock read, so the clock's design must cover it separately: its
+  stamps are the first of the lineage, and the floor the primary's clock
+  is later seeded from (step 2) starts at them. The roadmap's open design question (how the
   producers other than the reader share one last-issued value) therefore
   has a simple answer: the clock travels with the producer.
 - **Client events are published through the ring's batch API.**
@@ -431,10 +437,11 @@ over accurate), but the operator and the application author must know:
 
 The new replay rule refuses what format-15 journals written by `main`
 contain, and the `Tick` layout changes in both the journal and the
-replication stream (step 4). Format 16 and protocol 6 turn a misleading
+replication stream (step 4). Format 17 and protocol 8 (the recorded
+genesis length took format 16 and protocol 7) turn a misleading
 failure into the refusal an older build's journal or peer should get
 (`UnsupportedVersion`, a handshake refusal). Released users are
-unaffected: 0.17 writes format 14, so they cross 14 to 16 in the one
+unaffected: 0.17 writes format 14, so they cross 14 to 17 in the one
 migration the CHANGELOG already describes (snapshot on the old version,
 deploy, start on a fresh journal).
 
@@ -446,8 +453,11 @@ One commit per step, each reviewable on its own.
    `SequencerClock` with its compile-time time source and the jump
    guard (decision 5, without the admin command yet), and the producer
    wrapper over `publish`, `try_publish` and the batch API. The reader,
-   the DPDK poll loop, `journal_startup_events`, the epoch bump and the
-   test helpers publish through it, and the frame decoder stops
+   the DPDK poll loop, `journal_on_primary_events`, the epoch bump and
+   the test helpers publish through it (genesis, written by
+   `write_genesis_journal` before the producer exists, takes the clock's
+   rule directly: equal stamps within it must become strictly
+   increasing), and the frame decoder stops
    stamping. Replaces the separate tick clamp state in `tick.rs`,
    `reader.rs` and `dpdk_transport.rs`. Seeded at zero for now, so the
    only behaviour changes are strict increase within one process
@@ -464,7 +474,7 @@ One commit per step, each reviewable on its own.
    it), the typed error through the journal stage and the replica's
    distinct fatal exit, reader validation within a segment, and the
    boundary check in recovery carried from the walk. Bumps the journal
-   format to 16.
+   format to 17.
    Must not land before step 2: with the floor not yet carried across a
    restart, the first entry after a clock step back would be refused.
    Carries most of the test churn, since many tests hand-build slots
@@ -525,7 +535,7 @@ One commit per step, each reviewable on its own.
    reader row in `docs/pipeline-architecture.md`; the operator notes of
    decision 6; `CLOCK-ACCEPT` beside the other admin commands in
    `docs/replication.md`; CHANGELOG under
-   Unreleased (the format-15 and protocol-5 entries become 16 and 6);
+   Unreleased (the format-16 and protocol-7 entries become 17 and 8);
    the note in
    [application-api-review-2026-09.md](application-api-review-2026-09.md);
    remove the roadmap entry.

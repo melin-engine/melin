@@ -10,6 +10,7 @@
 //! | sequence         | u64      | 8     | Journal sequence at snapshot   |
 //! | chain_hash       | [u8; 32] | 32    | BLAKE3 hash chain state        |
 //! | epoch            | u64      | 8     | Fencing epoch at snapshot       |
+//! | genesis_entries  | u64      | 8     | Entries the lineage's genesis occupies (v3) |
 //! | app_payload      | var      | var   | Bytes from `A::snapshot`       |
 //! | crc32c           | u32      | 4     | CRC32C over everything above   |
 //!
@@ -17,6 +18,11 @@
 //! CRC) and the application owns the payload bytes. Atomic file rename
 //! keeps the snapshot crash-safe: the `.tmp` file is fully written and
 //! fsynced before the rename.
+//!
+//! `genesis_entries` is the journal header's lineage metadata of the
+//! same name (see `melin_journal::FileHeaderInfo::genesis_entries`),
+//! carried so a node that boots from the snapshot alone — no journal
+//! segment left to read it from — starts its new segment with it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -36,10 +42,22 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 // strict `FORMAT_VERSION` gate (where replay semantics could silently
 // change), the v1 layout is a strict prefix of v2, so the best-effort
 // decode is unambiguous.
-const TRANSPORT_VERSION: u16 = 2;
+//
+// v3 appended `genesis_entries` after `epoch`, the same way. A v2 (or
+// v1) file reads with the genesis length unknown, as the journal reads a
+// v15 header; and a snapshot of a lineage whose length is unknown is
+// still written as v2, which has no field to hold one, so the layout
+// tracks the lineage's journal headers rather than the build.
+const TRANSPORT_VERSION: u16 = 3;
+const TRANSPORT_VERSION_V2: u16 = 2;
 const TRANSPORT_VERSION_V1: u16 = 1;
 const HEADER_SIZE_V1: usize = 4 + 2 + 2 + 8 + 32; // magic + t_ver + a_ver + seq + hash
-const HEADER_SIZE: usize = HEADER_SIZE_V1 + 8; // v2 appends the epoch
+const HEADER_SIZE_V2: usize = HEADER_SIZE_V1 + 8; // v2 appends the epoch
+const HEADER_SIZE: usize = HEADER_SIZE_V2 + 8; // v3 appends genesis_entries
+
+/// The largest header any version has — what a reader that wants the
+/// header alone must read.
+pub const MAX_HEADER_SIZE: usize = HEADER_SIZE;
 const CRC_SIZE: usize = 4;
 const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -148,6 +166,10 @@ pub struct SnapshotHeader {
     /// fencing — exact, not approximate: a v1 snapshot can only have been
     /// taken before any promotion was journaled.
     pub epoch: u64,
+    /// The lineage's genesis length, as the journal header records it
+    /// (`melin_journal::FileHeaderInfo::genesis_entries`). `None` for v1
+    /// and v2 files — unknown, never "no genesis".
+    pub genesis_entries: Option<u64>,
     /// Bytes the header occupies in this file (version-dependent). The
     /// app payload starts at this offset.
     pub len: usize,
@@ -155,8 +177,9 @@ pub struct SnapshotHeader {
 
 impl SnapshotHeader {
     /// Decode and validate the framing header at the start of `bytes`.
-    /// Accepts transport versions 1 (no epoch) and 2. Does not touch the
-    /// app payload or the trailing CRC — callers own those checks.
+    /// Accepts transport versions 1 (no epoch), 2 (no genesis length)
+    /// and 3. Does not touch the app payload or the trailing CRC —
+    /// callers own those checks.
     pub fn parse(bytes: &[u8]) -> Result<Self, SnapshotError> {
         if bytes.len() < HEADER_SIZE_V1 {
             return Err(SnapshotError::Truncated);
@@ -178,6 +201,7 @@ impl SnapshotHeader {
         );
         let len = match transport_version {
             TRANSPORT_VERSION_V1 => HEADER_SIZE_V1,
+            TRANSPORT_VERSION_V2 => HEADER_SIZE_V2,
             TRANSPORT_VERSION => HEADER_SIZE,
             other => return Err(SnapshotError::UnsupportedTransportVersion(other)),
         };
@@ -205,11 +229,19 @@ impl SnapshotHeader {
                     .expect("epoch slice size fixed by header layout"),
             )
         };
+        let genesis_entries = (transport_version == TRANSPORT_VERSION).then(|| {
+            u64::from_le_bytes(
+                bytes[56..64]
+                    .try_into()
+                    .expect("genesis_entries slice size fixed by header layout"),
+            )
+        });
         Ok(Self {
             app_version,
             sequence,
             chain_hash,
             epoch,
+            genesis_entries,
             len,
         })
     }
@@ -223,11 +255,15 @@ impl SnapshotHeader {
 /// `journal_sequence` is the recovery resume point — typed [`WireSeq`]
 /// because recording any other space (e.g. a ring position) here would
 /// make recovery replay already-applied events on top of restored state.
+///
+/// `genesis_entries` is the lineage's genesis length from the journal
+/// header; `None` (unknown) writes a v2 file, which has no field for it.
 pub fn save<A: Application>(
     app: &A,
     journal_sequence: WireSeq,
     chain_hash: [u8; 32],
     epoch: u64,
+    genesis_entries: Option<u64>,
     path: &Path,
 ) -> Result<(), SnapshotError> {
     save_with_limit::<A>(
@@ -235,6 +271,7 @@ pub fn save<A: Application>(
         journal_sequence,
         chain_hash,
         epoch,
+        genesis_entries,
         path,
         MAX_SNAPSHOT_SIZE,
     )
@@ -247,17 +284,25 @@ fn save_with_limit<A: Application>(
     journal_sequence: WireSeq,
     chain_hash: [u8; 32],
     epoch: u64,
+    genesis_entries: Option<u64>,
     path: &Path,
     max_size: u64,
 ) -> Result<(), SnapshotError> {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let transport_version = match genesis_entries {
+        Some(_) => TRANSPORT_VERSION,
+        None => TRANSPORT_VERSION_V2,
+    };
     // Transport header.
     buf.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
-    buf.extend_from_slice(&TRANSPORT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&transport_version.to_le_bytes());
     buf.extend_from_slice(&A::APP_VERSION.to_le_bytes());
     buf.extend_from_slice(&journal_sequence.get().to_le_bytes());
     buf.extend_from_slice(&chain_hash);
     buf.extend_from_slice(&epoch.to_le_bytes());
+    if let Some(genesis_entries) = genesis_entries {
+        buf.extend_from_slice(&genesis_entries.to_le_bytes());
+    }
     // App payload.
     app.snapshot(&mut buf)?;
     // CRC over everything written so far.
@@ -336,8 +381,16 @@ fn save_with_limit<A: Application>(
 /// Load a snapshot from `path`. Returns the restored application plus
 /// the journal sequence, chain hash, and fencing epoch recorded at save
 /// time so the caller can resume the journal from the right spot and seed
-/// its observed epoch.
+/// its observed epoch. [`load_with_header`] returns the whole header,
+/// genesis length included.
 pub fn load<A: Application>(path: &Path) -> Result<(A, u64, [u8; 32], u64), SnapshotError> {
+    let (app, header) = load_with_header::<A>(path)?;
+    Ok((app, header.sequence, header.chain_hash, header.epoch))
+}
+
+/// [`load`], returning the restored application with the snapshot's
+/// whole [`SnapshotHeader`].
+pub fn load_with_header<A: Application>(path: &Path) -> Result<(A, SnapshotHeader), SnapshotError> {
     let mut file = File::open(path)?;
     let file_size = file.seek(SeekFrom::End(0))?;
     if file_size > MAX_SNAPSHOT_SIZE {
@@ -373,8 +426,8 @@ pub fn load<A: Application>(path: &Path) -> Result<(A, u64, [u8; 32], u64), Snap
         return Err(SnapshotError::UnsupportedAppVersion(header.app_version));
     }
     if header.len > data_end {
-        // A v2 header that overlaps the CRC region — only reachable for a
-        // payload-less v2 file whose size passed the v1 minimum above.
+        // A v2/v3 header that overlaps the CRC region — only reachable
+        // for a payload-less file whose size passed the v1 minimum above.
         return Err(SnapshotError::Truncated);
     }
 
@@ -389,7 +442,7 @@ pub fn load<A: Application>(path: &Path) -> Result<(A, u64, [u8; 32], u64), Snap
         return Err(SnapshotError::UnreadPayload(payload.len()));
     }
 
-    Ok((app, header.sequence, header.chain_hash, header.epoch))
+    Ok((app, header))
 }
 
 #[cfg(test)]
@@ -402,6 +455,8 @@ mod tests {
     /// header fields and trailing app payload. Used by negative-path tests
     /// so each test can vary exactly one field while the CRC stays correct
     /// (i.e. the failure must come from the semantic check, not the CRC).
+    /// A current-version file gets a genesis length of 0; any other
+    /// version gets the v2 layout.
     fn craft_snapshot(
         magic: u32,
         transport_version: u16,
@@ -418,6 +473,9 @@ mod tests {
         buf.extend_from_slice(&sequence.to_le_bytes());
         buf.extend_from_slice(&chain_hash);
         buf.extend_from_slice(&epoch.to_le_bytes());
+        if transport_version == TRANSPORT_VERSION {
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
         buf.extend_from_slice(app_payload);
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
@@ -445,13 +503,40 @@ mod tests {
         // save/load today, just an intent guard).
         for (label, chain) in [("populated", [0xCDu8; 32]), ("zero sentinel", [0u8; 32])] {
             let path = dir.path().join(format!("snap.{label}"));
-            save::<TestApp>(&app, WireSeq::new(999), chain, 7, &path).unwrap();
+            save::<TestApp>(&app, WireSeq::new(999), chain, 7, Some(4), &path).unwrap();
 
             let (restored, seq, ch, epoch) = load::<TestApp>(&path).unwrap();
             assert_eq!(seq, 999, "{label}");
             assert_eq!(ch, chain, "{label}");
             assert_eq!(epoch, 7, "{label}");
             assert_eq!(restored, app, "{label}");
+        }
+    }
+
+    /// The genesis length round-trips, a known one as v3 and an unknown
+    /// one as v2 (which has no field for it); a v2 file reads back with
+    /// the length unknown, never as "no genesis".
+    #[test]
+    fn genesis_length_round_trips_and_unknown_writes_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = populated_app();
+        for genesis_entries in [Some(0), Some(12), None] {
+            let path = dir.path().join(format!("snap.{genesis_entries:?}"));
+            save::<TestApp>(&app, WireSeq::new(5), [0x42; 32], 3, genesis_entries, &path).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+            let expected_version = if genesis_entries.is_some() { 3 } else { 2 };
+            assert_eq!(version, expected_version, "{genesis_entries:?}");
+
+            let (restored, header) = load_with_header::<TestApp>(&path).unwrap();
+            assert_eq!(restored, app);
+            assert_eq!(header.genesis_entries, genesis_entries);
+            assert_eq!(header.sequence, 5);
+            assert_eq!(header.epoch, 3);
+            assert_eq!(
+                SnapshotHeader::parse(&bytes).unwrap().genesis_entries,
+                genesis_entries
+            );
         }
     }
 
@@ -464,7 +549,7 @@ mod tests {
         let app = populated_app();
 
         // First save — no previous snapshot exists; `.prev` is not created.
-        save::<TestApp>(&app, WireSeq::new(1), [0x11; 32], 0, &path).unwrap();
+        save::<TestApp>(&app, WireSeq::new(1), [0x11; 32], 0, Some(0), &path).unwrap();
         assert!(path.exists());
         assert!(
             !prev_path.exists(),
@@ -473,7 +558,7 @@ mod tests {
         let first_bytes = std::fs::read(&path).unwrap();
 
         // Second save — previous snapshot must be rotated to .prev verbatim.
-        save::<TestApp>(&app, WireSeq::new(2), [0x22; 32], 0, &path).unwrap();
+        save::<TestApp>(&app, WireSeq::new(2), [0x22; 32], 0, Some(0), &path).unwrap();
         assert!(path.exists());
         assert!(prev_path.exists(), "second save must produce a .prev file");
         assert_eq!(
@@ -573,6 +658,7 @@ mod tests {
         assert_eq!(header.sequence, 777);
         assert_eq!(header.chain_hash, [0xCD; 32]);
         assert_eq!(header.epoch, 0);
+        assert_eq!(header.genesis_entries, None);
         assert_eq!(header.len, HEADER_SIZE_V1);
     }
 
@@ -629,7 +715,15 @@ mod tests {
     fn checksum_mismatch_detected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snap");
-        save::<TestApp>(&populated_app(), WireSeq::new(0), [0u8; 32], 0, &path).unwrap();
+        save::<TestApp>(
+            &populated_app(),
+            WireSeq::new(0),
+            [0u8; 32],
+            0,
+            Some(0),
+            &path,
+        )
+        .unwrap();
         // Flip one bit inside the payload region (after the header, before
         // the trailing CRC). The mutated byte recomputes to a different
         // CRC than the one written at save time.
@@ -666,29 +760,62 @@ mod tests {
             other => panic!("expected Truncated, got {other:?}"),
         }
 
-        // A v2 header cut off before its epoch field must also read as
-        // truncated, not as a short payload: the file passes the v1-size
-        // gate, so the version-aware header parse is what must catch it.
+        // A v2 header cut off before its epoch field, or a v3 one before
+        // its genesis length, must also read as truncated, not as a short
+        // payload: the file passes the v1-size gate, so the version-aware
+        // header parse is what must catch it.
+        for (version, cut) in [
+            (TRANSPORT_VERSION_V2, HEADER_SIZE_V2 - 4), // mid-epoch
+            (TRANSPORT_VERSION, HEADER_SIZE - 4),       // mid-genesis_entries
+        ] {
+            let bytes = craft_snapshot(
+                SNAP_MAGIC,
+                version,
+                TestApp::APP_VERSION,
+                0,
+                [0u8; 32],
+                0,
+                &[],
+            );
+            // Keep CRC validity out of the way: rewrite the trailing CRC
+            // over the truncated prefix so only the length check can fail.
+            let mut short = bytes[..cut].to_vec();
+            let crc = crc32c::crc32c(&short);
+            short.extend_from_slice(&crc.to_le_bytes());
+            std::fs::write(&path, &short).unwrap();
+            match load::<TestApp>(&path) {
+                Err(SnapshotError::Truncated) => {}
+                other => panic!("expected Truncated for cut-off v{version} header, got {other:?}"),
+            }
+        }
+    }
+
+    /// A v2 snapshot — what every release before v3 wrote — still loads,
+    /// with its epoch, and with the genesis length unknown.
+    #[test]
+    fn v2_snapshot_loads_with_an_unknown_genesis_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap.v2");
+        let app = populated_app();
+        let mut payload = Vec::new();
+        app.snapshot(&mut payload).unwrap();
         let bytes = craft_snapshot(
             SNAP_MAGIC,
-            TRANSPORT_VERSION,
+            TRANSPORT_VERSION_V2,
             TestApp::APP_VERSION,
-            0,
-            [0u8; 32],
-            0,
-            &[],
+            31,
+            [0x9A; 32],
+            6,
+            &payload,
         );
-        // Keep CRC validity out of the way: rewrite the trailing CRC over
-        // the truncated prefix so only the length check can fail.
-        let cut = HEADER_SIZE - 4; // mid-epoch
-        let mut short = bytes[..cut].to_vec();
-        let crc = crc32c::crc32c(&short);
-        short.extend_from_slice(&crc.to_le_bytes());
-        std::fs::write(&path, &short).unwrap();
-        match load::<TestApp>(&path) {
-            Err(SnapshotError::Truncated) => {}
-            other => panic!("expected Truncated for cut-off v2 header, got {other:?}"),
-        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (restored, header) = load_with_header::<TestApp>(&path).unwrap();
+        assert_eq!(restored, app);
+        assert_eq!(header.sequence, 31);
+        assert_eq!(header.epoch, 6);
+        assert_eq!(header.genesis_entries, None);
+        assert_eq!(header.len, HEADER_SIZE_V2);
     }
 
     #[test]
@@ -706,6 +833,7 @@ mod tests {
             WireSeq::new(0),
             [0u8; 32],
             0,
+            Some(0),
             &path,
             /* max_size */ 16,
         ) {

@@ -896,7 +896,7 @@ mod tests {
         forge_gap_entry(&live, 4); // expected 3, found 4
         std::fs::rename(&live, archive_path(&live, 1)).unwrap();
         // Recreate an (empty) live so the archive isn't the last word.
-        drop(BufferedWriter::<TestEvent>::create_continuing(&live, 5, [0u8; 32]).unwrap());
+        drop(BufferedWriter::<TestEvent>::create_continuing(&live, 5, [0u8; 32], Some(0)).unwrap());
 
         let err = verify_lineage::<TestEvent>(&live).unwrap_err();
         assert!(

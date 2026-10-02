@@ -33,6 +33,12 @@ const SHADOW_BATCH_SIZE: usize = 4096;
 /// [`FsyncState`] seqlock — only saved when the shadow's ring cursor
 /// matches the fsync boundary, guaranteeing the triple (app state,
 /// journal_seq, chain_hash) is self-consistent.
+///
+/// `genesis_entries` is the lineage's genesis length from the journal
+/// header, stamped into every snapshot so a boot from the snapshot alone
+/// still knows it. Constant for the stage's life: it is fixed when the
+/// lineage begins.
+#[allow(clippy::too_many_arguments)]
 pub fn run<A: Application>(
     mut consumer: ring::Consumer<InputSlot<A::Event>>,
     mut app: A,
@@ -42,6 +48,7 @@ pub fn run<A: Application>(
     shutdown: &AtomicBool,
     wait: WaitStrategy,
     initial_epoch: u64,
+    genesis_entries: Option<u64>,
 ) {
     // Scratch buffer for app methods that require a reports Vec.
     // Cleared after each call — shadow discards all reports.
@@ -92,7 +99,14 @@ pub fn run<A: Application>(
                     .tick(snapshot_interval, waiter.spinning())
                     .is_some()
             {
-                try_save_snapshot::<A>(&app, &consumer, &fsync_state, &snapshot_path, shadow_epoch);
+                try_save_snapshot::<A>(
+                    &app,
+                    &consumer,
+                    &fsync_state,
+                    &snapshot_path,
+                    shadow_epoch,
+                    genesis_entries,
+                );
             }
             waiter.idle();
             continue;
@@ -131,7 +145,14 @@ pub fn run<A: Application>(
 
         // Check if a snapshot is due.
         if snapshot_timer.tick(snapshot_interval, true).is_some() {
-            try_save_snapshot::<A>(&app, &consumer, &fsync_state, &snapshot_path, shadow_epoch);
+            try_save_snapshot::<A>(
+                &app,
+                &consumer,
+                &fsync_state,
+                &snapshot_path,
+                shadow_epoch,
+                genesis_entries,
+            );
         }
     }
 }
@@ -150,13 +171,21 @@ fn try_save_snapshot<A: Application>(
     fsync_state: &SeqLockReader<FsyncState>,
     path: &std::path::Path,
     epoch: u64,
+    genesis_entries: Option<u64>,
 ) {
     let state = fsync_state.load();
     // Both ring-index space — compare the raw positions.
     if state.input_ring_seq.get() != consumer.next_read() {
         return;
     }
-    match snapshot::save::<A>(app, state.journal_seq, state.chain_hash, epoch, path) {
+    match snapshot::save::<A>(
+        app,
+        state.journal_seq,
+        state.chain_hash,
+        epoch,
+        genesis_entries,
+        path,
+    ) {
         Ok(()) => {
             info!(
                 journal_seq = state.journal_seq.get(),
@@ -213,7 +242,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0, // initial_epoch
+                    0,       // initial_epoch
+                    Some(0), // genesis_entries
                 );
             })
             .unwrap();
@@ -260,7 +290,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0, // initial_epoch
+                    0,       // initial_epoch
+                    Some(0), // genesis_entries
                 );
             })
             .unwrap();
@@ -347,7 +378,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0, // initial_epoch
+                    0,       // initial_epoch
+                    Some(0), // genesis_entries
                 );
             })
             .unwrap();
@@ -423,7 +455,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0, // initial_epoch
+                    0,       // initial_epoch
+                    Some(0), // genesis_entries
                 );
             })
             .unwrap();
@@ -476,7 +509,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0, // initial_epoch
+                    0,       // initial_epoch
+                    Some(0), // genesis_entries
                 );
             })
             .unwrap();
@@ -573,7 +607,8 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     WaitStrategy::SpinThenYield,
-                    0, // initial_epoch
+                    0,       // initial_epoch
+                    Some(0), // genesis_entries
                 );
             })
             .unwrap();

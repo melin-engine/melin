@@ -573,13 +573,16 @@ fn handle_replica_connection<A: Application>(
     let catchup_end = if can_catch_up {
         // The lineage origin (oldest segment's header identity) lets a
         // fresh replica create a byte-identical journal before
-        // consuming the stream. Replicas with local state ignore it.
-        let (lineage_start, lineage_anchor) =
-            melin_transport_core::replication::catchup::lineage_origin(journal_path)?;
+        // consuming the stream; replicas with local state ignore it.
+        // The lineage's genesis length, from the same header, concerns
+        // every replica: a fresh one records it, one with a journal
+        // checks it against its own.
+        let origin = melin_transport_core::replication::catchup::lineage_origin(journal_path)?;
         encode_stream_start(
             handshake.last_sequence,
-            lineage_start,
-            lineage_anchor,
+            origin.starting_sequence,
+            origin.anchor_hash,
+            origin.genesis_entries,
             fence_state.epoch(),
             ack_policy.load(Ordering::Relaxed),
             &mut send_buf,
@@ -669,10 +672,11 @@ fn handle_replica_connection<A: Application>(
     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
 
     // Signal that this replica is ready to consume from the replication
-    // ring. The main thread waits on this before seeding test data.
-    // Must happen AFTER catch-up and overlap drain complete — otherwise
-    // seeding fills the replication ring faster than we can drain it,
-    // deadlocking the journal stage.
+    // ring. A primary that began a new history waits on this (its
+    // bring-up gate) before serving clients, so it must be set only
+    // AFTER catch-up and overlap drain complete: the first client write
+    // then finds a replica streaming live rather than one still catching
+    // up.
     replica_ready.store(true, Ordering::Release);
 
     let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);

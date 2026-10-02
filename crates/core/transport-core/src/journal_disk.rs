@@ -544,7 +544,7 @@ mod tests {
     }
 
     fn segment(dir: &std::path::Path) -> SegmentFile {
-        SegmentFile::create_continuing(&dir.join("test.journal"), 1, [0u8; 32]).unwrap()
+        SegmentFile::create_continuing(&dir.join("test.journal"), 1, [0u8; 32], Some(0)).unwrap()
     }
 
     fn submit(producer: &mut JournalWriteProducer, bytes: &[u8], meta: JournalWriteMeta) {
