@@ -21,7 +21,8 @@ use tracing::{debug, error};
 use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
 
-use crate::ack_policy::{AckPolicy, Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
+use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
+use crate::durability_gate::{DurabilityGate, GateInputs, GateOutcome};
 use crate::halt::{Refusal, RefusalQueue};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
@@ -282,24 +283,23 @@ pub fn run<A: Application>(
         #[cfg(test)]
         mut pause_after_control_drain,
     } = config;
-    // Resolve the starting policy from the shared atomic and derive the
-    // local Policy. The atomic is the single source of truth across the
-    // process lifetime; the response thread keeps a thread-local copy
-    // for cheap per-iteration use and rebuilds it when an admin
-    // `ACK-POLICY` command swaps the atomic. Initialise as DiskAndRam
-    // (the default policy) if the atomic ever holds a corrupted byte —
-    // better than panicking on a degraded process and matches the
-    // default operators see at boot.
-    let mut active_policy = AckPolicy::from_u8(
-        ack_policy.load(std::sync::atomic::Ordering::Relaxed),
-    )
-    .unwrap_or_else(|| {
-        tracing::error!(
-            "ack_policy atomic held a corrupted byte at startup; defaulting to disk+ram"
-        );
-        AckPolicy::DiskAndRam
-    });
-    let mut policy = active_policy.to_policy();
+    // The ack policy in force and the durability gate. The atomic is the
+    // single source of truth across the process lifetime; the gate keeps
+    // a thread-local copy for cheap per-iteration use and rebuilds it
+    // when an admin `ACK-POLICY` command swaps the atomic. Built here —
+    // before the first batch — so a degraded startup shows on `/healthz`
+    // and in the journal immediately. See `DurabilityGate`.
+    let mut gate = DurabilityGate::new(
+        GateInputs {
+            journal_persisted_wire_seq,
+            ack_policy,
+            replication_metrics,
+            replica_active,
+            utilization: Arc::clone(&utilization),
+            wait,
+        },
+        "response",
+    );
     // SINGLE_ISSUER: created and submitted from this thread only — the
     // kernel skips SQ locking and rejects cross-thread submission with
     // EEXIST instead of racing. Matches the journal/replication rings.
@@ -321,64 +321,12 @@ pub fn run<A: Application>(
 
     let mut encode_buf: EncodeBuf = [0u8; MAX_APP_FRAME];
 
-    // Cached durability position to avoid atomic reads on every slot.
-    // Initialised below from the policy's startup evaluation; updated
-    // via `evaluate_durability` on every gate iteration.
-    let mut cached_durable_pos: u64;
-
-    // Degradation logger. Tracks transitions, suppresses sub-second
-    // flap noise, and drives the `/healthz` `policy_degraded` gauge.
-    // See `DegradationLogger` for the full state machine. Initialised
-    // below from the policy's startup evaluation so an unsatisfiable
-    // policy (e.g. a primary that just lost both replicas while
-    // running `disk+ram` or `two-disks`) is visible immediately
-    // on `/healthz` and in the journal.
-    let startup_now = Instant::now();
-    let mut last_policy_check = startup_now;
-    /// Re-emit interval for the "still degraded" reminder.
-    const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
-    /// Cadence at which the idle path re-evaluates the policy. Bounds
-    /// the lag between a connection-state change and the `/healthz`
-    /// gauge / warn-log reflecting it. Cheap (a handful of atomic
-    /// loads + the policy evaluator) at this rate.
-    const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-    /// Cadence at which the gate-wait spin folds elapsed time into the
-    /// degraded-duration counter while the durability gate is stalled.
-    /// Tighter than the idle cadence — it bounds the boundary error when
-    /// a degradation begins or flips mid-wedge, which matters most for
-    /// short stalls. The accrual tick is gated by this period, but the
-    /// clock read behind it is gated by the `AmortizedTimer` mask, so the
-    /// effective resolution is `max(this, the mask's clock-read cadence)`.
-    /// The mask reads the clock ~every 6.5 ms at this spin's rate
-    /// (`AmortizedTimer::CHECK_MASK` is `2^16`), finer than the 10 ms
-    /// here, so this cadence is the binding one and is realized in full.
-    const GATE_ACCRUAL_INTERVAL: Duration = Duration::from_millis(10);
     /// Cadence at which the idle spin does its housekeeping *clock read*.
     /// The heartbeat scan, the policy re-check and the trace-stats flush
     /// each keep their own (coarser) interval; this only bounds how
     /// often the loop asks the clock what time it is, so it must stay at
     /// or below the finest of them (`trace::IDLE_FLUSH_INTERVAL`, 100 ms).
     const IDLE_HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(10);
-
-    // Initial evaluation so the cached durable position and the
-    // `/healthz` gauge reflect the cluster's startup shape before
-    // the first batch arrives.
-    let mut degraded_logger;
-    {
-        let journal_pos = journal_persisted_wire_seq.load();
-        let metrics_ref = replication_metrics.as_deref();
-        let active_ref = replica_active.as_ref();
-        let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
-        cached_durable_pos = status.durable_pos;
-        utilization
-            .policy_degraded
-            .store(status.degraded, Ordering::Relaxed);
-        degraded_logger = if status.degraded {
-            DegradationLogger::new_starting_degraded(startup_now, &policy)
-        } else {
-            DegradationLogger::new(startup_now)
-        };
-    }
 
     // Stage histograms registered with the global registry — see
     // `melin_transport_core::trace`. The four breakdown stages
@@ -529,14 +477,6 @@ pub fn run<A: Application>(
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
 
-    // Paces accrual ticks inside the durability gate-wait spin so the
-    // degraded-duration counter keeps advancing during a hard stall.
-    // Declared once at function scope (not per gate entry) so the normal
-    // gated path — entered briefly whenever durability lags by a few µs —
-    // pays no extra `Instant::now()`; the amortized mask only reads the
-    // clock once per ~1 M cumulative spin iterations.
-    let mut gate_accrual_timer = AmortizedTimer::new();
-
     // Input sequence of the last output slot handled. Refused writes are
     // released only where it changes — between two events' replies, never
     // inside one. `u64::MAX` is no event's sequence.
@@ -544,43 +484,8 @@ pub fn run<A: Application>(
 
     'run: loop {
         // Observe runtime policy swaps from the admin `ACK-POLICY`
-        // command. Relaxed load (single writer is the admin handler,
-        // single reader is this thread). When the byte changes,
-        // rebuild the local Policy and reset the cached durable
-        // position so the next gate evaluation starts from a clean
-        // slate under the new shape; log the transition for the audit
-        // trail. An unknown byte is treated as memory corruption: we
-        // log and keep the prior policy rather than silently downgrading.
-        let observed_byte = ack_policy.load(Ordering::Relaxed);
-        if observed_byte != active_policy.as_u8() {
-            match AckPolicy::from_u8(observed_byte) {
-                Some(next) => {
-                    tracing::info!(
-                        prev = active_policy.as_str(),
-                        next = next.as_str(),
-                        "ack policy swapped at runtime"
-                    );
-                    active_policy = next;
-                    policy = active_policy.to_policy();
-                    // The fresh policy may evaluate degraded/undegraded
-                    // differently against the same cluster shape; let
-                    // the next gate evaluation re-derive.
-                    cached_durable_pos = 0;
-                    // Re-seed the degradation logger so a transition
-                    // out of (or into) degraded under the new policy
-                    // surfaces immediately rather than waiting for the
-                    // sustained-state hold to roll over. Flushes accrual
-                    // first so pre-swap degraded time isn't dropped.
-                    degraded_logger.reseed(&utilization, Instant::now());
-                }
-                None => {
-                    tracing::error!(
-                        byte = observed_byte,
-                        "ack_policy atomic held a corrupted byte; retaining prior policy"
-                    );
-                }
-            }
-        }
+        // command — see `DurabilityGate::observe_policy_swap`.
+        gate.observe_policy_swap();
 
         if shutdown.load(Ordering::Relaxed) {
             // Fence: a superseded ex-primary must not acknowledge any
@@ -838,29 +743,11 @@ pub fn run<A: Application>(
                     }
                 }
 
-                // Re-evaluate the ack policy on a slow timer so
-                // the `policy_degraded` flag and the periodic warn track
-                // the cluster's real state even on an idle / quiet node.
-                // The gate-open block also calls `update_degraded_state`
-                // after each consumed batch; this is the equivalent for
-                // the no-batch path.
-                if now.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
-                    last_policy_check = now;
-                    let journal_pos = journal_persisted_wire_seq.load();
-                    let metrics_ref = replication_metrics.as_deref();
-                    let active_ref = replica_active.as_ref();
-                    let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
-                    degraded_logger.tick(
-                        &policy,
-                        &utilization,
-                        status.degraded,
-                        now,
-                        DEGRADED_LOG_INTERVAL,
-                    );
-                    // Cache the position so the next batch's gate sees a
-                    // fresh value rather than spinning from a stale cache.
-                    cached_durable_pos = status.durable_pos;
-                }
+                // Re-evaluate the ack policy on a slow timer so the
+                // `policy_degraded` flag and the periodic warn track the
+                // cluster's real state even on an idle / quiet node —
+                // the no-batch counterpart of `gate.after_batch()`.
+                gate.idle_recheck(now);
 
                 // Hand buffered latency samples to the stats registry
                 // while we have nothing better to do. Reuses the
@@ -992,9 +879,7 @@ pub fn run<A: Application>(
             #[cfg(feature = "tick-to-trade")]
             let mut gate_tracker = GateCrossTracker::new(slot.wire_seq);
 
-            if slot_needs_gate(slot, cached_durable_pos) {
-                let needed = slot.wire_seq;
-
+            if gate.needs_wait(slot) {
                 // Drain buffered sends before blocking, never after.
                 //
                 // The steady-state flush happens on the `count == 0`
@@ -1045,140 +930,19 @@ pub fn run<A: Application>(
                     }
                 }
 
-                // The gate waits on the journal-disk thread and the
-                // replication handlers — the exact threads a small box
-                // co-schedules with this one, so it waits the way every
-                // other wait does. A fresh waiter per gate entry: the
-                // spin budget is meant to cover one durability lag, not
-                // to carry over from the idle loop.
-                let mut gate_waiter = wait.waiter();
-                loop {
-                    // Inside the gate-wait loop, also observe a
-                    // policy swap. Without this, a batch whose gate
-                    // becomes structurally unsatisfiable (e.g. all
-                    // replicas die while a non-bypass slot is in
-                    // flight under `DiskAndRam`) would wedge the response
-                    // stage forever, even if an operator sends the
-                    // remediating `ACK-POLICY disk` — the outer loop
-                    // observation never gets a chance to run. The
-                    // relaxed load is ~1 cycle on x86; cheaper than
-                    // the wait below.
-                    let observed_byte = ack_policy.load(Ordering::Relaxed);
-                    if observed_byte != active_policy.as_u8()
-                        && let Some(next) = AckPolicy::from_u8(observed_byte)
-                    {
-                        tracing::info!(
-                            prev = active_policy.as_str(),
-                            next = next.as_str(),
-                            "ack policy swapped during gate wait"
-                        );
-                        active_policy = next;
-                        policy = active_policy.to_policy();
-                        // Flush accrual before re-seeding so the wedged-
-                        // degraded interval up to the swap isn't dropped.
-                        degraded_logger.reseed(&utilization, Instant::now());
-                    }
-
-                    // Observe shutdown here too, for the same reason: a
-                    // gate that cannot open — every replica gone under a
-                    // policy that needs one — held this thread until a
-                    // replica returned, and the shutdown sequence joins
-                    // it without a timeout. An operator restarting the
-                    // degraded node, or a fence (which co-sets
-                    // `shutdown`), hung the process. Straight back to the
-                    // top of the loop, where the shutdown branch decides
-                    // what to flush: this slot's reply, which the policy
-                    // never confirmed, is not appended, and the rest of
-                    // the batch goes with it. Those clients see a reset,
-                    // as after a crash, and reconcile on reconnect.
-                    if shutdown.load(Ordering::Relaxed) {
-                        continue 'run;
-                    }
-
-                    let journal_pos = journal_persisted_wire_seq.load();
-                    let metrics_ref = replication_metrics.as_deref();
-                    let active_ref = replica_active.as_ref();
-
-                    // The cross-tracker (traced builds only) samples the
-                    // replica cursor itself rather than sharing the
-                    // evaluation's read below: computing a standalone
-                    // replica cursor unconditionally spent four Acquire
-                    // loads per spin iteration on `ReplicationMetrics`,
-                    // the same cache line the replication sender writes
-                    // on every ack and every completed SEND. Gate
-                    // attribution does not re-read at all — it comes out
-                    // of `evaluate_gate`, from the same snapshot that
-                    // opens the gate.
+                // Shutdown while the gate is closed: straight back to the
+                // top of the loop, where the shutdown branch decides what
+                // to flush. This slot's reply, which the policy never
+                // confirmed, is not appended, and the rest of the batch
+                // goes with it. Those clients see a reset, as after a
+                // crash, and reconcile on reconnect.
+                if let GateOutcome::Shutdown = gate.wait_durable(
+                    slot.wire_seq,
+                    shutdown,
                     #[cfg(feature = "tick-to-trade")]
-                    gate_tracker.observe(
-                        journal_pos.get(),
-                        // The level the *active policy* gates replicas
-                        // on — in-memory under `disk+ram`, persisted under
-                        // `two-disks`. `None` when no clause is
-                        // replica-supplied (`disk`) and, transiently,
-                        // when the binding replica drops out of the
-                        // cursor view mid-wait. Passed through as-is so
-                        // the tracker can tell "no replica wait to
-                        // measure" from "the replica caught up".
-                        policy_replica_cursor(&policy, journal_pos, metrics_ref, active_ref),
-                        trace::mono_trace_ns(),
-                    );
-
-                    let (status, blocker) =
-                        evaluate_gate(&policy, needed, journal_pos, metrics_ref, active_ref);
-                    cached_durable_pos = status.durable_pos;
-                    utilization
-                        .policy_degraded
-                        .store(status.degraded, Ordering::Relaxed);
-
-                    // Accrue degraded time while wedged. The post-gate
-                    // tick attributes the whole wait to a single state, so
-                    // without this a healthy→degraded flip during the
-                    // wedge would be mis-charged. While the gate waiter
-                    // spins the clock read behind the tick is mask-gated,
-                    // landing only every ~65 k iterations
-                    // (`CHECK_MASK = 2^16`) regardless of the period
-                    // below; once it yields, each iteration already pays
-                    // a syscall and the read is unmasked.
-                    if gate_accrual_timer
-                        .tick(GATE_ACCRUAL_INTERVAL, gate_waiter.spinning())
-                        .is_some()
-                    {
-                        degraded_logger.tick(
-                            &policy,
-                            &utilization,
-                            status.degraded,
-                            Instant::now(),
-                            DEGRADED_LOG_INTERVAL,
-                        );
-                    }
-
-                    if cached_durable_pos >= needed {
-                        // Attribution: which subsystem supplied the
-                        // binding cursor, from the same snapshot that
-                        // opened the gate and against the policy
-                        // actually in force. Relaxed is fine — health
-                        // reads are infrequent.
-                        //
-                        // `None` is unreachable here: `needed >= 1`
-                        // inside this loop, and a degraded evaluation
-                        // pins `durable_pos` to 0, so an open gate
-                        // implies the policy was satisfiable and
-                        // attribution has a verdict. The no-op arm
-                        // keeps a metrics-only path from ever
-                        // panicking regardless.
-                        match blocker {
-                            Some(Blocker::Journal) => {
-                                utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Some(Blocker::Replication) => {
-                                utilization.gate_replication.fetch_add(1, Ordering::Relaxed);
-                            }
-                            None => {}
-                        }
-                        break;
-                    }
-                    gate_waiter.idle();
+                    &mut gate_tracker,
+                ) {
+                    continue 'run;
                 }
             }
 
@@ -1342,28 +1106,9 @@ pub fn run<A: Application>(
             unmark_dirty(conn_id, &mut dirty_connections);
         }
 
-        // Log degradation transitions / re-emit the reminder. Same
-        // logger the idle path uses; transitions are gated on a
-        // sustained-state hold so sub-second flap doesn't spam.
-        //
-        // Ticked after dispatch rather than before it, and off a fresh
-        // clock read: with the gate now evaluated per slot, a batch can
-        // span several waits, and `batch_now` was taken before the first
-        // of them. The accrual inside each wait already charges degraded
-        // time as it elapses; this tick decides transitions, so it wants
-        // the state and the timestamp as of the end of the batch.
-        let ticked_at = Instant::now();
-        let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
-        degraded_logger.tick(
-            &policy,
-            &utilization,
-            degraded_now,
-            ticked_at,
-            DEGRADED_LOG_INTERVAL,
-        );
-        // Bump the idle-path's check timestamp so we don't double-
-        // tick the logger when traffic stops.
-        last_policy_check = ticked_at;
+        // Log degradation transitions / re-emit the reminder — after
+        // dispatch, not before it. See `DurabilityGate::after_batch`.
+        gate.after_batch();
 
         #[cfg(feature = "latency-trace")]
         dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
