@@ -292,11 +292,12 @@ pub fn run_dpdk_poll<A: Application>(
                             connection_id: frame.connection_id,
                         });
                         id_to_handle.remove(&frame.connection_id);
-                        if let Some(mut removed) = connections[handle.index()].take() {
-                            removed.parse_buf.clear();
-                            parse_buf_pool.push(removed.parse_buf);
-                            connection_count -= 1;
-                        }
+                        release_slot(
+                            &mut connections,
+                            handle.index(),
+                            &mut parse_buf_pool,
+                            &mut connection_count,
+                        );
                     }
                 }
             };
@@ -460,11 +461,12 @@ pub fn run_dpdk_poll<A: Application>(
                     "DPDK: auth timeout, dropping connection"
                 );
                 transport.close(conn.handle);
-                if let Some(mut removed) = connections[idx].take() {
-                    removed.parse_buf.clear();
-                    parse_buf_pool.push(removed.parse_buf);
-                    connection_count -= 1;
-                }
+                release_slot(
+                    &mut connections,
+                    idx,
+                    &mut parse_buf_pool,
+                    &mut connection_count,
+                );
                 continue;
             }
 
@@ -481,11 +483,12 @@ pub fn run_dpdk_poll<A: Application>(
                     connection_id: conn.connection_id.0,
                 });
                 id_to_handle.remove(&conn.connection_id.0);
-                if let Some(mut removed) = connections[idx].take() {
-                    removed.parse_buf.clear();
-                    parse_buf_pool.push(removed.parse_buf);
-                    connection_count -= 1;
-                }
+                release_slot(
+                    &mut connections,
+                    idx,
+                    &mut parse_buf_pool,
+                    &mut connection_count,
+                );
                 continue;
             }
 
@@ -513,11 +516,12 @@ pub fn run_dpdk_poll<A: Application>(
                     }
                     transport.close(conn.handle);
                     id_to_handle.remove(&conn.connection_id.0);
-                    if let Some(mut removed) = connections[idx].take() {
-                        removed.parse_buf.clear();
-                        parse_buf_pool.push(removed.parse_buf);
-                        connection_count -= 1;
-                    }
+                    release_slot(
+                        &mut connections,
+                        idx,
+                        &mut parse_buf_pool,
+                        &mut connection_count,
+                    );
                 }
                 // Check idle timeout when no data was received. Throttled
                 // to avoid a per-poll `Instant::now()` via `elapsed()`.
@@ -536,11 +540,12 @@ pub fn run_dpdk_poll<A: Application>(
                         connection_id: conn.connection_id.0,
                     });
                     id_to_handle.remove(&conn.connection_id.0);
-                    if let Some(mut removed) = connections[idx].take() {
-                        removed.parse_buf.clear();
-                        parse_buf_pool.push(removed.parse_buf);
-                        connection_count -= 1;
-                    }
+                    release_slot(
+                        &mut connections,
+                        idx,
+                        &mut parse_buf_pool,
+                        &mut connection_count,
+                    );
                 }
                 continue;
             }
@@ -598,11 +603,12 @@ pub fn run_dpdk_poll<A: Application>(
                             connection_id: conn.connection_id.0,
                         });
                         id_to_handle.remove(&conn.connection_id.0);
-                        if let Some(mut removed) = connections[idx].take() {
-                            removed.parse_buf.clear();
-                            parse_buf_pool.push(removed.parse_buf);
-                            connection_count -= 1;
-                        }
+                        release_slot(
+                            &mut connections,
+                            idx,
+                            &mut parse_buf_pool,
+                            &mut connection_count,
+                        );
                         continue;
                     }
                 }
@@ -770,6 +776,28 @@ fn process_auth_frame(
     let _ = control_tx.send(ControlEvent::Connected {
         connection_id: conn.connection_id.0,
     });
+}
+
+/// Free a closed connection's slot: return its parse buffer to the pool
+/// (cleared, capacity kept) and release its `max_connections` count. A
+/// no-op on an empty slot, so a path that may already have released it
+/// stays balanced.
+///
+/// Only the slot: closing the socket, telling the response stage, and
+/// dropping the `id_to_handle` route stay with the caller, because which
+/// of those apply depends on how far the connection got.
+#[inline]
+fn release_slot(
+    connections: &mut [Option<ConnectionState>],
+    idx: usize,
+    parse_buf_pool: &mut Vec<Vec<u8>>,
+    connection_count: &mut usize,
+) {
+    if let Some(mut removed) = connections[idx].take() {
+        removed.parse_buf.clear();
+        parse_buf_pool.push(removed.parse_buf);
+        *connection_count -= 1;
+    }
 }
 
 /// Send an AuthFailed response and close the connection.
