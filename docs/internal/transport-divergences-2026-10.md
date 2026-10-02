@@ -47,12 +47,6 @@ with `read_exact` and has no such stall.
 
 So the same `max_connections` admits different populations.
 
-### Nonce source comment is wrong (comment only)
-
-`dpdk_transport.rs` says auth nonces "don't need CSPRNG-grade randomness".
-`client_auth.rs` requires a CSPRNG. `rand::rng()` is in fact a CSPRNG, so the
-code is fine and the comment contradicts the contract.
-
 ### Auth timeout defined twice (cosmetic)
 
 The 5 s client auth timeout is a literal in `server.rs` (per read, so up to

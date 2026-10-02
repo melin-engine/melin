@@ -196,10 +196,13 @@ pub fn run_dpdk_poll<A: Application>(
         .map(|_| Vec::with_capacity(MAX_FRAME_SIZE + 4))
         .collect();
 
-    // Fast PRNG for auth nonces. Seeded from OS entropy once at startup,
-    // then generates nonces without blocking. Auth nonces don't need
-    // CSPRNG-grade randomness — they prevent replay attacks within a
-    // session, not cryptographic key derivation.
+    // RNG for auth nonces. `rand::rng()` is a CSPRNG (ChaCha-based,
+    // seeded and periodically reseeded from OS entropy), as
+    // `client_auth::verify_client` requires: a predictable nonce would let
+    // a response be obtained in advance — signed by the client ahead of
+    // the challenge — and presented when that nonce is issued. It
+    // generates in user space, so the poll thread never blocks on a
+    // syscall per nonce.
     let mut rng = rand::rng();
 
     // Tick generator state. The DPDK poll thread is a tight busy-spin
@@ -345,9 +348,7 @@ pub fn run_dpdk_poll<A: Application>(
                 "DPDK: new connection, starting auth"
             );
 
-            // Generate a random nonce for the challenge. Uses a fast PRNG
-            // instead of getrandom to avoid blocking the poll thread on
-            // kernel entropy.
+            // Fresh random nonce for the challenge, from the CSPRNG above.
             let nonce: [u8; 32] = rng.random();
 
             // Send the Challenge frame immediately.
