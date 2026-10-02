@@ -1528,6 +1528,103 @@ where
     Ok(())
 }
 
+/// The replica's answer to a live `StreamStart` (not the post-snapshot
+/// one, which `handle_resync_verdict` validates itself).
+pub(in crate::replication) enum StreamStartVerdict {
+    /// The primary is behind this node's fencing epoch: a stale
+    /// ex-primary. Nothing was adopted; the caller drops the connection
+    /// and retries with backoff. The handshake already carried our higher
+    /// epoch, so the stale primary fences itself on its side.
+    StalePrimary,
+    /// Follow the primary. Its epoch and ack policy are adopted; the
+    /// lineage — `(segment start, anchor, genesis length)` — is what a
+    /// fresh replica creates its journal from.
+    Follow((u64, [u8; 32], Option<u64>)),
+}
+
+/// The fields of a live `StreamStart` that [`accept_stream_start`] acts
+/// on, grouped so both receivers hand them over by name rather than as a
+/// run of positional integers.
+pub(in crate::replication) struct StreamStart {
+    /// The sequence the primary resumes streaming from (logged only).
+    pub start_sequence: u64,
+    /// The primary's lineage: `(segment start, anchor, genesis length)`.
+    /// A tuple because it is handed back whole in
+    /// [`StreamStartVerdict::Follow`] and to the fresh-journal path.
+    pub lineage: (u64, [u8; 32], Option<u64>),
+    /// The primary's fencing epoch.
+    pub epoch: u64,
+    /// The primary's ack-policy byte, as carried on the wire.
+    pub ack_policy: u8,
+}
+
+/// Accept or refuse a primary's `StreamStart`, shared by the kernel-TCP
+/// and DPDK receivers so the two cannot drift on what following a
+/// primary means.
+///
+/// In order: refuse a primary behind our fencing epoch — following its
+/// divergent lineage on top of our more-current state would corrupt the
+/// journal — before anything is touched; record the primary's genesis
+/// length in an empty pre-upgrade journal; refuse a lineage whose genesis
+/// length disagrees with ours; then adopt the primary's epoch (streamed
+/// `EpochBump`s keep it current thereafter) and its ack policy
+/// (heartbeats keep it current mid-session).
+///
+/// An `Err` is fatal for the receive loop: the journal could not be read
+/// or rewritten, or the two journals do not share one lineage.
+///
+/// `transport` names the receiver (`"tcp"` or `"dpdk"`) in the refusal
+/// and streaming-started logs, so an operator running both can tell
+/// which path a line came from.
+pub(in crate::replication) fn accept_stream_start<A, W>(
+    start: StreamStart,
+    transport: &'static str,
+    pipeline: &Option<ReplicaPipelineHandles<A, W>>,
+    journal_writer: &mut Option<W>,
+    fence_state: &melin_transport_core::fence::FenceState,
+    control: &ReplicaControlPlane,
+) -> Result<StreamStartVerdict, Box<dyn std::error::Error>>
+where
+    A: Application,
+    W: JournalWrite<A::Event> + Send + 'static,
+{
+    let StreamStart {
+        start_sequence,
+        lineage,
+        epoch,
+        ack_policy,
+    } = start;
+    if fence_state.refuses_primary(epoch) {
+        tracing::warn!(
+            transport,
+            primary_epoch = epoch,
+            our_epoch = fence_state.epoch(),
+            "primary is behind our fencing epoch — refusing to follow stale primary"
+        );
+        return Ok(StreamStartVerdict::StalePrimary);
+    }
+    // A replica with a journal already records its lineage's genesis
+    // length; the primary's must agree with it.
+    if pipeline.is_none() {
+        adopt_genesis_into_empty_unknown_journal(journal_writer, lineage)?;
+    }
+    if let Some(local) = local_lineage_genesis(pipeline, journal_writer)? {
+        check_advertised_genesis(local, lineage.2)?;
+    }
+    fence_state.observe_epoch(epoch);
+    control
+        .primary_ack_policy
+        .store(ack_policy, Ordering::Release);
+    tracing::info!(
+        transport,
+        start_sequence,
+        epoch,
+        ack_policy,
+        "streaming started"
+    );
+    Ok(StreamStartVerdict::Follow(lineage))
+}
+
 /// Refuse to follow a primary whose lineage records a different genesis
 /// length than this replica's journal does.
 ///
@@ -1800,6 +1897,126 @@ mod tests {
         assert!(writer.is_some());
         assert_eq!(last, 1);
         assert!(!staging.exists(), "swept beside a journal with history");
+    }
+
+    /// A primary behind this node's fencing epoch is refused before
+    /// anything is adopted: not its epoch, not its ack policy, not its
+    /// genesis length into our journal.
+    #[test]
+    fn a_stale_primary_is_refused_before_anything_is_adopted() {
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("replica.journal");
+        let anchor = [9u8; 32];
+        let mut journal_writer =
+            Some(Writer::create_continuing(&path, 1, anchor, None).expect("create"));
+        let fence = melin_transport_core::fence::FenceState::new(5);
+        let control = ReplicaControlPlane::new();
+
+        let verdict = accept_stream_start::<counter_server::Counter, Writer>(
+            StreamStart {
+                start_sequence: 1,
+                lineage: (1, anchor, Some(3)),
+                epoch: 4,
+                ack_policy: crate::ack_policy::AckPolicy::Disk.as_u8(),
+            },
+            "test",
+            &None,
+            &mut journal_writer,
+            &fence,
+            &control,
+        )
+        .expect("a refusal is not an error");
+
+        assert!(matches!(verdict, StreamStartVerdict::StalePrimary));
+        assert_eq!(fence.epoch(), 5);
+        assert_eq!(
+            control.primary_ack_policy.load(Ordering::Acquire),
+            crate::ack_policy::ACK_POLICY_UNKNOWN
+        );
+        let header = journal_writer
+            .as_ref()
+            .expect("writer")
+            .read_header_info()
+            .expect("header");
+        assert_eq!(header.genesis_entries, None, "journal left untouched");
+    }
+
+    /// Following a primary adopts its epoch and ack policy, records its
+    /// genesis length in an empty pre-upgrade journal, and hands back the
+    /// lineage the fresh-journal path creates from.
+    #[test]
+    fn following_a_primary_adopts_its_epoch_policy_and_genesis() {
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("replica.journal");
+        let anchor = [9u8; 32];
+        let mut journal_writer =
+            Some(Writer::create_continuing(&path, 1, anchor, None).expect("create"));
+        let fence = melin_transport_core::fence::FenceState::new(5);
+        let control = ReplicaControlPlane::new();
+        let policy = crate::ack_policy::AckPolicy::Disk.as_u8();
+
+        let verdict = accept_stream_start::<counter_server::Counter, Writer>(
+            StreamStart {
+                start_sequence: 1,
+                lineage: (1, anchor, Some(3)),
+                epoch: 7,
+                ack_policy: policy,
+            },
+            "test",
+            &None,
+            &mut journal_writer,
+            &fence,
+            &control,
+        )
+        .expect("same lineage");
+
+        let StreamStartVerdict::Follow(lineage) = verdict else {
+            panic!("expected Follow");
+        };
+        assert_eq!(lineage, (1, anchor, Some(3)));
+        assert_eq!(fence.epoch(), 7);
+        assert_eq!(control.primary_ack_policy.load(Ordering::Acquire), policy);
+        let header = journal_writer
+            .as_ref()
+            .expect("writer")
+            .read_header_info()
+            .expect("header");
+        assert_eq!(header.genesis_entries, Some(3));
+    }
+
+    /// A primary whose genesis length disagrees with ours is fatal, and
+    /// its epoch is not adopted on the way out.
+    #[test]
+    fn a_disagreeing_genesis_length_is_fatal() {
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("replica.journal");
+        let anchor = [9u8; 32];
+        let mut journal_writer =
+            Some(Writer::create_continuing(&path, 1, anchor, Some(2)).expect("create"));
+        let fence = melin_transport_core::fence::FenceState::new(5);
+        let control = ReplicaControlPlane::new();
+
+        let err = accept_stream_start::<counter_server::Counter, Writer>(
+            StreamStart {
+                start_sequence: 1,
+                lineage: (1, anchor, Some(3)),
+                epoch: 7,
+                ack_policy: crate::ack_policy::AckPolicy::Disk.as_u8(),
+            },
+            "test",
+            &None,
+            &mut journal_writer,
+            &fence,
+            &control,
+        )
+        .err()
+        .expect("different lineages");
+
+        assert!(err.to_string().contains("refusing to follow the primary"));
+        assert_eq!(fence.epoch(), 5);
     }
 
     /// The handshake's local genesis length comes from the running

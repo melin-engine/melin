@@ -17,6 +17,7 @@ pub mod admin;
 mod buf_ring;
 pub mod client_auth;
 mod client_frames;
+mod durability_gate;
 pub mod halt;
 pub mod layout;
 pub mod process;

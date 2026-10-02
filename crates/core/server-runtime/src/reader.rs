@@ -43,6 +43,7 @@ pub type RequestDecoderArc<A> = Arc<dyn ErasedDecoder<<A as Application>::Event>
 use melin_app::unix_epoch_nanos;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
+use melin_transport_core::tick::TickSchedule;
 
 /// Size of each provided buffer. 4 KiB accommodates multiple frames per
 /// recv (frames are typically <100 bytes).
@@ -491,10 +492,11 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // heap allocation inside the hot loop.
     let mut stale: Vec<usize> = Vec::new();
 
-    // Tick generator state. `next_tick_deadline` is the monotonic instant the
-    // next `JournalEvent::Tick` should fire. `last_tick_ns` enforces strict
-    // monotonicity on the wall-clock timestamps published in those events
-    // (NTP can step the wall clock backwards). `tick_armed` tracks whether
+    // Tick generator state. `tick_schedule` holds the monotonic instant the
+    // next `JournalEvent::Tick` should fire and the floor that keeps the
+    // published wall-clock timestamps strictly monotonic (NTP can step the
+    // wall clock backwards) — shared with the DPDK poll thread, see
+    // `TickSchedule`. `tick_armed` tracks whether
     // an `IORING_OP_TIMEOUT` SQE is currently pending; we keep at most one.
     //
     // `tick_ts` lives across loop iterations because the kernel reads its
@@ -505,8 +507,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // same pattern: it stores Timespec as a long-lived struct field.)
     let tick_enabled = tick_cadence.is_some();
     let cadence = tick_cadence.unwrap_or(Duration::ZERO);
-    let mut next_tick_deadline = Instant::now() + cadence;
-    let mut last_tick_ns: u64 = 0;
+    let mut tick_schedule = TickSchedule::new(cadence, Instant::now());
     let mut tick_armed = false;
     // Arm the very first timeout here, before entering the loop. This both
     // (a) makes the initial `tick_ts` value actually read by the kernel
@@ -541,26 +542,16 @@ fn reader_loop<A: Application, R: AsRawFd>(
         // the timeout-arm so that a freshly-emitted tick re-arms a timeout for
         // the *new* deadline.
         if tick_enabled {
-            let now = Instant::now();
-            if now >= next_tick_deadline {
-                let raw_now_ns = unix_epoch_nanos();
-                let now_ns = melin_transport_core::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
-                last_tick_ns = now_ns;
-                melin_transport_core::tick::publish_tick(&mut producer, now_ns);
-                // Catch up rather than burst-emit if we fell badly behind.
-                let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
-                next_tick_deadline = if elapsed > cadence {
-                    Instant::now() + cadence
-                } else {
-                    next_tick_deadline + cadence
-                };
+            if tick_schedule.publish_if_due(Instant::now(), &mut producer) {
                 // The previous timeout (if any) is now stale; let it fire and
                 // be ignored, then arm a new one below.
                 tick_armed = false;
             }
 
             if !tick_armed {
-                let remaining = next_tick_deadline.saturating_duration_since(Instant::now());
+                let remaining = tick_schedule
+                    .next_deadline()
+                    .saturating_duration_since(Instant::now());
                 // Update the loop-scoped Timespec in place. The kernel reads
                 // it via the SQE's addr pointer on submit_and_wait below, so
                 // the binding must outlive that call (it does — outer scope).

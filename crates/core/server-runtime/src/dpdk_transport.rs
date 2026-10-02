@@ -45,6 +45,7 @@ use melin_app::unix_epoch_nanos;
 use melin_dpdk::transport::DpdkTransport;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
+use melin_transport_core::tick::TickSchedule;
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control::ConnectionId;
@@ -210,8 +211,7 @@ pub fn run_dpdk_poll<A: Application>(
     // making the per-iteration overhead unmeasurable.
     let tick_enabled = tick_cadence.is_some();
     let cadence = tick_cadence.unwrap_or(Duration::ZERO);
-    let mut next_tick_deadline = Instant::now() + cadence;
-    let mut last_tick_ns: u64 = 0;
+    let mut tick_schedule = TickSchedule::new(cadence, Instant::now());
     let mut tick_check_counter: u32 = 0;
     const TICK_CHECK_INTERVAL: u32 = 4096;
 
@@ -268,20 +268,9 @@ pub fn run_dpdk_poll<A: Application>(
             tick_check_counter = tick_check_counter.wrapping_add(1);
             if tick_check_counter >= TICK_CHECK_INTERVAL {
                 tick_check_counter = 0;
-                let now = Instant::now();
-                if now >= next_tick_deadline {
-                    let raw_now_ns = unix_epoch_nanos();
-                    let now_ns =
-                        melin_transport_core::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
-                    last_tick_ns = now_ns;
-                    melin_transport_core::tick::publish_tick(&mut producer, now_ns);
-                    let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
-                    next_tick_deadline = if elapsed > cadence {
-                        Instant::now() + cadence
-                    } else {
-                        next_tick_deadline + cadence
-                    };
-                }
+                // Nothing to re-arm on a published tick: the poll loop
+                // never sleeps, so the counter above is its only timer.
+                tick_schedule.publish_if_due(Instant::now(), &mut producer);
             }
         }
 
@@ -303,11 +292,12 @@ pub fn run_dpdk_poll<A: Application>(
                             connection_id: frame.connection_id,
                         });
                         id_to_handle.remove(&frame.connection_id);
-                        if let Some(mut removed) = connections[handle.index()].take() {
-                            removed.parse_buf.clear();
-                            parse_buf_pool.push(removed.parse_buf);
-                            connection_count -= 1;
-                        }
+                        release_slot(
+                            &mut connections,
+                            handle.index(),
+                            &mut parse_buf_pool,
+                            &mut connection_count,
+                        );
                     }
                 }
             };
@@ -471,11 +461,12 @@ pub fn run_dpdk_poll<A: Application>(
                     "DPDK: auth timeout, dropping connection"
                 );
                 transport.close(conn.handle);
-                if let Some(mut removed) = connections[idx].take() {
-                    removed.parse_buf.clear();
-                    parse_buf_pool.push(removed.parse_buf);
-                    connection_count -= 1;
-                }
+                release_slot(
+                    &mut connections,
+                    idx,
+                    &mut parse_buf_pool,
+                    &mut connection_count,
+                );
                 continue;
             }
 
@@ -492,11 +483,12 @@ pub fn run_dpdk_poll<A: Application>(
                     connection_id: conn.connection_id.0,
                 });
                 id_to_handle.remove(&conn.connection_id.0);
-                if let Some(mut removed) = connections[idx].take() {
-                    removed.parse_buf.clear();
-                    parse_buf_pool.push(removed.parse_buf);
-                    connection_count -= 1;
-                }
+                release_slot(
+                    &mut connections,
+                    idx,
+                    &mut parse_buf_pool,
+                    &mut connection_count,
+                );
                 continue;
             }
 
@@ -524,11 +516,12 @@ pub fn run_dpdk_poll<A: Application>(
                     }
                     transport.close(conn.handle);
                     id_to_handle.remove(&conn.connection_id.0);
-                    if let Some(mut removed) = connections[idx].take() {
-                        removed.parse_buf.clear();
-                        parse_buf_pool.push(removed.parse_buf);
-                        connection_count -= 1;
-                    }
+                    release_slot(
+                        &mut connections,
+                        idx,
+                        &mut parse_buf_pool,
+                        &mut connection_count,
+                    );
                 }
                 // Check idle timeout when no data was received. Throttled
                 // to avoid a per-poll `Instant::now()` via `elapsed()`.
@@ -547,11 +540,12 @@ pub fn run_dpdk_poll<A: Application>(
                         connection_id: conn.connection_id.0,
                     });
                     id_to_handle.remove(&conn.connection_id.0);
-                    if let Some(mut removed) = connections[idx].take() {
-                        removed.parse_buf.clear();
-                        parse_buf_pool.push(removed.parse_buf);
-                        connection_count -= 1;
-                    }
+                    release_slot(
+                        &mut connections,
+                        idx,
+                        &mut parse_buf_pool,
+                        &mut connection_count,
+                    );
                 }
                 continue;
             }
@@ -609,11 +603,12 @@ pub fn run_dpdk_poll<A: Application>(
                             connection_id: conn.connection_id.0,
                         });
                         id_to_handle.remove(&conn.connection_id.0);
-                        if let Some(mut removed) = connections[idx].take() {
-                            removed.parse_buf.clear();
-                            parse_buf_pool.push(removed.parse_buf);
-                            connection_count -= 1;
-                        }
+                        release_slot(
+                            &mut connections,
+                            idx,
+                            &mut parse_buf_pool,
+                            &mut connection_count,
+                        );
                         continue;
                     }
                 }
@@ -781,6 +776,28 @@ fn process_auth_frame(
     let _ = control_tx.send(ControlEvent::Connected {
         connection_id: conn.connection_id.0,
     });
+}
+
+/// Free a closed connection's slot: return its parse buffer to the pool
+/// (cleared, capacity kept) and release its `max_connections` count. A
+/// no-op on an empty slot, so a path that may already have released it
+/// stays balanced.
+///
+/// Only the slot: closing the socket, telling the response stage, and
+/// dropping the `id_to_handle` route stay with the caller, because which
+/// of those apply depends on how far the connection got.
+#[inline]
+fn release_slot(
+    connections: &mut [Option<ConnectionState>],
+    idx: usize,
+    parse_buf_pool: &mut Vec<Vec<u8>>,
+    connection_count: &mut usize,
+) {
+    if let Some(mut removed) = connections[idx].take() {
+        removed.parse_buf.clear();
+        parse_buf_pool.push(removed.parse_buf);
+        *connection_count -= 1;
+    }
 }
 
 /// Send an AuthFailed response and close the connection.

@@ -20,17 +20,17 @@ use melin_pipeline::ring;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 
-use crate::ack_policy::Blocker;
+use crate::durability_gate::{DurabilityGate, GateInputs, GateOutcome};
 use crate::halt::RefusalQueue;
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::DurableWireSeqCursor;
-use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
 
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
-use crate::response_frame::{EncodeBuf, MAX_APP_FRAME, frame_app_response};
+use crate::response_frame::{EncodeBuf, MAX_APP_FRAME, encode_slot_payload, frame_app_response};
 
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
@@ -130,18 +130,19 @@ pub fn run<A: Application>(
     // everything published before it is answered — see `crate::halt`.
     mut refusals: RefusalQueue<A::Report>,
 ) {
-    // Mirrors `response::run`: derive the local Policy from the shared
-    // policy atomic and observe runtime swaps from the admin
-    // `ACK-POLICY` command.
-    use crate::ack_policy::AckPolicy;
-    let mut active_policy =
-        AckPolicy::from_u8(ack_policy.load(Ordering::Relaxed)).unwrap_or_else(|| {
-            tracing::error!(
-                "ack_policy atomic held a corrupted byte at startup; defaulting to disk+ram (DPDK)"
-            );
-            AckPolicy::DiskAndRam
-        });
-    let mut policy = active_policy.to_policy();
+    // The ack policy in force and the durability gate — the same state
+    // machine the kernel response stage runs. See `DurabilityGate`.
+    let mut gate = DurabilityGate::new(
+        GateInputs {
+            journal_persisted_wire_seq,
+            ack_policy,
+            replication_metrics,
+            replica_active,
+            utilization: Arc::clone(&utilization),
+            wait,
+        },
+        "dpdk response",
+    );
     // Track known connections (for heartbeat scheduling).
     // FxHash over SipHash: keys are server-generated connection ids, never
     // attacker-chosen, so HashDoS resistance buys nothing and the default
@@ -161,42 +162,6 @@ pub fn run<A: Application>(
         buf[..written].to_vec()
     };
 
-    // Cached durability position (see response.rs for full explanation).
-    // Initialised below from the policy's startup evaluation.
-    let mut cached_durable_pos: u64;
-
-    // Degradation logger — same scheme as the TCP response stage
-    // (see `response::run`). Initialised below from an explicit
-    // policy evaluation so a degraded startup state shows up on
-    // `/healthz` and in the journal even before the first batch.
-    let startup_now = Instant::now();
-    let mut last_policy_check = startup_now;
-    const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
-    const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-    /// Gate-wait accrual cadence — see `response::run`. Tighter than the
-    /// idle policy-check cadence to bound boundary error on short stalls.
-    /// The `AmortizedTimer` mask reads the clock ~every 6.5 ms
-    /// (`CHECK_MASK = 2^16`), finer than this, so the 10 ms is realized.
-    const GATE_ACCRUAL_INTERVAL: Duration = Duration::from_millis(10);
-
-    let mut degraded_logger;
-    {
-        let journal_pos = journal_persisted_wire_seq.load();
-        let metrics_ref = replication_metrics.as_deref();
-        let active_ref = replica_active.as_ref();
-        let status =
-            crate::response::evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
-        cached_durable_pos = status.durable_pos;
-        utilization
-            .policy_degraded
-            .store(status.degraded, Ordering::Relaxed);
-        degraded_logger = if status.degraded {
-            crate::response::DegradationLogger::new_starting_degraded(startup_now, &policy)
-        } else {
-            crate::response::DegradationLogger::new(startup_now)
-        };
-    }
-
     // Pre-encode heartbeat frame (fixed-size, no heap allocation).
     let mut heartbeat_frame = [0u8; 8];
     let heartbeat_len = control_codec::encode_transport_response(
@@ -214,9 +179,6 @@ pub fn run<A: Application>(
     let mut waiter = wait.waiter();
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
-    // Paces accrual ticks inside the gate-wait spin. Function-scoped so
-    // the normal gated path pays no extra clock read — see `response::run`.
-    let mut gate_accrual_timer = AmortizedTimer::new();
     // Input sequence of the last output slot handled — refusals are
     // released only where it changes. See `response::run`.
     let mut last_input_seq = u64::MAX;
@@ -249,31 +211,8 @@ pub fn run<A: Application>(
 
     'run: loop {
         // Observe runtime policy swaps from the admin `ACK-POLICY`
-        // command. See `response::run` for the design rationale.
-        let observed_byte = ack_policy.load(Ordering::Relaxed);
-        if observed_byte != active_policy.as_u8() {
-            match AckPolicy::from_u8(observed_byte) {
-                Some(next) => {
-                    tracing::info!(
-                        prev = active_policy.as_str(),
-                        next = next.as_str(),
-                        "ack policy swapped at runtime (DPDK)"
-                    );
-                    active_policy = next;
-                    policy = active_policy.to_policy();
-                    cached_durable_pos = 0;
-                    // Flush accrual before re-seeding so pre-swap degraded
-                    // time isn't dropped.
-                    degraded_logger.reseed(&utilization, Instant::now());
-                }
-                None => {
-                    tracing::error!(
-                        byte = observed_byte,
-                        "ack_policy atomic held a corrupted byte; retaining prior policy (DPDK)"
-                    );
-                }
-            }
-        }
+        // command — see `DurabilityGate::observe_policy_swap`.
+        gate.observe_policy_swap();
 
         // Fencing note: a superseded ex-primary exits through this same
         // shutdown branch (`FenceState::fence_if_superseded` co-sets
@@ -376,26 +315,7 @@ pub fn run<A: Application>(
             // for the rationale.
             {
                 let now_ts = Instant::now();
-                if now_ts.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
-                    last_policy_check = now_ts;
-                    let journal_pos = journal_persisted_wire_seq.load();
-                    let metrics_ref = replication_metrics.as_deref();
-                    let active_ref = replica_active.as_ref();
-                    let status = crate::response::evaluate_durability(
-                        &policy,
-                        journal_pos,
-                        metrics_ref,
-                        active_ref,
-                    );
-                    degraded_logger.tick(
-                        &policy,
-                        &utilization,
-                        status.degraded,
-                        now_ts,
-                        DEGRADED_LOG_INTERVAL,
-                    );
-                    cached_durable_pos = status.durable_pos;
-                }
+                gate.idle_recheck(now_ts);
 
                 // Hand buffered latency samples to the stats registry
                 // while idle. Reuses the policy check's clock read —
@@ -473,105 +393,17 @@ pub fn run<A: Application>(
             // (the old `+1` compensated for the input-seq
             // off-by-(starting-1), which is gone now).
             //
-            if crate::response::slot_needs_gate(slot, cached_durable_pos) {
-                let needed = slot.wire_seq;
-                // Fresh waiter per gate entry — see `response::run`.
-                let mut gate_waiter = wait.waiter();
-                loop {
-                    // Observe a policy swap mid-gate-wait so a stuck
-                    // batch can be unblocked by an operator
-                    // `ACK-POLICY <policy>` command. See `response.rs`
-                    // for the rationale and ordering choice.
-                    let observed_byte = ack_policy.load(Ordering::Relaxed);
-                    if observed_byte != active_policy.as_u8()
-                        && let Some(next) = AckPolicy::from_u8(observed_byte)
-                    {
-                        tracing::info!(
-                            prev = active_policy.as_str(),
-                            next = next.as_str(),
-                            "ack policy swapped during gate wait (DPDK)"
-                        );
-                        active_policy = next;
-                        policy = active_policy.to_policy();
-                        // Flush accrual before re-seeding so the wedged-
-                        // degraded interval up to the swap isn't dropped.
-                        degraded_logger.reseed(&utilization, Instant::now());
-                    }
-
-                    // And shutdown, so a gate that cannot open does not
-                    // hold the shutdown sequence — see `response::run`.
-                    // The reply the policy never confirmed is not queued.
-                    if shutdown.load(Ordering::Relaxed) {
-                        continue 'run;
-                    }
-
-                    let journal_pos = journal_persisted_wire_seq.load();
-                    let metrics_ref = replication_metrics.as_deref();
-                    let active_ref = replica_active.as_ref();
-
-                    // Sampled per consumer rather than per iteration —
-                    // see `response.rs` for why these Acquire loads do
-                    // not belong in the spin body, and why the replica
-                    // cursor is derived from the active policy.
+            // A gate that cannot open does not hold the shutdown sequence;
+            // the reply the policy never confirmed is not queued.
+            if gate.needs_wait(slot)
+                && let GateOutcome::Shutdown = gate.wait_durable(
+                    slot.wire_seq,
+                    shutdown,
                     #[cfg(feature = "tick-to-trade")]
-                    gate_tracker.observe(
-                        journal_pos.get(),
-                        crate::response::policy_replica_cursor(
-                            &policy,
-                            journal_pos,
-                            metrics_ref,
-                            active_ref,
-                        ),
-                        trace::mono_trace_ns(),
-                    );
-
-                    let (status, blocker) = crate::response::evaluate_gate(
-                        &policy,
-                        needed,
-                        journal_pos,
-                        metrics_ref,
-                        active_ref,
-                    );
-                    cached_durable_pos = status.durable_pos;
-                    utilization
-                        .policy_degraded
-                        .store(status.degraded, Ordering::Relaxed);
-
-                    // Accrue degraded time while wedged so a mid-wedge
-                    // flip isn't mis-charged by the post-gate tick. The
-                    // clock read stays mask-gated while the waiter spins.
-                    if gate_accrual_timer
-                        .tick(GATE_ACCRUAL_INTERVAL, gate_waiter.spinning())
-                        .is_some()
-                    {
-                        degraded_logger.tick(
-                            &policy,
-                            &utilization,
-                            status.degraded,
-                            Instant::now(),
-                            DEGRADED_LOG_INTERVAL,
-                        );
-                    }
-
-                    if cached_durable_pos >= needed {
-                        // Attribution against the policy actually in
-                        // force, from the same snapshot that opened the
-                        // gate. See response.rs for the rationale,
-                        // including why the `None` arm is an
-                        // unreachable no-op.
-                        match blocker {
-                            Some(Blocker::Journal) => {
-                                utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Some(Blocker::Replication) => {
-                                utilization.gate_replication.fetch_add(1, Ordering::Relaxed);
-                            }
-                            None => {}
-                        }
-                        break;
-                    }
-                    gate_waiter.idle();
-                }
+                    &mut gate_tracker,
+                )
+            {
+                continue 'run;
             }
 
             #[cfg(feature = "tick-to-trade")]
@@ -619,26 +451,7 @@ pub fn run<A: Application>(
             // Frame 1: application payload (Report / Query via encoder;
             // EngineError via codec). BatchEnd payloads carry no body —
             // the terminator below handles them via is_last_in_request.
-            let payload_result: Option<Result<usize, &'static str>> = match slot.payload {
-                OutputPayload::Report(ref report) => {
-                    Some(frame_app_response(&mut encode_buf, |body| {
-                        encoder.encode_report(report, body)
-                    }))
-                }
-                OutputPayload::QueryResponse(ref q) => {
-                    Some(frame_app_response(&mut encode_buf, |body| {
-                        encoder.encode_query(q, body)
-                    }))
-                }
-                OutputPayload::EngineError => Some(
-                    control_codec::encode_transport_response(
-                        &TransportResponse::EngineError,
-                        &mut encode_buf,
-                    )
-                    .map_err(|_| "encode error"),
-                ),
-                OutputPayload::BatchEnd => None,
-            };
+            let payload_result = encode_slot_payload(&slot.payload, &*encoder, &mut encode_buf);
 
             // The BatchEnd terminator rides in the same frame. It is
             // transport-shaped and byte-identical every time, so it is
@@ -680,20 +493,9 @@ pub fn run<A: Application>(
         // producer now that every one of them has cleared its gate.
         consumer.commit();
 
-        // Log degradation transitions / heartbeat. Same scheme as the
-        // TCP response stage, including ticking after dispatch off a
-        // fresh clock read — with the gate evaluated per slot a batch
-        // can span several waits, and `batch_now` predates all of them.
-        let ticked_at = Instant::now();
-        let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
-        degraded_logger.tick(
-            &policy,
-            &utilization,
-            degraded_now,
-            ticked_at,
-            DEGRADED_LOG_INTERVAL,
-        );
-        last_policy_check = ticked_at;
+        // Log degradation transitions / re-emit the reminder — after
+        // dispatch, not before it. See `DurabilityGate::after_batch`.
+        gate.after_batch();
 
         #[cfg(feature = "latency-trace")]
         dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
