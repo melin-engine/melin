@@ -210,7 +210,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   naming the journal's failure and carrying it as its `source`. A
   replica that is shut down while its journal stage has failed, with any
   journal error, reports the failure (exit status 1, or 74 for a write
-  failure) instead of returning as from a clean shutdown.
+  failure) instead of returning as from a clean shutdown. A replica
+  whose own storage fails while it receives a resync (creating,
+  writing, syncing or installing the snapshot or segment seed) now
+  stops, with status 74 for a refused write or sync and 1 otherwise,
+  instead of retrying the transfer indefinitely.
 - **A decoder receives the application's own roles: `Permission` is
   replaced by `ClientRole<R>`.** `RequestDecoder` gains `type Role`, and
   `decode` takes `role: ClientRole<Self::Role>` in place of

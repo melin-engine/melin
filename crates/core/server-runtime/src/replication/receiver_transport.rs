@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info};
 
 use melin_app::AppEvent;
+use melin_journal::JournalError;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
@@ -218,34 +219,88 @@ pub(super) fn run_serviced<R: Send>(
     })
 }
 
+/// A resync transfer step that failed on this node's own storage, not on
+/// the network or the primary: creating, writing or syncing a received
+/// file, or installing it. Reconnecting would not help, so the resync
+/// stops the node instead of retrying. `source` is a
+/// [`JournalError::WriteFailed`] when the kernel refused a write or a
+/// sync (the failure [`crate::exit`] reports with its own exit status)
+/// and a [`JournalError::Io`] for the rest.
+#[derive(Debug)]
+pub(super) struct LocalTransferError {
+    /// What was being stored: "snapshot" or "segment seed".
+    what: &'static str,
+    source: JournalError,
+}
+
+impl LocalTransferError {
+    /// The kernel refused to write or sync `what`.
+    pub(super) fn write(what: &'static str, e: std::io::Error) -> Self {
+        Self {
+            what,
+            source: JournalError::WriteFailed(e),
+        }
+    }
+
+    /// Any other local failure: creating or installing `what`.
+    pub(super) fn io(what: &'static str, e: std::io::Error) -> Self {
+        Self {
+            what,
+            source: JournalError::Io(e),
+        }
+    }
+}
+
+impl std::fmt::Display for LocalTransferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not store the received {}: {}",
+            self.what, self.source
+        )
+    }
+}
+
+impl std::error::Error for LocalTransferError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Receive a chunked body (`SnapshotChunk*` → `SnapshotEnd`) into
 /// `tmp_path`, verifying the byte length and CRC32C trailer — the
 /// framing shared by the snapshot payload and the segment seed. The tmp
 /// file is removed on any failure (including transport errors), so
 /// callers never see a partial file. Shared by both receivers via
-/// [`ControlFrameSource`].
+/// [`ControlFrameSource`]. A failure to create, write or sync the file
+/// is a [`LocalTransferError`]; every other error is the network's or
+/// the primary's.
 pub(super) fn receive_chunked_body<S: ControlFrameSource>(
     source: &mut S,
     tmp_path: &std::path::Path,
     expected_len: u64,
-    what: &str,
+    what: &'static str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut tmp_file = std::fs::File::create(tmp_path)?;
+        let mut tmp_file =
+            std::fs::File::create(tmp_path).map_err(|e| LocalTransferError::io(what, e))?;
         let mut received: u64 = 0;
         let mut running_crc: u32 = 0;
         loop {
             let frame = source.next_frame(MAX_DATA_FRAME)?;
             match decode_primary_message(&frame)? {
                 PrimaryMessage::SnapshotChunk(data) => {
-                    std::io::Write::write_all(&mut tmp_file, &data)?;
+                    std::io::Write::write_all(&mut tmp_file, &data)
+                        .map_err(|e| LocalTransferError::write(what, e))?;
                     received += data.len() as u64;
                     running_crc = crc32c::crc32c_append(running_crc, &data);
                 }
                 PrimaryMessage::SnapshotEnd {
                     crc32c: expected_crc,
                 } => {
-                    tmp_file.sync_all()?;
+                    tmp_file
+                        .sync_all()
+                        .map_err(|e| LocalTransferError::write(what, e))?;
                     if received != expected_len {
                         return Err(format!(
                             "{what} length mismatch: expected {expected_len} bytes, got {received}"
@@ -3105,7 +3160,7 @@ mod tests {
     // now share, without a live transport.
     // -----------------------------------------------------------------
     mod chunked_body {
-        use super::super::{ControlFrameSource, receive_chunked_body};
+        use super::super::{ControlFrameSource, LocalTransferError, receive_chunked_body};
         use melin_transport_core::replication::protocol::{
             encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
         };
@@ -3214,6 +3269,53 @@ mod tests {
             let err = receive_chunked_body(&mut src, &tmp, 4, "snapshot").unwrap_err();
             assert!(err.to_string().contains("SnapshotChunk/End"), "{err}");
             assert!(!tmp.exists());
+        }
+
+        /// The kernel refusing to store the body is this node's storage
+        /// failing, not the transfer: a write failure (exit status 74),
+        /// which the resync stops on instead of retrying. The body goes
+        /// through a symlink to `/dev/full`, where every write fails
+        /// with `ENOSPC`; only the symlink is removed.
+        #[test]
+        fn a_refused_write_is_a_local_write_failure() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("body.tmp");
+            std::os::unix::fs::symlink("/dev/full", &tmp).unwrap();
+            let body = b"twelve bytes";
+            let mut src = source(vec![chunk(body), end(crc32c::crc32c(body))]);
+
+            let err =
+                receive_chunked_body(&mut src, &tmp, body.len() as u64, "snapshot").unwrap_err();
+            assert!(err.is::<LocalTransferError>(), "{err}");
+            assert!(crate::exit::is_journal_write_failure(&*err), "{err}");
+            assert!(std::fs::symlink_metadata(&tmp).is_err(), "symlink removed");
+            assert!(std::path::Path::new("/dev/full").exists());
+        }
+
+        /// A body that cannot even be created locally is a local failure
+        /// too (fatal), but not a refused write: nothing was written, so
+        /// it does not ask for the write-failure exit status.
+        #[test]
+        fn a_body_that_cannot_be_created_is_local_but_not_a_write_failure() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("missing-dir").join("body.tmp");
+            let mut src = source(vec![chunk(b"data")]);
+
+            let err = receive_chunked_body(&mut src, &tmp, 4, "segment seed").unwrap_err();
+            assert!(err.is::<LocalTransferError>(), "{err}");
+            assert!(!crate::exit::is_journal_write_failure(&*err), "{err}");
+        }
+
+        /// A disconnect mid-body is the network's failure: retryable, so
+        /// not a local one.
+        #[test]
+        fn a_disconnect_is_not_a_local_failure() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("body.tmp");
+            let mut src = source(vec![chunk(b"partial")]);
+
+            let err = receive_chunked_body(&mut src, &tmp, 7, "segment seed").unwrap_err();
+            assert!(!err.is::<LocalTransferError>(), "{err}");
         }
     }
 }

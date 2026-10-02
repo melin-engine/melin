@@ -87,7 +87,9 @@ mod validation_worker;
 #[cfg(any(feature = "dpdk", test))]
 mod join_worker;
 
-use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
+use receiver_transport::{
+    ControlFrameSource, LocalTransferError, SessionExit, StreamingResult, receive_chunked_body,
+};
 
 /// Writer-side view of the halt gate (the `replicas_connected`
 /// counter). The readers refuse client writes while the count is zero, so
@@ -1188,9 +1190,12 @@ pub(in crate::replication) enum ResyncDecision {
 /// and the seed length (the journal's `valid_end`). Shared by both
 /// receivers via [`ControlFrameSource`].
 ///
-/// Errors here are network-shaped — the caller retries (see
-/// [`ResyncDecision::Retry`]); the post-transfer install in
-/// [`handle_resync_verdict`] is what's fatal.
+/// Errors here are the network's or the primary's, and the caller
+/// retries (see [`ResyncDecision::Retry`]), except a
+/// [`LocalTransferError`]: this node's storage refused to create, write,
+/// sync or install a received file, which a reconnect cannot fix, so
+/// [`handle_resync_verdict`] stops the node on it, as it does on a
+/// failure of the post-transfer install.
 fn receive_resync_transfer<A, S>(
     source: &mut S,
     snapshot_path: &std::path::Path,
@@ -1214,7 +1219,7 @@ where
     tracing::info!(snap_sequence, snap_len, "receiving snapshot");
     let tmp_path = snapshot_path.with_extension("snapshot.tmp");
     receive_chunked_body(source, &tmp_path, snap_len, "snapshot")?;
-    std::fs::rename(&tmp_path, snapshot_path)?;
+    std::fs::rename(&tmp_path, snapshot_path).map_err(|e| LocalTransferError::io("snapshot", e))?;
     tracing::info!(snap_sequence, snap_len, "snapshot received and verified");
 
     // The primary is already sending the seed: a large state must not
@@ -1256,8 +1261,13 @@ where
             let _ = std::fs::remove_file(&seed_tmp);
             return Err(format!("segment seed failed structural verification: {e}").into());
         }
-        std::fs::rename(&seed_tmp, journal_path)?;
-        melin_journal::segment::fsync_parent_dir(journal_path)?;
+        std::fs::rename(&seed_tmp, journal_path)
+            .map_err(|e| LocalTransferError::io("segment seed", e))?;
+        // A plain I/O failure, not a refused write: like rotation's install,
+        // it leaves no unwritten journal data behind, so the write-failure
+        // exit status does not apply. Still this node's storage, so fatal.
+        melin_journal::segment::fsync_parent_dir(journal_path)
+            .map_err(|e| LocalTransferError::io("segment seed", e))?;
         Ok(())
     })?;
     Ok((snap_app, snap_sequence, snap_chain_hash, seed_len))
@@ -1364,11 +1374,17 @@ where
         match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path, fence_state) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "snapshot transfer failed — retrying");
                 // Half-applied resync state, not audit material — drop it
                 // so the retry starts clean (the pre-resync lineage is
                 // already archived; this is not it).
                 let _ = std::fs::remove_file(snapshot_path);
+                // This node's storage failed, not the transfer: a retry
+                // would loop on it, out of the supervisor's sight.
+                if e.is::<LocalTransferError>() {
+                    tracing::error!(error = %e, "snapshot transfer failed on local storage");
+                    return Err(e);
+                }
+                tracing::warn!(error = %e, "snapshot transfer failed — retrying");
                 return Ok(ResyncDecision::Retry);
             }
         };

@@ -1004,6 +1004,17 @@ operator documentation says what to do with it:
   host first, with `RestartPreventExitStatus=74` for systemd.
 - The preparer's `wait_for_writeback` now returns its error, failing the
   prepare through the existing warn-and-back-off path.
+- A replica's resync transfer no longer retries a local storage failure
+  as if it were the network's. Creating, writing, syncing or installing
+  the received snapshot or segment seed fails with
+  `LocalTransferError` (`receiver_transport.rs`), and
+  `handle_resync_verdict` stops the node on it: status 74 when the
+  kernel refused a write or sync, 1 otherwise. The retry itself was
+  safe (it rewrites a fresh file, never re-syncing the failed pages),
+  but on a failing device it looped out of the supervisor's sight.
+  Tests: `chunked_body::a_refused_write_is_a_local_write_failure`
+  (through `/dev/full`), `a_body_that_cannot_be_created_is_local_but_not_a_write_failure`
+  and `a_disconnect_is_not_a_local_failure`.
 
 Regression tests: `server-runtime/tests/journal_io_failure.rs` (a primary
 and a replica whose sync fails exit 74, through an injected `EIO` at
