@@ -45,6 +45,7 @@ use melin_app::unix_epoch_nanos;
 use melin_dpdk::transport::DpdkTransport;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
+use melin_transport_core::tick::TickSchedule;
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control::ConnectionId;
@@ -210,8 +211,7 @@ pub fn run_dpdk_poll<A: Application>(
     // making the per-iteration overhead unmeasurable.
     let tick_enabled = tick_cadence.is_some();
     let cadence = tick_cadence.unwrap_or(Duration::ZERO);
-    let mut next_tick_deadline = Instant::now() + cadence;
-    let mut last_tick_ns: u64 = 0;
+    let mut tick_schedule = TickSchedule::new(cadence, Instant::now());
     let mut tick_check_counter: u32 = 0;
     const TICK_CHECK_INTERVAL: u32 = 4096;
 
@@ -268,20 +268,9 @@ pub fn run_dpdk_poll<A: Application>(
             tick_check_counter = tick_check_counter.wrapping_add(1);
             if tick_check_counter >= TICK_CHECK_INTERVAL {
                 tick_check_counter = 0;
-                let now = Instant::now();
-                if now >= next_tick_deadline {
-                    let raw_now_ns = unix_epoch_nanos();
-                    let now_ns =
-                        melin_transport_core::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
-                    last_tick_ns = now_ns;
-                    melin_transport_core::tick::publish_tick(&mut producer, now_ns);
-                    let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
-                    next_tick_deadline = if elapsed > cadence {
-                        Instant::now() + cadence
-                    } else {
-                        next_tick_deadline + cadence
-                    };
-                }
+                // Nothing to re-arm on a published tick: the poll loop
+                // never sleeps, so the counter above is its only timer.
+                tick_schedule.publish_if_due(Instant::now(), &mut producer);
             }
         }
 
