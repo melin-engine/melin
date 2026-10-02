@@ -1429,6 +1429,18 @@ struct PipelineHandles<A: Send + 'static, W: Send + 'static> {
     pipeline_healthy: Option<Arc<AtomicBool>>,
 }
 
+/// How [`PipelineHandles::stop_and_join`] found the threads it joined.
+#[derive(Default)]
+struct Stopped {
+    /// The journal stage's own error, when it returned one. Kept rather
+    /// than folded into a generic failure: it is what the caller reports,
+    /// and a journal write failure decides the process's exit status (see
+    /// `crate::exit`).
+    journal_error: Option<JournalError>,
+    /// Whether any thread panicked (each logged where it was found).
+    panicked: bool,
+}
+
 impl<A: Send + 'static, W: Send + 'static> PipelineHandles<A, W> {
     /// No thread started yet.
     fn new(shutdown: Arc<AtomicBool>) -> Self {
@@ -1459,9 +1471,9 @@ impl<A: Send + 'static, W: Send + 'static> PipelineHandles<A, W> {
     }
 
     /// Raise the stop flag and join every thread held, logging each that
-    /// panicked or, for the journal stage, returned an error. Returns
-    /// whether any did. Leaves nothing held.
-    fn stop_and_join(&mut self) -> bool {
+    /// panicked or, for the journal stage, returned an error, and return
+    /// what it found. Leaves nothing held.
+    fn stop_and_join(&mut self) -> Stopped {
         if let Some(healthy) = &self.pipeline_healthy {
             healthy.store(false, Ordering::Relaxed);
         }
@@ -1481,34 +1493,36 @@ impl<A: Send + 'static, W: Send + 'static> PipelineHandles<A, W> {
             true
         }
 
-        let mut failed = false;
+        let mut stopped = Stopped::default();
         if let Some(h) = self.journal.take() {
-            let journal_result = h.join();
-            if let Ok(Err(ref e)) = journal_result {
-                error!(thread = "journal-seq", error = %e, "journal stage returned error");
-                failed = true;
+            match h.join() {
+                Ok(Ok(_writer)) => {}
+                Ok(Err(e)) => {
+                    error!(thread = "journal-seq", error = %e, "journal stage returned error");
+                    stopped.journal_error = Some(e);
+                }
+                Err(panic) => stopped.panicked |= panicked("journal-seq", Err(panic)),
             }
-            failed |= panicked("journal-seq", journal_result.map(|_| ()));
         }
         if let Some(h) = self.matching.take() {
-            failed |= panicked("matching", h.join().map(|_| ()));
+            stopped.panicked |= panicked("matching", h.join().map(|_| ()));
         }
         if let Some(h) = self.response.take() {
-            failed |= panicked("response", h.join());
+            stopped.panicked |= panicked("response", h.join());
         }
         if let Some(h) = self.replication.take() {
-            failed |= panicked("replication-sender", h.join());
+            stopped.panicked |= panicked("replication-sender", h.join());
         }
         if let Some(h) = self.event_publisher.take() {
-            failed |= panicked("event-publisher", h.join());
+            stopped.panicked |= panicked("event-publisher", h.join());
         }
         if let Some(h) = self.shadow.take() {
-            failed |= panicked("shadow", h.join());
+            stopped.panicked |= panicked("shadow", h.join());
         }
         if let Some(h) = self.health.take() {
-            failed |= panicked("health", h.join());
+            stopped.panicked |= panicked("health", h.join());
         }
-        failed
+        stopped
     }
 }
 
@@ -1523,26 +1537,36 @@ impl<A: Send + 'static, W: Send + 'static> Drop for PipelineHandles<A, W> {
             || self.health.is_some();
         if started {
             info!("startup failed: stopping the stages already running");
-            // The failures this reports are logged as they are found, and
-            // what the caller needs is the error startup is returning.
+            // What this finds is logged as it is found, a journal write
+            // failure is latched for the exit status when it is built (see
+            // `crate::exit`), and what the caller needs is the error
+            // startup is returning.
             self.stop_and_join();
         }
     }
 }
 
-/// Drain the pipeline and join every worker thread, surfacing panics
-/// and journal-stage errors as a single `pipeline failure` return.
+/// Drain the pipeline and join every worker thread. A journal-stage
+/// error is returned as itself, wrapped with context; panics alone as
+/// `pipeline failure`.
 fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
     mut handles: PipelineHandles<A, W>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("shutdown: draining pipeline");
-    let failed = handles.stop_and_join();
+    let stopped = handles.stop_and_join();
 
     // After every stage thread has joined, dump the per-stage latency
     // histograms to stderr. No-op when `latency-trace` is disabled.
     melin_transport_core::trace::print_report_all();
 
-    if failed {
+    if let Some(e) = stopped.journal_error {
+        error!("shutdown complete (with pipeline failure)");
+        return Err(Box::new(crate::exit::JournalStageFailed::new(
+            "journal stage failed",
+            e,
+        )));
+    }
+    if stopped.panicked {
         error!("shutdown complete (with pipeline failure)");
         return Err("pipeline failure".into());
     }

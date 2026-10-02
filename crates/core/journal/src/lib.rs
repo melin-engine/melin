@@ -29,6 +29,8 @@ pub mod reader;
 pub mod replication;
 pub mod segment;
 pub mod segment_file;
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) mod sync_fault;
 pub mod write;
 pub mod write_ring;
 

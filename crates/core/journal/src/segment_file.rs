@@ -92,12 +92,24 @@ impl SegmentFile {
         // unwritten extents (no zero-fill cost) on the supported targets.
         let allocated_end = fallocate_chunk(&file, 0)?;
 
-        write_header(&file, starting_sequence, anchor_hash, genesis_entries)?;
+        // The header write and its sync are write failures, not plain
+        // I/O errors (see `JournalError::WriteFailed`). At startup the
+        // file stays at the live path: a node restarted in place after a
+        // failed write-back would open it, read the header from the page
+        // cache, and its first sync would succeed on a header the device
+        // never took. On the rotation fallback the rollback replaces the
+        // file, and a failed rotation is not fatal, so the class changes
+        // nothing there. The first-boot genesis caller writes at a
+        // staging path that the next start sweeps, so an in-place restart
+        // would be safe there; classing it as a write failure anyway errs
+        // on the safe side for a rare trigger.
+        write_header(&file, starting_sequence, anchor_hash, genesis_entries)
+            .map_err(write_failed)?;
 
         // Flush the header durably before returning. Subsequent batch
         // flushes layer on top of a known-good header — a crash before
         // the next user write still leaves a parseable empty journal.
-        file.sync_all()?;
+        file.sync_all().map_err(JournalError::WriteFailed)?;
 
         Ok(Self {
             file,
@@ -152,7 +164,12 @@ impl SegmentFile {
             file.set_len(valid_end)?;
         }
         let allocated_end = fallocate_chunk(&file, valid_end)?;
-        file.sync_all()?;
+        // A write failure, not a plain I/O error: this is the first sync
+        // on the segment since the previous process wrote it, so a
+        // write-back failure of that process's data surfaces here, and
+        // it is reported once. Retried in place, the sync succeeds and
+        // the node runs on data the device never took.
+        file.sync_all().map_err(JournalError::WriteFailed)?;
 
         Ok((
             Self {
@@ -179,7 +196,7 @@ impl SegmentFile {
             return Ok(());
         }
         self.ensure_allocated(bytes.len() as u64)?;
-        write_all_at(&self.file, bytes, self.write_pos)?;
+        write_all_at(&self.file, bytes, self.write_pos).map_err(write_failed)?;
         self.write_pos += bytes.len() as u64;
         Ok(())
     }
@@ -209,7 +226,8 @@ impl SegmentFile {
         write_all_vectored_at(bufs, start, |slices, offset| {
             rustix::io::pwritev(file, slices, offset)
                 .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
-        })?;
+        })
+        .map_err(write_failed)?;
         self.write_pos += total as u64;
         Ok(())
     }
@@ -220,9 +238,20 @@ impl SegmentFile {
     /// reports the data is on stable media. On a drive with a volatile
     /// write cache this issues a device-side flush; on a PLP drive
     /// (VWC=0) the flush is a near-no-op.
+    ///
+    /// A failure is [`JournalError::WriteFailed`]: the kernel reports a
+    /// write-back error once, so it must not be retried.
     pub fn sync(&self) -> Result<(), JournalError> {
-        self.file.sync_data()?;
-        Ok(())
+        // The injected error enters in front of the same `map_err` as a
+        // real one, so the classification is exercised too.
+        #[cfg(any(test, feature = "test-utils"))]
+        let result = match crate::sync_fault::take(&self.path) {
+            Some(injected) => Err(injected),
+            None => self.file.sync_data(),
+        };
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let result = self.file.sync_data();
+        result.map_err(JournalError::WriteFailed)
     }
 
     /// Paced retry of a failed post-rotation directory fsync — a single
@@ -569,9 +598,58 @@ fn write_all_at(file: &File, buf: &[u8], offset: u64) -> Result<(), JournalError
     Ok(())
 }
 
+/// Reclassify an append's I/O error as a write failure (see
+/// [`JournalError::WriteFailed`]). Applied to the data write alone, not
+/// to the allocation before it: a refused `fallocate` wrote nothing, and
+/// restarting after it is safe.
+fn write_failed(error: JournalError) -> JournalError {
+    match error {
+        JournalError::Io(e) => JournalError::WriteFailed(e),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused data write is a write failure, through both append
+    /// paths. The segment's descriptor is swapped for a read-only one so
+    /// the kernel refuses the `pwrite`/`pwritev` itself (`EBADF`); the
+    /// batches fit the allocated chunk, so no `fallocate` runs first.
+    #[test]
+    fn a_refused_append_is_a_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refused.journal");
+        let mut segment = SegmentFile::create_continuing(&path, 1, [0; 32], Some(0)).unwrap();
+        segment.file = File::open(&path).unwrap();
+
+        match segment.write_batch(&[0xAB; 64]) {
+            Err(JournalError::WriteFailed(e)) => assert_eq!(e.raw_os_error(), Some(libc::EBADF)),
+            other => panic!("expected a write failure from pwrite, got {other:?}"),
+        }
+        let batch = [0xCD; 64];
+        match segment.write_vectored(&mut [IoSlice::new(&batch)]) {
+            Err(JournalError::WriteFailed(e)) => assert_eq!(e.raw_os_error(), Some(libc::EBADF)),
+            other => panic!("expected a write failure from pwritev, got {other:?}"),
+        }
+    }
+
+    /// Only a plain I/O error is reclassified: a write that fails for
+    /// another reason keeps its own variant.
+    #[test]
+    fn write_failed_reclassifies_io_only() {
+        assert!(matches!(
+            write_failed(JournalError::Io(std::io::Error::from_raw_os_error(
+                libc::EIO
+            ))),
+            JournalError::WriteFailed(_)
+        ));
+        assert!(matches!(
+            write_failed(JournalError::InvalidFile),
+            JournalError::InvalidFile
+        ));
+    }
 
     /// A prepared segment whose staging file has been unlinked: the
     /// header write and its sync land on the still-open inode, then the

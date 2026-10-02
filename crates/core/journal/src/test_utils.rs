@@ -23,3 +23,15 @@ pub fn set_prealloc_chunk_bytes_override(bytes: Option<u64>) {
 }
 
 pub use crate::prealloc::PreallocOverrideGuard;
+
+/// Make the next `fdatasync` of the live segment at `path` fail with
+/// `EIO`, as a device that rejected the write-back would. One call fails
+/// one sync; the failure is consumed when it fires.
+///
+/// `path` is the live segment's path exactly as the writer was opened
+/// with it (a node's `--journal`). The failure enters the writer where
+/// the kernel's would, so the error the caller sees, and its
+/// classification as a journal write failure, are the real ones.
+pub fn fail_next_sync(path: &std::path::Path) {
+    crate::sync_fault::arm(path);
+}
