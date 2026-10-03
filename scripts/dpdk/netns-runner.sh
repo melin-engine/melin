@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
 # Cargo target runner: run a test binary in namespaces of its own, on a
-# veth pair a DPDK node can use. No NIC, no hugepages, no root.
+# network DPDK nodes can use. No NIC, no hugepages, no root.
 #
 # Set as cargo's target runner, which nextest honours. For each process it
 # starts (each test, under nextest), it:
 #
 #   1. re-executes itself under `unshare -rnm` (new user, network and
 #      mount namespaces);
-#   2. builds one veth pair, both ends up, TX checksum offload off on both
-#      (veth-setup.py), and brings `lo` up;
+#   2. builds a bridge carrying the client's address, with one veth pair
+#      per node slot: the node's end for DPDK, the other end on the
+#      bridge. Every interface up, TX checksum offload off on every veth
+#      (veth-setup.py), `lo` up. The nodes reach each other (replication)
+#      and the client reaches every node;
 #   3. mounts a private tmpfs on /var/run, where EAL insists on creating
 #      its runtime directory;
 #   4. publishes the layout in the environment (below);
 #   5. execs the test binary with its arguments.
 #
-# Nothing outside the namespaces is touched: the link, the addresses and
-# the tmpfs vanish with the process. Tests built with an example's `dpdk`
-# feature start their node through the shared launcher
-# (crates/core/test-node), which reads the layout and refuses to run
-# without it. See docs/internal/dpdk-transparent-tests.md.
+# Nothing outside the namespaces is touched: the links, the addresses and
+# the tmpfs vanish with the process. Tests built with a `dpdk` feature
+# start their nodes through the shared launcher (crates/core/test-node),
+# which reads the layout and refuses to run without it. See
+# docs/internal/dpdk-transparent-tests.md.
 #
 # Usage (one test at a time: every DPDK node busy-polls a core):
 #   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run -p melin-example-echo --features dpdk -j 1
@@ -32,14 +35,18 @@
 #   - unprivileged user namespaces. Ubuntu 24.04 restricts them through
 #     AppArmor; lift that with
 #       sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+#   - the veth and bridge drivers, loaded: a user namespace cannot load a
+#     module (`sudo modprobe -a veth bridge`; Docker loads both)
 #
 # Layout published to the test (space-separated lists, one entry per node
-# slot, in slot order; one slot for now):
+# slot, in slot order; three slots, the largest cluster a test runs):
 #   MELIN_NETNS_DPDK_IFACES   interfaces DPDK attaches to (no address)
 #   MELIN_NETNS_NODE_IPS      the IP each slot's node owns on its interface
+#   MELIN_NETNS_NODE_MACS     each interface's MAC, which its DPDK port takes
 #   MELIN_NETNS_PREFIX_LEN    prefix length of the shared subnet
-#   MELIN_NETNS_CLIENT_IP     the kernel side's address, where clients
-#                             connect from
+#   MELIN_NETNS_CLIENT_IP     the kernel side's address (on the bridge),
+#                             where clients connect from
+#   MELIN_NETNS_CLIENT_MAC    the bridge's MAC
 
 set -euo pipefail
 
@@ -81,13 +88,28 @@ fi
 unset "$INNER_ENV"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DPDK_IFACE=veth0
-KERNEL_IFACE=veth1
-NODE_IP=10.99.0.2
+BRIDGE=br0
 CLIENT_IP=10.99.0.1
 PREFIX_LEN=24
+# Locally administered, and deliberately not the `02:00:<ip>` convention a
+# DPDK replica falls back to without `--dpdk-peer-mac`: a replica reaches
+# its primary here only if it was given the primary's real MAC, as on any
+# NIC that keeps its hardware address.
+CLIENT_MAC=02:99:00:00:00:01
+DPDK_IFACES=()
+NODE_IPS=()
+NODE_MACS=()
+for slot in 0 1 2; do
+    DPDK_IFACES+=("dpdk$slot")
+    NODE_IPS+=("10.99.0.$((slot + 2))")
+    NODE_MACS+=("02:99:00:00:00:0$((slot + 2))")
+done
 
-if ! python3 "$SCRIPT_DIR/veth-setup.py" "$DPDK_IFACE" "$KERNEL_IFACE" "$CLIENT_IP/$PREFIX_LEN"; then
+slots=()
+for i in "${!DPDK_IFACES[@]}"; do
+    slots+=("${DPDK_IFACES[$i]}=${NODE_MACS[$i]}")
+done
+if ! python3 "$SCRIPT_DIR/veth-setup.py" --bridge "$BRIDGE" "$CLIENT_IP/$PREFIX_LEN" "$CLIENT_MAC" "${slots[@]}"; then
     echo "netns-runner: error: network setup failed" >&2
     exit 1
 fi
@@ -107,9 +129,11 @@ if ! mount -t tmpfs tmpfs /var/run; then
     exit 1
 fi
 
-export MELIN_NETNS_DPDK_IFACES="$DPDK_IFACE"
-export MELIN_NETNS_NODE_IPS="$NODE_IP"
+export MELIN_NETNS_DPDK_IFACES="${DPDK_IFACES[*]}"
+export MELIN_NETNS_NODE_IPS="${NODE_IPS[*]}"
+export MELIN_NETNS_NODE_MACS="${NODE_MACS[*]}"
 export MELIN_NETNS_PREFIX_LEN="$PREFIX_LEN"
 export MELIN_NETNS_CLIENT_IP="$CLIENT_IP"
+export MELIN_NETNS_CLIENT_MAC="$CLIENT_MAC"
 
 exec "$@"

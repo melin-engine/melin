@@ -1248,6 +1248,7 @@ version = "0.18.0"
 dependencies = [
  "libc",
  "melin-app",
+ "melin-dpdk",
  "melin-server-runtime",
  "melin-wire-protocol",
 ]
