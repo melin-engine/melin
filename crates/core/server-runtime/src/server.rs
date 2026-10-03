@@ -611,7 +611,8 @@ impl ServerConfig {
 ///
 /// For callers that need a pre-bound listener or an externally
 /// controlled shutdown flag (e.g. benchmarks), use
-/// [`run_with_listener`] instead.
+/// [`run_with_listener`] instead; for an externally controlled flag on
+/// the build's own transport, [`run_with_shutdown`].
 pub fn run<A>(
     config: ServerConfig,
     startup: StartupEvents<A::Event>,
@@ -633,7 +634,78 @@ where
     let authorized_keys = load_authorized_keys(&decoder, &config.authorized_keys)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     crate::process::install_shutdown_handler(&shutdown);
+    run_selected::<A>(
+        config,
+        startup,
+        sizing,
+        decoder,
+        encoder,
+        event_publisher,
+        authorized_keys,
+        shutdown,
+    )
+}
 
+/// [`run`], stopped through `shutdown` rather than by a signal: the same
+/// transport selection and the same startup, but no SIGINT/SIGTERM
+/// handler is installed. Set `shutdown` to `true` for a clean shutdown;
+/// the node may also set it itself (a fenced node stops this way).
+///
+/// For a host that owns its process's signals, or runs several nodes in
+/// one process — the signal handler `run` installs is process-wide and
+/// stops one node only. Several DPDK nodes in one process also need a
+/// process-wide EAL (`melin_dpdk::Eal::init_process_wide`) and a port
+/// each. Unlike [`run_with_listener`], the client listener is the
+/// transport's own: on DPDK there is no kernel socket to hand in.
+pub fn run_with_shutdown<A>(
+    config: ServerConfig,
+    startup: StartupEvents<A::Event>,
+    sizing: A::Sizing,
+    decoder: impl RequestDecoder<Event = A::Event> + 'static,
+    encoder: impl ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
+    event_publisher: Option<EventPublisherFn<A>>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+{
+    // As in `run`.
+    melin_app::affinity::capture_home_mask();
+    let authorized_keys = load_authorized_keys(&decoder, &config.authorized_keys)?;
+    run_selected::<A>(
+        config,
+        startup,
+        sizing,
+        decoder,
+        encoder,
+        event_publisher,
+        authorized_keys,
+        shutdown,
+    )
+}
+
+/// The part of [`run`] and [`run_with_shutdown`] after the shutdown flag
+/// exists: memory locking, then the build's transport.
+#[allow(clippy::too_many_arguments)] // entry-chain hop, same arguments as run_impl
+fn run_selected<A>(
+    config: ServerConfig,
+    startup: StartupEvents<A::Event>,
+    sizing: A::Sizing,
+    decoder: impl RequestDecoder<Event = A::Event> + 'static,
+    encoder: impl ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
+    event_publisher: Option<EventPublisherFn<A>>,
+    authorized_keys: Arc<AuthorizedKeys>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+{
     if !config.no_mlock {
         crate::process::try_lock_memory();
     }
