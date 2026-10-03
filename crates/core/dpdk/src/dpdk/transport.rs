@@ -1061,7 +1061,8 @@ impl DpdkTransport {
         }
     }
 
-    /// Close a connection (sends FIN) and remove from the socket set.
+    /// Close a connection (abort, discarding unsent data; no FIN) and
+    /// remove it from the socket set.
     /// The socket is fully removed so its tuple doesn't block future
     /// connections from the same source port. Idempotent: a second
     /// `close` for a handle that has already been removed is a no-op,
