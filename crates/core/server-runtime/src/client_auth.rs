@@ -15,6 +15,11 @@ use std::fmt;
 use ed25519_dalek::{Signature, SignatureError, Verifier, VerifyingKey};
 use melin_app::auth::{AuthorizedKeys, ClientRole, RoleId};
 
+/// Largest ChallengeResponse frame payload a client listener accepts. The
+/// frame is 1 (tag) + 64 (signature) + 32 (public key) = 97 bytes; a longer
+/// length prefix is refused before its body is read.
+pub(crate) const MAX_AUTH_FRAME: usize = 256;
+
 /// Why the client listener refused a challenge response.
 ///
 /// `#[non_exhaustive]`: a refusal reason may be added. This is an error to

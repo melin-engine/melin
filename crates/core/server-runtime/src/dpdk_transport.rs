@@ -16,11 +16,12 @@
 //!
 //! # Auth handshake
 //!
-//! New connections start in `AuthState::ChallengePending` — the poll loop
+//! New connections start in `AuthState::WaitingForResponse` — the poll loop
 //! sends a Challenge frame and waits for the ChallengeResponse. Auth is
 //! non-blocking: bytes accumulate in `parse_buf` across poll iterations
 //! until a complete frame arrives. Connections that don't complete auth
-//! within `AUTH_TIMEOUT` are dropped.
+//! within `AUTH_TIMEOUT` are dropped. A failed attempt is answered with
+//! `AuthFailed` and the connection is closed once the peer has it.
 //!
 //! # Thread model
 //!
@@ -59,6 +60,7 @@ use tracing::{debug, warn};
 use crate::dpdk_response::{ControlEvent, TxFrame};
 use crate::halt::{HaltGate, RefusalSender};
 
+use crate::client_auth::MAX_AUTH_FRAME;
 use crate::client_frames::MAX_FRAME_SIZE;
 
 /// Auth handshake timeout. Connections that don't complete auth within
@@ -78,6 +80,19 @@ enum AuthState {
     },
     /// Auth completed successfully. Connection is ready for requests.
     Authenticated { role: ClientRole<RoleId> },
+    /// Auth failed and `AuthFailed` has been queued. Terminal: nothing
+    /// the client sends is read any more, so it gets one attempt per
+    /// connection, as on the io_uring path.
+    ///
+    /// The connection lingers only until the peer has acknowledged the
+    /// `AuthFailed` frame, because `DpdkTransport::close` aborts and
+    /// removes the socket without another dispatch — closing at once
+    /// would discard the reason unsent. `AUTH_TIMEOUT`, still counted
+    /// from accept, bounds the linger if the peer never acknowledges.
+    Rejected {
+        /// When the connection was accepted. Used for timeout.
+        accepted_at: Instant,
+    },
 }
 
 /// Per-connection state in the DPDK poll thread.
@@ -450,16 +465,37 @@ pub fn run_dpdk_poll<A: Application>(
             // so process_auth_frame can take it after the conn borrow.
             let conn_handle = conn.handle;
 
-            // Check auth timeout for pending connections. Throttled to
+            // Check auth timeout for pending connections, and for rejected
+            // ones whose peer never acknowledged `AuthFailed`. Throttled to
             // avoid a per-poll `Instant::now()` via `elapsed()`.
             if do_slow_checks
-                && let AuthState::WaitingForResponse { accepted_at, .. } = &conn.auth
+                && let AuthState::WaitingForResponse { accepted_at, .. }
+                | AuthState::Rejected { accepted_at } = &conn.auth
                 && accepted_at.elapsed() > AUTH_TIMEOUT
             {
                 debug!(
                     connection_id = conn.connection_id.0,
                     addr = %conn.addr,
                     "DPDK: auth timeout, dropping connection"
+                );
+                transport.close(conn.handle);
+                release_slot(
+                    &mut connections,
+                    idx,
+                    &mut parse_buf_pool,
+                    &mut connection_count,
+                );
+                continue;
+            }
+
+            // A rejected connection is closed as soon as the peer has
+            // acknowledged `AuthFailed` (see `AuthState::Rejected`).
+            if matches!(conn.auth, AuthState::Rejected { .. }) && transport.tx_drained(conn.handle)
+            {
+                debug!(
+                    connection_id = conn.connection_id.0,
+                    addr = %conn.addr,
+                    "DPDK: AuthFailed delivered, dropping connection"
                 );
                 transport.close(conn.handle);
                 release_slot(
@@ -573,6 +609,9 @@ pub fn run_dpdk_poll<A: Application>(
                         conn_handle,
                     );
                 }
+                // Terminal: whatever the client sends after a failed
+                // attempt is discarded unread.
+                AuthState::Rejected { .. } => conn.parse_buf.clear(),
                 AuthState::Authenticated { role } => {
                     use crate::client_frames::{FrameAction, process_client_frames};
                     let role = *role;
@@ -662,6 +701,78 @@ pub fn run_dpdk_poll<A: Application>(
     }
 }
 
+/// What a pending connection's parse buffer amounts to, auth-wise.
+#[derive(Debug)]
+enum AuthVerdict {
+    /// No complete auth frame yet — wait for more bytes.
+    Incomplete,
+    /// The frame is oversized, undecodable, or carries a signature that
+    /// does not admit the client. Answered with `AuthFailed`.
+    Rejected,
+    /// The client signed the nonce with a key listed for `role`.
+    Admitted {
+        role: ClientRole<RoleId>,
+        public_key: [u8; 32],
+    },
+}
+
+/// Judge the auth frame at the head of `parse_buf` against `nonce`.
+///
+/// A complete frame is consumed from the buffer, so on admission the bytes
+/// the client pipelined behind it stay in place for the data path. On
+/// rejection the caller drops the whole buffer, and an oversized frame is
+/// rejected on its prefix without being consumed.
+fn evaluate_auth_frame(
+    parse_buf: &mut Vec<u8>,
+    nonce: &[u8; 32],
+    authorized_keys: &AuthorizedKeys,
+    connection_id: u64,
+) -> AuthVerdict {
+    // Need at least 4 bytes for the length prefix.
+    let Some(prefix) = parse_buf.first_chunk::<4>() else {
+        return AuthVerdict::Incomplete;
+    };
+    let frame_len = u32::from_le_bytes(*prefix) as usize;
+
+    if frame_len > MAX_AUTH_FRAME {
+        debug!(connection_id, frame_len, "DPDK: auth frame too large");
+        return AuthVerdict::Rejected;
+    }
+
+    let consumed = 4 + frame_len;
+    if parse_buf.len() < consumed {
+        return AuthVerdict::Incomplete;
+    }
+
+    // Borrow the payload directly — no heap allocation.
+    let decoded = control_codec::decode_challenge_response(&parse_buf[4..consumed]);
+
+    // Compact the parse buffer now that the borrow is released.
+    // Single memmove instead of drain()'s per-byte shift.
+    let remaining = parse_buf.len() - consumed;
+    parse_buf.copy_within(consumed.., 0);
+    parse_buf.truncate(remaining);
+
+    let cr = match decoded {
+        Ok(cr) => cr,
+        Err(e) => {
+            debug!(connection_id, error = %e, "DPDK: auth decode error");
+            return AuthVerdict::Rejected;
+        }
+    };
+
+    match crate::client_auth::verify_client(authorized_keys, nonce, &cr.public_key, &cr.signature) {
+        Ok(role) => AuthVerdict::Admitted {
+            role,
+            public_key: cr.public_key,
+        },
+        Err(e) => {
+            debug!(connection_id, error = %e, "DPDK: auth failed");
+            AuthVerdict::Rejected
+        }
+    }
+}
+
 /// Process the auth handshake frame from a pending connection.
 fn process_auth_frame(
     conn: &mut ConnectionState,
@@ -671,82 +782,28 @@ fn process_auth_frame(
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     handle: SocketHandle,
 ) {
-    // Need at least 4 bytes for the length prefix.
-    if conn.parse_buf.len() < 4 {
-        return;
-    }
-
-    let frame_len = u32::from_le_bytes([
-        conn.parse_buf[0],
-        conn.parse_buf[1],
-        conn.parse_buf[2],
-        conn.parse_buf[3],
-    ]) as usize;
-
-    // ChallengeResponse is 1 (tag) + 64 (signature) + 32 (pubkey) = 97 bytes.
-    if frame_len > 256 {
-        debug!(
-            connection_id = conn.connection_id.0,
-            frame_len, "DPDK: auth frame too large"
-        );
-        send_auth_failed(conn, transport);
-        return;
-    }
-
-    if conn.parse_buf.len() < 4 + frame_len {
-        return; // Incomplete — wait for more data.
-    }
-
-    // Borrow the payload directly — no heap allocation. Compact after processing.
-    let consumed = 4 + frame_len;
-
-    // Decode the ChallengeResponse.
-    let cr = match control_codec::decode_challenge_response(&conn.parse_buf[4..consumed]) {
-        Ok(cr) => cr,
-        Err(e) => {
-            debug!(
-                connection_id = conn.connection_id.0,
-                error = %e,
-                "DPDK: auth decode error"
-            );
-            // Compact before returning.
-            let remaining = conn.parse_buf.len() - consumed;
-            conn.parse_buf.copy_within(consumed.., 0);
-            conn.parse_buf.truncate(remaining);
-            send_auth_failed(conn, transport);
-            return;
-        }
-    };
-
-    // Compact parse buffer now that the borrow is released.
-    // Single memmove instead of drain()'s per-byte shift.
-    let remaining = conn.parse_buf.len() - consumed;
-    conn.parse_buf.copy_within(consumed.., 0);
-    conn.parse_buf.truncate(remaining);
-
     // The nonce captured at Challenge-send time, which the client signed.
-    let nonce = match &conn.auth {
-        AuthState::WaitingForResponse { nonce, .. } => *nonce,
+    let (nonce, accepted_at) = match &conn.auth {
+        AuthState::WaitingForResponse { nonce, accepted_at } => (*nonce, *accepted_at),
         _ => unreachable!("process_auth_frame called in wrong state"),
     };
 
-    let public_key_bytes = cr.public_key;
-    let role = match crate::client_auth::verify_client(
-        authorized_keys,
+    let (role, public_key_bytes) = match evaluate_auth_frame(
+        &mut conn.parse_buf,
         &nonce,
-        &public_key_bytes,
-        &cr.signature,
+        authorized_keys,
+        conn.connection_id.0,
     ) {
-        Ok(role) => role,
-        Err(e) => {
-            debug!(
-                connection_id = conn.connection_id.0,
-                error = %e,
-                "DPDK: auth failed"
-            );
+        AuthVerdict::Incomplete => return,
+        AuthVerdict::Rejected => {
             send_auth_failed(conn, transport);
+            // One attempt per connection: the poll loop closes it once
+            // the peer has the AuthFailed frame.
+            conn.parse_buf.clear();
+            conn.auth = AuthState::Rejected { accepted_at };
             return;
         }
+        AuthVerdict::Admitted { role, public_key } => (role, public_key),
     };
 
     // Auth succeeded — send ServerReady.
@@ -801,17 +858,20 @@ fn release_slot(
     }
 }
 
-/// Send an AuthFailed response and close the connection.
+/// Queue an AuthFailed response, best effort. The caller moves the
+/// connection to `AuthState::Rejected`, which closes it once the frame
+/// has been delivered.
 fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
     let mut buf = [0u8; 16];
     if let Ok(written) =
         control_codec::encode_transport_response(&TransportResponse::AuthFailed, &mut buf)
     {
+        // The result is not checked: the queue refuses only past its
+        // per-connection limit, and before auth it holds at most the
+        // Challenge. Were it refused, only the reason would be lost; the
+        // connection is closed on the same terms either way.
         transport.queue_send(conn.handle, &buf[..written]);
     }
-    // Don't close immediately — let smoltcp flush the AuthFailed frame first.
-    // The connection will be cleaned up on the next poll when the client
-    // disconnects or the auth timeout fires.
 }
 
 #[cfg(test)]
@@ -1014,6 +1074,111 @@ mod tests {
                 assert!(matches!(decoded, CounterEvent::GetValue));
             }
             other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    mod auth_verdict {
+        use super::*;
+
+        use base64::Engine;
+        use ed25519_dalek::{Signer, SigningKey};
+        use melin_wire_protocol::control::ChallengeResponse;
+
+        use crate::test_roles::desk_keys;
+
+        const NONCE: [u8; 32] = [0x5A; 32];
+
+        fn client() -> SigningKey {
+            SigningKey::from_bytes(&[0x11; 32])
+        }
+
+        fn keys() -> AuthorizedKeys {
+            let public = base64::engine::general_purpose::STANDARD
+                .encode(client().verifying_key().to_bytes());
+            desk_keys("trader", &public)
+        }
+
+        /// A length-prefixed ChallengeResponse frame signing `nonce` with `signer`.
+        fn auth_frame(signer: &SigningKey, nonce: &[u8; 32]) -> Vec<u8> {
+            let response = ChallengeResponse {
+                signature: signer.sign(nonce).to_bytes(),
+                public_key: client().verifying_key().to_bytes(),
+            };
+            let mut payload = [0u8; 128];
+            let len = control_codec::encode_challenge_response(&response, &mut payload).unwrap();
+            let mut frame = (len as u32).to_le_bytes().to_vec();
+            frame.extend_from_slice(&payload[..len]);
+            frame
+        }
+
+        fn evaluate(buf: &mut Vec<u8>) -> AuthVerdict {
+            evaluate_auth_frame(buf, &NONCE, &keys(), 1)
+        }
+
+        #[test]
+        fn a_valid_response_is_admitted_and_pipelined_bytes_are_kept() {
+            let mut buf = auth_frame(&client(), &NONCE);
+            buf.extend_from_slice(b"next");
+            match evaluate(&mut buf) {
+                AuthVerdict::Admitted { public_key, .. } => {
+                    assert_eq!(public_key, client().verifying_key().to_bytes());
+                }
+                other => panic!("expected Admitted, got {other:?}"),
+            }
+            assert_eq!(buf, b"next");
+        }
+
+        /// Every prefix of a valid frame waits for more bytes rather than
+        /// being judged.
+        #[test]
+        fn a_partial_frame_is_incomplete_and_left_in_place() {
+            let frame = auth_frame(&client(), &NONCE);
+            for cut in 0..frame.len() {
+                let mut buf = frame[..cut].to_vec();
+                assert!(
+                    matches!(evaluate(&mut buf), AuthVerdict::Incomplete),
+                    "cut {cut}"
+                );
+                assert_eq!(buf, &frame[..cut]);
+            }
+        }
+
+        #[test]
+        fn a_signature_by_another_key_is_rejected() {
+            let impostor = SigningKey::from_bytes(&[0x33; 32]);
+            let mut buf = auth_frame(&impostor, &NONCE);
+            assert!(matches!(evaluate(&mut buf), AuthVerdict::Rejected));
+        }
+
+        /// A signature over another nonce — a replay from an earlier
+        /// connection — does not authenticate this one.
+        #[test]
+        fn a_signature_over_another_nonce_is_rejected() {
+            let mut buf = auth_frame(&client(), &[0xA5; 32]);
+            assert!(matches!(evaluate(&mut buf), AuthVerdict::Rejected));
+        }
+
+        #[test]
+        fn an_undecodable_frame_is_rejected() {
+            let mut buf = auth_frame(&client(), &NONCE);
+            buf[4] ^= 0xFF; // corrupt the tag
+            assert!(matches!(evaluate(&mut buf), AuthVerdict::Rejected));
+        }
+
+        #[test]
+        fn a_zero_length_frame_is_rejected() {
+            let mut buf = 0u32.to_le_bytes().to_vec();
+            assert!(matches!(evaluate(&mut buf), AuthVerdict::Rejected));
+        }
+
+        /// Rejected on the length prefix alone, before the body arrives.
+        #[test]
+        fn an_oversized_frame_is_rejected_on_its_prefix() {
+            let mut buf = ((MAX_AUTH_FRAME + 1) as u32).to_le_bytes().to_vec();
+            assert!(matches!(evaluate(&mut buf), AuthVerdict::Rejected));
+
+            let mut at_cap = (MAX_AUTH_FRAME as u32).to_le_bytes().to_vec();
+            assert!(matches!(evaluate(&mut at_cap), AuthVerdict::Incomplete));
         }
     }
 }

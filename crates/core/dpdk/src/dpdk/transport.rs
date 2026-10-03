@@ -1038,6 +1038,22 @@ impl DpdkTransport {
             .map_or(0, |q| q.queued_bytes())
     }
 
+    /// Whether everything queued for this connection has been delivered:
+    /// the TX queue is empty and the TCP send buffer holds nothing, i.e.
+    /// every byte handed to the socket has been acknowledged by the peer.
+    ///
+    /// `close` aborts the socket and discards both, so a caller that must get a
+    /// last frame to the peer before closing waits on this first. A stale
+    /// handle has nothing left to deliver and reads as drained.
+    pub fn tx_drained(&mut self, handle: SocketHandle) -> bool {
+        if self.tx_queue_bytes(handle) != 0 {
+            return false;
+        }
+        self.sockets
+            .try_get_mut::<tcp::Socket>(handle)
+            .is_none_or(|socket| socket.send_queue() == 0)
+    }
+
     /// Maximum bytes that `queue_send` will accept for this connection
     /// before returning `false`. Replication sockets get a higher limit
     /// via `add_listener_with_buffers`.
@@ -1061,7 +1077,8 @@ impl DpdkTransport {
         }
     }
 
-    /// Close a connection (sends FIN) and remove from the socket set.
+    /// Close a connection (abort, discarding unsent data; no FIN) and
+    /// remove it from the socket set.
     /// The socket is fully removed so its tuple doesn't block future
     /// connections from the same source port. Idempotent: a second
     /// `close` for a handle that has already been removed is a no-op,
