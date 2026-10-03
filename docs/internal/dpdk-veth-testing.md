@@ -74,7 +74,9 @@ script.
 As built, the keys are fixed in the script (the authorized one is the
 openssl-generated PEM from `melin-client`'s key tests), so no key tool is
 needed either. The unknown key must fail with "authentication failed", not
-with any error, and the server must then exit cleanly on SIGTERM.
+with any error, and the server must then exit cleanly on SIGTERM. The
+network setup has since moved to `scripts/dpdk/veth-setup.py`, shared with
+the test runner of `dpdk-transparent-tests.md`.
 
 ### 2. Test harness
 

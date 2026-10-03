@@ -27,7 +27,7 @@
 # Prerequisites:
 #   - libdpdk (the runtime libraries, including the af_packet PMD)
 #   - util-linux `unshare`, and python3 (standard library only) for the
-#     network setup: neither iproute2 nor ethtool is needed
+#     network setup (veth-setup.py): neither iproute2 nor ethtool is needed
 #   - unprivileged user namespaces. Ubuntu 24.04 restricts them through
 #     AppArmor; lift that with
 #       sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -78,6 +78,7 @@ fi
 # Inside the namespaces from here on.
 # ---------------------------------------------------------------------------
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE_IP=10.99.0.2
 CLIENT_IP=10.99.0.1
 PREFIX_LEN=24
@@ -109,67 +110,8 @@ fail() {
 }
 
 # veth0 (DPDK, no address) <-> veth1 (kernel, $CLIENT_IP), both up, TX
-# checksum offload off on both. With the offload on, the kernel hands
-# frames to af_packet with the TCP checksum only partially computed, the
-# userspace stack drops them, and every connect times out.
-python3 - "$CLIENT_IP" "$PREFIX_LEN" <<'EOF' || fail "network setup"
-import ctypes, fcntl, socket, struct, sys
-
-client_ip, prefix_len = sys.argv[1], int(sys.argv[2])
-
-RTM_NEWLINK, RTM_NEWADDR, NLMSG_ERROR = 16, 20, 2
-NLM_F_REQUEST, NLM_F_ACK, NLM_F_EXCL, NLM_F_CREATE = 0x1, 0x4, 0x200, 0x400
-IFLA_IFNAME, IFLA_LINKINFO, IFLA_INFO_KIND, IFLA_INFO_DATA = 3, 18, 1, 2
-VETH_INFO_PEER = 1
-IFA_ADDRESS, IFA_LOCAL = 1, 2
-IFF_UP = 0x1
-SIOCETHTOOL, ETHTOOL_STXCSUM = 0x8946, 0x17
-
-
-def attr(kind, data):
-    length = 4 + len(data)
-    return struct.pack("HH", length, kind) + data + b"\0" * ((4 - length % 4) % 4)
-
-
-def ifinfo(index=0, flags=0, change=0):
-    return struct.pack("BxHiII", socket.AF_UNSPEC, 0, index, flags, change)
-
-
-sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
-sock.bind((0, 0))
-seq = 0
-
-
-def request(what, msg_type, flags, body):
-    global seq
-    seq += 1
-    flags |= NLM_F_REQUEST | NLM_F_ACK
-    sock.send(struct.pack("IHHII", 16 + len(body), msg_type, flags, seq, 0) + body)
-    reply = sock.recv(65536)
-    if struct.unpack_from("H", reply, 4)[0] != NLMSG_ERROR:
-        sys.exit(f"{what}: unexpected netlink reply")
-    errno = -struct.unpack_from("i", reply, 16)[0]
-    if errno:
-        sys.exit(f"{what}: errno {errno}")
-
-
-peer = ifinfo() + attr(IFLA_IFNAME, b"veth1\0")
-linkinfo = attr(IFLA_INFO_KIND, b"veth") + attr(IFLA_INFO_DATA, attr(VETH_INFO_PEER, peer))
-request("create veth0/veth1", RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL,
-        ifinfo() + attr(IFLA_IFNAME, b"veth0\0") + attr(IFLA_LINKINFO, linkinfo))
-for name in ("lo", "veth0", "veth1"):
-    request(f"bring {name} up", RTM_NEWLINK, 0,
-            ifinfo(socket.if_nametoindex(name), IFF_UP, IFF_UP))
-addr = socket.inet_aton(client_ip)
-request("address veth1",RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL,
-        struct.pack("BBBBI", socket.AF_INET, prefix_len, 0, 0, socket.if_nametoindex("veth1"))
-        + attr(IFA_LOCAL, addr) + attr(IFA_ADDRESS, addr))
-
-ioctl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-for name in ("veth0", "veth1"):
-    value = ctypes.create_string_buffer(struct.pack("II", ETHTOOL_STXCSUM, 0))
-    fcntl.ioctl(ioctl_sock, SIOCETHTOOL, struct.pack("16sP", name.encode(), ctypes.addressof(value)))
-EOF
+# checksum offload off on both (see veth-setup.py for why).
+python3 "$SCRIPT_DIR/veth-setup.py" veth0 veth1 "$CLIENT_IP/$PREFIX_LEN" || fail "network setup"
 
 # EAL insists on creating /var/run/dpdk, and inside the user namespace it
 # believes it is root. A private tmpfs, gone with the mount namespace.
