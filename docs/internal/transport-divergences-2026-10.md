@@ -9,18 +9,14 @@ Paths are relative to `crates/core/server-runtime/src/`.
 
 ## Client ingress
 
-### DPDK auth failure leaves the connection open (likely bug)
+### DPDK closes a client connection without telling the peer
 
-`dpdk_transport.rs`, `process_auth_frame` / `send_auth_failed`. A bad
-signature, an undecodable ChallengeResponse, or an oversized auth frame sends
-`AuthFailed` but leaves the connection in `WaitingForResponse`.
-
-- **Bad signature.** The client can retry signatures against the same nonce
-  until `AUTH_TIMEOUT`, getting an `AuthFailed` per attempt.
-- **Oversized frame.** The bytes are never consumed, so every later recv
-  re-sends `AuthFailed` until `MAX_PARSE_BUF` or the timeout ends it.
-
-io_uring drops the connection after the first failure.
+`DpdkTransport::close` (`crates/core/dpdk`) aborts and removes the socket
+before anything is dispatched: no FIN, no RST. Every server-side close of a
+client connection is affected, a failed auth included: the client gets
+`AuthFailed` and then silence. `melin-client` returns on the error frame and is
+unaffected, but a client that waits for EOF hangs until it next sends. io_uring
+closes the socket, so the peer sees EOF.
 
 ### DPDK `PipelineFull` drops the client instead of sending ServerBusy
 
