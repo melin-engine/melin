@@ -501,6 +501,10 @@ impl Node {
 /// implies legacy memory, and the private `/var/run` makes it unnecessary.
 /// The main lcore is the first CPU this process may run on, rather than
 /// CPU 0, which a restricted runner need not allow.
+///
+/// This and `first_allowed_cpu` mirror `melin-test-node`'s copies; keep them
+/// in step until step 2 of `docs/internal/dpdk-transparent-tests.md` moves
+/// this harness onto the launcher and drops them.
 fn eal_args() -> String {
     format!(
         "--no-huge -m 512 --no-pci --vdev=net_af_packet0,iface={} -l {}",

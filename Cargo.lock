@@ -1242,6 +1242,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-test-node"
+version = "0.18.0"
+dependencies = [
+ "libc",
+ "melin-app",
+ "melin-server-runtime",
+ "melin-wire-protocol",
+]
+
+[[package]]
 name = "melin-transport-core"
 version = "0.18.0"
 dependencies = [
