@@ -47,12 +47,6 @@ with `read_exact` and has no such stall.
 
 So the same `max_connections` admits different populations.
 
-### Nonce source comment is wrong (comment only)
-
-`dpdk_transport.rs` says auth nonces "don't need CSPRNG-grade randomness".
-`client_auth.rs` requires a CSPRNG. `rand::rng()` is in fact a CSPRNG, so the
-code is fine and the comment contradicts the contract.
-
 ### Auth timeout defined twice (cosmetic)
 
 The 5 s client auth timeout is a literal in `server.rs` (per read, so up to
@@ -95,25 +89,7 @@ The DPDK heartbeat timer also omits the `past_spin_budget()` condition that
 `response.rs` explains is needed to keep the heartbeat scan from stretching to
 minutes on a nearly saturated stage.
 
-### DPDK `Connected` stamps a stale heartbeat clock (minor)
-
-`dpdk_response.rs`, `process_control_events` stamps a new connection with
-`last_heartbeat_scan` rather than now, so under sustained load it is
-heartbeated at the next scan. io_uring stamps `Instant::now()`.
-
 ## Replication
-
-### DPDK sender never sets `ack_latency_us` (likely bug)
-
-`replication/dpdk.rs`, ack handling. Only `tcp_sender.rs` updates
-`metrics.ack_latency_us[slot]`, so on DPDK `/metrics` reports 0 forever.
-
-### TCP sender over-counts evictions
-
-`replication/tcp_sender.rs`, supervisor loop. `evictions_total` is incremented
-on every 50 ms pass while the evicted flag is set and the handler hasn't been
-joined yet. A handler whose exit (uring drain) takes more than 50 ms is
-counted several times. DPDK counts once.
 
 ### DPDK sender `Handshaking` state has no deadline
 
@@ -127,20 +103,13 @@ disconnects. TCP's 10 s read timeout covers it.
 StreamStart/resync negotiation returns from `run_receiver` without
 `teardown_replica_pipeline`. That includes `read_frame`, decode, the genesis
 checks, `handle_resync_verdict`, and "unexpected response". DPDK wraps the
-same cases in `fatal_err_dpdk!`, except `decode_primary_message(payload)?` in
-its handshake loop, which bypasses the macro the same way.
+same cases in `fatal_err_dpdk!`.
 
 ### TCP receiver treats a quiet primary after auth as fatal
 
 `replication/tcp_receiver.rs`. A primary that disconnects or times out (5 s)
 after auth fails `run_receiver` fatally through `read_frame(...)?`. DPDK backs
 off and reconnects.
-
-### TCP receiver holds the socket through a resync-retry backoff
-
-`replication/tcp_receiver.rs`, `ResyncDecision::Retry`. The socket is kept
-open through the backoff sleep, contradicting the drop-before-sleep rule the
-same function follows elsewhere. DPDK closes it.
 
 ### DPDK ignores `queue_send` failures for the handshake and heartbeats
 

@@ -27,8 +27,10 @@ pub struct ReplicationMetrics {
     /// Per-slot bytes sent to the replica (cumulative). Includes
     /// catch-up and live streaming.
     pub bytes_sent: [AtomicU64; 2],
-    /// Per-slot ack round-trip latency in microseconds. Updated on
-    /// each ack by measuring elapsed time since the last batch send.
+    /// Per-slot time from the latest send (data or heartbeat) to the
+    /// latest ack, in microseconds. Not a true round trip: the ack is
+    /// not matched to the send it answers, so under continuous
+    /// streaming it reads closer to the interval between sends.
     pub ack_latency_us: [AtomicU64; 2],
     /// Per-slot cumulative count of valid `Ack` frames recorded
     /// (monotonic across reconnects — never reset on disconnect, like

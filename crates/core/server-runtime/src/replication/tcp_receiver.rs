@@ -842,6 +842,10 @@ where
                         resume_sequence,
                     ),
                     ResyncDecision::Retry => {
+                        // Drop the socket before sleeping — see the auth
+                        // failure arm above.
+                        drop(reader);
+                        drop(tcp_writer);
                         sleep_then_double_backoff(&mut backoff, shutdown, promote);
                         continue;
                     }
@@ -2258,6 +2262,51 @@ mod tests {
             // Streaming again, so shutdown finds the receiver in a session
             // rather than waiting on the primary's answer.
             stream_start(&mut s2, h2.last_sequence, lineage);
+            stop(replica, &shutdown);
+        }
+
+        /// A failed snapshot transfer backs off before redialing, and the
+        /// socket must be closed before that sleep, not after it: held
+        /// through the backoff, it ties up a primary slot on a dead session.
+        #[test]
+        fn a_failed_resync_transfer_closes_the_socket_before_backing_off() {
+            use melin_transport_core::replication::protocol::encode_need_snapshot;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_, lineage) = primary_journal(dir.path());
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let replica = spawn_replica(
+                dir.path(),
+                listener.local_addr().expect("addr"),
+                Duration::ZERO,
+                &shutdown,
+            );
+
+            let (mut s1, _s1r, _) = next_handshake(&listener);
+            // NeedSnapshot, then anything but the SnapshotBegin the
+            // transfer expects: the transfer fails and the receiver retries.
+            let mut buf = Vec::new();
+            encode_need_snapshot(&mut buf);
+            encode_need_snapshot(&mut buf);
+            s1.write_all(&buf).expect("NeedSnapshot x2");
+
+            // The first reconnect backoff is 1 s; the close must land well
+            // inside it.
+            s1.set_read_timeout(Some(Duration::from_millis(700)))
+                .expect("read timeout");
+            let mut byte = [0u8; 1];
+            match s1.read(&mut byte) {
+                Ok(0) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                other => panic!("socket still open during the backoff: {other:?}"),
+            }
+
+            // The retry dials again, as a fresh replica.
+            let (mut s2, _s2r, h2) = next_handshake(&listener);
+            assert_eq!(h2.last_sequence, 0, "retry handshakes as fresh");
+            stream_start(&mut s2, 0, lineage);
             stop(replica, &shutdown);
         }
 

@@ -125,16 +125,21 @@ pub fn run_sender<A: Application>(
     struct ReplicaSlot {
         consumer: Option<ReplicationConsumer>,
         handle: Option<std::thread::JoinHandle<ReplicationConsumer>>,
+        /// The current handler's eviction has been counted. A plain `bool`:
+        /// only this supervisor thread reads or writes it.
+        eviction_counted: bool,
     }
 
     let mut slots = [
         ReplicaSlot {
             consumer: Some(repl_consumer_1),
             handle: None,
+            eviction_counted: false,
         },
         ReplicaSlot {
             consumer: Some(repl_consumer_2),
             handle: None,
+            eviction_counted: false,
         },
     ];
 
@@ -174,23 +179,19 @@ pub fn run_sender<A: Application>(
         // to reclaim the consumer so the idle drain loop can clear the ring,
         // allowing the journal stage to resume publishing.
         for (i, slot) in slots.iter_mut().enumerate() {
-            if evict_flags[i].load(Ordering::Acquire) && slot.handle.is_some() {
+            // The handler watches the same flag and exits on its own; it is
+            // collected below once finished. Until then the flag stays set
+            // across passes, so count and log the eviction once.
+            if take_new_eviction(
+                evict_flags[i].load(Ordering::Acquire),
+                slot.handle.is_some(),
+                &mut slot.eviction_counted,
+            ) {
                 metrics.evictions_total.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     slot = i,
                     "evicting slow replica (ring backpressure timeout)"
                 );
-                // The handler thread checks shutdown — we can't signal it
-                // individually without adding per-slot flags. Instead, join
-                // the thread with a short timeout by checking is_finished.
-                // The handler's TCP read timeout (5s) will cause it to exit
-                // on the next iteration when it checks shutdown. But we
-                // want faster eviction, so we shutdown the TCP stream to
-                // unblock the read.
-                //
-                // For now, mark the slot and let it be collected below
-                // when the handler finishes naturally (TCP timeout or
-                // next send failure after the ring stops being fed).
             }
         }
 
@@ -223,6 +224,8 @@ pub fn run_sender<A: Application>(
                 && handle.is_finished()
             {
                 let handle = slot.handle.take().expect("just checked is_some");
+                // Re-arm for the slot's next handler.
+                slot.eviction_counted = false;
                 match handle.join() {
                     Ok(mut consumer) => {
                         // Drop any unread entries before the consumer is
@@ -394,6 +397,19 @@ pub fn run_sender<A: Application>(
         // that follows. In exchange the thread costs ~no CPU when idle,
         // which is why it needs no core of its own.
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Whether the supervisor should count an eviction this pass: the journal
+/// stage has flagged the slot, a handler is still running on it, and that
+/// handler's eviction has not been counted yet. Latches `counted`; the
+/// supervisor clears it when it collects the handler.
+fn take_new_eviction(evict_flag_set: bool, handler_running: bool, counted: &mut bool) -> bool {
+    if evict_flag_set && handler_running && !*counted {
+        *counted = true;
+        true
+    } else {
+        false
     }
 }
 
@@ -1248,5 +1264,28 @@ mod tests {
         // prove the kernel is done leaks them.
         assert_eq!(send_buf.len(), 64, "send_buf leaked despite a clean drain");
         close_pair(a, b);
+    }
+
+    /// An eviction is counted once, however many supervisor passes see
+    /// the flag before the handler exits, and counted again for the next
+    /// handler once the supervisor has re-armed the slot.
+    #[test]
+    fn eviction_is_counted_once_per_handler() {
+        let mut counted = false;
+        // No flag, or no handler to evict: nothing to count.
+        assert!(!take_new_eviction(false, true, &mut counted));
+        assert!(!take_new_eviction(true, false, &mut counted));
+        assert!(!counted);
+
+        // First pass with the flag set counts; later passes, while the
+        // handler is still draining, do not.
+        assert!(take_new_eviction(true, true, &mut counted));
+        for _ in 0..5 {
+            assert!(!take_new_eviction(true, true, &mut counted));
+        }
+
+        // The supervisor collects the handler and re-arms the slot.
+        counted = false;
+        assert!(take_new_eviction(true, true, &mut counted));
     }
 }

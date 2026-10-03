@@ -944,6 +944,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     transport.recv_into_vec(handle, &mut slot.recv_buf);
                     let mut consumed = 0;
                     let mut ack_error = false;
+                    // Whether an ack was recorded this tick. The latency
+                    // gauge is stored once after the loop rather than per
+                    // ack: `last_send` does not move inside it, so a later
+                    // ack's store would only overwrite an earlier one, and
+                    // this poll thread is also client ingress.
+                    let mut acked = false;
                     loop {
                         let remaining = &slot.recv_buf[consumed..];
                         match try_extract_frame(remaining, MAX_CONTROL_FRAME) {
@@ -951,13 +957,16 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 let payload = &remaining[payload_start..frame_end];
                                 if let Ok(ReplicaMessage::Ack(ack)) =
                                     decode_replica_message(payload)
-                                    && cursors.record_ack(slot_idx, &ack, slot.sent.get()).is_err()
                                 {
-                                    // Eviction on violation: reuse the ack-error
-                                    // teardown below (the store already logged
-                                    // the violation at error level).
-                                    ack_error = true;
-                                    break;
+                                    if cursors.record_ack(slot_idx, &ack, slot.sent.get()).is_err()
+                                    {
+                                        // Eviction on violation: reuse the ack-error
+                                        // teardown below (the store already logged
+                                        // the violation at error level).
+                                        ack_error = true;
+                                        break;
+                                    }
+                                    acked = true;
                                 }
                                 consumed += frame_end;
                             }
@@ -973,6 +982,14 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         }
                     }
                     compact_recv_buf(&mut slot.recv_buf, consumed);
+                    if acked {
+                        // Same measure as the TCP sender: time since the
+                        // last send (data or heartbeat) to the ack.
+                        metrics.ack_latency_us[slot_idx].store(
+                            slot.last_send.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
+                    }
                     if ack_error {
                         slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
                         continue;
@@ -1439,7 +1456,10 @@ where
             match try_extract_frame(&recv_buf, MAX_CONTROL_FRAME) {
                 FrameResult::Complete(payload_start, frame_end) => {
                     let payload = &recv_buf[payload_start..frame_end];
-                    let response = decode_primary_message(payload)?;
+                    let response = match decode_primary_message(payload) {
+                        Ok(response) => response,
+                        Err(e) => fatal_err_dpdk!(e.into()),
+                    };
                     compact_recv_buf(&mut recv_buf, frame_end);
                     match response {
                         PrimaryMessage::StreamStart {

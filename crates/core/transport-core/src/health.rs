@@ -264,7 +264,8 @@ struct HealthSnapshot {
     per_replica_lag: [u64; 2],
     /// Per-replica cumulative bytes sent.
     per_replica_bytes_sent: [u64; 2],
-    /// Per-replica ack round-trip latency in microseconds.
+    /// Per-replica time from the latest send to the latest ack, in
+    /// microseconds — see `ReplicationMetrics::ack_latency_us`.
     per_replica_ack_latency_us: [u64; 2],
     /// Per-replica cumulative valid-ack count (monotonic across
     /// reconnects). Δacked_sequence / Δacks_received between two
@@ -658,7 +659,7 @@ impl HealthSnapshot {
              # TYPE melin_replica_bytes_sent_total counter\n\
              melin_replica_bytes_sent_total{{slot=\"0\"}} {}\n\
              melin_replica_bytes_sent_total{{slot=\"1\"}} {}\n\
-             # HELP melin_replica_ack_latency_us Ack round-trip latency per replica in microseconds.\n\
+             # HELP melin_replica_ack_latency_us Microseconds from the latest send to a replica to its latest ack. Not matched to the send the ack answers, so under continuous streaming it reads closer to the send interval than to a round trip.\n\
              # TYPE melin_replica_ack_latency_us gauge\n\
              melin_replica_ack_latency_us{{slot=\"0\"}} {}\n\
              melin_replica_ack_latency_us{{slot=\"1\"}} {}\n\
