@@ -60,6 +60,7 @@ use tracing::{debug, warn};
 use crate::dpdk_response::{ControlEvent, TxFrame};
 use crate::halt::{HaltGate, RefusalSender};
 
+use crate::client_auth::MAX_AUTH_FRAME;
 use crate::client_frames::MAX_FRAME_SIZE;
 
 /// Auth handshake timeout. Connections that don't complete auth within
@@ -699,11 +700,6 @@ pub fn run_dpdk_poll<A: Application>(
         }
     }
 }
-
-/// Largest auth frame accepted. A ChallengeResponse is 1 (tag) + 64
-/// (signature) + 32 (pubkey) = 97 bytes; the io_uring path applies the
-/// same cap.
-const MAX_AUTH_FRAME: usize = 256;
 
 /// What a pending connection's parse buffer amounts to, auth-wise.
 #[derive(Debug)]

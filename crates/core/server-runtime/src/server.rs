@@ -34,6 +34,7 @@ use melin_transport_core::pipeline::{
 type Pipeline<A> = GenericPipeline<A>;
 
 use crate::StartupEvents;
+use crate::client_auth::MAX_AUTH_FRAME;
 use crate::reader::RequestDecoderArc;
 use crate::response::ResponseEncoderArc;
 use melin_app::auth::{AuthorizedKeys, ClientRole, KeyRole, RoleId};
@@ -3723,12 +3724,11 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         .read_exact(&mut len_buf)
         .map_err(|e| io::Error::other(format!("read auth frame length: {e}")))?;
     let frame_len = u32::from_le_bytes(len_buf) as usize;
-    // ChallengeResponse is 1 (tag) + 64 (signature) + 32 (public key) = 97 bytes.
-    if frame_len > 256 {
+    if frame_len > MAX_AUTH_FRAME {
         send_auth_failed(writer);
         return Err(io::Error::other(format!("auth frame too large: {frame_len}")).into());
     }
-    let mut frame_buf = [0u8; 256];
+    let mut frame_buf = [0u8; MAX_AUTH_FRAME];
     reader
         .read_exact(&mut frame_buf[..frame_len])
         .map_err(|e| io::Error::other(format!("read auth frame payload: {e}")))?;
