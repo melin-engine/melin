@@ -84,24 +84,50 @@ builds it.
 - **Network setup in Rust.** The child builds the veth pair, address and
   checksum setting with a small rtnetlink + ioctl helper over `libc`, so no
   new dependency and no Python.
-- **Server in-process.** The server runs inside the child, so a test can read
-  internals (health metrics, connection counts) as well as drive the wire.
+- **Did the child run?** A filter that matches nothing makes the child exit
+  0 having run no test. So the child also writes a marker file once the
+  test body has passed, and the parent requires both.
+- **Server in-process.** The server runs inside the child, through the
+  same entry point as the binaries (`server::run`), and stops on SIGTERM
+  sent to the child itself, because that entry point owns its shutdown
+  flag. The first draft meant to read slot counts off the health
+  endpoint, but it counts authenticated connections only, so a refused
+  connection's slot never appears there. The node runs with
+  `max_connections = 1` instead, and a slot is free when the next
+  authorised client gets in. That check must finish inside
+  the 5-second auth timeout, which frees an unclosed slot on its own.
 - **Clients.** `melin-client` for well-behaved clients; raw sockets for
   misbehaving ones.
 - **No silent skip.** A missing namespace capability fails the test with a
   message saying what the host lacks. Per CLAUDE.md, no `#[ignore]`.
-- **Serial.** A nextest test group with `max-threads = 1` keeps the tests
-  serial, alongside `cluster-serial` in `.config/nextest.toml`.
+- **Serial.** A nextest test group with `max-threads = 1` (`dpdk-serial`,
+  next to `cluster-serial` in `.config/nextest.toml`) keeps the tests
+  serial. Under a plain `cargo test --features dpdk`, a lock in the parent
+  does the same.
+- **Bounded.** The parent kills a child that runs past a limit set under
+  nextest's slow-timeout, so a hang is reported by the test, with the
+  child's output.
 
-First tests, chosen because each pins a known behaviour:
+The harness is `crates/core/server-runtime/tests/dpdk_veth/`. First tests,
+chosen because each pins a known behaviour:
 
 - **Bad key.** A client with an unknown key gets `AuthFailed`, and the server
   closes its connection and frees the slot.
 - **Retry after failure.** A client that sends a second ChallengeResponse after
-  a failed one gets no second `AuthFailed`. The connection closes.
+  a failed one gets no second `AuthFailed`. The connection closes. Two shapes:
+  the retry pipelined behind the failed attempt, and sent after the verdict.
+  The retry is signed by an authorised key, so a node that read it would
+  answer `ServerReady`.
 - **Close is silent.** After a server-side close the client sees neither FIN
-  nor RST. This pins the documented divergence, and the test flips when that
+  nor RST, and learns of the close only from the RST that answers its next
+  send. This pins the documented divergence, and the test flips when that
   is fixed.
+
+Writing these turned up a bug: the node does not notice an authorised
+client's FIN. Its slot comes back only when the next heartbeat is answered
+with an RST. Until then the node turns new connections away at
+`max_connections`, so every test's connect helper retries rather than
+expecting the slot at once.
 
 ### 3. CI
 
@@ -131,7 +157,8 @@ From `transport-divergences-2026-10.md`:
 
 - the pipelined first request after auth;
 - `PipelineFull` closing instead of `ServerBusy`;
-- the silent close;
+- the silent close (now pinned by `a_server_side_close_is_silent`);
+- the unseen client close;
 - the heartbeat drop when the SPSC ring is full (needs a small ring);
 - with step 4, the DPDK replication entries.
 

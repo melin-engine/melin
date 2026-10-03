@@ -11,11 +11,14 @@
 # Binaries are named exactly rather than matched by pattern. `binary()`
 # is an equality predicate: the previous `binary(failover)` matched
 # nothing at all (the binary is `raft_failover`), so the group sat empty
-# and these tests had been running fully parallel. Exact names are
-# self-policing — nextest treats a name that matches no binary as a hard
-# config error, so renaming or deleting one of these fails loudly
-# instead of silently emptying the group again. Adding a new
-# cluster-spawning test binary means adding it here.
+# and these tests had been running fully parallel. Exact names are not
+# self-policing: nextest accepts a name that matches no binary and the
+# group simply empties, so renaming or deleting one of these binaries
+# means updating it here, and adding a new cluster-spawning test binary
+# means adding it. `cargo nextest show-config test-groups` lists each
+# group's members (a group reported as `(no matches)` has lost them);
+# check `dpdk-serial` with `--features melin-server-runtime/dpdk`, since
+# its binary only exists in that build.
 #
 # A test that hangs — a fake peer that never answers, a read with no
 # deadline — would otherwise hang the pre-commit hook, and CI with it.
@@ -30,5 +33,16 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = 'binary(raft_failover) + binary(raft_smoke) + binary(startup_events) + binary(replicated_failover) + binary(halt_refusal) + binary(sizing) + binary(genesis_promotion)'
 test-group = 'cluster-serial'
 
+# The DPDK transport on veth (`melin-server-runtime`, built only with its
+# `dpdk` feature). Each test re-executes itself into namespaces of its own
+# and runs a node whose poll thread busy-polls a core, so they go one at a
+# time. A group of their own rather than `cluster-serial`: the namespaces
+# keep them apart from the cluster tests, which bind host ports and never
+# see theirs, so the two groups can overlap.
+[[profile.default.overrides]]
+filter = 'binary(dpdk_veth)'
+test-group = 'dpdk-serial'
+
 [test-groups]
 cluster-serial = { max-threads = 1 }
+dpdk-serial = { max-threads = 1 }

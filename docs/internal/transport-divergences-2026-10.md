@@ -7,6 +7,10 @@ why. Some differences are deliberate, and those are marked.
 
 Paths are relative to `crates/core/server-runtime/src/`.
 
+The DPDK side of an entry can be exercised without hardware on the veth
+harness (`dpdk-veth-testing.md`). An entry says it is covered there only
+when a test there covers it; the others have no DPDK test yet.
+
 ## Client ingress
 
 ### DPDK closes a client connection without telling the peer
@@ -17,6 +21,22 @@ client connection is affected, a failed auth included: the client gets
 `AuthFailed` and then silence. `melin-client` returns on the error frame and is
 unaffected, but a client that waits for EOF hangs until it next sends. io_uring
 closes the socket, so the peer sees EOF.
+
+Pinned by `a_server_side_close_is_silent` in the DPDK veth tests
+(`crates/core/server-runtime/tests/dpdk_veth/`): no FIN or RST within a
+read timeout after the close, and an RST answering the client's next send.
+The fix flips that test to require the EOF.
+
+### DPDK does not see a client's close (likely bug)
+
+`dpdk_transport.rs`, the read path. A connection is released when a
+zero-byte read finds the socket no longer active. A client's FIN moves the
+smoltcp socket to CloseWait, which still counts as active, so the node keeps
+the connection, its slot and its socket. They are released only when the
+next heartbeat is answered with an RST, at the idle timeout with heartbeats
+off, or never with both off. Until then a node at `max_connections` turns new clients
+away. io_uring releases the connection on EOF. The fix is to treat a
+zero-byte read on a socket that can no longer receive as a close.
 
 ### DPDK `PipelineFull` drops the client instead of sending ServerBusy
 

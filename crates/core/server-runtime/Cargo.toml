@@ -38,6 +38,14 @@ hash-chain = [
     "melin-transport-core/hash-chain",
 ]
 
+# The DPDK transport on a veth pair, each test in namespaces of its own
+# (see the file). Needs libdpdk to build, so only with `dpdk`: a plain
+# `cargo test`, and the pre-commit hook, never build it.
+[[test]]
+name = "dpdk_veth"
+path = "tests/dpdk_veth/main.rs"
+required-features = ["dpdk"]
+
 [dependencies]
 melin-app = { workspace = true }
 melin-pipeline = { workspace = true }
