@@ -10,6 +10,11 @@ A hand-run probe showed the whole DPDK path can run on an ordinary Linux
 host without root, hugepages, or a NIC. This plan turns that into a smoke
 script, a test harness, and a CI job.
 
+Status: steps 1 and 2 are done and pass on a developer host; step 3 is
+written but not yet proven on a hosted runner (until the first green run
+of the `dpdk` job); step 4 is not started. The step sections
+below describe what was built, where it differs from the first draft.
+
 ## What the probe established
 
 Inside an unprivileged user + network + mount namespace (`unshare -rnm`):
@@ -139,6 +144,12 @@ installs the SDK. It gains three things:
 - a step lifting the AppArmor user-namespace restriction;
 - a step running the DPDK test target serially;
 - an update to the comment saying a hosted runner cannot run DPDK.
+
+As built, it also installs nextest, as the test job does, so the test
+group and slow-timeout apply. The af_packet driver needs no extra package:
+`libdpdk-dev` depends on DPDK's runtime libraries, PMDs included. The smoke
+script is not run in CI: it needs a release build of the echo example, and
+the tests already check what it checks.
 
 If that pushes the job too long, the tests move to `nightly.yml` instead.
 

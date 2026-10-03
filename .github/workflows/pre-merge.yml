@@ -148,13 +148,15 @@ jobs:
       - name: Tests
         run: cargo nextest run --no-fail-fast --locked
 
-  # The one job that is two checks, because they share one apt install. Both
-  # need the DPDK SDK, and apt is what rust-cache does not cover — it caches
-  # cargo's registry and target directory, and every run starts on a fresh
-  # VM, so a second job would pay for the SDK a second time. Sharing costs
-  # the property the rest of this file relies on, that a failure in one check
-  # cannot hide another, so the second step carries `if: ${{ !cancelled() }}`
-  # to buy it back: it runs and reports whatever the first one did.
+  # The one job that is several checks, because they share one apt install.
+  # All need the DPDK SDK, and apt is what rust-cache does not cover — it
+  # caches cargo's registry and target directory, and every run starts on a
+  # fresh VM, so a second job would pay for the SDK a second time. Sharing
+  # costs the property the rest of this file relies on, that a failure in one
+  # check cannot hide another, so the packaging step carries
+  # `if: ${{ !cancelled() }}` to buy it back: it runs and reports whatever
+  # the DPDK steps did. The tests need not: they cannot build where the
+  # check failed.
   #
   # The DPDK transport is the one configuration nothing else compiles. The
   # pre-commit hook cannot cover it: `melin-dpdk`'s build script hard-fails
@@ -166,16 +168,19 @@ jobs:
   # it from the archive in seconds — no `scripts/dpdk/dpdk-setup.sh`, which
   # exists for hugepages and NIC binding rather than for building.
   #
-  # `cargo check` rather than build or test: the value here is proving the
-  # bindgen run and the feature-gated code still compile. Actually running
-  # DPDK needs hugepages, a bound NIC, and root, none of which a hosted
-  # runner has.
+  # A hosted runner can run DPDK too, though not on a NIC: the `dpdk_veth`
+  # tests put the transport on a veth pair through the af_packet PMD, with
+  # no hugepages and no root, inside unprivileged namespaces. That covers
+  # the transport's logic, not offloads, multi-queue, `rte_flow`, or
+  # anything else only a real NIC exercises. See
+  # `docs/internal/dpdk-veth-testing.md`.
   dpdk:
     runs-on: ubuntu-latest
-    # Two builds now, and the packaging one compiles eight crates from their
-    # tarballs with a target directory rust-cache cannot warm (each package
-    # builds under `target/package/`).
-    timeout-minutes: 45
+    # Three builds now: the check, the tests' debug build, and the packaging
+    # one, which compiles eight crates from their tarballs with a target
+    # directory rust-cache cannot warm (each package builds under
+    # `target/package/`).
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v7
@@ -188,10 +193,12 @@ jobs:
       # already ships Clang 16/17/18 — installing `libclang-dev` on top of
       # that pulled a whole LLVM development tree and dominated the job.
       # If bindgen ever fails to find it, set LIBCLANG_PATH rather than
-      # reinstalling the tree.
+      # reinstalling the tree. The package depends on DPDK's runtime
+      # libraries, PMDs included, so the af_packet driver the veth tests run
+      # on comes with it.
       #
       # This step pays full price every run. If it ever stops being seconds,
-      # the DPDK check moves to Nightly — but the packaging step stays here,
+      # the DPDK check and tests move to Nightly — but the packaging step stays here,
       # since its whole value is gating an ordinary push, and it would then
       # need `--exclude melin-dpdk` and the coverage loss that implies.
       - name: Install DPDK headers
@@ -201,6 +208,28 @@ jobs:
 
       - name: DPDK builds
         run: cargo check -p melin-server-runtime --all-targets --features dpdk --locked
+
+      # The veth tests run each test in new user, network and mount
+      # namespaces (`unshare -rnm`), which Ubuntu 24.04 lets an unprivileged
+      # process create only once AppArmor's restriction is lifted. The
+      # runner is a throwaway VM, so lifting it for the job costs nothing.
+      # Guarded on the key existing: an image without the restriction has
+      # nothing to lift, and if namespaces are still refused the tests fail
+      # saying so.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      # As in the test job.
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      # Serial through the `dpdk-serial` test group in `.config/nextest.toml`:
+      # each test runs a node whose poll thread busy-polls a core.
+      - name: DPDK tests on veth
+        run: cargo nextest run -p melin-server-runtime --features dpdk --test dpdk_veth --no-fail-fast --locked
 
       # Proves the workspace can still be packaged. Nothing else does: `cargo
       # check` compiles crates in place, while publishing builds each one from
