@@ -20,7 +20,8 @@ Inside an unprivileged user + network + mount namespace (`unshare -rnm`):
 - **Server.** The server runs DPDK on veth0 through the `net_af_packet` PMD.
   EAL arguments: `--no-huge -m <MiB> --no-pci --vdev=net_af_packet0,iface=veth0
   -l <core>`. `--in-memory` cannot be used: EAL refuses it with `--no-huge`,
-  which implies legacy memory.
+  which implies legacy memory. The core is the first CPU the process may
+  run on, not CPU 0, which a restricted host need not allow.
 - **Runtime directory.** EAL insists on creating `/var/run/dpdk`, and inside
   the user namespace it believes it is root. A private tmpfs mounted on
   `/var/run` satisfies it.
@@ -64,6 +65,11 @@ It exits non-zero on any failure and fails loudly if the namespace cannot be
 created. Network setup must not need iproute2 or ethtool. Python's standard
 library (rtnetlink over `AF_NETLINK`, the ethtool ioctl) is acceptable for a
 script.
+
+As built, the keys are fixed in the script (the authorized one is the
+openssl-generated PEM from `melin-client`'s key tests), so no key tool is
+needed either. The unknown key must fail with "authentication failed", not
+with any error, and the server must then exit cleanly on SIGTERM.
 
 ### 2. Test harness
 
