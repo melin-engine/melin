@@ -1,41 +1,32 @@
-//! The DPDK transport, end to end, on a veth pair instead of a NIC.
+//! The DPDK transport's client path, end to end, on veth instead of a NIC.
 //!
 //! Each test runs a counter node on DPDK through the `net_af_packet` PMD,
 //! with no hugepages, no bound NIC and no root, and drives it from a
-//! kernel-TCP client on the other end of the pair. That checks the
-//! transport's logic — the poll loop, the auth state machine, what a close
-//! does on the wire — and nothing about its speed: af_packet is not a NIC.
-//! See `docs/internal/dpdk-veth-testing.md`.
+//! kernel-TCP client on the runner's network. That checks the transport's
+//! logic — the poll loop, the auth state machine, what a close does on the
+//! wire — and nothing about its speed: af_packet is not a NIC. See
+//! `docs/internal/dpdk-veth-testing.md`.
 //!
-//! # Why each test re-executes itself
+//! Unlike the rest of this crate's integration tests, which run on DPDK
+//! only with the `dpdk` feature, these pin what the DPDK transport does
+//! where it differs from kernel TCP, so they exist only on DPDK. Built only
+//! with the `dpdk` feature (`required-features` in the manifest), so a
+//! plain `cargo test` never needs libdpdk.
 //!
-//! EAL initialises once per process, and the network a test builds must
-//! not be the host's. So each test re-runs its own binary under
-//! `unshare -rnm` (new user, network and mount namespaces), filtered to
-//! itself and marked by an environment variable. The child builds the
-//! veth pair, runs the node in-process and does the real work; the parent
-//! only asserts that the child passed. `unshare(2)` itself is no option in
-//! the parent: a user namespace needs a single-threaded caller, and the
-//! test runner is not one.
-//!
-//! The host must allow unprivileged user namespaces. Ubuntu 24.04 restricts
-//! them by default; a test fails, saying so, rather than skipping.
-//!
-//! Built only with the `dpdk` feature (`required-features` in the
-//! manifest), so a plain `cargo test` never needs libdpdk. Run with:
+//! The node is started through `melin-test-node`, so the test process must
+//! run under `scripts/dpdk/netns-runner.sh`, which gives it namespaces of
+//! its own with the network built (see
+//! `docs/internal/dpdk-transparent-tests.md`). The host must allow
+//! unprivileged user namespaces; the runner fails, saying so, when it does
+//! not. Run with:
 //!
 //! ```sh
-//! cargo nextest run -p melin-server-runtime --features dpdk --test dpdk_veth
+//! CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run -p melin-server-runtime --features dpdk --test dpdk_veth -j 1
 //! ```
 
-mod netns;
-
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Mutex;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use counter_server::{Counter, KIND_RESP_ACK, RequestDecoder, ResponseEncoder, increment_request};
@@ -43,23 +34,8 @@ use melin_client::{Connection, Handshake, SigningKey, Step, key};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
 use melin_wire_protocol::control_codec::{TAG_AUTH_FAILED, TAG_CHALLENGE};
-
-// ---------------------------------------------------------------------------
-// The network
-// ---------------------------------------------------------------------------
-
-/// The node's address, owned by DPDK's userspace stack on `veth0`.
-const NODE_IP: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 2);
-/// The client's address, on the kernel's `veth1`.
-const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 1);
-const PREFIX_LEN: u8 = 24;
-const NODE_PORT: u16 = 9876;
-
-fn node_addr() -> SocketAddr {
-    SocketAddr::V4(SocketAddrV4::new(NODE_IP, NODE_PORT))
-}
 
 // ---------------------------------------------------------------------------
 // Time limits
@@ -69,12 +45,9 @@ fn node_addr() -> SocketAddr {
 // 60-second periods, `.config/nextest.toml`) with nothing said about where.
 // ---------------------------------------------------------------------------
 
-/// How long the parent waits for its child, the whole test.
-const CHILD_LIMIT: Duration = Duration::from_secs(100);
-/// How long the node may take to come up: EAL init, journal creation.
-const STARTUP_LIMIT: Duration = Duration::from_secs(45);
-/// How long a clean shutdown may take.
-const SHUTDOWN_LIMIT: Duration = Duration::from_secs(20);
+/// How long the node may take to come up: EAL init, port start, journal
+/// creation.
+const STARTUP_LIMIT: Duration = melin_test_node::STARTUP_LIMIT;
 /// How long to wait for any single frame the node owes the client.
 const FRAME_LIMIT: Duration = Duration::from_secs(10);
 /// How long a client waits to be sure nothing more is coming.
@@ -94,15 +67,14 @@ const HEARTBEAT: Duration = Duration::from_secs(10);
 // The tests
 // ---------------------------------------------------------------------------
 
-/// Declare a test that runs `body` in a fresh namespace, against a fresh
-/// node. The macro keeps the name the child is filtered to and the
-/// function's own name one and the same.
+/// Declare a test that runs `body` against a fresh node, given the node's
+/// client address.
 macro_rules! veth_test {
     ($(#[doc = $doc:literal])* $name:ident, $body:expr) => {
         $(#[doc = $doc])*
         #[test]
         fn $name() {
-            in_namespace(stringify!($name), $body);
+            with_node($body);
         }
     };
 }
@@ -114,8 +86,8 @@ veth_test!(
     /// back — while the refused client still holds its end open, so the
     /// close cannot be one the client started.
     an_unknown_key_is_refused_and_its_slot_freed,
-    || {
-        let (mut refused, challenge) = connect_for_challenge();
+    |node| {
+        let (mut refused, challenge) = connect_for_challenge(node);
         refused
             .write_all(&answer(&challenge, &unknown_key()))
             .expect("send the challenge response");
@@ -125,7 +97,7 @@ veth_test!(
             "an unknown key is refused"
         );
 
-        assert_slot_freed("after a refused key");
+        assert_slot_freed(node, "after a refused key");
         drop(refused);
     }
 );
@@ -139,9 +111,9 @@ veth_test!(
     /// both are in the node's buffer when it judges the first; and sent
     /// after the client has the `AuthFailed`.
     a_second_attempt_after_a_failure_is_not_answered,
-    || {
+    |node| {
         // Pipelined: both answers go in one write.
-        let (mut client, challenge) = connect_for_challenge();
+        let (mut client, challenge) = connect_for_challenge(node);
         let mut both = answer(&challenge, &unknown_key());
         both.extend_from_slice(&answer(&challenge, &writer_key()));
         client.write_all(&both).expect("send both attempts");
@@ -151,11 +123,11 @@ veth_test!(
             "the first attempt is refused"
         );
         assert_nothing_more(&mut client, "a pipelined second attempt");
-        assert_slot_freed("after a pipelined second attempt");
+        assert_slot_freed(node, "after a pipelined second attempt");
         drop(client);
 
         // Sent after the verdict.
-        let (mut client, challenge) = connect_for_challenge();
+        let (mut client, challenge) = connect_for_challenge(node);
         client
             .write_all(&answer(&challenge, &unknown_key()))
             .expect("send the first attempt");
@@ -168,7 +140,7 @@ veth_test!(
         // the check below is about.
         let _ = client.write_all(&answer(&challenge, &writer_key()));
         assert_nothing_more(&mut client, "a second attempt after the verdict");
-        assert_slot_freed("after a second attempt following the verdict");
+        assert_slot_freed(node, "after a second attempt following the verdict");
         drop(client);
     }
 );
@@ -184,8 +156,8 @@ veth_test!(
     /// When that is fixed this test fails, and is to be flipped to require
     /// the EOF.
     a_server_side_close_is_silent,
-    || {
-        let (mut client, challenge) = connect_for_challenge();
+    |node| {
+        let (mut client, challenge) = connect_for_challenge(node);
         client
             .write_all(&answer(&challenge, &unknown_key()))
             .expect("send the challenge response");
@@ -196,7 +168,7 @@ veth_test!(
         );
         // The slot is released only together with the socket, so once it
         // is free the node has closed its side.
-        assert_slot_freed("after a refused key");
+        assert_slot_freed(node, "after a refused key");
 
         client
             .set_read_timeout(Some(SILENCE))
@@ -241,12 +213,12 @@ veth_test!(
     /// is fixed this test fails, and is to be flipped to require the slot
     /// back within [`SLOT_FREED_WITHIN`].
     a_client_close_is_seen_only_at_the_next_heartbeat,
-    || {
-        let conn = served_within(STARTUP_LIMIT, "the first client");
+    |node| {
+        let conn = served_within(node, STARTUP_LIMIT, "the first client");
         // Closes the socket: the client's FIN goes out now.
         drop(conn);
 
-        if challenge_within(SLOT_FREED_WITHIN).is_ok() {
+        if challenge_within(node, SLOT_FREED_WITHIN).is_ok() {
             panic!(
                 "the node freed a closed client's slot within {SLOT_FREED_WITHIN:?}, before \
                  its heartbeat: DPDK now sees a client's FIN. Flip this test to require the \
@@ -257,7 +229,7 @@ veth_test!(
 
         // The heartbeat goes out within a second of HEARTBEAT after the
         // last reply; the margin covers that and the RST's way back.
-        served_within(HEARTBEAT + FRAME_LIMIT, "after the node's heartbeat");
+        served_within(node, HEARTBEAT + FRAME_LIMIT, "after the node's heartbeat");
     }
 );
 
@@ -275,7 +247,7 @@ fn unknown_key() -> SigningKey {
     SigningKey::from_bytes(&[0xB2; 32])
 }
 
-/// Connect a bare socket and read the node's challenge, retrying until
+/// Connect a bare socket to `node` and read its challenge, retrying until
 /// the node is serving. Returns the socket and the challenge's payload.
 ///
 /// The retries are load-bearing, and not only at startup, when nothing
@@ -286,22 +258,18 @@ fn unknown_key() -> SigningKey {
 /// answers its next heartbeat (pinned by
 /// `a_client_close_is_seen_only_at_the_next_heartbeat`). Every test that
 /// has called [`assert_slot_freed`] leaves such a connection behind.
-fn connect_for_challenge() -> (TcpStream, Vec<u8>) {
-    challenge_within(STARTUP_LIMIT).unwrap_or_else(|e| {
-        panic!(
-            "no challenge from {} within {STARTUP_LIMIT:?}: {e}",
-            node_addr()
-        )
-    })
+fn connect_for_challenge(node: SocketAddr) -> (TcpStream, Vec<u8>) {
+    challenge_within(node, STARTUP_LIMIT)
+        .unwrap_or_else(|e| panic!("no challenge from {node} within {STARTUP_LIMIT:?}: {e}"))
 }
 
 /// [`connect_for_challenge`], giving up after `limit` with the last
 /// attempt's error.
-fn challenge_within(limit: Duration) -> io::Result<(TcpStream, Vec<u8>)> {
+fn challenge_within(node: SocketAddr, limit: Duration) -> io::Result<(TcpStream, Vec<u8>)> {
     let deadline = Instant::now() + limit;
     loop {
-        let attempt = TcpStream::connect_timeout(&node_addr(), Duration::from_millis(500))
-            .and_then(|mut stream| {
+        let attempt =
+            TcpStream::connect_timeout(&node, Duration::from_millis(500)).and_then(|mut stream| {
                 stream.set_read_timeout(Some(Duration::from_secs(1)))?;
                 stream.set_nodelay(true)?;
                 let frame = read_frame(&mut stream)?;
@@ -372,23 +340,23 @@ fn assert_nothing_more(client: &mut TcpStream, after: &str) {
     }
 }
 
-/// An authorised client connects, and is served, within
+/// An authorised client connects to `node`, and is served, within
 /// [`SLOT_FREED_WITHIN`]. The node runs with `max_connections` at one, so
 /// this proves the previous connection's slot was released.
 ///
 /// The client then closes, and its slot stays taken until the node's next
 /// heartbeat (see [`connect_for_challenge`]).
-fn assert_slot_freed(after: &str) {
-    drop(served_within(SLOT_FREED_WITHIN, after));
+fn assert_slot_freed(node: SocketAddr, after: &str) {
+    drop(served_within(node, SLOT_FREED_WITHIN, after));
 }
 
-/// An authorised client that connected, and was served, within `limit`.
-fn served_within(limit: Duration, after: &str) -> Connection {
+/// An authorised client that connected to `node`, and was served, within
+/// `limit`.
+fn served_within(node: SocketAddr, limit: Duration, after: &str) -> Connection {
     let deadline = Instant::now() + limit;
-    let mut conn =
-        Connection::connect_by(node_addr(), &writer_key(), deadline).unwrap_or_else(|e| {
-            panic!("{after}: the node's only connection slot was not free within {limit:?}: {e}")
-        });
+    let mut conn = Connection::connect_by(node, &writer_key(), deadline).unwrap_or_else(|e| {
+        panic!("{after}: the node's only connection slot was not free within {limit:?}: {e}")
+    });
     let reply = conn
         .request_one(&increment_request(1))
         .unwrap_or_else(|e| panic!("{after}: the authorised client was not served: {e}"));
@@ -404,155 +372,26 @@ fn served_within(limit: Duration, after: &str) -> Connection {
 // The node
 // ---------------------------------------------------------------------------
 
-/// A counter node on DPDK, running in this (child) process.
-///
-/// No `Drop`: a test that panics fails the child, whose exit takes the
-/// node, its namespaces and its tmpfs with it, so there is nothing to
-/// stop on that path.
-struct Node {
-    thread: JoinHandle<Result<(), String>>,
-    /// Journal and `authorized_keys`; held so they outlive the node.
-    _dir: tempfile::TempDir,
-}
-
-impl Node {
-    fn start() -> Node {
-        let dir = tempfile::tempdir_in(temp_parent()).expect("tempdir");
-        let authorized_keys = dir.path().join("authorized_keys");
-        std::fs::write(
-            &authorized_keys,
-            format!(
-                "{}\n",
-                key::authorized_keys_line("writer", &writer_key().verifying_key(), "veth-test")
-            ),
-        )
-        .expect("write authorized_keys");
-
-        let config = ServerConfig {
-            bind: node_addr(),
-            journal: dir.path().join("counter.journal"),
-            authorized_keys,
-            standalone: true,
-            ack_policy: AckPolicy::Disk,
-            no_mlock: true,
-            // Unpinned: the node shares the host with the test's client,
-            // and a CI runner with everything else.
-            cores: PipelineCores::unpinned(),
-            snapshot_interval_ms: 0,
-            health_bind: None,
-            // One slot, so a test can tell whether a closed connection's
-            // slot came back: the next client gets in only if it did.
-            max_connections: 1,
-            heartbeat_interval_secs: HEARTBEAT.as_secs(),
-            dpdk_eal_args: eal_args(),
-            dpdk_ip: NODE_IP.to_string(),
-            dpdk_prefix_len: PREFIX_LEN,
-            ..ServerConfig::default()
-        };
-
-        let thread = std::thread::Builder::new()
-            .name("node".into())
-            .spawn(move || {
-                server::run::<Counter>(
-                    config,
-                    StartupEvents::none(),
-                    (),
-                    RequestDecoder,
-                    ResponseEncoder,
-                    None,
-                )
-                .map_err(|e| e.to_string())
-            })
-            .expect("spawn the node thread");
-        Node { thread, _dir: dir }
-    }
-
-    /// Shut the node down the way an operator does, with SIGTERM: `run`
-    /// owns its shutdown flag and sets it from its signal handler.
-    fn stop(self) {
-        let Node { thread, _dir } = self;
-        assert!(
-            !thread.is_finished(),
-            "the node stopped before the test asked it to: {:?}",
-            thread.join()
-        );
-        // SAFETY: kill(2) on our own pid; `run` has installed its handler,
-        // since the node has been serving.
-        let rc = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
-        assert_eq!(rc, 0, "SIGTERM: {}", io::Error::last_os_error());
-        let deadline = Instant::now() + SHUTDOWN_LIMIT;
-        while !thread.is_finished() {
-            assert!(
-                Instant::now() < deadline,
-                "the node did not shut down within {SHUTDOWN_LIMIT:?}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        thread
-            .join()
-            .expect("node thread panicked")
-            .expect("node returned an error");
-    }
-}
-
-/// EAL arguments for af_packet on `veth0`, in ordinary memory.
-///
-/// `--in-memory` is not among them: EAL refuses it with `--no-huge`, which
-/// implies legacy memory, and the private `/var/run` makes it unnecessary.
-/// The main lcore is the first CPU this process may run on, rather than
-/// CPU 0, which a restricted runner need not allow.
-///
-/// This and `first_allowed_cpu` mirror `melin-test-node`'s copies; keep them
-/// in step until step 2 of `docs/internal/dpdk-transparent-tests.md` moves
-/// this harness onto the launcher and drops them.
-fn eal_args() -> String {
-    format!(
-        "--no-huge -m 512 --no-pci --vdev=net_af_packet0,iface={} -l {}",
-        netns::DPDK_IFACE,
-        first_allowed_cpu()
-    )
-}
-
-fn first_allowed_cpu() -> usize {
-    // SAFETY: `cpu_set_t` is plain old data; all-zero is the empty set.
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `set` is a live, writable cpu_set_t of the size passed.
-    let rc = unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) };
-    assert_eq!(rc, 0, "sched_getaffinity: {}", io::Error::last_os_error());
-    (0..libc::CPU_SETSIZE as usize)
-        // SAFETY: `c` is below CPU_SETSIZE, inside the set.
-        .find(|&c| unsafe { libc::CPU_ISSET(c, &set) })
-        .expect("this process may run on at least one CPU")
-}
-
-// ---------------------------------------------------------------------------
-// The re-exec harness
-// ---------------------------------------------------------------------------
-
-/// Set in the child; its value is the file the child creates once the
-/// test body has passed.
-const CHILD_ENV: &str = "MELIN_DPDK_VETH_CHILD";
-
 /// Serialises the tests under a plain `cargo test`, which runs them on
-/// parallel threads. Each would work alongside the others — every child
-/// has its own namespaces — but each node busy-polls a core, and the plan
-/// is for these to run one at a time. Under nextest the `dpdk-serial`
-/// test group does the same across processes.
+/// parallel threads of one process: each starts its node on the same slot
+/// of the runner's network, and each node busy-polls a core. Under nextest
+/// every test has a process of its own, and the `dpdk-serial` test group
+/// keeps them one at a time.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
-/// Run `body` against a fresh node in fresh namespaces: in the child,
-/// do it; in the parent, re-execute this test under `unshare -rnm` and
-/// assert that it passed.
-fn in_namespace(name: &str, body: fn()) {
-    match std::env::var_os(CHILD_ENV) {
-        Some(done) => run_child(body, Path::new(&done)),
-        None => run_parent(name),
-    }
-}
+/// Run `body` against a fresh counter node on DPDK, then stop the node.
+///
+/// No cleanup on a panic: the test has failed, and its process exiting
+/// takes the node, the namespaces and the tmpfs with it.
+fn with_node(body: fn(SocketAddr)) {
+    // A poisoned lock only means an earlier test failed; that one has
+    // reported itself, and this one has nothing to inherit from it.
+    let _serial = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-fn run_child(body: fn(), done: &Path) {
-    // Deliberately ignored: only one test runs in the child, and a
-    // subscriber already installed would be just as good.
+    // Deliberately ignored: a subscriber an earlier test in this process
+    // installed is just as good.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -561,144 +400,45 @@ fn run_child(body: fn(), done: &Path) {
                 )
             }),
         )
-        .with_writer(io::stderr)
+        .with_test_writer()
         .with_thread_names(true)
         .try_init();
 
-    if let Err(e) = netns::build(CLIENT_IP, PREFIX_LEN) {
-        panic!("{e}\n{}", namespace_hint());
-    }
-    if let Err(e) = netns::private_var_run() {
-        panic!("{e}\n{}", namespace_hint());
-    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let authorized_keys = dir.path().join("authorized_keys");
+    std::fs::write(
+        &authorized_keys,
+        format!(
+            "{}\n",
+            key::authorized_keys_line("writer", &writer_key().verifying_key(), "veth-test")
+        ),
+    )
+    .expect("write authorized_keys");
 
-    let node = Node::start();
-    body();
-    node.stop();
-
-    std::fs::write(done, b"passed").expect("record that the test body passed");
-}
-
-fn run_parent(name: &str) {
-    // A poisoned lock only means an earlier test failed; that one has
-    // reported itself, and this one has nothing to inherit from it.
-    let _serial = ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    preflight();
-
-    let marker_dir = tempfile::tempdir_in(temp_parent()).expect("tempdir");
-    let done = marker_dir.path().join("done");
-    let exe = std::env::current_exe().expect("this test binary's path");
-    let mut child = Command::new("unshare")
-        .arg("-rnm")
-        .arg("--")
-        .arg(&exe)
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(CHILD_ENV, &done)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the test under unshare");
-
-    // Drained on threads so a chatty child cannot fill a pipe and stall,
-    // and replayed through print!/eprint! so the test runner shows them
-    // with this test's output, only on failure.
-    let stdout = drain(child.stdout.take().expect("piped stdout"));
-    let stderr = drain(child.stderr.take().expect("piped stderr"));
-
-    let deadline = Instant::now() + CHILD_LIMIT;
-    let status = loop {
-        match child.try_wait().expect("wait for the child") {
-            Some(status) => break Some(status),
-            None if Instant::now() >= deadline => {
-                // Best effort: the child may exit between the check and
-                // the kill, and either way it is reaped just below.
-                let _ = child.kill();
-                child.wait().expect("reap the killed child");
-                break None;
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
+    let config = ServerConfig {
+        journal: dir.path().join("counter.journal"),
+        authorized_keys,
+        standalone: true,
+        ack_policy: AckPolicy::Disk,
+        no_mlock: true,
+        // Unpinned: the node shares the host with the test's client, and
+        // a CI runner with everything else.
+        cores: PipelineCores::unpinned(),
+        snapshot_interval_ms: 0,
+        health_bind: None,
+        // One slot, so a test can tell whether a closed connection's slot
+        // came back: the next client gets in only if it did.
+        max_connections: 1,
+        heartbeat_interval_secs: HEARTBEAT.as_secs(),
+        ..ServerConfig::default()
     };
-    print!(
-        "{}",
-        String::from_utf8_lossy(&stdout.join().expect("stdout reader"))
+    let node = melin_test_node::start::<Counter>(
+        config,
+        StartupEvents::none(),
+        (),
+        RequestDecoder,
+        ResponseEncoder,
     );
-    eprint!(
-        "{}",
-        String::from_utf8_lossy(&stderr.join().expect("stderr reader"))
-    );
-
-    let status = status.unwrap_or_else(|| {
-        panic!("{name} did not finish within {CHILD_LIMIT:?} in its namespace; killed")
-    });
-    assert!(
-        status.success(),
-        "{name} failed in its namespace ({status}); its output is above"
-    );
-    assert!(
-        done.exists(),
-        "the child exited cleanly but never ran {name}: the test filter matched nothing"
-    );
-}
-
-/// Where the done marker and the node's directory go: the temp directory,
-/// unless it lies under `/run` (`TMPDIR=/run/user/$UID`, say), which the
-/// child's private tmpfs on `/var/run` hides — the parent's marker from
-/// the child, and the directory itself once the child is inside. Then
-/// `/tmp`.
-fn temp_parent() -> std::path::PathBuf {
-    let tmp = std::env::temp_dir();
-    // An unresolvable temp dir is left as is: creating the marker
-    // directory in it fails just after, with the error that says why.
-    let resolved = std::fs::canonicalize(&tmp).unwrap_or_else(|_| tmp.clone());
-    if resolved.starts_with("/run") || resolved.starts_with("/var/run") {
-        std::path::PathBuf::from("/tmp")
-    } else {
-        tmp
-    }
-}
-
-/// Fail early, and say why, when the host cannot give us the namespaces.
-fn preflight() {
-    let output = Command::new("unshare")
-        .args(["-rnm", "true"])
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "cannot run `unshare` (util-linux): {e}\n{}",
-                namespace_hint()
-            )
-        });
-    assert!(
-        output.status.success(),
-        "this host cannot create an unprivileged user + network + mount namespace \
-         (`unshare -rnm true` failed: {})\n{}",
-        String::from_utf8_lossy(&output.stderr).trim(),
-        namespace_hint()
-    );
-}
-
-fn namespace_hint() -> &'static str {
-    "These tests need unprivileged user namespaces, with network and mount namespaces \
-     inside them. On Ubuntu 24.04 and later, AppArmor restricts them by default: lift it with \
-     `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. Elsewhere, check \
-     `kernel.unprivileged_userns_clone` and `user.max_user_namespaces`."
-}
-
-fn drain(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        // A read error only truncates what is replayed; the exit status
-        // still decides the test.
-        if let Err(e) = pipe.read_to_end(&mut bytes) {
-            bytes.extend_from_slice(
-                format!("\n[reading the child's output failed: {e}]\n").as_bytes(),
-            );
-        }
-        bytes
-    })
+    body(node.addr());
+    node.stop();
 }

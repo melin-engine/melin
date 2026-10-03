@@ -12,8 +12,11 @@ script, a test harness, and a CI job.
 
 Status: steps 1 and 2 are done and pass on a developer host; step 3 is
 written but not yet proven on a hosted runner (until the first green run
-of the `dpdk` job); step 4 is not started. The step sections
-below describe what was built, where it differs from the first draft.
+of the `dpdk` job); step 4 was done another way, by
+`dpdk-transparent-tests.md`. The step sections below describe what was
+built, where it differs from the first draft. Since then the harness of
+step 2 has moved onto that plan's test runner and node launcher (see the
+end of step 2).
 
 ## What the probe established
 
@@ -138,6 +141,16 @@ Writing these turned up a fourth, now pinned too:
   so every test's connect helper retries rather than expecting the slot at
   once. The test flips when the transport handles the close.
 
+Since moved (step 2 of `dpdk-transparent-tests.md`): the harness now runs
+under that plan's test runner (`scripts/dpdk/netns-runner.sh`), which
+builds the namespaces and the network before the test binary starts, and
+starts its node through the shared launcher (`melin-test-node`). The
+re-exec, the Rust network setup, the done marker, the parent's time limit
+and its own copy of the EAL arguments are gone; nextest's slow-timeout
+bounds a hang. The tests are unchanged. The price: they no longer run
+from a plain `cargo nextest run`, only under the runner, like every other
+DPDK test.
+
 ### 3. CI
 
 The existing `dpdk` job in `.github/workflows/pre-merge.yml` already
@@ -164,7 +177,11 @@ its own EAL `--file-prefix`. This would let the tests cover:
 - the sender's missing `Handshaking` deadline;
 - `queue_send` failures.
 
-Unverified so far.
+Done another way, by step 2 of `dpdk-transparent-tests.md`: the nodes share
+one process-wide EAL, each on a veth of its own on a bridge, and the
+runtime's cluster tests run on it. They cover the replication handshake
+and streaming between DPDK nodes; the other two items still want a test
+that provokes them.
 
 ## Divergences this makes testable
 
@@ -176,6 +193,7 @@ From `transport-divergences-2026-10.md`:
 - the unseen client close (now pinned by
   `a_client_close_is_seen_only_at_the_next_heartbeat`);
 - the heartbeat drop when the SPSC ring is full (needs a small ring);
-- with step 4, the DPDK replication entries.
+- the DPDK replication entries, now that DPDK nodes replicate to each
+  other in one test process (`dpdk-transparent-tests.md`).
 
 Each of those fixes would land with a test on this harness.
