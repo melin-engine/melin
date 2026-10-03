@@ -9,19 +9,28 @@ This builds on the veth harness (`dpdk-veth-testing.md`), which showed a DPDK
 node can run on a veth pair through `net_af_packet`, unprivileged, with no
 hugepages and no NIC.
 
-Status: step 1 is done and passes on a developer host; its CI step is
-written but not yet proven on a hosted runner. Steps 2 and 3 are not
-started. Where step 1 settled something the design left open, or turned
-out differently, its section says so.
+Status: steps 1 and 2 are done and pass on a developer host; their CI
+steps are written but not yet proven on a hosted runner. Step 3 is not
+started; its work list is the gates step 2 left (see step 2). Where a
+step settled something the design left open, or turned out differently,
+its section says so.
 
-To run the example suites on DPDK, from the repository root (one test at a
-time, as every node busy-polls a core):
+To run the suites on DPDK, from the repository root (one test at a time,
+as every node busy-polls a core). The example suites:
 
 ```sh
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run -p melin-example-echo -p melin-example-counter -p melin-example-notary --features melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk -j 1
 ```
 
-For one example, `-p melin-example-echo --features dpdk` is enough.
+For one example, `-p melin-example-echo --features dpdk` is enough. The
+runtime's integration suites, `dpdk_veth` included:
+
+```sh
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run -p melin-server-runtime --features dpdk -E 'kind(test)' -j 1
+```
+
+The host needs unprivileged user namespaces and the veth and bridge
+drivers loaded (see the runner's header).
 
 ## Why it does not work today
 
@@ -74,6 +83,23 @@ namespace to every test.
 The runner also runs nextest's `--list` invocations, which build a link
 for nothing; that costs a fraction of a second per test binary.
 
+As built (step 2): a bridge, `br0`, carries the client address
+(`10.99.0.1/24`) and has one veth pair per node slot, three slots (the
+largest cluster a test runs): `dpdkN` for DPDK, its peer `dpdkN-br` on
+the bridge, node `N` on `10.99.0.(N+2)`. The setup script gained a
+`--bridge` mode; the smoke script keeps the single pair. Every MAC is set
+(`02:99:00:00:00:NN`) rather than left random, and published
+(`MELIN_NETNS_NODE_MACS`, `MELIN_NETNS_CLIENT_MAC`): a DPDK replica must
+be given its primary's MAC (`--dpdk-peer-mac`), as on any port that keeps
+a hardware address, and the launcher fills it in from the layout. The
+MACs are deliberately not the `02:00:<ip>` convention a replica falls back
+to without one, so a test passes only if the peer MAC was passed through.
+TX checksum offload is off on both ends of every veth, which makes the
+kernel finish the checksum of anything the bridge forwards to a node; the
+bridge itself needs nothing. A user namespace cannot load a module, so
+the veth and bridge drivers must already be loaded on the host (Docker
+loads both; the CI job loads them).
+
 ### Node launcher: one entry point for both transports
 
 A shared test-support helper starts a node from a `ServerConfig` and returns
@@ -106,40 +132,138 @@ As built (step 1):
   `config.bind` (and on DPDK the `dpdk_*` fields) and leaves the rest of
   the config to the test. `STARTUP_LIMIT` is how long a client should give
   the node to serve: unchanged on kernel TCP, longer on DPDK for EAL and
-  port start.
-- **Stopping a DPDK node.** `server::run` owns its shutdown flag, so the
-  launcher stops it as an operator would, with SIGTERM to the process. It
-  first waits for `run` to have installed its handler (it reads SIGTERM's
-  disposition), since a SIGTERM before then would kill the test process.
-  No production change was needed. One window is left: a node already
-  tearing itself down after an internal failure, but not yet returned,
-  takes the SIGTERM as a second signal and exits the process with status 1,
-  so a test that is failing anyway loses the node's error message. Closing
-  it needs a way to stop `run` without a signal.
-- **One node per process.** Under the feature the launcher refuses a second
-  node in one process, saying why, instead of letting EAL fail. Under plain
-  `cargo test`, which runs every test of a binary in one process, all but
-  the first node-starting test fail that way: the DPDK run is nextest only.
+  port start. Step 2 added the cluster side, below.
+- **Stopping a DPDK node.** Step 1 stopped one with SIGTERM to the
+  process, as `server::run` owns its shutdown flag, which left a window
+  where a node already failing took the signal as a second one and exited
+  the process. Step 2 replaced it: see below.
 - **The feature.** Each example has a `dpdk` feature forwarding to
   `melin-server-runtime/dpdk` and `melin-test-node/dpdk`; the launcher
   takes the transport from its own feature. Enabling only
-  `melin-server-runtime/dpdk` builds DPDK into the binaries but leaves the
-  tests on kernel TCP (`run_with_listener` ignores the feature), so the
-  example feature is the switch.
-- **EAL arguments** are the veth harness's: af_packet on the slot's
-  interface, `--no-huge -m 512 --no-pci`, main lcore on the first CPU the
-  process may use. The client port is fixed: a node owns its IP outright.
+  `melin-server-runtime/dpdk` builds DPDK into an example's binaries but
+  leaves its tests on kernel TCP (`run_with_listener` ignores the
+  feature), so the example feature is the switch. (For the runtime's own
+  tests, step 2 made the runtime's `dpdk` the switch; see below.)
+- **EAL arguments** are the veth harness's: `--no-huge -m 512 --no-pci`,
+  main lcore on the first CPU the process may use. (Step 1 put the slot's
+  af_packet device in them too; step 2 attaches devices per node.) The
+  client port is fixed: a node owns its IP outright.
+
+As built (step 2):
+
+- **Cluster addresses.** `melin_test_node::addrs(slot, free_addr)` gives
+  node `slot`'s client and replication addresses before any node starts,
+  so a test wires its cluster (`replication_bind`, `replica_of`) the same
+  way on both transports, and `start_at::<A>(&addrs, config, ...)` starts
+  the node there. On kernel TCP they are two ports from the test's own
+  allocator (`|| free_addr(PORT_BASE)`), `slot` playing no part (what the
+  tests did before); on DPDK, the slot's IP with fixed client and
+  replication ports. The allocator is passed in rather than called by the
+  launcher: `free_addr` sits behind `melin-transport-core`'s `test-utils`,
+  which as a normal dependency of the launcher would be switched on in
+  every workspace-wide build. A DPDK replica's
+  `dpdk_peer_mac` comes from the layout, from its `replica_of`, and the
+  launcher refuses a `replication_bind` off the slot's IP or a
+  `replica_of` off the runner's network, saying how to take them from
+  `addrs` (the mistake an unported test would make).
+- **Slots.** On DPDK a node holds its slot from start until it is stopped
+  or joined; starting a second node on a held slot panics. `start`
+  without addresses takes the lowest free slot.
+- **The test's own peers.** `local_ip()` is where a test binds a socket a
+  node must reach (a scripted primary): loopback on kernel TCP, the
+  bridge's address on DPDK.
+- **Waiting on a node.** `Node::join` waits for a node to return on its own
+  (one expected to fail, or to fence itself) and returns its result;
+  `is_finished` and `shutdown_requested` (whether its shutdown flag is
+  set, which a fenced node does itself) serve the tests that watch for
+  that.
+- **Stopping a DPDK node** sets its shutdown flag, as on kernel TCP: the
+  launcher runs DPDK nodes with `server::run_with_shutdown` (below), so a
+  node can be stopped while others run, and step 1's signal window is
+  gone.
+- **One process, several nodes.** Under plain `cargo test` (under the
+  runner), tests of one binary now start their nodes in one process one
+  after another, as long as they hold no more slots at once than there
+  are. Running them in parallel threads is still nextest's job, one test
+  per process.
 
 ### EAL: process-wide (step 2)
 
-One EAL per process, initialised by the first node with every port the runner
-built, and cleaned up only at process exit. Each node takes a port of its own.
-The runtime already shares one EAL between a node's client and replication
-ports (`from_shared_with_port`); this makes the sharing process-wide.
+One EAL per process, cleaned up only at process exit. Each node takes a
+port of its own. The runtime already shares one EAL between a node's client
+and replication ports (`from_shared_with_port`); this makes the sharing
+process-wide.
 
 This is the one change to production code. The production path, with one
 node per process, must keep its behaviour exactly, including teardown order
 (see the note on vdev PMDs in `crates/core/dpdk/src/dpdk/port.rs`).
+
+As built:
+
+- **Opt-in, by whoever hosts several nodes.** `Eal::init_process_wide(args)`
+  (`melin-dpdk`) initialises EAL once and keeps it in a static that is
+  never dropped, so never cleaned up; `Eal::process_wide()` returns it. A
+  process exit releases its memory (no hugepages in the tests, and the
+  runtime directory is the runner's private tmpfs). Only the test launcher
+  calls it, with the arguments above and no device.
+- **`DpdkShared::init` checks for it first.** None, as in every deployment:
+  exactly the old path, EAL initialised from the node's arguments, owned,
+  and cleaned up last when the node's resources drop (ports stopped and
+  closed, then the pool, then EAL). Some: the node borrows it. Its own EAL
+  arguments must be empty, an error otherwise (they could only be
+  ignored); its mbuf pool is named after its first port,
+  `pktmbuf_pool_<port>`, as pool names are process-wide and nodes on one
+  EAL run at once (a node owning its EAL keeps `pktmbuf_pool`); its ports
+  stop and close at teardown as always; EAL is left running. The choice
+  is an enum held where the EAL used to be, so the drop order is the old
+  one. The cost to a deployed node is one `OnceLock` read at start, and
+  nothing at all on the poll loop. The two decisions with no libdpdk in
+  them (the arguments check, the pool name) live in an ungated module and
+  are unit-tested on every host.
+- **A device per node, by hotplug.** EAL starts with no device. The
+  launcher attaches a node's af_packet device as the node starts
+  (`Eal::attach_vdev`, over `rte_eal_hotplug_add`) and passes the port it
+  gets as `dpdk_ports`. The node's teardown closes the port, which
+  releases it but leaves the device on the virtual bus, so once the node
+  has returned the launcher detaches it (`Eal::detach_vdev`) and the next
+  node on the slot attaches it afresh. Stop, close, then cleanup still
+  holds: on the process-wide EAL there is no cleanup.
+- **Stopping one node of several.** `server::run_with_shutdown` is `run`
+  with a caller-owned shutdown flag and no signal handler. `run`'s handler
+  is process-wide, so with several nodes a signal would stop only the last
+  one to install it. `run` keeps its exact order (CPU mask, keys, handler,
+  memory lock, transport) and now ends in the same private function.
+- **EAL init on a thread of its own.** EAL pins the thread that
+  initialises it to its main lcore, and the threads it spawns inherit
+  that. The launcher initialises it on a short-lived thread, so the test's
+  threads and the nodes keep every CPU. So no node's poll thread is an EAL
+  lcore in the tests, and mbuf allocation skips the pool's per-lcore cache:
+  fine for logic tests, and never the case in a deployment, where the
+  node's own main thread initialises EAL and goes on to poll.
+
+Alternatives considered:
+
+- **An EAL per node, with `--file-prefix`** (the idea in
+  `dpdk-veth-testing.md`, step 4). EAL is a singleton per process whatever
+  the prefix: the prefix separates processes sharing a host, not nodes in
+  one. Not possible.
+- **The first node initialises EAL for the process.** No new call, but it
+  changes who owns EAL in every deployed node, for a test-only need: the
+  explicit opt-in leaves the deployed path as it was.
+- **Count references, clean up after the last node.** A restart after the
+  last node stopped would need EAL again, which cannot be initialised a
+  second time.
+- **Keep ports open on the shared EAL and reconfigure them on restart.** No
+  hotplug, but a stopped port's receive ring can hold mbufs from the pool
+  its node just freed (a NIC driver fills the ring from it), and
+  reconfiguring frees them into a freed pool. It would be correct for
+  af_packet only, by accident.
+- **Every device at EAL init (`--vdev` per slot).** Serves a cluster, but a
+  restart still has to re-probe a closed device: hotplug for one case
+  makes hotplug for all of them the simpler rule.
+- **A process per node.** The runtime would be untouched, but the tests
+  read their nodes' state in-process (a sizing probe, a fencing flag) and
+  every cluster test would have to be rewritten around processes.
 
 ## What stays kernel-only
 
@@ -197,7 +321,7 @@ drop its re-exec and its namespace code, but it would need the launcher as
 a runtime dev-dependency (step 2 adds that), and it would no longer run
 from a plain
 `cargo nextest run --features dpdk`. Worth revisiting once step 2 has
-landed.
+landed. (It moved in step 2.)
 
 The CI `dpdk` job checks the examples and the launcher with their `dpdk`
 features, and runs the three example suites through the runner with
@@ -211,10 +335,61 @@ features, and runs the three example suites through the runner with
   `halt_refusal`, `genesis_promotion`, `sizing`, `startup_events`, the raft
   tests.
 
+As built:
+
+- **The switch.** The runtime's `dpdk` feature now also enables
+  `melin-test-node/dpdk`, a dev-dependency's feature, so it reaches only
+  the runtime's own test builds (a dependent never builds the runtime's
+  dev-dependencies). `--features dpdk` on the runtime is therefore the
+  switch for its integration tests, as each example's `dpdk` is for its
+  own; the second command at the top runs them.
+- **Ported.** Every test of those seven binaries starts its nodes through
+  the launcher. On kernel TCP each behaves as before: the same `free_addr`
+  port scheme, nodes on threads through `run_with_listener`, stopped by
+  their flag. The `response_flush_*` binaries start no node and stay as
+  they are, kernel-only by nature; they run harmlessly in the DPDK run.
+- **Passing on DPDK:** `startup_events` (restarts in one process),
+  `raft_smoke`, `sizing` (a primary and a replica replicating over DPDK,
+  then both restarted), `genesis_promotion`'s refusal case (a DPDK replica
+  dialling the test's scripted primary on the kernel side), and in the
+  examples the two restart tests step 1 gated. Replication between DPDK
+  nodes works over the bridge, the replica seeded with its primary's MAC.
+- **Gated on a divergence**, both new and added to
+  `transport-divergences-2026-10.md`:
+  - "DPDK does not notice a replication peer that has gone": a node that
+    stops leaves its peer's link up, as nothing on a DPDK link has a
+    deadline. A primary keeps counting the replica that left and never
+    halts (`halt_refusal`); replicas keep following a stopped primary and
+    refuse to depose it (`replicated_failover`, `raft_failover`).
+  - "A promoted DPDK replica serves on kernel TCP": promotion falls back
+    to the kernel-TCP primary on the DPDK port's address and fails to
+    bind (`genesis_promotion`'s
+    `a_replica_configured_with_a_larger_genesis_is_promoted`, the notary
+    example's `a_promoted_replica_reports_the_head_the_primary_receipted`;
+    and the two failover tests behind the entry above).
+
+  A single-test binary is gated whole (`#![cfg(not(feature = "dpdk"))]`),
+  a test in a binary of several with `#[cfg(not(feature = "dpdk"))]`, and
+  each gate's comment names its entries.
+- **`dpdk_veth`** runs under the runner and starts its node through the
+  launcher: its re-exec, namespace code, done marker and copy of the EAL
+  arguments are gone (`dpdk-veth-testing.md` says what that changed). It
+  is DPDK-only by nature and built only with the feature.
+- **CI.** The `dpdk` job runs the runtime's integration suites on DPDK
+  through the runner, `-j 1`, in place of the veth tests alone, then the
+  example suites as before. It also loads the veth and bridge drivers,
+  which the runner's bridge needs and a user namespace cannot load. Both
+  DPDK runs are serial and take minutes; pre-merge still holds them.
+
 ### 3. Divergences
 
 Gate whatever fails on its divergence entry, then fix the divergences one at a
 time. Each fix removes a gate.
+
+The work list step 2 left, in the order that unblocks most: noticing a
+replication peer that has gone (three gates, the two failover tests also
+needing the next), then a DPDK primary for a promoted replica (two
+gates more).
 
 ## Limits
 
@@ -223,4 +398,6 @@ time. Each fix removes a gate.
 - **CPU.** Every DPDK node busy-polls a core. The DPDK run is serial, and if
   it grows too slow for pre-merge CI it moves to nightly.
 - **Host.** The host must allow unprivileged user namespaces, as for the veth
-  harness.
+  harness, and have the veth and bridge drivers loaded.
+- **Slots.** The runner builds three node slots, the largest cluster a test
+  runs. A test that needs more needs the runner to build more.

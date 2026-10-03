@@ -11,12 +11,15 @@
 //! A primary and one replica (a counter wrapped to observe its sizing,
 //! `disk` ack policy) over real TCP, then both restarted on their own
 //! journals.
+//!
+//! Nodes are started through `melin-test-node`: on kernel TCP by default,
+//! on DPDK with this crate's `dpdk` feature, under
+//! `scripts/dpdk/netns-runner.sh` (see
+//! `docs/internal/dpdk-transparent-tests.md`).
 
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -30,9 +33,9 @@ use melin_client::Connection;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
+use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
-use melin_wire_protocol::tcp::BlockingTcpListener;
 
 /// Port range for `free_addr`, shared with the other cluster tests: every
 /// other range below the ephemeral floor is taken. Sharing is safe only
@@ -135,40 +138,20 @@ impl Application for SizedCounter {
 // Harness
 // ---------------------------------------------------------------------------
 
-type Node = JoinHandle<Result<(), String>>;
-
 fn spawn_node(
+    addrs: &Addrs,
     config: ServerConfig,
     startup: StartupEvents<CounterEvent>,
     sizing: &Sizing,
-    shutdown: &Arc<AtomicBool>,
 ) -> Node {
-    let listener = BlockingTcpListener::bind(config.bind).expect("bind client port");
-    let shutdown = Arc::clone(shutdown);
-    let sizing = sizing.clone();
-    std::thread::spawn(move || {
-        server::run_with_listener::<SizedCounter>(
-            listener,
-            config,
-            startup,
-            sizing,
-            RequestDecoder,
-            ResponseEncoder,
-            None,
-            shutdown,
-        )
-        .map_err(|e| e.to_string())
-    })
-}
-
-fn stop_node(node: Node, shutdown: &AtomicBool, client_addr: SocketAddr) {
-    shutdown.store(true, Ordering::Relaxed);
-    // Wake the accept loop so it sees the flag. Dropped deliberately: a
-    // node that already stopped listening refuses, which is fine.
-    let _ = TcpStream::connect_timeout(&client_addr, Duration::from_millis(100));
-    node.join()
-        .expect("node thread panicked")
-        .expect("node returned an error");
+    melin_test_node::start_at::<SizedCounter>(
+        addrs,
+        config,
+        startup,
+        sizing.clone(),
+        RequestDecoder,
+        ResponseEncoder,
+    )
 }
 
 /// The value of one Prometheus gauge on a node's health endpoint, or `None`
@@ -258,7 +241,6 @@ fn every_node_sizes_its_own_instances_before_serving() {
         let key_path = tmp.path().join(format!("{name}.key"));
         std::fs::write(&key_path, key.to_bytes()).expect("write node key");
         ServerConfig {
-            bind: free_addr(PORT_BASE),
             journal: tmp.path().join(format!("{name}.journal")),
             authorized_keys: auth_path.clone(),
             ack_policy: AckPolicy::Disk,
@@ -278,38 +260,25 @@ fn every_node_sizes_its_own_instances_before_serving() {
         on_primary: Vec::new(),
     };
 
-    let replication_addr = free_addr(PORT_BASE);
+    let primary_addrs = melin_test_node::addrs(0, || free_addr(PORT_BASE));
+    let replica_addrs = melin_test_node::addrs(1, || free_addr(PORT_BASE));
     let mut primary_config = node_config("primary", &primary_key);
-    primary_config.replication_bind = Some(replication_addr);
-    let primary_client = primary_config.bind;
+    primary_config.replication_bind = Some(primary_addrs.replication());
     let primary_health = primary_config.health_bind.expect("set above");
     let mut replica_config = node_config("replica", &replica_key);
-    replica_config.replica_of = Some(replication_addr);
-    let replica_client = replica_config.bind;
+    replica_config.replica_of = Some(primary_addrs.replication());
 
     let primary_sizing = Sizing::new(PRIMARY_RESERVE);
-    let primary_shutdown = Arc::new(AtomicBool::new(false));
-    let primary = spawn_node(
-        primary_config,
-        genesis(),
-        &primary_sizing,
-        &primary_shutdown,
-    );
+    let primary = spawn_node(&primary_addrs, primary_config, genesis(), &primary_sizing);
     let replica_sizing = Sizing::new(REPLICA_RESERVE);
-    let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica = spawn_node(
-        replica_config,
-        genesis(),
-        &replica_sizing,
-        &replica_shutdown,
-    );
+    let replica = spawn_node(&replica_addrs, replica_config, genesis(), &replica_sizing);
 
     // --- The primary served, sized with its own sizing as a recovering
     // primary is: its new journal is created with the genesis in it, so
     // the genesis reaches the state by replay — sized on the genesis
     // instance before that replay, then again on the result. ---
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
-    let mut conn = connect(primary_client, &client_key);
+    let mut conn = connect(primary.addr(), &client_key);
     assert_eq!(value_of(&mut conn), GENESIS, "genesis applied");
     assert_eq!(
         primary_sizing.calls(),
@@ -348,8 +317,8 @@ fn every_node_sizes_its_own_instances_before_serving() {
         "the replica is sized with its own sizing, before it applies the stream"
     );
     drop(conn);
-    stop_node(replica, &replica_shutdown, replica_client);
-    stop_node(primary, &primary_shutdown, primary_client);
+    replica.stop();
+    primary.stop();
     assert_eq!(
         primary_sizing.calls().len(),
         2,
@@ -361,37 +330,24 @@ fn every_node_sizes_its_own_instances_before_serving() {
     // history lands in reserved collections; then again on the recovered
     // state — the primary at boot, the replica when its pipeline is
     // built on its first session — as a snapshot restart would be. ---
-    let replication_addr = free_addr(PORT_BASE);
+    let primary_addrs = melin_test_node::addrs(0, || free_addr(PORT_BASE));
+    let replica_addrs = melin_test_node::addrs(1, || free_addr(PORT_BASE));
     let mut primary_config = node_config("primary", &primary_key);
-    primary_config.replication_bind = Some(replication_addr);
-    let primary_client = primary_config.bind;
+    primary_config.replication_bind = Some(primary_addrs.replication());
     let primary_health = primary_config.health_bind.expect("set above");
     let mut replica_config = node_config("replica", &replica_key);
-    replica_config.replica_of = Some(replication_addr);
-    let replica_client = replica_config.bind;
+    replica_config.replica_of = Some(primary_addrs.replication());
 
     let primary_sizing = Sizing::new(RESTART_RESERVE);
-    let primary_shutdown = Arc::new(AtomicBool::new(false));
-    let primary = spawn_node(
-        primary_config,
-        genesis(),
-        &primary_sizing,
-        &primary_shutdown,
-    );
+    let primary = spawn_node(&primary_addrs, primary_config, genesis(), &primary_sizing);
     let replica_sizing = Sizing::new(RESTART_RESERVE + 1);
-    let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica = spawn_node(
-        replica_config,
-        genesis(),
-        &replica_sizing,
-        &replica_shutdown,
-    );
+    let replica = spawn_node(&replica_addrs, replica_config, genesis(), &replica_sizing);
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
-    let mut conn = connect(primary_client, &client_key);
+    let mut conn = connect(primary.addr(), &client_key);
     let replayed = value_of(&mut conn);
     drop(conn);
-    stop_node(replica, &replica_shutdown, replica_client);
-    stop_node(primary, &primary_shutdown, primary_client);
+    replica.stop();
+    primary.stop();
 
     assert_eq!(replayed, GENESIS + 5, "the journal replayed");
     let recovered = |reserve_for: u64| {

@@ -330,10 +330,6 @@ fn the_journal_holds_every_echo_in_order() {
     assert_eq!(journaled_echoes(tmp.path()), echoes);
 }
 
-// Kernel TCP only until step 2 of docs/internal/dpdk-transparent-tests.md
-// (a process-wide EAL): the restart below starts a second node in this
-// process, and EAL initialises once per process.
-#[cfg(not(feature = "dpdk"))]
 #[test]
 fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
     let tmp = tempfile::tempdir().expect("tempdir");

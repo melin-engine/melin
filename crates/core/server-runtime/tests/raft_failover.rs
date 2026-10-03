@@ -6,21 +6,33 @@
 //! comes back on its stale epoch-0 journal — the raft peer mesh must
 //! fence it (fence-on-supersession) so it self-demotes rather than
 //! serving clients alongside the new primary.
+//!
+//! Nodes are started through `melin-test-node`: on kernel TCP by default,
+//! on DPDK with this crate's `dpdk` feature, under
+//! `scripts/dpdk/netns-runner.sh` (see
+//! `docs/internal/dpdk-transparent-tests.md`). Raft is kernel TCP on every
+//! node.
+//!
+//! Kernel TCP only for now, on two divergences listed in
+//! `docs/internal/transport-divergences-2026-10.md`: a DPDK replica never
+//! sees its primary leave, so it refuses to depose it and never promotes
+//! ("DPDK does not notice a replication peer that has gone"); and once
+//! that is fixed, a promoted DPDK replica cannot serve ("A promoted DPDK
+//! replica serves on kernel TCP"). The gate goes when both do.
+#![cfg(not(feature = "dpdk"))]
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{Counter, RequestDecoder, ResponseEncoder};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
+use melin_test_node::Addrs;
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::TAG_CHALLENGE;
-use melin_wire_protocol::tcp::BlockingTcpListener;
 use serial_test::serial;
 
 /// Port range this file owns for `free_addr` (20000..25000);
@@ -60,7 +72,8 @@ fn serves_clients(addr: SocketAddr, patience: Duration) -> bool {
 
 struct NodeSetup {
     key: ed25519_dalek::SigningKey,
-    client_addr: SocketAddr,
+    /// Client and replication addresses.
+    addrs: Addrs,
     raft_addr: SocketAddr,
     health_addr: SocketAddr,
 }
@@ -95,12 +108,11 @@ fn cluster_summary(nodes: &[NodeSetup]) -> String {
 #[serial]
 fn killed_primary_triggers_exactly_one_auto_promotion() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let replication_addr = free_addr(PORT_BASE);
 
     let nodes: Vec<NodeSetup> = (0..3)
         .map(|i| NodeSetup {
             key: ed25519_dalek::SigningKey::from_bytes(&[0x51 + i as u8; 32]),
-            client_addr: free_addr(PORT_BASE),
+            addrs: melin_test_node::addrs(i, || free_addr(PORT_BASE)),
             raft_addr: free_addr(PORT_BASE),
             health_addr: free_addr(PORT_BASE),
         })
@@ -128,7 +140,6 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
         let key_path = tmp.path().join(format!("key-{i}"));
         std::fs::write(&key_path, nodes[i].key.to_bytes()).unwrap();
         ServerConfig {
-            bind: nodes[i].client_addr,
             journal: tmp.path().join(format!("node-{i}.journal")),
             authorized_keys: auth_path.clone(),
             no_mlock: true,
@@ -151,50 +162,31 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
         }
     };
 
+    let replication_addr = nodes[0].addrs.replication();
+    let start = |addrs: &Addrs, config: ServerConfig| {
+        melin_test_node::start_at::<Counter>(
+            addrs,
+            config,
+            StartupEvents::none(),
+            (),
+            RequestDecoder,
+            ResponseEncoder,
+        )
+    };
+
     // --- Primary (node 0): `disk+ram` ack policy, replication bind. ---
-    let primary_shutdown = Arc::new(AtomicBool::new(false));
-    let primary_handle = {
+    let primary = {
         let mut config = make_config(0);
         config.replication_bind = Some(replication_addr);
-        let listener = BlockingTcpListener::bind(config.bind).expect("bind primary client port");
-        let sd = Arc::clone(&primary_shutdown);
-        std::thread::spawn(move || -> Result<(), String> {
-            server::run_with_listener::<Counter>(
-                listener,
-                config,
-                StartupEvents::none(),
-                (),
-                RequestDecoder,
-                ResponseEncoder,
-                None,
-                sd,
-            )
-            .map_err(|e| e.to_string())
-        })
+        start(&nodes[0].addrs, config)
     };
 
     // --- Replicas (nodes 1, 2). ---
-    let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica_handles: Vec<_> = (1..3)
+    let replicas: Vec<_> = (1..3)
         .map(|i| {
             let mut config = make_config(i);
             config.replica_of = Some(replication_addr);
-            let listener =
-                BlockingTcpListener::bind(config.bind).expect("bind replica client port");
-            let sd = Arc::clone(&replica_shutdown);
-            std::thread::spawn(move || -> Result<(), String> {
-                server::run_with_listener::<Counter>(
-                    listener,
-                    config,
-                    StartupEvents::none(),
-                    (),
-                    RequestDecoder,
-                    ResponseEncoder,
-                    None,
-                    sd,
-                )
-                .map_err(|e| e.to_string())
-            })
+            start(&nodes[i].addrs, config)
         })
         .collect();
 
@@ -203,8 +195,8 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     // if the primary itself leads there is nothing to act on).
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if primary_handle.is_finished() {
-            panic!("primary exited early: {:?}", primary_handle.join().unwrap());
+        if primary.is_finished() {
+            panic!("primary exited early: {:?}", primary.join());
         }
         let connected = http_metrics(nodes[0].health_addr)
             .is_some_and(|m| m.contains("melin_replicas_connected 2\n"));
@@ -223,13 +215,7 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     }
 
     // --- Phase 2: kill the primary. ---
-    primary_shutdown.store(true, Ordering::Relaxed);
-    // Nudge its accept loop past the poll.
-    let _ = TcpStream::connect_timeout(&nodes[0].client_addr, Duration::from_millis(100));
-    primary_handle
-        .join()
-        .expect("primary thread panicked")
-        .expect("primary returned error");
+    primary.stop();
 
     // --- Phase 3: exactly one replica promotes and serves clients. ---
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -240,7 +226,7 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
             cluster_summary(&nodes)
         );
         let serving: Vec<usize> = (1..3)
-            .filter(|&i| serves_clients(nodes[i].client_addr, Duration::from_millis(500)))
+            .filter(|&i| serves_clients(nodes[i].addrs.client(), Duration::from_millis(500)))
             .collect();
         match serving.len() {
             0 => std::thread::sleep(Duration::from_millis(200)),
@@ -271,7 +257,7 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     // The loser must still be following: not serving clients, not leading.
     let loser = if winner == 1 { 2 } else { 1 };
     assert!(
-        !serves_clients(nodes[loser].client_addr, Duration::from_secs(2)),
+        !serves_clients(nodes[loser].addrs.client(), Duration::from_secs(2)),
         "the losing replica must not serve clients"
     );
     if let Some(m) = http_metrics(nodes[loser].health_addr) {
@@ -289,42 +275,27 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     // missing the winner's post-election entry so no caught-up peer will
     // grant it either. The leader therefore stays put, and its next append
     // — inbound to this node — trips `fence_if_superseded`, which co-sets
-    // the process shutdown flag. That flag is the very Arc we hand to
-    // `run_with_listener` (the `SupersessionPolicy` holds a clone), so the
+    // the process shutdown flag. That flag is the very one the launcher
+    // hands the node (the `SupersessionPolicy` holds a clone), so the
     // node tears its own server down and the flag we never write to
     // ourselves ends up set — the fingerprint of fence-on-supersession,
     // the only thing that stops a serving node from the inside (a driver
     // fatal leaves the node serving). Requires `--raft-auto-promote` (already
     // set), which is what arms the `SupersessionPolicy`.
-    let revived_shutdown = Arc::new(AtomicBool::new(false));
-    let revived_handle = {
+    let revived = {
         // Reuse node 0's identity, raft address, journal, and raft dir; a
         // fresh client/health port avoids the old ones lingering in
-        // TIME_WAIT. No replication bind — this exercises the raft-mesh
-        // fencing channel in isolation, not a data-plane handshake.
+        // TIME_WAIT (on DPDK, node 0's slot again: nothing lingers on a
+        // userspace stack that is gone). No replication bind — this
+        // exercises the raft-mesh fencing channel in isolation, not a
+        // data-plane handshake.
         let mut config = make_config(0);
-        config.bind = free_addr(PORT_BASE);
         config.health_bind = Some(free_addr(PORT_BASE));
-        let listener =
-            BlockingTcpListener::bind(config.bind).expect("bind revived primary client port");
-        let sd = Arc::clone(&revived_shutdown);
-        std::thread::spawn(move || -> Result<(), String> {
-            server::run_with_listener::<Counter>(
-                listener,
-                config,
-                StartupEvents::none(),
-                (),
-                RequestDecoder,
-                ResponseEncoder,
-                None,
-                sd,
-            )
-            .map_err(|e| e.to_string())
-        })
+        start(&melin_test_node::addrs(0, || free_addr(PORT_BASE)), config)
     };
 
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !revived_handle.is_finished() {
+    while !revived.is_finished() {
         assert!(
             Instant::now() < deadline,
             "the revived ex-primary was never fenced by the raft mesh"
@@ -335,21 +306,15 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
     // node fenced itself (fence-on-supersession co-sets the process
     // shutdown flag it shares with the runtime).
     assert!(
-        revived_shutdown.load(Ordering::Relaxed),
+        revived.shutdown_requested(),
         "the revived node stopped without fencing — supersession did not fire"
     );
-    revived_handle
+    revived
         .join()
-        .expect("revived primary thread panicked")
         .expect("revived primary returned an error instead of fencing cleanly");
 
     // Teardown.
-    replica_shutdown.store(true, Ordering::Relaxed);
-    for (i, h) in replica_handles.into_iter().enumerate() {
-        // Nudge the promoted node's accept loop.
-        let _ = TcpStream::connect_timeout(&nodes[i + 1].client_addr, Duration::from_millis(100));
-        h.join()
-            .expect("replica thread panicked")
-            .expect("replica returned error");
+    for replica in replicas {
+        replica.stop();
     }
 }

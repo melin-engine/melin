@@ -14,12 +14,20 @@
 //! attaches again, and the client resends the refused increment, which is
 //! taken. The primary is restarted standalone on its own journal, and
 //! replay must reach the value the client was told.
+//!
+//! Nodes are started through `melin-test-node`: on kernel TCP by default,
+//! on DPDK with this crate's `dpdk` feature, under
+//! `scripts/dpdk/netns-runner.sh` (see
+//! `docs/internal/dpdk-transparent-tests.md`).
+//!
+//! Kernel TCP only for now: a DPDK primary never sees its replica leave,
+//! so it never halts ("DPDK does not notice a replication peer that has
+//! gone", `docs/internal/transport-divergences-2026-10.md`). The gate
+//! goes when the divergence does.
+#![cfg(not(feature = "dpdk"))]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -32,9 +40,9 @@ use melin_client::Connection;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
+use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
-use melin_wire_protocol::tcp::BlockingTcpListener;
 
 /// Port range for `free_addr`, shared with `replicated_failover.rs`: every
 /// other range below the ephemeral floor is taken. Sharing is safe only
@@ -42,34 +50,21 @@ use melin_wire_protocol::tcp::BlockingTcpListener;
 /// never run at the same time.
 const PORT_BASE: u16 = 10_000;
 
-type Node = JoinHandle<Result<(), String>>;
-
-fn spawn_node(config: ServerConfig, shutdown: &Arc<AtomicBool>) -> Node {
-    let listener = BlockingTcpListener::bind(config.bind).expect("bind client port");
-    let shutdown = Arc::clone(shutdown);
-    std::thread::spawn(move || {
-        server::run_with_listener::<Counter>(
-            listener,
-            config,
-            StartupEvents::none(),
-            (),
-            RequestDecoder,
-            ResponseEncoder,
-            None,
-            shutdown,
-        )
-        .map_err(|e| e.to_string())
-    })
+/// Node `slot`'s addresses (`melin_test_node::addrs`), from this file's
+/// port range on kernel TCP.
+fn addrs(slot: usize) -> Addrs {
+    melin_test_node::addrs(slot, || free_addr(PORT_BASE))
 }
 
-fn stop_node(node: Node, shutdown: &AtomicBool, client_addr: SocketAddr) {
-    shutdown.store(true, Ordering::Relaxed);
-    // Wake the accept loop so it sees the flag. Dropped deliberately: a
-    // node that already stopped listening refuses, which is fine.
-    let _ = TcpStream::connect_timeout(&client_addr, Duration::from_millis(100));
-    node.join()
-        .expect("node thread panicked")
-        .expect("node returned an error");
+fn spawn_node(addrs: &Addrs, config: ServerConfig) -> Node {
+    melin_test_node::start_at::<Counter>(
+        addrs,
+        config,
+        StartupEvents::none(),
+        (),
+        RequestDecoder,
+        ResponseEncoder,
+    )
 }
 
 /// The value of one Prometheus gauge on a node's health endpoint, or `None`
@@ -134,7 +129,6 @@ fn a_write_refused_while_halted_is_not_replayed() {
         let key_path = tmp.path().join(format!("{name}.key"));
         std::fs::write(&key_path, key.to_bytes()).expect("write node key");
         ServerConfig {
-            bind: free_addr(PORT_BASE),
             journal: tmp.path().join(format!("{name}.journal")),
             authorized_keys: auth_path.clone(),
             ack_policy: AckPolicy::Disk,
@@ -150,31 +144,27 @@ fn a_write_refused_while_halted_is_not_replayed() {
         }
     };
 
-    let replication_addr = free_addr(PORT_BASE);
+    let primary_addrs = addrs(0);
     let mut primary_config = node_config("primary", &primary_key);
-    primary_config.replication_bind = Some(replication_addr);
-    let primary_client = primary_config.bind;
+    primary_config.replication_bind = Some(primary_addrs.replication());
     let primary_health = primary_config.health_bind.expect("set above");
     let primary_journal = primary_config.journal.clone();
     let mut replica_config = node_config("replica", &replica_key);
-    replica_config.replica_of = Some(replication_addr);
-    let replica_client = replica_config.bind;
+    replica_config.replica_of = Some(primary_addrs.replication());
 
-    let primary_shutdown = Arc::new(AtomicBool::new(false));
-    let primary = spawn_node(primary_config, &primary_shutdown);
-    let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica = spawn_node(replica_config, &replica_shutdown);
+    let primary = spawn_node(&primary_addrs, primary_config);
+    let replica = spawn_node(&addrs(1), replica_config);
 
     // --- Taking writes: the replica is attached, the write is taken. ---
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut conn = Connection::connect_by(primary_client, &client_key, deadline)
+    let mut conn = Connection::connect_by(primary.addr(), &client_key, deadline)
         .expect("client connects to the primary");
     let ack = one_reply(&mut conn, &increment_request(1));
     assert_eq!(ack[0], KIND_RESP_ACK, "the first increment is acked");
 
     // --- Halted: the replica leaves, the next write is refused. ---
-    stop_node(replica, &replica_shutdown, replica_client);
+    replica.stop();
     wait_for_gauge(primary_health, "melin_replicas_connected", 0);
     let refused = one_reply(&mut conn, &increment_request(5));
     assert_eq!(
@@ -192,21 +182,18 @@ fn a_write_refused_while_halted_is_not_replayed() {
 
     // --- Taking writes again: a replica attaches, the refused write is resent. ---
     let mut replica_config = node_config("replica2", &replica_key);
-    replica_config.replica_of = Some(replication_addr);
-    let replica_client = replica_config.bind;
-    let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica = spawn_node(replica_config, &replica_shutdown);
+    replica_config.replica_of = Some(primary_addrs.replication());
+    let replica = spawn_node(&addrs(2), replica_config);
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let ack = one_reply(&mut conn, &increment_request(5));
     assert_eq!(ack[0], KIND_RESP_ACK, "the resend is taken");
     assert_eq!(value_of(&mut conn), 6);
     drop(conn);
-    stop_node(replica, &replica_shutdown, replica_client);
-    stop_node(primary, &primary_shutdown, primary_client);
+    replica.stop();
+    primary.stop();
 
     // --- Replay: the journal holds only what the client was told. ---
     let restart_config = ServerConfig {
-        bind: free_addr(PORT_BASE),
         journal: primary_journal,
         authorized_keys: auth_path.clone(),
         standalone: true,
@@ -218,15 +205,13 @@ fn a_write_refused_while_halted_is_not_replayed() {
         health_bind: None,
         ..ServerConfig::default()
     };
-    let restart_client = restart_config.bind;
-    let restart_shutdown = Arc::new(AtomicBool::new(false));
-    let restarted = spawn_node(restart_config, &restart_shutdown);
+    let restarted = spawn_node(&addrs(0), restart_config);
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut conn = Connection::connect_by(restart_client, &client_key, deadline)
+    let mut conn = Connection::connect_by(restarted.addr(), &client_key, deadline)
         .expect("client connects to the restarted primary");
     let replayed = value_of(&mut conn);
     drop(conn);
-    stop_node(restarted, &restart_shutdown, restart_client);
+    restarted.stop();
 
     assert_eq!(
         replayed, 6,

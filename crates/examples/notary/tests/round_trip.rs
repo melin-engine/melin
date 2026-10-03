@@ -14,8 +14,8 @@
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
 //! `scripts/dpdk/netns-runner.sh` (see
-//! `docs/internal/dpdk-transparent-tests.md`). The admin and replication
-//! listeners the runtime binds itself stay on kernel TCP either way.
+//! `docs/internal/dpdk-transparent-tests.md`). Replication runs on the
+//! nodes' transport; the admin listener stays on kernel TCP either way.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -200,10 +200,24 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
 }
 
 /// Run a node with `config`, on its own thread. The launcher picks the
-/// client address (`config.bind`); the listeners the runtime binds itself
-/// (replication, admin) take theirs from `free_addr`.
+/// client address (`config.bind`); the admin listener takes its own from
+/// `free_addr`.
 fn spawn_node(config: ServerConfig) -> Server {
     melin_test_node::start::<Notary>(
+        config,
+        StartupEvents::none(),
+        (),
+        RequestDecoder,
+        ResponseEncoder,
+    )
+}
+
+/// [`spawn_node`], at addresses taken from `melin_test_node::addrs`
+/// before the node starts: a cluster's nodes need each other's.
+#[cfg(not(feature = "dpdk"))] // as its one caller
+fn spawn_node_at(addrs: &melin_test_node::Addrs, config: ServerConfig) -> Server {
+    melin_test_node::start_at::<Notary>(
+        addrs,
         config,
         StartupEvents::none(),
         (),
@@ -397,10 +411,6 @@ fn second_connection_sees_persisted_chain() {
     server.stop();
 }
 
-// Kernel TCP only until step 2 of docs/internal/dpdk-transparent-tests.md
-// (a process-wide EAL): the restart below starts a second node in this
-// process, and EAL initialises once per process.
-#[cfg(not(feature = "dpdk"))]
 #[test]
 fn the_chain_survives_a_restart() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -831,7 +841,7 @@ fn the_auditor_reports_an_empty_log_and_a_missing_one() {
 const PORT_BASE: u16 = 5_000;
 
 /// The replica's identity on the replication link.
-#[cfg(not(feature = "dpdk"))]
+#[cfg(not(feature = "dpdk"))] // as its one caller
 fn node_key() -> SigningKey {
     SigningKey::from_bytes(&[0xDD; 32])
 }
@@ -885,9 +895,10 @@ fn admin_until_ok(addr: SocketAddr, key: &SigningKey, command: &str) {
 /// time in each receipt is part of what must agree: it is folded into
 /// the head, and the replica never took a clock reading of its own.
 ///
-/// Kernel TCP only until step 2 of `docs/internal/dpdk-transparent-tests.md`
-/// (a process-wide EAL and a bridge): it runs two nodes in this process,
-/// and EAL initialises once per process.
+/// Kernel TCP only for now: a promoted DPDK replica falls back to serving
+/// on kernel TCP, at an address only its DPDK port owns, and never serves
+/// ("A promoted DPDK replica serves on kernel TCP",
+/// `docs/internal/transport-divergences-2026-10.md`).
 #[cfg(not(feature = "dpdk"))]
 #[test]
 fn a_promoted_replica_reports_the_head_the_primary_receipted() {
@@ -911,7 +922,8 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
     let key_path = tmp.path().join("replica.key");
     std::fs::write(&key_path, node_key().to_bytes()).expect("write replica key");
 
-    let replication_addr = free_addr(PORT_BASE);
+    let primary_addrs = melin_test_node::addrs(0, || free_addr(PORT_BASE));
+    let replica_addrs = melin_test_node::addrs(1, || free_addr(PORT_BASE));
     let admin_addr = free_addr(PORT_BASE);
 
     // `disk+ram`, the default and the typical deployment: a receipt means
@@ -934,15 +946,15 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
 
     let primary = {
         let mut config = node_config("primary.journal");
-        config.replication_bind = Some(replication_addr);
-        spawn_node(config)
+        config.replication_bind = Some(primary_addrs.replication());
+        spawn_node_at(&primary_addrs, config)
     };
     let replica = {
         let mut config = node_config("replica.journal");
-        config.replica_of = Some(replication_addr);
+        config.replica_of = Some(primary_addrs.replication());
         config.replication_key = Some(key_path);
         config.admin_bind = Some(admin_addr);
-        spawn_node(config)
+        spawn_node_at(&replica_addrs, config)
     };
 
     // Notarize on the primary. Under `disk+ram` the first receipt is

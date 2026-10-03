@@ -1230,6 +1230,7 @@ dependencies = [
  "melin-journal",
  "melin-pipeline",
  "melin-raft",
+ "melin-test-node",
  "melin-transport-core",
  "melin-wire-protocol",
  "proptest",

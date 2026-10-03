@@ -15,25 +15,27 @@
 //! - A replica configured with a larger genesis than its primary's, which
 //!   holds the primary's whole genesis, against a real primary. It must
 //!   be promoted and serve the primary's state.
+//!
+//! Nodes are started through `melin-test-node`: on kernel TCP by default,
+//! on DPDK with this crate's `dpdk` feature, under
+//! `scripts/dpdk/netns-runner.sh` (see
+//! `docs/internal/dpdk-transparent-tests.md`). The scripted primary is a
+//! kernel socket of the test's own, on the address the nodes reach the
+//! test at.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use counter_server::{
-    Counter, CounterEvent, GET_VALUE_REQUEST, KIND_RESP_VALUE, RequestDecoder, ResponseEncoder,
-};
+use counter_server::{Counter, CounterEvent, RequestDecoder, ResponseEncoder};
 use ed25519_dalek::{Signer, SigningKey};
-use melin_client::Connection;
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
+use melin_test_node::{Addrs, Node};
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_auth_ok, encode_challenge,
@@ -42,46 +44,29 @@ use melin_transport_core::replication::protocol::{
 use melin_transport_core::replication_wire::encode_input_batch;
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::{TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY};
-use melin_wire_protocol::tcp::BlockingTcpListener;
 
 /// Port range for `free_addr`, shared with the other cluster binaries:
 /// safe because they are all in nextest's `cluster-serial` group.
 const PORT_BASE: u16 = 10_000;
 
-type Node = JoinHandle<Result<(), String>>;
-
-fn spawn_node(
-    config: ServerConfig,
-    startup: StartupEvents<CounterEvent>,
-    shutdown: &Arc<AtomicBool>,
-) -> Node {
-    let listener = BlockingTcpListener::bind(config.bind).expect("bind client port");
-    let shutdown = Arc::clone(shutdown);
-    std::thread::spawn(move || {
-        server::run_with_listener::<Counter>(
-            listener,
-            config,
-            startup,
-            (),
-            RequestDecoder,
-            ResponseEncoder,
-            None,
-            shutdown,
-        )
-        .map_err(|e| e.to_string())
-    })
+/// Node `slot`'s addresses (`melin_test_node::addrs`), from this file's
+/// port range on kernel TCP.
+fn addrs(slot: usize) -> Addrs {
+    melin_test_node::addrs(slot, || free_addr(PORT_BASE))
 }
 
-fn stop_node(node: Node, shutdown: &AtomicBool, client_addr: SocketAddr) {
-    shutdown.store(true, Ordering::Relaxed);
-    // Wake the accept loop so it sees the flag. Dropped deliberately: a
-    // node that already stopped listening refuses, which is fine.
-    let _ = TcpStream::connect_timeout(&client_addr, Duration::from_millis(100));
-    node.join()
-        .expect("node thread panicked")
-        .expect("node returned an error");
+fn spawn_node(addrs: &Addrs, config: ServerConfig, startup: StartupEvents<CounterEvent>) -> Node {
+    melin_test_node::start_at::<Counter>(
+        addrs,
+        config,
+        startup,
+        (),
+        RequestDecoder,
+        ResponseEncoder,
+    )
 }
 
+#[cfg(not(feature = "dpdk"))] // as its one caller
 fn genesis(amounts: &[u64]) -> StartupEvents<CounterEvent> {
     StartupEvents {
         genesis: amounts
@@ -132,7 +117,6 @@ impl Cluster {
 
     fn config(&self, name: &str) -> ServerConfig {
         ServerConfig {
-            bind: free_addr(PORT_BASE),
             journal: self.tmp.path().join(format!("{name}.journal")),
             authorized_keys: self.auth_path.clone(),
             ack_policy: AckPolicy::Disk,
@@ -207,7 +191,11 @@ fn admin_command(addr: SocketAddr, key: &SigningKey, command: &str) -> Option<St
 
 /// The counter's value, read by a client of the node at `addr` once it
 /// serves.
+#[cfg(not(feature = "dpdk"))] // as its one caller
 fn value_at(addr: SocketAddr, key: &SigningKey) -> u64 {
+    use counter_server::{GET_VALUE_REQUEST, KIND_RESP_VALUE};
+    use melin_client::Connection;
+
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut conn = Connection::connect_by(addr, key, deadline).expect("client connects");
     let reply = conn
@@ -239,14 +227,14 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
 
     // A scripted primary: a new cluster's, whose journal records a
     // genesis of three entries.
-    let primary = TcpListener::bind("127.0.0.1:0").expect("bind replication listener");
+    let primary =
+        TcpListener::bind((melin_test_node::local_ip(), 0)).expect("bind replication listener");
     let mut replica_config = cluster.config("replica");
     replica_config.replica_of = Some(primary.local_addr().expect("addr"));
     let replica_admin = replica_config.admin_bind.expect("set above");
-    let replica_client = replica_config.bind;
     let replica_journal = replica_config.journal.clone();
-    let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica = spawn_node(replica_config, StartupEvents::none(), &replica_shutdown);
+    let replica = spawn_node(&addrs(0), replica_config, StartupEvents::none());
+    let replica_client = replica.addr();
 
     let (mut stream, _) = primary.accept().expect("the replica connects");
     stream
@@ -314,10 +302,7 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let err = replica
-        .join()
-        .expect("replica thread panicked")
-        .expect_err("the promotion must be refused");
+    let err = replica.join().expect_err("the promotion must be refused");
     assert!(err.contains("refusing promotion"), "{err}");
     assert!(err.contains("genesis takes 3"), "{err}");
     assert_eq!(
@@ -334,25 +319,27 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
 /// A replica configured with a larger genesis than its primary's holds
 /// the primary's whole genesis: it is promoted, and serves the primary's
 /// state — its own configured genesis plays no part.
+///
+/// Kernel TCP only for now: a promoted DPDK replica cannot serve ("A
+/// promoted DPDK replica serves on kernel TCP",
+/// `docs/internal/transport-divergences-2026-10.md`). The gate goes when
+/// the divergence does.
+#[cfg(not(feature = "dpdk"))]
 #[test]
 fn a_replica_configured_with_a_larger_genesis_is_promoted() {
     const GENESIS: u64 = 1_000_000;
     let cluster = Cluster::new();
 
-    let replication_addr = free_addr(PORT_BASE);
+    let primary_addrs = addrs(0);
     let mut primary_config = cluster.config("primary");
-    primary_config.replication_bind = Some(replication_addr);
-    let primary_client = primary_config.bind;
-    let primary_shutdown = Arc::new(AtomicBool::new(false));
-    let primary = spawn_node(primary_config, genesis(&[GENESIS]), &primary_shutdown);
+    primary_config.replication_bind = Some(primary_addrs.replication());
+    let primary = spawn_node(&primary_addrs, primary_config, genesis(&[GENESIS]));
 
     let mut replica_config = cluster.config("replica");
-    replica_config.replica_of = Some(replication_addr);
+    replica_config.replica_of = Some(primary_addrs.replication());
     let replica_admin = replica_config.admin_bind.expect("set above");
-    let replica_client = replica_config.bind;
     let replica_journal = replica_config.journal.clone();
-    let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica = spawn_node(replica_config, genesis(&[1, 2, 4]), &replica_shutdown);
+    let replica = spawn_node(&addrs(1), replica_config, genesis(&[1, 2, 4]));
 
     // The primary's whole genesis — one entry — is on the replica's disk.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -373,13 +360,13 @@ fn a_replica_configured_with_a_larger_genesis_is_promoted() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    stop_node(primary, &primary_shutdown, primary_client);
+    primary.stop();
 
     promote(replica_admin, &cluster.operator_key);
     assert_eq!(
-        value_at(replica_client, &cluster.operator_key),
+        value_at(replica.addr(), &cluster.operator_key),
         GENESIS,
         "the promoted replica serves the primary's genesis, not its own"
     );
-    stop_node(replica, &replica_shutdown, replica_client);
+    replica.stop();
 }

@@ -34,11 +34,18 @@ filter = 'binary(raft_failover) + binary(raft_smoke) + binary(startup_events) + 
 test-group = 'cluster-serial'
 
 # The DPDK transport on veth (`melin-server-runtime`, built only with its
-# `dpdk` feature). Each test re-executes itself into namespaces of its own
-# and runs a node whose poll thread busy-polls a core, so they go one at a
-# time. A group of their own rather than `cluster-serial`: the namespaces
-# keep them apart from the cluster tests, which bind host ports and never
-# see theirs, so the two groups can overlap.
+# `dpdk` feature). Each test runs a node whose poll thread busy-polls a
+# core, so they go one at a time. A group of their own rather than
+# `cluster-serial`: run under the netns runner, as they must be, each test
+# has a network of its own, so nothing keeps them apart from the cluster
+# tests but CPU.
+#
+# The cluster tests above run on DPDK too, built with the same feature
+# and under the same runner (`docs/internal/dpdk-transparent-tests.md`).
+# Their group still applies, and holds them to one at a time. That DPDK
+# run passes `-j 1` as well, which is what keeps every busy-polling node
+# of either group, and of the example suites, off each other's cores:
+# the groups alone would let one test of each run at once.
 [[profile.default.overrides]]
 filter = 'binary(dpdk_veth)'
 test-group = 'dpdk-serial'

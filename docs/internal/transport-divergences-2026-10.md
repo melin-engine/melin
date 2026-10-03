@@ -8,8 +8,11 @@ why. Some differences are deliberate, and those are marked.
 Paths are relative to `crates/core/server-runtime/src/`.
 
 The DPDK side of an entry can be exercised without hardware on the veth
-harness (`dpdk-veth-testing.md`). An entry says it is covered there only
-when a test there covers it; the others have no DPDK test yet.
+harness (`dpdk-veth-testing.md`), and by the kernel-TCP integration tests
+run on DPDK (`dpdk-transparent-tests.md`), where a test that fails on an
+entry is compiled out under the `dpdk` feature, naming it, until the
+entry is fixed. An entry says which tests cover it or are gated on it;
+the others have no DPDK test yet.
 
 ## Client ingress
 
@@ -135,6 +138,49 @@ off and reconnects.
 
 `replication/dpdk.rs`. A dropped Handshake frame leaves both sides waiting.
 Combined with the sender's missing `Handshaking` deadline, that hangs the slot.
+
+### DPDK does not notice a replication peer that has gone (likely bug)
+
+`replication/dpdk.rs`, both ends of the link. A DPDK node that stops
+tells its replication peer nothing (no FIN, no RST: the close described
+in "DPDK closes a client connection without telling the peer"), and
+neither end of a DPDK link has a deadline on a silent peer. The sender's
+streaming slot is released only once its socket is no longer active, and
+a socket retransmitting heartbeats to a peer that never answers stays
+active, since no timeout is set on it. The receiver waits on its primary
+the same way. io_uring sees the EOF, and its receiver gives a quiet
+primary 5 s.
+
+The effect, found by the cluster tests on DPDK
+(`dpdk-transparent-tests.md`, step 2):
+
+- A primary whose replica has stopped keeps counting it
+  (`melin_replicas_connected`) and never halts, so it does not refuse
+  writes as a primary whose last replica has left must. Under a policy
+  that needs a replica, acknowledgements stall instead.
+- A replica whose primary has stopped keeps its link "up": auto-promotion
+  refuses to depose a live primary, and the cluster never fails over.
+
+Tests gated on it: `halt_refusal`, `replicated_failover` and
+`raft_failover` (`crates/core/server-runtime/tests/`).
+
+### A promoted DPDK replica serves on kernel TCP
+
+`server.rs`, the promotion arm of the DPDK replica path, marked TODO
+there. A promoted DPDK replica runs the kernel-TCP primary: it binds a
+kernel listener on its client address (and on `--replication-bind`).
+That address is normally the DPDK port's, which no kernel interface
+holds, so the bind fails and the node exits rather than serving. Where
+the kernel does hold the address, the node serves, on kernel TCP: a
+failover silently gives up kernel bypass. A promoted io_uring replica
+serves on the transport it ran on. The fix is a DPDK primary path for a
+promoted replica.
+
+Found by the cluster tests on DPDK (`dpdk-transparent-tests.md`, step
+2). Tests gated on it: `genesis_promotion`'s
+`a_replica_configured_with_a_larger_genesis_is_promoted`, the notary
+example's `a_promoted_replica_reports_the_head_the_primary_receipted`,
+and, behind the entry above, `replicated_failover` and `raft_failover`.
 
 ## Deliberate differences (no action)
 
