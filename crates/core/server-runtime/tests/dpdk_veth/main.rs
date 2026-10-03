@@ -230,6 +230,37 @@ veth_test!(
     }
 );
 
+veth_test!(
+    /// When an authorised client closes its connection, the node does not
+    /// see the FIN. The connection, and its slot, are released only when
+    /// the node's next heartbeat is answered with an RST.
+    ///
+    /// This pins a known divergence from the kernel-TCP transport, which
+    /// releases the connection on EOF ("DPDK does not see a client's
+    /// close", `docs/internal/transport-divergences-2026-10.md`). When that
+    /// is fixed this test fails, and is to be flipped to require the slot
+    /// back within [`SLOT_FREED_WITHIN`].
+    a_client_close_is_seen_only_at_the_next_heartbeat,
+    || {
+        let conn = served_within(STARTUP_LIMIT, "the first client");
+        // Closes the socket: the client's FIN goes out now.
+        drop(conn);
+
+        if challenge_within(SLOT_FREED_WITHIN).is_ok() {
+            panic!(
+                "the node freed a closed client's slot within {SLOT_FREED_WITHIN:?}, before \
+                 its heartbeat: DPDK now sees a client's FIN. Flip this test to require the \
+                 slot back promptly and close the entry in \
+                 docs/internal/transport-divergences-2026-10.md"
+            );
+        }
+
+        // The heartbeat goes out within a second of HEARTBEAT after the
+        // last reply; the margin covers that and the RST's way back.
+        served_within(HEARTBEAT + FRAME_LIMIT, "after the node's heartbeat");
+    }
+);
+
 // ---------------------------------------------------------------------------
 // Clients
 // ---------------------------------------------------------------------------
@@ -252,8 +283,8 @@ fn unknown_key() -> SigningKey {
 /// `max_connections` is accepted and then never challenged, and the one
 /// slot can stay taken for up to [`HEARTBEAT`] after an authorised client
 /// has closed: the node does not see a client's FIN, only the RST that
-/// answers its next heartbeat ("DPDK does not see a client's close",
-/// `docs/internal/transport-divergences-2026-10.md`). Every test that
+/// answers its next heartbeat (pinned by
+/// `a_client_close_is_seen_only_at_the_next_heartbeat`). Every test that
 /// has called [`assert_slot_freed`] leaves such a connection behind.
 fn connect_for_challenge() -> (TcpStream, Vec<u8>) {
     challenge_within(STARTUP_LIMIT).unwrap_or_else(|e| {

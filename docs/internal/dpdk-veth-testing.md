@@ -123,11 +123,13 @@ chosen because each pins a known behaviour:
   send. This pins the documented divergence, and the test flips when that
   is fixed.
 
-Writing these turned up a bug: the node does not notice an authorised
-client's FIN. Its slot comes back only when the next heartbeat is answered
-with an RST. Until then the node turns new connections away at
-`max_connections`, so every test's connect helper retries rather than
-expecting the slot at once.
+Writing these turned up a fourth, now pinned too:
+
+- **Client close unseen.** The node does not notice an authorised client's
+  FIN. Its slot comes back only when the next heartbeat is answered with an
+  RST. Until then the node turns new connections away at `max_connections`,
+  so every test's connect helper retries rather than expecting the slot at
+  once. The test flips when the transport handles the close.
 
 ### 3. CI
 
@@ -158,7 +160,8 @@ From `transport-divergences-2026-10.md`:
 - the pipelined first request after auth;
 - `PipelineFull` closing instead of `ServerBusy`;
 - the silent close (now pinned by `a_server_side_close_is_silent`);
-- the unseen client close;
+- the unseen client close (now pinned by
+  `a_client_close_is_seen_only_at_the_next_heartbeat`);
 - the heartbeat drop when the SPSC ring is full (needs a small ring);
 - with step 4, the DPDK replication entries.
 

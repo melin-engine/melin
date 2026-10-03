@@ -38,6 +38,10 @@ off, or never with both off. Until then a node at `max_connections` turns new cl
 away. io_uring releases the connection on EOF. The fix is to treat a
 zero-byte read on a socket that can no longer receive as a close.
 
+Pinned by `a_client_close_is_seen_only_at_the_next_heartbeat` in the DPDK
+veth tests: no slot within a few seconds of the close, one after the
+heartbeat. The fix flips that test to require the slot back promptly.
+
 ### DPDK `PipelineFull` drops the client instead of sending ServerBusy
 
 `dpdk_transport.rs`, the `FrameAction::PipelineFull` arm. On a full input ring
