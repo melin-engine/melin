@@ -169,17 +169,18 @@ jobs:
   # exists for hugepages and NIC binding rather than for building.
   #
   # A hosted runner can run DPDK too, though not on a NIC: the `dpdk_veth`
-  # tests put the transport on a veth pair through the af_packet PMD, with
-  # no hugepages and no root, inside unprivileged namespaces. That covers
-  # the transport's logic, not offloads, multi-queue, `rte_flow`, or
-  # anything else only a real NIC exercises. See
-  # `docs/internal/dpdk-veth-testing.md`.
+  # tests and the example suites put the transport on a veth pair through
+  # the af_packet PMD, with no hugepages and no root, inside unprivileged
+  # namespaces. That covers the transport's logic, not offloads,
+  # multi-queue, `rte_flow`, or anything else only a real NIC exercises.
+  # See `docs/internal/dpdk-veth-testing.md` and
+  # `docs/internal/dpdk-transparent-tests.md`.
   dpdk:
     runs-on: ubuntu-latest
-    # Three builds now: the check, the tests' debug build, and the packaging
-    # one, which compiles eight crates from their tarballs with a target
-    # directory rust-cache cannot warm (each package builds under
-    # `target/package/`).
+    # Three builds now: the check, the tests' debug build (the veth tests
+    # and the example suites share it), and the packaging one, which
+    # compiles eight crates from their tarballs with a target directory
+    # rust-cache cannot warm (each package builds under `target/package/`).
     timeout-minutes: 60
 
     steps:
@@ -206,8 +207,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libdpdk-dev
 
+      # The examples and the test launcher too: their `dpdk` features
+      # compile code (the DPDK launcher, the gates in the round trips) that
+      # no default build sees.
       - name: DPDK builds
-        run: cargo check -p melin-server-runtime --all-targets --features dpdk --locked
+        id: dpdk-builds
+        run: cargo check -p melin-server-runtime -p melin-test-node -p melin-example-echo -p melin-example-counter -p melin-example-notary --all-targets --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk --locked
 
       # The veth tests run each test in new user, network and mount
       # namespaces (`unshare -rnm`), which Ubuntu 24.04 lets an unprivileged
@@ -230,6 +235,24 @@ jobs:
       # each test runs a node whose poll thread busy-polls a core.
       - name: DPDK tests on veth
         run: cargo nextest run -p melin-server-runtime --features dpdk --test dpdk_veth --no-fail-fast --locked
+
+      # The example suites the test job runs on kernel TCP, here on DPDK:
+      # with each example's `dpdk` feature, every node they start runs on
+      # a veth pair. The target runner gives each test process namespaces
+      # of its own and builds the link (`scripts/dpdk/netns-runner.sh`);
+      # nextest runs each test in a process of its own, which is what lets
+      # each start its own EAL. `-j 1` because every node busy-polls a
+      # core. Tests that need two nodes or a restart in one process are
+      # compiled out under the feature for now
+      # (`docs/internal/dpdk-transparent-tests.md`, step 2).
+      #
+      # Runs whatever the veth tests did, so one cannot hide the other, but
+      # not where the build check failed: it would only fail again.
+      - name: Example suites on DPDK
+        if: ${{ !cancelled() && steps.dpdk-builds.outcome == 'success' }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/dpdk/netns-runner.sh
+        run: cargo nextest run -p melin-example-echo -p melin-example-counter -p melin-example-notary --features melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk -j 1 --no-fail-fast --locked
 
       # Proves the workspace can still be packaged. Nothing else does: `cargo
       # check` compiles crates in place, while publishing builds each one from
