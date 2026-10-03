@@ -9,6 +9,20 @@ This builds on the veth harness (`dpdk-veth-testing.md`), which showed a DPDK
 node can run on a veth pair through `net_af_packet`, unprivileged, with no
 hugepages and no NIC.
 
+Status: step 1 is done and passes on a developer host; its CI step is
+written but not yet proven on a hosted runner. Steps 2 and 3 are not
+started. Where step 1 settled something the design left open, or turned
+out differently, its section says so.
+
+To run the example suites on DPDK, from the repository root (one test at a
+time, as every node busy-polls a core):
+
+```sh
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run -p melin-example-echo -p melin-example-counter -p melin-example-notary --features melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk -j 1
+```
+
+For one example, `-p melin-example-echo --features dpdk` is enough.
+
 ## Why it does not work today
 
 - **Transport is chosen by `run_with_listener`.** `server::run` already
@@ -44,6 +58,22 @@ nextest runs each test in its own process, so each test gets a fresh network.
 Tests need no namespace code. A run without the runner, under the feature,
 fails loudly, saying how to run it.
 
+As built (step 1): the link is built by `scripts/dpdk/veth-setup.py`
+(rtnetlink and the ethtool ioctl from Python's standard library), which the
+smoke script now shares instead of carrying its own copy. One pair:
+`veth0` for DPDK, `veth1` with the client address `10.99.0.1/24`, the node
+on `10.99.0.2`. The layout goes out as space-separated lists, one entry per
+node slot, so the bridge of step 2 adds entries rather than variables:
+`MELIN_NETNS_DPDK_IFACES`, `MELIN_NETNS_NODE_IPS`, `MELIN_NETNS_PREFIX_LEN`,
+`MELIN_NETNS_CLIENT_IP`. A `TMPDIR` under `/run`, which the tmpfs would
+hide, is moved to `/tmp`. The runner does not `exec` into `unshare`, so that
+when a run fails it can check whether the namespaces were what failed and
+say how to allow them; it does not probe up front, which would add a
+namespace to every test.
+
+The runner also runs nextest's `--list` invocations, which build a link
+for nothing; that costs a fraction of a second per test binary.
+
 ### Node launcher: one entry point for both transports
 
 A shared test-support helper starts a node from a `ServerConfig` and returns
@@ -59,8 +89,46 @@ an implementation choice: a `test-utils` feature of `melin-server-runtime`, or
 a small dev-only crate. It must not add a dependency to the runtime's
 production build.
 
-"Enabling the feature" means `--features melin-server-runtime/dpdk` on the
-test command (or an example-level `dpdk` feature forwarding to it).
+"Enabling the feature" means a crate-level `dpdk` feature that switches the
+launcher to DPDK (see "The feature" below for what was built).
+
+As built (step 1):
+
+- **Where.** A dev-only crate, `crates/core/test-node` (`melin-test-node`,
+  `publish = false`), rather than a `test-utils` feature of the runtime. The
+  runtime's own integration tests can then use it in step 2 through a
+  path-only dev-dependency, the cycle the counter example already forms; a
+  feature would have needed the runtime to enable a feature of itself for
+  its own tests. Its only dependencies are workspace crates and `libc`,
+  the latter only under its `dpdk` feature.
+- **API.** `melin_test_node::start::<A>(config, startup, sizing, decoder,
+  encoder)` returns a `Node` with `addr()` and `stop()`. It overwrites
+  `config.bind` (and on DPDK the `dpdk_*` fields) and leaves the rest of
+  the config to the test. `STARTUP_LIMIT` is how long a client should give
+  the node to serve: unchanged on kernel TCP, longer on DPDK for EAL and
+  port start.
+- **Stopping a DPDK node.** `server::run` owns its shutdown flag, so the
+  launcher stops it as an operator would, with SIGTERM to the process. It
+  first waits for `run` to have installed its handler (it reads SIGTERM's
+  disposition), since a SIGTERM before then would kill the test process.
+  No production change was needed. One window is left: a node already
+  tearing itself down after an internal failure, but not yet returned,
+  takes the SIGTERM as a second signal and exits the process with status 1,
+  so a test that is failing anyway loses the node's error message. Closing
+  it needs a way to stop `run` without a signal.
+- **One node per process.** Under the feature the launcher refuses a second
+  node in one process, saying why, instead of letting EAL fail. Under plain
+  `cargo test`, which runs every test of a binary in one process, all but
+  the first node-starting test fail that way: the DPDK run is nextest only.
+- **The feature.** Each example has a `dpdk` feature forwarding to
+  `melin-server-runtime/dpdk` and `melin-test-node/dpdk`; the launcher
+  takes the transport from its own feature. Enabling only
+  `melin-server-runtime/dpdk` builds DPDK into the binaries but leaves the
+  tests on kernel TCP (`run_with_listener` ignores the feature), so the
+  example feature is the switch.
+- **EAL arguments** are the veth harness's: af_packet on the slot's
+  interface, `--no-huge -m 512 --no-pci`, main lcore on the first CPU the
+  process may use. The client port is fixed: a node owns its IP outright.
 
 ### EAL: process-wide (step 2)
 
@@ -112,6 +180,28 @@ Also:
 - the existing `dpdk_veth` harness moves onto the runner if that simplifies
   it;
 - the CI `dpdk` job gains the example suites on DPDK.
+
+As built: every single-node round trip in the three examples passes on
+DPDK. None hit a divergence, so none carries a divergence gate and no new
+entry was found. Three tests are compiled out under the feature
+(`#[cfg(not(feature = "dpdk"))]`, with a comment pointing here), as they
+start a second node in the process:
+
+- echo: `the_node_recovers_from_a_snapshot_and_the_journal_tail` (restart);
+- notary: `the_chain_survives_a_restart` (restart) and
+  `a_promoted_replica_reports_the_head_the_primary_receipted` (two nodes;
+  ported to the launcher all the same, so step 2 only removes the gate).
+
+The `dpdk_veth` harness stays as it is. Moving it onto the runner would
+drop its re-exec and its namespace code, but it would need the launcher as
+a runtime dev-dependency (step 2 adds that), and it would no longer run
+from a plain
+`cargo nextest run --features dpdk`. Worth revisiting once step 2 has
+landed.
+
+The CI `dpdk` job checks the examples and the launcher with their `dpdk`
+features, and runs the three example suites through the runner with
+`-j 1`.
 
 ### 2. Process-wide EAL and a bridge
 

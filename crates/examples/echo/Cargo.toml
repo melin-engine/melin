@@ -43,11 +43,14 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 # The tests read the journal back to check what was written, the sizing
 # tests take the ring and batch constants from the transport, and the
-# round trip binds the server's listener itself so it can take a
-# kernel-assigned port.
+# round trip reads the protocol's tags from the wire crate.
 melin-journal = { workspace = true }
 melin-transport-core = { workspace = true }
 melin-wire-protocol = { workspace = true }
+# Starts the round trip's nodes, on kernel TCP or, with `dpdk`, on DPDK.
+# Path-only, like the runtime's dev-dependency on the counter: it is
+# `publish = false` and must stay version-less.
+melin-test-node = { path = "../../core/test-node" }
 tempfile = "3"
 
 [features]
@@ -57,3 +60,8 @@ default = ["hash-chain"]
 # switches the chain itself. On by default because a deployment's is;
 # `--no-default-features` is the chain-less floor.
 hash-chain = ["melin-server-runtime/hash-chain"]
+# The DPDK transport, for the server binary and for the round-trip tests,
+# which then run their nodes on a veth pair and must be run under
+# `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-transparent-tests.md`).
+# Needs libdpdk to build, so never on by default.
+dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk"]

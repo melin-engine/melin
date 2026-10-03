@@ -60,9 +60,18 @@ melin-client = { workspace = true }
 # example commits to is what keeps ring slots and the fsync batch at the
 # size the pipeline was tuned for, so both are asserted rather than left
 # to be discovered on a benchmark run. `test-utils` adds `free_addr`,
-# which the replicated round trip needs for the two listeners the
-# runtime binds itself; the client listener it binds itself, through
-# the wire crate, so it can take a kernel-assigned port.
+# which the round trip needs for the listeners the runtime binds itself
+# (replication, admin); the client listener is the launcher's.
 melin-transport-core = { workspace = true, features = ["test-utils"] }
-melin-wire-protocol = { workspace = true }
+# Starts the round trip's nodes, on kernel TCP or, with `dpdk`, on DPDK.
+# Path-only, like the runtime's dev-dependency on the counter: it is
+# `publish = false` and must stay version-less.
+melin-test-node = { path = "../../core/test-node" }
 tempfile = "3"
+
+[features]
+# The DPDK transport, for the server binary and for the round-trip tests,
+# which then run their nodes on a veth pair and must be run under
+# `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-transparent-tests.md`).
+# Needs libdpdk to build, so never on by default.
+dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk"]

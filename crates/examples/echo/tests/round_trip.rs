@@ -6,11 +6,14 @@
 //! 2. Against the journal on disk: every echo is there, in order, and the
 //!    node comes back from a snapshot plus the tail.
 //! 3. Through the command-line client, run as a real process.
+//!
+//! Nodes are started through `melin-test-node`: on kernel TCP by default,
+//! on DPDK with this crate's `dpdk` feature, under
+//! `scripts/dpdk/netns-runner.sh` (see
+//! `docs/internal/dpdk-transparent-tests.md`).
 
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use std::io::{Read, Write};
@@ -19,12 +22,12 @@ use melin_client::{Connection, SigningKey, key};
 use melin_journal::{JournalEvent, JournalReader};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
+use melin_test_node::Node as Server;
 use melin_wire_protocol::control_codec::{
     TAG_APP, TAG_BATCH_END, TAG_CHALLENGE_RESPONSE, TAG_ENGINE_ERROR, TAG_RESPONSE_HEARTBEAT,
     TAG_SERVER_BUSY,
 };
-use melin_wire_protocol::tcp::BlockingTcpListener;
 
 use echo_server::{Echo, KIND_RESP_ECHO, MAX_PAYLOAD, Payload, RequestDecoder, ResponseEncoder};
 use melin_server_runtime::StartupEvents;
@@ -54,8 +57,9 @@ fn bytes(len: usize, seed: u8) -> Vec<u8> {
 /// kernel accepts the connection before the accept loop runs, so the
 /// client has to get through the handshake to know.
 fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
-    let mut node = Connection::connect_by(addr, key, Instant::now() + Duration::from_secs(10))
-        .expect("a serving node");
+    let mut node =
+        Connection::connect_by(addr, key, Instant::now() + melin_test_node::STARTUP_LIMIT)
+            .expect("a serving node");
     // Generous: the suite shares the machine, and how fast a node answers
     // under full-suite load is not what these tests check. A refused
     // request still surfaces — as a 30 s `NoReply` rather than a 5 s one:
@@ -78,26 +82,6 @@ fn reader_key() -> SigningKey {
 
 fn pubkey_b64(key: &SigningKey) -> String {
     key::public_key_base64(&key.verifying_key())
-}
-
-/// A running server: its shutdown flag, listening address, and thread.
-struct Server {
-    shutdown: Arc<AtomicBool>,
-    addr: SocketAddr,
-    handle: std::thread::JoinHandle<Result<(), String>>,
-}
-
-impl Server {
-    fn stop(self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        // Best-effort poke so the accept loop wakes and sees the flag;
-        // whether the connect itself succeeds is irrelevant.
-        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(100));
-        self.handle
-            .join()
-            .expect("server thread panicked")
-            .expect("server returned error");
-    }
 }
 
 /// Start a server whose journal and `authorized_keys` live in `dir`.
@@ -135,11 +119,7 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
     )
     .expect("write auth keys");
 
-    let listener =
-        BlockingTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().expect("parse addr"))
-            .expect("bind");
     let mut config = ServerConfig {
-        bind: listener.local_addr().expect("local_addr"),
         journal: dir.join("echo.journal"),
         authorized_keys: auth_path,
         standalone: true,
@@ -157,27 +137,13 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
     };
     configure(&mut config);
 
-    let addr = config.bind;
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let sd = shutdown.clone();
-    let handle = std::thread::spawn(move || -> Result<(), String> {
-        server::run_with_listener::<Echo>(
-            listener,
-            config,
-            StartupEvents::none(),
-            (),
-            RequestDecoder,
-            ResponseEncoder,
-            None,
-            sd,
-        )
-        .map_err(|e| e.to_string())
-    });
-    Server {
-        shutdown,
-        addr,
-        handle,
-    }
+    melin_test_node::start::<Echo>(
+        config,
+        StartupEvents::none(),
+        (),
+        RequestDecoder,
+        ResponseEncoder,
+    )
 }
 
 /// Start a server in a fresh temporary directory. The directory is
@@ -209,7 +175,7 @@ fn journaled_echoes(dir: &Path) -> Vec<Vec<u8>> {
 #[test]
 fn an_echo_returns_the_bytes_it_was_sent() {
     let (_tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &writer_key());
+    let mut stream = connect_authenticated(server.addr(), &writer_key());
 
     // Sizes either side of the `u8` boundary included: the length is
     // carried in two bytes, and 256 is where a one-byte length would wrap.
@@ -227,7 +193,7 @@ fn an_echo_returns_the_bytes_it_was_sent() {
 #[test]
 fn an_oversized_payload_is_refused_without_dropping_the_connection() {
     let (_tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &writer_key());
+    let mut stream = connect_authenticated(server.addr(), &writer_key());
 
     // One byte past the cap. The runtime drops the frame at the decoder
     // without a response and keeps the connection, so the refusal is
@@ -249,11 +215,11 @@ fn a_reader_key_cannot_echo() {
     // Refused at the decoder: no reply, connection kept — there is no
     // request a reader key can make that would be answered, so the
     // refusal is observable only in the journal afterwards.
-    let mut watcher = connect_authenticated(server.addr, &reader_key());
+    let mut watcher = connect_authenticated(server.addr(), &reader_key());
     send(&mut watcher, b"not mine to journal");
 
     let sent = bytes(MAX_PAYLOAD, 9);
-    let mut stream = connect_authenticated(server.addr, &writer_key());
+    let mut stream = connect_authenticated(server.addr(), &writer_key());
     assert_eq!(exchange(&mut stream, &sent), (KIND_RESP_ECHO, sent.clone()));
 
     drop(stream);
@@ -273,7 +239,7 @@ fn a_reader_key_cannot_echo() {
 #[test]
 fn a_payload_that_looks_like_a_protocol_frame_is_echoed() {
     let (tmp, server) = start_server();
-    let mut stream = connect_authenticated(server.addr, &writer_key());
+    let mut stream = connect_authenticated(server.addr(), &writer_key());
 
     let payloads: Vec<Vec<u8>> = vec![
         vec![],
@@ -308,7 +274,7 @@ fn a_frame_that_is_not_an_application_frame_is_dropped() {
     let (tmp, server) = start_server();
     // The raw socket, authenticated: `melin-client` only sends
     // application frames, and these are the frames it cannot send.
-    let mut stream = connect_authenticated(server.addr, &writer_key()).into_stream();
+    let mut stream = connect_authenticated(server.addr(), &writer_key()).into_stream();
 
     let raw_frame = |payload: &[u8]| -> Vec<u8> {
         [&(payload.len() as u32).to_le_bytes()[..], payload].concat()
@@ -351,7 +317,7 @@ fn the_journal_holds_every_echo_in_order() {
     let (tmp, server) = start_server();
     let echoes = [bytes(0, 0), bytes(MAX_PAYLOAD, 1), bytes(5, 2)];
     {
-        let mut stream = connect_authenticated(server.addr, &writer_key());
+        let mut stream = connect_authenticated(server.addr(), &writer_key());
         for sent in &echoes {
             exchange(&mut stream, sent);
         }
@@ -364,6 +330,10 @@ fn the_journal_holds_every_echo_in_order() {
     assert_eq!(journaled_echoes(tmp.path()), echoes);
 }
 
+// Kernel TCP only until step 2 of docs/internal/dpdk-transparent-tests.md
+// (a process-wide EAL): the restart below starts a second node in this
+// process, and EAL initialises once per process.
+#[cfg(not(feature = "dpdk"))]
 #[test]
 fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -376,7 +346,7 @@ fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
     // runtime's framing — the case worth proving restores.
     let server = start_server_with(tmp.path(), |config| config.snapshot_interval_ms = 50);
     {
-        let mut stream = connect_authenticated(server.addr, &writer_key());
+        let mut stream = connect_authenticated(server.addr(), &writer_key());
         for sent in &before {
             exchange(&mut stream, sent);
         }
@@ -396,7 +366,7 @@ fn the_node_recovers_from_a_snapshot_and_the_journal_tail() {
     // step failed the node would not come up; the echo after it shows
     // the pipeline is whole, and the journal that it lost nothing.
     let server = start_server_in(tmp.path());
-    let mut stream = connect_authenticated(server.addr, &writer_key());
+    let mut stream = connect_authenticated(server.addr(), &writer_key());
     let sent = bytes(MAX_PAYLOAD, 4);
     assert_eq!(exchange(&mut stream, &sent), (KIND_RESP_ECHO, sent.clone()));
     drop(stream);
@@ -430,11 +400,11 @@ fn the_client_measures_a_closed_loop() {
     let (tmp, server) = start_server();
     // The binary connects once, without retrying, so wait for the server
     // to be ready the way the in-process tests do before spawning it.
-    drop(connect_authenticated(server.addr, &writer_key()));
+    drop(connect_authenticated(server.addr(), &writer_key()));
 
     let key = tmp.path().join("writer.key");
     std::fs::write(&key, writer_key().to_bytes()).expect("write key");
-    let addr = server.addr.to_string();
+    let addr = server.addr().to_string();
     let key_arg = key.to_str().expect("utf-8 path");
     let common = ["--server", &addr, "--key", key_arg];
 
@@ -481,7 +451,7 @@ fn the_client_refuses_a_size_the_server_would_drop() {
 #[test]
 fn the_client_reports_an_unauthorized_key() {
     let (tmp, server) = start_server();
-    drop(connect_authenticated(server.addr, &writer_key()));
+    drop(connect_authenticated(server.addr(), &writer_key()));
 
     // A key the server has never heard of: the handshake fails, and the
     // client says which public key to authorize.
@@ -489,7 +459,7 @@ fn the_client_reports_an_unauthorized_key() {
     std::fs::write(&key, [0xCC; 32]).expect("write key");
     let (code, _, stderr) = echo_client(&[
         "--server",
-        &server.addr.to_string(),
+        &server.addr().to_string(),
         "--key",
         key.to_str().expect("utf-8 path"),
     ]);

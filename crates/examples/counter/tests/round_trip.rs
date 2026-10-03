@@ -1,16 +1,19 @@
 //! Full round-trip integration test: start counter-server, connect with
 //! `melin-client`, send Increment + GetValue, verify responses, shut down
 //! cleanly.
+//!
+//! The node is started through `melin-test-node`: on kernel TCP by
+//! default, on DPDK with this crate's `dpdk` feature, under
+//! `scripts/dpdk/netns-runner.sh` (see
+//! `docs/internal/dpdk-transparent-tests.md`).
 
-use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use melin_client::{Connection, SigningKey, key};
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
-use melin_wire_protocol::tcp::BlockingTcpListener;
+use melin_server_runtime::server::ServerConfig;
+use melin_test_node::Node;
 
 use counter_server::{
     Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_OVERFLOW, KIND_RESP_VALUE, RequestDecoder,
@@ -26,8 +29,9 @@ use melin_server_runtime::StartupEvents;
 /// kernel accepts the connection before the accept loop runs, so the
 /// client has to get through the handshake to know.
 fn connect_authenticated(addr: SocketAddr, key: &SigningKey) -> Connection {
-    let mut node = Connection::connect_by(addr, key, Instant::now() + Duration::from_secs(10))
-        .expect("a serving node");
+    let mut node =
+        Connection::connect_by(addr, key, Instant::now() + melin_test_node::STARTUP_LIMIT)
+            .expect("a serving node");
     // Generous: the suite shares the machine, and how fast a node answers
     // under full-suite load is not what these tests check.
     node.set_read_timeout(Duration::from_secs(30))
@@ -44,11 +48,10 @@ fn value_of(frame: &[u8]) -> u64 {
 // Tests
 // ---------------------------------------------------------------------------
 
-fn start_server() -> (
-    Arc<AtomicBool>,
-    SocketAddr,
-    std::thread::JoinHandle<Result<(), String>>,
-) {
+/// Start a node in a fresh temporary directory. The directory is
+/// returned so the caller keeps it alive for as long as the node runs:
+/// the journal lives inside it.
+fn start_server() -> (tempfile::TempDir, Node) {
     // Server logs go to stderr, which the harness only shows for a
     // failing test: what the node did is then in the report.
     // Deliberately ignored: only the first test in the process installs
@@ -73,13 +76,7 @@ fn start_server() -> (
 
     let journal_path = tmp.path().join("counter.journal");
 
-    let listener =
-        BlockingTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().expect("parse addr"))
-            .expect("bind");
-    let server_addr = listener.local_addr().expect("local_addr");
-
     let config = ServerConfig {
-        bind: server_addr,
         journal: journal_path,
         authorized_keys: auth_path,
         standalone: true,
@@ -96,47 +93,21 @@ fn start_server() -> (
         ..ServerConfig::default()
     };
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let sd = shutdown.clone();
-
-    // tempdir must outlive the server thread (journal lives inside it).
-    let handle = std::thread::spawn(move || -> Result<(), String> {
-        let _tmp = tmp;
-        server::run_with_listener::<Counter>(
-            listener,
-            config,
-            StartupEvents::none(),
-            (),
-            RequestDecoder,
-            ResponseEncoder,
-            None,
-            sd,
-        )
-        .map_err(|e| e.to_string())
-    });
-
-    (shutdown, server_addr, handle)
-}
-
-fn stop_server(
-    shutdown: Arc<AtomicBool>,
-    addr: SocketAddr,
-    handle: std::thread::JoinHandle<Result<(), String>>,
-) {
-    shutdown.store(true, Ordering::Relaxed);
-    // Poke the accept loop so it notices the shutdown flag.
-    let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(100));
-    handle
-        .join()
-        .expect("server thread panicked")
-        .expect("server returned error");
+    let server = melin_test_node::start::<Counter>(
+        config,
+        StartupEvents::none(),
+        (),
+        RequestDecoder,
+        ResponseEncoder,
+    );
+    (tmp, server)
 }
 
 #[test]
 fn full_round_trip() {
-    let (shutdown, addr, handle) = start_server();
+    let (_tmp, server) = start_server();
     let key = SigningKey::from_bytes(&[0xAA; 32]);
-    let mut node = connect_authenticated(addr, &key);
+    let mut node = connect_authenticated(server.addr(), &key);
 
     // --- Increment by 10 ---
     let ack = node.request_one(&increment_request(10)).expect("increment");
@@ -154,16 +125,16 @@ fn full_round_trip() {
     assert_eq!(value_of(&value), 42);
 
     drop(node);
-    stop_server(shutdown, addr, handle);
+    server.stop();
 }
 
 /// An increment that would pass `u64::MAX` is answered with an overflow
 /// report carrying the unchanged value, and leaves the counter as it was.
 #[test]
 fn overflowing_increment_is_refused() {
-    let (shutdown, addr, handle) = start_server();
+    let (_tmp, server) = start_server();
     let key = SigningKey::from_bytes(&[0xAA; 32]);
-    let mut node = connect_authenticated(addr, &key);
+    let mut node = connect_authenticated(server.addr(), &key);
 
     let ack = node
         .request_one(&increment_request(u64::MAX))
@@ -183,17 +154,17 @@ fn overflowing_increment_is_refused() {
     );
 
     drop(node);
-    stop_server(shutdown, addr, handle);
+    server.stop();
 }
 
 #[test]
 fn second_connection_sees_persisted_state() {
-    let (shutdown, addr, handle) = start_server();
+    let (_tmp, server) = start_server();
     let key = SigningKey::from_bytes(&[0xAA; 32]);
 
     // First connection: increment to 100.
     {
-        let mut node = connect_authenticated(addr, &key);
+        let mut node = connect_authenticated(server.addr(), &key);
         let ack = node
             .request_one(&increment_request(100))
             .expect("increment");
@@ -202,11 +173,11 @@ fn second_connection_sees_persisted_state() {
 
     // Second connection: query — should see 100 (state survives connections).
     {
-        let mut node = connect_authenticated(addr, &key);
+        let mut node = connect_authenticated(server.addr(), &key);
         let value = node.request_one(&GET_VALUE_REQUEST).expect("query");
         assert_eq!(value[0], KIND_RESP_VALUE);
         assert_eq!(value_of(&value), 100);
     }
 
-    stop_server(shutdown, addr, handle);
+    server.stop();
 }
