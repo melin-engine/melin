@@ -19,6 +19,9 @@ pub use mac::{MacAddr, MacParseError, PeerMacSource, parse_mac, resolve_peer_mac
 // stack is decided from offload flags and frame bytes alone, so the
 // policy is tested on any host, with or without libdpdk.
 pub mod rx_checksum;
+// Ungated for the same reason: what a node does differently on a
+// process-wide EAL is decided from its configuration alone.
+mod eal_sharing;
 
 #[cfg(feature = "dpdk-sys")]
 mod dpdk;

@@ -244,7 +244,7 @@ struct ListenerEntry {
 pub struct DpdkShared {
     _ports: Vec<Port>,
     _mempool: Mempool,
-    _eal: Eal,
+    _eal: NodeEal,
     /// Intersection of all ports' checksum offload capabilities.
     pub offloads: ChecksumOffloads,
     /// MAC address of the first port (used for all smoltcp interfaces).
@@ -262,6 +262,30 @@ pub struct DpdkShared {
 // only used for mbuf alloc/free which DPDK guarantees is thread-safe.
 unsafe impl Send for DpdkShared {}
 unsafe impl Sync for DpdkShared {}
+
+/// The EAL a node's resources sit on.
+///
+/// An enum rather than always borrowing a process-wide EAL: a node that
+/// owns its EAL must still clean it up last, after its ports and pool, so
+/// that a deployed node's teardown is the one it has always had.
+enum NodeEal {
+    /// Initialized for this node from its EAL arguments and cleaned up
+    /// when the node's resources drop: one node per process, as deployed.
+    Own(Eal),
+    /// The process-wide EAL ([`Eal::init_process_wide`]), shared with the
+    /// process's other nodes. Dropping the node leaves it be: it is never
+    /// cleaned up, so the next node can still use it.
+    ProcessWide(&'static Eal),
+}
+
+impl NodeEal {
+    fn eal(&self) -> &Eal {
+        match self {
+            NodeEal::Own(eal) => eal,
+            NodeEal::ProcessWide(eal) => eal,
+        }
+    }
+}
 
 /// Per-thread DPDK transport. Owns its own smoltcp Interface and
 /// SocketSet. Each poll thread gets one of these.
@@ -366,11 +390,28 @@ impl TxQueue {
 impl DpdkShared {
     /// Initialize shared DPDK resources: EAL, mempool, ports.
     /// Call once before spawning poll threads.
+    ///
+    /// EAL is initialized here from `config.eal_args`, and cleaned up when
+    /// the resources drop — unless the process runs a process-wide EAL
+    /// ([`Eal::init_process_wide`]), which the node then shares: its EAL
+    /// arguments must be empty, its ports must be its own, and dropping it
+    /// leaves EAL running for the process's other nodes.
     pub fn init(config: &DpdkConfig) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
-        let eal = Eal::init(&eal_args)?;
+        let eal = match Eal::process_wide() {
+            None => {
+                let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
+                NodeEal::Own(Eal::init(&eal_args)?)
+            }
+            Some(eal) => {
+                // A failed process-wide init is final: report its error
+                // rather than attempting a second `rte_eal_init`.
+                let eal = eal?;
+                crate::eal_sharing::check_shared_eal_args(&config.eal_args)?;
+                NodeEal::ProcessWide(eal)
+            }
+        };
 
-        let port_count = eal.port_count();
+        let port_count = eal.eal().port_count();
         if config.port_ids.is_empty() {
             return Err("DPDK transport requires at least one port id".into());
         }
@@ -406,10 +447,14 @@ impl DpdkShared {
         // Scale mempool for number of queues and ports.
         let num_mbufs: u32 =
             8192 * (config.port_ids.len() as u32).max(1) * (config.num_queues as u32).max(1);
+        let pool_name = crate::eal_sharing::mempool_name(
+            matches!(eal, NodeEal::ProcessWide(_)),
+            config.port_ids[0],
+        );
         let mempool = if config.mtu > 1500 {
-            Mempool::create_for_mtu("pktmbuf_pool", num_mbufs, config.mtu as u16, socket_id)?
+            Mempool::create_for_mtu(&pool_name, num_mbufs, config.mtu as u16, socket_id)?
         } else {
-            Mempool::create_with_size("pktmbuf_pool", num_mbufs, socket_id)?
+            Mempool::create_with_size(&pool_name, num_mbufs, socket_id)?
         };
 
         // Configure and start all ports with N queue pairs.

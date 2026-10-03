@@ -97,6 +97,7 @@ fn generate_bindings() {
             "dpdk_wrapper.h",
             "\
             #include <rte_eal.h>\n\
+            #include <rte_dev.h>\n\
             #include <rte_ethdev.h>\n\
             #include <rte_mbuf.h>\n\
             #include <rte_mempool.h>\n\
@@ -152,6 +153,11 @@ fn generate_bindings() {
         // Non-inline DPDK functions.
         .allowlist_function("rte_eal_init")
         .allowlist_function("rte_eal_cleanup")
+        // Virtual-device hotplug, for a process hosting several nodes on
+        // one EAL (`Eal::attach_vdev`).
+        .allowlist_function("rte_eal_hotplug_add")
+        .allowlist_function("rte_eal_hotplug_remove")
+        .allowlist_function("rte_eth_dev_get_port_by_name")
         .allowlist_function("rte_pktmbuf_pool_create")
         .allowlist_function("rte_eth_dev_configure")
         .allowlist_function("rte_eth_dev_count_avail")
