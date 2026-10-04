@@ -298,7 +298,8 @@ pub struct DpdkTransport {
     sockets: SocketSet<'static>,
     /// (port, handle) for every TCP listening socket the transport
     /// currently maintains. Initialised with one entry from
-    /// `config.listen_port`; callers can add more via `add_listener`.
+    /// `config.listen_port` (none for `from_shared_unlistening`); callers
+    /// can add more via `add_listener`.
     /// `check_listener` iterates this list, accepts any socket that
     /// transitioned to Established, and replaces it with a fresh
     /// listener on the same port — so the slot for that port stays
@@ -513,6 +514,30 @@ impl DpdkTransport {
         config: &DpdkConfig,
         queue_id: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::build(shared, config, queue_id, Some(config.listen_port))
+    }
+
+    /// Like [`Self::from_shared`], but listening on no port: for a
+    /// transport that only dials out, such as a replica's link to its
+    /// primary. The stack refuses (RST) a connection attempt to any port of
+    /// it. Listeners can be added later with [`Self::add_listener`]: a
+    /// promoted replica adds its client port to the transport it ran on.
+    pub fn from_shared_unlistening(
+        shared: &Arc<DpdkShared>,
+        config: &DpdkConfig,
+        queue_id: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::build(shared, config, queue_id, None)
+    }
+
+    /// The constructors' common body: `listen_port` is the port of the
+    /// transport's first listener, with the client buffer sizes, or none.
+    fn build(
+        shared: &Arc<DpdkShared>,
+        config: &DpdkConfig,
+        queue_id: u16,
+        listen_port: Option<u16>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut device = DpdkDevice::new(
             &config.port_ids,
             shared.mempool_raw,
@@ -560,41 +585,53 @@ impl DpdkTransport {
 
         let mut sockets = SocketSet::new(Vec::with_capacity(MAX_CONNECTIONS));
 
-        let listen_socket = {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
-            let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-            tune_socket(&mut socket);
-            socket
-                .listen(config.listen_port)
-                .map_err(|e| format!("TCP listen failed: {e}"))?;
-            socket
-        };
-        let listen_handle = sockets.add(listen_socket);
-
-        tracing::info!(
-            ip = %config.ip_addr,
-            port = config.listen_port,
-            mac = ?shared.mac,
-            queue_id,
-            "DPDK transport initialized"
-        );
-
-        let mut transport = DpdkTransport {
-            _shared: Arc::clone(shared),
-            device,
-            iface,
-            sockets,
-            listeners: vec![ListenerEntry {
-                port: config.listen_port,
-                handle: listen_handle,
+        // A `Vec`, as `listeners` is: a transport holds one or two.
+        let mut listeners = Vec::with_capacity(2);
+        if let Some(port) = listen_port {
+            let listen_socket = {
+                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
+                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
+                let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+                tune_socket(&mut socket);
+                socket
+                    .listen(port)
+                    .map_err(|e| format!("TCP listen failed: {e}"))?;
+                socket
+            };
+            listeners.push(ListenerEntry {
+                port,
+                handle: sockets.add(listen_socket),
                 rx_buf_size: SOCKET_RX_BUF_SIZE,
                 tx_buf_size: SOCKET_TX_BUF_SIZE,
                 tx_queue_limit: MAX_TX_QUEUE_SIZE,
                 // Client port: keep the fan-in default so one client's burst
                 // cannot delay its peers within an egress pass.
                 dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
-            }],
+            });
+        }
+
+        match listen_port {
+            Some(port) => tracing::info!(
+                ip = %config.ip_addr,
+                port,
+                mac = ?shared.mac,
+                queue_id,
+                "DPDK transport initialized"
+            ),
+            None => tracing::info!(
+                ip = %config.ip_addr,
+                mac = ?shared.mac,
+                queue_id,
+                "DPDK transport initialized (no listener)"
+            ),
+        }
+
+        let mut transport = DpdkTransport {
+            _shared: Arc::clone(shared),
+            device,
+            iface,
+            sockets,
+            listeners,
             accepted: Vec::new(),
             // Pre-allocate all MAX_CONNECTIONS slots so index lookup is
             // always in-bounds. Each empty slot is a single discriminant
