@@ -660,22 +660,6 @@ impl DpdkTransport {
         Ok(transport)
     }
 
-    /// Like `from_shared` but overrides the listen port.
-    ///
-    /// Used by the replication sender to listen on the replication port
-    /// instead of the client port, while sharing the same DPDK NIC and
-    /// IP address.
-    pub fn from_shared_with_port(
-        shared: &Arc<DpdkShared>,
-        config: &DpdkConfig,
-        queue_id: u16,
-        listen_port: u16,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut overridden = config.clone();
-        overridden.listen_port = listen_port;
-        Self::from_shared(shared, &overridden, queue_id)
-    }
-
     /// Open an outbound TCP connection to a remote endpoint.
     ///
     /// Creates a new smoltcp TCP socket, calls `socket.connect()` to

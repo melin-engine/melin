@@ -11,14 +11,8 @@
 //! on DPDK with this crate's `dpdk` feature, under
 //! `scripts/dpdk/netns-runner.sh` (see
 //! `docs/internal/dpdk-transparent-tests.md`). Raft is kernel TCP on every
-//! node.
-//!
-//! Kernel TCP only for now: on DPDK a replica sees its primary leave and
-//! promotes, but a promoted DPDK replica cannot serve ("A promoted DPDK
-//! replica serves on kernel TCP",
-//! `docs/internal/transport-divergences-2026-10.md`). The gate goes when
-//! that divergence does.
-#![cfg(not(feature = "dpdk"))]
+//! node. On DPDK the primary's orderly stop resets its replicas' links,
+//! which they act on at once, and the winner serves as a DPDK primary.
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream};

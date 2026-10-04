@@ -66,7 +66,6 @@ fn spawn_node(addrs: &Addrs, config: ServerConfig, startup: StartupEvents<Counte
     )
 }
 
-#[cfg(not(feature = "dpdk"))] // as its one caller
 fn genesis(amounts: &[u64]) -> StartupEvents<CounterEvent> {
     StartupEvents {
         genesis: amounts
@@ -191,7 +190,6 @@ fn admin_command(addr: SocketAddr, key: &SigningKey, command: &str) -> Option<St
 
 /// The counter's value, read by a client of the node at `addr` once it
 /// serves.
-#[cfg(not(feature = "dpdk"))] // as its one caller
 fn value_at(addr: SocketAddr, key: &SigningKey) -> u64 {
     use counter_server::{GET_VALUE_REQUEST, KIND_RESP_VALUE};
     use melin_client::Connection;
@@ -318,13 +316,8 @@ fn a_replica_configured_without_genesis_refuses_promotion_mid_genesis() {
 
 /// A replica configured with a larger genesis than its primary's holds
 /// the primary's whole genesis: it is promoted, and serves the primary's
-/// state — its own configured genesis plays no part.
-///
-/// Kernel TCP only for now: a promoted DPDK replica cannot serve ("A
-/// promoted DPDK replica serves on kernel TCP",
-/// `docs/internal/transport-divergences-2026-10.md`). The gate goes when
-/// the divergence does.
-#[cfg(not(feature = "dpdk"))]
+/// state — its own configured genesis plays no part. On DPDK it serves
+/// as a DPDK primary, at its own address.
 #[test]
 fn a_replica_configured_with_a_larger_genesis_is_promoted() {
     const GENESIS: u64 = 1_000_000;

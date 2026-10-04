@@ -37,14 +37,11 @@
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
 //! `scripts/dpdk/netns-runner.sh` (see
-//! `docs/internal/dpdk-transparent-tests.md`).
-//!
-//! Kernel TCP only for now: on DPDK a replica sees its primary leave and
-//! promotes, but a promoted DPDK replica cannot serve ("A promoted DPDK
-//! replica serves on kernel TCP",
-//! `docs/internal/transport-divergences-2026-10.md`). The gate goes when
-//! that divergence does.
-#![cfg(not(feature = "dpdk"))]
+//! `docs/internal/dpdk-transparent-tests.md`). On DPDK the winner serves
+//! as a DPDK primary, and the primary is cut off the network before it is
+//! stopped, as a crashed host would be: its replicas hear nothing of its
+//! going, so failover completes only if they notice the silence
+//! themselves (the replica end of a DPDK link's liveness deadline).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -409,7 +406,14 @@ fn acked_events_survive_primary_death_under_ram_policy() {
 
     // --- Phase 3: kill the primary. Every acked event now exists only
     // on the surviving nodes (their RAM, and their journals as their
-    // own disk syncs trail through). ---
+    // own disk syncs trail through). On DPDK it is cut off first, so
+    // that its stop announces nothing: no RST reaches the replicas, and
+    // each must drop its link on the liveness deadline before the
+    // promotion below may proceed (auto-promotion refuses while the
+    // primary link is up). On kernel TCP a node has no link of its own
+    // to cut; its stop closes the links, as a crash would. ---
+    #[cfg(feature = "dpdk")]
+    primary.cut_off();
     primary.stop();
 
     // --- Phase 4: exactly one replica auto-promotes. The promotion

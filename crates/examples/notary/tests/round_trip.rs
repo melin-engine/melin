@@ -214,7 +214,6 @@ fn spawn_node(config: ServerConfig) -> Server {
 
 /// [`spawn_node`], at addresses taken from `melin_test_node::addrs`
 /// before the node starts: a cluster's nodes need each other's.
-#[cfg(not(feature = "dpdk"))] // as its one caller
 fn spawn_node_at(addrs: &melin_test_node::Addrs, config: ServerConfig) -> Server {
     melin_test_node::start_at::<Notary>(
         addrs,
@@ -841,7 +840,6 @@ fn the_auditor_reports_an_empty_log_and_a_missing_one() {
 const PORT_BASE: u16 = 5_000;
 
 /// The replica's identity on the replication link.
-#[cfg(not(feature = "dpdk"))] // as its one caller
 fn node_key() -> SigningKey {
     SigningKey::from_bytes(&[0xDD; 32])
 }
@@ -893,13 +891,8 @@ fn admin_until_ok(addr: SocketAddr, key: &SigningKey, command: &str) {
 /// it. The primary dies, the replica is promoted, and the new primary
 /// hands out the head the old one receipted, then chains onto it. The
 /// time in each receipt is part of what must agree: it is folded into
-/// the head, and the replica never took a clock reading of its own.
-///
-/// Kernel TCP only for now: a promoted DPDK replica falls back to serving
-/// on kernel TCP, at an address only its DPDK port owns, and never serves
-/// ("A promoted DPDK replica serves on kernel TCP",
-/// `docs/internal/transport-divergences-2026-10.md`).
-#[cfg(not(feature = "dpdk"))]
+/// the head, and the replica never took a clock reading of its own. On
+/// DPDK the promoted replica serves as a DPDK primary.
 #[test]
 fn a_promoted_replica_reports_the_head_the_primary_receipted() {
     capture_node_logs();

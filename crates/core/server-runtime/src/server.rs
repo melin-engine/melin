@@ -945,8 +945,8 @@ where
     // the disk as it found it. Checked in every role: a replica's
     // configuration is also the one it serves under once promoted, and a
     // configuration that cannot serve is better refused now than in the
-    // middle of a failover. `run_as_primary` re-checks (it is also reached
-    // from the DPDK promotion fallback, which does not pass through here).
+    // middle of a failover. `run_as_primary` re-checks (a promotion
+    // reaches it without passing through boot).
     validate_primary_config(&config)?;
 
     // Bind the replication listener up front, before any pipeline thread
@@ -1264,10 +1264,10 @@ where
 }
 
 /// Bind the kernel-TCP replication listener, non-blocking (the sender's
-/// accept loop polls the shutdown flag between accepts). The kernel path
-/// binds at boot (`run_impl`) so a failure cannot leak pipeline threads
-/// and a promotion cannot fail on it; the DPDK promotion fallback binds
-/// at promotion, where its kernel listeners come up.
+/// accept loop polls the shutdown flag between accepts). Bound at boot
+/// (`run_impl`) so a failure cannot leak pipeline threads and a promotion
+/// cannot fail on it. Kernel TCP only: a DPDK node's replication listener
+/// is a socket of its own stack, which no other process can take.
 fn bind_replication_listener(
     addr: std::net::SocketAddr,
 ) -> Result<crate::replication::ReplicationListener, Box<dyn std::error::Error>> {
@@ -1978,67 +1978,15 @@ where
         &raft_status,
     )?;
 
-    // Promotion fencing: a node that reached primary via promotion injects
-    // an `EpochBump` as the first journaled entry of its tenure, raising the
-    // cluster epoch so a paused/partitioned ex-primary self-demotes when a
-    // handshake crosses (see `melin_transport_core::fence`). Genesis primaries
-    // skip this — their epoch stays at whatever the journal recovered. The
-    // bump rides the input ring like a seed event (connection_id == 0), so it
-    // flows through journal + replication to every replica. We wait for the
-    // matching stage to apply it (epoch advanced) before serving so the first
-    // handshake already advertises the new epoch.
-    //
-    // The new epoch honours the promotion request's floor: a manual
-    // `PROMOTE` carries `MANUAL` (= 1) and resolves to the classic
-    // `epoch + 1`; a raft auto-promotion carries its election term
-    // (strictly above the old epoch by the driver's request rule), so
-    // tenure epochs align with raft terms and two overlapping
-    // promotions from different elections always allocate distinct
-    // epochs — the newer one fences the older.
+    // Promotion fencing: the bump is the first entry of a promoted node's
+    // tenure. See `journal_promotion_epoch_bump`.
     if let Some(requested_epoch) = promotion {
-        use melin_app::unix_epoch_nanos;
-        use melin_journal::JournalEvent;
-        use melin_transport_core::trace::mono_trace_ns;
-
-        let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
-        // Re-validate the term↔epoch alignment at the moment the epoch is
-        // minted, not just at the driver's request-time check: a streamed
-        // `EpochBump` from a concurrent promotion elsewhere can raise the
-        // fence during the drain, in which case `max` allocates `epoch+1`
-        // instead of the election term. Fencing still converges (the
-        // epochs stay distinct and the higher one wins), but the skew
-        // makes later "epochs outran raft terms" refusals — so say what
-        // actually happened while the evidence exists. Manual promotions
-        // (requested == MANUAL) are exempt: they never claimed alignment.
-        if requested_epoch > crate::promotion::PromotionRequest::MANUAL
-            && new_epoch != requested_epoch
-        {
-            warn!(
-                new_epoch,
-                requested_epoch,
-                "promotion epoch does not match its election term — a concurrent \
-                 promotion advanced the fencing epoch mid-drain; auto-promotion \
-                 refusals may report term/epoch misalignment until a newer election"
-            );
-        }
-        info!(
-            new_epoch,
-            requested_epoch, "promotion: injecting epoch bump"
+        journal_promotion_epoch_bump(
+            requested_epoch,
+            &fence_state,
+            &mut input_producer,
+            &shutdown,
         );
-        input_producer.publish(InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            sequence: 0,
-            timestamp_ns: unix_epoch_nanos(),
-            event: JournalEvent::EpochBump { epoch: new_epoch },
-            publish_ts: mono_trace_ns(),
-            recv_ts: mono_trace_ns(),
-        });
-        // Wait until the matching stage observes the bump (epoch raised) so
-        // the node advertises `new_epoch` on the very first handshake. Bounded
-        // by the shutdown flag so a stuck pipeline can't wedge startup.
-        ORCHESTRATOR_WAIT
-            .wait_until(|| fence_state.epoch() >= new_epoch || shutdown.load(Ordering::Relaxed));
     }
 
     // Bring-up gate: a primary that began the history with replication
@@ -2500,7 +2448,7 @@ where
         // survives a replica → primary transition. Seeded at epoch 0; the
         // receiver raises it from the replica's recovered journal and the
         // replication stream, and a promotion bumps it by injecting an
-        // `EpochBump`. Carried into `run_as_primary` post-promotion.
+        // `EpochBump`. Carried into `run_as_primary_dpdk` post-promotion.
         let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
 
         // Control-plane raft runs on kernel TCP even on DPDK nodes — the
@@ -2556,16 +2504,16 @@ where
         // No local rotation triggers on the replica side — rotation is
         // primary-driven (see the kernel-TCP receiver path).
 
-        // Use queue 0 for the replication receiver's smoltcp connection.
-        // Listen port is unused (receiver connects outbound, doesn't listen),
-        // but DpdkTransport requires one — use an ephemeral port.
-        let mut repl_transport = melin_dpdk::DpdkTransport::from_shared_with_port(
-            &shared,
-            &dpdk_config,
-            0,
-            39999, // Ephemeral — receiver connects outbound, doesn't accept.
-        )?;
-        repl_transport.send_gratuitous_arp();
+        // Queue 0's transport carries the replica's link to its primary
+        // and, should this node be promoted, everything it serves after:
+        // a promoted replica is a DPDK primary on this same transport (see
+        // the promotion arm below). It listens on nothing while the node
+        // is a replica — a replica serves nothing inbound, and the stack
+        // refuses a connection attempt — and gains its listeners at
+        // promotion.
+        let mut transport =
+            melin_dpdk::DpdkTransport::from_shared_unlistening(&shared, &dpdk_config, 0)?;
+        transport.send_gratuitous_arp();
 
         let primary_ipv4 = match primary_addr.ip() {
             std::net::IpAddr::V4(ip) => ip,
@@ -2575,7 +2523,7 @@ where
         };
 
         match crate::replication::run_receiver_dpdk::<A>(
-            repl_transport,
+            &mut transport,
             primary_ipv4,
             primary_addr.port(),
             &signing_key,
@@ -2594,11 +2542,15 @@ where
             // Clean shutdown — the raft and health guards tear down on drop.
             None => return Ok(()),
             Some((mut app, writer)) => {
-                // Promotion! Transition to primary mode (DPDK).
+                // Promotion! Transition to primary mode, on DPDK: the node
+                // serves on the transport it ran on, as a promoted
+                // kernel-TCP replica does. The receiver tore its pipeline
+                // down and handed over its application and journal writer;
+                // every link it opened is reset.
                 info!("replica promoted (DPDK) — transitioning to primary");
                 // See the kernel-TCP promotion path.
                 check_promotable(&writer)?;
-                // Release --health-bind before run_as_primary rebinds it.
+                // Release --health-bind before run_as_primary_dpdk rebinds it.
                 replica_health.stop();
                 // Idempotent; see the kernel-TCP promotion path.
                 <A as Application>::prefault(&mut app, &sizing);
@@ -2609,26 +2561,38 @@ where
                     flag.store(false, Ordering::Release);
                 }
 
-                // TODO: run_as_primary_dpdk — for now, fall back to
-                // kernel TCP primary after promotion.
-                warn!("DPDK primary promotion not yet implemented — falling back to kernel TCP");
-                let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
-                // Unlike the kernel path (bound at boot in `run_impl`),
-                // the fallback's kernel listeners only come up here at
-                // promotion — the DPDK stack carried replication until
-                // now. See `bind_replication_listener`.
-                let repl_listener = config
-                    .replication_bind
-                    .map(bind_replication_listener)
-                    .transpose()?;
+                // This thread ran the receiver, pinned to the reader's core
+                // (on an isolated core, at real-time priority) once it
+                // streamed, and it spawns the primary's threads next: a
+                // child inheriting that placement could never run to pin
+                // itself. Unpinned first, as the receiver does before it
+                // builds a pipeline; it is pinned again as the poll thread.
+                if let Err(e) = melin_app::affinity::clear_affinity() {
+                    warn!(
+                        error = e,
+                        "failed to clear the receiver's affinity before promotion"
+                    );
+                }
+
+                // What `DpdkTransport::from_shared` gives a primary at
+                // boot: the client listener, with the client buffers. The
+                // replication listener is added with the primary's other
+                // replication wiring, as at boot.
+                transport
+                    .add_listener(dpdk_config.listen_port)
+                    .map_err(|e| format!("add the client listener on promotion: {e}"))?;
+                // As at boot: the switch may have aged out this port's MAC
+                // while the node only dialled out.
+                transport.send_gratuitous_arp();
+
                 // The raft guard drops — stopping the driver and joining
                 // the (already exited) promotion thread — after this
                 // returns; see the kernel-TCP promotion path.
-                return run_as_primary::<A, _>(
+                return run_as_primary_dpdk::<A>(
                     app,
                     writer,
-                    listener,
-                    repl_listener,
+                    transport,
+                    &dpdk_config,
                     &config,
                     startup.on_primary,
                     decoder,
@@ -2640,7 +2604,6 @@ where
                     ack_policy_atomic,
                     fence_state,
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
-                    false, // a promoted node continues the history it streamed
                     raft_status,
                     journal_tip,
                 );
@@ -2667,6 +2630,19 @@ where
         }
         transports.push(transport);
     }
+    // Exactly one client poll queue (LMAX: single reader → single
+    // matcher); `dpdk_config_from` asks for one queue. Checked before
+    // anything touches the journal or spawns a thread.
+    let transport = match <[_; 1]>::try_from(transports) {
+        Ok([transport]) => transport,
+        Err(transports) => {
+            return Err(format!(
+                "expected exactly one client DPDK transport, the port gave {}",
+                transports.len()
+            )
+            .into());
+        }
+    };
 
     // The configuration was validated at the top of this function. Now
     // initialize or recover the application (journaling genesis on a new
@@ -2685,9 +2661,6 @@ where
         std::mem::take(&mut startup.genesis),
     )?;
     <A as Application>::prefault(&mut app, &sizing);
-    // As on the kernel-TCP path: read before the writer moves into the
-    // pipeline, for the shadow stage's snapshots.
-    let genesis_entries = writer.read_header_info()?.genesis_entries;
 
     // Fencing state for this DPDK primary, seeded with the recovered epoch.
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
@@ -2722,6 +2695,97 @@ where
     };
     let raft_status = raft.status();
 
+    // The admin endpoint, as on the kernel-TCP primary path: spawned by
+    // the caller of the primary function, since a promoted replica keeps
+    // the one it booted with. PROMOTE is rejected on a primary (no flag
+    // wired); ROTATE shares the flag the journal stage observes.
+    let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    let _admin_handle = config
+        .admin_bind
+        .map(|addr| {
+            crate::admin::spawn(
+                addr,
+                None,
+                rotate_flag.clone(),
+                Some(Arc::clone(&ack_policy_atomic)),
+                Arc::clone(&shutdown),
+                Arc::clone(&authorized_keys),
+            )
+        })
+        .transpose()?;
+
+    // The raft guard and the admin endpoint drop after this returns.
+    run_as_primary_dpdk::<A>(
+        app,
+        writer,
+        transport,
+        &dpdk_config,
+        &config,
+        startup.on_primary,
+        decoder,
+        encoder,
+        event_publisher,
+        Arc::clone(&shutdown),
+        authorized_keys,
+        rotate_flag,
+        ack_policy_atomic,
+        fence_state,
+        None, // not promoted — no EpochBump injection
+        raft_status,
+        journal_tip,
+    )
+}
+
+/// Run the server as a DPDK primary: the DPDK twin of [`run_as_primary`],
+/// used by both the normal DPDK primary startup and the promotion of a
+/// DPDK replica. Builds the pipeline, spawns its threads, wires the
+/// response stage, the ack gate, the halt gate and the replication driver
+/// onto `transport`, journals the promotion's epoch bump (if any) and the
+/// application's `on_primary` events, then runs the poll loop on this
+/// thread until shutdown.
+///
+/// `transport` is queue 0's, listening on the client port: built at boot
+/// by a primary, or the transport a promoted replica ran on, with its
+/// client listener added. The replication listener is added here. The
+/// EAL, ports and pool behind the transport are left as they are, never
+/// re-initialised: EAL cannot be initialised twice in a process.
+///
+/// The other parameters are [`run_as_primary`]'s, less the bring-up gate's
+/// `began_history` (a DPDK primary has none; see below).
+#[cfg(feature = "dpdk")]
+#[allow(clippy::too_many_arguments)] // boot assembly point, as run_as_primary
+fn run_as_primary_dpdk<A>(
+    app: A,
+    writer: BufferedWriter<A::Event>,
+    mut transport: melin_dpdk::DpdkTransport,
+    dpdk_config: &melin_dpdk::DpdkConfig,
+    config: &ServerConfig,
+    on_primary: Vec<A::Event>,
+    decoder: RequestDecoderArc<A>,
+    encoder: ResponseEncoderArc<A>,
+    event_publisher: Option<EventPublisherFn<A>>,
+    shutdown: Arc<AtomicBool>,
+    authorized_keys: Arc<AuthorizedKeys>,
+    rotate_flag: Option<Arc<AtomicBool>>,
+    ack_policy_atomic: Arc<AtomicU8>,
+    fence_state: Arc<melin_transport_core::fence::FenceState>,
+    promotion: Option<u64>,
+    raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
+    journal_tip: melin_transport_core::AdvertisedJournalTip,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+{
+    // Re-checked, as in `run_as_primary`: a promotion reaches here without
+    // the boot-time check.
+    validate_primary_config(config)?;
+    // As on the kernel-TCP path: read before the writer moves into the
+    // pipeline, for the shadow stage's snapshots.
+    let genesis_entries = writer.read_header_info()?.genesis_entries;
+
     // Clone the application's state for the shadow snapshot stage before
     // moving it into the pipeline (same as the kernel TCP path).
     let enable_shadow = config.snapshot_interval_ms > 0;
@@ -2739,10 +2803,12 @@ where
 
     // Build disruptor pipeline (same flags as the kernel TCP path).
     // DPDK doesn't currently spawn the publisher thread (see
-    // `event_publisher: None` in the handles bundle further down) but
-    // gating consumer allocation on the same `Some`/`event_bind` pair
-    // the kernel-TCP path uses means passing `None` from the binary is
-    // honoured here too — no orphan consumer slot is wired up.
+    // `event_publisher: None` in the handles bundle further down).
+    // Consumer allocation is gated on the same `Some`/`event_bind` pair
+    // the kernel-TCP path uses, so passing `None` wires up no consumer;
+    // but with `Some` and `--event-bind` a consumer slot is wired up and
+    // never drained — see "DPDK never runs the event publisher" in
+    // docs/internal/transport-divergences-2026-10.md.
     let enable_event_publisher = event_publisher.is_some() && config.event_bind.is_some();
     let enable_shadow = config.snapshot_interval_ms > 0;
     let Pipeline {
@@ -2809,41 +2875,23 @@ where
     // Lock-free, fixed-size slots — no heap allocation per frame.
     // 4096 slots × ~140 bytes = ~560 KiB. Enough to buffer a burst
     // without backpressuring the response stage.
-    // One SPSC channel per DPDK poll thread. The response stage routes
-    // frames to the correct thread based on thread_id encoded in
-    // connection_id bits 56..63.
-    let mut tx_producers = Vec::with_capacity(num_dpdk_threads);
-    let mut tx_consumers = Vec::with_capacity(num_dpdk_threads);
-    // The response thread produces into these, so they wait its way.
+    // One SPSC channel per DPDK poll thread (one: see `transport`). The
+    // response stage routes frames to the correct thread based on
+    // thread_id encoded in connection_id bits 56..63. A `Vec` because
+    // that is the response stage's interface.
+    // The response thread produces into it, so it waits its way.
     let wait = config.cores.response.wait;
-    for _ in 0..num_dpdk_threads {
-        let (tx_out, tx_rx) =
-            melin_pipeline::spsc::channel::<crate::dpdk_response::TxFrame>(4096, wait);
-        tx_producers.push(tx_out);
-        tx_consumers.push(tx_rx);
-    }
+    let (tx_out, tx_rx_0) =
+        melin_pipeline::spsc::channel::<crate::dpdk_response::TxFrame>(4096, wait);
+    let tx_producers = vec![tx_out];
 
     // Spawn pipeline threads (journal, matching — identical to TCP path).
     let cores = config.cores;
 
     // Wire runtime rotation into the journal stage (DPDK primary path).
-    // PROMOTE is rejected on a primary (no flag wired); ROTATE shares the
-    // same flag the journal stage observes.
+    // ROTATE shares `rotate_flag` with the admin endpoint the caller
+    // spawned.
     let mut journal_stage = journal_stage;
-    let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
-    let _admin_handle = config
-        .admin_bind
-        .map(|addr| {
-            crate::admin::spawn(
-                addr,
-                None,
-                rotate_flag.clone(),
-                Some(Arc::clone(&ack_policy_atomic)),
-                Arc::clone(&shutdown),
-                Arc::clone(&authorized_keys),
-            )
-        })
-        .transpose()?;
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     config.cores.place_journal_children(&mut journal_stage);
@@ -2938,22 +2986,21 @@ where
         shadow_consumer,
         shadow_app,
         chain_hash_lock,
-        &config,
+        config,
         &cores,
         &shutdown,
         fence_state.epoch(),
         genesis_entries,
     )?;
 
-    // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
-    // and smoltcp stack so the replication channel goes through kernel bypass.
     // `replication_metrics` was constructed above so the response gate can
-    // read per-slot cursors; the sender thread shares the same instance.
+    // read per-slot cursors; the replication driver shares the same
+    // instance.
     let replica_ready = Arc::new(AtomicBool::new(false));
     // Replication, if enabled: build a `DpdkReplicationDriver` for the
     // single client poll thread to drive. The driver's accept dispatch
-    // hangs off the second listener we added on the client transport
-    // earlier (port == repl_bind.port()).
+    // hangs off a second listener on the client transport, added below
+    // (port == repl_bind.port()).
     let (repl_driver, repl_listen_port) = if let Some((repl_consumer_1, repl_consumer_2)) =
         replication_consumers
     {
@@ -3010,7 +3057,7 @@ where
         const REPL_TX_BUF: usize = 512 * 1024;
         const REPL_TX_QUEUE: usize = 512 * 1024;
         const REPL_RX_BUF: usize = 64 * 1024;
-        transports[0]
+        transport
             .add_listener_with_buffers(
                 repl_port,
                 REPL_RX_BUF,
@@ -3052,6 +3099,19 @@ where
     // the client poll thread instead. Nothing to join.
     let replication_handle: Option<std::thread::JoinHandle<()>> = None;
 
+    // Promotion fencing, as on kernel TCP: the bump is the first entry of
+    // a promoted node's tenure, ahead of `on_primary`, and is applied
+    // before the poll loop below serves any client or replica. See
+    // `journal_promotion_epoch_bump`.
+    if let Some(requested_epoch) = promotion {
+        journal_promotion_epoch_bump(
+            requested_epoch,
+            &fence_state,
+            &mut input_producer,
+            &shutdown,
+        );
+    }
+
     // Journal `on_primary` through the pipeline. Genesis is already in
     // the journal (`init_engine` creates the journal with it); replicas
     // copy it by catch-up like the rest of the history.
@@ -3061,13 +3121,10 @@ where
     // attaches: the main thread IS the poll thread that accepts replica
     // connections, so blocking it here for one would deadlock until
     // shutdown. Until a replica attaches, writes under a policy that
-    // requires one are refused (no replica connected).
-    //
-    // A DPDK primary is never a promoted one (promotion falls back to the
-    // kernel-TCP primary), so there is no epoch bump to order against.
-    let _ = (&enable_replication, &replica_ready); // suppress unused warnings on non-DPDK paths
+    // requires one are refused (no replica connected). A promoted primary
+    // continues a history, which the gate never holds on either transport.
     journal_on_primary_events(
-        startup.on_primary,
+        on_primary,
         &mut input_producer,
         &journal_cursor,
         &matching_cursor,
@@ -3082,7 +3139,7 @@ where
 
     let pipeline_healthy = Arc::new(AtomicBool::new(true));
     let health_handle = spawn_health_endpoint(
-        &config,
+        config,
         &active_connections,
         &events_processed,
         &refused_writes,
@@ -3104,7 +3161,7 @@ where
     info!(
         ip = %dpdk_config.ip_addr,
         port = dpdk_config.listen_port,
-        num_dpdk_threads,
+        num_dpdk_threads = 1,
         "DPDK transport listening"
     );
 
@@ -3112,19 +3169,11 @@ where
     let max_conns = config.max_connections;
     let reader_core = config.cores.reader.core;
 
-    // Exactly one client poll queue (LMAX: single reader → single matcher).
-    // Additional DPDK queues, if any, are dedicated to the replication sender
-    // on its own thread and don't touch the input ring.
-    assert_eq!(
-        transports.len(),
-        1,
-        "expected exactly one client DPDK transport"
-    );
-    let transport_0 = transports.pop().expect("one client transport");
-    let tx_rx_0 = tx_consumers.remove(0);
+    // Exactly one client poll queue (LMAX: single reader → single
+    // matcher), on this thread.
     melin_app::affinity::pin_thread("dpdk-poll-0", reader_core);
     crate::dpdk_transport::run_dpdk_poll::<A>(
-        transport_0,
+        transport,
         input_producer,
         decoder,
         halt_gate,
@@ -3146,7 +3195,8 @@ where
     // to join here — replication sender (if enabled) is joined below.
     let dpdk_extras: Vec<(String, std::thread::Result<()>)> = Vec::new();
 
-    // The raft guard drops — stopping the driver — after this returns.
+    // The caller's raft guard drops — stopping the driver — after this
+    // returns.
     shutdown_pipeline_stages(
         PipelineHandles {
             journal: journal_handle,
@@ -3161,6 +3211,77 @@ where
         &pipeline_healthy,
         &shutdown,
     )
+}
+
+/// Promotion fencing: journal the `EpochBump` that opens a promoted
+/// node's tenure, and return once it is applied. Both transports' primary
+/// paths call it, before `on_primary` and before any client or replica is
+/// served; a primary that booted as one (not promoted) does not, and keeps
+/// the epoch its journal recovered.
+///
+/// The bump raises the cluster epoch so a paused/partitioned ex-primary
+/// self-demotes when a handshake crosses (see `melin_transport_core::fence`).
+/// It rides the input ring like a seed event (connection_id == 0), so it
+/// flows through journal + replication to every replica. The wait for the
+/// matching stage to apply it (epoch advanced) means the first handshake
+/// already advertises the new epoch. The caller must be the input ring's
+/// only producer.
+///
+/// The new epoch honours the promotion request's floor: a manual
+/// `PROMOTE` carries `MANUAL` (= 1) and resolves to the classic
+/// `epoch + 1`; a raft auto-promotion carries its election term
+/// (strictly above the old epoch by the driver's request rule), so
+/// tenure epochs align with raft terms and two overlapping
+/// promotions from different elections always allocate distinct
+/// epochs — the newer one fences the older.
+fn journal_promotion_epoch_bump<E: melin_app::AppEvent>(
+    requested_epoch: u64,
+    fence_state: &melin_transport_core::fence::FenceState,
+    input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
+    shutdown: &AtomicBool,
+) {
+    use melin_app::unix_epoch_nanos;
+    use melin_journal::JournalEvent;
+    use melin_transport_core::trace::mono_trace_ns;
+
+    let new_epoch = fence_state.epoch().saturating_add(1).max(requested_epoch);
+    // Re-validate the term↔epoch alignment at the moment the epoch is
+    // minted, not just at the driver's request-time check: a streamed
+    // `EpochBump` from a concurrent promotion elsewhere can raise the
+    // fence during the drain, in which case `max` allocates `epoch+1`
+    // instead of the election term. Fencing still converges (the
+    // epochs stay distinct and the higher one wins), but the skew
+    // makes later "epochs outran raft terms" refusals — so say what
+    // actually happened while the evidence exists. Manual promotions
+    // (requested == MANUAL) are exempt: they never claimed alignment.
+    if requested_epoch > crate::promotion::PromotionRequest::MANUAL && new_epoch != requested_epoch
+    {
+        warn!(
+            new_epoch,
+            requested_epoch,
+            "promotion epoch does not match its election term — a concurrent \
+             promotion advanced the fencing epoch mid-drain; auto-promotion \
+             refusals may report term/epoch misalignment until a newer election"
+        );
+    }
+    info!(
+        new_epoch,
+        requested_epoch, "promotion: injecting epoch bump"
+    );
+    input_producer.publish(InputSlot {
+        connection_id: 0,
+        key_hash: 0,
+        sequence: 0,
+        timestamp_ns: unix_epoch_nanos(),
+        event: JournalEvent::EpochBump { epoch: new_epoch },
+        publish_ts: mono_trace_ns(),
+        recv_ts: mono_trace_ns(),
+    });
+    // Wait until the matching stage observes the bump (epoch raised) so
+    // the node advertises `new_epoch` on the very first handshake. Bounded
+    // by the shutdown flag so a stuck pipeline can't wedge startup.
+    ORCHESTRATOR_WAIT
+        .wait_until(|| fence_state.epoch() >= new_epoch || shutdown.load(Ordering::Relaxed));
 }
 
 /// Journal a primary's `on_primary` [`StartupEvents`] and return once

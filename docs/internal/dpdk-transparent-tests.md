@@ -10,8 +10,9 @@ node can run on a veth pair through `net_af_packet`, unprivileged, with no
 hugepages and no NIC.
 
 Status: steps 1 and 2 are done and pass on a developer host; their CI
-steps are written but not yet proven on a hosted runner. Step 3 is under
-way; its work list is the gates step 2 left (see step 3). Where a
+steps are written but not yet proven on a hosted runner. Step 3 has
+lifted every gate step 2 left; the divergences that remain have no test
+compiled out on them (see step 3). Where a
 step settled something the design left open, or turned out differently,
 its section says so.
 
@@ -191,7 +192,7 @@ As built (step 2):
 
 One EAL per process, cleaned up only at process exit. Each node takes a
 port of its own. The runtime already shares one EAL between a node's client
-and replication ports (`from_shared_with_port`); this makes the sharing
+and replication ports (one `DpdkShared`); this makes the sharing
 process-wide.
 
 This is the one change to production code. The production path, with one
@@ -363,12 +364,14 @@ As built:
     and refused to depose it (`replicated_failover`, `raft_failover`).
     Fixed in step 3 (see "Replication peer liveness on DPDK" below);
     `halt_refusal` runs on DPDK.
-  - "A promoted DPDK replica serves on kernel TCP": promotion falls back
-    to the kernel-TCP primary on the DPDK port's address and fails to
+  - "A promoted DPDK replica serves on kernel TCP": promotion fell back
+    to the kernel-TCP primary on the DPDK port's address and failed to
     bind (`genesis_promotion`'s
     `a_replica_configured_with_a_larger_genesis_is_promoted`, the notary
     example's `a_promoted_replica_reports_the_head_the_primary_receipted`;
-    and the two failover tests behind the entry above).
+    and the two failover tests behind the entry above). Fixed in step 3
+    (see "A promoted replica on DPDK" below); every one of these runs on
+    DPDK.
 
   A single-test binary is gated whole (`#![cfg(not(feature = "dpdk"))]`),
   a test in a binary of several with `#[cfg(not(feature = "dpdk"))]`, and
@@ -394,11 +397,11 @@ needing the next), then a DPDK primary for a promoted replica (two
 gates more).
 
 Done: noticing a replication peer that has gone, below. `halt_refusal`
-runs on DPDK. The two failover tests now get as far as the promotion
-and stay gated on the promoted replica's kernel-TCP fallback, the next
-item. Also done: the limitation that deadline introduced, a replica's
-join stalling the primary's poll thread ("A replica's join off the
-primary's poll thread", below).
+runs on DPDK. Also done: the limitation that deadline introduced, a
+replica's join stalling the primary's poll thread ("A replica's join off
+the primary's poll thread", below). And a DPDK primary for a promoted
+replica ("A promoted replica on DPDK", below), which lifted the last
+gates step 2 left: no test is compiled out on a divergence any more.
 
 #### Replication peer liveness on DPDK
 
@@ -509,9 +512,13 @@ orderly stop on DPDK, and `dpdk_veth`'s
 replica's veth is taken down under it (`melin_test_node::Node::cut_off`),
 and its primary must drop it within the bound and refuse writes. Only
 the primary's end is checked there; the replica's (its
-`primary_link_up`) has no gauge to read. The failover tests,
-run with their gate lifted, show the replicas dropping the stopped
-primary at once and one promoting after the promotion grace period.
+`primary_link_up`) has no gauge to read, and is covered by the failover
+tests instead, which run on DPDK since a promoted replica serves there
+(below): `raft_failover` stops its primary, whose links are reset as it
+goes, and `replicated_failover` cuts its primary off before stopping it,
+so that no RST arrives. Auto-promotion refuses while a replica's
+primary link is up, so the second failover completes only once a
+replica has dropped the link on its own deadline.
 
 #### A replica's join off the primary's poll thread
 
@@ -617,6 +624,95 @@ it fails on the first request. `large_joins_complete_a_tick_at_a_time`
 brings up a fresh replica (journal catch-up) and a divergent one
 (snapshot, a seed of several MiB, catch-up), each many times a socket's
 queue, and checks both ack the primary's whole history.
+
+#### A promoted replica on DPDK
+
+The problem: a promoted DPDK replica ran the kernel-TCP primary, which
+binds kernel listeners on the client address and `--replication-bind`.
+Only the DPDK port holds those, so the bind failed and the node exited
+instead of serving; where the kernel did hold the address, the node
+served on kernel TCP, giving up kernel bypass without a word. A
+promoted kernel-TCP replica serves on the transport it ran on.
+
+What was built (`server.rs`):
+
+- **One DPDK primary function for both entries.** The part of
+  `run_dpdk_impl` that serves as a primary is now `run_as_primary_dpdk`,
+  the twin of the kernel-TCP `run_as_primary`, with the same parameters
+  bar the bring-up gate's: the pipeline, the response stage and its ack
+  gate, the halt gate, the replication driver (its liveness deadline and
+  join worker included), shadow snapshots, health, ticks and the poll
+  loop. The normal startup calls it after `init_engine` and the raft
+  driver, with no promotion; the promotion arm calls it with the
+  receiver's application and journal writer and the promotion request's
+  epoch floor. The epoch bump, which was inline in `run_as_primary`, is
+  a function both call (`journal_promotion_epoch_bump`), so the two
+  transports mint and order it the same way: after the pipeline is up,
+  before `on_primary`, before the first client or replica is served.
+- **The replica's transport, reused.** The receiver borrows the queue-0
+  transport rather than consuming it, and resets every link it opened
+  before it returns. The replica builds that transport with no listener
+  (`DpdkTransport::from_shared_unlistening`), where it used to listen on
+  a stray port nobody read; at promotion it gains the client listener
+  `from_shared` gives a booting primary, and `run_as_primary_dpdk` adds
+  the replication listener as it does at boot. EAL, ports and pool are
+  never touched again (EAL cannot be initialised twice), and the
+  receiver's stack, with its neighbour cache, carries on as the poll
+  thread's. A gratuitous ARP goes out again, as at boot.
+- **Everything else as on kernel TCP.** The promotion arm runs the same
+  steps in the same order as the kernel-TCP one: the genesis check
+  (`check_promotable`), the replica health endpoint released for the
+  primary's, sizing, the latched `ROTATE` cleared; the fence state, the
+  advertised tip, the raft driver and the admin endpoint (with its
+  `PROMOTE` flag) carry over. The receiver's pipeline is torn down
+  before the primary's is built, by the shared
+  `take_pipeline_for_promotion`, so the history continues in the same
+  journal from the writer's next sequence: nothing lost, repeated or
+  reordered. One DPDK-only step: the main thread ran the receiver,
+  pinned to the reader's core once it streamed, and is unpinned before
+  it spawns the primary's threads (a child of a pinned real-time thread
+  never runs to pin itself), then pinned again as the poll thread.
+- **Clients before the promotion.** A replica serves no client on either
+  transport. On kernel TCP its listener is bound from boot, so a connect
+  completes in the kernel's backlog and is served if the node is
+  promoted while it waits; on DPDK there is no listener until the
+  promotion, so a connect is refused. Clients retry either way, and the
+  tests' "serves clients" probe reads both as not serving.
+
+The normal DPDK primary startup behaves as before, with two changes of
+order, neither visible to a client or replica: the admin endpoint is
+spawned before the pipeline is built rather than just after (the order
+the kernel-TCP primary has always used; a failed admin bind now refuses
+the boot before any pipeline thread exists), and the one-queue check
+returns an error before anything is spawned instead of asserting after.
+The `on_primary` drain, the poll loop and the hot path are untouched;
+promotion adds nothing to them.
+
+Alternatives considered:
+
+- **A second, promotion-only DPDK primary function.** Simplest to
+  write, but two copies of the primary's assembly drift apart, and a
+  promoted node would be a different primary from a booted one.
+- **A fresh transport at promotion** (`from_shared` on queue 0 after
+  dropping the replica's). It would also reuse EAL, ports and pool, but
+  it rebuilds the stack under a queue another stack had been polling,
+  and throws away its neighbour cache and clock for nothing; reusing the
+  one transport keeps a single owner of the queue throughout.
+- **Listening on the client port from boot**, as the kernel-TCP replica
+  holds its listener. On DPDK nothing else can take the port, so there
+  is nothing to hold, and established connections nobody accepts would
+  pile up in the replica's socket set without the bound a kernel backlog
+  has.
+
+Coverage: `genesis_promotion`'s
+`a_replica_configured_with_a_larger_genesis_is_promoted` and the notary
+example's `a_promoted_replica_reports_the_head_the_primary_receipted`
+(operator `PROMOTE`, then clients served by the promoted DPDK node, its
+state and chain continuing the primary's), `raft_failover` (an
+auto-promotion after an orderly stop, the loser still following, the
+revived ex-primary fenced), and `replicated_failover` (an auto-promotion
+after the primary is cut off, every event acknowledged under `ram`
+present on the new primary). All four run on DPDK.
 
 ## Limits
 

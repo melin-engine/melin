@@ -279,7 +279,10 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
   `acked_sequence` that advances once the local journal write is
   durable. Both fields are populated on every ack so the primary's
   gate can evaluate any policy without separate ack streams.
-- Does not accept client connections.
+- Does not serve clients. On kernel TCP a client's connection is left
+  unanswered (and is served if the replica is promoted while it waits);
+  on DPDK it is refused. Either way the client retries, or goes to the
+  primary.
 
 If the primary disconnects or evicts the replica, the receiver
 reconnects with exponential backoff (1 s → 30 s cap), keeping the state
@@ -326,7 +329,11 @@ streaming, and keeps its link.
 
 The admin endpoint accepts `PROMOTE` on a replica to switch it to
 primary mode in-process: the warm application state is reused directly,
-no journal re-replay, no snapshot reload. Sub-second switchover.
+no journal re-replay, no snapshot reload. Sub-second switchover. The
+promoted node serves on the transport it ran on, at the addresses it was
+configured with: a DPDK replica becomes a DPDK primary, serving clients
+on its client port and accepting replicas on `--replication-bind`, with
+kernel bypass kept. The same holds for an automatic failover (below).
 
 After promotion the new primary will halt new writes if it has no
 replicas connected (see above) — the operator's playbook is to either

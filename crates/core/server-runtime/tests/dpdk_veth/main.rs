@@ -281,6 +281,39 @@ fn a_replica_cut_off_is_dropped_and_its_primary_halts() {
     primary.stop();
 }
 
+/// A DPDK replica refuses a client's connection outright (its stack
+/// listens on no port until promotion), rather than leaving it unanswered
+/// as a kernel-TCP replica does: the behaviour docs/replication.md
+/// promises operators. The replica is attached first, so its port is up
+/// and answering ARP: a refusal then comes from the replica's stack, not
+/// from an address nobody holds yet.
+#[test]
+fn a_replica_refuses_clients_until_promoted() {
+    let _serial = serialise();
+    let cluster = Cluster::new();
+
+    let primary = cluster.start_primary();
+    let replica = cluster.start_replica(1, "replica");
+    wait_for_gauge(
+        Cluster::health(0),
+        "melin_replicas_connected",
+        1,
+        STARTUP_LIMIT,
+    );
+
+    match TcpStream::connect_timeout(&replica.addr(), FRAME_LIMIT) {
+        Err(e) => assert_eq!(
+            e.kind(),
+            io::ErrorKind::ConnectionRefused,
+            "a replica's client port must refuse, not time out: {e}"
+        ),
+        Ok(_) => panic!("a replica accepted a client's connection"),
+    }
+
+    replica.stop();
+    primary.stop();
+}
+
 /// A replica's join that stalls on the primary's disk — here the snapshot
 /// read, held for longer than the replication liveness deadline twice
 /// over — holds up nothing else: the primary goes on serving its clients
