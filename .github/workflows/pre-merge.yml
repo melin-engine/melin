@@ -266,6 +266,16 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/dpdk/netns-runner.sh
         run: cargo nextest run -p melin-example-echo -p melin-example-counter -p melin-example-notary --features melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk -j 1 --no-fail-fast --locked
 
+      # The test job's Rustdoc step, with the `dpdk` features: the code
+      # they compile has docs of its own, which no default build renders,
+      # so a broken link there passed every other check. Last of the DPDK
+      # steps, so a doc error cannot hide a test result.
+      - name: Rustdoc with DPDK
+        if: ${{ !cancelled() && steps.dpdk-builds.outcome == 'success' }}
+        run: cargo doc --workspace --no-deps --locked --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # Proves the workspace can still be packaged. Nothing else does: `cargo
       # check` compiles crates in place, while publishing builds each one from
       # a generated tarball in isolation, so it is the only thing that catches

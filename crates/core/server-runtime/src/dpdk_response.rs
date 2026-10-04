@@ -64,7 +64,7 @@ pub struct TxFrame {
     pub connection_id: u64,
     /// Number of valid bytes in `data`.
     pub len: u16,
-    /// Wire frame: [u32 length prefix][payload]. Only `data[..len]` is valid.
+    /// Wire frame: `[u32 length prefix][payload]`. Only `data[..len]` is valid.
     pub data: [u8; MAX_TX_FRAME],
 }
 
