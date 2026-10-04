@@ -39,6 +39,35 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   node's client keys, an event publisher's subscribers say, calls it and
   applies exactly the client listener's rule, instead of keeping a copy
   of it in step.
+- **`melin_server_runtime::server::run_with_shutdown`**: `run` on the
+  build's own transport, stopped through a caller's flag instead of the
+  process-wide signal handler `run` installs. For a host that owns its
+  process's signals, or runs several nodes in one process. Unlike
+  `run_with_listener`, the client listener stays the transport's own, so
+  it works on DPDK.
+- **A process-wide DPDK EAL**, for a process hosting several DPDK nodes,
+  at once or one after another: `melin_dpdk::Eal::init_process_wide`
+  initialises it once and never cleans it up, `Eal::process_wide` reads
+  it, and `Eal::attach_vdev` / `detach_vdev` give each node a virtual
+  device and port of its own. A node in such a process shares it and
+  takes no EAL arguments of its own. A process that never calls it is
+  unchanged: the node owns its EAL, as before.
+- **Peer liveness for long-lived DPDK links.** `melin_dpdk::PeerLiveness`
+  arms keep-alive probes and a timeout on a connection
+  (`DpdkTransport::set_peer_liveness`), `DpdkTransport::reset` closes a
+  connection and sends its RST rather than vanishing, and
+  `DpdkTransport::tx_drained` says whether everything queued on a
+  connection has been acknowledged.
+- **`DpdkTransport::from_shared_unlistening`**: a transport with no
+  listener, for one that only dials out, to which listeners can be added
+  later with `add_listener`.
+- **DPDK testing without a NIC.** The DPDK transport runs on a veth pair
+  through the `net_af_packet` driver, unprivileged and without hugepages:
+  `scripts/dpdk/dpdk-veth.sh` is a smoke test, and
+  `scripts/dpdk/netns-runner.sh`, set as cargo's target runner, runs the
+  integration suites on DPDK when the `dpdk` feature is enabled (the
+  examples gain a `dpdk` feature for it). For contributors; nothing ships
+  with it.
 
 ### Removed
 
@@ -57,6 +86,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   backwards included. `JournalEncoder::adopt_sequence` replaces it for a
   replica taking its primary's numbering, and accepts only the next
   sequence.
+- **`melin_dpdk::DpdkTransport::from_shared_with_port`.** Build the
+  transport with `from_shared_unlistening` and add the port with
+  `add_listener`.
 
 ### Changed
 
@@ -126,6 +158,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `JournalReader::genesis_entries`, `JournaledApp::genesis_entries`,
   `snapshot::load_with_header`, `snapshot::MAX_HEADER_SIZE`, and
   `melin_journal::fresh_anchor` is public.
+- **A DPDK replica refuses client connections until it is promoted.** It
+  listened on its client port without serving, so a connect completed
+  and then saw nothing. It now has no client listener until promotion,
+  and a connect is refused at once. A kernel-TCP replica is unchanged: a
+  connect waits in the kernel's backlog. Clients retry either way.
+- **A DPDK primary reads a joining replica's catch-up and snapshot off
+  its poll thread.** The poll thread also carries client traffic and the
+  other replica's stream, and the join's disk reads stalled them all
+  while they ran: seconds for a large snapshot on a cold disk. A worker
+  per replica slot now does the reading, and the poll thread sends what
+  it has read a little at a time between its other work.
 
 ### Fixed
 
@@ -237,6 +280,47 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   release keeps the length it records: it is never given a genesis
   later. A temporary genesis file left by an interrupted first boot is
   removed on the next boot, whichever way it starts.
+- **A promoted DPDK replica could not serve.** Promotion fell back to the
+  kernel-TCP primary, which binds a kernel socket on the client address,
+  an address only the DPDK port holds: the bind failed and the node
+  exited instead of taking over. Where the kernel did hold the address,
+  the node served on kernel TCP, giving up kernel bypass without a word.
+  A promoted DPDK replica now becomes a DPDK primary, through the same
+  steps as a kernel-TCP promotion, on the transport it ran on.
+- **On DPDK, neither end of a replication link noticed that its peer had
+  gone.** A stopped DPDK node told its peer nothing, and neither end had
+  a deadline on a silent peer. A primary kept counting a stopped replica
+  (`melin_replicas_connected`) and never halted, so it did not refuse
+  writes as a primary whose last replica has left must; a replica kept a
+  stopped primary's link up, so auto-promotion refused to depose it and
+  the cluster never failed over. A replication link is now reset once
+  its peer has answered nothing for five seconds, a peer's FIN ends it,
+  and a node that drops a link or stops tells its peer at once. The
+  DPDK stack's clock is also monotonic now: on the wall clock, a step
+  could have fired or held its timers.
+- **A failed client authentication left a DPDK connection open.** A bad
+  signature, an undecodable response or an oversized auth frame was
+  answered with `AuthFailed`, but the connection stayed in the
+  handshake: the client could retry signatures against the same nonce
+  until the auth timeout, and an oversized frame was answered again on
+  every receive. As on kernel TCP, one failed attempt now ends the
+  connection, closed once the client has the `AuthFailed`.
+- **`melin_replica_ack_latency_us` read 0 on DPDK.** Only the kernel-TCP
+  sender recorded it. The DPDK sender now records the same measure: the
+  time from the latest send to the latest ack (not a per-message round
+  trip, on either transport, as its help text now says).
+- **`melin_replica_evictions_total` over-counted on kernel TCP.** An
+  eviction was counted, and warned about, again on every supervisor pass
+  until the evicted handler exited. It is counted once.
+- **Replication session teardown.** A kernel-TCP replica waiting to
+  retry a failed resync held its socket, and with it a slot on its
+  primary, through the backoff. A DPDK replica that failed to decode its
+  primary's handshake reply left its pipeline running. Both now tear
+  down as every other failed session does.
+- **A new DPDK client connection was heartbeated early.** It was stamped
+  with the time of the last heartbeat scan, stale under load, so the
+  next scan could heartbeat a connection that had only just been made.
+  It is stamped when the connection is registered.
 
 ## [0.18.0] - 2026-09-27
 
