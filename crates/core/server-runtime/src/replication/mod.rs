@@ -81,6 +81,11 @@ mod tcp_sender;
 // avoid) testable on a build without the `dpdk` feature.
 #[cfg(any(feature = "dpdk", test))]
 mod validation_worker;
+// The DPDK sender's join worker: likewise thread/channel plumbing over the
+// transport-agnostic catch-up steps, compiled under `test` so it is tested
+// without libdpdk.
+#[cfg(any(feature = "dpdk", test))]
+mod join_worker;
 
 use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
 
@@ -915,13 +920,15 @@ impl<A, W> AfterSession<A, W> {
 /// backoff. The shutdown-sentinel publish lives in
 /// [`teardown_replica_pipeline`].
 ///
-/// `close` runs any transport-specific teardown that must precede a
-/// reconnect — the DPDK receiver closes its smoltcp socket so the
-/// primary's slot and the local socket-set entry are freed; the
-/// kernel-TCP receiver passes a no-op (its `TcpStream` is dropped by the
-/// caller on the next loop turn). It is invoked only on the
-/// reconnecting paths (in-process resync, plain disconnect, stream
-/// gap), never on a terminal return.
+/// `close` ends the session's connection, transport-specifically. It is
+/// invoked exactly once, first, on every exit, terminal or not: the
+/// session is over whatever follows, and the primary must learn so now
+/// rather than after the pipeline teardown or the backoff. The DPDK
+/// receiver resets its smoltcp socket, which tells the primary (a DPDK
+/// node is its own TCP stack, so nothing else would once it stops) and
+/// frees the local socket-set entry; the kernel-TCP receiver passes a
+/// no-op (its `TcpStream` is dropped by the caller, and the kernel tells
+/// the primary).
 // Twelve arguments is a lot, but each is a distinct piece of the
 // receiver loop's state; bundling them would only move the noise.
 #[allow(clippy::too_many_arguments)]
@@ -936,7 +943,7 @@ pub(in crate::replication) fn handle_session_exit<A, W>(
     fence_state: &melin_transport_core::fence::FenceState,
     shutdown: &AtomicBool,
     promote: &crate::promotion::PromotionRequest,
-    mut close: impl FnMut(),
+    close: impl FnOnce(),
     // For the resync path, which recovers the local journal afresh — see
     // `recover_replica_state`.
     sizing: &A::Sizing,
@@ -949,6 +956,8 @@ where
         exit,
         heard_from_primary,
     } = result;
+
+    close();
 
     match exit {
         SessionExit::Shutdown => {
@@ -1012,8 +1021,6 @@ where
                 max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
                 "mid-stream chain divergence — re-deriving local state for in-process resync"
             );
-            // Transport-specific teardown before reconnecting.
-            close();
             match recover_replica_state::<A, W>(journal_path, snapshot_path, fence_state, sizing) {
                 Ok((app, journal_writer, seq, hash)) => AfterSession::Resync {
                     app,
@@ -1034,7 +1041,6 @@ where
             // hole. The primary evidently spoke, so the backoff resets
             // exactly as a heard-from disconnect does. Not a resync:
             // nothing on disk is wrong.
-            close();
             *backoff = std::time::Duration::from_secs(1);
             tracing::warn!(
                 error = %e,
@@ -1063,7 +1069,6 @@ where
             // useful data, so that costs nothing the primary cannot bear.
             // `warn!`, not `error!`: the server is working as designed —
             // what needs attention is the path between the nodes.
-            close();
             *backoff = std::time::Duration::from_secs(1);
             tracing::warn!(
                 error = %e,
@@ -1077,9 +1082,6 @@ where
         }
 
         SessionExit::Disconnected => {
-            // Transport-specific teardown before reconnecting (smoltcp
-            // socket reclaim on DPDK; no-op on kernel TCP).
-            close();
             // A session in which the primary spoke — data or heartbeat
             // (heartbeats flow even on a quiet system) — proves it
             // alive and serving: treat the drop as transient and reset
@@ -1174,7 +1176,7 @@ fn receive_resync_transfer<A, S>(
     fence_state: &melin_transport_core::fence::FenceState,
 ) -> Result<ResyncTransfer<A>, Box<dyn std::error::Error + Send + Sync>>
 where
-    A: Application,
+    A: Application + Send,
     S: ControlFrameSource,
 {
     let (snap_len, snap_sequence, snap_chain_hash) =
@@ -1193,8 +1195,10 @@ where
     std::fs::rename(&tmp_path, snapshot_path)?;
     tracing::info!(snap_sequence, snap_len, "snapshot received and verified");
 
+    // The primary is already sending the seed: a large state must not
+    // leave the link unanswered while it loads (see `serviced`).
     let (snap_app, _snap_seq, snap_hash, snap_epoch) =
-        melin_transport_core::snapshot::load::<A>(snapshot_path)?;
+        source.serviced(|| melin_transport_core::snapshot::load::<A>(snapshot_path))?;
     if snap_hash != snap_chain_hash {
         return Err(format!(
             "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
@@ -1222,15 +1226,18 @@ where
     // integrity, not that the primary sent a well-formed prefix ending at
     // the snapshot sequence. (With hash-chain on, the chain cross-check in
     // `handle_resync_verdict` subsumes this; without it, this is the only
-    // guard.)
-    if let Err(e) =
-        melin_journal::segment::verify_segment_prefix(&seed_tmp, snap_sequence, seed_len)
-    {
-        let _ = std::fs::remove_file(&seed_tmp);
-        return Err(format!("segment seed failed structural verification: {e}").into());
-    }
-    std::fs::rename(&seed_tmp, journal_path)?;
-    melin_journal::segment::fsync_parent_dir(journal_path)?;
+    // guard.) Reads the whole seed, so it runs serviced too.
+    source.serviced(|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Err(e) =
+            melin_journal::segment::verify_segment_prefix(&seed_tmp, snap_sequence, seed_len)
+        {
+            let _ = std::fs::remove_file(&seed_tmp);
+            return Err(format!("segment seed failed structural verification: {e}").into());
+        }
+        std::fs::rename(&seed_tmp, journal_path)?;
+        melin_journal::segment::fsync_parent_dir(journal_path)?;
+        Ok(())
+    })?;
     Ok((snap_app, snap_sequence, snap_chain_hash, seed_len))
 }
 
@@ -1262,6 +1269,9 @@ pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
 ) -> Result<ResyncDecision, Box<dyn std::error::Error + Send + Sync>>
 where
     A: Application + Send + 'static,
+    // The pipeline's rings carry events, and its teardown runs serviced
+    // on a helper thread.
+    A::Event: Send,
     W: JournalWrite<A::Event> + Send + 'static,
     S: ControlFrameSource,
 {
@@ -1278,18 +1288,15 @@ where
         tracing::info!("primary requires snapshot transfer — receiving snapshot");
     }
 
-    if let Some(p) = pipeline.take() {
-        let _ = teardown_replica_pipeline::<A, W>(p);
-    }
-
     // Invalidate the in-memory App + writer before moving their backing
     // files aside. On the in-process divergence repair path these still
     // hold the recovered handles; a transfer failure returns `Retry`, and
     // without this reset the stale writer — now pointing at an
     // archived-away journal — would survive the fresh-replica create gate
     // and get rebuilt into the next pipeline.
-    *app = None;
-    *journal_writer = None;
+    let old_pipeline = pipeline.take();
+    let old_app = app.take();
+    let old_writer = journal_writer.take();
 
     // Move the local lineage aside — never delete. Divergent journals are
     // audit-trail material; stale ones may be the last copy of pruned
@@ -1306,7 +1313,20 @@ where
     } else {
         ArchiveReason::Resync
     };
-    archive_local_lineage(journal_path, snapshot_path, reason)?;
+    // The primary starts the transfer as soon as it has sent its verdict,
+    // and the teardown waits on the journal: serviced (see `serviced`).
+    source.serviced(move || {
+        if let Some(p) = old_pipeline {
+            // What the teardown hands back (the app and writer, or the
+            // stage's failure) is discarded: the resync archives this
+            // lineage and installs the primary's in its place.
+            let _ = teardown_replica_pipeline::<A, W>(p);
+        }
+        // Dropped after the teardown and before the archive, as before.
+        drop(old_app);
+        drop(old_writer);
+        archive_local_lineage(journal_path, snapshot_path, reason)
+    })?;
     // Archived — a retried handshake must present as a fresh replica.
     *last_sequence = 0;
     *chain_hash = [0u8; 32];
@@ -1338,7 +1358,8 @@ where
     // chain hash. `chain_hash()` is `None` only with `hash-chain` disabled
     // (nothing to tie); an all-zeros snapshot hash means the primary runs
     // without `hash-chain` (also nothing to tie).
-    let writer = W::open_append(journal_path, snap_sequence, seed_len)?;
+    // Rebuilds the chain over the whole seed: serviced (see `serviced`).
+    let writer = source.serviced(|| W::open_append(journal_path, snap_sequence, seed_len))?;
     let seeded_chain = writer.chain_hash().unwrap_or(snap_chain_hash);
     if snap_chain_hash != [0u8; 32] && seeded_chain != snap_chain_hash {
         return Err(format!(
@@ -3775,7 +3796,60 @@ mod tests {
             "the returned error names the journal's cause, got: {err}"
         );
         assert!(pipeline.is_none(), "the dead pipeline was torn down");
-        assert_eq!((divergence_resyncs, closes), (0, 0));
+        assert_eq!(divergence_resyncs, 0);
+        // Once, as on every exit (the receivers pass a no-op here, as no
+        // session is open while the wait runs).
+        assert_eq!(closes, 1);
+    }
+
+    /// Every exit ends the connection, exactly once, terminal or not:
+    /// a replica that stops or promotes must tell its primary as surely
+    /// as one that reconnects (on DPDK nothing else will).
+    #[test]
+    fn every_session_exit_closes_the_connection_once() {
+        type Writer = melin_journal::BufferedWriter<CounterEvent>;
+        // A constructor per exit: `SessionExit` is neither `Clone` nor
+        // `Debug`, so each case is built fresh and labelled by hand.
+        type Case = (&'static str, fn() -> SessionExit);
+        let exits: [Case; 6] = [
+            ("shutdown", || SessionExit::Shutdown),
+            ("promote", || SessionExit::Promote),
+            ("fatal", || SessionExit::Fatal("protocol violation".into())),
+            ("disconnected", || SessionExit::Disconnected),
+            ("stream gap", || SessionExit::StreamGap("gap".into())),
+            ("corrupted", || SessionExit::Corrupted("damaged".into())),
+        ];
+        for (label, exit) in exits {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut pipeline: Option<ReplicaPipelineHandles<counter_server::Counter, Writer>> =
+                None;
+            let mut divergence_resyncs = 0u32;
+            let mut backoff = MAX_BACKOFF;
+            // Latched so the reconnecting exits' backoff sleep returns
+            // at once.
+            let shutdown = AtomicBool::new(true);
+            let mut closes = 0;
+            // The outcome is beside the point here (with no pipeline the
+            // terminal exits return errors); only the close count is.
+            let _after = handle_session_exit::<counter_server::Counter, Writer>(
+                StreamingResult {
+                    exit: exit(),
+                    heard_from_primary: true,
+                },
+                &mut pipeline,
+                &mut divergence_resyncs,
+                &mut backoff,
+                0,
+                &dir.path().join("r.journal"),
+                &dir.path().join("r.snapshot"),
+                &melin_transport_core::fence::FenceState::new(0),
+                &shutdown,
+                &crate::promotion::PromotionRequest::new(),
+                || closes += 1,
+                &(),
+            );
+            assert_eq!(closes, 1, "{label}");
+        }
     }
 
     /// Drive `handle_session_exit` through one `Disconnected` exit with

@@ -39,12 +39,11 @@
 //! `scripts/dpdk/netns-runner.sh` (see
 //! `docs/internal/dpdk-transparent-tests.md`).
 //!
-//! Kernel TCP only for now, on two divergences listed in
-//! `docs/internal/transport-divergences-2026-10.md`: a DPDK replica never
-//! sees its primary leave, so it refuses to depose it and never promotes
-//! ("DPDK does not notice a replication peer that has gone"); and once
-//! that is fixed, a promoted DPDK replica cannot serve ("A promoted DPDK
-//! replica serves on kernel TCP"). The gate goes when both do.
+//! Kernel TCP only for now: on DPDK a replica sees its primary leave and
+//! promotes, but a promoted DPDK replica cannot serve ("A promoted DPDK
+//! replica serves on kernel TCP",
+//! `docs/internal/transport-divergences-2026-10.md`). The gate goes when
+//! that divergence does.
 #![cfg(not(feature = "dpdk"))]
 
 use std::io::{BufRead, BufReader, Read, Write};

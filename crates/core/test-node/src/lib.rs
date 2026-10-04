@@ -584,6 +584,66 @@ mod dpdk {
             }
             self.join().expect("node returned an error");
         }
+
+        /// Cut the node off the runner's network, as a pulled cable or a
+        /// crashed host would: the bridge-side end of its interface goes
+        /// down, so nothing it sends arrives and nothing reaches it, and
+        /// no peer is told. For the deadlines a link's ends keep on a peer
+        /// that has gone without a word. The node itself runs on; stop it
+        /// as usual (its last words go nowhere).
+        ///
+        /// DPDK only: a kernel-TCP node shares the host's loopback with
+        /// every other, so there is no link of its own to cut.
+        pub fn cut_off(&self) {
+            let port = format!("{}{BRIDGE_PORT_SUFFIX}", layout().slot(self.slot).iface);
+            set_link_down(&port).unwrap_or_else(|e| panic!("bring {port} down: {e}"));
+        }
+    }
+
+    /// Appended to a slot's interface to name its bridge-side peer
+    /// (`BRIDGE_PORT_SUFFIX` in `scripts/dpdk/veth-setup.py`, which names
+    /// them).
+    const BRIDGE_PORT_SUFFIX: &str = "-br";
+
+    /// Clear `IFF_UP` on interface `name`, as `ip link set NAME down` does.
+    /// The runner's user namespace owns the network namespace, so the
+    /// test may.
+    fn set_link_down(name: &str) -> io::Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // SAFETY: `ifreq` is plain old data; all-zero is a valid value
+        // (an empty name, no flags).
+        let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+        // The name, NUL-terminated by the zeroing: one byte is kept back.
+        if name.len() >= req.ifr_name.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("interface name {name} is too long"),
+            ));
+        }
+        for (dst, &src) in req.ifr_name.iter_mut().zip(name.as_bytes()) {
+            *dst = src as libc::c_char;
+        }
+        // SAFETY: plain socket(2) call; the result is checked below.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by socket(2) and is owned by
+        // nothing else; `OwnedFd` closes it.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: `req` is a live, writable ifreq naming the interface,
+        // which SIOCGIFFLAGS fills in and SIOCSIFFLAGS reads.
+        unsafe {
+            if libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut req) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            req.ifr_ifru.ifru_flags &= !(libc::IFF_UP as libc::c_short);
+            if libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS as _, &req) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 
     /// The first CPU this process may run on, for EAL's main lcore: CPU 0

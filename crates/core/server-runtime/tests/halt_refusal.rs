@@ -19,12 +19,6 @@
 //! on DPDK with this crate's `dpdk` feature, under
 //! `scripts/dpdk/netns-runner.sh` (see
 //! `docs/internal/dpdk-transparent-tests.md`).
-//!
-//! Kernel TCP only for now: a DPDK primary never sees its replica leave,
-//! so it never halts ("DPDK does not notice a replication peer that has
-//! gone", `docs/internal/transport-divergences-2026-10.md`). The gate
-//! goes when the divergence does.
-#![cfg(not(feature = "dpdk"))]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
