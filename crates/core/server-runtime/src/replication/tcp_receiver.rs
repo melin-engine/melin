@@ -1947,13 +1947,48 @@ mod tests {
                 .collect()
         }
 
+        /// Set in the child process the test below runs its body in.
+        const ISOLATED: &str = "MELIN_TEST_BACKOFF_SHUTDOWN_ISOLATED";
+
         /// Shutdown while the receiver waits out a reconnect backoff must
         /// tear the live pipeline down — join every stage thread — rather
         /// than abandon it. Pins the fix for the connect-failure arm that
         /// returned without teardown (stages left detached mid-run, the
         /// journal writer never closed).
+        ///
+        /// The check reads every thread in the process by name, so it holds
+        /// only where no other test shares the process: under plain `cargo
+        /// test`, other tests' pipelines run stages of the same names, and
+        /// the check failed on them. So the body runs in a child process of
+        /// its own, this test binary filtered to this one test (nextest
+        /// already gives each test a process; there it costs one re-exec).
         #[test]
         fn shutdown_during_reconnect_backoff_joins_pipeline_threads() {
+            if std::env::var_os(ISOLATED).is_some() {
+                return backoff_shutdown_body();
+            }
+            // The test's path as libtest names it: the module path without
+            // the crate's name.
+            let module = module_path!();
+            let path = module.split_once("::").map_or(module, |(_, rest)| rest);
+            let test = format!("{path}::shutdown_during_reconnect_backoff_joins_pipeline_threads");
+            let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+                .args(["--exact", &test, "--test-threads=1", "--nocapture"])
+                .env(ISOLATED, "1")
+                .output()
+                .expect("run the test in a process of its own");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // A filter that matched nothing would also exit 0: require the
+            // one test to have run and passed.
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "the isolated run failed ({}):\n{stdout}\n{stderr}",
+                output.status
+            );
+        }
+
+        fn backoff_shutdown_body() {
             let dir = tempfile::tempdir().expect("tempdir");
 
             // Minimal primary journal — only its lineage identity is
@@ -2069,9 +2104,8 @@ mod tests {
 
             // The stage threads are named at spawn, and a leaked stage
             // spins forever — absence within the deadline proves the
-            // teardown joined them. Deadline-poll rather than one-shot:
-            // under plain `cargo test`, concurrent tests' stages may be
-            // momentarily alive, but those exit on their own.
+            // teardown joined them. This process runs no other test (see
+            // above), so every stage thread here is the receiver's.
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let names = live_thread_names();
