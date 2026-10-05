@@ -200,7 +200,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends libdpdk-dev
 
       - name: DPDK builds
+        id: dpdk-builds
         run: cargo check -p melin-server-runtime --all-targets --features dpdk --locked
+
+      # The test job's Rustdoc step, with the `dpdk` feature: the code it
+      # compiles has docs of its own, which no default build renders, so a
+      # broken link there passed every other check.
+      - name: Rustdoc with DPDK
+        if: ${{ !cancelled() && steps.dpdk-builds.outcome == 'success' }}
+        run: cargo doc --workspace --no-deps --locked --features melin-server-runtime/dpdk
+        env:
+          RUSTDOCFLAGS: -D warnings
 
       # Proves the workspace can still be packaged. Nothing else does: `cargo
       # check` compiles crates in place, while publishing builds each one from
