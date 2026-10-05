@@ -58,23 +58,11 @@ dpdk-serial = { max-threads = 1 }
 # One test at a time: every DPDK node busy-polls a core, and the groups
 # alone would let one test of each run at once.
 #
-# The filter leaves out the tests that fail on DPDK because of a known
-# transport divergence, each under the entry in
-# `docs/internal/transport-divergences-2026-10.md` that explains it. The
-# fix for an entry removes its tests from here, so this list is what does
-# not work on DPDK yet. (The filter language has no comments; the
-# clauses are in the order of this list.)
-#
-# - "A promoted DPDK replica serves on kernel TCP": raft_failover,
-#   replicated_failover, genesis_promotion's promotion case, notary's
-#   promoted-replica test.
+# A test that fails on DPDK because of a known transport divergence is
+# left out here, with a `default-filter` of the form
+# `not (binary(...) & test(=...) | ...)`, and listed in this comment under
+# the entry in `docs/internal/transport-divergences-2026-10.md` that
+# explains it. The fix for the entry removes it again, so the filter is
+# what does not work on DPDK yet. Nothing is left out today.
 [profile.dpdk]
 test-threads = 1
-default-filter = '''
-not (
-    (binary(raft_failover) & test(=killed_primary_triggers_exactly_one_auto_promotion))
-    | (binary(replicated_failover) & test(=acked_events_survive_primary_death_under_ram_policy))
-    | (binary(genesis_promotion) & test(=a_replica_configured_with_a_larger_genesis_is_promoted))
-    | (package(melin-example-notary) & test(=a_promoted_replica_reports_the_head_the_primary_receipted))
-)
-'''

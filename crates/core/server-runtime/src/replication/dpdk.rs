@@ -1290,9 +1290,14 @@ impl<A: Application> DpdkReplicationDriver<A> {
 ///
 /// The protocol is identical to `run_receiver` — same wire format, same
 /// fsync-then-ack-then-replay pattern. Only the I/O primitives differ.
+///
+/// `transport` is borrowed, not consumed: on a promotion the node goes on
+/// to serve as a DPDK primary on the same transport. Every session this
+/// loop opens is reset before it returns, so the caller gets the
+/// transport back holding no connection of the receiver's.
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver_dpdk<A>(
-    mut transport: melin_dpdk::DpdkTransport,
+    transport: &mut melin_dpdk::DpdkTransport,
     primary_ip: std::net::Ipv4Addr,
     primary_port: u16,
     signing_key: &ed25519_dalek::SigningKey,
@@ -1558,7 +1563,7 @@ where
         recv_buf.clear();
         let auth_result = {
             let mut auth_stream = PolledAuthStream {
-                transport: &mut transport,
+                transport: &mut *transport,
                 handle,
                 recv_buf: &mut recv_buf,
                 shutdown,
@@ -1687,7 +1692,7 @@ where
                             let decision = handle_resync_verdict(
                                 divergent,
                                 &mut DpdkFrameSource {
-                                    transport: &mut transport,
+                                    transport: &mut *transport,
                                     handle,
                                     recv_buf: &mut recv_buf,
                                     shutdown,
@@ -1848,7 +1853,7 @@ where
             let stream_marks = &p.stream_marks;
             let journal_failed = &p.journal_failed;
             let mut dpdk_transport = DpdkReceiverTransport {
-                transport: &mut transport,
+                transport: &mut *transport,
                 handle,
                 send_buf: std::mem::take(&mut send_buf),
             };
@@ -1894,7 +1899,7 @@ where
             // returns the socket entry to the socket set; each reconnect
             // allocates a fresh one, so skipping it leaks one entry per
             // disconnect.
-            || end_session(&mut transport, handle),
+            || end_session(transport, handle),
             sizing,
         );
         if let Some(r) = after.adopt(

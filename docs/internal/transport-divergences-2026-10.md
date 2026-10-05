@@ -146,24 +146,21 @@ off and reconnects.
 `replication/dpdk.rs`. A dropped Handshake frame leaves both sides waiting.
 Combined with the sender's missing `Handshaking` deadline, that hangs the slot.
 
-### A promoted DPDK replica serves on kernel TCP
+## Primary startup
 
-`server.rs`, the promotion arm of the DPDK replica path, marked TODO
-there. A promoted DPDK replica runs the kernel-TCP primary: it binds a
-kernel listener on its client address (and on `--replication-bind`).
-That address is normally the DPDK port's, which no kernel interface
-holds, so the bind fails and the node exits rather than serving. Where
-the kernel does hold the address, the node serves, on kernel TCP: a
-failover silently gives up kernel bypass. A promoted io_uring replica
-serves on the transport it ran on. The fix is a DPDK primary path for a
-promoted replica.
+### DPDK never runs the event publisher (likely bug)
 
-Found by the cluster tests on DPDK. Tests left out on it:
-`genesis_promotion`'s
-`a_replica_configured_with_a_larger_genesis_is_promoted`, the notary
-example's `a_promoted_replica_reports_the_head_the_primary_receipted`,
-`replicated_failover` and `raft_failover`. The two failover tests get as
-far as the promotion on DPDK, then fail on this.
+`server.rs`, `run_as_primary_dpdk`. With `--event-bind` set and a binary
+that supplies an event publisher, the DPDK primary gives the publisher
+its consumer on the output ring, as kernel TCP does, but never spawns the
+publisher thread. The output ring's producer is gated on its slowest
+consumer, so once the matching stage has produced a ring's worth of
+output past that idle consumer it waits for good: the node stops
+answering. Kernel TCP spawns the publisher (`spawn_event_publisher`),
+whose endpoint is kernel TCP by design and would serve a DPDK node
+unchanged. No example supplies a publisher, so no test reaches it. Found
+while sharing the DPDK primary path with promotion, which kept the
+startup as it was.
 
 ## Deliberate differences (no action)
 

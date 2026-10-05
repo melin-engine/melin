@@ -66,6 +66,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   arms keep-alive probes and a timeout on a connection
   (`DpdkTransport::set_peer_liveness`), and `DpdkTransport::reset` closes
   a connection and sends its RST rather than vanishing.
+- **`DpdkTransport::from_shared_unlistening`**: a transport with no
+  listener, for one that only dials out, to which listeners can be added
+  later with `add_listener`.
 
 ### Removed
 
@@ -84,6 +87,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   backwards included. `JournalEncoder::adopt_sequence` replaces it for a
   replica taking its primary's numbering, and accepts only the next
   sequence.
+- **`melin_dpdk::DpdkTransport::from_shared_with_port`.** Build the
+  transport with `from_shared_unlistening` and add the port with
+  `add_listener`.
 
 ### Changed
 
@@ -159,6 +165,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   while they ran: seconds for a large snapshot on a cold disk. A worker
   per replica slot now does the reading, and the poll thread sends what
   it has read a little at a time between its other work.
+- **A DPDK replica refuses client connections until it is promoted.** It
+  listened on its client port without serving, so a connect completed
+  and then saw nothing. It now has no client listener until promotion,
+  and a connect is refused at once. A kernel-TCP replica is unchanged: a
+  connect waits in the kernel's backlog. Clients retry either way.
 
 ### Fixed
 
@@ -307,6 +318,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   now required, which probes such a peer at least once a second. The
   DPDK stack's clock is also monotonic now: on the wall clock, a step
   could have fired or held its timers.
+- **A promoted DPDK replica could not serve.** Promotion fell back to the
+  kernel-TCP primary, which binds a kernel socket on the client address,
+  an address only the DPDK port holds: the bind failed and the node
+  exited instead of taking over. Where the kernel did hold the address,
+  the node served on kernel TCP, giving up kernel bypass without a word.
+  A promoted DPDK replica now becomes a DPDK primary, through the same
+  steps as a kernel-TCP promotion, on the transport it ran on.
 
 ## [0.18.0] - 2026-09-27
 
