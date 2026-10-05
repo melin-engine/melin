@@ -399,7 +399,9 @@ gates more).
 Done: noticing a replication peer that has gone, below. `halt_refusal`
 runs on DPDK. Also done: the limitation that deadline introduced, a
 replica's join stalling the primary's poll thread ("A replica's join off
-the primary's poll thread", below). And a DPDK primary for a promoted
+the primary's poll thread", below), and the part of the join that audit
+left on it, the catch-up→live handoff ("The catch-up→live handoff, a
+tick at a time", below). And a DPDK primary for a promoted
 replica ("A promoted replica on DPDK", below), which lifted the last
 gates step 2 left: no test is compiled out on a divergence any more.
 
@@ -547,8 +549,8 @@ clients, the other slot's stream and every link's probes and ACKs while
 the disk takes what it takes. A frame the socket refuses is held and
 sent first next tick; one larger than the socket's queue can ever take
 fails the join rather than wedging it. When the worker reports the end,
-every frame is already queued in order, and the slot runs the bridge
-into the live ring as before. A slot that drops mid-join cancels it (the
+every frame is already queued in order, and the slot steps the handoff
+into the live ring (next section). A slot that drops mid-join cancels it (the
 worker stops at its next frame); the slot drops its stream before its
 worker, so a worker blocked on a full channel is released before it is
 joined.
@@ -579,24 +581,16 @@ not to the poll thread, and is left for its own change.
 Audit of what else the poll thread does that could block for long:
 
 - The chain validation: on its worker already.
-- The bridge into the live ring (`bridge_catchup_to_live`) runs inline,
-  because it owns the slot's ring consumer and active flag. It re-reads
-  only what was journaled since the worker reached the end of the
-  journal (a few frames of pumping ago while the joiner drains at wire
-  speed; a backpressured joiner stretches that to its drain time, which
-  the residual pass then re-reads and publishes inline — still shorter
-  than the whole catch-up, and recent, so in the page cache), polls the
-  stack after every frame, and its wait on the disk is bounded (30 ms).
-  The links stay answered throughout, but the client loop sharing the
-  thread is held while the bridge runs, and the bridge waits for room in
-  the joiner's send queue. A joiner that dies mid-bridge holds client
-  ingress until its liveness deadline resets the link — up to about twice
-  the liveness timeout, since data is being sent into it. A joiner that
-  is alive but stops reading keeps acknowledging with a zero window, so
-  its deadline never fires: ingress is held until it drains, with no
-  bound but the joiner. Pre-existing, and DPDK only (the kernel-TCP
-  sender bridges on the replica's own thread, off the client path); a
-  deadline on the bridge's sends is an open follow-up.
+- The bridge into the live ring (`bridge_catchup_to_live`) ran inline
+  when this audit was written, because it owns the slot's ring consumer
+  and active flag. Its wait on the disk was bounded (30 ms), but it
+  waited for room in the joiner's send queue: a joiner that died
+  mid-bridge held client ingress until its liveness deadline reset the
+  link (up to about twice the liveness timeout, since data was being
+  sent into it), and one alive but not reading, acknowledging with a
+  zero window so that its deadline never fired, held it with no bound
+  but the joiner. It is now stepped a tick at a time, its disk reads on
+  the join worker: next section.
 - Streaming, acks, heartbeats, auth (one signature check), accepting
   (one nonce), dropping a link: no I/O, no waits.
 - Closing every link on stop waits at most 100 ms, once, on the way out.
@@ -624,6 +618,186 @@ it fails on the first request. `large_joins_complete_a_tick_at_a_time`
 brings up a fresh replica (journal catch-up) and a divergent one
 (snapshot, a seed of several MiB, catch-up), each many times a socket's
 queue, and checks both ack the primary's whole history.
+
+#### The catch-up→live handoff, a tick at a time
+
+The problem: the last step of a join, the handoff from the catch-up to
+the live stream, still ran to completion on the poll thread (see the
+audit above). It activates the slot's replication ring, re-reads from
+the journal what was journaled since the catch-up reached its end (the
+residual pass), then drains the ring into sequence-contiguity,
+back-filling from disk while the ring's first live chunk is ahead of
+what has been streamed. Its disk wait was bounded, but its sends waited
+for room in the joiner's socket, so a joiner that stopped reading
+mid-handoff held every client on the poll thread: until its liveness
+deadline if it had died, with no bound if it was alive and not reading.
+Under load the residual pass is not small: it carries whatever was
+journaled while the last catch-up frames waited in a full socket, so a
+slow joiner made a long handoff even before it stopped.
+
+What was built:
+
+- **A resumable handoff** (`melin_transport_core::replication::handoff`,
+  `LiveHandoff`). The same steps and decisions as
+  `bridge_catchup_to_live`, as a state machine the slot steps once per
+  tick: activate, residual pass, drain, back-fill while a chunk is
+  ahead, forward. Each step does what it can without waiting and
+  returns. The chunk classification (covered, next, ahead; batch or
+  control frame) is one function, `RingChunk::classify`, which the
+  inline drain now calls too, so the two cannot drift.
+- **The journal passes on the join worker.** The residual pass and each
+  back-fill pass are jobs for the slot's join worker
+  (`JoinRequest::HandoffPass`), their frames handed to the socket as the
+  catch-up's are, within the tick's byte budget. The poll thread no
+  longer reads the disk at any point of a join; before, the residual
+  pass and the back-fill read it inline.
+- **A ring chunk held across ticks.** A chunk the socket refuses stays
+  the consumer's uncommitted read (`ReplicationConsumer::pending`
+  re-borrows it on the next step), so the producer cannot reuse its slot,
+  nothing is read past it, and it is committed only once forwarded. A
+  chunk the drain has decided to forward is offered again as it stands,
+  not re-judged: the inline drain forwards a control frame a back-fill
+  has since passed, and goes live after a batch a back-fill has since
+  covered, and so does this. Dropping a slot (`go_idle`) releases a held
+  read, so the idle drain can read on.
+- **Acks during the handoff.** The slot's cursors are seeded at the
+  handoff's start (before the activation, contract B2 as before), but a
+  pass's entries count towards the sent high-water only when the pass
+  ends, and the replica may ack them before, so recording acks then
+  could evict a healthy replica for an ack "ahead" of what was sent. The
+  handoff keeps the newest ack read (acks are cumulative) and drops the
+  rest; the streaming arm records it on its first tick, as it recorded
+  the acks the inline bridge left unread on the socket. Reading them off
+  keeps the joiner's acks from backing up in its TX queue however long
+  the handoff takes.
+- **A deadline on a joiner that does not drain, once it has acked.** A
+  join (the catch-up and the handoff alike) whose replica has acked
+  anything, and whose socket has since refused what it has to send, with
+  nothing taken, for the join stall limit is dropped like any other
+  (reset, cursors disengaged, halt gate lowered); the replica reconnects
+  and resumes from what it journaled. A join waiting on its disk is not
+  stalled: the disk is not the replica's doing (the handoff's disk wait
+  keeps its own 30 ms bound, and a slow snapshot read is left alone, as
+  `a_stalled_join_costs_the_other_replica_nothing` requires). Any byte
+  taken ends the stall.
+
+Why only once the replica has acked: before its first ack, a replica
+reading nothing may be doing exactly what the join asked of it. A
+replica resyncing from a snapshot tears its old pipeline down and
+archives its lineage, then, once the snapshot is received, loads it,
+verifies the segment seed and rebuilds the seed's chain (`open_append`)
+— all without reading its socket (the link is only serviced, so it
+answers probes with a closing window) and for as long as its state
+takes. The primary meanwhile queues the seed and the catch-up behind
+it, so on a large state the socket refuses frames long before the
+install ends. A deadline counted from there would reset the replica
+mid-install, its transfer would fail, and it would reconnect to the same
+snapshot, the same load time and the same reset: a large-state replica
+could never join. A replica acks only from its streaming loop, past the
+install, and from then on reads as fast as its journal takes entries,
+so a refusal with nothing taken for the limit after an ack is a replica
+that has stopped. Before the first ack the join waits on the replica
+the way the kernel-TCP sender's always does — no deadline of its own —
+but costs nobody else: neither phase holds the poll thread, a replica
+that has gone is still dropped by its liveness deadline, and a loaded
+primary's handoff still evicts by its ring.
+
+The limit is the replication liveness timeout. To a join, a replica
+that has acked and then taken nothing for that long is no better than
+one whose stack has stopped answering, which the liveness deadline
+drops after the same silence; the figure is the one operators already
+have for a silent peer. The one wait left to a replica past its first
+ack is its own journal: its streaming loop stops reading while its input
+ring is full, servicing the link, and reads again as the journal drains
+it — a journal that takes no entry for that long is the condition that,
+on a streaming replica under load, ring eviction already drops it for,
+and the drop costs only a reconnect from what it journaled. What the primary does today
+to a *streaming* replica that stops reading, on both transports, is
+evict it when its replication ring fills; that rule is load-driven and
+never fires on an idle primary, nor on a catch-up, which runs with the
+ring inactive. It still applies wherever the ring is active, the handoff
+included, and under load fires first: now that the handoff returns to
+the poll loop every tick, the eviction check at the top of each tick
+sees the ring-full flag mid-handoff, where the inline bridge saw it only
+once it had finished. The deadline covers what eviction cannot.
+
+The kernel-TCP sender is unchanged: it calls `bridge_catchup_to_live`
+to completion on the replica's own thread, where a wait costs no client,
+and its drain makes the same decisions as before (the shared
+classification is a refactor, pinned by the existing drain tests). A
+kernel-TCP joiner that stops reading still holds its slot, with no
+client cost; a deadline there is not part of this change.
+
+Nothing on the hot path: the streaming arm is untouched; the handoff's
+state, the held read and the stall watch exist only while a slot is
+`Joining`, and the clock is read once per tick only then.
+
+Alternatives considered:
+
+- **A deadline on the inline bridge's sends**, the roadmap's interim
+  fix. It bounds the hold, but the hold remains: every client on the
+  queue waits up to the deadline, every time a joiner is slow, and the
+  residual pass still reads the disk on the poll thread.
+- **The whole handoff on the join worker.** It owns the ring consumer
+  and the active flag, and the ring's single-consumer invariant is
+  easiest to keep with one owner on one thread; handing the consumer to
+  the worker and back would make the consumer's owner change at the
+  handoff's edges, and the worker would still need the socket, which
+  only the poll thread may touch.
+- **Copying the held ring chunk out** instead of keeping the read
+  uncommitted. Up to a 512 KiB copy per refusal, and nothing gained: an
+  uncommitted read already pins the slot, which is what keeps the order.
+- **Ring-full eviction alone, with no new deadline.** It matches the
+  streaming rule exactly, but a catch-up never activates the ring and an
+  idle primary never fills it, so a joiner that stops reading on an idle
+  primary would keep its slot, and its place in the halt gate, for as
+  long as it stayed connected.
+- **The deadline over the whole join, from the first refusal.** It
+  would reset a replica installing a snapshot whose load outlasts the
+  limit, every time it reconnected (above). A larger fixed bound only moves the state size at which that
+  happens.
+- **A replica that reads into memory while its install runs.** It would
+  keep taking bytes, so a whole-join deadline would hold; but what it
+  buffers is the seed and the catch-up, unbounded in memory, to spare a
+  deadline the ack already lets the primary arm at the right moment.
+
+Coverage. The handoff's logic is unit-tested without libdpdk
+(`handoff` tests): the window before activation replayed from disk, over
+a socket refusing every other offer; entries journaled and published
+while the handoff waits on the socket, joining the stream exactly where
+the disk left off; a gap back-filled over several steps; a refused chunk
+held and offered again until taken, once; a control frame a back-fill
+has passed still forwarded after a refusal; the disk-wait bound; a
+failed pass. A property test drives the resumable drain and the inline
+one over the same randomised rings, disks and refusal patterns and
+requires the same frames, in the same order, to the same high-water,
+leaving the ring at the same chunk. The join worker's handoff pass, the
+stall watch (its arming on the first ack included) and the ack
+retention and detection have unit tests of their own. End to end,
+`dpdk_veth`'s `a_joiner_that_stops_reading_mid_handoff_holds_up_nothing`
+uses a replica written in the test (authenticated and handshaken as a
+fresh replica, then reading and acking only when told): the primary's
+history is sized so that, with the joiner reading nothing, the worker
+reads all of it but the catch-up cannot end; clients then write a few
+MiB; the joiner, still unacked, outlives the stall limit in its
+catch-up; it reads exactly the history and stops, and outlives the
+limit again in its handoff, whose residual pass carries those MiB with
+nobody reading (what a replica installing a snapshot looks like to its
+primary, in both phases); then it acks what it read, still reading
+nothing. Requests are answered promptly throughout, the joiner is
+dropped by the stall limit only after its ack (not by eviction: the
+bulk writes have stopped by then, and a request every few hundred
+milliseconds never fills its ring), and the other replica acks the
+head. The test checks its own premises (the catch-up still running
+while the clients write, and ending exactly at the history's end), so a
+change to the primary's buffers fails it with the reason. Against the
+inline bridge it fails on the first request; with the deadline over the
+whole join, on the joiner dropped in its catch-up.
+`a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped` covers
+the catch-up phase: a joiner that acks the first entries of a history
+several times what the primary queues for it, then stops reading, is
+dropped by the stall limit while its catch-up is still running, with
+clients served throughout.
 
 #### A promoted replica on DPDK
 

@@ -208,8 +208,11 @@ depends on how the peer went and on the transport:
   answering while it waits on its own disk or installs a snapshot, so a
   slow replica disk does not count either: as on kernel TCP, the replica
   stays connected while it catches up, and is evicted only if the
-  primary's replication ring for it fills (see "Fault isolation between
-  replica slots"). A node whose stack goes unanswered for the whole
+  primary's replication ring for it fills, or, while it is still
+  joining and once it has begun acknowledging entries, if it takes
+  nothing the primary sends for those same 5 seconds (see "Fault
+  isolation between replica slots"). A node whose
+  stack goes unanswered for the whole
   5 seconds — its process frozen, or starved of CPU — is taken for gone,
   and reconnects.
 - **A cut link, or a host that loses power**: on DPDK, as for a crash.
@@ -319,11 +322,27 @@ primary refuses to publish past the gap. The surviving replica and
 client traffic are unaffected.
 
 A replica that joins — catching up from the primary's journal, or
-receiving a snapshot — is isolated the same way, on either transport:
-the primary reads what it sends off its disk away from the work that
-serves clients and the other replica. A large catch-up or snapshot on a
-slow disk delays the joining replica alone; the other replica keeps
-streaming, and keeps its link.
+receiving a snapshot, then switching to the live stream — is isolated
+the same way, on either transport: the primary reads what it sends off
+its disk away from the work that serves clients and the other replica,
+and never waits on the joining replica to take it. A large catch-up or
+snapshot on a slow disk, or a joining replica that falls behind or stops
+reading, delays that replica alone; the other replica keeps streaming,
+and keeps its link, and clients are served throughout.
+
+On DPDK, a joining replica that has begun acknowledging what it journals
+and then takes none of what its primary has for it for 5 seconds (the
+same silence after which a peer counts as gone) is dropped, and
+reconnects and resumes from what it has journaled; a replica whose disk
+is merely slow keeps taking data and is unaffected. Until its first
+acknowledgement a joining replica is never dropped for reading nothing:
+one installing a snapshot reads nothing while it loads the state, for as
+long as the state takes.
+Once the switch to the live stream has begun, a replica that stops
+reading is also evicted as soon as its ring fills, as a streaming one
+is. On kernel TCP a joining replica that stops reading keeps its slot
+until it disconnects, without holding up client traffic or the other
+replica.
 
 ## Manual promotion
 

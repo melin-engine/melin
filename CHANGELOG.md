@@ -298,6 +298,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   and a node that drops a link or stops tells its peer at once. The
   DPDK stack's clock is also monotonic now: on the wall clock, a step
   could have fired or held its timers.
+- **A DPDK replica that stopped reading as it finished catching up froze
+  its primary's clients.** The last step of a replica's join, the
+  switch from catch-up to the live stream, ran on the poll thread that
+  also carries client traffic, and waited there for room in the
+  replica's socket. A replica that stopped reading at that moment, or
+  died then, held every client for as long as its socket stayed open:
+  indefinitely, for one that stayed connected. The switch now advances a
+  little at a time between the poll thread's other work, reading the
+  disk on the slot's worker, exactly as the catch-up before it does, and
+  sends the same entries in the same order. A joining replica that has started acknowledging entries and
+  then takes nothing the primary has for it for five seconds (the
+  replication liveness timeout) is dropped and reconnects, rather than
+  keeping its slot for as long as it stays silent. Before its first
+  acknowledgement it is never dropped for reading nothing, so a replica
+  installing a large snapshot may take as long as its state needs to
+  load; one that stops reading once its ring is active is still evicted
+  when the ring fills, as before. Kernel-TCP primaries are unchanged:
+  each replica's join runs on its own thread.
 - **A failed client authentication left a DPDK connection open.** A bad
   signature, an undecodable response or an oversized auth frame was
   answered with `AuthFailed`, but the connection stayed in the

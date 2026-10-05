@@ -14,6 +14,7 @@ pub mod ack_queue;
 pub mod archive;
 pub mod catchup;
 pub mod cursors;
+pub mod handoff;
 pub mod metrics;
 pub mod protocol;
 pub mod sent;

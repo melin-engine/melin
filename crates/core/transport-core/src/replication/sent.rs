@@ -15,9 +15,10 @@
 //!   catch-up end) look like a protocol violation and falsely evict a
 //!   healthy replica — exactly the "never a load effect" guarantee the
 //!   ack-sanity invariant promises.
-//! - **Single drain criterion** — the catch-up→live drain
-//!   (`drain_into_contiguity`, reached by both the kernel-TCP and DPDK
-//!   senders through `bridge_catchup_to_live`) decides skip-vs-forward
+//! - **Single drain criterion** — the catch-up→live drain (the kernel-TCP
+//!   sender's `drain_into_contiguity`, through `bridge_catchup_to_live`,
+//!   and the DPDK sender's resumable `LiveHandoff`, both classifying ring
+//!   chunks with the one `RingChunk::classify`) decides skip-vs-forward
 //!   from this bound rather than restating it. The two senders had
 //!   previously each restated the condition and drifted — TCP compared
 //!   against the catch-up end, DPDK against the handshake sequence — so
@@ -35,6 +36,7 @@
 /// the response gate and the health endpoint.
 ///
 /// [`ReplicaCursors`]: super::cursors::ReplicaCursors
+#[derive(Debug)]
 pub struct SentHighWater(u64);
 
 impl SentHighWater {
