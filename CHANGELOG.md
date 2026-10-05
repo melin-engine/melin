@@ -295,7 +295,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   stopped primary's link up, so auto-promotion refused to depose it and
   the cluster never failed over. A replication link is now reset once
   its peer has answered nothing for five seconds, a peer's FIN ends it,
-  and a node that drops a link or stops tells its peer at once. The
+  and a node that drops a link or stops tells its peer at once. A peer
+  that is alive but has stopped reading, a replica installing a snapshot
+  say, still answers, and stays connected: this relies on fastcp 0.13.2,
+  now required, which probes such a peer at least once a second. The
   DPDK stack's clock is also monotonic now: on the wall clock, a step
   could have fired or held its timers.
 - **A DPDK replica that stopped reading as it finished catching up froze

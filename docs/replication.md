@@ -211,10 +211,9 @@ depends on how the peer went and on the transport:
   primary's replication ring for it fills, or, while it is still
   joining and once it has begun acknowledging entries, if it takes
   nothing the primary sends for those same 5 seconds (see "Fault
-  isolation between replica slots"). A node whose
-  stack goes unanswered for the whole
-  5 seconds — its process frozen, or starved of CPU — is taken for gone,
-  and reconnects.
+  isolation between replica slots"). A node whose stack goes unanswered
+  for the whole 5 seconds (its process frozen, or starved of CPU) is
+  taken for gone, and reconnects.
 - **A cut link, or a host that loses power**: on DPDK, as for a crash.
   On kernel TCP the connection breaks when the kernel gives up
   retransmitting to the peer, which takes much longer, and an end that

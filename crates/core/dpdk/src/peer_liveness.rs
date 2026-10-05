@@ -62,7 +62,11 @@ impl PeerLiveness {
     /// The deadline only fires on a peer whose TCP stack has stopped
     /// answering: a crashed or stopped node, a cut link, or a node whose
     /// poll thread has stalled for the whole timeout. A live node whose
-    /// application is merely quiet keeps answering the probes.
+    /// application is merely quiet keeps answering the probes, and so does
+    /// one that has stopped reading: with its receive buffer full it
+    /// advertises a zero window, and its stack answers the zero-window
+    /// probes, which fastcp (from 0.13.2) sends at most a probe interval
+    /// apart while keep-alive is set.
     pub const REPLICATION: Self = Self::new(Duration::from_secs(1), Duration::from_secs(5));
 
     /// A liveness rule probing every `probe_interval` and giving up after
@@ -465,6 +469,37 @@ mod tests {
             })
             .expect("the stopped peer is declared gone");
         assert!(took <= RULE.timeout() * 2 + STEP, "took {took:?}");
+    }
+
+    /// A peer that is alive but has stopped reading (a replica installing
+    /// a snapshot, or one whose journal has stalled) is not gone, however
+    /// long it reads nothing. Its receive buffer fills and it advertises a
+    /// zero window; the node, with data queued, probes it, and its stack
+    /// answers every probe. fastcp before 0.13.2 doubled the probe delay
+    /// without bound, so once it passed the timeout the deadline fired
+    /// between two answers and reset a live peer, about 12 s in; 0.13.2
+    /// caps it at the keep-alive interval.
+    #[test]
+    fn a_live_peer_that_has_stopped_reading_is_never_declared_gone() {
+        let mut pair = Pair::connected(RULE);
+        let mut window_closed = false;
+        pair.run_for(RULE.timeout() * 6, |p| {
+            // Node 1 never reads. Node 0 keeps data queued for it; once
+            // the buffers are full the bytes are refused, which is the
+            // point: data is waiting on a zero window.
+            let _ = p.nodes[0].socket().send_slice(b"replication data");
+            let peer = p.nodes[1].socket();
+            window_closed |= peer.recv_queue() == peer.recv_capacity();
+            assert!(
+                p.nodes[0].link_up(),
+                "a live peer that stopped reading was declared gone"
+            );
+        });
+        assert!(window_closed, "the peer's receive buffer never filled");
+        assert!(
+            pair.nodes[0].socket().send_queue() > 0,
+            "no data was left waiting"
+        );
     }
 
     /// A cut link, both nodes running: each declares the other gone.
