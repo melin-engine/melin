@@ -27,7 +27,13 @@ tick-to-trade = ["latency-trace"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 ## DPDK userspace TCP transport.
-dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
+##
+## Also switches this crate's own integration tests to DPDK: the nodes
+## they start through `melin-test-node` (a dev-dependency, so a
+## dependent's build never sees it) then run on the network
+## `scripts/dpdk/netns-runner.sh` builds, and must be run under it (see
+## `docs/internal/dpdk-testing.md`).
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "melin-test-node/dpdk"]
 pipeline-stats = ["melin-transport-core/pipeline-stats"]
 ## Tamper-evident BLAKE3 journal chain and the cross-node divergence
 ## checks built on it (handshake, rotation boundary, periodic ChainCheck).
@@ -37,6 +43,15 @@ hash-chain = [
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
 ]
+
+# The DPDK transport's client path on veth, run under the netns runner
+# (see the file). DPDK only by nature, and needs libdpdk to build, so
+# only with `dpdk`: a plain `cargo test`, and the pre-commit hook, never
+# build it.
+[[test]]
+name = "dpdk_veth"
+path = "tests/dpdk_veth/main.rs"
+required-features = ["dpdk"]
 
 [dependencies]
 melin-app = { workspace = true }
@@ -98,3 +113,8 @@ melin-transport-core = { workspace = true, features = ["test-utils"] }
 # The client side of the wire protocol, for integration tests that talk to
 # a node the way a customer's client does.
 melin-client = { workspace = true }
+# Starts the integration tests' nodes, on kernel TCP or, with `dpdk`, on
+# DPDK. Path-only, like the counter above: it is `publish = false` and
+# must stay version-less, and it is another dev-only cycle (it depends on
+# this crate).
+melin-test-node = { path = "../test-node" }

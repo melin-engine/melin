@@ -56,6 +56,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   process's signals, or runs several nodes in one process. Unlike
   `run_with_listener`, the client listener stays the transport's own, so
   it works on DPDK.
+- **DPDK testing without a NIC.** The DPDK transport runs on veth links
+  through the `net_af_packet` driver, unprivileged and without hugepages:
+  `scripts/dpdk/netns-runner.sh`, set as cargo's target runner, runs the
+  integration suites on DPDK when the `dpdk` feature is enabled (the
+  examples gain a `dpdk` feature for it), with the `dpdk` nextest
+  profile. For contributors; nothing ships with it.
 
 ### Removed
 

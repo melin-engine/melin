@@ -75,10 +75,10 @@ impl Layout {
                 "this test was built with the `dpdk` feature, so its nodes run on DPDK, on the \
                  network scripts/dpdk/netns-runner.sh builds, but {ENV_NODE_IPS} is not set, \
                  so this process is not running under it. Run the tests through the runner, \
-                 one at a time (every DPDK node busy-polls a core), from the repository \
-                 root:\n  \
+                 with the `dpdk` nextest profile (one test at a time: every DPDK node \
+                 busy-polls a core), from the repository root:\n  \
                  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=\"$PWD/scripts/dpdk/netns-runner.sh\" \
-                 cargo nextest run -p <package> --features dpdk -j 1\n\
+                 cargo nextest run --profile dpdk -p <package> --features <package>/dpdk\n\
                  or build without the feature to run them on kernel TCP."
             ));
         };

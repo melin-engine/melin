@@ -7,12 +7,14 @@
 //!
 //! Promotion, the third way into the primary role, is covered by
 //! `replicated_failover.rs`.
+//!
+//! Nodes are started through `melin-test-node`: on kernel TCP by default,
+//! on DPDK with this crate's `dpdk` feature, under
+//! `scripts/dpdk/netns-runner.sh` (see
+//! `docs/internal/dpdk-testing.md`).
 
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use counter_server::{
@@ -22,16 +24,16 @@ use counter_server::{
 use melin_client::{Connection, SigningKey, key};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
-use melin_wire_protocol::tcp::BlockingTcpListener;
+use melin_server_runtime::server::ServerConfig;
 
 const CLIENT_KEY: [u8; 32] = [0xAA; 32];
 
-struct Node {
-    addr: SocketAddr,
-    shutdown: Arc<AtomicBool>,
-    handle: JoinHandle<Result<(), String>>,
-}
+/// How long a client waits for a node to serve: the launcher's limit,
+/// which on kernel TCP is the one this file always used, and longer on
+/// DPDK, where a node starts a port.
+const SERVE_WITHIN: Duration = melin_test_node::STARTUP_LIMIT;
+
+struct Node(melin_test_node::Node);
 
 /// Boot a standalone primary on `dir`'s journal, keeping whatever the
 /// directory already holds.
@@ -45,6 +47,21 @@ fn boot_with(
     startup: StartupEvents<CounterEvent>,
     tweak: impl FnOnce(&mut ServerConfig),
 ) -> Node {
+    let mut config = standalone_config(dir);
+    tweak(&mut config);
+
+    Node(melin_test_node::start::<Counter>(
+        config,
+        startup,
+        (),
+        RequestDecoder,
+        ResponseEncoder,
+    ))
+}
+
+/// A standalone primary's configuration on `dir`'s journal, with
+/// `authorized_keys` written there. `bind` is left for the caller.
+fn standalone_config(dir: &Path) -> ServerConfig {
     let auth_path = dir.join("authorized_keys");
     let client_key = SigningKey::from_bytes(&CLIENT_KEY);
     std::fs::write(
@@ -53,11 +70,7 @@ fn boot_with(
     )
     .expect("write auth keys");
 
-    let listener = BlockingTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().expect("addr"))
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let mut config = ServerConfig {
-        bind: addr,
+    ServerConfig {
         journal: dir.join("counter.journal"),
         authorized_keys: auth_path,
         standalone: true,
@@ -72,54 +85,37 @@ fn boot_with(
         snapshot_interval_ms: 0,
         health_bind: None,
         ..ServerConfig::default()
-    };
-    tweak(&mut config);
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let sd = Arc::clone(&shutdown);
-    let handle = std::thread::spawn(move || -> Result<(), String> {
-        server::run_with_listener::<Counter>(
-            listener,
-            config,
-            startup,
-            (),
-            RequestDecoder,
-            ResponseEncoder,
-            None,
-            sd,
-        )
-        .map_err(|e| e.to_string())
-    });
-    Node {
-        addr,
-        shutdown,
-        handle,
     }
 }
 
+/// Connect to the node at `addr`, authenticate, and return its first
+/// answer: the counter's value. The deadline is the hang detector — a
+/// boot stuck before its accept loop never completes the handshake.
+fn value_at(addr: SocketAddr) -> u64 {
+    let mut node = Connection::connect_by(
+        addr,
+        &SigningKey::from_bytes(&CLIENT_KEY),
+        Instant::now() + SERVE_WITHIN,
+    )
+    .expect("a serving node (boot stuck before the accept loop?)");
+    node.set_read_timeout(Duration::from_secs(30))
+        .expect("set timeout");
+    let frame = node.request_one(&GET_VALUE_REQUEST).expect("query");
+    assert_eq!(frame[0], KIND_RESP_VALUE);
+    u64::from_le_bytes(frame[1..9].try_into().expect("8-byte value"))
+}
+
 impl Node {
-    /// Connect, authenticate, and return the node's first answer: the
-    /// counter's value. The deadline is the hang detector — a boot stuck
-    /// before its accept loop never completes the handshake.
+    /// The counter's value, as [`value_at`] reads it.
     fn value(&self) -> u64 {
-        let mut node = Connection::connect_by(
-            self.addr,
-            &SigningKey::from_bytes(&CLIENT_KEY),
-            Instant::now() + Duration::from_secs(10),
-        )
-        .expect("a serving node (boot stuck before the accept loop?)");
-        node.set_read_timeout(Duration::from_secs(30))
-            .expect("set timeout");
-        let frame = node.request_one(&GET_VALUE_REQUEST).expect("query");
-        assert_eq!(frame[0], KIND_RESP_VALUE);
-        u64::from_le_bytes(frame[1..9].try_into().expect("8-byte value"))
+        value_at(self.0.addr())
     }
 
     fn increment(&self, amount: u64) {
         let mut node = Connection::connect_by(
-            self.addr,
+            self.0.addr(),
             &SigningKey::from_bytes(&CLIENT_KEY),
-            Instant::now() + Duration::from_secs(10),
+            Instant::now() + SERVE_WITHIN,
         )
         .expect("a serving node");
         node.set_read_timeout(Duration::from_secs(30))
@@ -129,14 +125,7 @@ impl Node {
     }
 
     fn stop(self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        // Poke the accept loop so it notices the shutdown flag. A failed
-        // connect is fine: the loop may already have noticed.
-        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(100));
-        self.handle
-            .join()
-            .expect("server thread panicked")
-            .expect("server returned error");
+        self.0.stop();
     }
 }
 
@@ -248,9 +237,8 @@ fn a_refused_first_boot_leaves_genesis_to_the_next_one() {
         c.ack_policy = ServerConfig::default().ack_policy;
     });
     let err = refused
-        .handle
+        .0
         .join()
-        .expect("server thread panicked")
         .expect_err("--standalone under the default ack policy must be refused");
     assert!(err.contains("--ack-policy disk"), "{err}");
     assert!(
@@ -261,4 +249,53 @@ fn a_refused_first_boot_leaves_genesis_to_the_next_one() {
     let node = boot(dir.path(), genesis_only());
     assert_eq!(node.value(), GENESIS);
     node.stop();
+}
+
+/// `server::run_with_shutdown`, the entry point a DPDK node runs through,
+/// on kernel TCP: it binds the client address itself, serves, and returns
+/// cleanly once its flag is set. Kernel TCP only: on DPDK every other test
+/// in this file runs its nodes through it.
+#[cfg(not(feature = "dpdk"))]
+#[test]
+fn a_node_run_with_its_own_shutdown_flag_serves_and_stops_on_it() {
+    use std::net::TcpStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use melin_server_runtime::server;
+    use melin_transport_core::test_ports::free_addr;
+
+    /// Port range for `free_addr`, shared with the cluster binaries: safe
+    /// because this binary is in nextest's `cluster-serial` group too.
+    const PORT_BASE: u16 = 10_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = ServerConfig {
+        bind: free_addr(PORT_BASE),
+        ..standalone_config(dir.path())
+    };
+    let addr = config.bind;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&shutdown);
+    let node = std::thread::spawn(move || -> Result<(), String> {
+        server::run_with_shutdown::<Counter>(
+            config,
+            genesis_only(),
+            (),
+            RequestDecoder,
+            ResponseEncoder,
+            None,
+            flag,
+        )
+        .map_err(|e| e.to_string())
+    });
+
+    assert_eq!(value_at(addr), GENESIS);
+    shutdown.store(true, Ordering::Relaxed);
+    // Wake the accept loop so it sees the flag. Dropped deliberately: a
+    // node that already stopped listening refuses, which is fine.
+    let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(100));
+    node.join()
+        .expect("node thread panicked")
+        .expect("node returned an error");
 }

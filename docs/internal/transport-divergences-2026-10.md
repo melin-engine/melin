@@ -7,6 +7,13 @@ why. Some differences are deliberate, and those are marked.
 
 Paths are relative to `crates/core/server-runtime/src/`.
 
+The DPDK side of an entry can be exercised without hardware: the
+integration suites run on DPDK over veth (`dpdk-testing.md`). A test that
+fails on an entry is left out of the `dpdk` nextest profile
+(`.config/nextest.toml`), under the entry's name, until the entry is
+fixed. An entry says which tests cover it or are left out on it; the
+others have no DPDK test yet.
+
 ## Client ingress
 
 ### DPDK closes a client connection without telling the peer
@@ -17,6 +24,26 @@ client connection is affected, a failed auth included: the client gets
 `AuthFailed` and then silence. `melin-client` returns on the error frame and is
 unaffected, but a client that waits for EOF hangs until it next sends. io_uring
 closes the socket, so the peer sees EOF.
+
+Pinned by `a_server_side_close_is_silent` in the DPDK veth tests
+(`crates/core/server-runtime/tests/dpdk_veth/`): no FIN or RST within a
+read timeout after the close, and an RST answering the client's next send.
+The fix flips that test to require the EOF.
+
+### DPDK does not see a client's close (likely bug)
+
+`dpdk_transport.rs`, the read path. A connection is released when a
+zero-byte read finds the socket no longer active. A client's FIN moves the
+smoltcp socket to CloseWait, which still counts as active, so the node keeps
+the connection, its slot and its socket. They are released only when the
+next heartbeat is answered with an RST, at the idle timeout with heartbeats
+off, or never with both off. Until then a node at `max_connections` turns
+new clients away. io_uring releases the connection on EOF. The fix is to treat a
+zero-byte read on a socket that can no longer receive as a close.
+
+Pinned by `a_client_close_is_seen_only_at_the_next_heartbeat` in the DPDK
+veth tests: no slot within a few seconds of the close, one after the
+heartbeat. The fix flips that test to require the slot back promptly.
 
 ### DPDK `PipelineFull` drops the client instead of sending ServerBusy
 
@@ -111,6 +138,48 @@ off and reconnects.
 
 `replication/dpdk.rs`. A dropped Handshake frame leaves both sides waiting.
 Combined with the sender's missing `Handshaking` deadline, that hangs the slot.
+
+### DPDK does not notice a replication peer that has gone (likely bug)
+
+`replication/dpdk.rs`, both ends of the link. A DPDK node that stops
+tells its replication peer nothing (no FIN, no RST: the close described
+in "DPDK closes a client connection without telling the peer"), and
+neither end of a DPDK link has a deadline on a silent peer. The sender's
+streaming slot is released only once its socket is no longer active, and
+a socket retransmitting heartbeats to a peer that never answers stays
+active, since no timeout is set on it. The receiver waits on its primary
+the same way. io_uring sees the EOF, and its receiver gives a quiet
+primary 5 s.
+
+The effect, found by the cluster tests on DPDK:
+
+- A primary whose replica has stopped keeps counting it
+  (`melin_replicas_connected`) and never halts, so it does not refuse
+  writes as a primary whose last replica has left must. Under a policy
+  that needs a replica, acknowledgements stall instead.
+- A replica whose primary has stopped keeps its link "up": auto-promotion
+  refuses to depose a live primary, and the cluster never fails over.
+
+Tests left out on it: `halt_refusal`, `replicated_failover` and
+`raft_failover` (`crates/core/server-runtime/tests/`).
+
+### A promoted DPDK replica serves on kernel TCP
+
+`server.rs`, the promotion arm of the DPDK replica path, marked TODO
+there. A promoted DPDK replica runs the kernel-TCP primary: it binds a
+kernel listener on its client address (and on `--replication-bind`).
+That address is normally the DPDK port's, which no kernel interface
+holds, so the bind fails and the node exits rather than serving. Where
+the kernel does hold the address, the node serves, on kernel TCP: a
+failover silently gives up kernel bypass. A promoted io_uring replica
+serves on the transport it ran on. The fix is a DPDK primary path for a
+promoted replica.
+
+Found by the cluster tests on DPDK. Tests left out on it:
+`genesis_promotion`'s
+`a_replica_configured_with_a_larger_genesis_is_promoted`, the notary
+example's `a_promoted_replica_reports_the_head_the_primary_receipted`,
+and, behind the entry above, `replicated_failover` and `raft_failover`.
 
 ## Deliberate differences (no action)
 

@@ -33,11 +33,18 @@
 //! higher tip, and the caught-up peer campaigns to take over — see
 //! `raft_promotion::auto_promotion_decision` and
 //! `challenger_should_campaign`.
+//!
+//! Nodes are started through `melin-test-node`: on kernel TCP by default,
+//! on DPDK with this crate's `dpdk` feature, under
+//! `scripts/dpdk/netns-runner.sh` (see
+//! `docs/internal/dpdk-testing.md`). On DPDK the winner serves
+//! as a DPDK primary, and the primary is cut off the network before it is
+//! stopped, as a crashed host would be: its replicas hear nothing of its
+//! going, so failover completes only if they notice the silence
+//! themselves (the replica end of a DPDK link's liveness deadline).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -49,12 +56,12 @@ use ed25519_dalek::{Signer, SigningKey};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
+use melin_test_node::Addrs;
 use melin_transport_core::test_ports::free_addr;
 use melin_wire_protocol::control_codec::{
     TAG_APP, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_LEN, TAG_SERVER_READY,
 };
-use melin_wire_protocol::tcp::BlockingTcpListener;
 use serial_test::serial;
 
 /// Port range this file owns for `free_addr` (10000..15000);
@@ -216,7 +223,8 @@ fn http_metrics(addr: SocketAddr) -> Option<String> {
 
 struct NodeSetup {
     key: SigningKey,
-    client_addr: SocketAddr,
+    /// Client and replication addresses.
+    addrs: Addrs,
     raft_addr: SocketAddr,
     health_addr: SocketAddr,
     admin_addr: SocketAddr,
@@ -263,12 +271,11 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             .try_init();
     }
     let tmp = tempfile::tempdir().expect("tempdir");
-    let replication_addr = free_addr(PORT_BASE);
 
     let nodes: Vec<NodeSetup> = (0..3)
         .map(|i| NodeSetup {
             key: SigningKey::from_bytes(&[0x61 + i as u8; 32]),
-            client_addr: free_addr(PORT_BASE),
+            addrs: melin_test_node::addrs(i, || free_addr(PORT_BASE)),
             raft_addr: free_addr(PORT_BASE),
             health_addr: free_addr(PORT_BASE),
             admin_addr: free_addr(PORT_BASE),
@@ -301,7 +308,6 @@ fn acked_events_survive_primary_death_under_ram_policy() {
         let key_path = tmp.path().join(format!("key-{i}"));
         std::fs::write(&key_path, nodes[i].key.to_bytes()).unwrap();
         ServerConfig {
-            bind: nodes[i].client_addr,
             journal: tmp.path().join(format!("node-{i}.journal")),
             authorized_keys: auth_path.clone(),
             ack_policy: AckPolicy::Ram,
@@ -326,50 +332,31 @@ fn acked_events_survive_primary_death_under_ram_policy() {
         }
     };
 
+    let replication_addr = nodes[0].addrs.replication();
+    let start = |i: usize, config: ServerConfig| {
+        melin_test_node::start_at::<Counter>(
+            &nodes[i].addrs,
+            config,
+            startup_events(i),
+            (),
+            RequestDecoder,
+            ResponseEncoder,
+        )
+    };
+
     // --- Primary (node 0): `ram` ack policy, replication bind. ---
-    let primary_shutdown = Arc::new(AtomicBool::new(false));
-    let primary_handle = {
+    let primary = {
         let mut config = make_config(0);
         config.replication_bind = Some(replication_addr);
-        let listener = BlockingTcpListener::bind(config.bind).expect("bind primary client port");
-        let sd = Arc::clone(&primary_shutdown);
-        std::thread::spawn(move || -> Result<(), String> {
-            server::run_with_listener::<Counter>(
-                listener,
-                config,
-                startup_events(0),
-                (),
-                RequestDecoder,
-                ResponseEncoder,
-                None,
-                sd,
-            )
-            .map_err(|e| e.to_string())
-        })
+        start(0, config)
     };
 
     // --- Replicas (nodes 1, 2). ---
-    let replica_shutdown = Arc::new(AtomicBool::new(false));
-    let replica_handles: Vec<_> = (1..3)
+    let replicas: Vec<_> = (1..3)
         .map(|i| {
             let mut config = make_config(i);
             config.replica_of = Some(replication_addr);
-            let listener =
-                BlockingTcpListener::bind(config.bind).expect("bind replica client port");
-            let sd = Arc::clone(&replica_shutdown);
-            std::thread::spawn(move || -> Result<(), String> {
-                server::run_with_listener::<Counter>(
-                    listener,
-                    config,
-                    startup_events(i),
-                    (),
-                    RequestDecoder,
-                    ResponseEncoder,
-                    None,
-                    sd,
-                )
-                .map_err(|e| e.to_string())
-            })
+            start(i, config)
         })
         .collect();
 
@@ -378,8 +365,8 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     // satisfiable when the first increment arrives.
     let deadline = Instant::now() + Duration::from_secs(60);
     let leader_at_formation = loop {
-        if primary_handle.is_finished() {
-            panic!("primary exited early: {:?}", primary_handle.join().unwrap());
+        if primary.is_finished() {
+            panic!("primary exited early: {:?}", primary.join());
         }
         let connected = http_metrics(nodes[0].health_addr)
             .is_some_and(|m| m.contains("melin_replicas_connected 2\n"));
@@ -404,7 +391,7 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     // adds 1 + 2 + 4 = 7.
     let acked_total = GENESIS + ON_PRIMARY + 7;
     {
-        let mut stream = connect_authenticated(nodes[0].client_addr, &client_key);
+        let mut stream = connect_authenticated(primary.addr(), &client_key);
         let mut expected_total = GENESIS + ON_PRIMARY;
         for amount in [1u64, 2, 4] {
             expected_total += amount;
@@ -419,13 +406,15 @@ fn acked_events_survive_primary_death_under_ram_policy() {
 
     // --- Phase 3: kill the primary. Every acked event now exists only
     // on the surviving nodes (their RAM, and their journals as their
-    // own disk syncs trail through). ---
-    primary_shutdown.store(true, Ordering::Relaxed);
-    let _ = TcpStream::connect_timeout(&nodes[0].client_addr, Duration::from_millis(100));
-    primary_handle
-        .join()
-        .expect("primary thread panicked")
-        .expect("primary returned error");
+    // own disk syncs trail through). On DPDK it is cut off first, so
+    // that its stop announces nothing: no RST reaches the replicas, and
+    // each must drop its link on the liveness deadline before the
+    // promotion below may proceed (auto-promotion refuses while the
+    // primary link is up). On kernel TCP a node has no link of its own
+    // to cut; its stop closes the links, as a crash would. ---
+    #[cfg(feature = "dpdk")]
+    primary.cut_off();
+    primary.stop();
 
     // --- Phase 4: exactly one replica auto-promotes. The promotion
     // policy sees the ack policy the dead primary advertised on the
@@ -440,7 +429,7 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             cluster_summary(&nodes)
         );
         let serving: Vec<usize> = (1..3)
-            .filter(|&i| serves_clients(nodes[i].client_addr, Duration::from_millis(500)))
+            .filter(|&i| serves_clients(nodes[i].addrs.client(), Duration::from_millis(500)))
             .collect();
         match serving.len() {
             0 => std::thread::sleep(Duration::from_millis(200)),
@@ -450,7 +439,7 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     };
     let loser = if winner == 1 { 2 } else { 1 };
     assert!(
-        !serves_clients(nodes[loser].client_addr, Duration::from_secs(2)),
+        !serves_clients(nodes[loser].addrs.client(), Duration::from_secs(2)),
         "the losing replica must not serve clients"
     );
 
@@ -480,7 +469,7 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     // winner's own `on_primary`, journaled on promotion before it served,
     // while neither replica's genesis ever was. ---
     {
-        let mut stream = connect_authenticated(nodes[winner].client_addr, &client_key);
+        let mut stream = connect_authenticated(nodes[winner].addrs.client(), &client_key);
         send_request(&mut stream, &GET_VALUE_REQUEST);
         let responses = read_until_batch_end(&mut stream);
         assert_eq!(responses.len(), 1);
@@ -512,11 +501,7 @@ fn acked_events_survive_primary_death_under_ram_policy() {
     }
 
     // Teardown.
-    replica_shutdown.store(true, Ordering::Relaxed);
-    for (i, h) in replica_handles.into_iter().enumerate() {
-        let _ = TcpStream::connect_timeout(&nodes[i + 1].client_addr, Duration::from_millis(100));
-        h.join()
-            .expect("replica thread panicked")
-            .expect("replica returned error");
+    for replica in replicas {
+        replica.stop();
     }
 }
