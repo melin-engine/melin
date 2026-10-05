@@ -21,7 +21,9 @@ use super::auth::{
     AuthChallenge, AuthOutcome, AuthTransport, PolledAuthStream, authenticate_with_primary,
     generate_challenge_nonce, step_authentication,
 };
-use super::join_worker::{JoinContext, JoinRequest, JoinStream, JoinWorker, Pump, stream_join};
+use super::join_worker::{
+    JoinContext, JoinRequest, JoinStallWatch, JoinStream, JoinWorker, Pump, stream_join,
+};
 use super::receiver_transport::{
     ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, run_serviced,
     streaming_loop, try_extract_frame,
@@ -35,7 +37,10 @@ use super::{
     take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
-use melin_transport_core::replication::catchup::{CatchUpPublisher, bridge_catchup_to_live};
+use melin_transport_core::replication::catchup::CatchUpPublisher;
+use melin_transport_core::replication::handoff::{
+    HandoffIo, HandoffStep, LiveHandoff, PassProgress,
+};
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, PrimaryMessage, ReplicaMessage, decode_primary_message,
     decode_replica_message, encode_ack, encode_challenge, encode_handshake, encode_heartbeat,
@@ -146,6 +151,38 @@ impl ReceiverTransport for DpdkReceiverTransport<'_> {
 /// so that a node that stops, or drops a link, tells its peer at once.
 const REPLICATION_LIVENESS: melin_dpdk::PeerLiveness = melin_dpdk::PeerLiveness::REPLICATION;
 
+/// How long a joining replica that has acked may leave the primary with
+/// bytes for it and no room to queue them — a frame its socket refused,
+/// with nothing taken since — before the primary drops it (see
+/// [`JoinStallWatch`]).
+///
+/// Only once the replica has acked: before its first ack it may be
+/// installing a snapshot, reading nothing for as long as its state takes
+/// to load, and no bound on that is right for every state. Before it, a
+/// join waits on the replica as the kernel-TCP sender's always does, with
+/// no deadline of its own (a replica that has gone is still dropped by its
+/// liveness deadline, a loaded primary's handoff still by its ring), and
+/// at no cost to anyone else: neither phase of the join holds the poll
+/// thread.
+///
+/// The liveness timeout, because to the join a replica that has taken
+/// nothing for that long, past its install, is no better than one whose
+/// stack has stopped answering, which the liveness deadline drops after
+/// the same silence: its slot and its place in the halt gate are given
+/// back, and it reconnects and resumes from what it journaled. A replica
+/// alive but not reading acknowledges with a zero window, so the liveness
+/// deadline itself never fires on it, and without this a join would hold
+/// the slot for as long as the replica chose.
+///
+/// The rule the primary already applies to a streaming replica that stops
+/// reading, on both transports, is eviction once its replication ring
+/// fills. That rule still applies where the ring is active — the handoff,
+/// once it has activated the ring — and under load fires first, acked or
+/// not. This deadline covers what it cannot: the catch-up, which runs with
+/// the ring inactive, and a handoff on an idle primary, whose ring never
+/// fills.
+const JOIN_STALL_LIMIT: std::time::Duration = REPLICATION_LIVENESS.timeout();
+
 /// How long an end of a replication link that is closing it waits for
 /// what it has already queued (a replica's final ack on shutdown and
 /// promotion, a stopping primary's last stream frames) to be acknowledged
@@ -177,10 +214,20 @@ fn linger_then_reset(
     }
 }
 
+/// What reading a joining replica's control frames found.
+#[derive(Debug, PartialEq, Eq)]
+enum JoinFrames {
+    /// A frame's length prefix is zero or over [`MAX_CONTROL_FRAME`]: a
+    /// replica the caller disconnects, as the streaming arm does.
+    Malformed,
+    /// Well formed. `acked`: an ack was among the complete frames — the
+    /// replica is in its streaming loop, which arms the join's
+    /// [`JoinStallWatch`].
+    Read { acked: bool },
+}
+
 /// Drop every complete control frame at the front of `buf`, keeping a
-/// trailing partial one for the next read. `false` if a frame is malformed —
-/// its length prefix zero or over [`MAX_CONTROL_FRAME`] — a replica the
-/// caller disconnects, as the streaming arm does.
+/// trailing partial one for the next read.
 ///
 /// Serves a `Joining` slot: the replica acks what it journals of the
 /// catch-up, and those acks must be read off the socket — left unread they
@@ -188,17 +235,68 @@ fn linger_then_reset(
 /// in its own TX queue — but not recorded, since the slot's cursors are
 /// not seeded until the bridge. Acks are cumulative, so the first one read
 /// once streaming covers what is dropped here.
-fn discard_control_frames(buf: &mut Vec<u8>) -> bool {
+fn discard_control_frames(buf: &mut Vec<u8>) -> JoinFrames {
     let mut consumed = 0;
-    let well_formed = loop {
+    let mut acked = false;
+    let outcome = loop {
         match try_extract_frame(&buf[consumed..], MAX_CONTROL_FRAME) {
-            FrameResult::Complete(_, frame_end) => consumed += frame_end,
-            FrameResult::Incomplete => break true,
-            FrameResult::Oversized => break false,
+            FrameResult::Complete(payload_start, frame_end) => {
+                let payload = &buf[consumed + payload_start..consumed + frame_end];
+                acked |= matches!(decode_replica_message(payload), Ok(ReplicaMessage::Ack(_)));
+                consumed += frame_end;
+            }
+            FrameResult::Incomplete => break JoinFrames::Read { acked },
+            FrameResult::Oversized => break JoinFrames::Malformed,
         }
     };
     compact_recv_buf(buf, consumed);
-    well_formed
+    outcome
+}
+
+/// Keep only the newest complete ack at the front of `buf`, and a trailing
+/// partial frame for the next read. [`JoinFrames::Malformed`] as
+/// [`discard_control_frames`]; `acked` whenever an ack is kept, which,
+/// as one is kept across reads, is true again on every read after the
+/// first (arming the stall watch is idempotent).
+///
+/// Serves a slot in its handoff: its cursors are seeded, but the sent
+/// high-water an ack is checked against is only settled once the handoff
+/// is over (a journal pass's entries are counted when the pass ends, and
+/// the replica may ack them before), so acks are not recorded yet — the
+/// streaming arm records what is kept here, on its first tick. Acks are
+/// cumulative, so the newest carries everything the older ones did; the
+/// rest are read off the socket and dropped, so that they cannot back up
+/// in the replica's TX queue however long the handoff takes.
+fn keep_last_ack(buf: &mut Vec<u8>) -> JoinFrames {
+    let mut consumed = 0;
+    // The newest ack's byte range in `buf`.
+    let mut newest: Option<(usize, usize)> = None;
+    loop {
+        match try_extract_frame(&buf[consumed..], MAX_CONTROL_FRAME) {
+            FrameResult::Complete(payload_start, frame_end) => {
+                let payload = &buf[consumed + payload_start..consumed + frame_end];
+                if matches!(decode_replica_message(payload), Ok(ReplicaMessage::Ack(_))) {
+                    newest = Some((consumed, consumed + frame_end));
+                }
+                consumed += frame_end;
+            }
+            FrameResult::Incomplete => break,
+            FrameResult::Oversized => return JoinFrames::Malformed,
+        }
+    }
+    let acked = newest.is_some();
+    match newest {
+        Some((start, end)) => {
+            let len = buf.len();
+            let ack_len = end - start;
+            buf.copy_within(start..end, 0);
+            // `ack_len <= end <= consumed`: the partial frame moves down.
+            buf.copy_within(consumed..len, ack_len);
+            buf.truncate(ack_len + (len - consumed));
+        }
+        None => compact_recv_buf(buf, consumed),
+    }
+    JoinFrames::Read { acked }
 }
 
 /// End a replica's session with its primary (see [`linger_then_reset`]):
@@ -221,7 +319,8 @@ enum SlotState {
     /// Handshake validated; the slot's join worker reads what the replica
     /// lacks (journal history, or a snapshot and history) off the disk
     /// while the poll thread moves its frames into the socket a tick at a
-    /// time (see [`PendingJoin`]). Then the bridge into the live ring.
+    /// time, then the handoff into the live ring, likewise a tick at a
+    /// time (see [`PendingJoin`]).
     Joining(melin_dpdk::SocketHandle),
     /// Streaming journal data to replica.
     Streaming(melin_dpdk::SocketHandle),
@@ -256,12 +355,126 @@ struct PendingValidation {
 /// deadline; inline on the poll thread they stalled client traffic and
 /// the other slot, and left every replication link unanswered long
 /// enough for healthy replicas to reset theirs. The slot stays `Joining`
-/// and pumps the worker's frames into its socket each tick.
+/// and pumps the worker's frames into its socket each tick, then steps
+/// the handoff into the live ring each tick.
+///
+/// Neither phase ever waits on the replica: a joiner that stops reading
+/// costs the poll thread nothing, and, once it has acked, is dropped when
+/// it has refused what the join has to send for [`JOIN_STALL_LIMIT`].
 struct PendingJoin {
-    stream: JoinStream,
-    /// The cursor and stream floor the bridge seeds: the handshake's
+    phase: JoinPhase,
+    /// The cursor and stream floor the handoff seeds: the handshake's
     /// position, or 0 for a divergent replica.
     stream_base: u64,
+    /// Whether the replica is draining the join, once it has acked.
+    stall: JoinStallWatch,
+}
+
+/// The two halves of a join.
+enum JoinPhase {
+    /// The worker's join frames, moved into the socket a tick at a time.
+    CatchUp(JoinStream),
+    /// Every catch-up frame is queued; the handoff into the live ring,
+    /// stepped a tick at a time. `pass` is its running journal pass, on
+    /// the slot's worker (see [`HandoffSocket`]).
+    Handoff {
+        handoff: LiveHandoff,
+        pass: Option<JoinStream>,
+    },
+}
+
+/// The DPDK side of a replica's handoff ([`HandoffIo`]): its socket, and
+/// the slot's join worker for the journal passes, so that the poll thread
+/// neither reads the disk nor waits for room in the socket. Lives for one
+/// tick, and reports what the tick came to.
+struct HandoffSocket<'a> {
+    transport: &'a mut melin_dpdk::DpdkTransport,
+    handle: melin_dpdk::SocketHandle,
+    joiner: &'a JoinWorker,
+    pass: &'a mut Option<JoinStream>,
+    /// Bytes queued this tick, against [`MAX_REPL_BYTES_PER_TICK`].
+    queued: usize,
+    /// The socket refused the last offer: the handoff waits on the replica.
+    blocked: bool,
+    /// The worker is gone (it panicked), a bug in us: logged at `error!`.
+    worker_gone: bool,
+}
+
+impl HandoffIo for HandoffSocket<'_> {
+    fn start_pass(&mut self, from: u64) -> io::Result<()> {
+        match self.joiner.submit(JoinRequest::HandoffPass { from }) {
+            Ok(stream) => {
+                *self.pass = Some(stream);
+                Ok(())
+            }
+            Err(_) => {
+                self.worker_gone = true;
+                Err(io::Error::other("the replica's join worker is gone"))
+            }
+        }
+    }
+
+    fn pump_pass(&mut self) -> PassProgress {
+        let Some(stream) = self.pass.as_mut() else {
+            return PassProgress::Done(Err(io::Error::other("no handoff pass is running")));
+        };
+        // This tick's budget is spent: the rest is the next tick's, as the
+        // streaming arm does it. Not the replica's doing.
+        if self.queued >= MAX_REPL_BYTES_PER_TICK {
+            self.blocked = false;
+            return PassProgress::Pending;
+        }
+        let budget = MAX_REPL_BYTES_PER_TICK - self.queued;
+        let capacity = self.transport.max_tx_queue_size(self.handle);
+        let (transport, handle) = (&mut *self.transport, self.handle);
+        match stream.pump(budget, capacity, |frame| {
+            transport.queue_send(handle, frame)
+        }) {
+            Pump::Pending { queued } => {
+                self.queued += queued;
+                self.blocked = stream.is_blocked();
+                PassProgress::Pending
+            }
+            Pump::Done(result) => {
+                *self.pass = None;
+                self.blocked = false;
+                PassProgress::Done(result)
+            }
+            Pump::WorkerGone => {
+                *self.pass = None;
+                self.worker_gone = true;
+                PassProgress::Done(Err(io::Error::other("the replica's join worker died")))
+            }
+        }
+    }
+
+    fn try_send(&mut self, frame: &[u8]) -> bool {
+        // The tick's budget, as above: the streaming arm's rule, never
+        // below one frame a tick.
+        if self.queued >= MAX_REPL_BYTES_PER_TICK {
+            self.blocked = false;
+            return false;
+        }
+        let taken = self.transport.queue_send(self.handle, frame);
+        if taken {
+            self.queued += frame.len();
+        }
+        self.blocked = !taken;
+        taken
+    }
+}
+
+/// What one tick of a join came to.
+enum JoinTick {
+    /// More to do: `queued` bytes went to the socket, and `blocked` the
+    /// socket refused what the join has to send.
+    Pending { queued: usize, blocked: bool },
+    /// Every catch-up frame is queued: the last sequence it streamed.
+    CaughtUp(u64),
+    /// The handoff is over: the slot's sent high-water.
+    Live(SentHighWater),
+    /// The join failed (logged): drop the replica.
+    Failed,
 }
 
 /// Per-replica slot — owns its ring consumer and state machine.
@@ -381,8 +594,14 @@ impl DpdkReplicaSlot {
         self.recv_buf.clear();
         self.auth = None;
         self.pending_validation = None;
-        // Abandons a join in progress: its worker stops at its next frame.
+        // Abandons a join in progress (the catch-up, or a handoff pass):
+        // its worker stops at its next frame.
         self.join = None;
+        // A handoff ended mid-way may hold a ring read (a chunk it was
+        // forwarding or back-filling for): release it, so the `Idle` arm's
+        // drain reads on from there. A no-op otherwise, and after an
+        // eviction's skip to the producer.
+        self.consumer.commit();
     }
 }
 
@@ -404,7 +623,6 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// Single owner of the per-replica progress cursors (per-slot
     /// acked positions and the gate's gauge pair).
     cursors: ReplicaCursors,
-    journal_path: std::path::PathBuf,
     replica_ready: Arc<AtomicBool>,
     replicas_connected: Arc<AtomicU32>,
     metrics: Arc<ReplicationMetrics>,
@@ -524,7 +742,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
                 },
             ],
             cursors: ReplicaCursors::new(replica_slots, metrics.clone()),
-            journal_path,
             replica_ready,
             replicas_connected,
             metrics,
@@ -611,7 +828,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
         // the variable names matching.
         let slots = &mut self.slots;
         let cursors = &self.cursors;
-        let journal_path = &self.journal_path;
         let replica_ready = &self.replica_ready;
         let replicas_connected = &self.replicas_connected;
         let metrics = &self.metrics;
@@ -786,14 +1002,15 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         // `Joining` arm moves its frames into the socket.
                         // A submission, not a spawn, for the reason the
                         // validation is (see `ValidationWorker`).
-                        match slot.joiner.submit(JoinRequest {
+                        match slot.joiner.submit(JoinRequest::Replica {
                             last_sequence: h.last_sequence,
                             divergent,
                         }) {
                             Ok(stream) => {
                                 slot.join = Some(PendingJoin {
-                                    stream,
+                                    phase: JoinPhase::CatchUp(stream),
                                     stream_base,
+                                    stall: JoinStallWatch::default(),
                                 });
                                 slot.state = SlotState::Joining(handle);
                             }
@@ -947,128 +1164,162 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         continue;
                     }
 
-                    // Read the replica's catch-up acks off the socket and
-                    // drop them (see `discard_control_frames`).
+                    let join = slot.join.as_mut().expect("join in progress while Joining");
+
+                    // Read the replica's acks off the socket: dropped during
+                    // the catch-up (see `discard_control_frames`), the newest
+                    // kept for the streaming arm during the handoff (see
+                    // `keep_last_ack`).
                     transport.recv_into_vec(handle, &mut slot.recv_buf);
-                    if !discard_control_frames(&mut slot.recv_buf) {
-                        warn!(
-                            slot = slot_idx,
-                            "malformed (zero-length or oversized) frame from replica during catch-up — disconnecting"
-                        );
-                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
-                        continue;
+                    let frames = match join.phase {
+                        JoinPhase::CatchUp(_) => discard_control_frames(&mut slot.recv_buf),
+                        JoinPhase::Handoff { .. } => keep_last_ack(&mut slot.recv_buf),
+                    };
+                    match frames {
+                        JoinFrames::Malformed => {
+                            warn!(
+                                slot = slot_idx,
+                                "malformed (zero-length or oversized) frame from replica during catch-up — disconnecting"
+                            );
+                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
+                            continue;
+                        }
+                        // The replica is past whatever it does before
+                        // streaming (a snapshot install): from now on it
+                        // reads, and refusing for the limit is a stall.
+                        JoinFrames::Read { acked: true } => join.stall.arm(),
+                        JoinFrames::Read { acked: false } => {}
                     }
 
-                    // Move what the worker has read into the socket, as
-                    // much as fits and at most a tick's worth (the bound
-                    // the streaming arm keeps, for the same reason: this
-                    // thread is also client ingress). Never waits on the
-                    // worker's disk.
-                    let join = slot.join.as_mut().expect("join in progress while Joining");
-                    let capacity = transport.max_tx_queue_size(handle);
-                    let pumped = join
-                        .stream
-                        .pump(MAX_REPL_BYTES_PER_TICK, capacity, |frame| {
-                            transport.queue_send(handle, frame)
-                        });
-                    let catchup_end = match pumped {
-                        Pump::Pending { queued } => {
+                    // One tick of the join: as much as fits in the socket,
+                    // at most a tick's worth (the bound the streaming arm
+                    // keeps, for the same reason: this thread is also client
+                    // ingress). Never waits on the disk or the replica.
+                    let now = std::time::Instant::now();
+                    let tick = match &mut join.phase {
+                        // The worker's join frames.
+                        JoinPhase::CatchUp(stream) => {
+                            let capacity = transport.max_tx_queue_size(handle);
+                            match stream.pump(MAX_REPL_BYTES_PER_TICK, capacity, |frame| {
+                                transport.queue_send(handle, frame)
+                            }) {
+                                Pump::Pending { queued } => JoinTick::Pending {
+                                    queued,
+                                    blocked: stream.is_blocked(),
+                                },
+                                // Every frame of the join is queued, in order.
+                                Pump::Done(Ok(end)) => JoinTick::CaughtUp(end),
+                                Pump::Done(Err(e)) => {
+                                    warn!(slot = slot_idx, error = %e, "catch-up/snapshot failed — disconnecting");
+                                    JoinTick::Failed
+                                }
+                                Pump::WorkerGone => {
+                                    // `error!`: the worker only dies by
+                                    // panicking, a bug in us.
+                                    error!(
+                                        slot = slot_idx,
+                                        "replica join worker died — disconnecting"
+                                    );
+                                    JoinTick::Failed
+                                }
+                            }
+                        }
+                        // The handoff into live streaming: activates the
+                        // ring, re-reads from the journal the entries that
+                        // fell into the activation window, then drains the
+                        // ring into sequence-contiguity (back-filling from
+                        // disk while a skipped entry hasn't flushed) before
+                        // going live — `bridge_catchup_to_live`'s steps and
+                        // decisions, taken a tick at a time: its journal
+                        // passes run on the slot's worker, and a ring chunk
+                        // the socket has no room for stays held in the ring
+                        // until it does. See
+                        // `melin_transport_core::replication::handoff`.
+                        JoinPhase::Handoff { handoff, pass } => {
+                            let mut io = HandoffSocket {
+                                transport: &mut *transport,
+                                handle,
+                                joiner: &slot.joiner,
+                                pass,
+                                queued: 0,
+                                blocked: false,
+                                worker_gone: false,
+                            };
+                            match handoff.step(&mut slot.consumer, &slot.active_flag, &mut io, now)
+                            {
+                                Ok(HandoffStep::Pending) => JoinTick::Pending {
+                                    queued: io.queued,
+                                    blocked: io.blocked,
+                                },
+                                Ok(HandoffStep::Live(sent)) => JoinTick::Live(sent),
+                                Err(e) if io.worker_gone => {
+                                    // `error!`: the worker only goes by
+                                    // panicking, a bug in us.
+                                    error!(slot = slot_idx, error = %e, "replica join worker died during the handoff — disconnecting");
+                                    JoinTick::Failed
+                                }
+                                Err(e) => {
+                                    warn!(slot = slot_idx, error = %e, "catch-up handoff failed — disconnecting");
+                                    JoinTick::Failed
+                                }
+                            }
+                        }
+                    };
+
+                    match tick {
+                        JoinTick::Pending { queued, blocked } => {
                             if queued > 0 {
                                 // Flush now, as the streaming arm does.
                                 transport.poll();
                             }
-                            continue;
-                        }
-                        // Every frame of the join is queued, in order.
-                        Pump::Done(Ok(end)) => end,
-                        Pump::Done(Err(e)) => {
-                            warn!(slot = slot_idx, error = %e, "catch-up/snapshot failed — disconnecting");
-                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
-                            continue;
-                        }
-                        Pump::WorkerGone => {
-                            // `error!`: the worker only dies by
-                            // panicking, a bug in us.
-                            error!(slot = slot_idx, "replica join worker died — disconnecting");
-                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
-                            continue;
-                        }
-                    };
-                    let stream_base = join.stream_base;
-                    slot.join = None;
-
-                    // Engage this slot's cursors and seed the gauge
-                    // pair BEFORE the bridge flips active so a reader
-                    // that observes active=true also observes a
-                    // non-zero cursor pair — see `ReplicaCursors` for
-                    // the ordering contract.
-                    cursors.seed_on_handshake(slot_idx, stream_base);
-
-                    // DPDK publisher for the bridge: queue_send, polling
-                    // the stack while the queue is full and after each
-                    // frame, so the links stay answered.
-                    let mut dpdk_publish = |buf: &[u8]| -> std::io::Result<()> {
-                        loop {
-                            if transport.queue_send(handle, buf) {
-                                break;
+                            let stalled = join.stall.observe(queued > 0, blocked, now);
+                            if stalled >= JOIN_STALL_LIMIT {
+                                warn!(
+                                    slot = slot_idx,
+                                    stalled_ms = stalled.as_millis() as u64,
+                                    "replica stopped reading its catch-up or handoff — disconnecting"
+                                );
+                                slot.go_idle(
+                                    slot_idx,
+                                    transport,
+                                    cursors,
+                                    metrics,
+                                    replicas_connected,
+                                );
                             }
+                        }
+                        JoinTick::CaughtUp(catchup_end) => {
                             transport.poll();
-                            if !transport.is_connected(handle) {
-                                return Err(std::io::Error::other(
-                                    "replica disconnected during send (TX backpressure)",
-                                ));
-                            }
+                            // Engage this slot's cursors and seed the gauge
+                            // pair BEFORE the handoff flips active so a
+                            // reader that observes active=true also observes
+                            // a non-zero cursor pair — see `ReplicaCursors`
+                            // for the ordering contract. The handoff's first
+                            // step, next tick, flips it.
+                            cursors.seed_on_handshake(slot_idx, join.stream_base);
+                            join.phase = JoinPhase::Handoff {
+                                handoff: LiveHandoff::new(join.stream_base, catchup_end),
+                                pass: None,
+                            };
+                            // A catch-up that ended is progress. The watch
+                            // stays armed if the replica has acked.
+                            join.stall.restart();
                         }
-                        transport.poll();
-                        Ok(())
-                    };
-
-                    // Bridge into live streaming: activates the
-                    // ring, re-reads from the journal the entries
-                    // that fell into the activation window, then
-                    // drains the ring into sequence-contiguity
-                    // (back-filling from disk if a skipped entry
-                    // hasn't flushed yet) before going live. The
-                    // bridge closes the catch-up→live gap under load
-                    // (the receiver's contiguity gate backstops only
-                    // the rare quiescent corner) — see
-                    // `bridge_catchup_to_live`.
-                    //
-                    // Inline, because it owns the slot's ring consumer
-                    // and active flag, and short: the window it re-reads
-                    // is what was journaled since the worker reached the
-                    // end of the journal (a few frames' worth of pumping
-                    // ago while the joiner drains at wire speed; a
-                    // backpressured joiner lengthens it to its drain
-                    // time — still shorter than the whole catch-up, and
-                    // recent, so in the page cache), and its spin on the
-                    // disk is bounded (`HANDOFF_BRIDGE_TIMEOUT`).
-                    // Forwards via the retrying DPDK publisher — the
-                    // drain may leave bytes in the TX queue, so a
-                    // fire-and-forget `queue_send` would silently drop
-                    // chunks here. Returns the slot's sent high-water
-                    // (heartbeats + ack-sanity bound).
-                    match bridge_catchup_to_live::<A::Event>(
-                        journal_path,
-                        stream_base,
-                        catchup_end,
-                        &slot.active_flag,
-                        &mut slot.consumer,
-                        &mut dpdk_publish,
-                        shutdown,
-                    ) {
-                        Ok(sent) => slot.sent = sent,
-                        Err(e) => {
-                            warn!(slot = slot_idx, error = %e, "catch-up handoff failed — disconnecting");
+                        JoinTick::Live(sent) => {
+                            transport.poll();
+                            // The sent high-water: heartbeats and the
+                            // ack-sanity bound.
+                            slot.sent = sent;
+                            slot.join = None;
+                            slot.last_send = now;
+                            replica_ready.store(true, Ordering::Release);
+                            metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+                            slot.state = SlotState::Streaming(handle);
+                        }
+                        JoinTick::Failed => {
                             slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
-                            continue;
                         }
                     }
-                    slot.last_send = std::time::Instant::now();
-
-                    replica_ready.store(true, Ordering::Release);
-                    metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                    slot.state = SlotState::Streaming(handle);
                 }
 
                 SlotState::Streaming(handle) => {
@@ -1987,23 +2238,62 @@ mod tests {
         let partial = frame(12);
         buf.extend_from_slice(&partial[..7]);
 
-        assert!(discard_control_frames(&mut buf));
+        assert_eq!(
+            discard_control_frames(&mut buf),
+            JoinFrames::Read { acked: false }
+        );
         assert_eq!(buf, partial[..7]);
 
         // The rest of the partial frame completes it; it goes next time.
         buf.extend_from_slice(&partial[7..]);
-        assert!(discard_control_frames(&mut buf));
+        assert_eq!(
+            discard_control_frames(&mut buf),
+            JoinFrames::Read { acked: false }
+        );
+        assert!(buf.is_empty());
+    }
+
+    /// An ack among the dropped frames is reported, a partial one only
+    /// once it completes.
+    #[test]
+    fn discard_control_frames_reports_an_ack() {
+        let mut buf = frame(8);
+        buf.extend(ack(3, 4));
+        buf.extend(frame(8));
+        assert_eq!(
+            discard_control_frames(&mut buf),
+            JoinFrames::Read { acked: true }
+        );
+        assert!(buf.is_empty());
+
+        let partial = ack(5, 6);
+        buf.extend_from_slice(&partial[..5]);
+        assert_eq!(
+            discard_control_frames(&mut buf),
+            JoinFrames::Read { acked: false }
+        );
+        buf.extend_from_slice(&partial[5..]);
+        assert_eq!(
+            discard_control_frames(&mut buf),
+            JoinFrames::Read { acked: true }
+        );
         assert!(buf.is_empty());
     }
 
     #[test]
     fn discard_control_frames_leaves_an_empty_or_short_buffer_alone() {
         let mut buf = Vec::new();
-        assert!(discard_control_frames(&mut buf));
+        assert_eq!(
+            discard_control_frames(&mut buf),
+            JoinFrames::Read { acked: false }
+        );
         assert!(buf.is_empty());
 
         let mut buf = vec![5, 0];
-        assert!(discard_control_frames(&mut buf));
+        assert_eq!(
+            discard_control_frames(&mut buf),
+            JoinFrames::Read { acked: false }
+        );
         assert_eq!(buf, [5, 0]);
     }
 
@@ -2011,9 +2301,75 @@ mod tests {
     fn discard_control_frames_rejects_an_oversized_frame() {
         let mut buf = frame(8);
         buf.extend(((MAX_CONTROL_FRAME + 1) as u32).to_le_bytes());
-        assert!(!discard_control_frames(&mut buf));
+        assert_eq!(discard_control_frames(&mut buf), JoinFrames::Malformed);
 
         let mut buf = 0u32.to_le_bytes().to_vec();
-        assert!(!discard_control_frames(&mut buf));
+        assert_eq!(discard_control_frames(&mut buf), JoinFrames::Malformed);
+    }
+
+    fn ack(acked_sequence: u64, in_memory_sequence: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_ack(
+            &Ack {
+                acked_sequence,
+                in_memory_sequence,
+            },
+            &mut buf,
+        );
+        buf
+    }
+
+    /// The newest ack survives, ahead of a partial frame; older acks and
+    /// frames that are not acks go. Kept across reads, so the newest of
+    /// all of them is what the streaming arm records.
+    #[test]
+    fn keep_last_ack_keeps_the_newest_ack_and_a_partial_frame() {
+        let mut buf = ack(1, 2);
+        buf.extend(frame(8));
+        buf.extend(ack(3, 4));
+        buf.extend(frame(8));
+        let partial = ack(5, 6);
+        buf.extend_from_slice(&partial[..5]);
+
+        let acked = JoinFrames::Read { acked: true };
+        assert_eq!(keep_last_ack(&mut buf), acked);
+        let mut expected = ack(3, 4);
+        expected.extend_from_slice(&partial[..5]);
+        assert_eq!(buf, expected);
+
+        // The partial ack completes, and is the newest from then on.
+        buf.extend_from_slice(&partial[5..]);
+        assert_eq!(keep_last_ack(&mut buf), acked);
+        assert_eq!(buf, ack(5, 6));
+        assert_eq!(keep_last_ack(&mut buf), acked, "idempotent");
+        assert_eq!(buf, ack(5, 6));
+    }
+
+    #[test]
+    fn keep_last_ack_with_no_ack_keeps_only_a_partial_frame() {
+        let none = JoinFrames::Read { acked: false };
+        let mut buf = frame(8);
+        buf.extend_from_slice(&frame(8)[..3]);
+        assert_eq!(keep_last_ack(&mut buf), none);
+        assert_eq!(buf, frame(8)[..3]);
+
+        let mut buf = Vec::new();
+        assert_eq!(keep_last_ack(&mut buf), none);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn keep_last_ack_rejects_an_oversized_frame() {
+        let mut buf = ack(1, 1);
+        buf.extend(((MAX_CONTROL_FRAME + 1) as u32).to_le_bytes());
+        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Malformed);
+    }
+
+    /// The deadline on a joiner that stops reading is the liveness
+    /// timeout, and long enough that a refusal or two is not a stall.
+    #[test]
+    fn the_join_stall_limit_is_the_liveness_timeout() {
+        assert_eq!(JOIN_STALL_LIMIT, REPLICATION_LIVENESS.timeout());
+        assert!(JOIN_STALL_LIMIT >= std::time::Duration::from_secs(1));
     }
 }
