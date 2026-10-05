@@ -31,17 +31,19 @@ use crate::replication_wire::MSG_INPUT_BATCH;
 /// ext4 jbd2 spike). 30 ms is orders of magnitude over that close time,
 /// so it never expires on in-spec hardware.
 ///
-/// The bound is deliberately tight rather than generous because the
-/// spin runs inline on the single-threaded DPDK driver loop, where it
-/// head-of-line-blocks the other replica's ring drain and ack
-/// processing. A stall long enough to expire 30 ms is a failing drive,
-/// not a hiccup — and on expiry the handoff falls back to the
-/// receiver's contiguity gate (a reconnect), which is the right
-/// outcome when the disk has stopped keeping up. Out-of-spec hardware
-/// (a consumer drive, with slower flushes and fatter tails) merely falls
-/// back more often: still correct, just less efficient.
-/// This is a safety bound, not a steady-state cost.
-const HANDOFF_BRIDGE_TIMEOUT: Duration = Duration::from_millis(30);
+/// The bound is deliberately tight rather than generous because, while
+/// it runs, the slot's ring is active and not drained: the journal stage
+/// keeps publishing into it, and a long wait ends in a ring-full eviction
+/// anyway. (It no longer holds the DPDK poll thread: that sender waits
+/// for the disk across ticks, see [`super::handoff`]; the kernel-TCP
+/// sender waits on the replica's own thread.) A stall long enough to
+/// expire 30 ms is a failing drive, not a hiccup — and on expiry the
+/// handoff falls back to the receiver's contiguity gate (a reconnect),
+/// which is the right outcome when the disk has stopped keeping up.
+/// Out-of-spec hardware (a consumer drive, with slower flushes and
+/// fatter tails) merely falls back more often: still correct, just less
+/// efficient. This is a safety bound, not a steady-state cost.
+pub(super) const HANDOFF_BRIDGE_TIMEOUT: Duration = Duration::from_millis(30);
 
 /// Closure-based publisher passed to [`catch_up_from_journal_with`].
 /// Receives the fully encoded `InputBatch` frame (length prefix included)
@@ -591,6 +593,12 @@ pub fn snapshot_transfer_with<E: AppEvent>(
 /// cursors *before* calling this (the seed-before-active ordering
 /// contract, B2 in `ReplicaCursors`).
 ///
+/// Runs to completion, waiting on the socket and the disk as it goes:
+/// the kernel-TCP sender calls it on the replica's own thread. The DPDK
+/// sender, whose thread is also client ingress, takes the same steps
+/// with the same decisions a bounded step at a time
+/// ([`super::handoff::LiveHandoff`]).
+///
 /// Regression context: the 2026-06-07 LAN bench reconnected an evicted
 /// replica whose live stream resumed 212 entries past its catch-up end
 /// — the pre-bridge handoff went live directly off the bulk pass.
@@ -682,7 +690,7 @@ pub fn bridge_catchup_to_live<E: AppEvent>(
 ///   chunk is present but still ahead (entries below it not yet flushed);
 ///   on expiry that is a fatal `Err` — the journal has stalled, so tear
 ///   down and reconnect rather than ship a gap.
-fn drain_into_contiguity(
+pub(super) fn drain_into_contiguity(
     sent: &mut super::sent::SentHighWater,
     consumer: &mut melin_journal::replication::ReplicationConsumer,
     forward: ForwardFn<'_>,
@@ -704,63 +712,31 @@ fn drain_into_contiguity(
             // the common case once the disk has drained the ring.)
             return Ok(());
         };
-        // Control frames (`Rotate`, `ChainCheck`) ride the rings between
-        // `InputBatch` chunks. One strictly BEHIND the stream position is
-        // stale re-delivery (the disk walk already streamed past it) —
-        // drop it. One AT or AHEAD of the position is live and must be
-        // forwarded: a rotation that happened after the disk walk ran
-        // was never re-announced by it, and dropping the only copy here
-        // would leave the replica appending into the wrong segment
-        // forever (false divergence at the next chain check). When the
-        // back-fill DID also announce the boundary, the wire carries a
-        // duplicate — the receiver's exact-position rule and the journal
-        // stage's already-rotated check drop it deterministically.
-        if peek_frame_tag(data)? != MSG_INPUT_BATCH {
-            if meta.end_sequence < sent.get() {
-                consumer.commit();
-                continue;
-            }
-            while meta.end_sequence > sent.get() {
-                let end = refill(sent.get(), forward)?;
-                sent.advance(end);
-                if meta.end_sequence > sent.get() {
-                    if expired() {
-                        return Err(io::Error::other(format!(
-                            "catch-up handoff: control frame at boundary {} but the \
-                             journal stalled at {} — reconnecting",
-                            meta.end_sequence,
-                            sent.get()
-                        )));
-                    }
-                    std::thread::yield_now();
-                }
-            }
-            forward(data)?;
+        let chunk = RingChunk::classify(meta.end_sequence, data, sent.get())?;
+        if chunk.fate == ChunkFate::Covered {
             consumer.commit();
             continue;
         }
-        if meta.end_sequence <= sent.get() {
-            // Wholly covered by the bulk/residual pass — discard.
-            consumer.commit();
-            continue;
-        }
-        // First uncovered chunk. Its lead sequence is fixed; hold the peek
-        // (refill never touches the consumer) and back-fill from disk
-        // until the chunk is contiguous with `sent`.
-        let first = peek_first_sequence(data)?;
-        while first > sent.get() + 1 {
+        // At or ahead of the stream position. An ahead chunk's peek is
+        // held (refill never touches the consumer) while the disk is
+        // back-filled until the chunk is no longer ahead.
+        while RingChunk::classify(meta.end_sequence, data, sent.get())?.fate == ChunkFate::Ahead {
             let end = refill(sent.get(), forward)?;
             sent.advance(end);
-            if first > sent.get() + 1 {
+            if RingChunk::classify(meta.end_sequence, data, sent.get())?.fate == ChunkFate::Ahead {
                 if expired() {
-                    return Err(io::Error::other(format!(
-                        "catch-up handoff: ring chunk starts at {first} but the journal \
-                         stalled at {} — reconnecting",
-                        sent.get()
-                    )));
+                    return Err(chunk.stalled(meta.end_sequence, sent.get()));
                 }
                 std::thread::yield_now();
             }
+        }
+        if !chunk.batch {
+            // A control frame that was at or ahead of the position is
+            // forwarded even when the back-fill has since passed it (see
+            // `RingChunk::classify`).
+            forward(data)?;
+            consumer.commit();
+            continue;
         }
         // Contiguous now. Forward the held chunk unless the back-fill
         // already covered it (the receiver also dedups, but skipping
@@ -771,6 +747,110 @@ fn drain_into_contiguity(
         }
         consumer.commit();
         return Ok(());
+    }
+}
+
+/// Where a ring chunk stands against the stream position during the
+/// catch-up→live drain. The one statement of the rule, shared by the
+/// inline drain ([`drain_into_contiguity`], the kernel-TCP sender's,
+/// through [`bridge_catchup_to_live`]) and the DPDK sender's resumable
+/// one ([`super::handoff::LiveHandoff`]), so the two cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChunkFate {
+    /// Already streamed: drop it.
+    Covered,
+    /// Next in line: forward it.
+    Next,
+    /// Past what has been streamed: the entries below it reach the wire
+    /// only from disk, so back-fill before forwarding it.
+    Ahead,
+}
+
+/// One ring chunk's classification (see [`RingChunk::classify`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RingChunk {
+    pub(super) fate: ChunkFate,
+    /// An `InputBatch` (the drain ends once one is forwarded) rather
+    /// than a control frame (forwarded, and the drain goes on).
+    pub(super) batch: bool,
+    /// An `InputBatch`'s lead sequence; 0 for a control frame. For the
+    /// stall error only.
+    first: u64,
+}
+
+impl RingChunk {
+    /// Classify a ring chunk ending at `end_sequence` against `sent`.
+    ///
+    /// An `InputBatch` is covered when it ends at or before `sent`, and
+    /// ahead when it starts past `sent + 1`: the journal stage published
+    /// it only after observing the activation, so every entry below its
+    /// first sequence was skipped from the ring and reaches the wire only
+    /// from disk.
+    ///
+    /// Control frames (`Rotate`, `ChainCheck`) ride the rings between
+    /// `InputBatch` chunks. One strictly BEHIND the stream position is
+    /// stale re-delivery (the disk walk already streamed past it) — drop
+    /// it. One AT the position is live and must be forwarded: a rotation
+    /// that happened after the disk walk ran was never re-announced by it,
+    /// and dropping the only copy here would leave the replica appending
+    /// into the wrong segment forever (false divergence at the next chain
+    /// check). One AHEAD is forwarded once the back-fill has reached its
+    /// boundary — even if the back-fill went past it: when the back-fill
+    /// DID also announce the boundary, the wire carries a duplicate, which
+    /// the receiver's exact-position rule and the journal stage's
+    /// already-rotated check drop deterministically.
+    pub(super) fn classify(end_sequence: u64, data: &[u8], sent: u64) -> io::Result<Self> {
+        if peek_frame_tag(data)? != MSG_INPUT_BATCH {
+            let fate = if end_sequence < sent {
+                ChunkFate::Covered
+            } else if end_sequence > sent {
+                ChunkFate::Ahead
+            } else {
+                ChunkFate::Next
+            };
+            return Ok(RingChunk {
+                fate,
+                batch: false,
+                first: 0,
+            });
+        }
+        if end_sequence <= sent {
+            // Wholly covered by the bulk/residual pass — discard.
+            return Ok(RingChunk {
+                fate: ChunkFate::Covered,
+                batch: true,
+                first: 0,
+            });
+        }
+        let first = peek_first_sequence(data)?;
+        let fate = if first > sent + 1 {
+            ChunkFate::Ahead
+        } else {
+            ChunkFate::Next
+        };
+        Ok(RingChunk {
+            fate,
+            batch: true,
+            first,
+        })
+    }
+
+    /// The error that ends a handoff whose back-fill never reached this
+    /// chunk: the journal stalled, so tear down and reconnect rather than
+    /// ship a gap.
+    pub(super) fn stalled(&self, end_sequence: u64, sent: u64) -> io::Error {
+        if self.batch {
+            io::Error::other(format!(
+                "catch-up handoff: ring chunk starts at {} but the journal \
+                 stalled at {sent} — reconnecting",
+                self.first
+            ))
+        } else {
+            io::Error::other(format!(
+                "catch-up handoff: control frame at boundary {end_sequence} but the \
+                 journal stalled at {sent} — reconnecting"
+            ))
+        }
     }
 }
 

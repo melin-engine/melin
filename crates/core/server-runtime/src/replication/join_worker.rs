@@ -57,15 +57,24 @@ use super::validation_worker::{WorkerGone, spawn_unpinned};
 /// worker wait for the wire, rather than read the disk ahead of it.
 const JOIN_FRAMES_IN_FLIGHT: usize = 4;
 
-/// What the worker needs to know about the replica it brings up.
+/// A piece of a join's disk side for the worker to stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct JoinRequest {
-    /// The replica's handshake position.
-    pub(crate) last_sequence: u64,
-    /// The handshake validation found the replica's chain divergent: it
-    /// gets the `HashMismatch` verdict and a snapshot, whatever its
-    /// position.
-    pub(crate) divergent: bool,
+pub(crate) enum JoinRequest {
+    /// Bring a replica up to date: the probe, then journal history or a
+    /// snapshot and history (see [`stream_join`]).
+    Replica {
+        /// The replica's handshake position.
+        last_sequence: u64,
+        /// The handshake validation found the replica's chain divergent:
+        /// it gets the `HashMismatch` verdict and a snapshot, whatever its
+        /// position.
+        divergent: bool,
+    },
+    /// One journal pass of the catch-up→live handoff (the residual pass,
+    /// or a back-fill): every entry on disk past `from`. The handoff on
+    /// the poll thread decides when to ask for one; see
+    /// `melin_transport_core::replication::handoff`.
+    HandoffPass { from: u64 },
 }
 
 /// One message from the worker to the slot, in wire order.
@@ -288,9 +297,84 @@ impl JoinStream {
     }
 }
 
+impl JoinStream {
+    /// Whether the socket refused the last frame offered, which waits to
+    /// be offered again: the join is waiting on the replica, not the disk.
+    pub(crate) fn is_blocked(&self) -> bool {
+        self.held.is_some()
+    }
+}
+
 impl Drop for JoinStream {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Watches a join for a replica that has stopped draining it (the DPDK
+/// sender drops one stalled past its `JOIN_STALL_LIMIT`).
+///
+/// The join is stalled while the socket refuses what it has to send — a
+/// frame held for the next tick — and not otherwise: a join waiting on
+/// its disk (the worker reading a snapshot, a pass reading the journal)
+/// has nothing for the replica, and is bounded elsewhere or not at all,
+/// as the disk is not the replica's doing. Any byte the socket takes ends
+/// the stall.
+///
+/// Nothing counts as a stall until the watch is [armed](Self::arm), which
+/// the sender does on the replica's first ack of the join. Before it, a
+/// replica that reads nothing may be doing what the join asked of it: a
+/// replica installing a snapshot tears its pipeline down, loads the
+/// snapshot and rebuilds the seed's chain without reading its socket, for
+/// as long as its state takes, while the primary has already queued the
+/// seed and the catch-up behind it. A replica acks only from its streaming
+/// loop, once that install is behind it, and from then on it reads as fast
+/// as its journal takes entries: a replica that has acked and then refuses
+/// everything for the limit has stopped, which is what the watch is for.
+#[derive(Debug, Default)]
+pub(crate) struct JoinStallWatch {
+    /// Whether the replica has acked anything in this join (see above).
+    /// Stays set for the rest of the join, across its phases.
+    armed: bool,
+    /// When the current stall began; `None` while the join is draining,
+    /// waiting on the disk, or not armed.
+    since: Option<std::time::Instant>,
+}
+
+impl JoinStallWatch {
+    /// The replica has acked: from now on, a refusal with nothing taken is
+    /// a stall. Idempotent.
+    pub(crate) fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Record one tick of the join: whether the socket took any bytes
+    /// (`moved`), and whether, at the end of it, the socket is refusing
+    /// what the join has to send (`blocked`). Returns how long the join
+    /// has been stalled, zero when it is not or the watch is not armed.
+    pub(crate) fn observe(
+        &mut self,
+        moved: bool,
+        blocked: bool,
+        now: std::time::Instant,
+    ) -> std::time::Duration {
+        self.since = match (self.armed, blocked, moved) {
+            // Not armed: a stall counts from the first refusal seen armed,
+            // never from before the replica acked. Not refused: no stall.
+            (false, _, _) | (true, false, _) => None,
+            // Progress this tick: the stall, if any, starts afresh.
+            (true, true, true) => Some(now),
+            (true, true, false) => Some(self.since.unwrap_or(now)),
+        };
+        self.since.map_or(std::time::Duration::ZERO, |since| {
+            now.saturating_duration_since(since)
+        })
+    }
+
+    /// End the current stall, if any, keeping the watch armed: the join
+    /// moved on to a phase that starts with nothing refused.
+    pub(crate) fn restart(&mut self) {
+        self.since = None;
     }
 }
 
@@ -314,6 +398,9 @@ pub(crate) struct JoinContext {
 /// behind) and the snapshot transfer, which ends in its own `StreamStart`
 /// and catch-up. Returns the last sequence streamed.
 ///
+/// A [`JoinRequest::HandoffPass`] is one journal catch-up pass from its
+/// position, for the handoff that follows.
+///
 /// The snapshot route's pre-flight runs before the verdict is published:
 /// the replica archives its lineage on the verdict, so a snapshot that
 /// cannot be produced must fail the join with nothing sent (see
@@ -327,8 +414,26 @@ pub(crate) fn stream_join<E: AppEvent>(
     cancel: &AtomicBool,
 ) -> io::Result<u64> {
     let journal_path = ctx.journal_path.as_path();
-    let can_catch_up = !request.divergent
-        && can_catch_up_from_journal(journal_path, request.last_sequence)
+    let (last_sequence, divergent) = match *request {
+        JoinRequest::Replica {
+            last_sequence,
+            divergent,
+        } => (last_sequence, divergent),
+        JoinRequest::HandoffPass { from } => {
+            return match catch_up_from_journal_with::<E>(journal_path, from, publish, cancel)? {
+                CatchUpResult::Ok(end) => Ok(end),
+                // The pass before this one streamed up to `from`; only a
+                // concurrent archive prune loses its start point. The
+                // replica re-handshakes and is routed to a snapshot.
+                CatchUpResult::NeedSnapshot => Err(io::Error::other(
+                    "journal history pruned during catch-up handoff — reconnect for snapshot \
+                     transfer",
+                )),
+            };
+        }
+    };
+    let can_catch_up = !divergent
+        && can_catch_up_from_journal(journal_path, last_sequence)
             .map_err(|e| io::Error::other(format!("catch-up probe: {e}")))?;
 
     let mut frame = Vec::with_capacity(128);
@@ -337,7 +442,7 @@ pub(crate) fn stream_join<E: AppEvent>(
         // from the same header.
         let origin = lineage_origin(journal_path)?;
         encode_stream_start(
-            request.last_sequence,
+            last_sequence,
             origin.starting_sequence,
             origin.anchor_hash,
             origin.genesis_entries,
@@ -346,9 +451,9 @@ pub(crate) fn stream_join<E: AppEvent>(
             &mut frame,
         );
         publish(&frame)?;
-        catch_up_from_journal_with::<E>(journal_path, request.last_sequence, publish, cancel)?
+        catch_up_from_journal_with::<E>(journal_path, last_sequence, publish, cancel)?
     } else {
-        if request.divergent {
+        if divergent {
             encode_hash_mismatch(&mut frame);
         } else {
             encode_need_snapshot(&mut frame);
@@ -393,7 +498,7 @@ mod tests {
     }
 
     fn request() -> JoinRequest {
-        JoinRequest {
+        JoinRequest::Replica {
             last_sequence: 0,
             divergent: false,
         }
@@ -595,34 +700,27 @@ mod tests {
         let worker = JoinWorker::spawn(
             "test-join".into(),
             |req: &JoinRequest, publish: CatchUpPublisher<'_>, cancel: &AtomicBool| {
+                let JoinRequest::HandoffPass { from } = *req else {
+                    panic!("this test submits passes only");
+                };
                 // Far more than the channel holds: the first join blocks
                 // on it once the slot stops pumping.
                 for _ in 0..1000 {
                     if cancel.load(Ordering::Acquire) {
                         break;
                     }
-                    publish(&req.last_sequence.to_le_bytes())?;
+                    publish(&from.to_le_bytes())?;
                 }
-                Ok(req.last_sequence)
+                Ok(from)
             },
         )
         .unwrap();
-        let abandoned = worker
-            .submit(JoinRequest {
-                last_sequence: 1,
-                divergent: false,
-            })
-            .unwrap();
+        let abandoned = worker.submit(JoinRequest::HandoffPass { from: 1 }).unwrap();
         // Let the worker fill the channel, then walk away.
         std::thread::sleep(Duration::from_millis(50));
         drop(abandoned);
 
-        let mut stream = worker
-            .submit(JoinRequest {
-                last_sequence: 2,
-                divergent: false,
-            })
-            .unwrap();
+        let mut stream = worker.submit(JoinRequest::HandoffPass { from: 2 }).unwrap();
         let (sent, result) = pump_to_end(&mut stream);
         assert_eq!(sent.len(), 1000);
         assert!(sent.iter().all(|f| f == &2u64.to_le_bytes()));
@@ -764,7 +862,7 @@ mod tests {
             let ctx = ctx(journal(dir.path(), 5));
             let (sent, result) = run(
                 &ctx,
-                JoinRequest {
+                JoinRequest::Replica {
                     last_sequence: 2,
                     divergent: false,
                 },
@@ -793,7 +891,7 @@ mod tests {
             let ctx = ctx(journal(dir.path(), 3));
             let (sent, result) = run(
                 &ctx,
-                JoinRequest {
+                JoinRequest::Replica {
                     last_sequence: 2,
                     divergent: true,
                 },
@@ -805,5 +903,136 @@ mod tests {
                 sent.len()
             );
         }
+
+        /// A handoff pass streams what is on disk past its position, and
+        /// nothing else: no `StreamStart`, no probe's verdict.
+        #[test]
+        fn a_handoff_pass_streams_only_the_entries_past_its_position() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = ctx(journal(dir.path(), 5));
+            let (sent, result) = run(&ctx, JoinRequest::HandoffPass { from: 3 });
+            assert_eq!(result.unwrap(), 5);
+            let seqs: Vec<u64> = sent
+                .iter()
+                .flat_map(|frame| {
+                    melin_transport_core::replication_wire::try_decode_input_batch::<CounterEvent>(
+                        &frame[4..],
+                    )
+                    .expect("only InputBatch frames")
+                    .into_iter()
+                    .map(|slot| slot.sequence)
+                })
+                .collect();
+            assert_eq!(seqs, [4, 5]);
+
+            // Nothing new: the pass ends where it began.
+            let (sent, result) = run(&ctx, JoinRequest::HandoffPass { from: 5 });
+            assert_eq!(result.unwrap(), 5);
+            assert!(sent.is_empty());
+        }
+    }
+
+    /// The stall clock runs only while the socket refuses what the join
+    /// has to send, restarts on any progress, and stops while the join
+    /// waits on its disk.
+    #[test]
+    fn the_stall_watch_counts_only_refusals_without_progress() {
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut watch = JoinStallWatch::default();
+        watch.arm();
+
+        // Draining: no stall.
+        assert_eq!(watch.observe(true, false, at(0)), Duration::ZERO);
+        // Refused with nothing taken: the stall starts, and grows.
+        assert_eq!(watch.observe(false, true, at(10)), Duration::ZERO);
+        assert_eq!(
+            watch.observe(false, true, at(1_010)),
+            Duration::from_secs(1)
+        );
+        // Some bytes taken, then refused again: it starts afresh.
+        assert_eq!(watch.observe(true, true, at(2_000)), Duration::ZERO);
+        assert_eq!(
+            watch.observe(false, true, at(7_000)),
+            Duration::from_secs(5)
+        );
+        // Waiting on the disk with nothing refused: not the replica's
+        // doing, so no stall, however long.
+        assert_eq!(watch.observe(false, false, at(60_000)), Duration::ZERO);
+        assert_eq!(watch.observe(false, true, at(61_000)), Duration::ZERO);
+    }
+
+    /// Before the replica's first ack, nothing is a stall however long the
+    /// socket refuses (a replica installing a snapshot reads nothing for as
+    /// long as its state takes to load); once armed, the stall counts from
+    /// the first refusal seen armed, not from before.
+    #[test]
+    fn the_stall_watch_counts_nothing_before_the_replica_acks() {
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut watch = JoinStallWatch::default();
+
+        assert_eq!(watch.observe(false, true, at(0)), Duration::ZERO);
+        assert_eq!(watch.observe(false, true, at(600_000)), Duration::ZERO);
+
+        watch.arm();
+        assert_eq!(watch.observe(false, true, at(601_000)), Duration::ZERO);
+        assert_eq!(
+            watch.observe(false, true, at(603_000)),
+            Duration::from_secs(2)
+        );
+        // Arming again changes nothing.
+        watch.arm();
+        assert_eq!(
+            watch.observe(false, true, at(604_000)),
+            Duration::from_secs(3)
+        );
+    }
+
+    /// A restart ends the current stall but keeps the watch armed: the
+    /// next phase's refusals count from their own start.
+    #[test]
+    fn a_restarted_stall_watch_stays_armed() {
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut watch = JoinStallWatch::default();
+        watch.arm();
+        assert_eq!(watch.observe(false, true, at(0)), Duration::ZERO);
+        assert_eq!(
+            watch.observe(false, true, at(4_000)),
+            Duration::from_secs(4)
+        );
+
+        watch.restart();
+        assert_eq!(watch.observe(false, true, at(5_000)), Duration::ZERO);
+        assert_eq!(
+            watch.observe(false, true, at(6_000)),
+            Duration::from_secs(1),
+            "still armed after the restart"
+        );
+    }
+
+    /// The stream reports a frame the socket refused as a stall on the
+    /// replica, and a wait on the worker as none.
+    #[test]
+    fn a_held_frame_reads_as_blocked() {
+        let worker = JoinWorker::spawn("test-join".into(), frames_job(2)).unwrap();
+        let mut stream = worker.submit(request()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(!stream.is_blocked());
+            match stream.pump(usize::MAX, usize::MAX, |_| false) {
+                Pump::Pending { queued: 0 } if stream.is_blocked() => break,
+                Pump::Pending { .. } => {
+                    assert!(std::time::Instant::now() < deadline, "no frame came");
+                    std::thread::yield_now();
+                }
+                other => panic!("expected a refused frame, got {other:?}"),
+            }
+        }
+        let (sent, result) = pump_to_end(&mut stream);
+        assert_eq!(sent.len(), 2);
+        assert!(!stream.is_blocked());
+        assert_eq!(result.unwrap(), 2);
     }
 }

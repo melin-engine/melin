@@ -325,6 +325,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the node served on kernel TCP, giving up kernel bypass without a word.
   A promoted DPDK replica now becomes a DPDK primary, through the same
   steps as a kernel-TCP promotion, on the transport it ran on.
+- **A DPDK replica that stopped reading as it finished catching up froze
+  its primary's clients.** The last step of a replica's join, the
+  switch from catch-up to the live stream, ran on the poll thread that
+  also carries client traffic, and waited there for room in the
+  replica's socket. A replica that stopped reading at that moment, or
+  died then, held every client for as long as its socket stayed open:
+  indefinitely, for one that stayed connected. The switch now advances a
+  little at a time between the poll thread's other work, reading the
+  disk on the slot's worker, exactly as the catch-up before it does, and
+  sends the same entries in the same order. A joining replica that has
+  started acknowledging entries and then takes nothing the primary has
+  for it for five seconds (the replication liveness timeout) is dropped
+  and reconnects, rather than keeping its slot for as long as it stays
+  silent. Before its first acknowledgement it is never dropped for
+  reading nothing, so a replica installing a large snapshot may take as
+  long as its state needs to load; one that stops reading once its ring
+  is active is still evicted when the ring fills, as before. Kernel-TCP
+  primaries are unchanged: each replica's join runs on its own thread.
 
 ## [0.18.0] - 2026-09-27
 
