@@ -17,6 +17,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Add
 use crate::device::DpdkDevice;
 use crate::eal::Eal;
 use crate::mempool::Mempool;
+use crate::peer_liveness::{self, PeerLiveness, StackClock};
 use crate::port::{ChecksumOffloads, Port};
 
 /// Apply low-latency TCP tuning to a smoltcp socket.
@@ -244,7 +245,7 @@ struct ListenerEntry {
 pub struct DpdkShared {
     _ports: Vec<Port>,
     _mempool: Mempool,
-    _eal: Eal,
+    _eal: NodeEal,
     /// Intersection of all ports' checksum offload capabilities.
     pub offloads: ChecksumOffloads,
     /// MAC address of the first port (used for all smoltcp interfaces).
@@ -263,6 +264,30 @@ pub struct DpdkShared {
 unsafe impl Send for DpdkShared {}
 unsafe impl Sync for DpdkShared {}
 
+/// The EAL a node's resources sit on.
+///
+/// An enum rather than always borrowing a process-wide EAL: a node that
+/// owns its EAL must still clean it up last, after its ports and pool, so
+/// that a deployed node's teardown is the one it has always had.
+enum NodeEal {
+    /// Initialized for this node from its EAL arguments and cleaned up
+    /// when the node's resources drop: one node per process, as deployed.
+    Own(Eal),
+    /// The process-wide EAL ([`Eal::init_process_wide`]), shared with the
+    /// process's other nodes. Dropping the node leaves it be: it is never
+    /// cleaned up, so the next node can still use it.
+    ProcessWide(&'static Eal),
+}
+
+impl NodeEal {
+    fn eal(&self) -> &Eal {
+        match self {
+            NodeEal::Own(eal) => eal,
+            NodeEal::ProcessWide(eal) => eal,
+        }
+    }
+}
+
 /// Per-thread DPDK transport. Owns its own smoltcp Interface and
 /// SocketSet. Each poll thread gets one of these.
 ///
@@ -273,7 +298,8 @@ pub struct DpdkTransport {
     sockets: SocketSet<'static>,
     /// (port, handle) for every TCP listening socket the transport
     /// currently maintains. Initialised with one entry from
-    /// `config.listen_port`; callers can add more via `add_listener`.
+    /// `config.listen_port` (none for `from_shared_unlistening`); callers
+    /// can add more via `add_listener`.
     /// `check_listener` iterates this list, accepts any socket that
     /// transitioned to Established, and replaces it with a fresh
     /// listener on the same port — so the slot for that port stays
@@ -290,6 +316,8 @@ pub struct DpdkTransport {
     /// Defaults to `MAX_TX_QUEUE_SIZE`; overridden for replication sockets
     /// via `add_listener_with_buffers`.
     tx_queue_limits: Vec<usize>,
+    /// The stack's monotonic clock, read into `cached_timestamp`.
+    clock: StackClock,
     /// Cached smoltcp timestamp. Refreshed periodically, not every poll.
     cached_timestamp: Instant,
     /// Poll iteration counter for timestamp refresh.
@@ -366,11 +394,28 @@ impl TxQueue {
 impl DpdkShared {
     /// Initialize shared DPDK resources: EAL, mempool, ports.
     /// Call once before spawning poll threads.
+    ///
+    /// EAL is initialized here from `config.eal_args`, and cleaned up when
+    /// the resources drop — unless the process runs a process-wide EAL
+    /// ([`Eal::init_process_wide`]), which the node then shares: its EAL
+    /// arguments must be empty, its ports must be its own, and dropping it
+    /// leaves EAL running for the process's other nodes.
     pub fn init(config: &DpdkConfig) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
-        let eal = Eal::init(&eal_args)?;
+        let eal = match Eal::process_wide() {
+            None => {
+                let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
+                NodeEal::Own(Eal::init(&eal_args)?)
+            }
+            Some(eal) => {
+                // A failed process-wide init is final: report its error
+                // rather than attempting a second `rte_eal_init`.
+                let eal = eal?;
+                crate::eal_sharing::check_shared_eal_args(&config.eal_args)?;
+                NodeEal::ProcessWide(eal)
+            }
+        };
 
-        let port_count = eal.port_count();
+        let port_count = eal.eal().port_count();
         if config.port_ids.is_empty() {
             return Err("DPDK transport requires at least one port id".into());
         }
@@ -406,10 +451,14 @@ impl DpdkShared {
         // Scale mempool for number of queues and ports.
         let num_mbufs: u32 =
             8192 * (config.port_ids.len() as u32).max(1) * (config.num_queues as u32).max(1);
+        let pool_name = crate::eal_sharing::mempool_name(
+            matches!(eal, NodeEal::ProcessWide(_)),
+            config.port_ids[0],
+        );
         let mempool = if config.mtu > 1500 {
-            Mempool::create_for_mtu("pktmbuf_pool", num_mbufs, config.mtu as u16, socket_id)?
+            Mempool::create_for_mtu(&pool_name, num_mbufs, config.mtu as u16, socket_id)?
         } else {
-            Mempool::create_with_size("pktmbuf_pool", num_mbufs, socket_id)?
+            Mempool::create_with_size(&pool_name, num_mbufs, socket_id)?
         };
 
         // Configure and start all ports with N queue pairs.
@@ -465,6 +514,30 @@ impl DpdkTransport {
         config: &DpdkConfig,
         queue_id: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::build(shared, config, queue_id, Some(config.listen_port))
+    }
+
+    /// Like [`Self::from_shared`], but listening on no port: for a
+    /// transport that only dials out, such as a replica's link to its
+    /// primary. The stack refuses (RST) a connection attempt to any port of
+    /// it. Listeners can be added later with [`Self::add_listener`]: a
+    /// promoted replica adds its client port to the transport it ran on.
+    pub fn from_shared_unlistening(
+        shared: &Arc<DpdkShared>,
+        config: &DpdkConfig,
+        queue_id: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::build(shared, config, queue_id, None)
+    }
+
+    /// The constructors' common body: `listen_port` is the port of the
+    /// transport's first listener, with the client buffer sizes, or none.
+    fn build(
+        shared: &Arc<DpdkShared>,
+        config: &DpdkConfig,
+        queue_id: u16,
+        listen_port: Option<u16>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut device = DpdkDevice::new(
             &config.port_ids,
             shared.mempool_raw,
@@ -481,12 +554,8 @@ impl DpdkTransport {
 
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(shared.mac));
         let iface_config = Config::new(hw_addr);
-        let now = Instant::from_millis(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is before UNIX epoch")
-                .as_millis() as i64,
-        );
+        let clock = StackClock::start();
+        let now = clock.now();
         let mut iface = Interface::new(iface_config, &mut DpdkDeviceRef(&device), now);
 
         let ip = Ipv4Address::new(
@@ -516,47 +585,60 @@ impl DpdkTransport {
 
         let mut sockets = SocketSet::new(Vec::with_capacity(MAX_CONNECTIONS));
 
-        let listen_socket = {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
-            let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-            tune_socket(&mut socket);
-            socket
-                .listen(config.listen_port)
-                .map_err(|e| format!("TCP listen failed: {e}"))?;
-            socket
-        };
-        let listen_handle = sockets.add(listen_socket);
-
-        tracing::info!(
-            ip = %config.ip_addr,
-            port = config.listen_port,
-            mac = ?shared.mac,
-            queue_id,
-            "DPDK transport initialized"
-        );
-
-        let mut transport = DpdkTransport {
-            _shared: Arc::clone(shared),
-            device,
-            iface,
-            sockets,
-            listeners: vec![ListenerEntry {
-                port: config.listen_port,
-                handle: listen_handle,
+        // A `Vec`, as `listeners` is: a transport holds one or two.
+        let mut listeners = Vec::with_capacity(2);
+        if let Some(port) = listen_port {
+            let listen_socket = {
+                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
+                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
+                let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+                tune_socket(&mut socket);
+                socket
+                    .listen(port)
+                    .map_err(|e| format!("TCP listen failed: {e}"))?;
+                socket
+            };
+            listeners.push(ListenerEntry {
+                port,
+                handle: sockets.add(listen_socket),
                 rx_buf_size: SOCKET_RX_BUF_SIZE,
                 tx_buf_size: SOCKET_TX_BUF_SIZE,
                 tx_queue_limit: MAX_TX_QUEUE_SIZE,
                 // Client port: keep the fan-in default so one client's burst
                 // cannot delay its peers within an egress pass.
                 dispatch_burst_limit: tcp::DEFAULT_DISPATCH_BURST_LIMIT,
-            }],
+            });
+        }
+
+        match listen_port {
+            Some(port) => tracing::info!(
+                ip = %config.ip_addr,
+                port,
+                mac = ?shared.mac,
+                queue_id,
+                "DPDK transport initialized"
+            ),
+            None => tracing::info!(
+                ip = %config.ip_addr,
+                mac = ?shared.mac,
+                queue_id,
+                "DPDK transport initialized (no listener)"
+            ),
+        }
+
+        let mut transport = DpdkTransport {
+            _shared: Arc::clone(shared),
+            device,
+            iface,
+            sockets,
+            listeners,
             accepted: Vec::new(),
             // Pre-allocate all MAX_CONNECTIONS slots so index lookup is
             // always in-bounds. Each empty slot is a single discriminant
             // tag — no heap allocation per slot.
             tx_queues: (0..MAX_CONNECTIONS).map(|_| None).collect(),
             tx_queue_limits: vec![MAX_TX_QUEUE_SIZE; MAX_CONNECTIONS],
+            clock,
             cached_timestamp: now,
             poll_count: 0,
             pending_tx_bytes: 0,
@@ -576,22 +658,6 @@ impl DpdkTransport {
         }
 
         Ok(transport)
-    }
-
-    /// Like `from_shared` but overrides the listen port.
-    ///
-    /// Used by the replication sender to listen on the replication port
-    /// instead of the client port, while sharing the same DPDK NIC and
-    /// IP address.
-    pub fn from_shared_with_port(
-        shared: &Arc<DpdkShared>,
-        config: &DpdkConfig,
-        queue_id: u16,
-        listen_port: u16,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut overridden = config.clone();
-        overridden.listen_port = listen_port;
-        Self::from_shared(shared, &overridden, queue_id)
     }
 
     /// Open an outbound TCP connection to a remote endpoint.
@@ -665,9 +731,14 @@ impl DpdkTransport {
     /// for data transfer (both send and receive directions open). A
     /// handle that has been removed (caller raced a `close`) reads as
     /// "not connected" — never panic on the caller's behalf.
+    ///
+    /// Unlike [`Self::is_active`], false once the peer has closed its
+    /// half (its FIN), as soon as the bytes it sent before are read: the
+    /// test for a link that needs both directions. See `link_up` in
+    /// [`crate::peer_liveness`].
     pub fn is_connected(&mut self, handle: SocketHandle) -> bool {
         match self.sockets.try_get_mut::<tcp::Socket>(handle) {
-            Some(socket) => socket.may_send() && socket.may_recv(),
+            Some(socket) => peer_liveness::link_up(socket),
             None => {
                 tracing::warn!(
                     handle = ?handle,
@@ -689,15 +760,11 @@ impl DpdkTransport {
     /// Run one poll iteration.
     pub fn poll(&mut self) -> Instant {
         // Refresh the smoltcp timestamp periodically, not every poll.
-        // smoltcp only needs ms-precision for TCP retransmit/keepalive timers.
+        // smoltcp only needs ms-precision for TCP retransmit/keepalive timers,
+        // but a monotonic clock (see `StackClock`).
         self.poll_count = self.poll_count.wrapping_add(1);
         if self.poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
-            self.cached_timestamp = Instant::from_millis(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock is before UNIX epoch")
-                    .as_millis() as i64,
-            );
+            self.cached_timestamp = self.clock.now();
         }
 
         // Batch ingress: poll all ports in one pass. MAC learning happens
@@ -1103,6 +1170,43 @@ impl DpdkTransport {
         }
         if let Some(q) = self.tx_queues[handle.index()].take() {
             self.pending_tx_bytes -= q.queued_bytes();
+        }
+    }
+
+    /// Close a connection like [`Self::close`], but tell the peer: the
+    /// socket's RST goes out before it is removed, so the peer's stack
+    /// ends the connection at once instead of waiting on its own
+    /// deadline. For links whose peer acts on the end of the session
+    /// (replication); unsent data is discarded, so a caller with a last
+    /// frame to deliver waits on [`Self::tx_drained`] first.
+    ///
+    /// Idempotent like `close`. See `abort_announced` in
+    /// [`crate::peer_liveness`].
+    pub fn reset(&mut self, handle: SocketHandle) {
+        // Whatever is still queued above the socket would never be sent:
+        // the socket is aborted below. Drop it first so the egress pass
+        // does not hand it to the socket.
+        if let Some(q) = self.tx_queues[handle.index()].take() {
+            self.pending_tx_bytes -= q.queued_bytes();
+        }
+        peer_liveness::abort_announced(
+            &mut self.iface,
+            &mut self.device,
+            &mut self.sockets,
+            handle,
+            self.cached_timestamp,
+        );
+        self.device.flush_tx();
+        self.close(handle);
+    }
+
+    /// Arm `liveness` on an established connection: probe it while idle,
+    /// and reset it once the peer has been silent for the rule's timeout,
+    /// after which [`Self::is_active`] reads false. A stale handle is
+    /// ignored (it has nothing left to watch).
+    pub fn set_peer_liveness(&mut self, handle: SocketHandle, liveness: &PeerLiveness) {
+        if let Some(socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) {
+            liveness.apply(socket);
         }
     }
 

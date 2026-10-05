@@ -7,6 +7,13 @@ why. Some differences are deliberate, and those are marked.
 
 Paths are relative to `crates/core/server-runtime/src/`.
 
+The DPDK side of an entry can be exercised without hardware: the
+integration suites run on DPDK over veth (`dpdk-testing.md`). A test that
+fails on an entry is left out of the `dpdk` nextest profile
+(`.config/nextest.toml`), under the entry's name, until the entry is
+fixed. An entry says which tests cover it or are left out on it; the
+others have no DPDK test yet.
+
 ## Client ingress
 
 ### DPDK closes a client connection without telling the peer
@@ -17,6 +24,32 @@ client connection is affected, a failed auth included: the client gets
 `AuthFailed` and then silence. `melin-client` returns on the error frame and is
 unaffected, but a client that waits for EOF hangs until it next sends. io_uring
 closes the socket, so the peer sees EOF.
+
+Pinned by `a_server_side_close_is_silent` in the DPDK veth tests
+(`crates/core/server-runtime/tests/dpdk_veth/`): no FIN or RST within a
+read timeout after the close, and an RST answering the client's next send.
+The fix flips that test to require the EOF.
+
+Replication links no longer close this way: they go through
+`DpdkTransport::reset`, which sends the RST before removing the socket
+(see "Peer liveness on replication links" in `dpdk-replication.md`). A
+client close could use the same call, or a graceful FIN, which needs the
+socket kept until the FIN is acknowledged.
+
+### DPDK does not see a client's close (likely bug)
+
+`dpdk_transport.rs`, the read path. A connection is released when a
+zero-byte read finds the socket no longer active. A client's FIN moves the
+smoltcp socket to CloseWait, which still counts as active, so the node keeps
+the connection, its slot and its socket. They are released only when the
+next heartbeat is answered with an RST, at the idle timeout with heartbeats
+off, or never with both off. Until then a node at `max_connections` turns
+new clients away. io_uring releases the connection on EOF. The fix is to treat a
+zero-byte read on a socket that can no longer receive as a close.
+
+Pinned by `a_client_close_is_seen_only_at_the_next_heartbeat` in the DPDK
+veth tests: no slot within a few seconds of the close, one after the
+heartbeat. The fix flips that test to require the slot back promptly.
 
 ### DPDK `PipelineFull` drops the client instead of sending ServerBusy
 
@@ -90,8 +123,9 @@ minutes on a nearly saturated stage.
 ### DPDK sender `Handshaking` state has no deadline
 
 `replication/dpdk.rs`. `AUTH_TIMEOUT` covers `Authenticating` only. An
-authenticated replica that then stays silent holds a slot until it
-disconnects. TCP's 10 s read timeout covers it.
+authenticated replica that is still running but sends no Handshake holds
+a slot until it disconnects (one that has stopped is reset by the link's
+liveness deadline). TCP's 10 s read timeout covers both.
 
 ### TCP receiver leaks the replica pipeline on handshake errors (likely bug)
 
@@ -111,6 +145,22 @@ off and reconnects.
 
 `replication/dpdk.rs`. A dropped Handshake frame leaves both sides waiting.
 Combined with the sender's missing `Handshaking` deadline, that hangs the slot.
+
+## Primary startup
+
+### DPDK never runs the event publisher (likely bug)
+
+`server.rs`, `run_as_primary_dpdk`. With `--event-bind` set and a binary
+that supplies an event publisher, the DPDK primary gives the publisher
+its consumer on the output ring, as kernel TCP does, but never spawns the
+publisher thread. The output ring's producer is gated on its slowest
+consumer, so once the matching stage has produced a ring's worth of
+output past that idle consumer it waits for good: the node stops
+answering. Kernel TCP spawns the publisher (`spawn_event_publisher`),
+whose endpoint is kernel TCP by design and would serve a DPDK node
+unchanged. No example supplies a publisher, so no test reaches it. Found
+while sharing the DPDK primary path with promotion, which kept the
+startup as it was.
 
 ## Deliberate differences (no action)
 

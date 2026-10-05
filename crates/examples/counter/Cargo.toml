@@ -35,10 +35,12 @@ clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-# The round trip talks to the server through the client crate, and binds
-# the server's listener itself so it can take a kernel-assigned port.
+# The round trip talks to the server through the client crate, and starts
+# it through the shared launcher: on kernel TCP or, with `dpdk`, on DPDK.
+# The launcher is path-only for the reason the runtime's dev-dependency
+# on this crate is: `publish = false`, so no version.
 melin-client = { workspace = true }
-melin-wire-protocol = { workspace = true }
+melin-test-node = { path = "../../core/test-node" }
 tempfile = "3"
 
 [features]
@@ -48,3 +50,8 @@ default = ["hash-chain"]
 # the chain itself, the way a real deployment's crate does. On by default
 # for the same reason the runtime's is.
 hash-chain = ["melin-server-runtime/hash-chain"]
+# The DPDK transport, for the server binary and for the round-trip tests,
+# which then run their nodes on a veth pair and must be run under
+# `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-testing.md`).
+# Needs libdpdk to build, so never on by default.
+dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk"]

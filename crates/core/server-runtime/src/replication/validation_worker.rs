@@ -82,32 +82,10 @@ impl ValidationWorker {
         F: Fn(&std::path::Path, &Handshake) -> io::Result<HandshakeValidation> + Send + 'static,
     {
         let (jobs_tx, jobs_rx) = channel::<ValidationJob>();
-
-        // Hand the worker its scheduling context before it exists — see
-        // the module docs. `0` is the unpinned sentinel: this thread
-        // sleeps between retries and does blocking file I/O, so it wants
-        // the process's home CPU mask, not a reserved core.
-        let saved = melin_app::affinity::take_context();
-        if let Err(ref e) = saved {
-            tracing::warn!(worker = %name, error = %e, "cannot snapshot scheduling context");
-        }
-        if let Err(e) = melin_app::affinity::prepare_child_context(0) {
-            tracing::warn!(worker = %name, error = %e, "cannot prepare child context");
-        }
-        let spawned = std::thread::Builder::new()
-            .name(name.clone())
-            .spawn(move || worker_loop(journal_path, jobs_rx, validate));
-        // Restore before propagating a spawn failure: a failed spawn must
-        // not strand the caller on the child's (unpinned) context.
-        if let Ok(ctx) = saved
-            && let Err(e) = melin_app::affinity::restore_context(&ctx)
-        {
-            tracing::error!(worker = %name, error = %e, "caller could not restore its own affinity");
-        }
-
+        let handle = spawn_unpinned(name, move || worker_loop(journal_path, jobs_rx, validate))?;
         Ok(ValidationWorker {
             jobs: Some(jobs_tx),
-            handle: Some(spawned?),
+            handle: Some(handle),
         })
     }
 
@@ -142,18 +120,50 @@ impl Drop for ValidationWorker {
         if let Some(handle) = self.handle.take()
             && handle.join().is_err()
         {
-            tracing::warn!("handshake validation worker panicked");
+            // `error!`: the worker only dies by panicking, a bug in us.
+            tracing::error!("handshake validation worker panicked");
         }
     }
 }
 
-/// The worker thread is gone (it panicked); no verdict will ever arrive.
+/// Spawn a long-lived replication worker thread named `name`, unpinned
+/// and under `SCHED_OTHER` whoever calls it — see the module docs for why
+/// a thread inheriting a pinned, real-time poll thread's context would
+/// never run. Shared by every parked worker the DPDK sender keeps (this
+/// one, and the join worker).
+pub(super) fn spawn_unpinned(
+    name: String,
+    body: impl FnOnce() + Send + 'static,
+) -> io::Result<JoinHandle<()>> {
+    // Hand the worker its scheduling context before it exists. `0` is the
+    // unpinned sentinel: these threads sleep and do blocking file I/O, so
+    // they want the process's home CPU mask, not a reserved core.
+    let saved = melin_app::affinity::take_context();
+    if let Err(ref e) = saved {
+        tracing::warn!(worker = %name, error = %e, "cannot snapshot scheduling context");
+    }
+    if let Err(e) = melin_app::affinity::prepare_child_context(0) {
+        tracing::warn!(worker = %name, error = %e, "cannot prepare child context");
+    }
+    let spawned = std::thread::Builder::new().name(name.clone()).spawn(body);
+    // Restore before propagating a spawn failure: a failed spawn must
+    // not strand the caller on the child's (unpinned) context.
+    if let Ok(ctx) = saved
+        && let Err(e) = melin_app::affinity::restore_context(&ctx)
+    {
+        tracing::error!(worker = %name, error = %e, "caller could not restore its own affinity");
+    }
+    spawned
+}
+
+/// A parked replication worker's thread is gone (it panicked); nothing
+/// submitted to it will ever be answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkerGone;
 
 impl std::fmt::Display for WorkerGone {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("handshake validation worker is no longer running")
+        f.write_str("replication worker is no longer running")
     }
 }
 

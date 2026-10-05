@@ -188,6 +188,39 @@ primary. No reject reason names this case.
 Standalone deployments (no replication configured) skip this halt
 entirely and run under `disk`.
 
+### How a node notices that its peer has gone
+
+The halt above, and automatic failover below, both start from one end of
+a replication link noticing that the other has gone. When that happens
+depends on how the peer went and on the transport:
+
+- **A node that stops**, or drops the link (a replica it evicts, a
+  session it ends), tells its peer as it goes, on either transport. The
+  peer notices at once.
+- **A node that crashes** is announced by its kernel on kernel TCP: the
+  kernel closes the process's connections, and the peer notices at once.
+  A DPDK node is its own network stack, so nothing speaks for it once it
+  has crashed. Both ends of a DPDK link probe it every second while it
+  is idle and give up on a peer that has answered nothing for 5 seconds
+  (up to 10 when the end that notices was sending at the time). The
+  probes are answered by the peer's network stack, so a live peer whose
+  application is merely quiet is never taken for gone. A replica keeps
+  answering while it waits on its own disk or installs a snapshot, so a
+  slow replica disk does not count either: as on kernel TCP, the replica
+  stays connected while it catches up, and is evicted only if the
+  primary's replication ring for it fills, or, while it is still joining
+  and once it has begun acknowledging entries, if it takes nothing the
+  primary sends for those same 5 seconds (see "Fault isolation between
+  replica slots"). A node whose stack goes unanswered for the whole
+  5 seconds (its process frozen, or starved of CPU) is taken for gone,
+  and reconnects.
+- **A cut link, or a host that loses power**: on DPDK, as for a crash.
+  On kernel TCP the connection breaks when the kernel gives up
+  retransmitting to the peer, which takes much longer, and an end that
+  is not sending may not notice at all until the link is restored.
+
+None of this is configurable.
+
 ### Runtime policy swap
 
 The operator can change the active ack policy without restarting the
@@ -248,7 +281,10 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
   `acked_sequence` that advances once the local journal write is
   durable. Both fields are populated on every ack so the primary's
   gate can evaluate any policy without separate ack streams.
-- Does not accept client connections.
+- Does not serve clients. On kernel TCP a client's connection is left
+  unanswered (and is served if the replica is promoted while it waits);
+  on DPDK it is refused. Either way the client retries, or goes to the
+  primary.
 
 If the primary disconnects or evicts the replica, the receiver
 reconnects with exponential backoff (1 s → 30 s cap), keeping the state
@@ -284,11 +320,37 @@ journal that can only be repaired by reconnection + catch-up, so the
 primary refuses to publish past the gap. The surviving replica and
 client traffic are unaffected.
 
+A replica that joins, catching up from the primary's journal or
+receiving a snapshot and then switching to the live stream, is isolated
+the same way, on either transport: the primary reads what it sends off
+its disk away from the work that serves clients and the other replica,
+and never waits on the joining replica to take it. A large catch-up or
+snapshot on a slow disk, or a joining replica that falls behind or stops
+reading, delays that replica alone; the other replica keeps streaming,
+and keeps its link, and clients are served throughout.
+
+On DPDK, a joining replica that has begun acknowledging what it journals
+and then takes none of what its primary has for it for 5 seconds (the
+same silence after which a peer counts as gone) is dropped, and
+reconnects and resumes from what it has journaled; a replica whose disk
+is merely slow keeps taking data and is unaffected. Until its first
+acknowledgement a joining replica is never dropped for reading nothing:
+one installing a snapshot reads nothing while it loads the state, for as
+long as the state takes. Once the switch to the live stream has begun,
+a replica that stops reading is also evicted as soon as its ring fills,
+as a streaming one is. On kernel TCP a joining replica that stops
+reading keeps its slot until it disconnects, without holding up client
+traffic or the other replica.
+
 ## Manual promotion
 
 The admin endpoint accepts `PROMOTE` on a replica to switch it to
 primary mode in-process: the warm application state is reused directly,
-no journal re-replay, no snapshot reload. Sub-second switchover.
+no journal re-replay, no snapshot reload. Sub-second switchover. The
+promoted node serves on the transport it ran on, at the addresses it was
+configured with: a DPDK replica becomes a DPDK primary, serving clients
+on its client port and accepting replicas on `--replication-bind`, with
+kernel bypass kept. The same holds for an automatic failover (below).
 
 After promotion the new primary will halt new writes if it has no
 replicas connected (see above) — the operator's playbook is to either
@@ -374,7 +436,10 @@ itself: the election term is journaled as the new fencing epoch, so any
 two election-driven promotions always mint distinct epochs and the
 newer fences the older. Expect failover within several seconds: the
 election timeout (1–2 s), a short grace period confirming the primary is
-really gone (see below), and the promotion itself (sub-second).
+really gone (see below), and the promotion itself (sub-second). A
+replica's link counts as down only once it has noticed the primary has
+gone, which for a crashed DPDK primary takes a few seconds more (see "How
+a node notices that its peer has gone").
 
 Auto-promotion is deliberately conservative. The elected replica
 **refuses** to promote — logging the reason — when:

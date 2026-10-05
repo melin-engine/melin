@@ -1,0 +1,37 @@
+[package]
+name = "melin-test-node"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Test support: start nodes on kernel TCP, or on DPDK under the netns runner, from one entry point."
+# Test support only, pulled in as a dev-dependency: never shipped, and
+# kept out of every production build. A crate rather than a feature of
+# `melin-server-runtime` so that the runtime's own integration tests can
+# use it too (a dev-dependency cycle, as with `melin-example-counter`),
+# without a test-only switch on a published crate. Version-less in its
+# dependents for the same reason as the counter: see the root manifest.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+melin-app = { workspace = true }
+# Pulled without default features (see the root manifest): whether the
+# journal carries the hash chain is the test crate's choice, made through
+# its own dependency on the runtime, not this crate's.
+melin-server-runtime = { workspace = true }
+melin-wire-protocol = { workspace = true }
+# Only the DPDK side needs these: the process-wide EAL and the per-node
+# devices on it, and the CPU set for EAL's lcore.
+melin-dpdk = { workspace = true, optional = true, features = ["dpdk-sys"] }
+libc = { workspace = true, optional = true }
+
+[features]
+## Start nodes on the DPDK transport, on the network
+## `scripts/dpdk/netns-runner.sh` builds. Needs libdpdk to build.
+dpdk = ["melin-server-runtime/dpdk", "dep:melin-dpdk", "dep:libc"]

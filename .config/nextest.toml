@@ -11,11 +11,14 @@
 # Binaries are named exactly rather than matched by pattern. `binary()`
 # is an equality predicate: the previous `binary(failover)` matched
 # nothing at all (the binary is `raft_failover`), so the group sat empty
-# and these tests had been running fully parallel. Exact names are
-# self-policing — nextest treats a name that matches no binary as a hard
-# config error, so renaming or deleting one of these fails loudly
-# instead of silently emptying the group again. Adding a new
-# cluster-spawning test binary means adding it here.
+# and these tests had been running fully parallel. Exact names are not
+# self-policing: nextest accepts a name that matches no binary and the
+# group simply empties, so renaming or deleting one of these binaries
+# means updating it here, and adding a new cluster-spawning test binary
+# means adding it. `cargo nextest show-config test-groups` lists each
+# group's members (a group reported as `(no matches)` has lost them);
+# check `dpdk-serial` with `--features melin-server-runtime/dpdk`, since
+# its binary only exists in that build.
 #
 # A test that hangs — a fake peer that never answers, a read with no
 # deadline — would otherwise hang the pre-commit hook, and CI with it.
@@ -30,5 +33,36 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = 'binary(raft_failover) + binary(raft_smoke) + binary(startup_events) + binary(replicated_failover) + binary(halt_refusal) + binary(sizing) + binary(genesis_promotion)'
 test-group = 'cluster-serial'
 
+# The DPDK transport on veth (`melin-server-runtime`, built only with its
+# `dpdk` feature). Each test runs a node whose poll thread busy-polls a
+# core, so they go one at a time. A group of their own rather than
+# `cluster-serial`: run under the netns runner, as they must be, each test
+# has a network of its own, so nothing keeps them apart from the cluster
+# tests but CPU.
+#
+# The cluster tests above run on DPDK too, built with the same feature
+# and under the same runner, through the `dpdk` profile below
+# (`docs/internal/dpdk-testing.md`). Their group still applies, and holds
+# them to one at a time.
+[[profile.default.overrides]]
+filter = 'binary(dpdk_veth)'
+test-group = 'dpdk-serial'
+
 [test-groups]
 cluster-serial = { max-threads = 1 }
+dpdk-serial = { max-threads = 1 }
+
+# The suites on the DPDK transport: run with the `dpdk` features under
+# `scripts/dpdk/netns-runner.sh` and `--profile dpdk`.
+#
+# One test at a time: every DPDK node busy-polls a core, and the groups
+# alone would let one test of each run at once.
+#
+# A test that fails on DPDK because of a known transport divergence is
+# left out here, with a `default-filter` of the form
+# `not (binary(...) & test(=...) | ...)`, and listed in this comment under
+# the entry in `docs/internal/transport-divergences-2026-10.md` that
+# explains it. The fix for the entry removes it again, so the filter is
+# what does not work on DPDK yet. Nothing is left out today.
+[profile.dpdk]
+test-threads = 1

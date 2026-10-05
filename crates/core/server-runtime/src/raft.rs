@@ -213,7 +213,8 @@ impl Drop for RaftDriverGuard {
 /// Called on every mode path (primary, replica, DPDK variants) right after
 /// the fence state exists — the driver shares the process `shutdown` flag
 /// and survives a replica → primary promotion untouched: the guard is
-/// dropped (stopping the driver) only after `run_as_primary` returns.
+/// dropped (stopping the driver) only after `run_as_primary` (or its DPDK
+/// twin) returns.
 #[allow(clippy::too_many_arguments)] // driver assembly point, same as melin_raft::driver::spawn
 pub(crate) fn spawn_raft_driver(
     raft_config: RaftConfig,
@@ -276,7 +277,7 @@ pub(crate) fn spawn_raft_driver(
 
 /// Owns a replica's minimal health endpoint: join handle + its private
 /// stop flag (distinct from the process `shutdown` flag so promotion can
-/// tear it down early — `run_as_primary` rebinds the same
+/// tear it down early — `run_as_primary` (or its DPDK twin) rebinds the same
 /// `--health-bind`). [`Self::stop`] is explicit for exactly that
 /// pre-rebind moment; `Drop` covers every other exit path (clean
 /// shutdown, early `?` errors) so the listener thread and its port can

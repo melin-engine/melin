@@ -4,8 +4,8 @@
 //! **requesters** (the admin `PROMOTE` command, and the raft driver on
 //! auto-promotion), the **consumer** (the replica's receive loop, which
 //! observes the request, drains, and tears down), and the **epoch
-//! allocator** (`run_as_primary`, which journals the tenure's
-//! `EpochBump`).
+//! allocator** (`run_as_primary`, or `run_as_primary_dpdk` on DPDK, which
+//! journals the tenure's `EpochBump`).
 //!
 //! The request is a `u64`, not a bool, because a promotion must carry
 //! *which election authorized it*: the raft driver stores its leader

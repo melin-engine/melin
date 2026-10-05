@@ -27,8 +27,11 @@ dpdk-sys = ["dep:libc", "dep:bindgen", "dep:pkg-config", "dep:cc"]
 # release of the branch this crate used to track, so it carries the
 # zero-copy RX window bound, the descriptor-capacity ordering fix and
 # `Interface::forget_tcp_socket`. Back on the registry the workspace's
-# source policy (`deny.toml`: no git dependencies) holds again.
-smoltcp = { package = "fastcp", version = "0.13.1", default-features = false, features = [
+# source policy (`deny.toml`: no git dependencies) holds again. 0.13.2 is
+# required: it caps the zero-window probe interval at the keep-alive
+# interval, without which a replication peer that is alive but has stopped
+# reading is reset by its liveness deadline (`peer_liveness`).
+smoltcp = { package = "fastcp", version = "0.13.2", default-features = false, features = [
     "std",
     "medium-ethernet",
     "proto-ipv4",

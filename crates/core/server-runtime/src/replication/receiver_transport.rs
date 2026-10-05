@@ -62,6 +62,19 @@ pub(super) trait ReceiverTransport {
 
     /// Whether the underlying connection is still active.
     fn is_connected(&mut self) -> bool;
+
+    /// Keep the connection answered while the receiver waits on local
+    /// work instead of reading (a full input ring behind a slow journal),
+    /// without taking any data off it.
+    ///
+    /// A kernel-TCP connection needs nothing: the kernel acknowledges
+    /// and answers probes on its own, closing the window as the socket
+    /// buffer fills. A user-space stack only does that when it is
+    /// polled, and an unanswered link is one its peer's liveness deadline
+    /// declares gone — so a replica whose disk merely stalls would be
+    /// dropped by its primary, which a kernel-TCP replica is not.
+    /// Called on every pass of such a wait, so it must be cheap.
+    fn keep_link_serviced(&mut self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +138,85 @@ pub(super) trait ControlFrameSource {
         &mut self,
         max_size: usize,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Run `work`, local work that reads nothing from the link (tearing
+    /// the pipeline down, loading or installing what the transfer
+    /// delivered), while the connection stays answered — the resync's
+    /// counterpart of [`ReceiverTransport::keep_link_serviced`], for
+    /// steps that can outlast the primary's liveness deadline on a large
+    /// state or a slow disk.
+    ///
+    /// On kernel TCP the kernel answers for the process, so the work just
+    /// runs.
+    fn serviced<R: Send>(&mut self, work: impl FnOnce() -> R + Send) -> R {
+        work()
+    }
+}
+
+/// How often [`run_serviced`] services the link while the work runs:
+/// well within a TCP stack's retransmission and probe timers, and
+/// sleeping in between so a helper sharing the core still gets to run.
+const SERVICED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// [`ControlFrameSource::serviced`] for a transport whose stack runs on
+/// the calling thread: `work` runs on a helper thread while this one
+/// calls `service` every [`SERVICED_POLL_INTERVAL`] until it is done.
+/// Returns what `work` returns; a panic in `work` is re-raised here, as
+/// if it had run on this thread.
+///
+/// If the helper cannot be spawned the work runs here, unserviced, with
+/// a warning: no worse than before the link was serviced at all.
+#[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+pub(super) fn run_serviced<R: Send>(
+    work: impl FnOnce() -> R + Send,
+    mut service: impl FnMut(),
+) -> R {
+    // `Mutex<Option<_>>` so the work can be taken back and run here if
+    // the helper cannot be spawned: the helper's closure only borrows it,
+    // and a failed spawn drops that closure unrun.
+    let work = std::sync::Mutex::new(Some(work));
+    let take_work = || {
+        work.lock()
+            // Poisoning cannot lose the work: the only code ever run
+            // under the lock is this `take`, which does not panic.
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("serviced work is taken exactly once")
+    };
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("repl-serviced".into())
+            .spawn_scoped(scope, || {
+                // Off the caller's core: a receiver thread is pinned once
+                // streaming has started (on an isolated core, at real-time
+                // priority), and a helper inheriting that would compete
+                // for the core with the service loop below.
+                if let Err(e) = melin_app::affinity::clear_affinity() {
+                    tracing::warn!(error = e, "failed to unpin the replication helper thread");
+                }
+                take_work()()
+            });
+        let worker = match spawned {
+            Ok(worker) => worker,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not spawn the replication helper thread — running its work \
+                     without servicing the link; a slow one may outlast the peer's \
+                     liveness deadline"
+                );
+                return take_work()();
+            }
+        };
+        while !worker.is_finished() {
+            service();
+            std::thread::sleep(SERVICED_POLL_INTERVAL);
+        }
+        match worker.join() {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 /// Receive a chunked body (`SnapshotChunk*` → `SnapshotEnd`) into
@@ -358,6 +450,9 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     stream_marks: &StreamMarkQueue,
     journal_failed: &AtomicBool,
     pending_acks: &mut PendingAckQueue,
+    // Run on every pass of a push waiting for ring space — see
+    // [`ReceiverTransport::keep_link_serviced`].
+    keep_link_serviced: &mut impl FnMut(),
 ) -> StreamingFrameOutcome {
     let mut consumed = 0;
     let mut last_target = 0u64;
@@ -414,10 +509,15 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                 // full ring, its gate cursor never advances
                                 // again and an unconditional spin would wedge
                                 // the receiver forever (no Fatal exit, no
-                                // teardown, no divergence repair).
+                                // teardown, no divergence repair). The
+                                // wait keeps the link answered: a slow
+                                // journal is not a gone replica.
                                 match batch.push_with_or_abort(
                                     |s| *s = slot,
-                                    || journal_failed.load(Ordering::Relaxed),
+                                    || {
+                                        keep_link_serviced();
+                                        journal_failed.load(Ordering::Relaxed)
+                                    },
                                 ) {
                                     // `push` returns the slot index; the
                                     // journal cursor is next-to-consume,
@@ -964,6 +1064,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             stream_marks,
             journal_failed,
             &mut pending_acks,
+            &mut || transport.keep_link_serviced(),
         );
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
@@ -1133,6 +1234,7 @@ mod tests {
             marks,
             journal_failed,
             &mut acks,
+            &mut || {},
         );
         (outcome, acks)
     }
@@ -2156,6 +2258,130 @@ mod tests {
         assert!(drain(&mut consumer).is_empty());
     }
 
+    /// A push that waits for ring space behind a slow journal keeps the
+    /// link serviced on every pass: on DPDK that is what answers the
+    /// primary, whose liveness deadline would otherwise drop a replica
+    /// that is only waiting on its own disk.
+    #[test]
+    fn a_push_waiting_on_a_full_ring_keeps_the_link_serviced() {
+        let (mut producer, mut consumer) = ring(4);
+        let mut slot_buf = Vec::new();
+        let slots: Vec<_> = (1..=6).map(|seq| slot(seq, seq)).collect();
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &slots);
+
+        // The "journal" only makes room when the link is serviced, so
+        // the frame can only be published if the wait services it.
+        let mut serviced = 0usize;
+        let mut journaled = Vec::new();
+        let mut acks = PendingAckQueue::new(16);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            0,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+            &mut acks,
+            &mut || {
+                serviced += 1;
+                journaled.extend(drain(&mut consumer).into_iter().map(|s| s.sequence));
+            },
+        );
+
+        assert!(outcome.frame_err.is_none(), "{:?}", outcome.frame_err);
+        assert_eq!(outcome.accum_end_sequence, 6);
+        assert!(serviced > 0, "the full-ring wait never serviced the link");
+        journaled.extend(drain(&mut consumer).into_iter().map(|s| s.sequence));
+        assert_eq!(journaled, (1..=6).collect::<Vec<_>>());
+    }
+
+    /// A push that finds room never services the link: the call is for
+    /// waits only, so the streaming fast path pays nothing for it.
+    #[test]
+    fn a_push_with_room_does_not_service_the_link() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(1, 1), slot(2, 2)]);
+
+        let mut serviced = 0usize;
+        let mut acks = PendingAckQueue::new(16);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            0,
+            &mut slot_buf,
+            &no_marks(),
+            &AtomicBool::new(false),
+            &mut acks,
+            &mut || serviced += 1,
+        );
+
+        assert!(outcome.frame_err.is_none());
+        assert_eq!(serviced, 0);
+        assert_eq!(drain(&mut consumer).len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // run_serviced: local work run while the link stays answered
+    // ---------------------------------------------------------------
+
+    /// The link is serviced for as long as the work runs, and the work's
+    /// result comes back to the caller.
+    #[test]
+    fn serviced_work_keeps_the_link_serviced_until_it_is_done() {
+        let release = AtomicBool::new(false);
+        let mut serviced = 0usize;
+        let result = run_serviced(
+            || {
+                while !release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                42u32
+            },
+            || {
+                serviced += 1;
+                // The work finishes only once it has been serviced a
+                // few times: a service loop that stopped early would
+                // hang here.
+                if serviced == 5 {
+                    release.store(true, Ordering::Release);
+                }
+            },
+        );
+        assert_eq!(result, 42);
+        assert!(serviced >= 5);
+    }
+
+    /// A panic in the work reaches the caller, as if it had run inline.
+    #[test]
+    fn a_panic_in_serviced_work_reaches_the_caller() {
+        let caught = std::panic::catch_unwind(|| {
+            run_serviced(|| -> u32 { panic!("install failed") }, || {})
+        });
+        let payload = caught.expect_err("the panic must propagate");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"install failed"));
+    }
+
+    /// Without a override, a source runs the work inline (kernel TCP:
+    /// the kernel answers the link on the process's behalf).
+    #[test]
+    fn the_default_serviced_runs_the_work_inline() {
+        struct NoFrames;
+        impl ControlFrameSource for NoFrames {
+            fn next_frame(
+                &mut self,
+                _max_size: usize,
+            ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+                Err("no frames".into())
+            }
+        }
+        let caller = std::thread::current().id();
+        let ran_on = NoFrames.serviced(|| std::thread::current().id());
+        assert_eq!(ran_on, caller);
+    }
+
     // ---------------------------------------------------------------
     // Sequence-contiguity tests
     //
@@ -2608,6 +2834,7 @@ mod tests {
             &no_marks(),
             &AtomicBool::new(false),
             &mut acks,
+            &mut || {},
         );
 
         match &outcome.frame_err {
