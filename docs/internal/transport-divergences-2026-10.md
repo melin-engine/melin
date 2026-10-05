@@ -30,6 +30,12 @@ Pinned by `a_server_side_close_is_silent` in the DPDK veth tests
 read timeout after the close, and an RST answering the client's next send.
 The fix flips that test to require the EOF.
 
+Replication links no longer close this way: they go through
+`DpdkTransport::reset`, which sends the RST before removing the socket
+(see "Peer liveness on replication links" in `dpdk-replication.md`). A
+client close could use the same call, or a graceful FIN, which needs the
+socket kept until the FIN is acknowledged.
+
 ### DPDK does not see a client's close (likely bug)
 
 `dpdk_transport.rs`, the read path. A connection is released when a
@@ -117,8 +123,9 @@ minutes on a nearly saturated stage.
 ### DPDK sender `Handshaking` state has no deadline
 
 `replication/dpdk.rs`. `AUTH_TIMEOUT` covers `Authenticating` only. An
-authenticated replica that then stays silent holds a slot until it
-disconnects. TCP's 10 s read timeout covers it.
+authenticated replica that is still running but sends no Handshake holds
+a slot until it disconnects (one that has stopped is reset by the link's
+liveness deadline). TCP's 10 s read timeout covers both.
 
 ### TCP receiver leaks the replica pipeline on handshake errors (likely bug)
 
@@ -139,30 +146,6 @@ off and reconnects.
 `replication/dpdk.rs`. A dropped Handshake frame leaves both sides waiting.
 Combined with the sender's missing `Handshaking` deadline, that hangs the slot.
 
-### DPDK does not notice a replication peer that has gone (likely bug)
-
-`replication/dpdk.rs`, both ends of the link. A DPDK node that stops
-tells its replication peer nothing (no FIN, no RST: the close described
-in "DPDK closes a client connection without telling the peer"), and
-neither end of a DPDK link has a deadline on a silent peer. The sender's
-streaming slot is released only once its socket is no longer active, and
-a socket retransmitting heartbeats to a peer that never answers stays
-active, since no timeout is set on it. The receiver waits on its primary
-the same way. io_uring sees the EOF, and its receiver gives a quiet
-primary 5 s.
-
-The effect, found by the cluster tests on DPDK:
-
-- A primary whose replica has stopped keeps counting it
-  (`melin_replicas_connected`) and never halts, so it does not refuse
-  writes as a primary whose last replica has left must. Under a policy
-  that needs a replica, acknowledgements stall instead.
-- A replica whose primary has stopped keeps its link "up": auto-promotion
-  refuses to depose a live primary, and the cluster never fails over.
-
-Tests left out on it: `halt_refusal`, `replicated_failover` and
-`raft_failover` (`crates/core/server-runtime/tests/`).
-
 ### A promoted DPDK replica serves on kernel TCP
 
 `server.rs`, the promotion arm of the DPDK replica path, marked TODO
@@ -179,7 +162,8 @@ Found by the cluster tests on DPDK. Tests left out on it:
 `genesis_promotion`'s
 `a_replica_configured_with_a_larger_genesis_is_promoted`, the notary
 example's `a_promoted_replica_reports_the_head_the_primary_receipted`,
-and, behind the entry above, `replicated_failover` and `raft_failover`.
+`replicated_failover` and `raft_failover`. The two failover tests get as
+far as the promotion on DPDK, then fail on this.
 
 ## Deliberate differences (no action)
 

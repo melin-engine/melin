@@ -176,7 +176,8 @@ pub(super) struct AuthChallenge {
 #[cfg(any(feature = "dpdk", test))]
 pub(super) trait AuthTransport {
     type Handle: Copy;
-    /// Whether the connection is still open.
+    /// Whether the connection still carries the exchange: false once
+    /// either side has closed, the peer by FIN or RST included.
     fn is_active(&mut self, handle: Self::Handle) -> bool;
     /// Append any bytes received on `handle` to `dest`.
     fn recv_into_vec(&mut self, handle: Self::Handle, dest: &mut Vec<u8>);

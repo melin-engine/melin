@@ -17,6 +17,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Add
 use crate::device::DpdkDevice;
 use crate::eal::Eal;
 use crate::mempool::Mempool;
+use crate::peer_liveness::{self, PeerLiveness, StackClock};
 use crate::port::{ChecksumOffloads, Port};
 
 /// Apply low-latency TCP tuning to a smoltcp socket.
@@ -314,6 +315,8 @@ pub struct DpdkTransport {
     /// Defaults to `MAX_TX_QUEUE_SIZE`; overridden for replication sockets
     /// via `add_listener_with_buffers`.
     tx_queue_limits: Vec<usize>,
+    /// The stack's monotonic clock, read into `cached_timestamp`.
+    clock: StackClock,
     /// Cached smoltcp timestamp. Refreshed periodically, not every poll.
     cached_timestamp: Instant,
     /// Poll iteration counter for timestamp refresh.
@@ -526,12 +529,8 @@ impl DpdkTransport {
 
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(shared.mac));
         let iface_config = Config::new(hw_addr);
-        let now = Instant::from_millis(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is before UNIX epoch")
-                .as_millis() as i64,
-        );
+        let clock = StackClock::start();
+        let now = clock.now();
         let mut iface = Interface::new(iface_config, &mut DpdkDeviceRef(&device), now);
 
         let ip = Ipv4Address::new(
@@ -602,6 +601,7 @@ impl DpdkTransport {
             // tag — no heap allocation per slot.
             tx_queues: (0..MAX_CONNECTIONS).map(|_| None).collect(),
             tx_queue_limits: vec![MAX_TX_QUEUE_SIZE; MAX_CONNECTIONS],
+            clock,
             cached_timestamp: now,
             poll_count: 0,
             pending_tx_bytes: 0,
@@ -710,9 +710,14 @@ impl DpdkTransport {
     /// for data transfer (both send and receive directions open). A
     /// handle that has been removed (caller raced a `close`) reads as
     /// "not connected" — never panic on the caller's behalf.
+    ///
+    /// Unlike [`Self::is_active`], false once the peer has closed its
+    /// half (its FIN), as soon as the bytes it sent before are read: the
+    /// test for a link that needs both directions. See `link_up` in
+    /// [`crate::peer_liveness`].
     pub fn is_connected(&mut self, handle: SocketHandle) -> bool {
         match self.sockets.try_get_mut::<tcp::Socket>(handle) {
-            Some(socket) => socket.may_send() && socket.may_recv(),
+            Some(socket) => peer_liveness::link_up(socket),
             None => {
                 tracing::warn!(
                     handle = ?handle,
@@ -734,15 +739,11 @@ impl DpdkTransport {
     /// Run one poll iteration.
     pub fn poll(&mut self) -> Instant {
         // Refresh the smoltcp timestamp periodically, not every poll.
-        // smoltcp only needs ms-precision for TCP retransmit/keepalive timers.
+        // smoltcp only needs ms-precision for TCP retransmit/keepalive timers,
+        // but a monotonic clock (see `StackClock`).
         self.poll_count = self.poll_count.wrapping_add(1);
         if self.poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
-            self.cached_timestamp = Instant::from_millis(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock is before UNIX epoch")
-                    .as_millis() as i64,
-            );
+            self.cached_timestamp = self.clock.now();
         }
 
         // Batch ingress: poll all ports in one pass. MAC learning happens
@@ -1148,6 +1149,43 @@ impl DpdkTransport {
         }
         if let Some(q) = self.tx_queues[handle.index()].take() {
             self.pending_tx_bytes -= q.queued_bytes();
+        }
+    }
+
+    /// Close a connection like [`Self::close`], but tell the peer: the
+    /// socket's RST goes out before it is removed, so the peer's stack
+    /// ends the connection at once instead of waiting on its own
+    /// deadline. For links whose peer acts on the end of the session
+    /// (replication); unsent data is discarded, so a caller with a last
+    /// frame to deliver waits on [`Self::tx_drained`] first.
+    ///
+    /// Idempotent like `close`. See `abort_announced` in
+    /// [`crate::peer_liveness`].
+    pub fn reset(&mut self, handle: SocketHandle) {
+        // Whatever is still queued above the socket would never be sent:
+        // the socket is aborted below. Drop it first so the egress pass
+        // does not hand it to the socket.
+        if let Some(q) = self.tx_queues[handle.index()].take() {
+            self.pending_tx_bytes -= q.queued_bytes();
+        }
+        peer_liveness::abort_announced(
+            &mut self.iface,
+            &mut self.device,
+            &mut self.sockets,
+            handle,
+            self.cached_timestamp,
+        );
+        self.device.flush_tx();
+        self.close(handle);
+    }
+
+    /// Arm `liveness` on an established connection: probe it while idle,
+    /// and reset it once the peer has been silent for the rule's timeout,
+    /// after which [`Self::is_active`] reads false. A stale handle is
+    /// ignored (it has nothing left to watch).
+    pub fn set_peer_liveness(&mut self, handle: SocketHandle, liveness: &PeerLiveness) {
+        if let Some(socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) {
+            liveness.apply(socket);
         }
     }
 
