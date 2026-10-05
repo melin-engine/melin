@@ -776,6 +776,10 @@ enum RequestKind {
     /// histogram dump from the latency-trace registry. Empty body when
     /// the server was built without `--features latency-trace`.
     StatsDump,
+    /// HTTP GET /reset-stats — clear every stage histogram so the next
+    /// dump covers only what happened after this call. No-op body when
+    /// the server was built without `--features latency-trace`.
+    StatsReset,
 }
 
 /// Peek at the first bytes to detect HTTP vs plain TCP.
@@ -811,14 +815,19 @@ fn detect_request(stream: &mut TcpStream) -> RequestKind {
 
     let data = &buf[..n];
     // Prefix matches use 6 bytes (`GET /` + 1 path byte) so that a
-    // short non-blocking read still classifies correctly. `/m` and
-    // `/s` are the only documented two paths beyond `/`; an
-    // undocumented path beginning with `m` or `s` would be
-    // misclassified, but no other paths are exposed.
+    // short non-blocking read still classifies correctly. `/m`, `/s`
+    // and `/r` are the only documented paths beyond `/`; an
+    // undocumented path beginning with one of those letters would be
+    // misclassified, but no other paths are exposed. `/reset-stats` is
+    // spelled to start with a distinct letter for exactly this reason
+    // — `/stats-reset` would collide with `/stats-dump` inside the
+    // six-byte window.
     let kind = if data.starts_with(b"GET /m") {
         RequestKind::Metrics
     } else if data.starts_with(b"GET /s") {
         RequestKind::StatsDump
+    } else if data.starts_with(b"GET /r") {
+        RequestKind::StatsReset
     } else if data.starts_with(b"GET /") {
         RequestKind::HttpHealth
     } else {
@@ -839,6 +848,41 @@ fn detect_request(stream: &mut TcpStream) -> RequestKind {
     }
 
     kind
+}
+
+/// Clear every stage histogram and write a one-line acknowledgement
+/// into `buf`. Returns bytes written.
+///
+/// The registry accumulates for the whole process lifetime, so without
+/// this a bench cannot separate a warmup from the run that follows it,
+/// and successive runs against one server blur together. The bench
+/// calls this once the warmup is done and `/stats-dump` once the
+/// measured phase ends.
+///
+/// Mutating on GET is deliberate: `latency-trace` is a dev/bench build
+/// and the health port is unauthenticated, so a POST would buy no
+/// safety while making the endpoint harder to hit from a shell. The
+/// endpoint does not exist in a build without the feature.
+///
+/// Reply is `reset\t<stages>\n` — a count rather than a bare `ok` so a
+/// caller that reset before the pipeline threads registered sees `0`
+/// and can tell it cleared nothing.
+fn write_stats_reset(buf: &mut [u8]) -> usize {
+    let mut c = Cursor::new(buf);
+
+    #[cfg(feature = "latency-trace")]
+    {
+        let cleared = crate::trace::global_registry().reset_all();
+        // Best-effort diagnostic write into a buffer sized far above
+        // this line's length.
+        let _ = writeln!(c, "reset\t{cleared}");
+    }
+    #[cfg(not(feature = "latency-trace"))]
+    {
+        let _ = writeln!(c, "# latency-trace disabled");
+    }
+
+    c.position() as usize
 }
 
 /// Write the latency-trace stage histograms into `buf` as one
@@ -1020,6 +1064,14 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
             write_http(
                 &mut resp_buf,
                 "text/tab-separated-values; charset=utf-8",
+                &body_buf[..body_len],
+            )
+        }
+        RequestKind::StatsReset => {
+            let body_len = write_stats_reset(&mut body_buf);
+            write_http(
+                &mut resp_buf,
+                "text/plain; charset=utf-8",
                 &body_buf[..body_len],
             )
         }

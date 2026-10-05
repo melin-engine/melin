@@ -524,6 +524,43 @@ impl StatsRegistry {
         out
     }
 
+    /// Drain every recorder and clear all stage histograms, starting a
+    /// fresh measurement window. Returns the number of stages cleared.
+    ///
+    /// The histograms are otherwise cumulative for the whole process
+    /// lifetime, so a run that warms up and then measures folds the
+    /// warmup into the same percentiles, and two runs against one
+    /// server cannot be told apart. Issue this between the warmup and
+    /// the measured phase.
+    ///
+    /// Refreshes before clearing so samples already handed over are
+    /// discarded with the window they belong to instead of surviving
+    /// into the next one. A recorder that has not flushed since its
+    /// last sample still holds those samples thread-locally and will
+    /// contribute them to the *new* window; stage threads flush on an
+    /// [`IDLE_FLUSH_INTERVAL`] timer, so allow that much settling time
+    /// after traffic stops if the boundary has to be exact.
+    pub fn reset_all(&self) -> usize {
+        // Same lock discipline as `snapshot_all` — the refresh below
+        // can block, and holding the registry lock across it would
+        // serialize concurrent callers and stall `register`.
+        let entries: Vec<std::sync::Arc<StageEntry>> = match self.entries.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let deadline = std::time::Instant::now() + REFRESH_BUDGET;
+        for entry in entries.iter() {
+            let mut sync = match entry.sync.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            sync.refresh_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+            sync.reset();
+            entry.clipped.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        entries.len()
+    }
+
     /// Print every registered stage's percentile report to stderr.
     /// Called from the server's shutdown path so dev runs without the
     /// bench still see the per-stage breakdown — the bench fetches the
@@ -894,6 +931,52 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing from snapshot"));
             assert_eq!(stage.samples, 1, "{name} lost its sample to the budget");
         }
+    }
+
+    #[test]
+    fn reset_starts_a_fresh_window() {
+        // Warmup samples must not survive into the measured window —
+        // the whole reason the endpoint exists. Stages stay registered
+        // (so the next dump still lists them) but come back empty.
+        let reg = StatsRegistry::new();
+        let mut rec = reg.register("test::reset_window", StageUnit::Slot);
+        rec.record_ns(9_000);
+        rec.record_ns(MAX_TRACKED_NS * 2);
+        rec.flush();
+
+        let before = reg.snapshot_all();
+        let before = before
+            .iter()
+            .find(|s| s.name == "test::reset_window")
+            .expect("stage missing before reset");
+        assert_eq!(before.samples, 2);
+        assert_eq!(before.clipped, 1);
+
+        assert_eq!(reg.reset_all(), 1, "reset should report the stage count");
+
+        let after = reg.snapshot_all();
+        let after = after
+            .iter()
+            .find(|s| s.name == "test::reset_window")
+            .expect("reset must not deregister the stage");
+        assert_eq!(after.samples, 0, "warmup samples survived the reset");
+        assert_eq!(after.clipped, 0, "clipped count survived the reset");
+        assert_eq!(after.max_ns, 0);
+
+        // The recorder is still usable and feeds the new window.
+        rec.record_ns(1_500);
+        rec.flush();
+        let next = reg.snapshot_all();
+        let next = next
+            .iter()
+            .find(|s| s.name == "test::reset_window")
+            .expect("stage missing after reset");
+        assert_eq!(next.samples, 1);
+        assert!(
+            next.max_ns < 10_000,
+            "pre-reset max leaked: {}",
+            next.max_ns
+        );
     }
 
     #[test]
