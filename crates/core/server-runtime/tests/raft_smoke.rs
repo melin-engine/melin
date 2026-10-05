@@ -1,19 +1,20 @@
 //! Smoke test: a raft-enabled server (single-voter control plane) boots,
 //! elects itself, and serves the `melin_raft_*` gauges on `--health-bind`.
+//!
+//! The node is started through `melin-test-node`, so it runs on DPDK with
+//! this crate's `dpdk` feature; raft and the health endpoint are kernel
+//! TCP on every node, on the namespace's loopback under the runner.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use counter_server::{Counter, RequestDecoder, ResponseEncoder};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::layout::PipelineCores;
-use melin_server_runtime::server::{self, ServerConfig};
+use melin_server_runtime::server::ServerConfig;
 use melin_transport_core::test_ports::free_addr;
-use melin_wire_protocol::tcp::BlockingTcpListener;
 use serial_test::serial;
 
 /// Port range this file owns for `free_addr` (25000..30000);
@@ -47,12 +48,7 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
     let raft_addr = free_addr(PORT_BASE);
     let health_addr = free_addr(PORT_BASE);
 
-    let listener = BlockingTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-        .expect("bind client listener");
-    let addr = listener.local_addr().expect("local_addr");
-
     let config = ServerConfig {
-        bind: addr,
         journal: tmp.path().join("smoke.journal"),
         authorized_keys: auth_path,
         standalone: true,
@@ -74,30 +70,21 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
         ..ServerConfig::default()
     };
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let sd = Arc::clone(&shutdown);
-    let handle = std::thread::spawn(move || -> Result<(), String> {
-        let _tmp = tmp;
-        server::run_with_listener::<Counter>(
-            listener,
-            config,
-            StartupEvents::none(),
-            (),
-            RequestDecoder,
-            ResponseEncoder,
-            None,
-            sd,
-        )
-        .map_err(|e| e.to_string())
-    });
+    let node = melin_test_node::start::<Counter>(
+        config,
+        StartupEvents::none(),
+        (),
+        RequestDecoder,
+        ResponseEncoder,
+    );
 
     // A single voter elects itself within the 1–2 s election timeout;
     // poll the real health endpoint for the gauges.
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut led = false;
     while Instant::now() < deadline {
-        if handle.is_finished() {
-            panic!("server exited early: {:?}", handle.join().unwrap());
+        if node.is_finished() {
+            panic!("server exited early: {:?}", node.join());
         }
         if let Some(body) = http_metrics(health_addr)
             && body.contains("melin_raft_is_leader 1\n")
@@ -111,10 +98,6 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    shutdown.store(true, Ordering::Relaxed);
-    // Nudge the accept loop past its poll.
-    let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(100));
-    let result = handle.join().expect("server thread panicked");
+    node.stop();
     assert!(led, "raft gauges never reported leadership");
-    result.expect("server returned error");
 }
