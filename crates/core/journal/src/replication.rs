@@ -287,6 +287,29 @@ impl ReplicationConsumer {
         Some((meta, data))
     }
 
+    /// The batch the last `try_read` returned, while it is uncommitted.
+    ///
+    /// For a caller that holds a batch across calls — the DPDK sender's
+    /// catch-up→live handoff keeps the ring's first live batch while the
+    /// replica's socket has no room for it, and returns to its poll loop
+    /// in between — and so cannot keep the slice `try_read` lent it. The
+    /// slot is still the consumer's: the producer cannot reuse it before
+    /// `commit`, so these are the same bytes. `None` once committed (or
+    /// skipped past by [`Self::skip_to_producer`]).
+    pub fn pending(&self) -> Option<(ReplicationMeta, &[u8])> {
+        let meta = self.pending_meta?;
+        let idx = (self.pending_seq & self.buffers.mask) as usize;
+        // SAFETY: as in `try_read`: the slot at `pending_seq` was published
+        // before `try_read` returned it, and the producer cannot claim it
+        // again until `commit` advances this consumer's progress counter,
+        // which has not happened while `pending_meta` is set.
+        let data = unsafe {
+            let chunk = &*self.buffers.chunks[idx].get();
+            &chunk[..meta.len as usize]
+        };
+        Some((meta, data))
+    }
+
     /// Release the last read slot back to the producer.
     ///
     /// Must be called after `try_read` returns `Some` and before the next
@@ -385,6 +408,37 @@ mod tests {
         assert_eq!(meta.end_sequence, 42);
         assert_eq!(received, data);
         consumer.commit();
+    }
+
+    /// A held read stays readable through `pending`, unchanged, and keeps
+    /// its slot from the producer, until it is committed.
+    #[test]
+    fn pending_returns_the_held_batch_until_commit() {
+        let (mut producer, mut consumers) =
+            build_replication_ring(1, 2, WaitStrategy::SpinThenYield);
+        let consumer = &mut consumers[0];
+        assert!(consumer.pending().is_none(), "nothing read yet");
+
+        producer.publish(b"first", 1);
+        producer.publish(b"second", 2);
+        let (meta, data) = consumer.try_read().unwrap();
+        assert_eq!((meta.end_sequence, data), (1, &b"first"[..]));
+
+        // The ring is full while the read is held: the producer cannot
+        // take the held slot, so `pending` keeps returning its bytes.
+        assert!(producer.try_publish(b"third", 3).is_err());
+        let (meta, data) = consumer.pending().expect("the read is held");
+        assert_eq!((meta.end_sequence, data), (1, &b"first"[..]));
+
+        consumer.commit();
+        assert!(consumer.pending().is_none(), "committed");
+        producer
+            .try_publish(b"third", 3)
+            .expect("the slot is free again");
+        let (meta, _) = consumer.try_read().unwrap();
+        assert_eq!(meta.end_sequence, 2);
+        consumer.skip_to_producer();
+        assert!(consumer.pending().is_none(), "skipped past");
     }
 
     #[test]
