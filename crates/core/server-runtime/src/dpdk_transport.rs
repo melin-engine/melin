@@ -272,6 +272,12 @@ pub fn run_dpdk_poll<A: Application>(
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            // Tell the replicas this primary has gone, as its kernel
+            // would on kernel TCP; a DPDK node that just stops says
+            // nothing, leaving them to their liveness deadline.
+            if let Some(driver) = repl_driver.take() {
+                driver.close_all_links(&mut transport);
+            }
             break;
         }
 
@@ -667,8 +673,9 @@ pub fn run_dpdk_poll<A: Application>(
         transport.poll();
 
         // Drive the replication driver's per-iteration work — handshake
-        // progression, journal catch-up (blocking on first connect),
-        // ack processing, and live data-batch sends. With a single
+        // progression, a joining replica's catch-up (read off the disk by
+        // the slot's join worker, sent from here a tick at a time), ack
+        // processing, and live data-batch sends. With a single
         // queue + single thread, this is what replaces the previous
         // dedicated replication sender thread; the poll above flushed any TX
         // the driver queued on the prior iteration and received any

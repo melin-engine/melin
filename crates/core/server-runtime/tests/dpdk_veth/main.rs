@@ -1,11 +1,13 @@
-//! The DPDK transport's client path, end to end, on veth instead of a NIC.
+//! The DPDK transport's client path, end to end, on veth instead of a NIC,
+//! the liveness deadline on its replication links, and a primary that keeps
+//! those links answered while a replica's join waits on its disk.
 //!
-//! Each test runs a counter node on DPDK through the `net_af_packet` PMD,
-//! with no hugepages, no bound NIC and no root, and drives it from a
+//! Each test runs counter nodes on DPDK through the `net_af_packet` PMD,
+//! with no hugepages, no bound NIC and no root, and drives them from a
 //! kernel-TCP client on the runner's network. That checks the transport's
 //! logic — the poll loop, the auth state machine, what a close does on the
-//! wire — and nothing about its speed: af_packet is not a NIC. See
-//! `docs/internal/dpdk-testing.md`.
+//! wire, when a silent peer counts as gone — and nothing about its speed:
+//! af_packet is not a NIC. See `docs/internal/dpdk-testing.md`.
 //!
 //! Unlike the rest of this crate's integration tests, which run on DPDK
 //! only with the `dpdk` feature, these pin what the DPDK transport does
@@ -21,16 +23,20 @@
 //! not. Run with:
 //!
 //! ```sh
-//! CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run -p melin-server-runtime --features dpdk --test dpdk_veth -j 1
+//! CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run --profile dpdk -p melin-server-runtime --features dpdk --test dpdk_veth
 //! ```
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use counter_server::{Counter, KIND_RESP_ACK, RequestDecoder, ResponseEncoder, increment_request};
+use counter_server::{
+    Counter, CounterEvent, KIND_RESP_ACK, KIND_RESP_REJECTED, RequestDecoder, ResponseEncoder,
+    increment_request,
+};
 use melin_client::{Connection, Handshake, SigningKey, Step, key};
+use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
@@ -233,6 +239,399 @@ veth_test!(
     }
 );
 
+/// A replica that goes without a word — cut off the network, as a crashed
+/// host or a pulled cable leaves it — is dropped by its primary within
+/// the replication liveness bound, and the primary, its last replica
+/// gone, halts and refuses writes.
+///
+/// The case the liveness deadline exists for: a replica that stops
+/// cleanly tells its primary (`halt_refusal` covers that, on both
+/// transports), so only a link that falls silent reaches the deadline.
+/// DPDK only, because a DPDK node is its own TCP stack: on kernel TCP the
+/// kernel speaks for a crashed process.
+#[test]
+fn a_replica_cut_off_is_dropped_and_its_primary_halts() {
+    let _serial = serialise();
+    let cluster = Cluster::new();
+    let primary_health = Cluster::health(0);
+
+    let primary = cluster.start_primary();
+    let replica = cluster.start_replica(1, "replica");
+
+    wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
+    let mut conn = served_within(primary.addr(), STARTUP_LIMIT, "with the replica attached");
+
+    replica.cut_off();
+    // The peer is gone at most twice the timeout after its last word (the
+    // primary is sending to it: heartbeats); the margin covers the gauge
+    // poll and a slow runner.
+    let bound = melin_dpdk::PeerLiveness::REPLICATION.timeout() * 2 + FRAME_LIMIT;
+    wait_for_gauge(primary_health, "melin_replicas_connected", 0, bound);
+    let refused = conn
+        .request_one(&increment_request(1))
+        .expect("the halted primary answers");
+    assert_eq!(
+        refused.first(),
+        Some(&KIND_RESP_REJECTED),
+        "a primary whose last replica has gone must refuse writes"
+    );
+    drop(conn);
+
+    replica.stop();
+    primary.stop();
+}
+
+/// A replica's join that stalls on the primary's disk — here the snapshot
+/// read, held for longer than the replication liveness deadline twice
+/// over — holds up nothing else: the primary goes on serving its clients
+/// and answering its other replica, which keeps its link throughout.
+///
+/// DPDK only, because only there is the replication sender the thread
+/// that runs the TCP stack: when that thread did the join's disk work
+/// itself, a stall past the deadline left every other replica's link
+/// unanswered, and healthy replicas reset their links to a live primary.
+///
+/// The stall is injected without a hook: the primary's snapshot is a FIFO
+/// the test holds open and writes nothing into, so the join blocks reading
+/// it exactly as it would on a slow disk. The joining replica is made to
+/// need a snapshot by giving it a journal of its own that the primary's
+/// does not share (a divergent replica gets a snapshot, whatever its
+/// position).
+#[test]
+fn a_stalled_join_costs_the_other_replica_nothing() {
+    let _serial = serialise();
+    let cluster = Cluster::new();
+    let primary_health = Cluster::health(0);
+
+    let primary = cluster.start_primary();
+    let streaming = cluster.start_replica(1, "streaming");
+    wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
+    let mut conn = served_within(primary.addr(), STARTUP_LIMIT, "with one replica attached");
+    for _ in 0..4 {
+        assert_acked(&mut conn, "before the join");
+    }
+
+    // The primary's snapshot, as a FIFO. Created only now: a primary
+    // reads its snapshot at startup.
+    let snapshot = cluster.dir.path().join("primary.snapshot");
+    let stalled_snapshot = StalledFile::create(&snapshot);
+
+    // The joining replica's own history: one event the primary never had.
+    let joining_journal = cluster.dir.path().join("joining.journal");
+    let mut writer =
+        BufferedWriter::<CounterEvent>::create(&joining_journal).expect("create journal");
+    writer
+        .append(&JournalEvent::App(CounterEvent::Increment { amount: 7 }))
+        .expect("append");
+    drop(writer);
+    let joining = cluster.start_replica(2, "joining");
+
+    // The join has begun once the primary has judged the replica
+    // divergent: from there the join reads the snapshot, and blocks.
+    wait_for_gauge(
+        primary_health,
+        "melin_replica_divergence_total",
+        1,
+        STARTUP_LIMIT,
+    );
+
+    // Requests during the stall are each answered promptly, from the
+    // first second to past twice the liveness timeout (the longest a dead
+    // peer can take to be noticed), and both replicas stay counted: the
+    // streaming one never lost its link, and the joining one is still in
+    // its join.
+    conn.set_read_timeout(SERVED_DURING_STALL)
+        .expect("set the client's read timeout");
+    let stall = melin_dpdk::PeerLiveness::REPLICATION.timeout() * 2 + Duration::from_secs(2);
+    let stall_end = Instant::now() + stall;
+    while Instant::now() < stall_end {
+        let asked = Instant::now();
+        assert_acked(&mut conn, "during the stalled join");
+        assert!(
+            asked.elapsed() < SERVED_DURING_STALL,
+            "a request took {:?} during the stalled join",
+            asked.elapsed()
+        );
+        // Sampled, so a link dropped and re-made between two samples would
+        // slip past this check alone; the bound above is what rules that
+        // out for a stall, since the requests share the poll thread with
+        // the links and a peer is only declared gone after the poll
+        // thread has been silent for the whole liveness timeout.
+        assert_eq!(
+            gauge(primary_health, "melin_replicas_connected"),
+            Some(2),
+            "a replica was dropped during the stalled join"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        stalled_snapshot.has_reader(),
+        "the join must still be blocked on the snapshot for the test to mean anything"
+    );
+
+    // Unblock the join (it reads the end of an empty snapshot and fails,
+    // dropping the joining replica, which then retries without one).
+    drop(stalled_snapshot);
+    drop(conn);
+    joining.stop();
+    streaming.stop();
+    primary.stop();
+}
+
+/// Both kinds of join complete over DPDK when what they stream is many
+/// times what a replication socket's queue holds, so the primary hands it
+/// over across many ticks: a fresh replica's journal catch-up, and a
+/// divergent replica's snapshot, segment seed and catch-up. Each replica
+/// ends up with the primary's whole history. (Being served while a join
+/// is held up is `a_stalled_join_costs_the_other_replica_nothing`'s to
+/// check; this one checks only that a join spread over many ticks
+/// completes intact.)
+#[test]
+fn large_joins_complete_a_tick_at_a_time() {
+    let _serial = serialise();
+    let cluster = Cluster::new();
+    let primary_health = Cluster::health(0);
+
+    // A history of a few MiB, written before the primary starts so that
+    // it costs no round trips.
+    const HISTORY: u64 = 150_000;
+    let mut writer =
+        BufferedWriter::<CounterEvent>::create(&cluster.dir.path().join("primary.journal"))
+            .expect("create journal");
+    for _ in 0..HISTORY {
+        writer
+            .append(&JournalEvent::App(CounterEvent::Increment { amount: 1 }))
+            .expect("append");
+    }
+    drop(writer);
+
+    let mut primary_config = cluster.config(0, "primary");
+    // A snapshot to serve the divergent replica.
+    primary_config.snapshot_interval_ms = 200;
+    let primary_addrs = Cluster::addrs(0);
+    primary_config.replication_bind = Some(primary_addrs.replication());
+    let primary = Cluster::start(&primary_addrs, primary_config);
+
+    // The fresh replica: full catch-up from the journal.
+    let fresh = cluster.start_replica(1, "fresh");
+    wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
+    let mut conn = served_within(primary.addr(), STARTUP_LIMIT, "with the fresh replica");
+    // Events through the pipeline, so the shadow stage snapshots.
+    for _ in 0..4 {
+        assert_acked(&mut conn, "before the snapshot");
+    }
+    let snapshot = cluster.dir.path().join("primary.snapshot");
+    let deadline = Instant::now() + STARTUP_LIMIT;
+    while !snapshot.exists() {
+        assert!(Instant::now() < deadline, "the primary wrote no snapshot");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The divergent replica: its own one-event history.
+    let divergent_journal = cluster.dir.path().join("divergent.journal");
+    let mut writer =
+        BufferedWriter::<CounterEvent>::create(&divergent_journal).expect("create journal");
+    writer
+        .append(&JournalEvent::App(CounterEvent::Increment { amount: 7 }))
+        .expect("append");
+    drop(writer);
+    let divergent = cluster.start_replica(2, "divergent");
+    wait_for_gauge(
+        primary_health,
+        "melin_replica_divergence_total",
+        1,
+        STARTUP_LIMIT,
+    );
+    wait_for_gauge(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
+
+    // One more event, past every join, and both replicas journal it: each
+    // acks the primary's whole history.
+    assert_acked(&mut conn, "with both replicas attached");
+    let head = gauge(primary_health, "melin_journal_sequence").expect("the primary's sequence");
+    assert!(head > HISTORY, "the primary's history ends at {head}");
+    for slot in ["0", "1"] {
+        wait_for_gauge(
+            primary_health,
+            &format!("melin_replica_acked_sequence{{slot=\"{slot}\"}}"),
+            head,
+            STARTUP_LIMIT,
+        );
+    }
+
+    drop(conn);
+    divergent.stop();
+    fresh.stop();
+    primary.stop();
+}
+
+/// How long a request may take while another replica's join is stalled:
+/// far above an answer's round trip, far below the stall.
+const SERVED_DURING_STALL: Duration = Duration::from_secs(2);
+
+/// A file that blocks whoever reads it, until dropped: a FIFO the test
+/// holds open for writing (so a reader's open returns at once, and its
+/// read waits for data) and never writes into. Dropping it removes the
+/// FIFO and closes the write end, so a blocked reader sees the end of
+/// the file.
+struct StalledFile {
+    path: std::path::PathBuf,
+    /// Opened read-write, which on Linux never blocks on a FIFO and keeps
+    /// a writer present.
+    _held: std::fs::File,
+}
+
+impl StalledFile {
+    fn create(path: &std::path::Path) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        );
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("hold the FIFO open");
+        StalledFile {
+            path: path.to_owned(),
+            _held: held,
+        }
+    }
+
+    /// Whether anyone besides this holder has the FIFO open. The nodes
+    /// run in this process, so their open files are in `/proc/self/fd`
+    /// beside this holder's own.
+    fn has_reader(&self) -> bool {
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return false;
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|target| target == self.path))
+            .count()
+            > 1
+    }
+}
+
+impl Drop for StalledFile {
+    fn drop(&mut self) {
+        // Deliberately ignored: the FIFO is in the test's temp dir, which
+        // goes with the test.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// An increment on `conn` is acked.
+fn assert_acked(conn: &mut Connection, when: &str) {
+    let reply = conn
+        .request_one(&increment_request(1))
+        .unwrap_or_else(|e| panic!("{when}: the request was not answered: {e}"));
+    assert_eq!(
+        reply.first(),
+        Some(&KIND_RESP_ACK),
+        "{when}: increment acked"
+    );
+}
+
+/// A primary on slot 0 and replicas on the other slots of the runner's
+/// network, in a temp dir with the keys they share.
+struct Cluster {
+    dir: tempfile::TempDir,
+    authorized_keys: std::path::PathBuf,
+}
+
+impl Cluster {
+    /// The keys: the primary's and three replicas', and the test's writer.
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let authorized_keys = dir.path().join("authorized_keys");
+        let mut lines = vec![key::authorized_keys_line(
+            "writer",
+            &writer_key().verifying_key(),
+            "veth-test",
+        )];
+        for slot in 0..3 {
+            lines.push(key::authorized_keys_line(
+                "replication",
+                &Self::node_key(slot).verifying_key(),
+                &format!("node-{slot}"),
+            ));
+        }
+        std::fs::write(&authorized_keys, lines.join("\n")).expect("write authorized_keys");
+        Cluster {
+            dir,
+            authorized_keys,
+        }
+    }
+
+    fn node_key(slot: usize) -> SigningKey {
+        SigningKey::from_bytes(&[0xC1 + slot as u8; 32])
+    }
+
+    /// A node's health endpoint. On kernel TCP, on the loopback of the
+    /// runner's network namespace: this process's own, so any port is
+    /// free.
+    fn health(slot: usize) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 9_101 + slot as u16))
+    }
+
+    fn addrs(slot: usize) -> melin_test_node::Addrs {
+        melin_test_node::addrs(slot, || {
+            unreachable!("on DPDK the slot gives the addresses")
+        })
+    }
+
+    /// The configuration every node shares; journal `{name}.journal`.
+    fn config(&self, slot: usize, name: &str) -> ServerConfig {
+        let key_path = self.dir.path().join(format!("{name}.key"));
+        std::fs::write(&key_path, Self::node_key(slot).to_bytes()).expect("write node key");
+        ServerConfig {
+            journal: self.dir.path().join(format!("{name}.journal")),
+            authorized_keys: self.authorized_keys.clone(),
+            ack_policy: AckPolicy::Disk,
+            no_mlock: true,
+            cores: PipelineCores::unpinned(),
+            tick_interval_ms: 0,
+            snapshot_interval_ms: 0,
+            health_bind: Some(Self::health(slot)),
+            replication_key: Some(key_path),
+            ..ServerConfig::default()
+        }
+    }
+
+    /// The primary, on slot 0, journal `primary.journal`.
+    fn start_primary(&self) -> melin_test_node::Node {
+        let addrs = Self::addrs(0);
+        let mut config = self.config(0, "primary");
+        config.replication_bind = Some(addrs.replication());
+        Self::start(&addrs, config)
+    }
+
+    /// A replica of the primary, on `slot`, journal `{name}.journal`.
+    fn start_replica(&self, slot: usize, name: &str) -> melin_test_node::Node {
+        let mut config = self.config(slot, name);
+        config.replica_of = Some(Self::addrs(0).replication());
+        Self::start(&Self::addrs(slot), config)
+    }
+
+    fn start(addrs: &melin_test_node::Addrs, config: ServerConfig) -> melin_test_node::Node {
+        melin_test_node::start_at::<Counter>(
+            addrs,
+            config,
+            StartupEvents::none(),
+            (),
+            RequestDecoder,
+            ResponseEncoder,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Clients
 // ---------------------------------------------------------------------------
@@ -379,14 +778,12 @@ fn served_within(node: SocketAddr, limit: Duration, after: &str) -> Connection {
 /// keeps them one at a time.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
-/// Run `body` against a fresh counter node on DPDK, then stop the node.
-///
-/// No cleanup on a panic: the test has failed, and its process exiting
-/// takes the node, the namespaces and the tmpfs with it.
-fn with_node(body: fn(SocketAddr)) {
+/// Take this test's turn (see [`ONE_AT_A_TIME`]) and install the log
+/// subscriber. Hold the guard for the whole test.
+fn serialise() -> MutexGuard<'static, ()> {
     // A poisoned lock only means an earlier test failed; that one has
     // reported itself, and this one has nothing to inherit from it.
-    let _serial = ONE_AT_A_TIME
+    let serial = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -403,7 +800,40 @@ fn with_node(body: fn(SocketAddr)) {
         .with_test_writer()
         .with_thread_names(true)
         .try_init();
+    serial
+}
 
+/// The value of one Prometheus gauge on a node's health endpoint, or
+/// `None` while the endpoint is not up.
+fn gauge(health: SocketAddr, name: &str) -> Option<u64> {
+    let mut stream = TcpStream::connect_timeout(&health, Duration::from_millis(200)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
+    let mut body = String::new();
+    stream.read_to_string(&mut body).ok()?;
+    body.lines()
+        .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
+}
+
+/// Wait, at most `limit`, for gauge `name` to read `value`.
+fn wait_for_gauge(health: SocketAddr, name: &str, value: u64, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    while gauge(health, name) != Some(value) {
+        assert!(
+            Instant::now() < deadline,
+            "{name} did not reach {value} within {limit:?} (last: {:?})",
+            gauge(health, name)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Run `body` against a fresh counter node on DPDK, then stop the node.
+///
+/// No cleanup on a panic: the test has failed, and its process exiting
+/// takes the node, the namespaces and the tmpfs with it.
+fn with_node(body: fn(SocketAddr)) {
+    let _serial = serialise();
     let dir = tempfile::tempdir().expect("tempdir");
     let authorized_keys = dir.path().join("authorized_keys");
     std::fs::write(

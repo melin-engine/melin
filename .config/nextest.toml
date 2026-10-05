@@ -65,16 +65,14 @@ dpdk-serial = { max-threads = 1 }
 # not work on DPDK yet. (The filter language has no comments; the
 # clauses are in the order of this list.)
 #
-# - "DPDK does not notice a replication peer that has gone":
-#   halt_refusal, raft_failover, replicated_failover.
-# - "A promoted DPDK replica serves on kernel TCP": genesis_promotion's
-#   promotion case, notary's promoted-replica test.
+# - "A promoted DPDK replica serves on kernel TCP": raft_failover,
+#   replicated_failover, genesis_promotion's promotion case, notary's
+#   promoted-replica test.
 [profile.dpdk]
 test-threads = 1
 default-filter = '''
 not (
-    (binary(halt_refusal) & test(=a_write_refused_while_halted_is_not_replayed))
-    | (binary(raft_failover) & test(=killed_primary_triggers_exactly_one_auto_promotion))
+    (binary(raft_failover) & test(=killed_primary_triggers_exactly_one_auto_promotion))
     | (binary(replicated_failover) & test(=acked_events_survive_primary_death_under_ram_policy))
     | (binary(genesis_promotion) & test(=a_replica_configured_with_a_larger_genesis_is_promoted))
     | (package(melin-example-notary) & test(=a_promoted_replica_reports_the_head_the_primary_receipted))

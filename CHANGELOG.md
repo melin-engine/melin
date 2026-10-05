@@ -62,6 +62,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   integration suites on DPDK when the `dpdk` feature is enabled (the
   examples gain a `dpdk` feature for it), with the `dpdk` nextest
   profile. For contributors; nothing ships with it.
+- **Peer liveness for long-lived DPDK links.** `melin_dpdk::PeerLiveness`
+  arms keep-alive probes and a timeout on a connection
+  (`DpdkTransport::set_peer_liveness`), and `DpdkTransport::reset` closes
+  a connection and sends its RST rather than vanishing.
 
 ### Removed
 
@@ -149,6 +153,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `JournalReader::genesis_entries`, `JournaledApp::genesis_entries`,
   `snapshot::load_with_header`, `snapshot::MAX_HEADER_SIZE`, and
   `melin_journal::fresh_anchor` is public.
+- **A DPDK primary reads a joining replica's catch-up and snapshot off
+  its poll thread.** The poll thread also carries client traffic and the
+  other replica's stream, and the join's disk reads stalled them all
+  while they ran: seconds for a large snapshot on a cold disk. A worker
+  per replica slot now does the reading, and the poll thread sends what
+  it has read a little at a time between its other work.
 
 ### Fixed
 
@@ -283,6 +293,20 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   with the time of the last heartbeat scan, stale under load, so the
   next scan could heartbeat a connection that had only just been made.
   It is stamped when the connection is registered.
+- **On DPDK, neither end of a replication link noticed that its peer had
+  gone.** A stopped DPDK node told its peer nothing, and neither end had
+  a deadline on a silent peer. A primary kept counting a stopped replica
+  (`melin_replicas_connected`) and never halted, so it did not refuse
+  writes as a primary whose last replica has left must; a replica kept a
+  stopped primary's link up, so auto-promotion refused to depose it and
+  the cluster never failed over. A replication link is now reset once
+  its peer has answered nothing for five seconds, a peer's FIN ends it,
+  and a node that drops a link or stops tells its peer at once. A peer
+  that is alive but has stopped reading, a replica installing a snapshot
+  say, still answers, and stays connected: this relies on fastcp 0.13.2,
+  now required, which probes such a peer at least once a second. The
+  DPDK stack's clock is also monotonic now: on the wall clock, a step
+  could have fired or held its timers.
 
 ## [0.18.0] - 2026-09-27
 
