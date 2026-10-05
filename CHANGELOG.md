@@ -43,6 +43,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   on a connection has been acknowledged by the peer. `close` discards
   what is unsent, so a caller with a last frame to deliver waits on it
   first.
+- **A process-wide DPDK EAL**, for a process hosting several DPDK nodes,
+  at once or one after another: `melin_dpdk::Eal::init_process_wide`
+  initialises it once and never cleans it up, `Eal::process_wide` reads
+  it, and `Eal::attach_vdev` / `detach_vdev` give each node a virtual
+  device and port of its own. A node in such a process shares it and
+  takes no EAL arguments of its own. A process that never calls it is
+  unchanged: the node owns its EAL, as before.
 
 ### Removed
 
