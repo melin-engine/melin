@@ -119,3 +119,10 @@ panic = "abort"
 [profile.dev.package."*"]
 opt-level = 2
 
+# THROWAWAY (ci/fastcp-zwp-check, never to be merged): fastcp's
+# zero-window-probe fix, pinned to its commit before it is published as
+# 0.13.2, to see the DPDK CI suites pass with it. The deny job is
+# expected to fail on this git source.
+[patch.crates-io]
+fastcp = { git = "https://github.com/melin-engine/fastcp.git", rev = "d25540432fe89358ba8c33007f163ba22ea7b6d7" }
+
