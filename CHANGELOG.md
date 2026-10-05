@@ -50,6 +50,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   device and port of its own. A node in such a process shares it and
   takes no EAL arguments of its own. A process that never calls it is
   unchanged: the node owns its EAL, as before.
+- **`melin_server_runtime::server::run_with_shutdown`**: `run` on the
+  build's own transport, stopped through a caller's flag instead of the
+  process-wide signal handler `run` installs. For a host that owns its
+  process's signals, or runs several nodes in one process. Unlike
+  `run_with_listener`, the client listener stays the transport's own, so
+  it works on DPDK.
 
 ### Removed
 
