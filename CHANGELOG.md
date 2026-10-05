@@ -39,6 +39,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   node's client keys, an event publisher's subscribers say, calls it and
   applies exactly the client listener's rule, instead of keeping a copy
   of it in step.
+- **`melin_dpdk::DpdkTransport::tx_drained`**: whether everything queued
+  on a connection has been acknowledged by the peer. `close` discards
+  what is unsent, so a caller with a last frame to deliver waits on it
+  first.
 
 ### Removed
 
@@ -237,6 +241,29 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   release keeps the length it records: it is never given a genesis
   later. A temporary genesis file left by an interrupted first boot is
   removed on the next boot, whichever way it starts.
+- **A failed client authentication left a DPDK connection open.** A bad
+  signature, an undecodable response or an oversized auth frame was
+  answered with `AuthFailed`, but the connection stayed in the
+  handshake: the client could retry signatures against the same nonce
+  until the auth timeout, and an oversized frame was answered again on
+  every receive. As on kernel TCP, one failed attempt now ends the
+  connection, closed once the client has the `AuthFailed`.
+- **`melin_replica_ack_latency_us` read 0 on DPDK.** Only the kernel-TCP
+  sender recorded it. The DPDK sender now records the same measure: the
+  time from the latest send to the latest ack (not a per-message round
+  trip, on either transport, as its help text now says).
+- **`melin_replica_evictions_total` over-counted on kernel TCP.** An
+  eviction was counted, and warned about, again on every supervisor pass
+  until the evicted handler exited. It is counted once.
+- **Replication session teardown.** A kernel-TCP replica waiting to
+  retry a failed resync held its socket, and with it a slot on its
+  primary, through the backoff. A DPDK replica that failed to decode its
+  primary's handshake reply left its pipeline running. Both now tear
+  down as every other failed session does.
+- **A new DPDK client connection was heartbeated early.** It was stamped
+  with the time of the last heartbeat scan, stale under load, so the
+  next scan could heartbeat a connection that had only just been made.
+  It is stamped when the connection is registered.
 
 ## [0.18.0] - 2026-09-27
 
