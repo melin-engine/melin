@@ -288,7 +288,7 @@ pub fn run_dpdk_poll<A: Application>(
                 tick_check_counter = 0;
                 // Nothing to re-arm on a published tick: the poll loop
                 // never sleeps, so the counter above is its only timer.
-                tick_schedule.publish_if_due(Instant::now(), &mut producer);
+                tick_schedule.publish_if_due(Instant::now(), unix_epoch_nanos, &mut producer);
             }
         }
 

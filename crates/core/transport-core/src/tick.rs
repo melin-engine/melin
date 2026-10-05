@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use crate::pipeline::InputSlot;
 use crate::trace::mono_trace_ns;
-use melin_app::{AppEvent, unix_epoch_nanos};
+use melin_app::AppEvent;
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 
@@ -104,19 +104,24 @@ impl TickSchedule {
     }
 
     /// Publish a tick if one is due at `now`, stamped with the wall clock
-    /// clamped monotonic against the previous tick. Returns whether a tick
-    /// was published (or dropped on a full ring — see [`publish_tick`]),
-    /// so the caller can re-arm any timer it keyed on the old deadline.
+    /// read from `wall_ns` (nanoseconds since the Unix epoch — production
+    /// passes `melin_app::unix_epoch_nanos`) clamped monotonic against the
+    /// previous tick. `wall_ns` is called only once a tick is due, so a
+    /// poll that finds nothing due costs no clock read. Returns whether a
+    /// tick was published (or dropped on a full ring — see
+    /// [`publish_tick`]), so the caller can re-arm any timer it keyed on
+    /// the old deadline.
     #[inline]
     pub fn publish_if_due<E: AppEvent>(
         &mut self,
         now: Instant,
+        wall_ns: impl FnOnce() -> u64,
         producer: &mut ring::Producer<InputSlot<E>>,
     ) -> bool {
         if now < self.next_deadline {
             return false;
         }
-        let now_ns = clamp_monotonic(unix_epoch_nanos(), self.last_now_ns);
+        let now_ns = clamp_monotonic(wall_ns(), self.last_now_ns);
         self.last_now_ns = now_ns;
         publish_tick(producer, now_ns);
         self.advance(Instant::now());
@@ -207,25 +212,33 @@ mod tests {
         let t0 = Instant::now();
         let mut s = TickSchedule::new(cadence, t0);
 
-        // Before the deadline: nothing published, deadline untouched.
-        assert!(!s.publish_if_due(t0 + cadence - Duration::from_nanos(1), &mut producer));
+        // A fixed wall clock rather than the real one: the stamps are
+        // exact, and the test runs under Miri's isolation, which refuses
+        // `clock_gettime(CLOCK_REALTIME)`.
+        const WALL_NS: u64 = 1_700_000_000_000_000_000;
+
+        // Before the deadline: nothing published, deadline untouched, and
+        // the wall clock never read.
+        assert!(!s.publish_if_due(
+            t0 + cadence - Duration::from_nanos(1),
+            || panic!("wall clock read before a tick was due"),
+            &mut producer,
+        ));
         assert_eq!(s.next_deadline(), t0 + cadence);
         assert!(consumer.try_consume().is_none());
 
-        // At the deadline: the first tick carries the wall clock.
-        let wall_before = unix_epoch_nanos();
-        assert!(s.publish_if_due(t0 + cadence, &mut producer));
+        // At the deadline: the first tick carries the wall clock as read.
+        assert!(s.publish_if_due(t0 + cadence, || WALL_NS, &mut producer));
         let (_, slot) = consumer.try_consume().expect("a tick on the ring");
-        let first = tick_of(slot);
-        assert!(first >= wall_before.max(1));
-        assert_eq!(s.last_now_ns, first);
+        assert_eq!(tick_of(slot), WALL_NS);
+        assert_eq!(s.last_now_ns, WALL_NS);
         assert_eq!(s.next_deadline(), t0 + 2 * cadence, "re-armed on the grid");
 
         // A previous tick stamped ahead of the wall clock (a backwards
         // step since): the next is clamped to one past it.
-        let ahead = unix_epoch_nanos() + 3_600_000_000_000;
+        let ahead = WALL_NS + 3_600_000_000_000;
         s.last_now_ns = ahead;
-        assert!(s.publish_if_due(t0 + 2 * cadence, &mut producer));
+        assert!(s.publish_if_due(t0 + 2 * cadence, || WALL_NS, &mut producer));
         let (_, slot) = consumer.try_consume().expect("a second tick");
         assert_eq!(tick_of(slot), ahead + 1);
         assert_eq!(s.last_now_ns, ahead + 1);
