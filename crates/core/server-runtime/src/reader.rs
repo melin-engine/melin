@@ -542,7 +542,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
         // the timeout-arm so that a freshly-emitted tick re-arms a timeout for
         // the *new* deadline.
         if tick_enabled {
-            if tick_schedule.publish_if_due(Instant::now(), &mut producer) {
+            if tick_schedule.publish_if_due(Instant::now(), unix_epoch_nanos, &mut producer) {
                 // The previous timeout (if any) is now stale; let it fire and
                 // be ignored, then arm a new one below.
                 tick_armed = false;
