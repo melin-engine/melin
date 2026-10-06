@@ -985,6 +985,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use melin_transport_core::replication::protocol::{ReplicaMessage, decode_replica_message};
+    use melin_wire_protocol::framing::split_frame_limited;
 
     /// Connected localhost pair: (transport side, peer side).
     fn socket_pair() -> (TcpStream, TcpStream) {
@@ -1024,19 +1025,13 @@ mod tests {
             assert!(n > 0, "peer closed before all acks arrived");
             buf.extend_from_slice(&chunk[..n]);
             // Parse complete frames.
-            loop {
-                if buf.len() < 4 {
-                    break;
-                }
-                let len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-                if buf.len() < 4 + len {
-                    break;
-                }
-                match decode_replica_message(&buf[4..4 + len]).expect("decodable frame") {
+            while let Some(frame) = split_frame_limited(&buf, MAX_CONTROL_FRAME).unwrap() {
+                match decode_replica_message(frame.payload).expect("decodable frame") {
                     ReplicaMessage::Ack(a) => acks.push(a),
                     other => panic!("expected Ack frame, got {other:?}"),
                 }
-                buf.drain(..4 + len);
+                let consumed = frame.consumed();
+                buf.drain(..consumed);
             }
         }
         assert!(buf.is_empty(), "trailing bytes after expected acks");

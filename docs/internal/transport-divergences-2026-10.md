@@ -82,11 +82,6 @@ The 5 s client auth timeout is a literal in `server.rs` (per read, so up to
 ~10 s across the two reads) and `AUTH_TIMEOUT` in `dpdk_transport.rs` (total
 since accept).
 
-### DPDK client framing tests test a copy
-
-`dpdk_transport.rs` tests exercise a test-local `try_extract_frame`, not
-`process_client_frames`. They give no coverage of the production path.
-
 ## Response stage
 
 ### DPDK heartbeat SPSC-full drops the connection without closing it (likely bug)

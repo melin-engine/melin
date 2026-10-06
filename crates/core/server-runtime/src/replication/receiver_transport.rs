@@ -22,6 +22,7 @@ use melin_transport_core::replication::protocol::{
     Ack, InputBatchError, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
     try_decode_input_batch_into,
 };
+use melin_wire_protocol::framing::{PREFIX_LEN, split_frame_limited};
 
 use super::{PendingAckQueue, try_flush_dual_track};
 
@@ -81,6 +82,7 @@ pub(super) trait ReceiverTransport {
 // Shared frame-extraction helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum FrameResult {
     /// Complete frame: payload `[start..end)`, total frame `[0..end)`.
     Complete(usize, usize),
@@ -91,22 +93,19 @@ pub(super) enum FrameResult {
 }
 
 /// Try to extract one length-prefixed frame from a receive buffer.
+///
+/// The wire protocol's splitter, plus the one rule replication adds on
+/// top of it: every replication message carries at least a tag, so a
+/// zero-length frame is malformed and refused like an oversized one,
+/// on its 4 prefix bytes, as an oversized length is.
+#[inline]
 pub(super) fn try_extract_frame(buf: &[u8], max_size: usize) -> FrameResult {
-    if buf.len() < 4 {
-        return FrameResult::Incomplete;
+    match split_frame_limited(buf, max_size) {
+        Ok(Some(frame)) if frame.payload.is_empty() => FrameResult::Oversized,
+        Ok(Some(frame)) => FrameResult::Complete(PREFIX_LEN, frame.consumed()),
+        Ok(None) => FrameResult::Incomplete,
+        Err(_) => FrameResult::Oversized,
     }
-    let len = u32::from_le_bytes(
-        buf[0..4]
-            .try_into()
-            .expect("bounds checked: buf has at least 4 bytes"),
-    ) as usize;
-    if len == 0 || len > max_size {
-        return FrameResult::Oversized;
-    }
-    if buf.len() < 4 + len {
-        return FrameResult::Incomplete;
-    }
-    FrameResult::Complete(4, 4 + len)
 }
 
 /// Remove `consumed` leading bytes from a receive buffer.
@@ -1249,6 +1248,71 @@ mod tests {
             .add_consumer()
             .build(WaitStrategy::SpinThenYield);
         (producer, consumers.pop().expect("consumer present"))
+    }
+
+    // ---------------------------------------------------------------
+    // try_extract_frame
+    // ---------------------------------------------------------------
+
+    /// A replication frame: `len` as the prefix, followed by `body` (which
+    /// may be shorter than `len`, for a frame still arriving).
+    fn prefixed(len: usize, body: &[u8]) -> Vec<u8> {
+        let mut buf = (len as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    #[test]
+    fn extract_waits_for_the_whole_frame() {
+        assert_eq!(try_extract_frame(&[], 16), FrameResult::Incomplete);
+        assert_eq!(try_extract_frame(&[3, 0, 0], 16), FrameResult::Incomplete);
+        assert_eq!(
+            try_extract_frame(&prefixed(3, &[]), 16),
+            FrameResult::Incomplete
+        );
+        assert_eq!(
+            try_extract_frame(&prefixed(3, &[1, 2]), 16),
+            FrameResult::Incomplete
+        );
+    }
+
+    #[test]
+    fn extract_returns_payload_bounds_and_ignores_trailing_bytes() {
+        let buf = prefixed(3, &[1, 2, 3, 0xFF, 0xFF]);
+        assert_eq!(try_extract_frame(&buf, 16), FrameResult::Complete(4, 7));
+    }
+
+    #[test]
+    fn extract_admits_a_frame_at_the_limit() {
+        let buf = prefixed(16, &[7; 16]);
+        assert_eq!(try_extract_frame(&buf, 16), FrameResult::Complete(4, 20));
+        // ...and waits for its payload rather than refusing it.
+        assert_eq!(try_extract_frame(&buf[..4], 16), FrameResult::Incomplete);
+    }
+
+    /// Refused on the prefix alone: nothing is buffered towards a length
+    /// that would never be accepted.
+    #[test]
+    fn extract_refuses_an_oversized_prefix_before_its_payload() {
+        assert_eq!(
+            try_extract_frame(&prefixed(17, &[]), 16),
+            FrameResult::Oversized
+        );
+        assert_eq!(
+            try_extract_frame(&prefixed(MAX_DATA_FRAME + 1, &[]), MAX_DATA_FRAME),
+            FrameResult::Oversized
+        );
+    }
+
+    /// Every replication message carries a tag, so an empty frame is
+    /// malformed, unlike on the client wire, where framing lets it
+    /// through and the reader drops it.
+    #[test]
+    fn extract_refuses_a_zero_length_frame() {
+        assert_eq!(
+            try_extract_frame(&prefixed(0, &[1, 2, 3]), 16),
+            FrameResult::Oversized
+        );
     }
 
     // ---------------------------------------------------------------

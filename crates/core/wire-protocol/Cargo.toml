@@ -13,4 +13,5 @@ description = "Length-prefixed wire framing and transport listener for TCP and U
 workspace = true
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"

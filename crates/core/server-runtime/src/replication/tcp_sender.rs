@@ -24,12 +24,13 @@ use melin_transport_core::replication::catchup::{
     preflight_snapshot_transfer, snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
-    MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_hash_mismatch,
+    Ack, MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_hash_mismatch,
     encode_heartbeat, encode_need_snapshot, encode_stream_start, read_frame,
 };
 use melin_transport_core::replication::validate::{
     HandshakeValidation, validate_replica_handshake_settled,
 };
+use melin_wire_protocol::framing::split_frame_limited;
 
 // --- Replication Sender (Primary side) ---
 
@@ -1048,41 +1049,17 @@ fn live_stream_uring(
                     let n = result as usize;
                     parse_buf.extend_from_slice(&recv_buf[..n]);
 
-                    // Extract complete ack frames from parse_buf.
-                    let mut cursor = 0;
-                    while cursor + 4 <= parse_buf.len() {
-                        let frame_len = u32::from_le_bytes(
-                            parse_buf[cursor..cursor + 4]
-                                .try_into()
-                                .expect("bounds checked: 4-byte slice"),
-                        ) as usize;
-                        if frame_len == 0 || frame_len > MAX_CONTROL_FRAME {
-                            return Err(io::Error::other(format!(
-                                "invalid ack frame length: {frame_len}"
-                            )));
-                        }
-                        if cursor + 4 + frame_len > parse_buf.len() {
-                            break; // Incomplete frame.
-                        }
-                        let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
-                        if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(payload) {
-                            // Eviction on violation: returning Err tears the
-                            // connection down; the accept loop's cleanup
-                            // disengages the cursors and frees the slot.
-                            cursors
-                                .record_ack(slot_idx, &ack, sent.get())
-                                .map_err(io::Error::other)?;
-                            metrics.ack_latency_us[slot_idx]
-                                .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
-                        }
-                        cursor += 4 + frame_len;
-                    }
-                    // Compact parse_buf.
-                    if cursor > 0 {
-                        let remaining = parse_buf.len() - cursor;
-                        parse_buf.copy_within(cursor.., 0);
-                        parse_buf.truncate(remaining);
-                    }
+                    drain_ack_frames(&mut parse_buf, |ack| {
+                        // Eviction on violation: returning Err tears the
+                        // connection down; the accept loop's cleanup
+                        // disengages the cursors and frees the slot.
+                        cursors
+                            .record_ack(slot_idx, &ack, sent.get())
+                            .map_err(io::Error::other)?;
+                        metrics.ack_latency_us[slot_idx]
+                            .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        Ok(())
+                    })?;
 
                     // Resubmit RECV.
                     let sqe = opcode::Recv::new(
@@ -1155,6 +1132,48 @@ fn live_stream_uring(
             waiter.idle();
         }
     }
+}
+
+/// Split the replica's complete frames off the front of `parse_buf`, hand
+/// every `Ack` among them to `on_ack`, and compact the consumed bytes
+/// away; a trailing partial frame stays for the next RECV.
+///
+/// A length prefix above [`MAX_CONTROL_FRAME`], or of zero (every replica
+/// message carries a tag), is an `Err` as soon as its 4 bytes are in, as
+/// is an `Err` from `on_ack`; either ends the connection, so nothing is
+/// compacted on that path. A frame that is not a decodable `Ack` is
+/// skipped.
+///
+/// Not [`super::receiver_transport::try_extract_frame`], which applies
+/// the same rule: the error names the length the replica declared.
+fn drain_ack_frames(
+    parse_buf: &mut Vec<u8>,
+    mut on_ack: impl FnMut(Ack) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut cursor = 0;
+    loop {
+        let frame = match split_frame_limited(&parse_buf[cursor..], MAX_CONTROL_FRAME) {
+            Ok(Some(frame)) if !frame.payload.is_empty() => frame,
+            Ok(Some(_)) => return Err(io::Error::other("invalid ack frame length: 0")),
+            Ok(None) => break,
+            Err(too_large) => {
+                return Err(io::Error::other(format!(
+                    "invalid ack frame length: {}",
+                    too_large.declared
+                )));
+            }
+        };
+        if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(frame.payload) {
+            on_ack(ack)?;
+        }
+        cursor += frame.consumed();
+    }
+    if cursor > 0 {
+        let remaining = parse_buf.len() - cursor;
+        parse_buf.copy_within(cursor.., 0);
+        parse_buf.truncate(remaining);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1287,5 +1306,110 @@ mod tests {
         // The supervisor collects the handler and re-arms the slot.
         counted = false;
         assert!(take_new_eviction(true, true, &mut counted));
+    }
+
+    // --- drain_ack_frames ---
+
+    fn ack_frame(seq: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        melin_transport_core::replication::protocol::encode_ack(
+            &Ack {
+                acked_sequence: seq,
+                in_memory_sequence: seq,
+            },
+            &mut buf,
+        );
+        buf
+    }
+
+    /// `drain_ack_frames` over `buf`, returning the acked sequences it
+    /// handed over alongside its result.
+    fn drain(buf: &mut Vec<u8>) -> (io::Result<()>, Vec<u64>) {
+        let mut seen = Vec::new();
+        let result = drain_ack_frames(buf, |ack| {
+            seen.push(ack.acked_sequence);
+            Ok(())
+        });
+        (result, seen)
+    }
+
+    #[test]
+    fn ack_frames_are_handed_over_and_a_partial_one_is_kept() {
+        let mut buf = ack_frame(1);
+        buf.extend_from_slice(&ack_frame(2));
+        let third = ack_frame(3);
+        buf.extend_from_slice(&third[..third.len() - 1]);
+
+        let (result, seen) = drain(&mut buf);
+        result.unwrap();
+        assert_eq!(seen, [1, 2]);
+        assert_eq!(
+            buf,
+            third[..third.len() - 1],
+            "partial frame compacted to the front"
+        );
+
+        buf.push(*third.last().unwrap());
+        let (result, seen) = drain(&mut buf);
+        result.unwrap();
+        assert_eq!(seen, [3]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_frame_that_is_not_an_ack_is_skipped() {
+        let mut buf = vec![1, 0, 0, 0, 0xEE];
+        buf.extend_from_slice(&ack_frame(4));
+        let (result, seen) = drain(&mut buf);
+        result.unwrap();
+        assert_eq!(seen, [4]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_frame_at_the_cap_waits_for_its_payload() {
+        let mut buf = (MAX_CONTROL_FRAME as u32).to_le_bytes().to_vec();
+        let (result, seen) = drain(&mut buf);
+        result.unwrap();
+        assert!(seen.is_empty());
+        assert_eq!(buf.len(), 4, "prefix kept for the next RECV");
+    }
+
+    /// Refused on the prefix alone, after the acks in front of it.
+    #[test]
+    fn an_oversized_prefix_fails_before_its_payload() {
+        let mut buf = ack_frame(5);
+        buf.extend_from_slice(&((MAX_CONTROL_FRAME as u32) + 1).to_le_bytes());
+        let (result, seen) = drain(&mut buf);
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("invalid ack frame length: {}", MAX_CONTROL_FRAME + 1)
+        );
+        assert_eq!(seen, [5]);
+    }
+
+    #[test]
+    fn a_zero_length_frame_fails() {
+        let mut buf = 0u32.to_le_bytes().to_vec();
+        let (result, seen) = drain(&mut buf);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid ack frame length: 0"
+        );
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn an_on_ack_error_stops_the_drain() {
+        let mut buf = ack_frame(6);
+        buf.extend_from_slice(&ack_frame(7));
+        let mut calls = 0;
+        let result = drain_ack_frames(&mut buf, |_| {
+            calls += 1;
+            Err(io::Error::other("cursor violation"))
+        });
+        assert_eq!(result.unwrap_err().to_string(), "cursor violation");
+        assert_eq!(calls, 1);
     }
 }

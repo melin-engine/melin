@@ -6,6 +6,8 @@
 
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
+use crate::framing::FrameTooLarge;
+
 /// Bound on one frame's payload, after the 4-byte length prefix: the
 /// same limit on every transport. A reader refuses a frame declaring
 /// more, and [`BlockingFrameWriter`] refuses to write one, so an
@@ -44,6 +46,11 @@ impl<R: Read> BlockingFrameReader<R> {
     /// Read the next complete frame into the internal buffer.
     /// Returns a borrowed slice of the frame payload, or `None` on clean
     /// disconnect. The slice is valid until the next `read_frame()` call.
+    ///
+    /// A prefix declaring more than [`MAX_FRAME_SIZE`] is
+    /// [`io::ErrorKind::InvalidData`] wrapping a [`FrameTooLarge`]
+    /// (reachable through [`io::Error::get_ref`]); the stream has no frame
+    /// boundary left to resume from.
     pub fn read_frame(&mut self) -> io::Result<Option<&[u8]>> {
         // Read the 4-byte length prefix.
         let mut len_buf = [0u8; 4];
@@ -53,12 +60,16 @@ impl<R: Read> BlockingFrameReader<R> {
             Err(e) => return Err(e),
         }
 
-        let len = u32::from_le_bytes(len_buf) as usize;
+        let declared = u32::from_le_bytes(len_buf);
+        let len = declared as usize;
         if len > MAX_FRAME_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("frame too large: {len} bytes (max {MAX_FRAME_SIZE})"),
-            ));
+            // Carries the typed error, so a caller can tell an oversized
+            // frame from a failing socket by downcasting.
+            return Err(FrameTooLarge {
+                declared,
+                max: MAX_FRAME_SIZE,
+            }
+            .into());
         }
 
         self.reader.read_exact(&mut self.buf[..len])?;
@@ -236,8 +247,21 @@ mod tests {
         client.write_all(&fake_len.to_le_bytes()).unwrap();
 
         let mut reader = BlockingFrameReader::new(server);
-        let result = reader.read_frame();
-        assert!(result.is_err());
+        let err = reader.read_frame().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            format!("frame too large: {fake_len} bytes (max {MAX_FRAME_SIZE})")
+        );
+        // The typed error rides inside, with the declared length.
+        assert_eq!(
+            err.get_ref()
+                .and_then(|inner| inner.downcast_ref::<FrameTooLarge>()),
+            Some(&FrameTooLarge {
+                declared: fake_len,
+                max: MAX_FRAME_SIZE
+            })
+        );
     }
 
     #[test]

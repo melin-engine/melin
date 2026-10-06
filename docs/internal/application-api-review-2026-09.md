@@ -368,6 +368,11 @@ constructor). Breaking once, then never again for this reason.
 Downstream applications with struct literals need a one-line change
 each.
 
+Declined: public types stay exhaustive by project policy (see
+`CLAUDE.md`), so a new variant or field surfaces as a compile error at
+every match that must handle it. Such additions are breaking changes,
+called out in `CHANGELOG.md` under Changed.
+
 ### F5. No conformance test kit
 
 Each example hand-writes the same checks. A `melin_app::testing` module

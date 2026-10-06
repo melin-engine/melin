@@ -1323,6 +1323,7 @@ mod tests {
     //! regress the "earlier frames must be visible before ServerBusy /
     //! disconnect" guarantees.
     use super::*;
+    use crate::client_frames::MAX_REQUEST_BODY;
     use melin_app::auth::NoRoles;
     use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, QueryCtx, RejectReason};
@@ -2204,8 +2205,8 @@ mod tests {
             ..
         } = make_fixture(16);
         conn.parse_buf.extend_from_slice(&frame(0x42));
-        // Three of four length-prefix bytes — `cursor + 4 <= len()` is
-        // false, so the loop breaks before consuming anything from the
+        // Three of four length-prefix bytes — not even a length to judge
+        // yet, so the loop breaks before consuming anything from the
         // partial.
         conn.parse_buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
 
@@ -2220,6 +2221,46 @@ mod tests {
             vec![0xDE, 0xAD, 0xBE],
             "partial length prefix preserved for next recv-cycle"
         );
+    }
+
+    /// The cap is inclusive: a frame of exactly `MAX_FRAME_SIZE` payload
+    /// bytes is waited for while it arrives and then published, and a
+    /// prefix one past it drops the connection on its own, with no payload
+    /// behind it and nothing in front.
+    #[test]
+    fn process_frames_admits_a_frame_at_the_limit_and_drops_one_past_it() {
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(16);
+        let mut body = vec![0x05; MAX_REQUEST_BODY];
+        body[0] = 0x2A;
+        let at_limit = request_frame(TAG_APP, &body);
+        assert_eq!(at_limit.len(), 4 + MAX_FRAME_SIZE);
+
+        // The prefix and part of the payload: kept, not judged oversized.
+        conn.parse_buf.extend_from_slice(&at_limit[..4 + 1]);
+        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect, "a frame at the limit is not oversized");
+        assert_eq!(conn.parse_buf, at_limit[..4 + 1]);
+        assert!(drain(&mut consumer).is_empty());
+
+        // The rest of it arrives: published, buffer drained.
+        conn.parse_buf.extend_from_slice(&at_limit[4 + 1..]);
+        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect);
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x2A)));
+        assert!(conn.parse_buf.is_empty());
+
+        // One byte more, announced by a prefix alone: dropped at once.
+        conn.parse_buf.extend_from_slice(&oversize_prefix());
+        let (disconnect, _control_rx) = run_process_frames(&mut conn, &mut producer);
+        assert!(disconnect, "oversize prefix alone must request disconnect");
+        assert!(drain(&mut consumer).is_empty());
     }
 
     #[test]

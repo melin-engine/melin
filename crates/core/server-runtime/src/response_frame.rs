@@ -38,6 +38,12 @@ pub(crate) type EncodeBuf = [u8; MAX_APP_FRAME];
 /// A length past the body region is this server's bug and comes back as
 /// `Err` — the caller logs it and drops the response, rather than send a
 /// frame that would desync the client's framing.
+///
+/// Writes the same header as the wire protocol's `seal_request` but does
+/// not call it: the body cap here is `MAX_RESPONSE_BODY`, not the request
+/// cap, the `&'static str` error cannot take a `From` conversion, and
+/// `EncodeBuf`'s fixed size already bounds the frame, so the extra frame
+/// limit check would be a wasted branch on the response hot path.
 #[inline]
 pub(crate) fn frame_app_response(
     buf: &mut EncodeBuf,

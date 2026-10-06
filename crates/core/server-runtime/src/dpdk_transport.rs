@@ -52,6 +52,7 @@ use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control::ConnectionId;
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
+use melin_wire_protocol::framing::split_frame_limited;
 use rand::RngExt;
 
 use melin_dpdk::SocketHandle;
@@ -735,24 +736,22 @@ fn evaluate_auth_frame(
     authorized_keys: &AuthorizedKeys,
     connection_id: u64,
 ) -> AuthVerdict {
-    // Need at least 4 bytes for the length prefix.
-    let Some(prefix) = parse_buf.first_chunk::<4>() else {
-        return AuthVerdict::Incomplete;
+    let (decoded, consumed) = match split_frame_limited(parse_buf, MAX_AUTH_FRAME) {
+        // Borrow the payload directly — no heap allocation.
+        Ok(Some(frame)) => (
+            control_codec::decode_challenge_response(frame.payload),
+            frame.consumed(),
+        ),
+        Ok(None) => return AuthVerdict::Incomplete,
+        Err(too_large) => {
+            debug!(
+                connection_id,
+                frame_len = too_large.declared,
+                "DPDK: auth frame too large"
+            );
+            return AuthVerdict::Rejected;
+        }
     };
-    let frame_len = u32::from_le_bytes(*prefix) as usize;
-
-    if frame_len > MAX_AUTH_FRAME {
-        debug!(connection_id, frame_len, "DPDK: auth frame too large");
-        return AuthVerdict::Rejected;
-    }
-
-    let consumed = 4 + frame_len;
-    if parse_buf.len() < consumed {
-        return AuthVerdict::Incomplete;
-    }
-
-    // Borrow the payload directly — no heap allocation.
-    let decoded = control_codec::decode_challenge_response(&parse_buf[4..consumed]);
 
     // Compact the parse buffer now that the borrow is released.
     // Single memmove instead of drain()'s per-byte shift.
@@ -885,109 +884,23 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
 mod tests {
     use super::*;
 
-    // The framing tests below operate on raw length-prefixed bytes, so any
-    // `AppEvent` serves as a realistic payload. The in-tree counter example
-    // stands in for a production application's event, keeping these tests
-    // free of any application crate but the example.
+    // The client data path splits frames in `process_client_frames`, shared
+    // with the io_uring reader and tested there (`reader.rs`), on the wire
+    // protocol's splitter, whose own tests cover the partial, empty,
+    // exact-limit and oversized cases. What is left to check here is that
+    // an application's encoded events come back out of that splitter, under
+    // the cap the DPDK path applies, byte for byte.
+    //
+    // The in-tree counter example stands in for a production application's
+    // event, keeping these tests free of any application crate but the
+    // example.
     use counter_server::CounterEvent;
     use melin_app::AppEvent;
+    use melin_wire_protocol::framing::Frame;
 
-    /// Result of trying to extract a length-prefixed frame from a parse buffer.
-    #[derive(Debug, PartialEq)]
-    enum FrameResult<'a> {
-        Complete(&'a [u8]),
-        Incomplete,
-        Oversized(usize),
-    }
-
-    fn try_extract_frame(buf: &[u8]) -> FrameResult<'_> {
-        if buf.len() < 4 {
-            return FrameResult::Incomplete;
-        }
-        let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        if frame_len > MAX_FRAME_SIZE {
-            return FrameResult::Oversized(frame_len);
-        }
-        if buf.len() < 4 + frame_len {
-            return FrameResult::Incomplete;
-        }
-        FrameResult::Complete(&buf[4..4 + frame_len])
-    }
-
-    // --- try_extract_frame tests ---
-
-    #[test]
-    fn extract_frame_empty_buffer() {
-        assert_eq!(try_extract_frame(&[]), FrameResult::Incomplete);
-    }
-
-    #[test]
-    fn extract_frame_partial_length() {
-        assert_eq!(try_extract_frame(&[0x05, 0x00]), FrameResult::Incomplete);
-    }
-
-    #[test]
-    fn extract_frame_length_only_no_payload() {
-        // Length says 5 bytes, but no payload present.
-        assert_eq!(
-            try_extract_frame(&[0x05, 0x00, 0x00, 0x00]),
-            FrameResult::Incomplete
-        );
-    }
-
-    #[test]
-    fn extract_frame_partial_payload() {
-        // Length says 5 bytes, only 3 payload bytes present.
-        assert_eq!(
-            try_extract_frame(&[0x05, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC]),
-            FrameResult::Incomplete
-        );
-    }
-
-    #[test]
-    fn extract_frame_complete() {
-        let buf = [0x03, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC];
-        assert_eq!(
-            try_extract_frame(&buf),
-            FrameResult::Complete(&[0xAA, 0xBB, 0xCC])
-        );
-    }
-
-    #[test]
-    fn extract_frame_complete_with_trailing_data() {
-        // 3-byte payload + extra bytes (next frame).
-        let buf = [0x03, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xFF, 0xFF];
-        assert_eq!(
-            try_extract_frame(&buf),
-            FrameResult::Complete(&[0xAA, 0xBB, 0xCC])
-        );
-    }
-
-    #[test]
-    fn extract_frame_zero_length() {
-        // Zero-length frame is valid (empty payload).
-        let buf = [0x00, 0x00, 0x00, 0x00];
-        assert_eq!(try_extract_frame(&buf), FrameResult::Complete(&[]));
-    }
-
-    #[test]
-    fn extract_frame_oversized() {
-        // Frame length exceeds MAX_FRAME_SIZE (1024).
-        let len = (MAX_FRAME_SIZE + 1) as u32;
-        let buf = len.to_le_bytes();
-        assert_eq!(
-            try_extract_frame(&buf),
-            FrameResult::Oversized(MAX_FRAME_SIZE + 1)
-        );
-    }
-
-    #[test]
-    fn extract_frame_exactly_max_size() {
-        // Frame length exactly at MAX_FRAME_SIZE should succeed (not oversized).
-        let len = MAX_FRAME_SIZE as u32;
-        let mut buf = Vec::from(len.to_le_bytes().as_slice());
-        buf.extend(vec![0u8; MAX_FRAME_SIZE]);
-        assert!(matches!(try_extract_frame(&buf), FrameResult::Complete(_)));
+    /// The first frame of `buf` under the client data path's cap.
+    fn split(buf: &[u8]) -> Option<Frame<'_>> {
+        split_frame_limited(buf, MAX_FRAME_SIZE).expect("frame within MAX_FRAME_SIZE")
     }
 
     /// Encode a `CounterEvent` into a length-prefixed wire frame:
@@ -1004,26 +917,19 @@ mod tests {
 
     #[test]
     fn wire_round_trip_increment() {
-        let frame = counter_frame(CounterEvent::Increment { amount: 42 });
-        match try_extract_frame(&frame) {
-            FrameResult::Complete(payload) => {
-                let decoded = CounterEvent::decode(payload).unwrap();
-                assert!(matches!(decoded, CounterEvent::Increment { amount: 42 }));
-            }
-            other => panic!("expected Complete, got {other:?}"),
-        }
+        let wire = counter_frame(CounterEvent::Increment { amount: 42 });
+        let frame = split(&wire).expect("complete frame");
+        assert_eq!(frame.consumed(), wire.len());
+        let decoded = CounterEvent::decode(frame.payload).unwrap();
+        assert!(matches!(decoded, CounterEvent::Increment { amount: 42 }));
     }
 
     #[test]
     fn wire_round_trip_get_value() {
-        let frame = counter_frame(CounterEvent::GetValue);
-        match try_extract_frame(&frame) {
-            FrameResult::Complete(payload) => {
-                let decoded = CounterEvent::decode(payload).unwrap();
-                assert!(matches!(decoded, CounterEvent::GetValue));
-            }
-            other => panic!("expected Complete, got {other:?}"),
-        }
+        let wire = counter_frame(CounterEvent::GetValue);
+        let frame = split(&wire).expect("complete frame");
+        let decoded = CounterEvent::decode(frame.payload).unwrap();
+        assert!(matches!(decoded, CounterEvent::GetValue));
     }
 
     // --- Incremental accumulation (simulates TCP byte-at-a-time arrival) ---
@@ -1037,14 +943,11 @@ mod tests {
         let mut parse_buf = Vec::new();
         for (i, &byte) in wire.iter().enumerate() {
             parse_buf.push(byte);
-            let result = try_extract_frame(&parse_buf);
+            let result = split(&parse_buf);
             if i < written - 1 {
-                assert_eq!(result, FrameResult::Incomplete, "byte {i}");
+                assert_eq!(result, None, "byte {i}");
             } else {
-                assert!(
-                    matches!(result, FrameResult::Complete(_)),
-                    "expected Complete at final byte"
-                );
+                assert!(result.is_some(), "expected a frame at the final byte");
             }
         }
     }
@@ -1062,26 +965,15 @@ mod tests {
         combined.extend_from_slice(&frame2);
 
         // First extraction should get frame 1.
-        let payload1_len = match try_extract_frame(&combined) {
-            FrameResult::Complete(p) => {
-                let decoded = CounterEvent::decode(p).unwrap();
-                assert!(matches!(decoded, CounterEvent::Increment { amount: 1 }));
-                p.len()
-            }
-            other => panic!("expected Complete, got {other:?}"),
-        };
+        let first = split(&combined).expect("first frame");
+        let decoded = CounterEvent::decode(first.payload).unwrap();
+        assert!(matches!(decoded, CounterEvent::Increment { amount: 1 }));
 
-        // Advance past first frame (4 bytes length + payload).
-        let remaining = &combined[4 + payload1_len..];
-
-        // Second extraction should get frame 2.
-        match try_extract_frame(remaining) {
-            FrameResult::Complete(p) => {
-                let decoded = CounterEvent::decode(p).unwrap();
-                assert!(matches!(decoded, CounterEvent::GetValue));
-            }
-            other => panic!("expected Complete, got {other:?}"),
-        }
+        // Second extraction, past the first frame, should get frame 2.
+        let second = split(&combined[first.consumed()..]).expect("second frame");
+        let decoded = CounterEvent::decode(second.payload).unwrap();
+        assert!(matches!(decoded, CounterEvent::GetValue));
+        assert_eq!(first.consumed() + second.consumed(), combined.len());
     }
 
     mod auth_verdict {
