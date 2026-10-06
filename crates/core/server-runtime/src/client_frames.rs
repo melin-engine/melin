@@ -1,9 +1,10 @@
 //! Transport-agnostic client frame processing.
 //!
 //! Both the kernel (io_uring) and DPDK client readers parse the same
-//! length-prefixed wire format, decode through the same
-//! [`ErasedDecoder`], and publish [`InputSlot`]s to the same disruptor
-//! ring with identical batching semantics. This module extracts that
+//! length-prefixed wire format (split by the wire protocol's zero-copy
+//! splitter, the one `melin-client` frames with too), decode through the
+//! same [`ErasedDecoder`], and publish [`InputSlot`]s to the same
+//! disruptor ring with identical batching semantics. This module extracts that
 //! shared logic into [`process_client_frames`] so both backends call a
 //! single implementation.
 
@@ -17,6 +18,7 @@ use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_wire_protocol::control_codec::{TAG_APP, TAG_LEN};
+use melin_wire_protocol::framing::split_frame_limited;
 
 use crate::halt::{HaltGate, Refusal, RefusalSender, Verdict};
 
@@ -114,27 +116,25 @@ pub(crate) fn process_client_frames<A: Application>(
     // refusal queue: the halt is what turned it away.
     let mut refused: u64 = 0;
 
-    while cursor + 4 <= parse_buf.len() {
-        let len_bytes: [u8; 4] = parse_buf[cursor..cursor + 4]
-            .try_into()
-            .expect("slice is exactly 4 bytes");
-        let frame_len = u32::from_le_bytes(len_bytes) as usize;
-
-        if frame_len > MAX_FRAME_SIZE {
-            debug!(
-                connection_id,
-                frame_len, "frame too large, dropping connection"
-            );
-            result = FrameAction::Disconnect;
-            break;
-        }
-
-        if cursor + 4 + frame_len > parse_buf.len() {
-            break;
-        }
-
-        let frame = &parse_buf[cursor + 4..cursor + 4 + frame_len];
-        cursor += 4 + frame_len;
+    loop {
+        // An oversized prefix is refused as soon as its 4 bytes are in,
+        // without waiting for a payload that would never be read.
+        let frame = match split_frame_limited(&parse_buf[cursor..], MAX_FRAME_SIZE) {
+            Ok(Some(frame)) => frame,
+            // A partial frame stays in `parse_buf` for the next recv.
+            Ok(None) => break,
+            Err(too_large) => {
+                debug!(
+                    connection_id,
+                    frame_len = too_large.declared,
+                    "frame too large, dropping connection"
+                );
+                result = FrameAction::Disconnect;
+                break;
+            }
+        };
+        cursor += frame.consumed();
+        let frame = frame.payload;
 
         // Only an application frame carries a request: a client sends none
         // of the protocol's own frames after the handshake. Anything else
