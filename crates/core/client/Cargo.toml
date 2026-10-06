@@ -12,7 +12,7 @@ license = "Apache-2.0"
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Blocking client for a Melin node: framing, Ed25519 authentication, and the request/response batch protocol"
+description = "Client for a Melin node: framing, Ed25519 authentication, and the request/response batch protocol, blocking or I/O-free"
 
 [lints]
 workspace = true
@@ -31,3 +31,5 @@ base64 = { workspace = true }
 # where a port merely freed can be taken by another test process before
 # the connect. `std::net` cannot bind without listening; socket2 can.
 socket2 = "0.6"
+# Round-trips arbitrary runs of framed requests through the decoder.
+proptest = "1"

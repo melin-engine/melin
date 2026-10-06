@@ -69,6 +69,23 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **`DpdkTransport::from_shared_unlistening`**: a transport with no
   listener, for one that only dials out, to which listeners can be added
   later with `add_listener`.
+- **I/O-free framing, for a program that runs its own I/O loop**
+  (io_uring, DPDK). `melin_wire_protocol::framing` splits length-prefixed
+  frames out of bytes the caller already holds: `split_frame` and
+  `split_frame_limited` over a caller-owned buffer, and `FrameDecoder`,
+  which buffers partial frames across reads. A prefix over the limit is
+  `FrameTooLarge`, and poisons the decoder, since no frame boundary is
+  left to resume from. `melin-client` re-exports the module as
+  `melin_client::framing`, so a client needs no wire-protocol dependency
+  to frame, and adds `next_reply`, the next classified `Reply` out of a
+  `FrameDecoder`, and `frame_request`, which frames a request whose
+  body the caller encodes in place behind `REQUEST_HEADER_LEN` bytes of
+  header, at any offset of a larger send buffer, handing the encoder at
+  most `MAX_REQUEST_BODY` bytes and refusing a longer body with
+  `RequestTooLarge`. Neither does I/O, so read
+  timeouts, and the rule that a heartbeat does not extend one, stay with
+  the caller. `FrameTooLarge` converts into `melin_client::Error` as a
+  protocol error.
 
 ### Removed
 
@@ -93,6 +110,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **`melin_client::Error` gains `BufferTooSmall { needed, available }`**,
+  returned by `frame_request` when the buffer cannot hold the header, or
+  the encoder reports a body longer than the region it was handed.
+  Source-breaking for an exhaustive `match` on `Error`: add an arm.
 - **A decoder receives the application's own roles: `Permission` is
   replaced by `ClientRole<R>`.** `RequestDecoder` gains `type Role`, and
   `decode` takes `role: ClientRole<Self::Role>` in place of
