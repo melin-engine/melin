@@ -1276,6 +1276,7 @@ dependencies = [
 name = "melin-wire-protocol"
 version = "0.18.0"
 dependencies = [
+ "proptest",
  "tempfile",
 ]
 
