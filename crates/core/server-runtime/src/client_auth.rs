@@ -22,10 +22,10 @@ pub(crate) const MAX_AUTH_FRAME: usize = 256;
 
 /// Why the client listener refused a challenge response.
 ///
-/// `#[non_exhaustive]`: a refusal reason may be added. This is an error to
-/// report, not an access check to match exhaustively.
+/// Exhaustive, so a caller matching on it is told by the compiler when a
+/// refusal reason is added (a breaking change, called out in the
+/// changelog).
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum ClientAuthError {
     /// The key is listed as `replication`, which authorizes streaming
     /// between nodes and may not open a client connection (see
