@@ -40,12 +40,23 @@
 //!   answer to send;
 //! - [`next_reply`] (or [`classify`], on a payload already split off)
 //!   tells each reply apart, heartbeats included;
-//! - [`frame_request`] frames a request in place in its send buffer,
-//!   behind a header of [`REQUEST_HEADER_LEN`] bytes, at any offset, so
-//!   several batch into one write.
+//! - sending, a request is framed in place in its send buffer, at any
+//!   offset, so several batch into one write: the body is encoded into
+//!   the region [`request_body`] hands out, behind room for a header of
+//!   [`REQUEST_HEADER_LEN`] bytes, and [`seal_request`] writes the header
+//!   in front of it ([`frame_request`] does both around a closure).
+//!
+//! The request framing is the wire protocol's own, re-exported here: an
+//! application's codec crate that needs only framing can depend on
+//! `melin-wire-protocol` alone, and gets a conversion of its errors into
+//! that crate's `ProtocolError` as well as into this crate's [`Error`].
 //!
 //! The read timeout is then the caller's to keep, and so is the rule
-//! that a heartbeat does not extend it (see [Silence](#silence)).
+//! that a heartbeat does not extend it (see [Silence](#silence)). An
+//! error from [`next_reply`] means the connection is to be dropped:
+//! [`Error::FrameTooLarge`] for a length prefix over the limit (the
+//! decoder is poisoned), [`Error::Protocol`] for a frame no reply
+//! carries.
 //!
 //! ## Silence
 //!
@@ -97,12 +108,16 @@ pub use melin_wire_protocol::blocking::MAX_FRAME_SIZE;
 // Re-exported as a module rather than item by item: its `Frame` is the
 // raw length-prefixed frame, not this crate's classified [`Frame`].
 pub use melin_wire_protocol::framing;
+// Request framing lives with the wire protocol, so a codec crate that
+// needs only framing does not depend on this one; re-exported here so a
+// client finds it next to the rest of the I/O-free path. Its error
+// converts into [`Error`].
+pub use melin_wire_protocol::framing::{
+    MAX_REQUEST_BODY, REQUEST_HEADER_LEN, RequestFrameError, frame_request, request_body,
+    seal_request,
+};
 
-use framing::{FrameDecoder, FrameTooLarge, PREFIX_LEN};
-
-// The prefix is written as a `u32`; every frame length this crate
-// produces is bounded by `MAX_FRAME_SIZE`, so the cast is lossless.
-const _: () = assert!(MAX_FRAME_SIZE <= u32::MAX as usize);
+use framing::{FrameDecoder, FrameTooLarge, PREFIX_LEN, request_payload_len};
 
 /// Read and connect timeout used by [`Connection::connect`] and
 /// [`Connection::connect_by`]. Generous for a round trip anywhere on a
@@ -136,17 +151,30 @@ pub enum Error {
     NoReply { timeout: Duration },
     /// The node closed the connection.
     Disconnected,
-    /// The node sent something the protocol does not allow here.
+    /// The node sent something the protocol does not allow here: a frame
+    /// no reply carries, or one out of place in the handshake. The
+    /// connection is to be dropped.
     Protocol(String),
+    /// A length prefix from the node declared a payload of `declared`
+    /// bytes, over the limit of `max`. Past it the stream has no frame
+    /// boundary left: a [`FrameDecoder`] that reported it is poisoned,
+    /// and the connection is to be dropped, as after
+    /// [`Protocol`](Error::Protocol). A variant of its own so a caller
+    /// can tell the two apart (and log the length) without asking the
+    /// decoder, which the `Result` of [`next_reply`] still borrows.
+    FrameTooLarge { declared: u32, max: usize },
     /// The request, with the protocol's tag in front of it, would not
     /// fit in one frame of [`MAX_FRAME_SIZE`] bytes; nothing was sent
-    /// (from [`Connection::send`]) or framed (from [`frame_request`]).
+    /// (from [`Connection::send`]) or framed (from [`frame_request`] or
+    /// [`seal_request`]).
     RequestTooLarge { len: usize },
-    /// [`frame_request`] was given a buffer that cannot hold the frame:
-    /// `needed` bytes, header included, against the `available` length
-    /// of the buffer. Either the buffer is shorter than
-    /// [`REQUEST_HEADER_LEN`], or the encoder reported a body longer than
-    /// the region it was handed (a bug in the encoder). Nothing was framed.
+    /// A request framed in place did not fit its buffer: `needed` bytes,
+    /// header included, against the `available` length of the buffer.
+    /// Either the buffer is shorter than [`REQUEST_HEADER_LEN`], or the
+    /// body runs past its end (from an encoder, a bug: it reported more
+    /// than it was handed). Nothing was framed. The
+    /// [`RequestFrameError::BufferTooSmall`] of [`frame_request`] and
+    /// [`seal_request`], for a codec whose error is this one.
     BufferTooSmall { needed: usize, available: usize },
     /// The node is shedding load; retry later, on a new connection.
     ServerBusy,
@@ -180,6 +208,10 @@ impl fmt::Display for Error {
             ),
             Error::Disconnected => f.write_str("the node closed the connection"),
             Error::Protocol(what) => write!(f, "protocol violation: {what}"),
+            Error::FrameTooLarge { declared, max } => write!(
+                f,
+                "protocol violation: the node declared a {declared}-byte frame, the limit is {max}"
+            ),
             Error::RequestTooLarge { len } => write!(
                 f,
                 "request too large: {len} bytes with its header, the frame limit is {MAX_FRAME_SIZE}"
@@ -211,12 +243,25 @@ impl From<io::Error> for Error {
 }
 
 impl From<FrameTooLarge> for Error {
-    /// A length prefix over the limit is the node sending what the
-    /// protocol does not allow, and leaves no frame boundary to resume
-    /// from: a [`Protocol`](Error::Protocol) error, after which the
-    /// connection is dropped like after any other.
+    /// [`Error::FrameTooLarge`], with the declared length and the limit.
     fn from(e: FrameTooLarge) -> Self {
-        Error::Protocol(e.to_string())
+        Error::FrameTooLarge {
+            declared: e.declared,
+            max: e.max,
+        }
+    }
+}
+
+impl From<RequestFrameError> for Error {
+    /// Variant for variant: [`Error::RequestTooLarge`] and
+    /// [`Error::BufferTooSmall`].
+    fn from(e: RequestFrameError) -> Self {
+        match e {
+            RequestFrameError::RequestTooLarge { len } => Error::RequestTooLarge { len },
+            RequestFrameError::BufferTooSmall { needed, available } => {
+                Error::BufferTooSmall { needed, available }
+            }
+        }
     }
 }
 
@@ -295,10 +340,16 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
 ///   [`Reply::Heartbeat`] is returned like any other reply, for the
 ///   caller to skip.
 /// - `Ok(None)`: no complete frame yet; push more bytes and call again.
-/// - `Err(_)`: a length prefix over the decoder's limit (the decoder is
-///   poisoned and every later call fails the same way), or a frame no
-///   reply carries, as [`classify`] reports it. Either way the
-///   connection is to be dropped.
+/// - `Err(`[`Error::FrameTooLarge`]`)`: a length prefix over the
+///   decoder's limit, with the length it declared. The decoder is
+///   poisoned and every later call fails the same way.
+/// - `Err(`[`Error::Protocol`]`)`: a frame no reply carries, as
+///   [`classify`] reports it.
+///
+/// Neither error is recoverable: either way the connection is to be
+/// dropped. The variants tell them apart for the caller's log, in the
+/// `Err` arm itself, where the decoder cannot be asked while the result
+/// still borrows it.
 ///
 /// The decoder does no I/O, so it measures no time: the read timeout,
 /// and with it [`Error::NoReply`], are the caller's. So is the rule that
@@ -359,133 +410,6 @@ pub fn next_reply(decoder: &mut FrameDecoder) -> Result<Option<Reply<'_>>, Error
         Some(payload) => classify(payload).map(Some),
         None => Ok(None),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Request frames
-// ---------------------------------------------------------------------------
-
-/// Bytes [`frame_request`] writes ahead of a request body: the length
-/// prefix and the protocol's one-byte tag.
-pub const REQUEST_HEADER_LEN: usize = PREFIX_LEN + TAG_LEN;
-
-/// The widest request body one frame carries: the tag counts toward
-/// [`MAX_FRAME_SIZE`], so a body may take the rest of it.
-pub const MAX_REQUEST_BODY: usize = MAX_FRAME_SIZE - TAG_LEN;
-
-/// The payload length of a request frame carrying `body_len` bytes (the
-/// tag and the body), or [`Error::RequestTooLarge`] if that exceeds
-/// [`MAX_FRAME_SIZE`]. The one place the request limit is decided, for
-/// [`Connection::send`] and [`frame_request`] alike.
-#[inline]
-fn request_payload_len(body_len: usize) -> Result<usize, Error> {
-    // Saturating: a length near `usize::MAX` (an encoder's bug) is still
-    // reported as too large rather than wrapping into one that fits.
-    let len = TAG_LEN.saturating_add(body_len);
-    if len > MAX_FRAME_SIZE {
-        return Err(Error::RequestTooLarge { len });
-    }
-    Ok(len)
-}
-
-/// Frame one request in place at the front of `buf`, for a program that
-/// assembles its own send buffer: `encode` writes the application's body
-/// into `buf[REQUEST_HEADER_LEN..]` and returns how many bytes it wrote,
-/// then the header (the length prefix and the protocol's tag) goes in
-/// front of them. Returns the frame's length, header included: the bytes
-/// to send are `buf[..n]`. The caller never needs the protocol's tag.
-///
-/// Several requests batch into one buffer by framing each at the current
-/// end, `frame_request(&mut buf[end..], ..)`, and advancing `end` by what
-/// it returns; the frames lie back to back, ready for one write.
-///
-/// `encode` is handed the rest of `buf`, capped at [`MAX_REQUEST_BODY`]
-/// bytes, so a codec that sizes its output by the slice it is given never
-/// writes a body the frame limit would refuse, even in a send buffer
-/// wider than one frame. It may fail with its own error type, which needs
-/// a conversion from [`Error`] for the failures decided here:
-///
-/// - a `buf` shorter than [`REQUEST_HEADER_LEN`] is
-///   [`Error::BufferTooSmall`], and `encode` is not called;
-/// - a length from `encode` wider than [`MAX_REQUEST_BODY`] (one that
-///   takes the frame over [`MAX_FRAME_SIZE`]) is
-///   [`Error::RequestTooLarge`], as from [`Connection::send`];
-/// - otherwise, a length from `encode` past the region it was handed (a
-///   `buf` too short for the body) is [`Error::BufferTooSmall`].
-///
-/// The frame limit is checked before the region, so a length that is
-/// both is reported as [`Error::RequestTooLarge`].
-///
-/// On any error the header is not written and nothing is framed: `encode`
-/// may have written into the body region, but a caller that sends only
-/// what `frame_request` reported, and does not advance its cursor on an
-/// error, sends nothing that could desync the node's framing.
-///
-/// ```
-/// use melin_client::framing::FrameDecoder;
-/// use melin_client::{REQUEST_HEADER_LEN, frame_request};
-///
-/// /// The application codec's own error, which can carry the client's.
-/// #[derive(Debug)]
-/// enum CodecError {
-///     NoRoom,
-///     Framing(melin_client::Error),
-/// }
-/// impl From<melin_client::Error> for CodecError {
-///     fn from(e: melin_client::Error) -> Self {
-///         CodecError::Framing(e)
-///     }
-/// }
-///
-/// let mut buf = [0u8; 64];
-/// let mut end = 0;
-/// for body in [&b"first"[..], b"second"] {
-///     // The closure's return type is spelled out: with `?` on both sides,
-///     // nothing else pins down its error type.
-///     end += frame_request(&mut buf[end..], |out| -> Result<usize, CodecError> {
-///         let dst = out.get_mut(..body.len()).ok_or(CodecError::NoRoom)?;
-///         dst.copy_from_slice(body);
-///         Ok(body.len())
-///     })?;
-/// }
-/// // `buf[..end]` is two request frames, back to back, ready for one write.
-/// assert_eq!(end, 2 * REQUEST_HEADER_LEN + 5 + 6);
-/// let mut decoder = FrameDecoder::new();
-/// decoder.push(&buf[..end]);
-/// assert!(decoder.next().unwrap().unwrap().ends_with(b"first"));
-/// assert!(decoder.next().unwrap().unwrap().ends_with(b"second"));
-/// # Ok::<(), CodecError>(())
-/// ```
-#[inline]
-pub fn frame_request<E: From<Error>>(
-    buf: &mut [u8],
-    encode: impl FnOnce(&mut [u8]) -> Result<usize, E>,
-) -> Result<usize, E> {
-    let available = buf.len();
-    let Some(body) = buf.get_mut(REQUEST_HEADER_LEN..) else {
-        return Err(Error::BufferTooSmall {
-            needed: REQUEST_HEADER_LEN,
-            available,
-        }
-        .into());
-    };
-    // Capped at the widest body a frame carries: an encoder that fills
-    // what it is handed then cannot outgrow the frame limit.
-    let region = body.len().min(MAX_REQUEST_BODY);
-    let body_len = encode(&mut body[..region])?;
-    let payload_len = request_payload_len(body_len)?;
-    if body_len > region {
-        return Err(Error::BufferTooSmall {
-            needed: REQUEST_HEADER_LEN + body_len,
-            available,
-        }
-        .into());
-    }
-    // Lossless: `request_payload_len` bounds it by `MAX_FRAME_SIZE`,
-    // which fits a `u32` (asserted at the top of the crate).
-    buf[..PREFIX_LEN].copy_from_slice(&(payload_len as u32).to_le_bytes());
-    buf[PREFIX_LEN] = TAG_APP;
-    Ok(REQUEST_HEADER_LEN + body_len)
 }
 
 // ---------------------------------------------------------------------------
@@ -633,7 +557,7 @@ impl Connection {
     /// frame over [`MAX_FRAME_SIZE`] is [`Error::RequestTooLarge`], and
     /// nothing is written: the node would drop the connection on it.
     pub fn send(&mut self, body: &[u8]) -> Result<(), Error> {
-        // Not built on `frame_request`: that frames into a caller's
+        // Not built on `seal_request`: that frames into a caller's
         // buffer, and here the body would then be copied a second time,
         // into the writer's. The limit is the shared one.
         request_payload_len(body.len())?;
@@ -734,10 +658,22 @@ impl Connection {
 }
 
 /// A read that failed under a socket timeout of `timeout` is the node's
-/// silence, [`Error::NoReply`]; anything else is the socket failing.
+/// silence, [`Error::NoReply`]; an oversized length prefix, which the
+/// blocking reader reports wrapped in an I/O error, is
+/// [`Error::FrameTooLarge`] as from [`next_reply`]; anything else is the
+/// socket failing.
 fn io_error(e: io::Error, timeout: Duration) -> Error {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::NoReply { timeout },
+        io::ErrorKind::InvalidData => {
+            match e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<FrameTooLarge>())
+            {
+                Some(&too_large) => too_large.into(),
+                None => Error::Io(e),
+            }
+        }
         _ => Error::Io(e),
     }
 }
@@ -915,8 +851,10 @@ pub fn authenticate(stream: &mut (impl Read + Write), key: &SigningKey) -> Resul
 }
 
 /// One frame read straight off `stream` into `buf`, with the node's
-/// close reported as [`Error::Disconnected`] and a frame `buf` cannot
-/// hold refused before any of it is read.
+/// close reported as [`Error::Disconnected`], a prefix over
+/// [`MAX_FRAME_SIZE`] as [`Error::FrameTooLarge`], and any other frame
+/// `buf` cannot hold refused as [`Error::Protocol`], before any of it is
+/// read.
 // Not built on the splitter: it reads the prefix and then exactly the
 // payload, so no byte past the frame leaves the stream, where splitting
 // needs the bytes read into a buffer first.
@@ -927,7 +865,17 @@ fn read_unbuffered_frame<'a>(stream: &mut impl Read, buf: &'a mut [u8]) -> Resul
     };
     let mut prefix = [0u8; PREFIX_LEN];
     stream.read_exact(&mut prefix).map_err(closed)?;
-    let len = u32::from_le_bytes(prefix) as usize;
+    let declared = u32::from_le_bytes(prefix);
+    let len = declared as usize;
+    // A prefix over the frame limit is the same error as after the
+    // handshake; one within it but too long for a handshake frame is the
+    // node breaking the handshake.
+    if len > MAX_FRAME_SIZE {
+        return Err(Error::FrameTooLarge {
+            declared,
+            max: MAX_FRAME_SIZE,
+        });
+    }
     let Some(frame) = buf.get_mut(..len) else {
         return Err(Error::Protocol(format!(
             "a {len}-byte frame where a handshake frame was expected"
@@ -973,6 +921,9 @@ mod tests {
         /// Answer every request with a zero-tagged frame — what a
         /// zeroed or corrupt buffer looks like on the wire.
         ZeroTag,
+        /// Answer every request with a length prefix over the frame
+        /// limit, and nothing after it.
+        Oversized,
         /// Answer every request with `ServerBusy`.
         Busy,
         /// Answer every request with `EngineError`.
@@ -1085,6 +1036,7 @@ mod tests {
                     return;
                 }
                 Behaviour::ZeroTag => tagged_frame(0x00, b"looks zeroed"),
+                Behaviour::Oversized => ((MAX_FRAME_SIZE + 1) as u32).to_le_bytes().to_vec(),
                 Behaviour::Busy => control(TransportResponse::ServerBusy),
                 Behaviour::Failing => control(TransportResponse::EngineError),
                 Behaviour::Hangup | Behaviour::AdminLines => unreachable!(),
@@ -1471,6 +1423,25 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn handshake_read_reports_a_prefix_over_the_frame_limit_as_frame_too_large() {
+        let mut buf = [0u8; 64];
+
+        // Over the frame limit: the same error as after the handshake.
+        let declared = MAX_FRAME_SIZE as u32 + 1;
+        let prefix = declared.to_le_bytes();
+        let err = read_unbuffered_frame(&mut &prefix[..], &mut buf).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::FrameTooLarge { declared: d, max: MAX_FRAME_SIZE } if d == declared
+        ));
+
+        // Exactly at the limit: no handshake frame, but within the limit.
+        let prefix = (MAX_FRAME_SIZE as u32).to_le_bytes();
+        let err = read_unbuffered_frame(&mut &prefix[..], &mut buf).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
     /// A node's control frame as a `Handshake` is fed it: the payload
     /// after the length prefix.
     fn payload(response: TransportResponse) -> Vec<u8> {
@@ -1711,12 +1682,41 @@ mod tests {
             next_reply(&mut decoder).unwrap(),
             Some(Reply::Response(b"ok"))
         );
-        let err = next_reply(&mut decoder).unwrap_err();
-        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
-        assert!(err.to_string().contains("frame too large"), "{err}");
-        // Poisoned: more bytes change nothing.
+        // Its own variant, told apart in the `Err` arm with no need to ask
+        // the decoder, and carrying the length the prefix declared.
+        let declared = MAX_FRAME_SIZE as u32 + 1;
+        match next_reply(&mut decoder) {
+            Err(Error::FrameTooLarge { declared: d, max }) => {
+                assert_eq!((d, max), (declared, MAX_FRAME_SIZE));
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+        assert!(decoder.is_poisoned());
+        // Poisoned: more bytes change nothing, and the length is the
+        // original one.
         decoder.push(&app_frame(b"later"));
-        assert!(matches!(next_reply(&mut decoder), Err(Error::Protocol(_))));
+        let err = next_reply(&mut decoder).unwrap_err();
+        assert!(
+            matches!(err, Error::FrameTooLarge { declared: d, .. } if d == declared),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "protocol violation: the node declared a {declared}-byte frame, the limit is {MAX_FRAME_SIZE}"
+            )
+        );
+
+        // A decoder with a tighter limit reports that limit.
+        let mut decoder = FrameDecoder::with_max_payload(16);
+        decoder.push(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            next_reply(&mut decoder),
+            Err(Error::FrameTooLarge {
+                declared: u32::MAX,
+                max: 16
+            })
+        ));
     }
 
     #[test]
@@ -1727,120 +1727,80 @@ mod tests {
     }
 
     #[test]
-    fn frame_request_writes_the_header_in_front_of_the_body() {
-        let mut buf = [0xEE; 32];
-        let n = frame_body(&mut buf, b"abc").unwrap();
-        assert_eq!(n, REQUEST_HEADER_LEN + 3);
-        assert_eq!(&buf[..n], app_frame(b"abc").as_slice());
-        // Nothing past the frame is touched.
-        assert!(buf[n..].iter().all(|&b| b == 0xEE));
+    fn request_framing_is_the_wire_protocols_reexported() {
+        // The same items, reachable from this crate's root and through
+        // its `framing` module.
+        assert_eq!(REQUEST_HEADER_LEN, framing::REQUEST_HEADER_LEN);
+        assert_eq!(REQUEST_HEADER_LEN, PREFIX_LEN + TAG_LEN);
+        assert_eq!(MAX_REQUEST_BODY, framing::MAX_REQUEST_BODY);
+        assert_eq!(MAX_REQUEST_BODY, MAX_FRAME_SIZE - TAG_LEN);
+        // Compiles only if the root's names are the module's items.
+        let _: fn(&mut [u8], usize) -> Result<usize, framing::RequestFrameError> = seal_request;
+        let _: fn(&mut [u8]) -> Result<&mut [u8], RequestFrameError> = framing::request_body;
 
-        // An empty body is a tag-only frame, and the encoder is handed
-        // everything after the header.
-        let n = frame_request(&mut buf, |out| {
-            assert_eq!(out.len(), 32 - REQUEST_HEADER_LEN);
-            Ok::<_, Error>(0)
-        })
-        .unwrap();
-        assert_eq!(&buf[..n], app_frame(b"").as_slice());
+        // The closure-free form through the root names.
+        let mut buf = [0xEEu8; 32];
+        let body = request_body(&mut buf).unwrap();
+        body[..3].copy_from_slice(b"abc");
+        let n = seal_request(&mut buf, 3).unwrap();
+        assert_eq!(&buf[..n], app_frame(b"abc").as_slice());
+        assert!(buf[n..].iter().all(|&b| b == 0xEE));
     }
 
     #[test]
-    fn frame_request_takes_the_widest_body_and_refuses_one_more() {
-        assert_eq!(MAX_REQUEST_BODY, MAX_FRAME_SIZE - TAG_LEN);
-        let mut buf = vec![0u8; REQUEST_HEADER_LEN + MAX_FRAME_SIZE + 16];
-
-        let widest = vec![0xAB; MAX_REQUEST_BODY];
-        let n = frame_body(&mut buf, &widest).unwrap();
-        assert_eq!(n, PREFIX_LEN + MAX_FRAME_SIZE);
-        let frame = framing::split_frame(&buf[..n]).unwrap().unwrap();
-        assert_eq!(frame.consumed(), n);
-        assert_eq!(classify(frame.payload).unwrap(), Reply::Response(&widest));
-
-        // One byte over: refused as `send` refuses it, and no header is
-        // written: the bytes in front of the body are as they were.
-        // The encoder is handed exactly the widest body, though the buffer
-        // is wider, so a codec sizing itself by its slice stays in bounds.
-        let mut buf = vec![0x5C; REQUEST_HEADER_LEN + MAX_FRAME_SIZE + 16];
-        let err = frame_request(&mut buf, |out| {
-            assert_eq!(out.len(), MAX_REQUEST_BODY);
-            Ok::<_, Error>(MAX_REQUEST_BODY + 1)
-        })
-        .unwrap_err();
+    fn request_framing_errors_map_into_the_clients_error() {
+        // With this crate's `Error` as the encoder's error type, each
+        // framing failure arrives as its own variant.
+        let mut wide = vec![0x5C; REQUEST_HEADER_LEN + MAX_FRAME_SIZE + 16];
+        let err = frame_request(&mut wide, |_| Ok::<_, Error>(MAX_REQUEST_BODY + 1)).unwrap_err();
         assert!(
             matches!(err, Error::RequestTooLarge { len } if len == MAX_FRAME_SIZE + 1),
             "{err:?}"
         );
-        assert!(buf[..REQUEST_HEADER_LEN].iter().all(|&b| b == 0x5C));
+        assert!(err.to_string().contains("request too large"), "{err}");
 
-        // An encoder reporting an absurd length is refused, not wrapped;
-        // the frame limit is checked before the region, even when the
-        // buffer is too short as well.
-        let err = frame_request(&mut buf, |_| Ok::<_, Error>(usize::MAX)).unwrap_err();
-        assert!(matches!(err, Error::RequestTooLarge { .. }), "{err:?}");
-        let mut small = [0u8; 16];
-        let err = frame_request(&mut small, |_| Ok::<_, Error>(MAX_REQUEST_BODY + 1)).unwrap_err();
-        assert!(matches!(err, Error::RequestTooLarge { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn frame_request_refuses_a_buffer_too_small() {
-        // No room for the header: the encoder is never called.
-        for len in 0..REQUEST_HEADER_LEN {
-            let mut buf = vec![0u8; len];
-            let err = frame_request(&mut buf, |_| -> Result<usize, Error> {
-                panic!("the encoder must not run without room for the header")
-            })
-            .unwrap_err();
-            assert!(
-                matches!(err, Error::BufferTooSmall { needed: REQUEST_HEADER_LEN, available } if available == len),
-                "{err:?}"
-            );
-            assert!(err.to_string().contains("too small"), "{err}");
-        }
-
-        // Exactly the header: room for an empty body only.
-        let mut buf = [0u8; REQUEST_HEADER_LEN];
-        assert_eq!(frame_body(&mut buf, b"").unwrap(), REQUEST_HEADER_LEN);
-
-        // An encoder claiming more than it was handed: refused, header
-        // left unwritten.
-        let mut buf = [0x77u8; REQUEST_HEADER_LEN + 4];
-        let err = frame_request(&mut buf, |_| Ok::<_, Error>(5)).unwrap_err();
+        let mut short = [0u8; 2];
+        let err = frame_request(&mut short, |_| -> Result<usize, Error> {
+            panic!("the encoder must not run without room for the header")
+        })
+        .unwrap_err();
         assert!(
             matches!(
                 err,
-                Error::BufferTooSmall { needed, available }
-                    if needed == REQUEST_HEADER_LEN + 5 && available == REQUEST_HEADER_LEN + 4
+                Error::BufferTooSmall {
+                    needed: REQUEST_HEADER_LEN,
+                    available: 2
+                }
             ),
             "{err:?}"
         );
-        assert!(buf[..REQUEST_HEADER_LEN].iter().all(|&b| b == 0x77));
+        assert!(err.to_string().contains("too small"), "{err}");
+
+        let mut buf = [0u8; REQUEST_HEADER_LEN + 4];
+        assert!(matches!(
+            seal_request(&mut buf, 5).map_err(Error::from),
+            Err(Error::BufferTooSmall { needed, available })
+                if needed == REQUEST_HEADER_LEN + 5 && available == REQUEST_HEADER_LEN + 4
+        ));
+        // An encoder's own failure passes through untouched.
+        assert!(matches!(
+            frame_request(&mut buf, |_| Err(Error::Protocol("mine".into()))),
+            Err(Error::Protocol(what)) if what == "mine"
+        ));
     }
 
     #[test]
-    fn frame_request_passes_the_encoders_error_through() {
-        #[derive(Debug, PartialEq)]
-        enum CodecError {
-            Mine,
-            Client(String),
-        }
-        impl From<Error> for CodecError {
-            fn from(e: Error) -> Self {
-                CodecError::Client(e.to_string())
-            }
-        }
-        let mut buf = [0x33u8; 16];
-        assert_eq!(
-            frame_request(&mut buf, |_| Err(CodecError::Mine)),
-            Err(CodecError::Mine)
-        );
-        assert!(buf.iter().all(|&b| b == 0x33));
-        // The failures decided by `frame_request` arrive converted.
+    fn an_oversized_frame_on_a_connection_is_frame_too_large() {
+        // The blocking path reports what `next_reply` reports.
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::Oversized);
+        let mut node = Connection::connect(addr, &key).unwrap();
+        node.send(b"").unwrap();
+        let declared = MAX_FRAME_SIZE as u32 + 1;
         assert!(matches!(
-            frame_request(&mut buf[..2], |_| Ok::<_, CodecError>(0)),
-            Err(CodecError::Client(_))
-        ));
+            node.next_frame(),
+            Err(Error::FrameTooLarge { declared: d, max: MAX_FRAME_SIZE }) if d == declared
+        ),);
     }
 
     #[test]

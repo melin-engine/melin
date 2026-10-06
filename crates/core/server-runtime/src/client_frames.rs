@@ -17,7 +17,7 @@ use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::{MonoTraceInstant, mono_trace_ns};
-use melin_wire_protocol::control_codec::{TAG_APP, TAG_LEN};
+use melin_wire_protocol::control_codec::TAG_APP;
 use melin_wire_protocol::framing::split_frame_limited;
 
 use crate::halt::{HaltGate, Refusal, RefusalSender, Verdict};
@@ -35,8 +35,10 @@ pub const MAX_FRAME_SIZE: usize = melin_wire_protocol::blocking::MAX_FRAME_SIZE;
 /// Bound on one request body — what an application's `RequestDecoder`
 /// is handed after the runtime has read the tag.
 /// Public so an application can check its widest request against it at
-/// compile time; see the re-export in the crate root.
-pub const MAX_REQUEST_BODY: usize = MAX_FRAME_SIZE - TAG_LEN;
+/// compile time; see the re-export in the crate root. The wire
+/// protocol's, the bound a client's request framing enforces, so the two
+/// sides agree on it by construction.
+pub const MAX_REQUEST_BODY: usize = melin_wire_protocol::framing::MAX_REQUEST_BODY;
 
 /// Outcome of [`process_client_frames`].
 pub(crate) enum FrameAction {
