@@ -6,9 +6,7 @@
 [![MSRV](https://img.shields.io/crates/msrv/melin-app)](Cargo.toml)
 [![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
 
-Melin is a replicated sequencer for latency-critical systems that cannot lose an event. Your business logic plugs in as a plain state machine, and Melin makes it durable and replicated: every input is assigned a total order, then journaled and replicated before the response goes out. Snapshots and automatic failover are built in.
-
-It is the runtime under a matching engine, a ledger, or any system that must replay identically for audit while keeping tail latency inside a budget measured in microseconds. Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: lock-free disruptor rings, io_uring I/O with optional DPDK kernel bypass, and mechanical sympathy throughout.
+Melin is a low-latency durable replication layer for your state machine. It is the runtime under a matching engine, a ledger, or any system that records every event and must replay identically for audit while keeping tail latency inside a budget measured in microseconds. Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: lock-free disruptor rings, io_uring I/O with optional DPDK kernel bypass, and mechanical sympathy throughout.
 
 **Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity (internal crossing, a new instrument, a parallel run alongside an existing engine) in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
@@ -28,7 +26,7 @@ It is the runtime under a matching engine, a ledger, or any system that must rep
 
 ## Benchmarks
 
-Every figure is a full round trip as the client sees it: the request leaves the client, the primary journals and replicates it, the application executes it, and the response arrives back. The application is [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), an order-matching engine built on this sequencer.
+Every figure is a full round trip as the client sees it: the request leaves the client, the primary journals and replicates it, the application executes it, and the response arrives back. The application is [the Melin Exchange Core](https://github.com/melin-engine/exchange-core), the reference application built on this sequencer.
 
 **Setup.** Four bare-metal AMD EPYC 9275F servers over LAN: one benchmark client, one primary, two replicas. 24-core Zen 5 with SMT off, Micron 7450 PRO NVMe with power-loss protection, Mellanox ConnectX-6 Dx 100 Gb/s. Default ack policy (`disk+ram`): one fsynced copy plus a second copy in another node's memory. For the DPDK rows, the client and all three server nodes run on DPDK kernel bypass. Measured August 2026.
 
@@ -46,7 +44,7 @@ Every figure is a full round trip as the client sees it: the request leaves the 
 | Kernel TCP | 25K/s | 38 µs | 62 µs | 73 µs | 104 µs |
 | DPDK kernel bypass | 48K/s | 20 µs | 45 µs | 47 µs | 49 µs |
 
-The benchmark harness and tuning guidance ship with the Melin Exchange Core.
+The benchmark harness and tuning guidance ship with [the Melin Exchange Core](https://github.com/melin-engine/exchange-core).
 
 ## Building an application on Melin
 
@@ -59,7 +57,7 @@ Melin's core crates form a generic sequencer. Your application plugs in via four
 | `RequestDecoder` | Turns a request's body, laid out as you define it, into your event; the runtime reads the framing |
 | `ResponseEncoder` | Writes your response's body; the runtime frames it |
 
-The one rule: your application must be deterministic, because every node replays the same events and must reach the same state. The [application guide](docs/building-an-application.md) walks through a complete application and sets out what that rule asks of it — along with event design, retries, upgrades and testing. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and your binary becomes pure composition:
+The one rule: your application must be deterministic, because every node replays the same events and must reach the same state. The [application guide](docs/building-an-application.md) walks through a complete application and sets out what that rule asks of it along with event design, retries, upgrades and testing. Everything else (transport, journaling, replication, signal handling, memory locking, CPU pinning) is handled by the runtime, and your binary becomes pure composition:
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -72,9 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Three examples, in order of size: [`crates/examples/echo`](crates/examples/echo) is the runtime with nothing on top — a state-free echo, and the sequencer's latency floor to measure any application against; [`crates/examples/counter`](crates/examples/counter) is the smallest application with state to keep; and [`crates/examples/notary`](crates/examples/notary) exercises the ordering and durability guarantees: a tamper-evident hash chain over client-submitted digests.
+Three examples, in order of size: [`crates/examples/echo`](crates/examples/echo) is the runtime with nothing on top, a state-free echo, and the sequencer's latency floor to measure any application against; [`crates/examples/counter`](crates/examples/counter) is the smallest application with state to keep; and [`crates/examples/notary`](crates/examples/notary) exercises the ordering and durability guarantees: a tamper-evident hash chain over client-submitted digests.
 
-On the other side of the socket, [`melin-client`](crates/core/client) speaks the wire protocol — length-prefixed framing, the Ed25519 challenge/response, the reply batch — so a client of your application is your own request and response codec and nothing else. Every example client and test harness is built on it. Like the examples, it is Apache-2.0: it is the code you link into your own client binaries.
+On the other side of the socket, [`melin-client`](crates/core/client) speaks the wire protocol: length-prefixed framing, the Ed25519 challenge/response, the reply batch, so a client of your application is your own request and response codec and nothing else. Every example client and test harness is built on it. Like the examples, it is Apache-2.0: it is the code you link into your own client binaries.
 
 ## Architecture
 
@@ -106,7 +104,7 @@ The full data flow, ring sizes, and threading model are in [pipeline architectur
 
 ## Melin Exchange Core
 
-A production exchange core is built on this sequencer and distributed separately: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [melin-exchange-core](https://github.com/melin-engine/exchange-core).
+The Melin Exchange Core is the reference application built on this sequencer, distributed separately: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [melin-exchange-core](https://github.com/melin-engine/exchange-core).
 
 ## Contributing
 
