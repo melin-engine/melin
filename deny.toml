@@ -72,6 +72,9 @@ exceptions = [
     { allow = ["BUSL-1.1"], name = "melin-pipeline" },
     { allow = ["BUSL-1.1"], name = "melin-raft" },
     { allow = ["BUSL-1.1"], name = "melin-server-runtime" },
+    # Unpublished tooling under crates/tools, listed for the same reason as
+    # melin-test-node below: the check covers every member.
+    { allow = ["BUSL-1.1"], name = "melin-shm-proxy" },
     # Unpublished test support (a dev-dependency only), listed because the
     # check covers every member, not only the published ones.
     { allow = ["BUSL-1.1"], name = "melin-test-node" },
