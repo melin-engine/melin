@@ -285,7 +285,10 @@ fn held(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::ops::RangeInclusive;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use melin_journal::replication::{ReplicationProducer, build_replication_ring};
@@ -446,7 +449,7 @@ mod tests {
 
     /// A pass over a real journal: what `catch_up_from_journal_with`
     /// streams from `from`.
-    fn journal_disk(path: &std::path::Path) -> Disk<'_> {
+    fn journal_disk(path: &Path) -> Disk<'_> {
         Box::new(move |from| {
             let never = AtomicBool::new(false);
             let mut frames = Vec::new();
@@ -461,23 +464,99 @@ mod tests {
         })
     }
 
-    fn append(writer: &mut BufferedWriter<TestEvent>, seqs: std::ops::RangeInclusive<u64>) {
-        for s in seqs {
-            writer
-                .append(&JournalEvent::App(TestEvent::Add(s)))
-                .expect("append");
+    /// A pass over a disk that holds everything up to `tip`: the
+    /// catch-up's contract (every entry past `from`, ending at `from` when
+    /// there is nothing new), streamed as a single batch.
+    fn memory_disk(tip: &Cell<u64>) -> Disk<'_> {
+        Box::new(move |from| {
+            let tip = tip.get();
+            Ok(if tip > from {
+                (vec![batch(from + 1..=tip)], tip)
+            } else {
+                (Vec::new(), from)
+            })
+        })
+    }
+
+    /// The journal a test appends to and the handoff's passes read.
+    ///
+    /// Natively a real journal file, so the passes are exactly what the
+    /// catch-up streams. Under Miri, which cannot create the file, an
+    /// in-memory durable tip ([`memory_disk`]). The two cut a pass into
+    /// frames differently (the catch-up may split it, the memory disk
+    /// never does), so a test must not assert on how many frames a pass
+    /// takes.
+    enum TestJournal {
+        Real {
+            /// Held so the directory outlives the journal in it.
+            _dir: tempfile::TempDir,
+            path: PathBuf,
+            /// `RefCell`: a test keeps the journal borrowed by its disk
+            /// while it goes on appending. Boxed: the writer's buffers
+            /// would otherwise size the `Memory` variant too.
+            writer: Box<RefCell<BufferedWriter<TestEvent>>>,
+        },
+        /// The last durable sequence. `Cell`: as `Real`'s writer.
+        Memory(Cell<u64>),
+    }
+
+    impl TestJournal {
+        /// An empty journal: real natively, in memory under Miri. Chosen
+        /// with `cfg!` rather than `#[cfg]` so both are compiled, and
+        /// checked, on every build.
+        fn new() -> Self {
+            if cfg!(miri) {
+                return TestJournal::Memory(Cell::new(0));
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("j.journal");
+            let writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+            TestJournal::Real {
+                _dir: dir,
+                path,
+                writer: Box::new(RefCell::new(writer)),
+            }
+        }
+
+        /// Journal `seqs`, which follow on from what is there.
+        fn append(&self, seqs: RangeInclusive<u64>) {
+            match self {
+                TestJournal::Real { writer, .. } => {
+                    let mut writer = writer.borrow_mut();
+                    for s in seqs {
+                        writer
+                            .append(&JournalEvent::App(TestEvent::Add(s)))
+                            .expect("append");
+                    }
+                }
+                TestJournal::Memory(tip) => {
+                    assert_eq!(*seqs.start(), tip.get() + 1, "appends are contiguous");
+                    tip.set(*seqs.end());
+                }
+            }
+        }
+
+        fn disk(&self) -> Disk<'_> {
+            match self {
+                TestJournal::Real { path, .. } => journal_disk(path),
+                TestJournal::Memory(tip) => memory_disk(tip),
+            }
         }
     }
 
-    /// Step until the handoff goes live, at most `limit` steps.
+    /// Step until the handoff goes live, at most `limit` steps, all at
+    /// `now`. The caller's clock, not a fresh read: a test that stepped
+    /// before passes the `now` it armed the disk-wait bound with, so the
+    /// bound expires only where the test says, never because the test ran
+    /// slowly (as it does under Miri, whose clock follows the work done).
     fn run(
         handoff: &mut LiveHandoff,
         consumer: &mut ReplicationConsumer,
         active: &AtomicBool,
         io: &mut FakeIo<'_>,
+        now: Instant,
         limit: usize,
     ) -> SentHighWater {
-        let now = Instant::now();
         for _ in 0..limit {
             match handoff
                 .step(consumer, active, io, now)
@@ -498,16 +577,14 @@ mod tests {
     /// ring's first chunk — one dense stream, each entry once.
     #[test]
     fn the_window_before_activation_is_replayed_from_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("j.journal");
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        append(&mut writer, 1..=12); // 11..=12: after the bulk pass's end.
-        append(&mut writer, 13..=14);
+        let journal = TestJournal::new();
+        journal.append(1..=12); // 11..=12: after the bulk pass's end.
+        journal.append(13..=14);
         let (mut producer, mut consumer) = ring();
         publish(&mut producer, 13..=14);
 
         let active = AtomicBool::new(false);
-        let mut io = FakeIo::new(journal_disk(&path));
+        let mut io = FakeIo::new(journal.disk());
         // Refuses the first offer, takes the second, and so on.
         let mut flip = true;
         io.accept = Box::new(move |_| {
@@ -515,7 +592,14 @@ mod tests {
             flip
         });
         let mut handoff = LiveHandoff::new(4, 10);
-        let sent = run(&mut handoff, &mut consumer, &active, &mut io, 100);
+        let sent = run(
+            &mut handoff,
+            &mut consumer,
+            &active,
+            &mut io,
+            Instant::now(),
+            100,
+        );
 
         assert!(
             active.load(Ordering::Acquire),
@@ -534,15 +618,13 @@ mod tests {
     /// the live stream's, in order.
     #[test]
     fn entries_arriving_mid_handoff_join_the_stream_at_the_boundary() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("j.journal");
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        append(&mut writer, 1..=12);
+        let journal = TestJournal::new();
+        journal.append(1..=12);
         let (mut producer, mut consumer) = ring();
 
         let active = AtomicBool::new(false);
         let socket_open = std::cell::Cell::new(false);
-        let mut io = FakeIo::new(journal_disk(&path));
+        let mut io = FakeIo::new(journal.disk());
         io.accept = Box::new(|_| socket_open.get());
         let mut handoff = LiveHandoff::new(4, 10);
         let now = Instant::now();
@@ -560,13 +642,13 @@ mod tests {
         // Meanwhile the journal stage, with the ring active, journals and
         // publishes 13..=16 in two batches.
         assert!(active.load(Ordering::Acquire));
-        append(&mut writer, 13..=14);
+        journal.append(13..=14);
         publish(&mut producer, 13..=14);
-        append(&mut writer, 15..=16);
+        journal.append(15..=16);
         publish(&mut producer, 15..=16);
 
         socket_open.set(true);
-        let sent = run(&mut handoff, &mut consumer, &active, &mut io, 100);
+        let sent = run(&mut handoff, &mut consumer, &active, &mut io, now, 100);
         assert_eq!(entries(&io.wire), (11..=14).collect::<Vec<_>>());
         assert_eq!(sent.get(), 14);
         // The live stream goes on from the very next chunk.
@@ -581,15 +663,13 @@ mod tests {
     /// until they land, then forwards them and the chunk, in order.
     #[test]
     fn a_gap_is_backfilled_over_several_steps() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("j.journal");
-        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        append(&mut writer, 1..=12);
+        let journal = TestJournal::new();
+        journal.append(1..=12);
         let (mut producer, mut consumer) = ring();
         publish(&mut producer, 15..=16); // 13..=14 in flight to the disk.
 
         let active = AtomicBool::new(false);
-        let mut io = FakeIo::new(journal_disk(&path));
+        let mut io = FakeIo::new(journal.disk());
         let mut handoff = LiveHandoff::new(4, 10);
         let now = Instant::now();
         for _ in 0..20 {
@@ -606,8 +686,8 @@ mod tests {
         );
         assert!(io.starts[1..].iter().all(|&s| s == 12));
 
-        append(&mut writer, 13..=14);
-        let sent = run(&mut handoff, &mut consumer, &active, &mut io, 100);
+        journal.append(13..=14);
+        let sent = run(&mut handoff, &mut consumer, &active, &mut io, now, 100);
         assert_eq!(entries(&io.wire), (11..=16).collect::<Vec<_>>());
         assert_eq!(sent.get(), 16);
     }
@@ -686,7 +766,14 @@ mod tests {
             true
         });
         let mut handoff = LiveHandoff::new(10, 10);
-        let sent = run(&mut handoff, &mut consumer, &active, &mut io, 100);
+        let sent = run(
+            &mut handoff,
+            &mut consumer,
+            &active,
+            &mut io,
+            Instant::now(),
+            100,
+        );
         let wire: Vec<Wire> = io.wire.iter().map(|f| decode(f)).collect();
         assert_eq!(
             wire,
@@ -764,7 +851,14 @@ mod tests {
             Ok((vec![batch(from + 1..=from + 2)], from + 2))
         }));
         let mut handoff = LiveHandoff::new(3, 10);
-        let sent = run(&mut handoff, &mut consumer, &active, &mut io, 10);
+        let sent = run(
+            &mut handoff,
+            &mut consumer,
+            &active,
+            &mut io,
+            Instant::now(),
+            10,
+        );
         assert_eq!(entries(&io.wire), [11, 12]);
         assert_eq!(sent.get(), 12);
         assert!(
@@ -887,7 +981,7 @@ mod tests {
                 });
                 let active = AtomicBool::new(false);
                 let mut handoff = LiveHandoff::new(bulk_end, bulk_end);
-                let sent = run(&mut handoff, &mut consumer, &active, &mut io, 10_000);
+                let sent = run(&mut handoff, &mut consumer, &active, &mut io, Instant::now(), 10_000);
 
                 prop_assert_eq!(&io.wire, &inline_wire);
                 prop_assert_eq!(sent.get(), inline_sent.get());
