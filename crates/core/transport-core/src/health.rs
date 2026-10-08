@@ -181,6 +181,14 @@ pub struct RaftStatus {
     /// control plane is visible instead of its gauges freezing at the
     /// last-published (possibly leader) state.
     pub running: AtomicBool,
+    /// Times this node's journal-tip vote filter gave up steering: it had
+    /// dropped every vote request for several election timeouts with no
+    /// leader in sight, so it let Raft's own rules elect whoever they
+    /// could, a behind node included. Published by the raft driver from
+    /// the filter's own count; exposed as
+    /// `melin_raft_vote_filter_escapes_total`. `u64`: a monotonic
+    /// counter, as Prometheus expects, that never wraps in practice.
+    pub vote_filter_escapes: AtomicU64,
 }
 
 impl RaftStatus {
@@ -200,6 +208,7 @@ impl RaftStatus {
             leader_id: AtomicU64::new(0),
             role: std::sync::atomic::AtomicU8::new(Self::ROLE_FOLLOWER),
             running: AtomicBool::new(true),
+            vote_filter_escapes: AtomicU64::new(0),
         }
     }
 
@@ -345,6 +354,7 @@ struct RaftSnapshot {
     leader_id: u64,
     role: u8,
     running: bool,
+    vote_filter_escapes: u64,
 }
 
 impl HealthSnapshot {
@@ -579,6 +589,7 @@ impl HealthSnapshot {
                 leader_id: r.leader_id.load(Ordering::Relaxed),
                 role: r.role.load(Ordering::Relaxed),
                 running: r.running.load(Ordering::Relaxed),
+                vote_filter_escapes: r.vote_filter_escapes.load(Ordering::Relaxed),
             }),
         }
     }
@@ -793,7 +804,10 @@ impl HealthSnapshot {
                  melin_raft_is_leader {}\n\
                  # HELP melin_raft_driver_running Whether the raft driver thread is alive (1) or has stopped, e.g. on an unrecoverable state-file error while the pipeline keeps serving (0).\n\
                  # TYPE melin_raft_driver_running gauge\n\
-                 melin_raft_driver_running {}\n",
+                 melin_raft_driver_running {}\n\
+                 # HELP melin_raft_vote_filter_escapes_total Times this node's journal-tip vote filter blocked every election for several election timeouts and stopped steering until a leader emerged, so a behind node could win (promotion-time checks still apply).\n\
+                 # TYPE melin_raft_vote_filter_escapes_total counter\n\
+                 melin_raft_vote_filter_escapes_total {}\n",
                 raft.node_id,
                 raft.term,
                 raft.leader_id,
@@ -802,6 +816,7 @@ impl HealthSnapshot {
                 // role it published.
                 u8::from(raft.running && raft.role == RaftStatus::ROLE_LEADER),
                 u8::from(raft.running),
+                raft.vote_filter_escapes,
             );
         }
         c.position() as usize
@@ -1102,6 +1117,7 @@ mod tests {
         raft.role.store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
         raft.leader_id.store(2, Ordering::Relaxed);
         raft.term.store(7, Ordering::Relaxed);
+        raft.vote_filter_escapes.store(3, Ordering::Relaxed);
         let fence = Arc::new(crate::fence::FenceState::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -1119,6 +1135,14 @@ mod tests {
         assert!(body.contains("melin_raft_term 7\n"), "{body}");
         assert!(body.contains("melin_raft_is_leader 1\n"), "{body}");
         assert!(body.contains("melin_raft_driver_running 1\n"), "{body}");
+        assert!(
+            body.contains("# TYPE melin_raft_vote_filter_escapes_total counter\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("melin_raft_vote_filter_escapes_total 3\n"),
+            "{body}"
+        );
         // A replica is following, not accepting client writes.
         assert!(body.contains("melin_trading_active 0\n"), "{body}");
 

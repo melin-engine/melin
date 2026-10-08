@@ -95,6 +95,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `Reply` out of a `FrameDecoder`. None of it does I/O, so read
   timeouts, and the rule that a heartbeat does not extend one, stay with
   the caller.
+- **`melin_raft_vote_filter_escapes_total`**, a counter on every
+  raft-enabled node's health endpoint: the times the node stopped
+  steering elections toward the most-caught-up node because steering had
+  blocked every election for several election timeouts, so a behind
+  node could win. Until now that showed only as a one-off warning in
+  the log. `VoteFilter::escapes` is the count, which the raft driver
+  publishes.
 
 ### Removed
 
@@ -119,6 +126,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **`melin_transport_core::health::RaftStatus` gains
+  `vote_filter_escapes`**, the count behind
+  `melin_raft_vote_filter_escapes_total`. Build a `RaftStatus` with
+  `RaftStatus::new`, which starts it at zero.
 - **`melin_client::Error` gains `FrameTooLarge { declared, max }` and
   `BufferTooSmall { needed, available }`.** `FrameTooLarge` is a length
   prefix from the node over the frame limit, from `next_reply` and from

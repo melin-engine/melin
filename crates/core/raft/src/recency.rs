@@ -26,7 +26,10 @@
 //! filter is a *stateful gate* ([`VoteFilter`]): after
 //! [`LIVENESS_ESCAPE_DROPS`] consecutively dropped requests with no
 //! leader observed, it stops filtering until a leader is next seen,
-//! letting Raft's own rules elect whoever they can. The filter is
+//! letting Raft's own rules elect whoever they can. Each opening is
+//! counted ([`VoteFilter::escapes`]) and exported as
+//! `melin_raft_vote_filter_escapes_total`, so an operator can see when
+//! an election ran without the recency preference. The filter is
 //! therefore best-effort steering, not a guarantee: the authoritative
 //! journal-safety check belongs at *promotion* time, never at the
 //! ballot box. That check exists — the auto-promotion policy in
@@ -196,6 +199,11 @@ pub struct VoteFilter {
     /// at [`LIVENESS_ESCAPE_DROPS`]; `u32` (not `u8`) only to make the
     /// constant's type unremarkable — the count never exceeds the limit.
     consecutive_drops: u32,
+    /// Times the escape has opened since this filter was built. Never
+    /// reset, unlike `consecutive_drops`: re-arming closes the escape,
+    /// but that it opened stays a fact. `u64`: it backs a Prometheus
+    /// counter (see [`Self::escapes`]).
+    escapes: u64,
 }
 
 impl VoteFilter {
@@ -213,6 +221,7 @@ impl VoteFilter {
         }
         self.consecutive_drops += 1;
         if self.consecutive_drops == LIVENESS_ESCAPE_DROPS {
+            self.escapes += 1;
             tracing::warn!(
                 drops = self.consecutive_drops,
                 "journal-tip vote filter blocked every election — \
@@ -228,6 +237,13 @@ impl VoteFilter {
     /// filter.
     pub fn leader_observed(&mut self) {
         self.consecutive_drops = 0;
+    }
+
+    /// How many times the escape has opened: each time this voter gave
+    /// up steering and let Raft's own rules elect whoever they could.
+    /// Monotonic; the driver publishes it to the health endpoint.
+    pub fn escapes(&self) -> u64 {
+        self.escapes
     }
 }
 
@@ -308,15 +324,27 @@ mod tests {
 
         // The first LIVENESS_ESCAPE_DROPS behind-requests are dropped…
         for i in 0..LIVENESS_ESCAPE_DROPS {
+            assert_eq!(f.escapes(), 0, "no escape before drop {i}");
             assert!(!f.should_deliver(behind, local), "drop {i}");
         }
-        // …then the escape opens and stays open.
+        // …the last of them opens the escape, once…
+        assert_eq!(f.escapes(), 1);
+        // …and it stays open, counted once however long it stays open.
         assert!(f.should_deliver(behind, local));
         assert!(f.should_deliver(behind, local));
+        assert_eq!(f.escapes(), 1);
 
-        // Observing a leader re-arms the filter.
+        // Observing a leader re-arms the filter but keeps the count.
         f.leader_observed();
+        assert_eq!(f.escapes(), 1);
         assert!(!f.should_deliver(behind, local));
+
+        // A second sustained deadlock opens it again, and counts again.
+        for _ in 1..LIVENESS_ESCAPE_DROPS {
+            assert!(!f.should_deliver(behind, local));
+        }
+        assert_eq!(f.escapes(), 2);
+        assert!(f.should_deliver(behind, local));
     }
 
     proptest::proptest! {

@@ -427,7 +427,13 @@ With `--raft-bind` alone the election is **observational**: leadership
 is elected and exported, but promotion stays operator-driven. Elections
 steer toward the most-caught-up node — candidates advertise their
 journal position and peers holding more data decline to vote for them —
-so the elected leader is the right node to `PROMOTE`.
+so the elected leader is the right node to `PROMOTE`. Steering gives way
+to liveness: a node that has declined every candidate for several
+election timeouts with no leader emerging stops declining until one
+does, so the cluster is never left leaderless by it, at the cost that a
+behind node may then win. Each time a node gives way it increments
+`melin_raft_vote_filter_escapes_total`; promotion still refuses a
+behind winner (below).
 
 ### Automatic failover (`--raft-auto-promote`)
 
@@ -917,6 +923,15 @@ normal-case post-recovery state.
   service continues, but automatic failover is offline) and on a
   sustained absence of any node reporting `melin_raft_is_leader 1`
   (control-plane quorum lost).
+- `melin_raft_vote_filter_escapes_total` counts the times a node stopped
+  steering elections toward the most-caught-up node because steering
+  had blocked every election for several election timeouts. An
+  increase means an election ran without the data-recency preference,
+  so the elected leader may be behind — promotion still refuses a
+  behind winner while a caught-up peer is reachable, but the event is
+  worth a look: it usually follows prolonged control-plane trouble
+  (lost peers, a partition, an overloaded host). Resets on process
+  restart, like every counter here.
 
 ## Limitations
 

@@ -453,25 +453,36 @@ async fn driver_main(
             );
         }
         let m = metrics_rx.borrow().clone();
+        {
+            // Poisoning unreachable under panic=abort.
+            let mut filter = rpc_cfg
+                .vote_filter
+                .lock()
+                .expect("vote filter mutex poisoned");
+            // Read after the metrics above and stored before `leader_id`
+            // below, whose Release store publishes it. The RPC tasks run
+            // on this runtime's one thread, so an escape that let this
+            // node vote for the leader `m` names opened before `m` was
+            // read: a reader that sees that leader (`leader_id`, Acquire)
+            // sees it counted.
+            status
+                .vote_filter_escapes
+                .store(filter.escapes(), Ordering::Relaxed);
+            if m.current_leader.is_some() {
+                // A leader exists — elections are working, so re-arm the
+                // journal-tip vote filter's liveness escape. Without this a
+                // node that is *itself* the leader would never re-arm (it
+                // receives no appends), and drops accumulated across
+                // leadership churn would eventually open the escape while
+                // the cluster is healthy. See `crate::recency`.
+                filter.leader_observed();
+            }
+        }
         status.term.store(m.current_term, Ordering::Relaxed);
         status
             .leader_id
-            .store(m.current_leader.unwrap_or(0), Ordering::Relaxed);
+            .store(m.current_leader.unwrap_or(0), Ordering::Release);
         status.role.store(role_of(m.state), Ordering::Relaxed);
-        if m.current_leader.is_some() {
-            // A leader exists — elections are working, so re-arm the
-            // journal-tip vote filter's liveness escape. Without this a
-            // node that is *itself* the leader would never re-arm (it
-            // receives no appends), and drops accumulated across
-            // leadership churn would eventually open the escape while
-            // the cluster is healthy. See `crate::recency`.
-            // Poisoning unreachable under panic=abort.
-            rpc_cfg
-                .vote_filter
-                .lock()
-                .expect("vote filter mutex poisoned")
-                .leader_observed();
-        }
         if let Err(fatal) = &m.running_state {
             // The raft core died (e.g. persistent storage error). Sequencing
             // is unaffected by construction — the data plane never calls
