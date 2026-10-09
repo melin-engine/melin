@@ -1,7 +1,14 @@
 # Degraded acks on a halted node (plan)
 
-Status: **step 0 done** (with journaled ack-policy changes, see below);
-the rest **proposed** (2026-10). Covers the roadmap item "Degraded acks on
+Status: **implemented, pending step 1's root cause** (2026-10). Step 0
+landed with journaled ack-policy changes (see below), and steps 2–5 on
+top of them; the end-to-end tests pass on kernel TCP and on DPDK under
+the netns runner. Step 1's test does not reproduce the `disk` hang on
+either transport, at load or idle, with ticks on or off: the primary's
+persisted cursor keeps passing the ticks it journals with no replica
+attached, which rules the leading hypothesis out. It is still to be run
+against the Exchange Core's reproduction. Covers the roadmap item
+"Degraded acks on
 a halted node", which replaces the former items "Halt refusals behind a
 stalled ack gate" and "Answer queries on a halted node": both are
 symptoms of the same stall, and one change resolves both.
@@ -155,7 +162,15 @@ the policy says so.
 
 Degraded release starts when the node has been halted (replica count
 zero, the `HaltGate` condition) for a **grace period**, and stops as soon
-as a replica is streaming again. It is driven by the halt, never by gate
+as the halt ends. As built, that is when a replica joins the count
+(`ReplicaPresence`), once the primary accepts its handshake, before it
+has caught up: the same boundary the write halt uses, so the node never
+takes writes with full acks while still sending degraded ones. Replies
+held during the catch-up wait for it, and a replica that is accepted and
+then fails restarts the grace period when it leaves (the receiver's
+doubling backoff bounds how often). Keying
+release on the streaming flag instead would split the two boundaries;
+it is not worth that. It is driven by the halt, never by gate
 lag: a slow but connected replica is backpressure, and its replies wait
 as they do today.
 
@@ -171,6 +186,22 @@ passed. The plan accepts that: the halt itself starts no earlier.
 When the halt ends, replies already sent as degraded are not followed by
 a second, full ack (see "Not part of this item"). Events sequenced after
 the replica is back are acked under the policy as usual.
+
+**Journaled policy changes (as built).** This plan predates
+[journaled-ack-policy-2026-10.md](journaled-ack-policy-2026-10.md), under
+which a policy change is an output slot the gate applies once the change
+is durable under the policy before it. A degraded release must not apply
+one: the primary's disk alone is not that witness, and applying a
+witnessed change on it would undo what the journaled plan guarantees. So
+the gate never applies a change it released degraded. Such a change
+joins the gate's pending changes (the queue that also holds a new
+tenure's carried-over change), applied in order, each once the policy
+before it confirms it; an unwitnessed one, already on this node's disk,
+applies at once, as a forced swap does. While a change is pending, every
+slot after it can only go out degraded, which is true under either
+policy. A halted node's carried-over change is handled the same way, so
+a restarted primary with no replica answers its queries degraded after
+the grace period rather than holding them until a replica returns.
 
 ### 3. Queries take the same release and the same mark
 
