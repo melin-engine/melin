@@ -324,9 +324,11 @@ Before sending any response, the response stage verifies that the corresponding 
 3. If the acked position has not reached that response's own sequence number, spin-wait until it does.
 4. Once confirmed, the response is encoded and sent.
 
-The check is made **per response**, not once per batch. A response is released as soon as its own event satisfies the policy, so a request does not wait on unrelated requests that happened to be processed alongside it. Since the acked position is a high-water mark, a client that receives a response knows that event and every event before it satisfies the configured policy.
+The check is made **per response**, not once per batch. A response is released as soon as its own event satisfies the policy, so a request does not wait on unrelated requests that happened to be processed alongside it. Since the acked position is a high-water mark, a client that receives a response ending in a plain batch end knows that event and every event before it satisfies the configured policy.
 
-The one reply exempt from the wait is the refusal of a write while the node is halted. The write is refused before it enters the pipeline, so there is no event to wait on; the refusal is sent once the replies to everything received before it on that connection have gone out, keeping replies in request order.
+A primary halted for want of a replica has a second, weaker release condition once the halt has lasted a grace period: a response whose event is fsynced on the primary's own journal is released, and its request ends in `BatchEndDegraded` instead of `BatchEnd`. The policy is still checked first on every response, and a release on the weaker condition never moves the acked position, so no later response is taken for confirmed on its account. See "Degraded acks" in [replication](replication.md).
+
+The one reply exempt from the wait is the refusal of a write while the node is halted. The write is refused before it enters the pipeline, so there is no event to wait on; the refusal is sent once the replies to everything received before it have gone out, keeping replies in request order, and it always ends in a plain batch end.
 
 A reply still waiting when the node stops, whether an operator stopped it or a newer primary superseded it, is dropped: the policy never confirmed the event, so the node cannot acknowledge it. The client sees the connection close, as it would on a crash, and reconciles on reconnect. The event itself is journaled and applied, so a retry of the same request is applied a second time unless the application recognises it as a repeat — a client that retries needs an application that deduplicates.
 

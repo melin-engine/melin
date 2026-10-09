@@ -1,6 +1,13 @@
 # Degraded acks on a halted node (plan)
 
-Status: **proposed** (2026-10). Covers the roadmap item "Degraded acks on
+Status: **implemented, pending DPDK runs and step 1's root cause**
+(2026-10). Steps 0 and 2–5 are in; the end-to-end tests are written for
+both transports but have run on kernel TCP only. Step 1's test does not
+reproduce the `disk` hang on kernel TCP, at load or idle, with ticks on
+or off: the primary's persisted cursor keeps passing the ticks it
+journals with no replica attached, which rules the leading hypothesis
+out on that transport. It is still to be run on DPDK, and against the
+Exchange Core's reproduction. Covers the roadmap item "Degraded acks on
 a halted node", which replaces the former items "Halt refusals behind a
 stalled ack gate" and "Answer queries on a halted node": both are
 symptoms of the same stall, and one change resolves both.
@@ -153,7 +160,14 @@ the policy says so.
 
 Degraded release starts when the node has been halted (replica count
 zero, the `HaltGate` condition) for a **grace period**, and stops as soon
-as a replica is streaming again. It is driven by the halt, never by gate
+as the halt ends. As built, that is when a replica joins the count, at
+authentication, before it has caught up: the same boundary the write
+halt uses, so the node never takes writes with full acks while still
+sending degraded ones. Replies held during the catch-up wait for it, and
+a replica that authenticates and then fails restarts the grace period
+when it leaves (the receiver's doubling backoff bounds how often). Keying
+release on the streaming flag instead would split the two boundaries;
+it is not worth that. It is driven by the halt, never by gate
 lag: a slow but connected replica is backpressure, and its replies wait
 as they do today.
 

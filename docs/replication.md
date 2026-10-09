@@ -143,13 +143,23 @@ or automatic failover is silently unavailable until you do. Manual
 
 ### Strict fail-closed semantics
 
-Every policy is **strict**. If the required copies can't exist in the
-current cluster shape (e.g. `disk+ram` configured but no replica is
-connected), the response gate stalls and clients see no reply rather
-than the system silently weakening the contract. The
-`melin_ack_policy_degraded` gauge on `/healthz` flips to `1` and a
+Every policy is **strict about full acknowledgements**. A reply that
+ends in a plain batch end is sent only once the copies the policy
+requires exist. If they can't exist in the current cluster shape (e.g.
+`disk+ram` configured but no replica is connected), no reply is ever
+sent as if they did: the system never silently weakens the contract.
+The `melin_ack_policy_degraded` gauge on `/healthz` flips to `1` and a
 warn-level log line is emitted on transition and every 5 seconds while
 degraded.
+
+What such a node does with the replies it holds depends on why the
+policy cannot be met. A replica that is connected but behind is
+backpressure: its replies wait for it. A node that has lost every
+replica halts (below), and after a grace period it answers the replies
+it holds once its own journal has them, each **marked as backed by the
+primary alone** (see "Degraded acks"). The mark is what keeps the
+contract: a client can always tell a full acknowledgement from a weaker
+one, and decides what the weaker one means to it.
 
 This is deliberate: silently down-grading the ack contract under load
 is exactly the kind of failure mode regulators and venue operators
@@ -161,23 +171,26 @@ runtime policy swap below.
 
 Independent of the ack gate, the node halts when **every** configured
 replica disconnects. New client writes are refused with a
-`ReplicaDisconnected` reason code — clients see the halt reason rather
-than a TCP read timeout — while queries keep answering. A refused write
+`ReplicaDisconnected` reason code, so clients see the halt reason rather
+than a TCP read timeout, and queries are still answered. A refused write
 never enters the pipeline: it is not applied, not journaled, and not
-replicated, so no replay or failover can bring it back. Its rejection does
-not wait on the ack policy, but it does keep its place on the connection:
-it goes out after the replies to the client's earlier requests. Because
-the journal never sees a refused write, the node counts them: the
-`melin_writes_refused_total` counter on `/metrics` says how many writes a
-halt cost.
+replicated, so no replay or failover can bring it back. A rejection
+always ends in a plain batch end: it is a definite answer ("not applied,
+safe to resend"), with nothing on any disk to qualify. It keeps its place
+among the node's replies: it goes out after the replies to every request
+the node received before it. Because the journal never sees a refused
+write, the node counts them: the `melin_writes_refused_total` counter on
+`/metrics` says how many writes a halt cost.
 
-Writes the node accepted just before the halt are applied as usual, and
-their replies wait on the ack policy like any other — sent once a replica
-is back (or an operator relaxes the policy), never if the node is
-superseded or stopped first. A node stopped while such a reply waits stops
-promptly and drops it; the write stays journaled and applied, so a retry
-after reconnect applies it again unless the application recognises the
-repeat.
+Writes the node accepted just before the halt are applied as usual. Their
+replies wait on the ack policy, and so do the rejections and query
+replies that come after them, until either a replica is back and
+confirms them in full, or the grace period runs out and the node answers
+them as degraded acks (see "Degraded acks"). They are never sent if the
+node is superseded or stopped first. A node stopped while such a reply
+waits stops promptly and drops it; the write stays journaled and
+applied, so a retry after reconnect applies it again unless the
+application recognises the repeat.
 
 A node superseded by a newer primary does not refuse: it is stopping, and
 answers nothing. A connection that sends anything while it winds down is
@@ -205,6 +218,66 @@ once it has. While the halt is lifted the health endpoint reports
 
 Standalone deployments (no replication configured) skip this halt
 entirely and run under `disk`.
+
+### Degraded acks
+
+A primary that has had no replica connected for the grace period
+(`--degraded-ack-grace-ms`, 2 seconds by default) stops waiting for one
+to confirm what it holds. Each held reply, to a write accepted before
+the halt or to a query, is sent as soon as the primary's own journal has
+the event fsynced, and its batch ends in **`BatchEndDegraded`** instead
+of `BatchEnd`. The rejections queued behind those replies then go out
+too, in their place. A query answered this way is marked the same way:
+its answer may reflect writes that only the primary's disk holds.
+
+The grace period starts when the last replica leaves, as the node sees
+it (see "How a node notices that its peer has gone"). A replica that
+comes back within it, and catches up, confirms the held replies in full,
+and nothing is marked. Once a replica connects again, every reply waits
+for the policy as before, including while that replica is still catching
+up: the replies held then are confirmed once it has caught up. A replica
+that connects and drops out again before streaming restarts the grace
+period when it leaves. Replies already sent as degraded acks are not
+followed by a second, full acknowledgement when a replica returns.
+
+What a degraded ack means:
+
+- **The request was applied, and the primary's disk holds it.** It was
+  not refused, and it is not lost if the primary restarts.
+- **No replica is known to hold it.** If the cluster fails over to a
+  node that never received it, it is lost, as a write that timed out
+  might be. A client that needs the policy's guarantee treats a degraded
+  ack as unconfirmed and reconciles once the cluster is whole again,
+  which is what a timeout would have forced it to do. A client that
+  accepts a single disk copy treats it as done. The client decides, not
+  the node.
+
+`melin-client` reports the mark: a batch end carries `Ack::Policy` or
+`Ack::PrimaryOnly`, and the convenience calls that expect a full
+acknowledgement return an error that carries the reply instead (see
+[Building an application](building-an-application.md)). A client built
+on an older `melin-client` fails with a protocol error on the first
+degraded ack rather than reading it as a full one: upgrade clients
+before nodes.
+
+Under `disk` nothing is ever degraded: the primary's own fsync is what
+the policy asks for, so every reply is a full one. The policy itself
+never changes: `/healthz` reports the policy the operator set, and
+`melin_ack_policy_degraded` stays `1` for as long as it cannot be met.
+`melin_degraded_acks_total` counts the degraded acks sent, and a
+warn-level log line marks the start and the end of each degraded
+stretch.
+
+Degraded acks widen the split-brain exposure only to the writes the
+node had already accepted when the halt began: new writes are refused.
+If the halt is a partition and the other side promotes a replica, those
+writes may be acked here and missing there, and each such ack is marked.
+
+An operator committed to strict fail-closed behaviour can switch degraded
+acks off with `--no-degraded-acks`. A halted node then holds every reply
+it holds, and every rejection and query reply behind it, until a replica
+returns or the operator swaps the policy; clients see nothing until then
+but their own read timeout.
 
 ### How a node notices that its peer has gone
 
@@ -743,6 +816,8 @@ requiring the full journal history.
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` under the `replication` role. |
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `ACK-POLICY <policy>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
 | `--ack-policy <policy>` | Primary | `disk+ram` | Active ack policy at startup: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Can be swapped at runtime via admin `ACK-POLICY`. |
+| `--degraded-ack-grace-ms <ms>` | Primary | `2000` | How long a primary must have had no replica before it answers the replies it holds once its own journal has them, marked as degraded acks. See "Degraded acks". |
+| `--no-degraded-acks` | Primary | off | Never send degraded acks: a halted primary holds its replies, and the rejections and queries behind them, until a replica returns or the policy is swapped. |
 | `--dpdk-peer-mac <mac>` | Replica on DPDK | derived | Ethernet address of the primary named by `--replica-of`. Only consulted when replicating over DPDK. See below. |
 
 ### Addressing the primary over DPDK
@@ -911,6 +986,11 @@ normal-case post-recovery state.
   says how many writes it cost, which the gauge's duration cannot.
   Standalone nodes and replicas export the series at zero. Resets on
   process restart, like every counter here.
+- `melin_degraded_acks_total` (Prometheus counter) — replies a halted
+  primary sent as degraded acks, backed by its own disk alone (see
+  "Degraded acks"), one per request. Every increase is a client told its
+  request is unconfirmed by any replica: alert on it. A warn-level log
+  line marks the start and the end of each stretch of degraded acks.
 - `melin_ack_policy_degraded` (Prometheus gauge on the health
   endpoint) — `1` while the active policy can't be satisfied by the
   current cluster shape, `0` otherwise. Alert on sustained `1`.
