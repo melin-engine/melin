@@ -33,7 +33,7 @@
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary(raft_failover) + binary(raft_smoke) + binary(startup_events) + binary(replicated_failover) + binary(halt_refusal) + binary(sizing) + binary(genesis_promotion)'
+filter = 'binary(raft_failover) + binary(raft_smoke) + binary(startup_events) + binary(replicated_failover) + binary(halt_refusal) + binary(degraded_acks) + binary(sizing) + binary(genesis_promotion)'
 test-group = 'cluster-serial'
 
 # The DPDK transport on veth (`melin-server-runtime`, built only with its
