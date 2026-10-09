@@ -23,7 +23,12 @@
 
 mod halt_cluster;
 
-use counter_server::{KIND_RESP_ACK, KIND_RESP_REJECTED, increment_request};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use counter_server::{GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, increment_request};
+use melin_client::Frame;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::server::ServerConfig;
 
@@ -174,6 +179,113 @@ fn an_explicit_swap_to_disk_with_no_replica_lifts_the_halt() {
         "the replica's return cleared the operator's lift"
     );
     assert_eq!(value_of(&mut conn), 15, "only the acked writes applied");
+
+    drop(conn);
+    primary.stop();
+}
+
+/// Writes pipelined on their own connection until `stop`: a burst, then
+/// every reply to it. Returns how many requests were answered, and the
+/// error that ended the stream, if one did. A node that leaves a request
+/// unanswered past the client's read timeout ends it with `NoReply`.
+fn pipelined_writer(
+    fx: &Fixture,
+    node: &melin_test_node::Node,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<(u64, Option<String>)> {
+    const BURST: usize = 32;
+    let mut conn = fx.client(node);
+    conn.set_read_timeout(Duration::from_secs(10))
+        .expect("set the read timeout");
+    std::thread::spawn(move || {
+        let mut answered = 0;
+        while !stop.load(Ordering::Relaxed) {
+            for _ in 0..BURST {
+                if let Err(e) = conn.send(&increment_request(1)) {
+                    return (answered, Some(e.to_string()));
+                }
+            }
+            let mut ends = 0;
+            while ends < BURST {
+                match conn.next_frame() {
+                    Ok(Frame::BatchEnd) => ends += 1,
+                    Ok(_) => {}
+                    Err(e) => return (answered, Some(e.to_string())),
+                }
+            }
+            answered += BURST as u64;
+        }
+        (answered, None)
+    })
+}
+
+/// Under `disk` the primary's own journal confirms every reply, so a
+/// primary that loses its replica at load keeps answering: the writes in
+/// flight, the refusals after them, and queries. Its own persisted cursor
+/// keeps passing the ticks it journals with no replica attached (a stall
+/// there, masked while a replica's acks satisfied `disk`, was the leading
+/// hypothesis for a hang reported under this policy).
+#[test]
+fn a_disk_primary_keeps_answering_once_its_replica_is_gone() {
+    let fx = Fixture::new(0x91);
+    let primary_addrs = addrs(0);
+    let mut primary_config = fx.primary_config(&primary_addrs, AckPolicy::Disk);
+    // Ticks on, and frequent: a halted node keeps journaling them.
+    primary_config.tick_interval_ms = 5;
+    let health = primary_config.health_bind.expect("set by the fixture");
+
+    let primary = spawn_node(&primary_addrs, primary_config);
+    let replica = spawn_node(
+        &addrs(1),
+        fx.replica_config("replica", &primary_addrs, AckPolicy::Disk),
+    );
+    wait_for_gauge(health, "melin_replicas_connected", 1);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..2)
+        .map(|_| pipelined_writer(&fx, &primary, Arc::clone(&stop)))
+        .collect();
+    // At load when the replica goes.
+    std::thread::sleep(Duration::from_millis(300));
+    replica.stop();
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::Relaxed);
+    for writer in writers {
+        let (answered, error) = writer.join().expect("writer thread");
+        assert_eq!(
+            error, None,
+            "a writer's stream ended after {answered} answered requests"
+        );
+    }
+
+    // The primary's own persisted cursor passes the ticks it journals
+    // alone.
+    let alone = gauge(health, "melin_journal_sequence").expect("health is up");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while gauge(health, "melin_journal_sequence").is_none_or(|seq| seq <= alone) {
+        assert!(
+            Instant::now() < deadline,
+            "the primary's persisted cursor stopped at {alone} with no replica attached"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut conn = fx.client(&primary);
+    conn.set_read_timeout(Duration::from_secs(5))
+        .expect("set the read timeout");
+    let before = value_of(&mut conn);
+    assert_eq!(
+        one_reply(&mut conn, &increment_request(1))[0],
+        KIND_RESP_REJECTED,
+        "halted: the write is refused"
+    );
+    let reply = one_reply(&mut conn, &GET_VALUE_REQUEST);
+    assert_eq!(
+        u64::from_le_bytes(reply[1..9].try_into().expect("8 bytes")),
+        before,
+        "the query behind a refusal answers, and the refusal applied nothing"
+    );
 
     drop(conn);
     primary.stop();
