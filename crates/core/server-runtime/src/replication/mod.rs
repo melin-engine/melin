@@ -785,14 +785,45 @@ pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send
 /// A journal that failed on the way down (its final drain's sync, say)
 /// is still a failure: it is reported rather than a clean stop, whatever
 /// the journal error, and a write failure among them decides the exit
-/// status (see `crate::exit`). A panicked stage was already logged where
-/// it unwound, and the shutdown stays clean.
-fn shutdown_result<A, W>(outcome: Option<TeardownOutcome<A, W>>) -> ReceiverResult<A, W> {
+/// status (see `crate::exit`). A panicked stage is a failure too, as it
+/// is on a primary: a journal stage that unwound cannot vouch for its
+/// final drain, so the stop is not clean (exit status 1, unless a write
+/// failure was latched).
+///
+/// Every receiver's shutdown goes through this, whether it was streaming
+/// or waiting to reconnect: the pipeline survives reconnects, so its
+/// final drain can fail either way.
+pub(super) fn shutdown_result<A, W>(
+    outcome: Option<TeardownOutcome<A, W>>,
+) -> ReceiverResult<A, W> {
     match outcome {
         Some(TeardownOutcome::JournalFailed(je)) => Err(Box::new(
             crate::exit::JournalStageFailed::new("replica journal stage failed", je),
         )),
-        Some(TeardownOutcome::Clean(..) | TeardownOutcome::Panicked) | None => Ok(None),
+        Some(TeardownOutcome::Panicked) => {
+            Err("replica pipeline stage panicked during shutdown".into())
+        }
+        Some(TeardownOutcome::Clean(..)) | None => Ok(None),
+    }
+}
+
+/// The error a receiver returns when it stops on `error` after tearing
+/// its pipeline down (`outcome`, `None`: no pipeline was running).
+///
+/// A journal failure found at that teardown wins: it becomes the error's
+/// `source`, so a write failure decides the exit status (see
+/// `crate::exit`), and `error` stays in the message as the context.
+/// Anything else returns `error` unchanged: a panicked stage was logged
+/// where it unwound, and the node is stopping on a failure anyway.
+pub(super) fn fatal_after_teardown<A, W>(
+    outcome: Option<TeardownOutcome<A, W>>,
+    error: Box<dyn std::error::Error>,
+) -> Box<dyn std::error::Error> {
+    match outcome {
+        Some(TeardownOutcome::JournalFailed(je)) => {
+            Box::new(crate::exit::JournalStageFailed::new(error.to_string(), je))
+        }
+        Some(TeardownOutcome::Clean(..) | TeardownOutcome::Panicked) | None => error,
     }
 }
 
@@ -1147,11 +1178,22 @@ where
     A: Application + Send + 'static,
     W: JournalWrite<A::Event> + Send + 'static,
 {
-    if let Some(p) = pipeline.take()
-        && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
-    {
-        *app = Some(e);
-        *journal_writer = Some(w);
+    if let Some(p) = pipeline.take() {
+        match teardown_replica_pipeline::<A, W>(p) {
+            TeardownOutcome::Clean(e, w) => {
+                *app = Some(e);
+                *journal_writer = Some(w);
+            }
+            // The journal's error, not the generic "no local state"
+            // below: a write failure decides the exit status.
+            TeardownOutcome::JournalFailed(je) => {
+                return Err(Box::new(crate::exit::JournalStageFailed::new(
+                    "pipeline failed during promotion",
+                    je,
+                )));
+            }
+            TeardownOutcome::Panicked => return Err("pipeline failed during promotion".into()),
+        }
     }
     match (app.take(), journal_writer.take()) {
         (Some(e), Some(w)) => Ok(Some((e, w))),
@@ -1347,18 +1389,22 @@ where
     };
     // The primary starts the transfer as soon as it has sent its verdict,
     // and the teardown waits on the journal: serviced (see `serviced`).
-    source.serviced(move || {
-        if let Some(p) = old_pipeline {
-            // What the teardown hands back (the app and writer, or the
-            // stage's failure) is discarded: the resync archives this
-            // lineage and installs the primary's in its place.
-            let _ = teardown_replica_pipeline::<A, W>(p);
-        }
-        // Dropped after the teardown and before the archive, as before.
-        drop(old_app);
-        drop(old_writer);
-        archive_local_lineage(journal_path, snapshot_path, reason)
-    })?;
+    source.serviced(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if let Some(p) = old_pipeline {
+                // The app and writer the teardown hands back are discarded:
+                // the resync archives this lineage and installs the primary's
+                // in its place. A failure of the stage is not: it stops the
+                // node (see `resync_teardown_result`).
+                resync_teardown_result(teardown_replica_pipeline::<A, W>(p))?;
+            }
+            // Dropped after the teardown and before the archive, as before.
+            drop(old_app);
+            drop(old_writer);
+            archive_local_lineage(journal_path, snapshot_path, reason)?;
+            Ok(())
+        },
+    )?;
     // Archived — a retried handshake must present as a fresh replica.
     *last_sequence = 0;
     *chain_hash = [0u8; 32];
@@ -1460,6 +1506,34 @@ where
             })
         }
         other => Err(format!("expected StreamStart after snapshot, got {other:?}").into()),
+    }
+}
+
+/// Whether a resync may go ahead after tearing down the pipeline it
+/// replaces. The pipeline survives reconnects, so its journal stage may
+/// have failed while the receiver was disconnected, and its final drain
+/// can fail at this teardown.
+///
+/// Chain divergence is what the resync repairs: it goes ahead. Any other
+/// journal failure stops the node, as it does on a streaming session's
+/// fatal exit: a resync would archive the journal and write a fresh one
+/// on the device that just failed, and a write failure among them must
+/// reach the exit status (see `crate::exit`) rather than be retried in
+/// place. A panicked stage is a bug, and stops the node too.
+fn resync_teardown_result<A, W>(
+    outcome: TeardownOutcome<A, W>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match outcome {
+        TeardownOutcome::Clean(..)
+        | TeardownOutcome::JournalFailed(melin_journal::JournalError::ReplicaChainDivergence {
+            ..
+        }) => Ok(()),
+        // Already error!-logged by the journal thread's spawn wrapper.
+        TeardownOutcome::JournalFailed(je) => Err(Box::new(crate::exit::JournalStageFailed::new(
+            "replica journal stage failed before a resync",
+            je,
+        ))),
+        TeardownOutcome::Panicked => Err("replica pipeline stage panicked before a resync".into()),
     }
 }
 
@@ -1741,8 +1815,10 @@ mod tests {
 
     /// A replica shut down by its operator reports a journal that failed
     /// on the way down instead of a clean stop: a write failure exits
-    /// with status 74, any other journal failure with status 1. A clean
-    /// or panicked teardown, or none at all, stays a clean shutdown.
+    /// with status 74, any other journal failure, or a panicked stage,
+    /// with status 1. A clean teardown, or none at all, stays a clean
+    /// shutdown. Checked through the chain-only helper: the exit status
+    /// also reads a process-wide latch other tests may set.
     #[test]
     fn a_shutdown_reports_a_journal_that_failed_on_the_way_down() {
         type Outcome = TeardownOutcome<(), ()>;
@@ -1764,8 +1840,75 @@ mod tests {
             shutdown_result(Some(Outcome::Clean((), ()))),
             Ok(None)
         ));
-        assert!(matches!(shutdown_result(Some(Outcome::Panicked)), Ok(None)));
+        // A panicked stage cannot vouch for its final drain: a failure
+        // (status 1), as on a primary. Before, a clean stop.
+        let panicked = shutdown_result(Some(Outcome::Panicked)).expect_err("a failure");
+        assert!(!crate::exit::is_journal_write_failure(&*panicked));
         assert!(matches!(shutdown_result::<(), ()>(None), Ok(None)));
+    }
+
+    /// A receiver stopping on a fatal error reports a journal failure
+    /// found at its teardown as the error's source, with the fatal error
+    /// kept in the message; otherwise the fatal error is returned as is.
+    /// Before, the DPDK receiver discarded the teardown's outcome.
+    #[test]
+    fn a_fatal_exit_keeps_a_journal_failure_found_at_teardown() {
+        type Outcome = TeardownOutcome<(), ()>;
+        let fatal = || -> Box<dyn std::error::Error> { "unexpected response".into() };
+
+        let error = fatal_after_teardown(
+            Some(Outcome::JournalFailed(
+                melin_journal::JournalError::WriteFailed(std::io::Error::from_raw_os_error(
+                    libc::EIO,
+                )),
+            )),
+            fatal(),
+        );
+        assert!(crate::exit::is_journal_write_failure(&*error), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("unexpected response"), "{message}");
+        assert!(message.contains("journal write failed"), "{message}");
+
+        for outcome in [Some(Outcome::Clean((), ())), Some(Outcome::Panicked), None] {
+            let error = fatal_after_teardown(outcome, fatal());
+            assert!(!crate::exit::is_journal_write_failure(&*error));
+            assert_eq!(error.to_string(), "unexpected response");
+        }
+    }
+
+    /// A resync goes ahead after a clean teardown or after the chain
+    /// divergence it repairs, and stops the node on any other journal
+    /// failure (keeping it as the source, so a write failure reaches the
+    /// exit status) or a panic. Before, the outcome was discarded and the
+    /// resync went ahead on a device that had just failed.
+    #[test]
+    fn a_resync_stops_on_a_journal_failure_at_teardown() {
+        type Outcome = TeardownOutcome<(), ()>;
+        assert!(resync_teardown_result(Outcome::Clean((), ())).is_ok());
+        assert!(
+            resync_teardown_result(Outcome::JournalFailed(
+                melin_journal::JournalError::ReplicaChainDivergence {
+                    sequence: 7,
+                    expected: [1; 32],
+                    actual: [2; 32],
+                }
+            ))
+            .is_ok()
+        );
+
+        let write = resync_teardown_result(Outcome::JournalFailed(
+            melin_journal::JournalError::WriteFailed(std::io::Error::from_raw_os_error(libc::EIO)),
+        ))
+        .expect_err("a write failure stops the node");
+        assert!(crate::exit::is_journal_write_failure(&*write), "{write}");
+
+        let io = resync_teardown_result(Outcome::JournalFailed(melin_journal::JournalError::Io(
+            std::io::Error::from_raw_os_error(libc::EIO),
+        )))
+        .expect_err("an I/O failure stops the node");
+        assert!(!crate::exit::is_journal_write_failure(&*io), "{io}");
+
+        assert!(resync_teardown_result(Outcome::Panicked).is_err());
     }
 
     /// Build a wire-ready `InputBatch` frame containing a single `Tick`
@@ -4068,7 +4211,13 @@ mod tests {
         );
         assert_eq!(divergence_resyncs, 0, "not a resync");
         if let Some(p) = pipeline.take() {
-            let _ = teardown_replica_pipeline::<counter_server::Counter, Writer>(p);
+            assert!(
+                matches!(
+                    teardown_replica_pipeline::<counter_server::Counter, Writer>(p),
+                    TeardownOutcome::Clean(..)
+                ),
+                "the surviving pipeline tears down cleanly"
+            );
         }
     }
 

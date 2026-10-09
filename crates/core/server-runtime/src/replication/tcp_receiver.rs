@@ -23,9 +23,9 @@ use super::receiver_transport::{
 };
 use super::{
     ReplicaPipelineHandles, ResumePoint, ResyncDecision, StreamStartVerdict,
-    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
-    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
-    take_pipeline_for_promotion, teardown_replica_pipeline,
+    build_replica_pipeline_with_threads, fatal_after_teardown, handle_resync_verdict,
+    handle_session_exit, journal_failed_while_disconnected, recover_replica_state, shutdown_result,
+    sleep_then_double_backoff, take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use crate::uring_teardown::{DrainBackoff, wake_pending_ops};
 use melin_transport_core::replication::protocol::{
@@ -671,10 +671,13 @@ where
         // continues back here, so teardown/promotion handling exists
         // exactly once.
         if shutdown.load(Ordering::Relaxed) {
-            if let Some(p) = pipeline.take() {
-                let _ = teardown_replica_pipeline::<A, BufferedWriter<A::Event>>(p);
-            }
-            return Ok(None);
+            // The pipeline survived the disconnect, so its final drain
+            // can still fail here: reported, not a clean stop.
+            return shutdown_result(
+                pipeline
+                    .take()
+                    .map(teardown_replica_pipeline::<A, BufferedWriter<A::Event>>),
+            );
         }
         if promote.is_requested() {
             info!("promotion triggered while disconnected");
@@ -716,9 +719,31 @@ where
                 warn!(error = %err, "failed to set SO_BUSY_POLL on replica receive socket");
             }
         }
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        // A fatal error from here to the end of the handshake stops the
+        // receiver: tear the surviving pipeline down first, so its final
+        // drain runs and a journal failure found there is reported, and
+        // wins the exit status over the handshake error (see
+        // `fatal_after_teardown`). The DPDK receiver's `fatal_err_dpdk!`
+        // is the same rule.
+        macro_rules! or_teardown {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return Err(fatal_after_teardown(
+                            pipeline
+                                .take()
+                                .map(teardown_replica_pipeline::<A, BufferedWriter<A::Event>>),
+                            e.into(),
+                        ));
+                    }
+                }
+            };
+        }
 
-        let mut reader = stream.try_clone()?;
+        or_teardown!(stream.set_read_timeout(Some(std::time::Duration::from_secs(5))));
+
+        let mut reader = or_teardown!(stream.try_clone());
         let mut tcp_writer = stream;
 
         // `reader`/`tcp_writer` are clones of one socket; auth is sequential so
@@ -765,8 +790,8 @@ where
         };
         send_buf.clear();
         encode_handshake(&handshake, &mut send_buf);
-        tcp_writer.write_all(&send_buf)?;
-        tcp_writer.flush()?;
+        or_teardown!(tcp_writer.write_all(&send_buf));
+        or_teardown!(tcp_writer.flush());
         send_buf.clear();
 
         // --- Protocol negotiation ---
@@ -775,8 +800,8 @@ where
         // sequence-contiguity gate. Derived from local knowledge (our
         // own handshake, or the verified snapshot), never from the
         // wire.
-        let response_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-        let response = decode_primary_message(&response_frame)?;
+        let response_frame = or_teardown!(read_frame(&mut reader, MAX_CONTROL_FRAME));
+        let response = or_teardown!(decode_primary_message(&response_frame));
         let (stream_lineage, session_start) = match response {
             PrimaryMessage::StreamStart {
                 start_sequence,
@@ -785,7 +810,7 @@ where
                 genesis_entries,
                 epoch,
                 ack_policy,
-            } => match super::accept_stream_start(
+            } => match or_teardown!(super::accept_stream_start(
                 super::StreamStart {
                     start_sequence,
                     lineage: (segment_start_sequence, anchor_hash, genesis_entries),
@@ -797,7 +822,7 @@ where
                 &mut journal_writer,
                 &fence_state,
                 control,
-            )? {
+            )) {
                 StreamStartVerdict::Follow(lineage) => (lineage, last_sequence),
                 // Disconnect and retry with backoff; the operator's logs
                 // flag the misdirected `--replica-of`.
@@ -852,7 +877,12 @@ where
                 }
             }
             _ => {
-                return Err(format!("unexpected response: {response:?}").into());
+                return Err(fatal_after_teardown(
+                    pipeline
+                        .take()
+                        .map(teardown_replica_pipeline::<A, BufferedWriter<A::Event>>),
+                    format!("unexpected response: {response:?}").into(),
+                ));
             }
         };
 
@@ -2716,6 +2746,332 @@ mod tests {
                 .expect("promoted, not shut down");
             assert!(verdict.contains("refusing promotion"), "{verdict}");
             assert!(verdict.contains("holds 2 entries"), "{verdict}");
+        }
+
+        /// A replica shut down while it waits to reconnect, whose
+        /// pipeline's final drain then fails its sync, reports the
+        /// failure: the exit status it maps to is 74. The pipeline
+        /// survives the disconnect, holding entries 2 and 3 back under
+        /// the group-commit delay, and the shutdown's drain is the sync
+        /// that fails. Before, the receiver discarded the teardown's
+        /// outcome on this path and returned as from a clean stop.
+        #[test]
+        fn a_shutdown_during_reconnect_backoff_reports_a_failed_final_drain() {
+            let message = final_drain_fails_during_reconnect_backoff(StopBy::Shutdown);
+            assert!(message.contains("journal write failed"), "{message}");
+        }
+
+        /// The same failed final drain, reached through a promotion
+        /// requested while disconnected: the promotion is refused with
+        /// the journal's error, not handed a writer whose last batch the
+        /// device refused, and the exit status it maps to is 74.
+        #[test]
+        fn a_promotion_during_reconnect_backoff_reports_a_failed_final_drain() {
+            let message = final_drain_fails_during_reconnect_backoff(StopBy::Promotion);
+            assert!(
+                message.contains("pipeline failed during promotion"),
+                "{message}"
+            );
+            assert!(message.contains("journal write failed"), "{message}");
+        }
+
+        /// How [`final_drain_fails_during_reconnect_backoff`] ends the receiver.
+        enum StopBy {
+            Shutdown,
+            Promotion,
+        }
+
+        /// Bring a replica's pipeline up holding entries 2 and 3 back
+        /// under the group-commit delay, take the primary away for good,
+        /// arm a sync failure on the replica's journal and stop the
+        /// receiver as `stop_by` says, so the teardown's final drain is
+        /// the sync that fails. Asserts the receiver returns an error
+        /// whose chain maps to status 74 and returns its message.
+        fn final_drain_fails_during_reconnect_backoff(stop_by: StopBy) -> String {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_, lineage) = primary_journal(dir.path());
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+            let journal = dir.path().join("replica.journal");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let control = crate::replication::ReplicaControlPlane::new();
+            let replica = {
+                let journal = journal.clone();
+                let snapshot = dir.path().join("replica.snapshot");
+                let shutdown = Arc::clone(&shutdown);
+                let control = control.clone();
+                std::thread::spawn(move || -> Result<bool, (std::process::ExitCode, String)> {
+                    run_receiver::<App>(
+                        addr,
+                        &journal,
+                        &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                        &shutdown,
+                        &control,
+                        3_600_000,
+                        snapshot,
+                        crate::layout::PipelineCores::unpinned(),
+                        melin_journal::StagingMode::ZeroFill,
+                        // Long enough that entries 2 and 3 are still
+                        // unwritten when the shutdown drains them, short
+                        // of the scripted primary's 10 s read timeout
+                        // while it waits for entry 1's ack.
+                        Duration::from_secs(4),
+                        64,
+                        Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        &(),
+                    )
+                    .map(|state| state.is_none())
+                    // The status from the error's chain alone: the
+                    // process-wide latch is shared with other tests.
+                    .map_err(|e| {
+                        let message = e.to_string();
+                        (crate::exit::status_for(&Err(e), false), message)
+                    })
+                })
+            };
+
+            let (mut s1, _s1r, h1) = next_handshake(&listener);
+            assert_eq!(h1.last_sequence, 0, "fresh replica handshake");
+            stream_start(&mut s1, 0, lineage);
+            // Entry 1 is held for the delay too, then made durable.
+            send_entries(&mut s1, &[1]);
+            wait_for_ack(&mut s1, 1);
+            send_entries(&mut s1, &[2, 3]);
+            // The replica holds entries 2 and 3 in its pipeline, not yet
+            // durable: its in-memory ack says so. Waiting for it keeps a
+            // loaded machine from ending the session before they arrive.
+            loop {
+                if let ReplicaMessage::Ack(a) = read_replica_msg(&mut s1)
+                    && a.in_memory_sequence >= 3
+                {
+                    assert!(a.acked_sequence < 3, "entries 2 and 3 are not durable yet");
+                    break;
+                }
+            }
+            // The primary goes away for good: every reconnect is refused.
+            // A FIN rather than a close, which would send a reset while
+            // the replica's acks sit unread here: the replica sees a plain
+            // end of stream and leaves the session at once, without
+            // waiting for entries 2 and 3 to become durable. The socket
+            // stays open, unread, until the test ends.
+            s1.shutdown(std::net::Shutdown::Write).expect("FIN");
+            drop(listener);
+            // Long enough for the receiver to see the disconnect and
+            // enter its reconnect wait, far short of the delay.
+            std::thread::sleep(Duration::from_millis(500));
+
+            melin_journal::test_utils::fail_next_sync(&journal);
+            match stop_by {
+                StopBy::Shutdown => shutdown.store(true, Ordering::Relaxed),
+                StopBy::Promotion => assert!(
+                    control
+                        .promote
+                        .request(crate::promotion::PromotionRequest::MANUAL),
+                    "promotion filed"
+                ),
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !replica.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "receiver did not exit after the stop request"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let (status, message) = replica
+                .join()
+                .expect("replica thread panicked")
+                .expect_err("a failed final drain is not a clean stop or promotion");
+            assert_eq!(
+                status,
+                std::process::ExitCode::from(crate::exit::EXIT_JOURNAL_WRITE_FAILED),
+                "{message}"
+            );
+            message
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // A resync whose local storage fails stops the receiver instead of
+    // retrying it, end to end against a scripted primary serving a real
+    // snapshot + segment-seed transfer. Gated like `divergence_resync`,
+    // whose fixtures it shares the shape of.
+    // -----------------------------------------------------------------
+    #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+    mod resync_local_failure {
+        use super::super::super::auth::authenticate_replica;
+        use super::scripted::*;
+        use super::*;
+        use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+        use melin_transport_core::cursors::WireSeq;
+        use melin_transport_core::replication::catchup::snapshot_transfer_with;
+        use melin_transport_core::replication::protocol::encode_need_snapshot;
+        use std::process::ExitCode;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        /// What the receiver returned: whether its error is a
+        /// `LocalTransferError`, the exit status its chain maps to (the
+        /// process-wide latch is shared with other tests, so left out),
+        /// and its message.
+        struct Stopped {
+            local: bool,
+            status: ExitCode,
+            message: String,
+        }
+
+        /// Serve a fresh replica a `NeedSnapshot` verdict and a real
+        /// snapshot + segment-seed transfer, after `plant` has prepared
+        /// its storage to fail, and return how the receiver stopped. A
+        /// receiver that retried instead would dial again and never
+        /// return, failing the deadline.
+        fn resync_onto_failing_storage(plant: impl FnOnce(&std::path::Path)) -> Stopped {
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            // The primary: entries 1..=5, a rotation after 2, a snapshot
+            // at 4 (so the seed is a prefix of the live segment).
+            let primary_journal = dir.path().join("primary.journal");
+            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            let mut chain_at_4 = [0u8; 32];
+            for v in 1..=5u64 {
+                w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
+                if v == 2 {
+                    w.rotate_segment().expect("rotate");
+                }
+                if v == 4 {
+                    chain_at_4 = w.chain_hash().expect("chain");
+                }
+            }
+            drop(w);
+            melin_transport_core::snapshot::save::<App>(
+                &App,
+                WireSeq::new(4),
+                chain_at_4,
+                0,
+                Some(0),
+                &primary_journal.with_extension("snapshot"),
+            )
+            .expect("save snapshot");
+
+            plant(dir.path());
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let replica = {
+                let journal = dir.path().join("replica.journal");
+                let snapshot = dir.path().join("replica.snapshot");
+                let shutdown = Arc::clone(&shutdown);
+                std::thread::spawn(move || -> Result<bool, Stopped> {
+                    run_receiver::<App>(
+                        addr,
+                        &journal,
+                        &ed25519_dalek::SigningKey::from_bytes(&REPLICA_KEY),
+                        &shutdown,
+                        &crate::replication::ReplicaControlPlane::new(),
+                        3_600_000,
+                        snapshot,
+                        crate::layout::PipelineCores::unpinned(),
+                        melin_journal::StagingMode::ZeroFill,
+                        Duration::ZERO,
+                        64,
+                        Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        &(),
+                    )
+                    .map(|state| state.is_none())
+                    .map_err(|e| Stopped {
+                        local: e.is::<crate::replication::receiver_transport::LocalTransferError>(),
+                        message: e.to_string(),
+                        status: crate::exit::status_for(&Err(e), false),
+                    })
+                })
+            };
+
+            let mut s1 = accept_within(&listener, 30);
+            let mut s1r = s1.try_clone().expect("clone");
+            authenticate_replica(&mut s1r, &replica_auth()).expect("auth");
+            match read_replica_msg(&mut s1) {
+                ReplicaMessage::Handshake(h) => assert_eq!(h.last_sequence, 0, "fresh"),
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            let mut buf = Vec::new();
+            encode_need_snapshot(&mut buf);
+            s1.write_all(&buf).expect("NeedSnapshot");
+            {
+                let transfer_shutdown = AtomicBool::new(false);
+                let mut publish = |b: &[u8]| -> std::io::Result<()> {
+                    s1.write_all(b)?;
+                    s1.flush()
+                };
+                // Dropped deliberately: the replica may stop reading, and
+                // close the connection, before the transfer is through;
+                // what it does then is what the caller asserts on.
+                let _ = snapshot_transfer_with::<EvtAdd>(
+                    &primary_journal,
+                    &mut publish,
+                    &transfer_shutdown,
+                    1,
+                );
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !replica.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the receiver is still running: a local storage failure must stop it, \
+                     not retry the resync"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let stopped = match replica.join().expect("replica thread panicked") {
+                Ok(clean) => panic!("the receiver must fail, returned Ok({clean})"),
+                Err(stopped) => stopped,
+            };
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "the receiver must not have dialed again"
+            );
+            stopped
+        }
+
+        /// The snapshot cannot even be created (a directory sits at its
+        /// temporary path): the receiver stops with a local failure,
+        /// status 1, rather than retrying the transfer forever.
+        #[test]
+        fn a_snapshot_that_cannot_be_stored_stops_the_resync() {
+            let stopped = resync_onto_failing_storage(|dir| {
+                std::fs::create_dir(dir.join("replica.snapshot").with_extension("snapshot.tmp"))
+                    .expect("plant a directory");
+            });
+            assert!(stopped.local, "{}", stopped.message);
+            assert_eq!(stopped.status, ExitCode::FAILURE, "{}", stopped.message);
+            assert!(stopped.message.contains("snapshot"), "{}", stopped.message);
+        }
+
+        /// The segment seed lands on a full filesystem (its temporary path
+        /// is a symlink to `/dev/full`, where every write fails with
+        /// `ENOSPC`): the receiver stops with a local failure, status 1,
+        /// as a plain I/O error, safe to restart once space is freed.
+        /// Only the symlink is touched.
+        #[test]
+        fn a_seed_on_a_full_filesystem_stops_the_resync() {
+            let stopped = resync_onto_failing_storage(|dir| {
+                std::os::unix::fs::symlink(
+                    "/dev/full",
+                    dir.join("replica.journal").with_extension("seed.tmp"),
+                )
+                .expect("plant a symlink to /dev/full");
+            });
+            assert!(stopped.local, "{}", stopped.message);
+            assert_eq!(stopped.status, ExitCode::FAILURE, "{}", stopped.message);
+            assert!(
+                stopped.message.contains("segment seed"),
+                "{}",
+                stopped.message
+            );
+            assert!(std::path::Path::new("/dev/full").exists());
         }
     }
 

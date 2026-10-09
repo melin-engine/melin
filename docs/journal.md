@@ -88,7 +88,7 @@ An explicit group commit delay (`group_commit_delay`) can be configured but is s
 1. **Clean shutdown** — all entries are complete and synced, followed by the live segment's pre-allocated zeros. Nothing to recover.
 2. **Crash mid-write** — a process kill, or a power loss before `fdatasync` returned, can leave the last write partly on disk: a prefix of it, or, after a power loss, any mix of its sectors, the rest still reading as pre-allocated zeros. None of it was acknowledged. Recovery discards it (see the torn-write rule below).
 3. **Storage corruption** — bit rot, a lost or misdirected write, or a range of storage returning zeros, anywhere in the journal. CRC32C, sequence checks and the rules below detect it, and recovery refuses to start rather than discard data that may have been acknowledged. The exception is the end of the live segment, where damage can look exactly like a crash mid-write (see *Limits of the rule* below).
-4. **A failed write**: the device refuses a write or a sync while the node runs. The node stops with status 74 and must not be restarted in place on the same host (see [When a journal write fails](#when-a-journal-write-fails)).
+4. **A failed write**: a sync of the journal fails while the node runs, because the device did not take data the operating system had accepted. The node stops with status 74 and must not be restarted in place on the same host (see [When a journal write fails](#when-a-journal-write-fails)).
 
 ### Recovery Algorithm
 
@@ -137,18 +137,22 @@ recover(journal_path):
 
 ### When a journal write fails
 
-If the operating system reports that a write to the journal, or the sync that makes it durable, failed, the node stops at once with a `WriteFailed` error and **exit status 74** (`EX_IOERR`). The same status is used when a node starting up fails to write or sync the header of a new journal segment, or fails the sync it performs before it resumes appending to an existing one: that sync is the first to see a write left by the previous run, so its failure means that write never reached the device.
+If the operating system reports that the sync that makes journal writes durable failed, the node stops at once with a `WriteFailed` error and **exit status 74** (`EX_IOERR`). The same status is used when a node starting up fails the sync of the header of a new journal segment, or fails the sync it performs before it resumes appending to an existing one: that sync is the first to see a write left by the previous run, so its failure means that write never reached the device.
+
+A write the operating system refuses outright, before it holds any of the data, is a plain I/O error (`Io`) and exits with status 1: nothing is left behind that a restart could misread. If data written earlier then fails to reach the device after the node has stopped, the next start's first sync reports it, and that start stops with status 74.
+
+A failed sync of a new segment while the journal rotates does not stop the node: the rotation is abandoned, logged as an error naming the write failure, and the node keeps appending to its current segment. The device has still refused a write, so whenever that node later stops on an error, for whatever reason, it exits with status 74, and prints a second line saying a journal sync failed earlier in the process. Treat it as above.
 
 What was acknowledged depends on the ack policy (see [replication.md](replication.md#ack-policies)). On a standalone node, which runs under `disk`, nothing in the failed batch or after it was acknowledged: the acknowledgement waited for this node's sync, and the sync did not succeed. On a replicated cluster that is not so: under every policy an acknowledgement can rest on another node's copy (its memory under `ram` and `disk+ram`, its sync under `disk`), so the failed batch may well have been acknowledged, and it survives on those other nodes, not on this one. That is one more reason to fail over and re-seed the node, below, rather than bring it back with its own history.
 
-**Do not restart the node in place.** After a failed write, Linux can keep the data the device refused in memory, mark it as written, and report the failure only once. A node restarted on the same host, without a reboot, reads that data back from memory as if it were on disk, replays it, and its own sync succeeds, so it goes on to acknowledge new events written after a stretch of journal the device does not hold. When that memory is reclaimed, or the host loses power, the stretch reads as zeros or stale data, and the events after it are lost or refused at the next start.
+**Do not restart the node in place.** After a failed sync, Linux can keep the data the device did not take in memory, mark it as written, and report the failure only once. A node restarted on the same host, without a reboot, reads that data back from memory as if it were on disk, replays it, and its own sync succeeds, so it goes on to acknowledge new events written after a stretch of journal the device does not hold. When that memory is reclaimed, or the host loses power, the stretch reads as zeros or stale data, and the events after it are lost or refused at the next start.
 
 Instead, either:
 
 - **Fail over and re-seed.** On a replicated cluster, promote a replica if the failed node was the primary (raft-driven failover does this on its own). Then move the failed node's journal, archives and snapshots aside, keeping them for investigation, and bring it back as a replica once its storage is sound: it re-seeds itself from the primary.
 - **Reboot the host first.** A reboot clears what the operating system held in memory, so the next start reads only what is on the device. Investigate the storage before starting the node again. This is the only route for a standalone node; recovery then treats the unacknowledged batch like any write cut short by a crash.
 
-Typical triggers are a thin-provisioned volume that ran out of backing space, a network or cloud block volume that lost its path or timed out, and a failing disk. A full filesystem is usually refused earlier, when the journal reserves space, which is a plain I/O error (`Io`): nothing was written, and a restart in place is safe once space is freed.
+Typical triggers are a thin-provisioned volume that ran out of backing space, a network or cloud block volume that lost its path or timed out, and a failing disk. A full filesystem is usually refused earlier, when the journal reserves space or writes, which is a plain I/O error (`Io`): nothing was left half-written, and a restart in place is safe once space is freed.
 
 A supervisor must hold back on status 74. Under systemd, with `Restart=on-failure` or `Restart=always`:
 
@@ -454,7 +458,7 @@ The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`
 | `SequenceDuplicate` | A sequence number repeated | Writer bug or storage anomaly — investigate |
 | `SegmentChainBreak` | A segment's header anchor does not equal the previous segment's tail chain hash | Tampered archive, missing segment, or foreign segment spliced in — investigate before trusting the history |
 | `MissingHistoryPrefix` | The oldest surviving segment starts after the history start recovery requires (sequence 1, or the snapshot's anchor + 1) | Archives trimmed without a covering snapshot — restore the trimmed segments or a snapshot that covers them; recovery refuses to build partial state |
-| `WriteFailed` | The operating system refused a write or a sync of the journal | The node exits with status 74. Do not restart it in place: fail over, or reboot the host first (see [When a journal write fails](#when-a-journal-write-fails)) |
+| `WriteFailed` | A sync of the journal failed: the device did not take data the operating system had accepted | The node exits with status 74. Do not restart it in place: fail over, or reboot the host first (see [When a journal write fails](#when-a-journal-write-fails)) |
 | `Io` | Underlying I/O error | Disk failure, permissions, full disk |
 
 ### Limitations

@@ -360,7 +360,7 @@ fn main() -> ExitCode {
 }
 ```
 
-`exit::exit_code` prints the error, if any, and turns the result into the process's exit status. Your binary must propagate it: when the device refuses a journal write, the node exits with status 74 (`exit::EXIT_JOURNAL_IO_ERROR`, `EX_IOERR`), and that status is how a supervisor knows not to restart the node in place (see [When a journal write fails](journal.md#when-a-journal-write-fails)). Every other failure exits with status 1. A `main` that does more on the way out can test the error with `exit::is_journal_write_failure` and return `ExitCode::from(exit::EXIT_JOURNAL_IO_ERROR)` itself; returning the error from `main` instead exits with status 1 and loses the distinction.
+`exit::exit_code` prints the error, if any, and turns the result into the process's exit status. Your binary must propagate it: when a sync of the journal fails, the node exits with status 74 (`exit::EXIT_JOURNAL_WRITE_FAILED`, `EX_IOERR`), and that status is how a supervisor knows not to restart the node in place (see [When a journal write fails](journal.md#when-a-journal-write-fails)). Every other failure exits with status 1. `exit_code` decides from the error and from a record the journal keeps for the whole process, so the status is right even if the error was reworded on its way out. A `main` that does more on the way out should still end by calling `exit_code` with the result; returning the error from `main` instead exits with status 1 and loses the distinction. `exit::is_journal_write_failure` tells whether an error itself carries the failure, for logging.
 
 Run it the way the quickstart ran echo:
 

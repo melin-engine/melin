@@ -32,9 +32,9 @@ use super::validation_worker::ValidationWorker;
 use super::{
     ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles, ReplicationMetrics,
     ResumePoint, ResyncDecision, SentHighWater, StreamStartVerdict,
-    build_replica_pipeline_with_threads, handle_resync_verdict, handle_session_exit,
-    journal_failed_while_disconnected, recover_replica_state, sleep_then_double_backoff,
-    take_pipeline_for_promotion, teardown_replica_pipeline,
+    build_replica_pipeline_with_threads, fatal_after_teardown, handle_resync_verdict,
+    handle_session_exit, journal_failed_while_disconnected, recover_replica_state, shutdown_result,
+    sleep_then_double_backoff, take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
 use melin_transport_core::replication::catchup::CatchUpPublisher;
@@ -1694,10 +1694,13 @@ where
         // continues back here, so teardown/promotion handling exists
         // exactly once.
         if shutdown.load(Ordering::Relaxed) {
-            if let Some(p) = pipeline.take() {
-                let _ = teardown_replica_pipeline::<A, BufferedWriter<A::Event>>(p);
-            }
-            return Ok(None);
+            // The pipeline survived the disconnect, so its final drain
+            // can still fail here: reported, not a clean stop.
+            return shutdown_result(
+                pipeline
+                    .take()
+                    .map(teardown_replica_pipeline::<A, BufferedWriter<A::Event>>),
+            );
         }
         if promote.is_requested() {
             info!("promotion triggered while disconnected");
@@ -1862,14 +1865,18 @@ where
         // Helper macro: shut the pipeline down before bubbling up a fatal
         // error from the handshake. Borrows `pipeline` directly so we don't
         // leak the threads on the way out, and resets the link so the
-        // primary frees our slot now, not at its liveness deadline.
+        // primary frees our slot now, not at its liveness deadline. A
+        // journal failure found at that teardown wins the exit status over
+        // the handshake error (see `fatal_after_teardown`).
         macro_rules! fatal_err_dpdk {
             ($msg:expr) => {{
                 transport.reset(handle);
-                if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline::<A, BufferedWriter<A::Event>>(p);
-                }
-                return Err($msg);
+                return Err(fatal_after_teardown(
+                    pipeline
+                        .take()
+                        .map(teardown_replica_pipeline::<A, BufferedWriter<A::Event>>),
+                    $msg,
+                ));
             }};
         }
         recv_buf.clear();

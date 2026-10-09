@@ -1,6 +1,7 @@
 //! Journal error types.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Format a 32-byte hash as a short hex prefix (first 8 bytes) for
 /// operator-facing diagnostics. Public so downstream crates (e.g.
@@ -26,10 +27,11 @@ pub fn hex_prefix(hash: &[u8; 32]) -> String {
 pub enum JournalError {
     /// Underlying I/O error.
     Io(std::io::Error),
-    /// The kernel refused a write or a sync of the live segment's data:
-    /// an append's `pwrite`, its `fdatasync`, the header write and
-    /// `fsync` of a new segment, or the `fsync` that seals a reopened
-    /// segment before appends resume.
+    /// The kernel failed a sync of journal data: the live segment's
+    /// `fdatasync` after an append, the `fsync` of a new segment's
+    /// header, or the `fsync` that seals a reopened segment before
+    /// appends resume (the first sync to see a write-back error left by
+    /// the previous process).
     ///
     /// Kept apart from [`Self::Io`] because of what it leaves behind.
     /// After a failed write-back, Linux marks the pages clean, keeps
@@ -38,9 +40,29 @@ pub enum JournalError {
     /// device never took as if it were durable, and its next sync
     /// succeeds. Restarting in place is unsafe until the host reboots;
     /// a node stopped by this error says so through its exit status.
-    /// An error before anything was written (allocating space, creating
-    /// a file, reading) is [`Self::Io`]. A failed rotation is never
-    /// fatal, whatever its class: its rollback discards the new segment.
+    ///
+    /// A failed `pwrite`/`pwritev` of an append (or of a header) is
+    /// [`Self::Io`], not this: a buffered write the kernel refused left
+    /// no clean-but-unwritten pages behind. Pages dirtied by earlier,
+    /// successful writes may still fail their write-back after the
+    /// process exits, but that error is then reported to the first sync
+    /// on a newly opened descriptor, which is the reopen's `fsync` at
+    /// the next start, already in this class. Allocating space,
+    /// creating a file and reading are [`Self::Io`] too: nothing was
+    /// written. A failed rotation is never fatal, whatever its class:
+    /// its rollback discards the new segment.
+    ///
+    /// The segment preparer's own syncs of a staging file (the
+    /// background preallocation, before the journal writes anything into
+    /// it) are [`Self::Io`] too, and so stay off the latch: the file holds
+    /// only zeros or an extent allocation, never journal data, and is
+    /// never adopted after a failure (the next prepare, or the next
+    /// start, removes it), so nothing a restart could misread is left
+    /// behind. The rotation's syncs differ: they flush the header the
+    /// journal wrote into the adopted segment.
+    ///
+    /// Construct it with [`Self::write_failed`], which also sets the
+    /// process-wide latch read by [`write_failure_latched`].
     WriteFailed(std::io::Error),
     /// File does not start with expected magic bytes.
     InvalidFile,
@@ -233,5 +255,63 @@ impl std::error::Error for JournalError {
 impl From<std::io::Error> for JournalError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+/// Set, never cleared outside tests, once any [`JournalError::WriteFailed`]
+/// has been built through [`JournalError::write_failed`] in this process.
+///
+/// A process-wide static rather than state carried by the error, because
+/// the error is what gets lost: on its way out of the runtime it can be
+/// formatted into a message, or replaced by another failure seen at the
+/// same teardown, and a chain walk then no longer finds it. What the
+/// latch answers ("did the kernel fail a journal sync in this process's
+/// life?") is a property of the process, which is what the exit status
+/// reports. An `AtomicBool` because it is written from whichever thread
+/// hit the failure (the journal's disk thread, the replication receiver)
+/// and read once on the way out; it is off every hot path.
+static WRITE_FAILURE_LATCHED: AtomicBool = AtomicBool::new(false);
+
+impl JournalError {
+    /// A [`Self::WriteFailed`] for `error`, latching the failure for the
+    /// process (see [`write_failure_latched`]). Every production site
+    /// builds the variant through this.
+    pub fn write_failed(error: std::io::Error) -> Self {
+        WRITE_FAILURE_LATCHED.store(true, Ordering::SeqCst);
+        Self::WriteFailed(error)
+    }
+}
+
+/// Whether this process has seen a journal write failure (a
+/// [`JournalError::WriteFailed`] built through
+/// [`JournalError::write_failed`]), whatever became of the error since.
+///
+/// It also latches a failure that did not stop the node (a failed
+/// rotation, which rolls back): the device failed a sync during this
+/// process's life, and a node that later stops on any error should not
+/// be restarted in place either.
+pub fn write_failure_latched() -> bool {
+    WRITE_FAILURE_LATCHED.load(Ordering::SeqCst)
+}
+
+/// Clear the latch, for tests that share a process. See
+/// `test_utils::reset_write_failure_latch`.
+#[cfg(feature = "test-utils")]
+pub(crate) fn reset_write_failure_latch() {
+    WRITE_FAILURE_LATCHED.store(false, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Building the error through its constructor latches it for the
+    /// process; nothing in this crate's tests clears the latch, so the
+    /// assertion holds whatever runs in parallel.
+    #[test]
+    fn write_failed_latches_the_failure() {
+        let error = JournalError::write_failed(std::io::Error::from_raw_os_error(libc::EIO));
+        assert!(matches!(error, JournalError::WriteFailed(_)));
+        assert!(write_failure_latched());
     }
 }

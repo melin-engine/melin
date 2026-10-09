@@ -768,17 +768,38 @@ fn write_zeros_paced(file: &File, bytes: u64, shutdown: &AtomicBool) -> Result<(
 /// it makes the window's wall time reflect real device time and
 /// guarantees no staging IO stays in flight into the next one.
 ///
-/// Not best-effort: an error fails the prepare. With `WAIT_AFTER` the
-/// call reports a write-back error on the range, and reporting it
-/// consumes it (Linux reports each write-back error once per open file),
-/// so the final `sync_all` would then succeed on a segment whose zeros
-/// never reached the device, and the rotation would adopt it.
+/// A write-back error on the range fails the prepare. With `WAIT_AFTER`
+/// the call reports it, and reporting it consumes it (Linux reports each
+/// write-back error once per open file), so the final `sync_all` would
+/// then succeed on a segment whose zeros never reached the device, and
+/// the rotation would adopt it.
+///
+/// Any other error (see [`is_writeback_error`]) means the call itself
+/// was refused, not that the zeros failed to reach the device: the fill
+/// just paces less accurately, and the final `sync_all`, which then
+/// still sees any write-back error, remains the durability point.
 fn wait_for_writeback(file: &File, offset: u64, len: u64) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
     #[cfg(test)]
-    if let Some(errno) = tests::FAIL_WRITEBACK.take() {
-        return Err(io::Error::from_raw_os_error(errno));
+    let injected = tests::FAIL_WRITEBACK.take();
+    #[cfg(not(test))]
+    let injected: Option<i32> = None;
+    let outcome = match injected {
+        Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+        None => sync_file_range_wait(file, offset, len),
+    };
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(e) if is_writeback_error(&e) => Err(e),
+        Err(e) => {
+            note_writeback_wait_unavailable(&e);
+            Ok(())
+        }
     }
+}
+
+/// `sync_file_range(WAIT_BEFORE | WRITE | WAIT_AFTER)` over the range.
+fn sync_file_range_wait(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
     // SAFETY: plain syscall on an owned, open fd; no memory is passed.
     let rc = unsafe {
         libc::sync_file_range(
@@ -794,6 +815,42 @@ fn wait_for_writeback(file: &File, offset: u64, len: u64) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// Whether a `sync_file_range` error reports a failed write-back of the
+/// range, which the call consumes, rather than a refusal of the call.
+///
+/// `EIO` is the device failing the write. `ENOSPC` and `EDQUOT` are what
+/// a filesystem that allocates at write-back time (delayed allocation,
+/// thin or network storage) reports when the space or quota it counted
+/// on is gone; the kernel records them in the same per-file error state
+/// as `EIO`, so they are consumed the same way. Everything else
+/// (`EINVAL`, `ENOSYS`, `ESPIPE` on a filesystem or file that does not
+/// support the call, `EBADF`, a transient `ENOMEM`) refuses the call
+/// before any write-back is waited on, and consumes nothing.
+fn is_writeback_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EIO | libc::ENOSPC | libc::EDQUOT)
+    )
+}
+
+/// Log, once per process, that the zero fill cannot wait for its
+/// write-back. A `warn!`: staging still works, but paced against a
+/// clock that no longer reflects the device. Once only, because the
+/// refusal repeats on every window of every prepare.
+fn note_writeback_wait_unavailable(error: &io::Error) {
+    /// Whether the refusal was logged. A process-wide static: the
+    /// refusal is a property of the filesystem, the same for every
+    /// preparer, and one line says all there is to say.
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            error = %error,
+            "segment staging cannot wait for write-back on this filesystem; \
+             pacing is approximate (the final sync still checks the segment)"
+        );
     }
 }
 
@@ -916,14 +973,42 @@ mod tests {
             const { std::cell::Cell::new(None) };
     }
 
-    /// The syscall's own error is returned, not dropped: on a descriptor
-    /// `sync_file_range` rejects (a pipe, `ESPIPE`) the wait fails.
+    /// A descriptor `sync_file_range` refuses (a pipe, `ESPIPE`, as a
+    /// filesystem without the call refuses with `EINVAL` or `ENOSYS`)
+    /// keeps the old best-effort behaviour: the wait succeeds, the fill
+    /// paces less accurately, and the final sync stays the durability
+    /// point. Failing it would fail every prepare forever on such a
+    /// filesystem and leave every rotation on the synchronous fallback.
     #[test]
-    fn wait_for_writeback_reports_the_kernels_error() {
+    fn an_unsupported_writeback_wait_is_best_effort() {
         let (reader, _writer) = std::io::pipe().expect("pipe");
         let file = File::from(std::os::fd::OwnedFd::from(reader));
-        let error = wait_for_writeback(&file, 0, 4096).expect_err("a pipe cannot be synced");
-        assert_eq!(error.raw_os_error(), Some(libc::ESPIPE));
+        wait_for_writeback(&file, 0, 4096).expect("a refused call is not a write-back error");
+    }
+
+    /// Only an error that reports a failed write-back of the range fails
+    /// the wait; a refusal of the call, injected where the kernel's error
+    /// enters, does not.
+    #[test]
+    fn only_a_writeback_error_fails_the_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = File::create(dir.path().join("staging")).expect("create");
+        for errno in [libc::EIO, libc::ENOSPC, libc::EDQUOT] {
+            FAIL_WRITEBACK.set(Some(errno));
+            let error = wait_for_writeback(&file, 0, 4096).expect_err("a write-back error");
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+        for errno in [
+            libc::EINVAL,
+            libc::ENOSYS,
+            libc::ESPIPE,
+            libc::EBADF,
+            libc::ENOMEM,
+        ] {
+            FAIL_WRITEBACK.set(Some(errno));
+            wait_for_writeback(&file, 0, 4096)
+                .unwrap_or_else(|e| panic!("errno {errno} refuses the call, got {e}"));
+        }
     }
 
     /// A write-back error reported by a window's wait fails the fill, and
