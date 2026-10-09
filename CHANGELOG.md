@@ -59,6 +59,28 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   supply them. `response::run` returns a `bool` (whether the stage
   started) instead of `()`, so a `JoinHandle<()>` binding for its thread
   no longer compiles.
+- **An explicit `ACK-POLICY disk` on a primary with no replica connected
+  lifts the halt.** A primary that loses its last replica still halts
+  under every policy, `disk` included, but an operator's swap to `disk`,
+  sent once the node has no replica, now resumes client writes on its
+  disk alone, as the manual-promotion playbook in `docs/replication.md`
+  always said it would. Before, the swap released replies held by the ack
+  policy but the halt went on refusing new writes, leaving a promoted
+  primary with no replica no way to take writes short of a replica
+  joining. The lift lasts until a replica is streaming again or the
+  policy is swapped back to one that needs a replica; the next loss of
+  the last replica then halts the node again. A swap to `disk` made while
+  a replica is still connected, or on a replica before its promotion,
+  lifts nothing: send it again once the node is a primary with no
+  replica. The health endpoint reports `trading` while the lift holds,
+  and every swap that lifts or restores the halt is logged at `info`. In
+  `melin-transport-core`, `halt_state::HaltState` holds the lift and
+  `HealthState` gains `halt_state`; in `melin-server-runtime`,
+  `HaltGate::new` takes the halt state, `admin::spawn` takes an
+  `admin::AckPolicyControl` (the policy byte and the halt state) where it
+  took the policy atomic, `replication::Sender` gains `halt_state`, and
+  `DpdkReplicationDriver::new` takes it. Source-breaking for code that
+  builds any of these.
 
 ### Fixed
 

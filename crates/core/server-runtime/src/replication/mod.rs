@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use melin_journal::{BufferedWriter, JournalWrite};
 
 use melin_app::Application;
+use melin_transport_core::halt_state::HaltState;
 use melin_transport_core::pipeline::{InputSlot, OutputSlot};
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
@@ -100,20 +101,44 @@ use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, recei
 /// Deliberately a *borrowed view*, not an owner: `melin_transport_core` owns
 /// the `Arc<AtomicU32>` and reads it on the matching hot path and for the
 /// `melin_replicas_connected` gauge. This type is only the senders' write
-/// surface, so centralizing it costs nothing on the read side.
+/// surface, so centralizing it costs nothing on the read side. It carries
+/// the halt's shared state beside the count, because a replica that starts
+/// streaming ends the operator's override of the halt.
 pub(crate) struct ReplicaGate<'a> {
     count: &'a AtomicU32,
+    halt_state: &'a HaltState,
 }
 
 impl<'a> ReplicaGate<'a> {
-    pub(crate) fn new(count: &'a AtomicU32) -> Self {
-        Self { count }
+    pub(crate) fn new(count: &'a AtomicU32, halt_state: &'a HaltState) -> Self {
+        Self { count, halt_state }
     }
 
-    /// A replica has authenticated — lift the halt by one. `Release` so a peer
-    /// that observes the connect also observes everything that preceded it.
+    /// A replica has authenticated — lift the halt by one. `SeqCst`, not
+    /// just `Release` (so a peer that observes the connect also observes
+    /// everything that preceded it): the admin handler's check that no
+    /// replica is connected before it latches the halt override relies on
+    /// this increment's place in the single total order (see
+    /// `HaltState::on_policy_swap`). Once per connection, off any hot
+    /// path.
     pub(crate) fn lift(&self) {
-        self.count.fetch_add(1, Ordering::Release);
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A replica has entered the live stream: clear the operator's halt
+    /// override, so that losing the last replica halts the node again.
+    /// Cleared here rather than on authentication, which [`lift`] marks:
+    /// a replica that authenticates and fails before it streams has not
+    /// restored what the operator's consent replaced.
+    ///
+    /// [`lift`]: Self::lift
+    pub(crate) fn streaming(&self) {
+        if self.halt_state.on_replica_streaming() {
+            tracing::info!(
+                "a replica is streaming: the operator's halt override is cleared, and the node \
+                 halts again if its last replica leaves"
+            );
+        }
     }
 
     /// A replica left — lower the halt by one. Returns `true` if it was the

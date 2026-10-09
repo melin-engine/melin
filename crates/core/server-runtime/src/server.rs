@@ -946,6 +946,16 @@ where
     // before issuing `PROMOTE`; the same `Arc` becomes the response
     // stage's source of truth after the replica → primary transition.
     let ack_policy_atomic = Arc::new(AtomicU8::new(config.ack_policy.as_u8()));
+    // The operator's override of the replica-loss halt, beside the policy
+    // it is set through. Created as early, for the same reason: the admin
+    // endpoint holds it from boot, and it survives a promotion. The
+    // replica count it is judged against is attached once the node serves
+    // as a primary (`run_as_primary`).
+    let halt_state = Arc::new(melin_transport_core::halt_state::HaltState::new());
+    let ack_policy_control = crate::admin::AckPolicyControl {
+        policy: Arc::clone(&ack_policy_atomic),
+        halt_state: Arc::clone(&halt_state),
+    };
 
     // Validate before the bind below and before anything touches the
     // journal directory, so a refused boot has no side effects and leaves
@@ -1024,7 +1034,7 @@ where
                     addr,
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
-                    Some(Arc::clone(&ack_policy_atomic)),
+                    Some(ack_policy_control.clone()),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -1160,6 +1170,7 @@ where
                     authorized_keys,
                     rotate_flag,
                     ack_policy_atomic,
+                    halt_state,
                     fence_state,
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     false, // a promoted node continues the history it streamed
@@ -1182,7 +1193,7 @@ where
                 addr,
                 None,
                 rotate_flag.clone(),
-                Some(Arc::clone(&ack_policy_atomic)),
+                Some(ack_policy_control.clone()),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -1262,6 +1273,7 @@ where
         authorized_keys,
         rotate_flag,
         ack_policy_atomic,
+        halt_state,
         fence_state,
         None, // not promoted — no EpochBump injection
         began_history,
@@ -1575,6 +1587,9 @@ fn run_as_primary<A, L>(
     authorized_keys: Arc<AuthorizedKeys>,
     rotate_flag: Option<Arc<AtomicBool>>,
     ack_policy_atomic: Arc<AtomicU8>,
+    // The operator's override of the replica-loss halt, shared with the
+    // admin endpoint. This function attaches the pipeline's replica count.
+    halt_state: Arc<melin_transport_core::halt_state::HaltState>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     promotion: Option<u64>,
     // This boot began the history (`InitializedEngine::began_history`):
@@ -1680,8 +1695,10 @@ where
     // Client writes a halted node refuses at ingress, reader → response
     // stage, counted for the health endpoint. See `crate::halt`.
     let refused_writes = Arc::new(AtomicU64::new(0));
+    attach_halt_state(&halt_state, replicas_connected.as_ref())?;
     let halt_gate = crate::halt::HaltGate::new(
         replicas_connected.clone(),
+        Arc::clone(&halt_state),
         Arc::clone(&fence_state),
         Arc::clone(&refused_writes),
     );
@@ -1925,6 +1942,7 @@ where
         let handlers = [cores.repl_handler_0, cores.repl_handler_1];
         let sender_fence = Arc::clone(&fence_state);
         let sender_ack_policy = Arc::clone(&ack_policy_atomic);
+        let sender_halt_state = Arc::clone(&halt_state);
         // Bound in `run_impl` before any pipeline thread was spawned —
         // see the `repl_listener` parameter doc.
         let repl_listener = repl_listener
@@ -1968,6 +1986,7 @@ where
                         heartbeat_secs,
                         fence_state: sender_fence,
                         ack_policy: sender_ack_policy,
+                        halt_state: sender_halt_state,
                     },
                     &s_repl,
                     &ready_flag,
@@ -2025,6 +2044,7 @@ where
         input_cursor,
         &pipeline_healthy,
         &replicas_connected,
+        &halt_state,
         &fence_state,
         &replication_metrics,
         &replica_active,
@@ -2459,6 +2479,12 @@ where
     // process, threaded into both replica (pre-staging for promotion)
     // and primary admin listeners.
     let ack_policy_atomic = Arc::new(AtomicU8::new(config.ack_policy.as_u8()));
+    // The halt override beside it, as on the kernel-TCP path.
+    let halt_state = Arc::new(melin_transport_core::halt_state::HaltState::new());
+    let ack_policy_control = crate::admin::AckPolicyControl {
+        policy: Arc::clone(&ack_policy_atomic),
+        halt_state: Arc::clone(&halt_state),
+    };
     // As on the kernel-TCP path: refuse a configuration no primary can run
     // under before EAL init and before anything touches the journal, in
     // every role — a replica's configuration is the one it serves under
@@ -2517,7 +2543,7 @@ where
                     addr,
                     Some(promotion_request.clone()),
                     rotate_flag.clone(),
-                    Some(Arc::clone(&ack_policy_atomic)),
+                    Some(ack_policy_control.clone()),
                     Arc::clone(&shutdown),
                     Arc::clone(&authorized_keys),
                 )
@@ -2682,6 +2708,7 @@ where
                     authorized_keys,
                     rotate_flag,
                     ack_policy_atomic,
+                    halt_state,
                     fence_state,
                     promotion_request.pending(), // promoted — EpochBump with the request's epoch floor
                     raft_status,
@@ -2787,7 +2814,7 @@ where
                 addr,
                 None,
                 rotate_flag.clone(),
-                Some(Arc::clone(&ack_policy_atomic)),
+                Some(ack_policy_control.clone()),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -2809,6 +2836,7 @@ where
         authorized_keys,
         rotate_flag,
         ack_policy_atomic,
+        halt_state,
         fence_state,
         None, // not promoted — no EpochBump injection
         raft_status,
@@ -2848,6 +2876,7 @@ fn run_as_primary_dpdk<A>(
     authorized_keys: Arc<AuthorizedKeys>,
     rotate_flag: Option<Arc<AtomicBool>>,
     ack_policy_atomic: Arc<AtomicU8>,
+    halt_state: Arc<melin_transport_core::halt_state::HaltState>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
     promotion: Option<u64>,
     raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
@@ -2943,8 +2972,10 @@ where
     // Client writes a halted node refuses at ingress, poll thread →
     // response stage, counted for the health endpoint. See `crate::halt`.
     let refused_writes = Arc::new(AtomicU64::new(0));
+    attach_halt_state(&halt_state, replicas_connected.as_ref())?;
     let halt_gate = crate::halt::HaltGate::new(
         replicas_connected.clone(),
+        Arc::clone(&halt_state),
         Arc::clone(&fence_state),
         Arc::clone(&refused_writes),
     );
@@ -3160,6 +3191,7 @@ where
             heartbeat_secs,
             Arc::clone(&fence_state),
             Arc::clone(&ack_policy_atomic),
+            Arc::clone(&halt_state),
             Arc::clone(&authorized_keys),
         )?;
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
@@ -3227,6 +3259,7 @@ where
         input_cursor,
         &pipeline_healthy,
         &replicas_connected,
+        &halt_state,
         &fence_state,
         &replication_metrics,
         &replica_active,
@@ -3846,6 +3879,19 @@ where
     Ok(Some(handle))
 }
 
+/// Attach the pipeline's replica count to the halt override, on a node
+/// that now serves as a replicated primary. A standalone node (no count)
+/// never halts for want of a replica, and attaches nothing.
+fn attach_halt_state(
+    halt_state: &melin_transport_core::halt_state::HaltState,
+    replicas_connected: Option<&Arc<std::sync::atomic::AtomicU32>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(count) = replicas_connected {
+        halt_state.attach(Arc::clone(count))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_health_endpoint(
     config: &ServerConfig,
@@ -3856,6 +3902,7 @@ fn spawn_health_endpoint(
     input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
     pipeline_healthy: &Arc<AtomicBool>,
     replicas_connected: &Option<Arc<std::sync::atomic::AtomicU32>>,
+    halt_state: &Arc<melin_transport_core::halt_state::HaltState>,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
     replication_metrics: &Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: &Option<[Arc<AtomicBool>; 2]>,
@@ -3896,6 +3943,7 @@ fn spawn_health_endpoint(
             pipeline_healthy: Arc::clone(pipeline_healthy),
             replicas_connected: replicas_connected.clone(),
             fence_state: Some(Arc::clone(fence_state)),
+            halt_state: Some(Arc::clone(halt_state)),
             replication_metrics: replication_metrics.clone(),
             replica_active: replica_active.clone(),
             replication_ring_producer_cursors: repl_ring_producers,

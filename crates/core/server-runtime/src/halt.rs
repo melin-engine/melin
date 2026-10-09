@@ -1,12 +1,23 @@
 //! Refusing client writes while a node cannot honour durability.
 //!
 //! A node halts when replication is configured and no replica is
-//! connected: it can no longer promise what the ack policy promises, so it
-//! takes no new writes. Each is answered with the application's rejection
-//! for [`RejectReason::ReplicaDisconnected`]; queries still run. A node a
+//! connected, under every ack policy, and takes no new writes. Each is
+//! answered with the application's rejection for
+//! [`RejectReason::ReplicaDisconnected`]; queries still run. A node a
 //! newer primary has fenced is stopping and answers nothing: a connection
 //! that sends anything while it winds down is closed, and the client
 //! reconnects to the new primary.
+//!
+//! The halt does two jobs. Under a policy that needs a replica, the node
+//! can no longer promise what the policy promises. Under `disk`, which the
+//! primary's own fsync satisfies, it is what stops a primary a partition
+//! has cut off from its replicas: fencing reaches such a node only once
+//! the partition heals, and without the halt it would keep acking a
+//! history the other side may be abandoning. So the policy value alone
+//! never lifts the halt. An operator's explicit `ACK-POLICY disk`, sent
+//! while the node has no replica, does: it latches an override
+//! ([`HaltState`]) that holds until a replica streams again or the
+//! policy goes back to one that needs a replica.
 //!
 //! # Refused at ingress
 //!
@@ -66,6 +77,7 @@ use melin_pipeline::padding::Sequence;
 use melin_pipeline::spsc;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::fence::FenceState;
+use melin_transport_core::halt_state::HaltState;
 
 /// Refusals the response stage can hold before a reader has to shed load.
 ///
@@ -94,6 +106,10 @@ pub struct HaltGate {
     /// senders. `None` in standalone mode, which never halts for want of
     /// a replica.
     replicas_connected: Option<Arc<AtomicU32>>,
+    /// The operator's override: latched by an explicit `ACK-POLICY disk`
+    /// sent while no replica is connected. See
+    /// [`melin_transport_core::halt_state`].
+    halt_state: Arc<HaltState>,
     /// Latched once a newer primary is observed.
     fence_state: Arc<FenceState>,
     /// Writes refused so far; shared with the health endpoint.
@@ -101,16 +117,19 @@ pub struct HaltGate {
 }
 
 impl HaltGate {
-    /// A gate over the node's replica count (`None` in standalone mode)
-    /// and its fence latch — the same two the health endpoint folds into
-    /// its status word — that counts what it refuses into `refused`.
+    /// A gate over the node's replica count (`None` in standalone mode),
+    /// the operator's halt override and its fence latch — the same three
+    /// the health endpoint folds into its status word — that counts what
+    /// it refuses into `refused`.
     pub fn new(
         replicas_connected: Option<Arc<AtomicU32>>,
+        halt_state: Arc<HaltState>,
         fence_state: Arc<FenceState>,
         refused: Arc<AtomicU64>,
     ) -> Self {
         Self {
             replicas_connected,
+            halt_state,
             fence_state,
             refused,
         }
@@ -127,18 +146,16 @@ impl HaltGate {
     /// The verdict on a client write arriving now. Fencing wins: a
     /// superseded node is shutting down whatever its replica count.
     ///
-    /// Two relaxed loads. Relaxed is enough: a halt that starts between the
-    /// check and the publish is the case a write published just before the
-    /// halt already covers — see the module docs.
+    /// Two relaxed loads while a replica is connected, a third (the
+    /// override) only when none is. Relaxed is enough: a halt that starts
+    /// or lifts between the check and the publish is the case a write
+    /// published just before the halt already covers — see the module
+    /// docs.
     #[inline]
     pub fn verdict(&self) -> Verdict {
         if self.fence_state.is_fenced() {
             Verdict::Close
-        } else if self
-            .replicas_connected
-            .as_ref()
-            .is_some_and(|count| count.load(Ordering::Relaxed) == 0)
-        {
+        } else if self.halt_state.halted(self.replicas_connected.as_deref()) {
             Verdict::Refuse(RejectReason::ReplicaDisconnected)
         } else {
             Verdict::Take
@@ -302,7 +319,93 @@ mod tests {
     }
 
     fn gate(replicas_connected: Option<Arc<AtomicU32>>, fence: Arc<FenceState>) -> HaltGate {
-        HaltGate::new(replicas_connected, fence, Arc::new(AtomicU64::new(0)))
+        HaltGate::new(
+            replicas_connected,
+            Arc::new(HaltState::new()),
+            fence,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    /// A gate over a replicated primary's count, with the override the
+    /// admin handler and the senders share.
+    fn gate_with_override(count: &Arc<AtomicU32>) -> (HaltGate, Arc<HaltState>) {
+        let halt_state = Arc::new(HaltState::new());
+        halt_state.attach(Arc::clone(count)).expect("first attach");
+        let gate = HaltGate::new(
+            Some(Arc::clone(count)),
+            Arc::clone(&halt_state),
+            Arc::new(FenceState::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        (gate, halt_state)
+    }
+
+    const REFUSED: Verdict = Verdict::Refuse(RejectReason::ReplicaDisconnected);
+
+    /// Under any policy, `disk` included, the node halts on losing its
+    /// last replica; the policy value alone never lifts it. (The gate
+    /// does not read the policy: only the operator's swap reaches it.)
+    #[test]
+    fn an_explicit_swap_to_disk_with_no_replica_lifts_the_halt() {
+        let count = Arc::new(AtomicU32::new(1));
+        let (gate, over) = gate_with_override(&count);
+        assert_eq!(gate.verdict(), Verdict::Take);
+        count.store(0, Ordering::Relaxed);
+        assert_eq!(gate.verdict(), REFUSED, "losing the replica halts");
+
+        over.on_policy_swap(true);
+        assert_eq!(gate.verdict(), Verdict::Take, "the swap lifts the halt");
+    }
+
+    #[test]
+    fn a_streaming_replica_clears_the_override_so_its_departure_halts_again() {
+        let count = Arc::new(AtomicU32::new(0));
+        let (gate, over) = gate_with_override(&count);
+        over.on_policy_swap(true);
+        assert_eq!(gate.verdict(), Verdict::Take);
+
+        count.store(1, Ordering::SeqCst);
+        over.on_replica_streaming();
+        assert_eq!(gate.verdict(), Verdict::Take);
+        count.store(0, Ordering::Relaxed);
+        assert_eq!(gate.verdict(), REFUSED);
+    }
+
+    #[test]
+    fn a_swap_back_to_a_replica_backed_policy_halts_again() {
+        let count = Arc::new(AtomicU32::new(0));
+        let (gate, over) = gate_with_override(&count);
+        over.on_policy_swap(true);
+        assert_eq!(gate.verdict(), Verdict::Take);
+        over.on_policy_swap(false);
+        assert_eq!(gate.verdict(), REFUSED);
+    }
+
+    #[test]
+    fn a_swap_to_disk_with_a_replica_connected_does_not_stop_the_halt() {
+        let count = Arc::new(AtomicU32::new(1));
+        let (gate, over) = gate_with_override(&count);
+        over.on_policy_swap(true);
+        count.store(0, Ordering::Relaxed);
+        assert_eq!(gate.verdict(), REFUSED);
+    }
+
+    #[test]
+    fn fencing_wins_over_the_override() {
+        let count = Arc::new(AtomicU32::new(0));
+        let halt_state = Arc::new(HaltState::new());
+        halt_state.attach(Arc::clone(&count)).expect("first attach");
+        let fence = Arc::new(FenceState::new(1));
+        let gate = HaltGate::new(
+            Some(count),
+            Arc::clone(&halt_state),
+            Arc::clone(&fence),
+            Arc::new(AtomicU64::new(0)),
+        );
+        halt_state.on_policy_swap(true);
+        fence.fence();
+        assert_eq!(gate.verdict(), Verdict::Close);
     }
 
     #[test]
@@ -338,7 +441,12 @@ mod tests {
     #[test]
     fn refusals_are_counted() {
         let refused = Arc::new(AtomicU64::new(0));
-        let gate = HaltGate::new(None, Arc::new(FenceState::new(0)), Arc::clone(&refused));
+        let gate = HaltGate::new(
+            None,
+            Arc::new(HaltState::new()),
+            Arc::new(FenceState::new(0)),
+            Arc::clone(&refused),
+        );
         gate.record_refused(3);
         gate.record_refused(2);
         assert_eq!(refused.load(Ordering::Relaxed), 5);

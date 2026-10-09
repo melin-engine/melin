@@ -570,7 +570,7 @@ impl DpdkReplicaSlot {
         transport: &mut melin_dpdk::DpdkTransport,
         cursors: &ReplicaCursors,
         metrics: &ReplicationMetrics,
-        replicas_connected: &AtomicU32,
+        replica_gate: &ReplicaGate<'_>,
     ) {
         if let SlotState::Authenticating(h)
         | SlotState::Handshaking(h)
@@ -587,7 +587,7 @@ impl DpdkReplicaSlot {
             self.active_flag.store(false, Ordering::Release);
             metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
             if was_authenticated {
-                ReplicaGate::new(replicas_connected).lower();
+                replica_gate.lower();
             }
         }
         self.state = SlotState::Idle;
@@ -635,6 +635,9 @@ pub struct DpdkReplicationDriver<A: Application> {
     /// The active ack policy — stamped on `StreamStart` and
     /// `Heartbeat` (see the kernel-TCP `Sender::ack_policy`).
     ack_policy: Arc<std::sync::atomic::AtomicU8>,
+    /// The operator's halt override, cleared when a replica starts
+    /// streaming (see `ReplicaGate::streaming`).
+    halt_state: Arc<melin_transport_core::halt_state::HaltState>,
     /// Operator key table. `Arc` because it's shared, read-only, with the
     /// client-auth path and the kernel-TCP sender; the driver only ever
     /// `lookup`s during a replica's challenge/response. Held by the driver
@@ -664,6 +667,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         heartbeat_secs: u64,
         fence_state: Arc<melin_transport_core::fence::FenceState>,
         ack_policy: Arc<std::sync::atomic::AtomicU8>,
+        halt_state: Arc<melin_transport_core::halt_state::HaltState>,
         authorized_keys: Arc<AuthorizedKeys>,
     ) -> Result<Self, String> {
         let [consumer_0, consumer_1] = repl_consumers;
@@ -749,6 +753,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             heartbeat_interval: std::time::Duration::from_secs(heartbeat_secs),
             fence_state,
             ack_policy,
+            halt_state,
             authorized_keys,
             _app: PhantomData,
         })
@@ -829,7 +834,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let slots = &mut self.slots;
         let cursors = &self.cursors;
         let replica_ready = &self.replica_ready;
-        let replicas_connected = &self.replicas_connected;
+        // The senders' one view of the halt: the replica count and the
+        // halt's shared state, moved together.
+        let replica_gate = &ReplicaGate::new(&self.replicas_connected, &self.halt_state);
         let metrics = &self.metrics;
         let fence_state = &self.fence_state;
         let ack_policy = &self.ack_policy;
@@ -856,7 +863,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             // teardown is the shared `go_idle`.
             slot.consumer.skip_to_producer();
             slot.evict_flag.store(false, Ordering::Release);
-            slot.go_idle(i, transport, cursors, metrics, replicas_connected);
+            slot.go_idle(i, transport, cursors, metrics, replica_gate);
         }
 
         let mut any_active = false;
@@ -901,11 +908,11 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             // Proven a Replication key — only now does this
                             // connection lift the halt gate (lowered by
                             // `go_idle` on teardown).
-                            ReplicaGate::new(replicas_connected).lift();
+                            replica_gate.lift();
                             slot.state = SlotState::Handshaking(handle);
                         }
                         AuthOutcome::Rejected => {
-                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected)
+                            slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate)
                         }
                     }
                     continue;
@@ -921,7 +928,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot = slot_idx,
                             "replica disconnected during handshake (DPDK)"
                         );
-                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
+                        slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                         continue;
                     }
 
@@ -944,13 +951,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     slot = slot_idx,
                                     "handshake validation worker died — disconnecting"
                                 );
-                                slot.go_idle(
-                                    slot_idx,
-                                    transport,
-                                    cursors,
-                                    metrics,
-                                    replicas_connected,
-                                );
+                                slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                                 continue;
                             }
                             Ok(res) => res,
@@ -979,13 +980,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             }
                             Err(e) => {
                                 warn!(slot = slot_idx, error = %e, "handshake validation failed — disconnecting");
-                                slot.go_idle(
-                                    slot_idx,
-                                    transport,
-                                    cursors,
-                                    metrics,
-                                    replicas_connected,
-                                );
+                                slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                                 continue;
                             }
                         };
@@ -1018,13 +1013,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 // `error!`: the worker only disappears by
                                 // panicking, a bug in us.
                                 error!(slot = slot_idx, error = %e, "cannot start the replica's join — disconnecting");
-                                slot.go_idle(
-                                    slot_idx,
-                                    transport,
-                                    cursors,
-                                    metrics,
-                                    replicas_connected,
-                                );
+                                slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                             }
                         }
                         continue;
@@ -1070,7 +1059,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                             transport,
                                             cursors,
                                             metrics,
-                                            replicas_connected,
+                                            replica_gate,
                                         );
                                         continue;
                                     }
@@ -1113,7 +1102,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                                 transport,
                                                 cursors,
                                                 metrics,
-                                                replicas_connected,
+                                                replica_gate,
                                             );
                                         }
                                     }
@@ -1128,7 +1117,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         transport,
                                         cursors,
                                         metrics,
-                                        replicas_connected,
+                                        replica_gate,
                                     );
                                 }
                                 Err(e) => {
@@ -1138,14 +1127,14 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         transport,
                                         cursors,
                                         metrics,
-                                        replicas_connected,
+                                        replica_gate,
                                     );
                                 }
                             }
                         }
                         FrameResult::Oversized => {
                             warn!(slot = slot_idx, "oversized handshake frame — disconnecting");
-                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
+                            slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                         }
                         FrameResult::Incomplete => {} // Wait for more data.
                     }
@@ -1160,7 +1149,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot = slot_idx,
                             "replica disconnected during catch-up (DPDK)"
                         );
-                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
+                        slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                         continue;
                     }
 
@@ -1181,7 +1170,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 slot = slot_idx,
                                 "malformed (zero-length or oversized) frame from replica during catch-up — disconnecting"
                             );
-                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
+                            slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                             continue;
                         }
                         // The replica is past whatever it does before
@@ -1279,13 +1268,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     stalled_ms = stalled.as_millis() as u64,
                                     "replica stopped reading its catch-up or handoff — disconnecting"
                                 );
-                                slot.go_idle(
-                                    slot_idx,
-                                    transport,
-                                    cursors,
-                                    metrics,
-                                    replicas_connected,
-                                );
+                                slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                             }
                         }
                         JoinTick::CaughtUp(catchup_end) => {
@@ -1313,11 +1296,14 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot.join = None;
                             slot.last_send = now;
                             replica_ready.store(true, Ordering::Release);
+                            // Streaming: an operator's override of the
+                            // halt no longer applies.
+                            replica_gate.streaming();
                             metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
                             slot.state = SlotState::Streaming(handle);
                         }
                         JoinTick::Failed => {
-                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
+                            slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                         }
                     }
                 }
@@ -1376,7 +1362,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         );
                     }
                     if ack_error {
-                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
+                        slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                         continue;
                     }
 
@@ -1459,7 +1445,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot = slot_idx,
                             "TX overflow on replica socket — disconnecting"
                         );
-                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
+                        slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                         continue;
                     }
                     if !slot.send_buf.is_empty() {
@@ -1490,7 +1476,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     //    deadline — a replica that stopped answering.
                     if !transport.is_connected(handle) {
                         warn!(slot = slot_idx, "replica disconnected (DPDK)");
-                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
+                        slot.go_idle(slot_idx, transport, cursors, metrics, replica_gate);
                         continue;
                     }
 

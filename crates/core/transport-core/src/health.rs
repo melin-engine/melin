@@ -69,6 +69,12 @@ pub struct HealthState {
     /// it has already stopped acking, and load balancers must not keep
     /// routing to it. `None` in tests/binaries without fencing wired.
     pub fence_state: Option<Arc<crate::fence::FenceState>>,
+    /// The replica-loss halt's shared state, for the operator's override
+    /// (see [`crate::halt_state`]). Folded into the `trading` flag so a node
+    /// whose halt an explicit `ACK-POLICY disk` lifted reports `trading`,
+    /// as its readers take writes. `None` where nothing can lift the halt
+    /// (a replica, tests).
+    pub halt_state: Option<Arc<crate::halt_state::HaltState>>,
     /// Per-replica replication metrics. None in standalone mode.
     pub replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     /// Per-slot engaged flags from the replication sender (`Release`-flipped
@@ -139,6 +145,9 @@ impl HealthState {
             // `halted` — a replica is not accepting client writes.
             replicas_connected: Some(Arc::new(AtomicU32::new(0))),
             fence_state: Some(fence_state),
+            // A replica is halted whatever an operator swapped its policy
+            // to: the override applies once it serves as a primary.
+            halt_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -377,16 +386,21 @@ impl HealthSnapshot {
 
         // Trading state: "trading" when standalone or at least one replica
         // connected, "halted" when replication is enabled but all replicas
-        // are disconnected — or when the node has been fenced (superseded
-        // by a higher-epoch primary). Mirrors the readers' halt gate
-        // (`HaltGate` in the server runtime) so probes agree with what the
-        // node enforces.
+        // are disconnected (unless an operator's swap to `disk` lifted the
+        // halt) — or when the node has been fenced (superseded by a
+        // higher-epoch primary). Mirrors the readers' halt gate (`HaltGate`
+        // in the server runtime) so probes agree with what the node
+        // enforces.
         let fenced = state.fence_state.as_ref().is_some_and(|f| f.is_fenced());
-        let trading = !fenced
-            && state
-                .replicas_connected
-                .as_ref()
-                .is_none_or(|count| count.load(Ordering::Relaxed) > 0);
+        let no_replica = state
+            .replicas_connected
+            .as_ref()
+            .is_some_and(|count| count.load(Ordering::Relaxed) == 0);
+        let lifted = state
+            .halt_state
+            .as_ref()
+            .is_some_and(|halt| halt.is_lifted());
+        let trading = !fenced && (!no_replica || lifted);
 
         // Per-replica metrics from the replication sender (if enabled).
         let replicas_connected_val = state
@@ -1242,19 +1256,20 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
-        start_health_with_replica(active, journal_seq, repl_acked, None, None)
+        start_health_with_replica(active, journal_seq, repl_acked, None, None, None)
     }
 
-    /// Like `start_health` but with explicit `replicas_connected` and
-    /// `fence_state` wiring. `repl_acked` is the slowest engaged replica's
-    /// acked wire seq, or `u64::MAX` for "no replica engaged" — see
-    /// [`test_cursors`].
+    /// Like `start_health` but with explicit `replicas_connected`,
+    /// `fence_state` and `halt_state` wiring. `repl_acked` is the
+    /// slowest engaged replica's acked wire seq, or `u64::MAX` for "no
+    /// replica engaged" — see [`test_cursors`].
     fn start_health_with_replica(
         active: u64,
         journal_seq: u64,
         repl_acked: u64,
         replicas_connected: Option<Arc<AtomicU32>>,
         fence_state: Option<Arc<crate::fence::FenceState>>,
+        halt_state: Option<Arc<crate::halt_state::HaltState>>,
     ) -> (
         SocketAddr,
         Arc<AtomicU64>,
@@ -1286,6 +1301,7 @@ mod tests {
             pipeline_healthy: Arc::clone(&healthy),
             replicas_connected,
             fence_state,
+            halt_state,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -1413,6 +1429,7 @@ mod tests {
                 pipeline_healthy: Arc::clone(&healthy),
                 replicas_connected: None,
                 fence_state: None,
+                halt_state: None,
                 replication_metrics: None,
                 replica_active: None,
                 replication_ring_producer_cursors: None,
@@ -1449,6 +1466,7 @@ mod tests {
                 pipeline_healthy: Arc::new(AtomicBool::new(true)),
                 replicas_connected: None,
                 fence_state: None,
+                halt_state: None,
                 replication_metrics: None,
                 replica_active: None,
                 replication_ring_producer_cursors: None,
@@ -1510,8 +1528,14 @@ mod tests {
     #[test]
     fn health_shows_halted_when_replica_disconnected() {
         let replica_count = Arc::new(AtomicU32::new(0)); // no replicas connected
-        let (addr, _events, _healthy, shutdown, handle) =
-            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&replica_count)), None);
+        let (addr, _events, _healthy, shutdown, handle) = start_health_with_replica(
+            5,
+            100,
+            u64::MAX,
+            Some(Arc::clone(&replica_count)),
+            None,
+            None,
+        );
 
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 halted\n");
@@ -1520,6 +1544,36 @@ mod tests {
         replica_count.store(1, Ordering::Relaxed);
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 trading\n");
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    /// An operator's `ACK-POLICY disk` on a node with no replica lifts the
+    /// halt; the probe must agree with the readers, which take writes.
+    #[test]
+    fn health_shows_trading_when_the_operator_lifted_the_halt() {
+        use crate::halt_state::{HaltState, SwapEffect};
+
+        let replica_count = Arc::new(AtomicU32::new(0));
+        let halt_state = Arc::new(HaltState::new());
+        halt_state
+            .attach(Arc::clone(&replica_count))
+            .expect("first attach");
+        let (addr, _events, _healthy, shutdown, handle) = start_health_with_replica(
+            5,
+            100,
+            u64::MAX,
+            Some(Arc::clone(&replica_count)),
+            None,
+            Some(Arc::clone(&halt_state)),
+        );
+
+        assert_eq!(read_health(addr), "OK 5 100 0 halted\n");
+        assert_eq!(halt_state.on_policy_swap(true), SwapEffect::Lifted);
+        assert_eq!(read_health(addr), "OK 5 100 0 trading\n");
+        halt_state.on_policy_swap(false);
+        assert_eq!(read_health(addr), "OK 5 100 0 halted\n");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -1539,6 +1593,7 @@ mod tests {
             u64::MAX,
             Some(Arc::clone(&replica_count)),
             Some(Arc::clone(&fence)),
+            None,
         );
 
         let buf = read_health(addr);
@@ -1611,6 +1666,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             fence_state: None,
+            halt_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -1646,7 +1702,7 @@ mod tests {
         // Verify that unhealthy + halted → 0 values.
         let replica_count = Arc::new(AtomicU32::new(0)); // disconnected → halted
         let (addr, _events, healthy, shutdown, handle) =
-            start_health_with_replica(0, 0, u64::MAX, Some(Arc::clone(&replica_count)), None);
+            start_health_with_replica(0, 0, u64::MAX, Some(Arc::clone(&replica_count)), None, None);
 
         healthy.store(false, Ordering::Relaxed);
 
@@ -1678,6 +1734,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             fence_state: None,
+            halt_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -1764,6 +1821,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             fence_state: None,
+            halt_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -1832,6 +1890,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             fence_state: None,
+            halt_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -1911,6 +1970,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             fence_state: None,
+            halt_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: Some([prod_0, prod_1]),
@@ -1964,6 +2024,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             fence_state: None,
+            halt_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -2218,6 +2279,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: Some(Arc::new(AtomicU32::new(2))),
             fence_state: None,
+            halt_state: None,
             replication_metrics: Some(metrics),
             replica_active: Some([
                 Arc::new(AtomicBool::new(true)),
@@ -2302,6 +2364,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: Some(Arc::new(AtomicU32::new(1))),
             fence_state: None,
+            halt_state: None,
             replication_metrics: Some(metrics),
             replica_active: Some([
                 Arc::new(AtomicBool::new(true)),
@@ -2382,6 +2445,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: Some(Arc::new(AtomicU32::new(2))),
             fence_state: None,
+            halt_state: None,
             replication_metrics: Some(Arc::clone(&metrics)),
             replica_active: Some([Arc::clone(&active[0]), Arc::clone(&active[1])]),
             replication_ring_producer_cursors: None,
@@ -2547,6 +2611,7 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             fence_state: None,
+            halt_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,

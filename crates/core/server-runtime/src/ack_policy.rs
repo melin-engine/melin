@@ -106,6 +106,16 @@ impl AckPolicy {
         Policy::new(clauses).expect("AckPolicy::to_policy: hand-constructed clauses must validate")
     }
 
+    /// Whether the policy needs a second node: every policy but `disk`,
+    /// which the primary's own fsync satisfies. Exhaustive rather than
+    /// derived from the clauses, so a new policy has to say.
+    pub fn needs_replica(self) -> bool {
+        match self {
+            AckPolicy::Disk => false,
+            AckPolicy::Ram | AckPolicy::DiskAndRam | AckPolicy::TwoDisks => true,
+        }
+    }
+
     /// CLI / log-friendly name. Matches the `clap::ValueEnum` spelling.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -223,6 +233,16 @@ mod tests {
         // this to detect a corrupted atomic and retain the prior policy.
         for b in [4, 5, 255] {
             assert_eq!(AckPolicy::from_u8(b), None);
+        }
+    }
+
+    /// `needs_replica` says what the clauses say: a policy needs a second
+    /// node exactly when one of its clauses counts two copies.
+    #[test]
+    fn needs_replica_agrees_with_the_clauses() {
+        for p in ALL {
+            let wants_two = p.to_policy().clauses().iter().any(|c| c.count >= 2);
+            assert_eq!(p.needs_replica(), wants_two, "{p}");
         }
     }
 

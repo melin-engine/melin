@@ -21,7 +21,10 @@
 //!   Available only when the spawn caller wired the shared policy
 //!   atomic. `DURABILITY <local|replicated|hybrid|durably-replicated>`
 //!   is accepted as a deprecated alias for one release and logged at
-//!   `warn!`.
+//!   `warn!`. A swap to `disk` on a primary with no replica connected
+//!   also lifts the replica-loss halt, until a replica streams again or
+//!   the policy goes back to one that needs a replica (see
+//!   [`melin_transport_core::halt_state`]).
 //!
 //! A command for which the corresponding flag is `None` is rejected
 //! with `ERR <command> not available on this node\n` so operators get
@@ -47,8 +50,22 @@ use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info, warn};
 
 use melin_app::auth::AuthorizedKeys;
+use melin_transport_core::halt_state::{HaltState, SwapEffect};
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
+
+/// What the `ACK-POLICY` command acts on: the policy byte the response
+/// stage and the replication senders read, and the halt state whose
+/// override an explicit swap to `disk` latches. Travel together because a
+/// swap must update both.
+#[derive(Clone)]
+pub struct AckPolicyControl {
+    /// The active ack policy, as [`AckPolicy::as_u8`].
+    pub policy: Arc<AtomicU8>,
+    /// The replica-loss halt's shared state, which holds the operator's
+    /// override.
+    pub halt_state: Arc<HaltState>,
+}
 
 /// Spawn the admin listener on a dedicated thread.
 ///
@@ -69,7 +86,7 @@ pub fn spawn(
     bind_addr: SocketAddr,
     promote: Option<PromotionRequest>,
     rotate_requested: Option<Arc<AtomicBool>>,
-    ack_policy: Option<Arc<AtomicU8>>,
+    ack_policy: Option<AckPolicyControl>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
 ) -> Result<(JoinHandle<()>, SocketAddr), Box<dyn std::error::Error>> {
@@ -90,7 +107,7 @@ pub fn spawn(
                     addr,
                     promote.as_ref(),
                     rotate_requested.as_deref(),
-                    ack_policy.as_deref(),
+                    ack_policy.as_ref(),
                     &shutdown,
                     &authorized_keys,
                 )
@@ -121,7 +138,7 @@ fn run(
     addr: SocketAddr,
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
-    ack_policy: Option<&AtomicU8>,
+    ack_policy: Option<&AckPolicyControl>,
     shutdown: &AtomicBool,
     authorized_keys: &AuthorizedKeys,
 ) {
@@ -271,7 +288,7 @@ fn handle_connection(
     mut stream: TcpStream,
     promote: Option<&PromotionRequest>,
     rotate_requested: Option<&AtomicBool>,
-    ack_policy: Option<&AtomicU8>,
+    ack_policy: Option<&AckPolicyControl>,
     authorized_keys: &AuthorizedKeys,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -370,12 +387,14 @@ fn handle_connection(
 
 /// Apply an `ACK-POLICY <policy>` command. Validates the argument,
 /// publishes the new policy through the shared atomic if the node has
-/// a response stage wired, and emits an INFO log carrying the prev →
-/// next transition for the audit trail. Auth is enforced upstream in
-/// [`authenticate`], so reaching this point already implies an
+/// a response stage wired, records the swap on the halt override (a swap
+/// to `disk` with no replica connected lifts the halt; a swap to a policy
+/// that needs a replica restores it), and emits an INFO log carrying the
+/// prev → next transition for the audit trail. Auth is enforced upstream
+/// in [`authenticate`], so reaching this point already implies an
 /// operator-signed request.
-fn handle_ack_policy(stream: &mut TcpStream, ack_policy: Option<&AtomicU8>, arg: &str) {
-    let Some(atomic) = ack_policy else {
+fn handle_ack_policy(stream: &mut TcpStream, ack_policy: Option<&AckPolicyControl>, arg: &str) {
+    let Some(control) = ack_policy else {
         send_best_effort(stream, b"ERR ACK-POLICY not available on this node\n");
         debug!("rejected ACK-POLICY — atomic not wired (replica node?)");
         return;
@@ -403,16 +422,34 @@ fn handle_ack_policy(stream: &mut TcpStream, ack_policy: Option<&AtomicU8>, arg:
     // (the response stage only reads), and only the current policy
     // matters — losing the ordering of prev observations relative to
     // unrelated events on other threads is fine.
-    let prev_byte = atomic.swap(next.as_u8(), Ordering::Relaxed);
+    let prev_byte = control.policy.swap(next.as_u8(), Ordering::Relaxed);
     let prev = AckPolicy::from_u8(prev_byte)
         .map(|p| p.as_str())
         .unwrap_or("<corrupted>");
+    // After the policy byte: a write the lifted halt lets in is answered
+    // under the new policy (the gate observes the byte on its next slot).
+    let effect = control.halt_state.on_policy_swap(!next.needs_replica());
     send_best_effort(stream, b"OK\n");
     info!(
         prev = prev,
         next = next.as_str(),
         "ack policy changed by operator"
     );
+    match effect {
+        SwapEffect::Lifted => info!(
+            "halt lifted by operator: no replica is connected and the ack policy is now disk, \
+             so client writes are taken on this node's disk alone until a replica streams \
+             again or the policy is swapped back"
+        ),
+        SwapEffect::ReplicaConnected => info!(
+            "halt not lifted: a replica is connected, so the node still halts if it leaves; \
+             send ACK-POLICY disk again once it has"
+        ),
+        SwapEffect::Cleared { was_lifted: true } => {
+            info!("halt override cleared by operator: the node halts while no replica is connected")
+        }
+        SwapEffect::NotServing | SwapEffect::Cleared { was_lifted: false } => {}
+    }
 }
 
 /// Format an "unknown policy" diagnostic into `buf` without allocating.
@@ -720,23 +757,103 @@ mod tests {
     /// it with `initial`, send the supplied command, and return
     /// `(response, policy_after)`.
     fn run_ack_policy(initial: AckPolicy, cmd: &[u8]) -> (String, Option<AckPolicy>) {
+        let control = AckPolicyControl {
+            policy: Arc::new(AtomicU8::new(initial.as_u8())),
+            halt_state: Arc::new(HaltState::new()),
+        };
+        let (resp, after) = run_ack_policy_on(&control, &[cmd]);
+        (resp.into_iter().last().expect("one reply"), after)
+    }
+
+    /// Spawn an admin listener over `control`, send each of `cmds` on a
+    /// connection of its own, and return the replies and the policy after
+    /// the last.
+    fn run_ack_policy_on(
+        control: &AckPolicyControl,
+        cmds: &[&[u8]],
+    ) -> (Vec<String>, Option<AckPolicy>) {
         let (key, auth_keys) = operator_keys();
-        let policy = Arc::new(AtomicU8::new(initial.as_u8()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (_h, addr) = spawn(
             "127.0.0.1:0".parse().unwrap(),
             None,
             None,
-            Some(Arc::clone(&policy)),
+            Some(control.clone()),
             Arc::clone(&shutdown),
             auth_keys,
         )
         .expect("spawn admin listener");
 
-        let resp = send_command(addr, &key, cmd);
-        let after = AckPolicy::from_u8(policy.load(Ordering::Relaxed));
+        let resps = cmds
+            .iter()
+            .map(|cmd| send_command(addr, &key, cmd))
+            .collect();
+        let after = AckPolicy::from_u8(control.policy.load(Ordering::Relaxed));
         shutdown.store(true, Ordering::Release);
-        (resp, after)
+        (resps, after)
+    }
+
+    /// A primary's control: its replica count attached to the override.
+    fn primary_control(
+        initial: AckPolicy,
+        replicas: u32,
+    ) -> (AckPolicyControl, Arc<std::sync::atomic::AtomicU32>) {
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(replicas));
+        let halt_state = Arc::new(HaltState::new());
+        halt_state.attach(Arc::clone(&count)).expect("first attach");
+        let control = AckPolicyControl {
+            policy: Arc::new(AtomicU8::new(initial.as_u8())),
+            halt_state,
+        };
+        (control, count)
+    }
+
+    #[test]
+    fn a_swap_to_disk_on_a_primary_with_no_replica_lifts_the_halt() {
+        let (control, _count) = primary_control(AckPolicy::DiskAndRam, 0);
+        let (resps, after) = run_ack_policy_on(&control, &[b"ACK-POLICY disk\n"]);
+        assert_eq!(resps, ["OK"]);
+        assert_eq!(after, Some(AckPolicy::Disk));
+        assert!(control.halt_state.is_lifted());
+    }
+
+    #[test]
+    fn a_swap_to_disk_with_a_replica_connected_does_not_lift_the_halt() {
+        let (control, _count) = primary_control(AckPolicy::DiskAndRam, 1);
+        let (resps, _) = run_ack_policy_on(&control, &[b"ACK-POLICY disk\n"]);
+        assert_eq!(resps, ["OK"]);
+        assert!(!control.halt_state.is_lifted());
+    }
+
+    #[test]
+    fn a_swap_to_a_replica_backed_policy_restores_the_halt() {
+        let (control, _count) = primary_control(AckPolicy::Disk, 0);
+        let (_, after) = run_ack_policy_on(&control, &[b"ACK-POLICY disk\n", b"ACK-POLICY ram\n"]);
+        assert_eq!(after, Some(AckPolicy::Ram));
+        assert!(!control.halt_state.is_lifted());
+    }
+
+    /// A rejected command changes neither the policy nor the override.
+    #[test]
+    fn a_rejected_swap_leaves_the_override_alone() {
+        let (control, _count) = primary_control(AckPolicy::Disk, 0);
+        let (resps, _) = run_ack_policy_on(&control, &[b"ACK-POLICY disk\n", b"ACK-POLICY fast\n"]);
+        assert!(resps[1].starts_with("ERR"), "{resps:?}");
+        assert!(control.halt_state.is_lifted());
+    }
+
+    /// The pre-staged policy on a replica carries over a promotion, but
+    /// the consent to run alone is given once the node serves.
+    #[test]
+    fn a_swap_on_a_node_not_serving_latches_nothing() {
+        let control = AckPolicyControl {
+            policy: Arc::new(AtomicU8::new(AckPolicy::DiskAndRam.as_u8())),
+            halt_state: Arc::new(HaltState::new()),
+        };
+        let (resps, after) = run_ack_policy_on(&control, &[b"ACK-POLICY disk\n"]);
+        assert_eq!(resps, ["OK"]);
+        assert_eq!(after, Some(AckPolicy::Disk), "the policy is pre-staged");
+        assert!(!control.halt_state.is_lifted());
     }
 
     #[test]

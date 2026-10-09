@@ -81,6 +81,9 @@ pub struct Sender {
     /// `Heartbeat` so replicas judge auto-promotion against the policy
     /// this primary actually acks under.
     pub ack_policy: Arc<std::sync::atomic::AtomicU8>,
+    /// The operator's halt override, cleared when a replica starts
+    /// streaming (see `ReplicaGate::streaming`).
+    pub halt_state: Arc<melin_transport_core::halt_state::HaltState>,
 }
 
 /// Run the replication sender. Listens for replica connections,
@@ -109,6 +112,7 @@ pub fn run_sender<A: Application>(
         heartbeat_secs,
         fence_state,
         ack_policy,
+        halt_state,
     } = config;
     // Unwrap the invariant-carrying newtype — from here `listener` is a
     // plain TcpListener, known non-blocking.
@@ -209,7 +213,7 @@ pub fn run_sender<A: Application>(
             // `join()` ordered the handler's post-auth writes before here.
             // `lower` warns "halted" if this was the last replica.
             if authenticated_flags[slot_idx].swap(false, Ordering::AcqRel) {
-                ReplicaGate::new(replicas_connected).lower();
+                ReplicaGate::new(replicas_connected, &halt_state).lower();
             }
             // Disengage cursors BEFORE clearing the active flag — ordering
             // contract B2 (see `ReplicaCursors`).
@@ -310,6 +314,7 @@ pub fn run_sender<A: Application>(
                     let slot_evict = Arc::clone(&evict_flags[slot_idx]);
                     let slot_fence = Arc::clone(&fence_state);
                     let slot_ack_policy = Arc::clone(&ack_policy);
+                    let slot_halt_state = Arc::clone(&halt_state);
                     let slot_authenticated = Arc::clone(&authenticated_flags[slot_idx]);
                     let handler = handlers[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
@@ -366,6 +371,7 @@ pub fn run_sender<A: Application>(
                                 metrics: &slot_metrics,
                                 fence_state: &slot_fence,
                                 ack_policy: &slot_ack_policy,
+                                halt_state: &slot_halt_state,
                                 slot_idx,
                                 batch_size,
                                 heartbeat_secs,
@@ -429,6 +435,8 @@ struct SlotContext<'a> {
     /// The primary's active ack policy — stamped on `StreamStart` and
     /// `Heartbeat` (see `Sender::ack_policy`).
     ack_policy: &'a std::sync::atomic::AtomicU8,
+    /// The operator's halt override, cleared once this replica streams.
+    halt_state: &'a melin_transport_core::halt_state::HaltState,
     slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
@@ -471,6 +479,7 @@ fn handle_replica_connection<A: Application>(
         metrics,
         fence_state,
         ack_policy,
+        halt_state,
         slot_idx,
         batch_size: _,
         heartbeat_secs,
@@ -498,7 +507,7 @@ fn handle_replica_connection<A: Application>(
     // it on slot teardown, reading `authenticated` to know this connection
     // lifted it. Set the latch after the increment so a post-join read of the
     // latch implies the increment is visible too.
-    ReplicaGate::new(replicas_connected).lift();
+    ReplicaGate::new(replicas_connected, halt_state).lift();
     authenticated.store(true, Ordering::Release);
 
     // Read handshake.
@@ -695,6 +704,8 @@ fn handle_replica_connection<A: Application>(
     // then finds a replica streaming live rather than one still catching
     // up.
     replica_ready.store(true, Ordering::Release);
+    // Streaming: an operator's override of the halt no longer applies.
+    ReplicaGate::new(replicas_connected, halt_state).streaming();
 
     let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);
     let mut last_send = std::time::Instant::now();
@@ -834,6 +845,7 @@ fn live_stream_uring(
         active_flag: _,
         heartbeat_secs: _,
         fence_state: _,
+        halt_state: _,
         replicas_connected: _,
         authenticated: _,
     } = ctx;

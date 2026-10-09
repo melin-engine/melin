@@ -1675,6 +1675,7 @@ mod tests {
         }
         HaltGate::new(
             replicas.map(|count| Arc::new(std::sync::atomic::AtomicU32::new(count))),
+            Arc::new(melin_transport_core::halt_state::HaltState::new()),
             fence,
             refused,
         )

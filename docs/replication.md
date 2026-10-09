@@ -185,6 +185,24 @@ closed at once, and every connection is closed when the process exits.
 Clients see a reset, as they would on a crash, and reconnect to the new
 primary. No reject reason names this case.
 
+The halt applies under every ack policy, `disk` included, even though a
+`disk` primary's own fsync satisfies the policy. Under `disk` the halt
+is what stops a primary that a network partition has cut off from its
+replicas: such a primary hears of a promotion on the other side only
+once the partition heals, and without the halt it would keep
+acknowledging writes the cluster may be about to abandon.
+
+An operator who knows the node is alone can lift the halt by sending
+`ACK-POLICY disk` (see "Runtime policy swap") while no replica is
+connected. Client writes then resume on the primary's disk alone. The
+lift holds until a replica is streaming again, or until the policy is
+swapped back to one that needs a replica; after that, losing the last
+replica halts the node again. A swap to `disk` sent while a replica is
+still connected lifts nothing, so swapping ahead of maintenance does not
+stop the node from halting when the replica leaves: send the swap again
+once it has. While the halt is lifted the health endpoint reports
+`trading`, and the swap that lifted it is logged.
+
 Standalone deployments (no replication configured) skip this halt
 entirely and run under `disk`.
 
@@ -245,20 +263,25 @@ runbooks before it is removed.
 The intended workflow is failover:
 
 1. Primary dies, replica is promoted (`PROMOTE`).
-2. The promoted node is now standalone — under `disk+ram` its gate is
-   structurally unsatisfiable (no second node to hold the in-memory
-   copy) and replies would stall.
+2. The promoted node has no replica: it halts (new writes are refused),
+   and under `disk+ram` its gate is structurally unsatisfiable (no
+   second node to hold the in-memory copy), so replies would stall.
 3. Operator sends `ACK-POLICY disk` → the gate re-evaluates under
-   `disk` and replies resume in seconds, no restart, no dropped
-   client connections.
-4. New replicas are spun up and connect.
+   `disk`, replies resume, and, since no replica is connected, the halt
+   lifts and new writes are taken, in seconds, with no restart and no
+   dropped client connections.
+4. New replicas are spun up and connect. Once one is streaming, the
+   node halts again if it loses its last replica.
 5. Operator sends `ACK-POLICY disk+ram` → the gate is satisfied by the
    new cluster shape and service continues at the full contract.
 
 The replica's admin listener also accepts `ACK-POLICY` — operators can
 **pre-stage** the post-promotion policy by sending `ACK-POLICY disk`
 *before* `PROMOTE`; the value persists across the in-process
-transition.
+transition, so held replies are released under it as soon as the node
+is promoted. Lifting the halt takes the swap sent to the promoted node,
+once it is a primary with no replica: a pre-staged swap does not lift
+it.
 
 ## Replica configuration
 
@@ -354,8 +377,8 @@ kernel bypass kept. The same holds for an automatic failover (below).
 
 After promotion the new primary will halt new writes if it has no
 replicas connected (see above) — the operator's playbook is to either
-spin up new replicas immediately or send `ACK-POLICY disk` to resume
-writes under the single-copy policy.
+spin up new replicas immediately or send `ACK-POLICY disk` to the
+promoted node to resume writes under the single-copy policy.
 
 The old primary should still be stopped promptly, but epoch fencing
 (below) now closes the split-brain window if it isn't: the moment the
@@ -798,8 +821,9 @@ Most failures resolve without operator action:
   primary**: its journal may be short of events it already acked, and
   bringing it back in that role discards them (see "Failover is
   mandatory" above). Bring it back as a replica instead. Send
-  `ACK-POLICY disk` after promotion if the new primary is standalone;
-  restore the target policy once new replicas attach.
+  `ACK-POLICY disk` to the new primary after promotion if it has no
+  replica, which lifts its halt; restore the target policy once new
+  replicas attach.
 - **One replica crashes, primary and other replica alive** — the
   cluster continues under the configured policy. Under `disk+ram` the
   gate is satisfied by whichever node fsyncs first plus the surviving
@@ -879,7 +903,8 @@ normal-case post-recovery state.
 - The health endpoint's `trading`/`halted` flag (and the
   `melin_trading_active` gauge) reports `halted` on a fenced node even
   while replicas remain connected — point load-balancer probes and
-  failover alerting at it.
+  failover alerting at it. It reports `trading` on a node with no
+  replica whose halt an operator lifted with `ACK-POLICY disk`.
 - `melin_writes_refused_total` (Prometheus counter) — client writes
   turned away at ingress while the node was halted. A refused write is
   never journaled, so this is its only trace; `increase()` over a halt
@@ -908,7 +933,10 @@ normal-case post-recovery state.
   every 5 seconds while it persists; an info-level log fires on
   return to target.
 - Every admin `ACK-POLICY` swap emits an info-level audit log with
-  the `prev → next` transition.
+  the `prev → next` transition, and a second one when the swap lifts
+  the halt, restores it, or is sent with a replica connected and so
+  lifts nothing. A replica that starts streaming while the halt is
+  lifted logs that the lift is cleared.
 - On raft-enabled nodes, the `melin_raft_node_id` / `melin_raft_term` /
   `melin_raft_leader_id` / `melin_raft_role` / `melin_raft_is_leader` /
   `melin_raft_driver_running` gauges expose control-plane election
