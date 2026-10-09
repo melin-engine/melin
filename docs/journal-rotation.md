@@ -84,14 +84,14 @@ A snapshot records both the sequence of the last event it captured and the chain
 1. Load snapshot (restores state as of sequence N)
 2. Walk archived segments in order; skip events with `sequence <= N`, replay the rest
 3. Verify each segment's header anchor matches the previous tail
-4. Walk the live segment; truncate at the last valid entry on torn tails
+4. Walk the live segment; truncate after the last whole entry when the segment ends in a torn write
 5. Open the live segment for append
 
 **When:** Steady state on any restart.
 
 ### 2. Live segment missing, archives present (with or without snapshot)
 
-**Recovery flow:** Walk archives in monotonic order, replaying events past the snapshot's sequence (when present). After the last archive, synthesize a fresh live segment continuing from the last archive's tail — its header anchor is the previous segment's final chain hash so the chain stays continuous. The next event written gets `last_archived_seq + 1`.
+**Recovery flow:** Walk archives in monotonic order, replaying events past the snapshot's sequence (when present). With no live segment after it, nothing confirms where the last archive ends, so it gets the same check as every archive: its last entry must be whole and followed by nothing but zeros, or recovery refuses. After the last archive, synthesize a fresh live segment continuing from the last archive's tail — its header anchor is the previous segment's final chain hash so the chain stays continuous. The next event written gets `last_archived_seq + 1`.
 
 **When:** Crash between the live → archive rename and the new live file's creation. The just-archived segment captured every event acknowledged before the crash, so no committed event is lost. This used to require a recent snapshot to recover correctly; multi-segment recovery removed that requirement — operators no longer need to time their snapshots to the rotation cadence.
 
@@ -117,7 +117,7 @@ The snapshot is written atomically: data goes to `melin.snapshot.tmp`, is synced
 
 ### 6. Crash during normal operation
 
-The live segment may have a partially written final entry (torn write). The reader validates each entry's CRC32C checksum and treats a truncated or corrupt final entry as end-of-data; the writer truncates to the last valid entry on `open_append`. At most the in-flight event is lost — and since the response stage waits for journal durability before acknowledging to the client, the client never received confirmation for that event.
+The live segment may end in a partly written final write (torn write): a prefix of it, or any mix of its sectors after a power loss, followed by pre-allocated zeros. Recovery stops at the first entry that is not whole and discards the rest when it fits within what one unsynced write can cover, logging a warning; the writer truncates after the last whole entry on `open_append`. Only the events of that write are lost — and since the response stage waits for journal durability before acknowledging to the client, no client received confirmation for them. Anything recovery cannot explain as a torn write stops the node instead; see [Crash Recovery](journal.md#crash-recovery).
 
 ### 7. Crash mid-rotation
 

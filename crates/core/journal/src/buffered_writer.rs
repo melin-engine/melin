@@ -186,6 +186,13 @@ impl<E: AppEvent> BufferedWriter<E> {
     ///
     /// Issues exactly one `pwrite` covering the whole batch, followed by
     /// `fdatasync`. Returns only when the kernel reports data is durable.
+    ///
+    /// A crash before the sync can tear the batch, and recovery accepts a
+    /// torn tail only within [`MAX_UNSYNCED_BYTES`](crate::write_ring::MAX_UNSYNCED_BYTES),
+    /// so a batch must not outgrow it. Every caller flushes far sooner (at
+    /// most one pipeline batch, itself bounded by one write-ring chunk);
+    /// one that did not would cost availability, not data: a longer torn
+    /// tail is refused at recovery rather than discarded.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
         // Paced retry of a failed post-rotation dir fsync — a single
         // branch in steady state.
@@ -193,6 +200,11 @@ impl<E: AppEvent> BufferedWriter<E> {
         if self.encoder.batch_len() == 0 {
             return Ok(());
         }
+        debug_assert!(
+            self.encoder.batch_len() as u64 <= crate::write_ring::MAX_UNSYNCED_BYTES,
+            "a batch of {} bytes exceeds the journal's unsynced bound",
+            self.encoder.batch_len()
+        );
         self.segment
             .write_batch(self.encoder.pending_batch_bytes(&self.batch_buf))?;
         self.segment.sync()?;

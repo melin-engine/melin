@@ -274,6 +274,10 @@ pub trait AppEvent: Copy {
     /// time against each event's actual `encoded_size`: an event that
     /// exceeds what was declared stops the node rather than be journaled.
     ///
+    /// Recovery holds journaled entries to it too: an entry wider than
+    /// this bound is corruption. Never lower it below the width of events
+    /// already in a journal the new version will replay.
+    ///
     /// The compile-time check fires when the journal is instantiated for
     /// this type, so it surfaces on `cargo build` and `cargo test`, not on
     /// `cargo check` — a check-only CI or rust-analyzer will stay green

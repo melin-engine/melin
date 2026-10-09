@@ -44,7 +44,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use melin_journal::segment;
-use melin_journal::{JournalError, JournalEvent, JournalReader};
+use melin_journal::{JournalError, JournalEvent, JournalReader, SegmentKind};
 use notary_server::receipt::{Receipt, hex, unhex};
 use notary_server::{GENESIS_HEAD, HEAD_LEN, NotaryEvent, fold};
 
@@ -107,11 +107,11 @@ fn run(cli: Cli) -> Result<bool, Error> {
     };
     println!("segments: {}", lineage.segments);
     println!("journal entries: {}", lineage.entries);
-    if let Some((expected, found)) = lineage.live_tail_gap {
+    if let Some(torn) = lineage.live_torn_tail {
         println!(
-            "note: the live segment ends in a sequence gap (expected {expected}, found \
-             {found}); the entries past it were never acknowledged and are ignored, as \
-             recovery would"
+            "note: the live segment ends in a torn write ({} bytes at offset {}); it was \
+             never acknowledged and is ignored, as recovery would",
+            torn.len, torn.offset
         );
     }
     if lineage.lineage_start > 1 {
@@ -183,7 +183,14 @@ fn refold(
             segments.push(live.to_path_buf());
         }
         'walk: for path in &segments {
-            let mut reader = JournalReader::<NotaryEvent>::open(path)?;
+            // The same live/archived rule `verify_lineage` applied, so
+            // the two walks cannot disagree about where a segment ends.
+            let kind = if path == live {
+                SegmentKind::Live
+            } else {
+                SegmentKind::Archived
+            };
+            let mut reader = JournalReader::<NotaryEvent>::open_segment(path, kind)?;
             while let Some(entry) = reader.next_entry()? {
                 if let JournalEvent::App(NotaryEvent::Notarize { leaf }) = entry.event {
                     let prev = head;

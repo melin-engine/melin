@@ -85,10 +85,9 @@ An explicit group commit delay (`group_commit_delay`) can be configured but is s
 
 ### What Can Go Wrong
 
-1. **Clean shutdown** — all entries are complete and synced. No recovery needed.
-2. **Crash mid-write** — the last entry may be partially written (truncated). The entry magic, length, or CRC will be invalid.
-3. **Crash after write** — pre-allocated zero-filled space beyond the last write is always present; PLP ensures the written data itself is durable.
-4. **Bit rot / storage corruption** — a previously valid entry has flipped bits. CRC32C detects this.
+1. **Clean shutdown** — all entries are complete and synced, followed by the live segment's pre-allocated zeros. Nothing to recover.
+2. **Crash mid-write** — a process kill, or a power loss before `fdatasync` returned, can leave the last write partly on disk: a prefix of it, or, after a power loss, any mix of its sectors, the rest still reading as pre-allocated zeros. None of it was acknowledged. Recovery discards it (see the torn-write rule below).
+3. **Storage corruption** — bit rot, a lost or misdirected write, or a range of storage returning zeros, anywhere in the journal. CRC32C, sequence checks and the rules below detect it, and recovery refuses to start rather than discard data that may have been acknowledged. The exception is the end of the live segment, where damage can look exactly like a crash mid-write (see *Limits of the rule* below).
 
 ### Recovery Algorithm
 
@@ -101,25 +100,39 @@ recover(journal_path):
         must continue the sequence space exactly. Checked BEFORE any
         replay — a foreign or tampered segment never reaches the application.
      c. Read entries sequentially:
-        - Validate entry_magic (0x4A45), CRC32C, sequence continuity.
+        - Validate entry_magic (0x4A45), the length against the widest
+          entry of its event type, CRC32C, sequence continuity.
         - Absorb the entry's raw bytes into the segment hash chain.
         - Apply it to the application.
-        - If entry_magic is 0x0000 → end of data (pre-allocated space). Stop.
-        - If entry is truncated at EOF (live segment) → partial write
-          from crash. Stop.
-        - If CRC mismatch or sequence gap mid-archive → return error.
-  2. Truncate the live file to valid_file_end (remove trailing garbage).
+        - At the first entry that is not whole (zero or bad magic, CRC
+          mismatch, running past the end of the file), stop, and decide
+          from the rest of the file whether this is the end of the
+          segment's data or corruption (see below).
+        - Any other failure → return error.
+  2. Truncate the live file to valid_file_end (remove the torn write).
   3. Re-allocate space from valid_file_end forward.
   4. Reopen writer for appending. The writer rebuilds its chain state
      self-containedly: anchor from the header, hasher re-absorbed from
      the raw byte range — no chain state is handed over from the replay.
 ```
 
-**Key behaviors:**
+**Where the data ends.** The journal writes a batch, or a backlog of batches, and then syncs; it does not write again until that sync has returned. So a crash can tear at most one such write, at most 40 MiB (the journal stage's 64-batch hand-off, each batch at most 640 KiB), and only at the end of the live segment. Recovery therefore accepts:
 
-- A truncated final entry is treated as harmless (crash during write) and silently discarded. The events it contained were never acknowledged to the client (persist-before-ack), so no client believes they succeeded.
-- Zero-filled bytes (from `posix_fallocate`) are treated as end-of-data, not corruption.
-- A CRC mismatch or sequence gap mid-stream is treated as real corruption and returns an error. The operator must investigate — this should never happen under normal operation.
+- **In the live segment**, a stop on zeros, or on an entry that is not whole, when every non-zero byte from there on lies within 40 MiB of the stop and the rest of the file is zeros. That is a torn write: it was never acknowledged (persist-before-ack), so no client believes its events succeeded. Recovery logs a warning naming the file, the offset and the number of bytes it discards, and continues.
+- **In an archived segment**, a stop followed only by zeros (allocation padding the rotation did not trim). An archive is synced in full before it is archived, so it cannot hold a torn write.
+
+**What recovery refuses.** Everything else stops the node with an error, and the file is left exactly as it was:
+
+- Data after the stop that is further away than one write can reach, or anything at all after the stop in an archive (including the newest archive when the live segment is missing) — `UnrecoverableTail`, naming the file, where its entries stop and why, the last sequence read, and where data was found beyond it.
+- A whole entry (its CRC verifies) that does not belong: a sequence gap or a repeated sequence anywhere, a segment whose first entry disagrees with its header, an event the application cannot decode. A crash leaves bytes as written or as zeros, never a whole entry in the wrong place — `SequenceGap`, `SequenceDuplicate`, `CorruptEntry`.
+- An entry whose length is wider than any entry of its event type can be — `CorruptEntry`. A torn write can shorten a length, never lengthen it; a corrupted length would otherwise point the checksum at the wrong bytes.
+
+**Limits of the rule.** Within 40 MiB of the end of the live segment, damage to synced data — a flipped bit, a range of zeros — produces the same bytes as a torn write, and recovery discards from the damaged entry onward, with the warning above. Use it: a warning after a clean shutdown, or one that discards more than the batches in flight when the node stopped, means storage damage, not a crash. On a replicated cluster the discarded entries are still on the other nodes — but only until the damaged node serves again as primary, at which point the replicas set their longer history aside as diverged. So when such a warning appears on a node that was primary, stop it before it serves, fail over to a replica and re-seed the node as described under *When recovery refuses* below. Recovery reads the rest of the live segment, pre-allocated space included, to rule out data beyond the stop, which adds the time to read up to one segment to every start.
+
+**When recovery refuses.** The node exits with the error and changes nothing on disk. Do not truncate or edit the journal to get it started: the entries after the stop may have been acknowledged.
+
+- **Replicated cluster:** treat the node as failed. If it was the primary, fail over to a replica (see [replication.md](replication.md)). Then move the node's journal, archives and snapshots aside — keep them for investigation — and restart it as a replica; it re-seeds itself from the primary.
+- **Standalone node:** keep a copy of the segment and check the storage. The data the error points at, beyond the stop, is the history that would be lost; recovering it, or deciding to give it up, is a decision about acknowledged events, not a routine restart.
 
 ### Recovery with Snapshots
 
@@ -410,11 +423,11 @@ The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`
 |-------|-------|--------|
 | `InvalidFile` | Bad magic bytes | Wrong file, not a journal |
 | `UnsupportedVersion` | Format version mismatch | Need the version that wrote the journal (see Migration) |
-| `CorruptEntry` | Unknown tag, or an event the application cannot decode | Storage corruption, or a journal written by an application version that encodes events differently (see Changing the Application's Encoding) — investigate before restarting |
-| `ChecksumMismatch` | CRC32C validation failed (entry or file header) | Bit rot or partial write — investigate storage |
+| `CorruptEntry` | Unknown tag, an event the application cannot decode, or an entry length wider than its event type allows | Storage corruption, or a journal written by an application version that encodes events differently (see Changing the Application's Encoding) — investigate before restarting |
+| `ChecksumMismatch` | CRC32C validation failed on a file header | Storage corruption — investigate storage |
+| `UnrecoverableTail` | A segment's entries stop early (zeros, bad magic, CRC mismatch, an entry running past the end) and data follows that no crash can explain | Storage corruption or a lost write — see "When recovery refuses" under [Recovery Algorithm](#recovery-algorithm) |
 | `SequenceGap` | Non-contiguous sequence numbers, or a segment's first entry disagreeing with its header | Corruption, file truncation, or a misplaced segment — investigate |
 | `SequenceDuplicate` | A sequence number repeated | Writer bug or storage anomaly — investigate |
-| `TruncatedEntry` | Incomplete entry at EOF | Normal crash recovery — entry is discarded |
 | `SegmentChainBreak` | A segment's header anchor does not equal the previous segment's tail chain hash | Tampered archive, missing segment, or foreign segment spliced in — investigate before trusting the history |
 | `MissingHistoryPrefix` | The oldest surviving segment starts after the history start recovery requires (sequence 1, or the snapshot's anchor + 1) | Archives trimmed without a covering snapshot — restore the trimmed segments or a snapshot that covers them; recovery refuses to build partial state |
 | `Io` | Underlying I/O error | Disk failure, permissions, full disk |

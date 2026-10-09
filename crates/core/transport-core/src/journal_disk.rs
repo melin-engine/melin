@@ -448,6 +448,14 @@ impl JournalDisk {
             return Ok(false);
         };
         let bytes_written = self.batches.staged_total_bytes();
+        // What a crash during this drain can tear; recovery's bound. Only
+        // a ring deeper than the pipeline's (a test) could exceed it; the
+        // pipeline asserts its ring fits, in release builds too, when it
+        // builds it (`into_sequencer`).
+        debug_assert!(
+            bytes_written as u64 <= melin_journal::write_ring::MAX_UNSYNCED_BYTES,
+            "a drain of {bytes_written} bytes exceeds the journal's unsynced bound"
+        );
 
         if bytes_written > 0 {
             // One `pwritev` for the whole backlog rather than one

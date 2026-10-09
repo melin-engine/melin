@@ -323,7 +323,11 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
         // --- Walk each sealed archive in monotonic order ---
         for (idx, archive_path) in &archives {
-            let mut reader = JournalReader::<A::Event>::open(archive_path)?;
+            // Archived: synced whole before it was sealed, so nothing but
+            // zeros may follow its last entry — including the last archive
+            // when the live segment is missing, which no successor header
+            // vouches for.
+            let mut reader = JournalReader::<A::Event>::open_archived(archive_path)?;
             // Verify lineage continuity from the header alone, before
             // any of this segment's events reach the application.
             verify_segment_link(
@@ -344,7 +348,6 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 &mut last_drain_ns,
                 &mut recovered_epoch,
                 &mut reports,
-                /* allow_partial_tail = */ false,
             )?;
             // Carry forward only when this segment actually had a chain
             // (hash-chain feature on). Otherwise leave `prev_tail_hash`
@@ -429,9 +432,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             archived_genesis_entries,
         )?;
         verify_boundary_snapshot_anchor(&reader, snap_sequence, snap_chain_check)?;
-        // The live segment may have a partial-tail crash: replay loop
-        // tolerates `SequenceGap` by stopping early, mirroring legacy
-        // behaviour.
+        // The live segment may end in a torn, never-acknowledged write;
+        // the reader stops before it, or refuses the segment when what
+        // follows the stop cannot be one (see `melin_journal::reader`).
+        // `open_append` below then overwrites it.
         replay_segment(
             &mut reader,
             &mut app,
@@ -440,7 +444,6 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             &mut last_drain_ns,
             &mut recovered_epoch,
             &mut reports,
-            /* allow_partial_tail = */ true,
         )?;
 
         // An empty live segment resumes at its header's starting
@@ -801,10 +804,9 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 /// entry (`seq == snap_sequence`) is observed — every entry surfaces to
 /// this loop, so no capture machinery is needed.
 ///
-/// `allow_partial_tail` controls how `SequenceGap` is treated: archived
-/// segments are sealed and any gap is corruption (returned as an error);
-/// the live segment may have a torn tail from a crash, so a gap
-/// terminates replay cleanly.
+/// Where the segment's entries end is the reader's decision (it was
+/// opened as live or archived); every error it returns, a sequence gap
+/// included, is corruption and stops recovery.
 fn replay_segment<A: Application>(
     reader: &mut JournalReader<A::Event>,
     app: &mut A,
@@ -813,7 +815,6 @@ fn replay_segment<A: Application>(
     last_drain_ns: &mut u64,
     recovered_epoch: &mut u64,
     reports: &mut Vec<A::Report>,
-    allow_partial_tail: bool,
 ) -> Result<(), JournaledAppError> {
     loop {
         match reader.next_entry() {
@@ -852,17 +853,6 @@ fn replay_segment<A: Application>(
                 }
             }
             Ok(None) => break,
-            Err(JournalError::SequenceGap { expected, actual }) => {
-                if allow_partial_tail {
-                    tracing::warn!(
-                        expected,
-                        actual,
-                        "sequence gap during recovery — truncating at gap"
-                    );
-                    break;
-                }
-                return Err(JournalError::SequenceGap { expected, actual }.into());
-            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -2730,5 +2720,398 @@ mod tests {
         // The 99_999 event was never durable; only the archived ones
         // count toward the recovered total.
         assert_eq!(recovered.app().total, expected_durable);
+    }
+
+    /// The recovery rule (determinism audit, findings 5, 6, 7 and 16):
+    /// the live segment may end in a torn, never-acknowledged write —
+    /// any malformed entry whose non-zero bytes fit in one unsynced drain
+    /// with only zeros after them — and recovery drops it; anything else
+    /// is corruption, and recovery refuses without touching the file. An
+    /// archive is sealed and synced before it is archived, so it may end
+    /// in nothing but zeros.
+    mod recovery_policy {
+        use super::*;
+        use std::os::unix::fs::FileExt;
+
+        /// The most bytes a crash can leave half-written: one drain.
+        const DRAIN: u64 = melin_journal::write_ring::MAX_UNSYNCED_BYTES;
+
+        /// File offset of each entry's start, then the end of the last.
+        fn entry_bounds(path: &Path) -> Vec<u64> {
+            let mut reader = JournalReader::<TestEvent>::open(path).unwrap();
+            let mut bounds = vec![reader.valid_file_end()];
+            while reader.next_entry().unwrap().is_some() {
+                bounds.push(reader.valid_file_end());
+            }
+            bounds
+        }
+
+        fn write_at(path: &Path, offset: u64, bytes: &[u8]) {
+            let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            f.write_all_at(bytes, offset).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        fn read_at(path: &Path, offset: u64, len: usize) -> Vec<u8> {
+            let f = std::fs::File::open(path).unwrap();
+            let mut buf = vec![0u8; len];
+            f.read_exact_at(&mut buf, offset).unwrap();
+            buf
+        }
+
+        fn adds(n: u64) -> Vec<TestEvent> {
+            (1..=n).map(TestEvent::Add).collect()
+        }
+
+        /// A live segment holding `Add(1..=n)` at sequences `1..=n`, in
+        /// its preallocated file. Returns the entry bounds.
+        fn journal_with(path: &Path, n: u64) -> Vec<u64> {
+            let ja = TestApp_::create(TestApp::new(), path).unwrap();
+            drop(append_events(ja, &adds(n)));
+            entry_bounds(path)
+        }
+
+        /// One entry exactly as the writer frames it.
+        fn entry_bytes(seq: u64, event: TestEvent) -> Vec<u8> {
+            let mut buf = [0u8; 256];
+            let n =
+                melin_journal::codec::encode(seq, 1_000, 1, &JournalEvent::App(event), &mut buf)
+                    .unwrap();
+            buf[..n].to_vec()
+        }
+
+        fn refused(path: &Path) -> JournaledAppError {
+            match TestApp_::recover(TestApp::new(), path) {
+                Ok(ja) => panic!(
+                    "recovery accepted a corrupt journal and resumes at sequence {}",
+                    ja.next_sequence()
+                ),
+                Err(e) => e,
+            }
+        }
+
+        /// Recovery kept exactly `Add(1..=k)`.
+        fn assert_recovers_first(path: &Path, k: u64, context: &str) {
+            let ja = TestApp_::recover(TestApp::new(), path)
+                .unwrap_or_else(|e| panic!("{context}: recovery refused: {e}"));
+            assert_eq!(ja.next_sequence(), k + 1, "{context}: resume point");
+            assert_eq!(ja.app().total, k * (k + 1) / 2, "{context}: state");
+        }
+
+        /// Finding 5: entries 1, 2, 3, 5, 6. Both after the gap are
+        /// CRC-valid, so they were written whole, and a crash cannot put a
+        /// whole entry with the wrong sequence anywhere: refused, and the
+        /// file keeps them.
+        #[test]
+        fn a_sequence_gap_in_the_live_segment_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.journal");
+            let bounds = journal_with(&path, 3);
+            let mut tail = entry_bytes(5, TestEvent::Add(5));
+            tail.extend(entry_bytes(6, TestEvent::Add(6)));
+            write_at(&path, bounds[3], &tail);
+
+            let err = refused(&path);
+            assert!(
+                matches!(
+                    err,
+                    JournaledAppError::Journal(JournalError::SequenceGap {
+                        expected: 4,
+                        actual: 5
+                    })
+                ),
+                "got {err:?}"
+            );
+            assert_eq!(
+                read_at(&path, bounds[3], tail.len()),
+                tail,
+                "file untouched"
+            );
+        }
+
+        /// Finding 5, the lone case: one whole entry with the wrong
+        /// sequence at the very end is just as impossible for a crash to
+        /// produce.
+        #[test]
+        fn a_lone_gap_entry_at_the_live_tail_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.journal");
+            let bounds = journal_with(&path, 3);
+            write_at(&path, bounds[3], &entry_bytes(5, TestEvent::Add(5)));
+
+            let err = refused(&path);
+            assert!(
+                matches!(
+                    err,
+                    JournaledAppError::Journal(JournalError::SequenceGap { .. })
+                ),
+                "got {err:?}"
+            );
+        }
+
+        /// Finding 5, the header variant: a whole first entry that does not
+        /// carry the header's starting sequence.
+        #[test]
+        fn a_first_entry_off_the_header_starting_sequence_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.journal");
+            drop(TestApp_::create(TestApp::new(), &path).unwrap());
+            write_at(
+                &path,
+                melin_journal::codec::ENTRY_OFFSET,
+                &entry_bytes(2, TestEvent::Add(2)),
+            );
+
+            let err = refused(&path);
+            assert!(
+                matches!(
+                    err,
+                    JournaledAppError::Journal(JournalError::SequenceGap {
+                        expected: 1,
+                        actual: 2
+                    })
+                ),
+                "got {err:?}"
+            );
+        }
+
+        /// Finding 7: one flipped bit in the last entry's length moves its
+        /// claimed CRC slot into preallocation zeros. No write can tear a
+        /// length upwards, and no entry of this application is that long:
+        /// refused, and the entry stays.
+        #[test]
+        fn a_flipped_bit_in_the_last_entrys_length_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.journal");
+            let bounds = journal_with(&path, 5);
+            let last = read_at(&path, bounds[4], (bounds[5] - bounds[4]) as usize);
+            // Length is the `u16` after the two magic bytes; bit 6 of its
+            // low byte.
+            write_at(&path, bounds[4] + 2, &[last[2] ^ 0x40]);
+
+            let err = refused(&path);
+            assert!(
+                matches!(
+                    err,
+                    JournaledAppError::Journal(JournalError::CorruptEntry { sequence: 5, .. })
+                ),
+                "got {err:?}"
+            );
+            let mut flipped = last.clone();
+            flipped[2] ^= 0x40;
+            assert_eq!(
+                read_at(&path, bounds[4], last.len()),
+                flipped,
+                "the entry is still on disk"
+            );
+        }
+
+        /// Finding 6: a zeroed range with entries more than one drain
+        /// beyond it is not a torn write — it is a hole in data that was
+        /// synced. Refused.
+        #[test]
+        fn a_zeroed_range_with_entries_past_one_drain_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.journal");
+            let bounds = journal_with(&path, 10);
+            let later = read_at(&path, bounds[6], (bounds[10] - bounds[6]) as usize);
+            write_at(
+                &path,
+                bounds[3],
+                &vec![0u8; (bounds[6] - bounds[3]) as usize],
+            );
+            // The rest of the history, as a longer segment would hold it:
+            // further than one drain past the hole.
+            write_at(&path, bounds[3] + DRAIN, &later);
+
+            let err = refused(&path);
+            assert!(
+                matches!(
+                    err,
+                    JournaledAppError::Journal(JournalError::UnrecoverableTail { .. })
+                ),
+                "got {err:?}"
+            );
+        }
+
+        /// A drain whose sectors reached the disk out of order (power lost
+        /// during the sync): the first entries of the drain read as zeros,
+        /// later ones landed. All of it was unacknowledged, and it fits in
+        /// one drain: recovered as a torn tail. The same bytes cannot be
+        /// told apart from a zeroed range of synced entries close to the
+        /// end, which is why the rule is bounded by one drain.
+        #[test]
+        fn a_drain_torn_out_of_order_recovers() {
+            let _prealloc = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.journal");
+            let bounds = journal_with(&path, 10);
+            write_at(
+                &path,
+                bounds[3],
+                &vec![0u8; (bounds[6] - bounds[3]) as usize],
+            );
+
+            assert_recovers_first(&path, 3, "out-of-order drain");
+        }
+
+        /// Archive-only recovery (the live segment lost between rotation's
+        /// rename and its new file) of an archive with entries 4 to 6
+        /// zeroed: no successor header vouches for where the archive ends,
+        /// and an archive is synced before it is sealed, so the zeros are
+        /// corruption.
+        #[test]
+        fn the_last_archive_with_a_zeroed_range_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.journal");
+            journal_with(&path, 10);
+            let mut ja = TestApp_::recover(TestApp::new(), &path).unwrap();
+            ja.rotate_segment().unwrap();
+            drop(ja);
+            std::fs::remove_file(&path).unwrap();
+            let archive = melin_journal::segment::archive_path(&path, 1);
+            let bounds = entry_bounds(&archive);
+            write_at(
+                &archive,
+                bounds[3],
+                &vec![0u8; (bounds[6] - bounds[3]) as usize],
+            );
+
+            let err = refused(&path);
+            assert!(
+                matches!(
+                    err,
+                    JournaledAppError::Journal(JournalError::UnrecoverableTail { .. })
+                ),
+                "got {err:?}"
+            );
+        }
+
+        /// Archive-only recovery of an archive cut inside its final entry.
+        #[test]
+        fn the_last_archive_cut_inside_its_final_entry_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.journal");
+            journal_with(&path, 5);
+            let mut ja = TestApp_::recover(TestApp::new(), &path).unwrap();
+            ja.rotate_segment().unwrap();
+            drop(ja);
+            std::fs::remove_file(&path).unwrap();
+            let archive = melin_journal::segment::archive_path(&path, 1);
+            let bounds = entry_bounds(&archive);
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&archive)
+                .unwrap();
+            f.set_len(bounds[5] - 3).unwrap();
+
+            let err = refused(&path);
+            assert!(
+                matches!(
+                    err,
+                    JournaledAppError::Journal(JournalError::UnrecoverableTail { .. })
+                ),
+                "got {err:?}"
+            );
+        }
+
+        /// The archive's allocation padding survives when compaction did
+        /// not reach the disk; zeros after the last entry are not
+        /// corruption.
+        #[test]
+        fn an_uncompacted_archive_recovers() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.journal");
+            journal_with(&path, 5);
+            let mut ja = TestApp_::recover(TestApp::new(), &path).unwrap();
+            ja.rotate_segment().unwrap();
+            drop(ja);
+            std::fs::remove_file(&path).unwrap();
+            let archive = melin_journal::segment::archive_path(&path, 1);
+            let len = std::fs::metadata(&archive).unwrap().len();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&archive)
+                .unwrap();
+            f.set_len(len + 1024 * 1024).unwrap();
+
+            assert_recovers_first(&path, 5, "padded archive");
+        }
+
+        /// Finding 16: entries 1 to 5 synced, then every prefix of entry
+        /// 6 in preallocated space — what a crash mid-`pwritev` leaves. A
+        /// cut after one magic byte reads as bad magic, a cut inside the
+        /// CRC as a checksum mismatch with a non-zero stored value; every
+        /// cut must recover entries 1 to 5, and the whole entry 1 to 6.
+        #[test]
+        fn every_prefix_of_a_torn_final_entry_recovers() {
+            let _prealloc = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+            let dir = tempfile::tempdir().unwrap();
+            let original = dir.path().join("original.journal");
+            let bounds = journal_with(&original, 6);
+            let (start, end) = (bounds[5], bounds[6]);
+            let alloc = std::fs::metadata(&original).unwrap().len();
+            let crc = read_at(&original, end - 4, 4);
+            assert_ne!(crc[0], 0, "the sweep must cut inside a non-zero CRC");
+
+            let work = dir.path().join("work.journal");
+            for cut in start..=end {
+                std::fs::copy(&original, &work).unwrap();
+                let f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+                // Everything from the cut is preallocation zeros again.
+                f.set_len(cut).unwrap();
+                f.set_len(alloc).unwrap();
+                drop(f);
+                let kept = if cut == end { 6 } else { 5 };
+                assert_recovers_first(&work, kept, &format!("cut {} bytes in", cut - start));
+            }
+        }
+
+        /// Finding 16, the sweep: cut the journal at every byte of its
+        /// data, leave preallocation zeros after the cut (as a crash
+        /// does, rather than truncating), and recover exactly the entries
+        /// written whole before the cut. The recovered writer must then
+        /// append and recover again.
+        #[test]
+        fn crash_at_every_byte_offset_in_preallocated_space_recovers() {
+            let _prealloc = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+            let dir = tempfile::tempdir().unwrap();
+            let original = dir.path().join("original.journal");
+            let bounds = journal_with(&original, 6);
+            let alloc = std::fs::metadata(&original).unwrap().len();
+            let first = melin_journal::codec::ENTRY_OFFSET;
+            let end = *bounds.last().unwrap();
+
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4) as u64;
+            std::thread::scope(|scope| {
+                for tid in 0..threads {
+                    let (original, bounds) = (&original, &bounds);
+                    let work = dir.path().join(format!("work-{tid}.journal"));
+                    scope.spawn(move || {
+                        let mut cut = first + tid;
+                        while cut <= end {
+                            std::fs::copy(original, &work).unwrap();
+                            let f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+                            f.set_len(cut).unwrap();
+                            f.set_len(alloc).unwrap();
+                            drop(f);
+                            // Entries whose last byte precedes the cut.
+                            let kept = bounds[1..].iter().filter(|&&b| b <= cut).count() as u64;
+                            let context = format!("cut at byte {cut}");
+                            assert_recovers_first(&work, kept, &context);
+
+                            let ja = TestApp_::recover(TestApp::new(), &work).unwrap();
+                            drop(append_events(ja, &[TestEvent::Add(1_000)]));
+                            let again = TestApp_::recover(TestApp::new(), &work)
+                                .unwrap_or_else(|e| panic!("{context}: re-recovery: {e}"));
+                            assert_eq!(again.next_sequence(), kept + 2, "{context}");
+                            cut += threads;
+                        }
+                    });
+                }
+            });
+        }
     }
 }

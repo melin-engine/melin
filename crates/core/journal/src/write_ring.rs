@@ -74,6 +74,28 @@ const _: () = assert!(crate::encoder::MAX_ENTRY_SIZE <= CHUNK_SIZE);
 /// as it does today.
 pub const DEFAULT_CAPACITY: usize = 64;
 
+/// The most journal bytes a writer ever has written but not yet synced:
+/// one full drain of the ring, every slot holding a full chunk
+/// (`DEFAULT_CAPACITY` × `CHUNK_SIZE`).
+///
+/// This is the bound on what a crash can leave half-written. The disk
+/// thread writes everything the ring holds and then syncs once, and it
+/// starts the next drain only after that sync returns; the composed
+/// [`crate::BufferedWriter`] writes no more than this between syncs
+/// either (see its `flush_batch_sync`). So after a crash, process kill or
+/// power loss, every byte past the last synced one lies within this many
+/// bytes of it, and recovery tolerates a malformed tail only when its
+/// non-zero bytes fit in this span (see [`crate::reader`]).
+///
+/// `u64` because it is compared against file offsets. Derived rather than
+/// written out, so resizing the ring or its chunks moves it too. The bound
+/// holds only for a ring built at `DEFAULT_CAPACITY`, which is what the
+/// pipeline builds; [`build_journal_write_ring`] takes the capacity as a
+/// parameter so tests can go deeper. The pipeline asserts (in release
+/// builds too) that the ring it builds fits this bound, and the disk
+/// thread debug-asserts each drain against it.
+pub const MAX_UNSYNCED_BYTES: u64 = DEFAULT_CAPACITY as u64 * CHUNK_SIZE as u64;
+
 /// Descriptor for one batch handed to the disk thread.
 ///
 /// Everything the disk thread must publish *after* the batch is durable

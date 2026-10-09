@@ -55,9 +55,9 @@ Severity is a judgement from code reading.
 | 2 | A replica reconnecting while its journal lags re-applies the unjournaled tail | High | Confirmed (fixed) |
 | 3 | A snapshot-only boot journals genesis a second time | High | Reproduced (fixed) |
 | 4 | A first boot that fails after creating the journal loses genesis for good | High | Reproduced (fixed) |
-| 5 | A sequence gap in the live segment truncates durable entries | High | Reproduced |
-| 6 | A zeroed range in the live segment reads as end of data | Medium | Reproduced |
-| 7 | A flipped bit in an entry's length field bypasses the CRC | Medium | Reproduced |
+| 5 | A sequence gap in the live segment truncates durable entries | High | Reproduced (fixed) |
+| 6 | A zeroed range in the live segment reads as end of data | Medium | Reproduced (fixed, bounded) |
+| 7 | A flipped bit in an entry's length field bypasses the CRC | Medium | Reproduced (fixed) |
 | 8 | Replicated entries have no end-to-end integrity; DPDK verifies no checksum on receive | High | Confirmed (fixed) |
 | 9 | The event publisher broadcasts reports before they are durable | High | Confirmed |
 | 10 | A runtime ack-policy change never reaches replicas while data flows | High | Confirmed |
@@ -66,7 +66,7 @@ Severity is a judgement from code reading.
 | 13 | Raft-mesh fencing ignores reply envelopes | Medium | Confirmed |
 | 14 | A replica adopts its primary's epoch before it holds that epoch's entries | Medium | Confirmed |
 | 15 | Promotion can drop a rotation boundary | Medium | Confirmed |
-| 16 | A torn, never-acknowledged final entry can block startup | Medium | Reproduced |
+| 16 | A torn, never-acknowledged final entry can block startup | Medium | Reproduced (fixed) |
 | 17 | The tick contract is untested and has no working example | Medium | Confirmed |
 | 18 | A ServerBusy reply can overtake replies to earlier requests | Medium | Confirmed |
 | 19 | Recovery trusts the page cache after a failed fsync | Medium | Reported |
@@ -442,6 +442,31 @@ Move any discarded tail aside instead of truncating it.
 `segment.rs::verify_lineage_reports_gap_at_live_tail` codifies today's
 tolerance and changes with it.
 
+**Status: fixed**, with findings 6, 7 and 16, by one end-of-entries
+rule in `JournalReader` (module docs of `journal/src/reader.rs`), which
+`JournaledApp` recovery and `verify_lineage` both apply:
+
+- A whole entry — its CRC verifies — is never a torn write, so a gap, a
+  duplicate, a first entry off the header's `starting_sequence` or an
+  undecodable event is an error wherever it is, the live tail included.
+  This is stricter than the fix direction above (which would have
+  dropped a lone gap entry followed by zeros): a crash leaves bytes as
+  written or as zeros, never a whole entry in the wrong place, so such an
+  entry is a writer bug or a misdirected write and may have been
+  acknowledged. `replay_segment`'s `allow_partial_tail` is gone; the
+  reader is opened as live (`open`) or archived (`open_archived`).
+- `verify_lineage_reports_gap_at_live_tail` became
+  `verify_lineage_rejects_gap_at_live_tail`, and `LineageReport`'s
+  `live_tail_gap` became `live_torn_tail`, reported by
+  `verify_lineage_reports_torn_live_tail`.
+- Reproductions, each failing before the fix (`journaled_app.rs`,
+  `recovery_policy`): `a_sequence_gap_in_the_live_segment_is_refused`
+  (entries 1, 2, 3, 5, 6), `a_lone_gap_entry_at_the_live_tail_is_refused`
+  and `a_first_entry_off_the_header_starting_sequence_is_refused`. Each
+  also checks the file is left untouched.
+- Not done: the discarded tail is still truncated by `open_append`, not
+  moved aside (deferred; see the suggested order, item 3).
+
 ### 6. A zeroed range in the live segment reads as end of data
 
 **Medium. Reproduced.** Breaks promise 5.
@@ -466,6 +491,62 @@ non-zero byte after the stop is corruption and could be refused.
 **Fix direction.** Give the zero-magic path the zero-CRC path's remainder
 scan, bounded as in finding 5, and preserve the tail.
 
+**Status: fixed, within the bound** (rule under finding 5). A stop on
+zeros now gets the same scan as a stop on a malformed entry. In the live
+segment it is a torn tail only when every non-zero byte from the stop
+lies within `write_ring::MAX_UNSYNCED_BYTES` of it (one drain:
+`DEFAULT_CAPACITY` slots of `CHUNK_SIZE`) and the rest of the file is
+zero; otherwise `JournalError::UnrecoverableTail`. Archives may be
+followed by zeros only (uncompacted allocation padding), the last
+archive with no live segment included.
+
+- The bound. The disk thread writes the whole ring and syncs once,
+  starting the next drain only after the sync returns; rotation runs on
+  a drained ring; a resync seed is synced before its rename; the genesis
+  journal is built under a staging name and renamed only once synced;
+  `BufferedWriter` callers flush at most one pipeline batch (one chunk)
+  per sync. So no writer leaves more than one drain unsynced. Exceeding
+  it would cost availability (a refused boot), not data. The bound is
+  derived from the ring constants (`MAX_UNSYNCED_BYTES` in
+  `write_ring.rs`), and the pipeline builds its ring at
+  `DEFAULT_CAPACITY` and asserts, in release builds too, that the ring
+  it built fits the bound (`into_sequencer`, `pipeline.rs`). The
+  capacity is a runtime parameter of `build_journal_write_ring`, so this
+  is a construction-time check rather than a compile-time one. Both sync
+  sites also debug-assert each sync against it (the drain in
+  `JournalDisk::drain_and_sync`, the batch in
+  `BufferedWriter::flush_batch_sync`), and
+  `the_torn_tail_bound_is_one_drain_from_the_stop` (`reader.rs`) pins
+  the reader's side.
+- Left open: an archive cut exactly on an entry boundary. Nothing
+  follows the stop, so the archived rule accepts it. With a successor
+  segment the lineage check (its `starting_sequence` and chain anchor)
+  catches it; with the live segment missing, the last archive's final
+  entries are lost silently and the synthesized live segment resumes
+  early. The header does not record a sealed archive's end, so
+  detecting this needs a format change, a candidate for the step that
+  moves discarded tails aside.
+- The audit's reproduction above (entries 4 to 6 zeroed among 1 to 10)
+  still recovers, by design: a drain whose sectors reached the disk out
+  of order on power loss leaves the same bytes, and both are within one
+  drain of the end. `a_drain_torn_out_of_order_recovers` pins that. The
+  rule catches a zeroed range with data beyond one drain, which is the
+  first-page case on any live segment longer than the bound. Inside the
+  bound, damage to synced data reads as a torn write and is discarded
+  with a `warn!` naming the extent; `docs/journal.md` says so. Accepted
+  as a documented limit: closing it would need a durable record of each
+  completed sync (a format change), and it only matters when storage
+  damages acknowledged data near the end of the live segment.
+- Reproductions, failing before the fix:
+  `a_zeroed_range_with_entries_past_one_drain_is_refused`,
+  `the_last_archive_with_a_zeroed_range_is_refused` and
+  `the_last_archive_cut_inside_its_final_entry_is_refused`;
+  `an_uncompacted_archive_recovers` pins the padding case. Reader-level:
+  `zero_crc_with_data_past_one_drain_surfaces_error`,
+  `an_archived_segment_may_end_in_zeros_only`.
+- Cost: recovery reads the live segment to its end, preallocation
+  included, once per boot (a `memcmp` against zeros per 64 KiB).
+
 ### 7. A flipped bit in an entry's length field bypasses the CRC
 
 **Medium. Reproduced.** Breaks promise 5.
@@ -482,6 +563,28 @@ swallow entries up to about 64 KiB before the tail.
 widest payload (the application's `MAX_ENCODED_SIZE`, or eight bytes for a
 tick or epoch bump) before checking the CRC. The reader already knows the
 event type.
+
+**Status: fixed** as directed. `codec::decode` is already generic over
+the application's event type, so no plumbing was needed: right after the
+magic it refuses a `length` above `ENTRY_META_SIZE` plus the tag's
+widest payload (`TRANSPORT_PAYLOAD_SIZE` for a tick or epoch bump,
+`E::MAX_ENCODED_SIZE` for an application event, the larger of the two
+while the tag is not yet buffered or is unknown) as `CorruptEntry`,
+before the truncation and CRC checks, and the reader never takes that
+error for a torn write: a torn write leaves bytes as written or as zeros,
+so it can shrink a length, never widen it. Reproduction, failing before
+the fix: `a_flipped_bit_in_the_last_entrys_length_is_refused`
+(`journaled_app.rs`); also `an_over_long_length_is_corruption_not_a_torn_tail`
+(`reader.rs`) and the codec's `a_length_wider_than_the_event_type_allows_is_refused`.
+The replication catch-up path, which decodes with the same function,
+gains the check too. An application must not lower `MAX_ENCODED_SIZE`
+below events already journaled (documented on the trait).
+
+Residual, accepted: a flip that leaves the length within its type's
+widest entry still fails the CRC, and on the live segment's last entries
+that reads as a torn write and is discarded within the bound (the
+limitation under finding 6). How often the cap catches a flip depends on
+how far the application's events fall short of their declared maximum.
 
 ### 16. A torn, never-acknowledged final entry can block startup
 
@@ -504,6 +607,18 @@ everything after it, within the bound of one unsynced drain, is zeros, and
 preserve what is discarded. The existing sweep
 `crash_at_every_byte_offset_recovers` truncates the file instead of
 leaving preallocation zeros, which is why it passes.
+
+**Status: fixed** (rule under finding 5): any malformed entry, the first
+of a segment included, is a torn tail when the bound allows. The
+truncating sweep stays; its sibling
+`crash_at_every_byte_offset_in_preallocated_space_recovers` cuts at every
+byte of the data, leaves preallocation zeros after the cut, and asserts
+recovery keeps exactly the entries written whole before it, then appends
+and recovers again. `every_prefix_of_a_torn_final_entry_recovers` covers
+the reproduction above — cuts between the magic bytes and inside a
+non-zero CRC among them. Both failed before the fix (at the cuts the
+table under Reproductions lists). Preserving the discarded bytes is
+left for a later step.
 
 ## Integrity and observers
 
@@ -1225,7 +1340,14 @@ real sockets, ticks and snapshots as noted):
    whole instead of a completion marker (see finding 4).
 3. Findings 5, 6, 7, 16 and 19: one recovery policy. Tolerate only a
    bounded, all-zero tail, preserve whatever is discarded, and cap entry
-   length. (Finding 24, the shutdown drain, is already fixed.)
+   length. (Finding 24, the shutdown drain, is already fixed.) **Done**
+   for findings 5, 6, 7 and 16 (one rule in the journal reader, bounded
+   by one unsynced drain, and the length cap). Finding 19 remains.
+   Moving the discarded tail aside instead of truncating it is
+   deferred, undecided: it only helps when storage damages acknowledged
+   entries near the end of the live segment (the documented limit under
+   finding 6), where the copy would keep the intact entries that the
+   truncation deletes.
 4. Findings 8 and 11: wire integrity and the DPDK sender.
 5. Findings 10, 12, 13, 14 and 15: failover correctness.
 6. Finding 9: an API decision, gating the publisher or documenting it.

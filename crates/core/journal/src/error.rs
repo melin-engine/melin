@@ -85,6 +85,22 @@ pub enum JournalError {
     /// out of order, the entry would make the journal unrecoverable
     /// (`SequenceDuplicate` at the next start).
     SequenceRegression { sequence: u64, last_encoded: u64 },
+    /// A segment's entries stop early, at byte `offset` of `path`, and
+    /// what follows cannot be a torn write a crash left behind: a
+    /// non-zero byte sits at `nonzero_at`, beyond what one unsynced write
+    /// can reach in the live segment, or anywhere after the stop in a
+    /// sealed archive (which is synced before it is archived). Recovery
+    /// refuses rather than discard data that may have been acknowledged.
+    ///
+    /// `cause` is why the entry at `offset` did not decode (`None` when
+    /// it reads as zeros); `last_sequence` is the last entry that did.
+    UnrecoverableTail {
+        path: std::path::PathBuf,
+        offset: u64,
+        last_sequence: Option<u64>,
+        nonzero_at: u64,
+        cause: Option<Box<JournalError>>,
+    },
 }
 
 impl fmt::Display for JournalError {
@@ -154,6 +170,32 @@ impl fmt::Display for JournalError {
                 "refused to journal sequence {sequence}: sequence {last_encoded} is \
                  already journaled"
             ),
+            Self::UnrecoverableTail {
+                path,
+                offset,
+                last_sequence,
+                nonzero_at,
+                cause,
+            } => {
+                write!(
+                    f,
+                    "journal segment {} stops at byte {offset} (",
+                    path.display()
+                )?;
+                match cause {
+                    Some(cause) => write!(f, "{cause}")?,
+                    None => write!(f, "zeros")?,
+                }
+                match last_sequence {
+                    Some(seq) => write!(f, ", after sequence {seq}")?,
+                    None => write!(f, ", before its first entry")?,
+                }
+                write!(
+                    f,
+                    ") but holds data at byte {nonzero_at}: not a torn write, refusing to \
+                     discard it"
+                )
+            }
         }
     }
 }

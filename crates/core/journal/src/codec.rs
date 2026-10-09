@@ -626,6 +626,12 @@ pub type DecodedEntry<E> = (usize, u64, u64, u64, JournalEvent<E>);
 /// [`decode_file_header`] rejects any version whose entries differ from
 /// [`FORMAT_VERSION`]'s, so by the time entries are decoded the layout
 /// is known.
+///
+/// Before any other check that reads past the header, `length` is held
+/// to the widest entry the event type can have (an application event is
+/// at most `E::MAX_ENCODED_SIZE` wide): a wider one is
+/// [`JournalError::CorruptEntry`], never [`JournalError::TruncatedEntry`]
+/// or a checksum mismatch, which a reader may take for a torn write.
 pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> {
     if buf.len() < ENTRY_HEADER_SIZE + 1 + CRC_SIZE {
         return Err(JournalError::TruncatedEntry);
@@ -642,12 +648,24 @@ pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> 
     }
 
     let payload_len = header.length.get() as usize;
+    let sequence = header.sequence.get();
+    // Before the CRC, and before asking for more bytes: the CRC sits where
+    // `length` says, so a corrupted length would otherwise point the check
+    // at bytes that are not the CRC — preallocation zeros past the end of
+    // data, say — and the entry would read as torn. A torn write cannot
+    // widen a length (its bytes are as written or zero), so an over-long
+    // one is corruption.
+    if payload_len > max_entry_length::<E>(buf.get(EVENT_TAG_OFFSET).copied()) {
+        return Err(JournalError::CorruptEntry {
+            sequence,
+            reason: "entry length exceeds the widest entry of its event type",
+        });
+    }
     let total_len = ENTRY_HEADER_SIZE + payload_len + CRC_SIZE;
     if buf.len() < total_len {
         return Err(JournalError::TruncatedEntry);
     }
 
-    let sequence = header.sequence.get();
     let timestamp_ns = header.timestamp_ns.get();
 
     let data_end = ENTRY_HEADER_SIZE + payload_len;
@@ -714,6 +732,26 @@ pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> 
     };
 
     Ok((total_len, sequence, timestamp_ns, key_hash, event))
+}
+
+/// Offset of the event tag within an entry: after the header and the
+/// metadata's `key_hash`.
+const EVENT_TAG_OFFSET: usize = ENTRY_HEADER_SIZE + core::mem::size_of::<u64>();
+
+/// The widest `length` (metadata plus payload) an entry can carry, given
+/// its event tag when it is known: the 8-byte transport payload for a
+/// tick or an epoch bump, the application's declared
+/// [`AppEvent::MAX_ENCODED_SIZE`] for an application event — the encoder
+/// refuses anything wider — and the larger of the two when the tag is
+/// not yet buffered or not one this codec writes (that entry fails on its
+/// tag later).
+fn max_entry_length<E: AppEvent>(tag: Option<u8>) -> usize {
+    let payload = match tag {
+        Some(TAG_TICK | TAG_EPOCH_BUMP) => TRANSPORT_PAYLOAD_SIZE,
+        Some(TAG_APP) => E::MAX_ENCODED_SIZE,
+        _ => E::MAX_ENCODED_SIZE.max(TRANSPORT_PAYLOAD_SIZE),
+    };
+    ENTRY_META_SIZE + payload
 }
 
 /// Flatten a [`melin_app::CodecError`] into a static reason string so it
@@ -1025,6 +1063,83 @@ mod tests {
     fn truncated_input_rejected() {
         let err = decode::<TestEvent>(&[0u8; 10]).unwrap_err();
         assert!(matches!(err, JournalError::TruncatedEntry));
+    }
+
+    /// Set an encoded entry's `length` and re-seal its CRC where the new
+    /// length puts it, so only the length cap can object.
+    fn with_length(buf: &mut [u8], length: usize) -> usize {
+        buf[2..4].copy_from_slice(&(length as u16).to_le_bytes());
+        let data_end = ENTRY_HEADER_SIZE + length;
+        let crc = crc32c::crc32c(&buf[..data_end]);
+        le::put_u32(&mut buf[data_end..], crc);
+        data_end + CRC_SIZE
+    }
+
+    /// Each event type's widest entry decodes, and one byte more is
+    /// corruption — refused before the CRC (which `with_length` made
+    /// valid anyway) and never reported as truncation, whatever the
+    /// buffer holds.
+    #[test]
+    fn a_length_wider_than_the_event_type_allows_is_refused() {
+        let widest_tick = ENTRY_META_SIZE + TRANSPORT_PAYLOAD_SIZE;
+        let widest_app = ENTRY_META_SIZE + TestEvent::MAX_ENCODED_SIZE;
+        for (event, widest) in [
+            (JournalEvent::Tick { now_ns: 7 }, widest_tick),
+            (JournalEvent::EpochBump { epoch: 7 }, widest_tick),
+            (JournalEvent::App(TestEvent::Payload(7)), widest_app),
+        ] {
+            let mut buf = [0u8; 256];
+            let n = encode(5, 0, 0, &event, &mut buf).unwrap();
+            assert_eq!(n, ENTRY_HEADER_SIZE + widest + CRC_SIZE, "{event:?}");
+            decode::<TestEvent>(&buf[..n]).expect("the widest entry decodes");
+
+            let n = with_length(&mut buf, widest + 1);
+            // From the first byte that holds the tag on.
+            for avail in [EVENT_TAG_OFFSET + 1, n, buf.len()] {
+                let err = decode::<TestEvent>(&buf[..avail]).unwrap_err();
+                assert!(
+                    matches!(err, JournalError::CorruptEntry { sequence: 5, .. }),
+                    "{event:?} with {avail} bytes buffered: {err:?}"
+                );
+            }
+        }
+    }
+
+    /// Before the tag is buffered, and for a tag this codec never
+    /// writes, the cap is the wider of the two payloads; the tag's own
+    /// check rejects the entry afterwards.
+    #[test]
+    fn the_length_cap_without_a_known_tag_is_the_widest_payload() {
+        let widest = ENTRY_META_SIZE + TestEvent::MAX_ENCODED_SIZE.max(TRANSPORT_PAYLOAD_SIZE);
+        let mut buf = [0u8; 256];
+        encode(
+            5,
+            0,
+            0,
+            &JournalEvent::Tick::<TestEvent> { now_ns: 7 },
+            &mut buf,
+        )
+        .unwrap();
+        let n = with_length(&mut buf, widest + 1);
+        // The smallest prefix `decode` looks at, short of the tag.
+        let no_tag = ENTRY_HEADER_SIZE + 1 + CRC_SIZE;
+        assert!(no_tag <= EVENT_TAG_OFFSET);
+        let err = decode::<TestEvent>(&buf[..no_tag]).unwrap_err();
+        assert!(matches!(err, JournalError::CorruptEntry { .. }), "{err:?}");
+        buf[EVENT_TAG_OFFSET] = 0x7f;
+        let n2 = with_length(&mut buf, widest);
+        assert_eq!(n2 + 1, n);
+        let err = decode::<TestEvent>(&buf[..n2]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                JournalError::CorruptEntry {
+                    reason: "unknown event tag",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
