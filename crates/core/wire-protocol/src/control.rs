@@ -20,8 +20,17 @@ pub struct ConnectionId(pub u64);
 pub enum TransportResponse {
     /// Periodic keep-alive sent to idle connections.
     Heartbeat,
-    /// Marks the end of a response batch for a single request.
+    /// Marks the end of a response batch for a single request, backed as
+    /// the ack policy in force requires.
     BatchEnd,
+    /// Marks the end of a response batch for a single request that only
+    /// the primary's own disk backs, a weaker guarantee than the ack
+    /// policy in force. Sent by a primary halted for want of a replica
+    /// for a request it had sequenced before the halt (or a query that
+    /// may reflect such requests), once its own journal holds it. A
+    /// client that needs the policy's guarantee treats the request as
+    /// unconfirmed and reconciles.
+    BatchEndDegraded,
     /// The matching stage encountered an internal error processing
     /// the request. The client should not retry.
     EngineError,

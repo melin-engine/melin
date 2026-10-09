@@ -33,7 +33,7 @@ pub const TAG_APP: u8 = 0x09;
 
 /// Every control frame's tag, in either direction. An array, as the one
 /// collection a `const` block can walk.
-const CONTROL_TAGS: [u8; 8] = [
+const CONTROL_TAGS: [u8; 9] = [
     TAG_RESPONSE_HEARTBEAT,
     TAG_BATCH_END,
     TAG_ENGINE_ERROR,
@@ -42,6 +42,7 @@ const CONTROL_TAGS: [u8; 8] = [
     TAG_CHALLENGE_RESPONSE,
     TAG_AUTH_FAILED,
     TAG_SERVER_READY,
+    TAG_BATCH_END_DEGRADED,
 ];
 
 const _: () = {
@@ -55,11 +56,25 @@ const _: () = {
             CONTROL_TAGS[i] != TAG_APP,
             "TAG_APP must be no control frame's tag"
         );
+        assert!(
+            CONTROL_TAGS[i] != 0x00 && CONTROL_TAGS[i] < 0x10,
+            "a control tag must be neither a zeroed byte nor an old application tag"
+        );
+        let mut j = i + 1;
+        while j < CONTROL_TAGS.len() {
+            assert!(
+                CONTROL_TAGS[i] != CONTROL_TAGS[j],
+                "two control frames must not share a tag"
+            );
+            j += 1;
+        }
         i += 1;
     }
 };
 
 pub const TAG_RESPONSE_HEARTBEAT: u8 = 0x01;
+/// The end of a request's reply, backed as the ack policy in force
+/// requires.
 pub const TAG_BATCH_END: u8 = 0x02;
 pub const TAG_ENGINE_ERROR: u8 = 0x03;
 pub const TAG_SERVER_BUSY: u8 = 0x04;
@@ -67,6 +82,12 @@ pub const TAG_CHALLENGE: u8 = 0x05;
 pub const TAG_CHALLENGE_RESPONSE: u8 = 0x06;
 pub const TAG_AUTH_FAILED: u8 = 0x07;
 pub const TAG_SERVER_READY: u8 = 0x08;
+/// The end of a request's reply that only the primary's own disk backs:
+/// sent by a node halted for want of a replica, for a request it had
+/// already sequenced, once its own journal holds it. Weaker than the ack
+/// policy in force, and marked so; see
+/// [`TransportResponse::BatchEndDegraded`].
+pub const TAG_BATCH_END_DEGRADED: u8 = 0x0A;
 
 /// Encode a transport-level response into `buf`.
 ///
@@ -95,6 +116,10 @@ pub fn encode_transport_response(
         }
         TransportResponse::BatchEnd => {
             buf[pos] = TAG_BATCH_END;
+            pos += 1;
+        }
+        TransportResponse::BatchEndDegraded => {
+            buf[pos] = TAG_BATCH_END_DEGRADED;
             pos += 1;
         }
         TransportResponse::EngineError => {
@@ -188,6 +213,7 @@ mod tests {
         let variants = [
             TransportResponse::Heartbeat,
             TransportResponse::BatchEnd,
+            TransportResponse::BatchEndDegraded,
             TransportResponse::EngineError,
             TransportResponse::ServerBusy,
             TransportResponse::AuthFailed,
@@ -212,6 +238,7 @@ mod tests {
         let variants = [
             TransportResponse::Heartbeat,
             TransportResponse::BatchEnd,
+            TransportResponse::BatchEndDegraded,
             TransportResponse::EngineError,
             TransportResponse::ServerBusy,
             TransportResponse::Challenge { nonce: [0; 32] },

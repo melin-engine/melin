@@ -81,6 +81,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   took the policy atomic, `replication::Sender` gains `halt_state`, and
   `DpdkReplicationDriver::new` takes it. Source-breaking for code that
   builds any of these.
+- **A reply batch says what backs it: a new `BatchEndDegraded` frame,
+  and `melin_client`'s `Frame::BatchEnd(Ack)` / `Reply::BatchEnd(Ack)`.**
+  The wire protocol gains `TAG_BATCH_END_DEGRADED` (`0x0A`) and
+  `TransportResponse::BatchEndDegraded`: the end of a reply backed by the
+  primary's own disk alone, weaker than the ack policy, which a primary
+  halted for want of a replica sends. In `melin-client`,
+  `Frame::BatchEnd` and `Reply::BatchEnd` carry an `Ack`, `Policy` or
+  `PrimaryOnly`, so every caller that matches a batch end decides what a
+  degraded one means to it; `Connection::request_batch` returns a reply's
+  frames with their `Ack`; and `request` and `request_one` take only a
+  full reply, reporting a degraded one as the new `Error::Degraded`,
+  which carries its frames. Source-breaking for every `match` on `Frame`,
+  `Reply`, `Error` or `TransportResponse`. Wire-breaking by design: a
+  client built against an older `melin-client` gets `Error::Protocol` on
+  the first degraded reply rather than reading it as a full ack, so
+  upgrade clients before nodes.
 
 ### Fixed
 

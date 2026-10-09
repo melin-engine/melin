@@ -22,12 +22,19 @@
 //! [`Connection::request`] — one request, and the domain frames of its
 //! reply batch — or the pair [`Connection::send`] and
 //! [`Connection::next_frame`], for callers that keep several requests in
-//! flight or want to time the reply frame itself. Blocking, one thread
-//! per connection, `std::net` only: the shape a gateway thread or a load
-//! generator wants, with no allocation and no staging copy per frame in
-//! either direction. A program that owns its socket — a Unix socket, or
-//! a descriptor its own I/O loop takes over — runs the handshake alone
-//! with [`authenticate`].
+//! flight or want to time the reply frame itself.
+//!
+//! Every reply batch ends by saying what backs it ([`Ack`]): the node's
+//! ack policy, or, from a primary halted for want of a replica, its own
+//! disk alone. [`Connection::request`] takes only the first, and reports
+//! the second as [`Error::Degraded`] with the reply's frames;
+//! [`Connection::request_batch`] returns either, and the caller decides.
+//!
+//! Blocking, one thread per connection, `std::net` only: the shape a
+//! gateway thread or a load generator wants, with no allocation and no
+//! staging copy per frame in either direction. A program that owns its
+//! socket — a Unix socket, or a descriptor its own I/O loop takes over —
+//! runs the handshake alone with [`authenticate`].
 //!
 //! A program that runs its own I/O loop (`io_uring` completions, DPDK
 //! receive bursts, a non-blocking socket polled by hand) uses the
@@ -90,9 +97,9 @@ use ed25519_dalek::Signer;
 use melin_wire_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use melin_wire_protocol::control::ChallengeResponse;
 use melin_wire_protocol::control_codec::{
-    CHALLENGE_RESPONSE_LEN, TAG_APP, TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE,
-    TAG_ENGINE_ERROR, TAG_LEN, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
-    encode_challenge_response,
+    CHALLENGE_RESPONSE_LEN, TAG_APP, TAG_AUTH_FAILED, TAG_BATCH_END, TAG_BATCH_END_DEGRADED,
+    TAG_CHALLENGE, TAG_ENGINE_ERROR, TAG_LEN, TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY,
+    TAG_SERVER_READY, encode_challenge_response,
 };
 
 pub mod key;
@@ -180,6 +187,13 @@ pub enum Error {
     ServerBusy,
     /// The node's application failed on the request; do not retry.
     EngineError,
+    /// The reply came back backed by the primary's disk alone
+    /// ([`Ack::PrimaryOnly`]), weaker than the node's ack policy, from a
+    /// convenience method that takes only a full one. The reply's frames
+    /// are here, for a caller that accepts it after all; one that does
+    /// not treats the request as unconfirmed and reconciles. The
+    /// connection is still good.
+    Degraded { frames: Vec<Vec<u8>> },
 }
 
 impl fmt::Display for Error {
@@ -222,6 +236,10 @@ impl fmt::Display for Error {
             ),
             Error::ServerBusy => f.write_str("the node is busy: retry later on a new connection"),
             Error::EngineError => f.write_str("the node reported an engine error; do not retry"),
+            Error::Degraded { .. } => f.write_str(
+                "the reply is backed by the primary's disk alone, not by the node's ack policy: \
+                 the request is unconfirmed until the cluster is whole again",
+            ),
         }
     }
 }
@@ -269,6 +287,38 @@ impl From<RequestFrameError> for Error {
 // Frames
 // ---------------------------------------------------------------------------
 
+/// What backs a reply, as the end of its batch says.
+///
+/// A node acks a request once the copies its ack policy requires exist.
+/// A primary halted for want of a replica cannot get them for the
+/// requests it had already sequenced when the halt began; after a grace
+/// period it answers those once its own journal holds them, and says so.
+/// A query answered then may reflect such requests, and is marked the
+/// same way.
+///
+/// The client decides what a weaker reply means: one that needs the
+/// policy's guarantee treats [`PrimaryOnly`](Ack::PrimaryOnly) as
+/// unconfirmed and reconciles once the cluster is whole again (a
+/// failover to a node that never received the request loses it); one
+/// that accepts a single disk copy treats it as done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ack {
+    /// Backed as the node's ack policy requires.
+    Policy,
+    /// Backed by the primary's own disk alone: weaker than the ack
+    /// policy, which the node could not meet.
+    PrimaryOnly,
+}
+
+/// One request's reply batch, from [`Connection::request_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batch {
+    /// The application frames of the reply, in order.
+    pub frames: Vec<Vec<u8>>,
+    /// What backs them.
+    pub ack: Ack,
+}
+
 /// One frame from the node, as [`Connection::next_frame`] hands it over.
 /// Heartbeats never surface: they carry nothing and are skipped.
 #[derive(Debug, PartialEq, Eq)]
@@ -277,8 +327,9 @@ pub enum Frame<'a> {
     /// the protocol's framing stripped. Borrowed from the connection's
     /// buffer, valid until the next read.
     Response(&'a [u8]),
-    /// The last frame of one request's reply batch.
-    BatchEnd,
+    /// The last frame of one request's reply batch, saying what backs
+    /// the reply.
+    BatchEnd(Ack),
     /// The node is shedding load; nothing further will come for the
     /// request, and the connection should be dropped.
     ServerBusy,
@@ -300,7 +351,7 @@ pub enum Reply<'a> {
     /// waiting on a reply keeps its own deadline, as `next_frame` does.
     Heartbeat,
     /// As [`Frame::BatchEnd`].
-    BatchEnd,
+    BatchEnd(Ack),
     /// As [`Frame::ServerBusy`].
     ServerBusy,
     /// As [`Frame::EngineError`].
@@ -313,7 +364,7 @@ pub enum Reply<'a> {
 /// load generator on a user-space TCP stack — so it need not know the
 /// protocol's tags.
 ///
-/// A tag that is not one of the five a reply may carry — the
+/// A tag that is not one of the six a reply may carry — the
 /// handshake's tags, which are over before any reply, and any the
 /// protocol does not define — is [`Error::Protocol`]. So is an empty
 /// frame, and `0x00` with it: a zeroed buffer on the wire is a loud
@@ -323,7 +374,8 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
         None => Err(Error::Protocol("empty frame".into())),
         Some((&TAG_APP, body)) => Ok(Reply::Response(body)),
         Some((&TAG_RESPONSE_HEARTBEAT, _)) => Ok(Reply::Heartbeat),
-        Some((&TAG_BATCH_END, _)) => Ok(Reply::BatchEnd),
+        Some((&TAG_BATCH_END, _)) => Ok(Reply::BatchEnd(Ack::Policy)),
+        Some((&TAG_BATCH_END_DEGRADED, _)) => Ok(Reply::BatchEnd(Ack::PrimaryOnly)),
         Some((&TAG_SERVER_BUSY, _)) => Ok(Reply::ServerBusy),
         Some((&TAG_ENGINE_ERROR, _)) => Ok(Reply::EngineError),
         Some((&tag, _)) => Err(Error::Protocol(format!(
@@ -365,7 +417,7 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
 /// ```
 /// use std::time::{Duration, Instant};
 /// use melin_client::framing::FrameDecoder;
-/// use melin_client::{Error, Reply, next_reply};
+/// use melin_client::{Ack, Error, Reply, next_reply};
 ///
 /// # use melin_wire_protocol::control_codec::{TAG_APP, TAG_BATCH_END, TAG_RESPONSE_HEARTBEAT};
 /// # let stream = [
@@ -388,7 +440,12 @@ pub fn classify(payload: &[u8]) -> Result<Reply<'_>, Error> {
 ///             // Not an answer: the deadline stands.
 ///             Reply::Heartbeat => {}
 ///             Reply::Response(body) => responses.push(body.to_vec()),
-///             Reply::BatchEnd => break 'io,
+///             Reply::BatchEnd(Ack::Policy) => break 'io,
+///             // Only the primary's disk holds it: this caller wants the
+///             // policy's guarantee, so the request is unconfirmed.
+///             Reply::BatchEnd(Ack::PrimaryOnly) => {
+///                 return Err(Error::Degraded { frames: responses });
+///             }
 ///             Reply::ServerBusy => return Err(Error::ServerBusy),
 ///             Reply::EngineError => return Err(Error::EngineError),
 ///         }
@@ -591,7 +648,7 @@ impl Connection {
                     }
                     continue;
                 }
-                Reply::BatchEnd => return Ok(Frame::BatchEnd),
+                Reply::BatchEnd(ack) => return Ok(Frame::BatchEnd(ack)),
                 Reply::ServerBusy => return Ok(Frame::ServerBusy),
                 Reply::EngineError => return Ok(Frame::EngineError),
                 // `classify` saw the tag, so the frame holds at least it.
@@ -603,19 +660,33 @@ impl Connection {
     }
 
     /// Send one request and collect the application frames of its reply
-    /// batch, in order. A batch may hold none (the application had
-    /// nothing to say) or several (an acknowledgement and the reports the
-    /// request caused, say).
-    pub fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    /// batch, in order, with what backs them. A batch may hold none (the
+    /// application had nothing to say) or several (an acknowledgement and
+    /// the reports the request caused, say).
+    pub fn request_batch(&mut self, body: &[u8]) -> Result<Batch, Error> {
         self.send(body)?;
         let mut frames = Vec::new();
         loop {
             match self.next_frame()? {
                 Frame::Response(bytes) => frames.push(bytes.to_vec()),
-                Frame::BatchEnd => return Ok(frames),
+                Frame::BatchEnd(ack) => return Ok(Batch { frames, ack }),
                 Frame::ServerBusy => return Err(Error::ServerBusy),
                 Frame::EngineError => return Err(Error::EngineError),
             }
+        }
+    }
+
+    /// [`request_batch`](Self::request_batch) for a caller that takes
+    /// only a reply backed as the node's ack policy requires: the frames
+    /// of a batch that ends in [`Ack::Policy`]. A batch only the
+    /// primary's disk backs is [`Error::Degraded`], which carries its
+    /// frames, so that a weaker reply is never taken for a full one
+    /// unawares.
+    pub fn request(&mut self, body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        let Batch { frames, ack } = self.request_batch(body)?;
+        match ack {
+            Ack::Policy => Ok(frames),
+            Ack::PrimaryOnly => Err(Error::Degraded { frames }),
         }
     }
 
@@ -908,6 +979,9 @@ mod tests {
     enum Behaviour {
         /// Reply to every request with its body, then end the batch.
         Echo,
+        /// As `Echo`, with every batch backed by the primary's disk
+        /// alone: what a halted primary sends for a request it held.
+        DegradedEcho,
         /// A heartbeat before every reply, and two reply frames per batch.
         ChattyEcho,
         /// Read requests and never answer.
@@ -1016,6 +1090,11 @@ mod tests {
                 Behaviour::Echo | Behaviour::EagerHeartbeat => {
                     [app_frame(&body), control(TransportResponse::BatchEnd)].concat()
                 }
+                Behaviour::DegradedEcho => [
+                    app_frame(&body),
+                    control(TransportResponse::BatchEndDegraded),
+                ]
+                .concat(),
                 Behaviour::ChattyEcho => [
                     control(TransportResponse::Heartbeat),
                     app_frame(&body),
@@ -1082,8 +1161,45 @@ mod tests {
                 node.next_frame().unwrap(),
                 Frame::Response(&n.to_le_bytes())
             );
-            assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd);
+            assert_eq!(node.next_frame().unwrap(), Frame::BatchEnd(Ack::Policy));
         }
+
+        let batch = node.request_batch(b"backed").unwrap();
+        assert_eq!(batch.frames, [b"backed".to_vec()]);
+        assert_eq!(batch.ack, Ack::Policy);
+    }
+
+    /// A reply only the primary's disk backs says so on every path: the
+    /// frame, the batch, and the convenience methods, which never pass it
+    /// off as a full one.
+    #[test]
+    fn a_degraded_reply_is_marked_and_never_taken_for_a_full_one() {
+        let key = client_key();
+        let addr = fake_node(key.verifying_key(), Behaviour::DegradedEcho);
+        let mut node = Connection::connect(addr, &key).unwrap();
+
+        node.send(b"held").unwrap();
+        assert_eq!(node.next_frame().unwrap(), Frame::Response(b"held"));
+        assert_eq!(
+            node.next_frame().unwrap(),
+            Frame::BatchEnd(Ack::PrimaryOnly)
+        );
+
+        let batch = node.request_batch(b"held").unwrap();
+        assert_eq!(batch.frames, [b"held".to_vec()]);
+        assert_eq!(batch.ack, Ack::PrimaryOnly);
+
+        let err = node.request_one(b"held").unwrap_err();
+        assert!(
+            matches!(&err, Error::Degraded { frames } if frames == &[b"held".to_vec()]),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("primary's disk"), "{err}");
+        // The connection is still good.
+        assert_eq!(
+            node.request_batch(b"after").unwrap().frames,
+            [b"after".to_vec()]
+        );
     }
 
     /// The body is the application's from its first byte: one equal to a
@@ -1578,7 +1694,11 @@ mod tests {
         );
         assert_eq!(
             classify(&payload(TransportResponse::BatchEnd)).unwrap(),
-            Reply::BatchEnd
+            Reply::BatchEnd(Ack::Policy)
+        );
+        assert_eq!(
+            classify(&payload(TransportResponse::BatchEndDegraded)).unwrap(),
+            Reply::BatchEnd(Ack::PrimaryOnly)
         );
         assert_eq!(
             classify(&payload(TransportResponse::ServerBusy)).unwrap(),
@@ -1645,6 +1765,7 @@ mod tests {
             control(TransportResponse::Heartbeat),
             app_frame(b"body"),
             control(TransportResponse::BatchEnd),
+            control(TransportResponse::BatchEndDegraded),
             control(TransportResponse::ServerBusy),
             control(TransportResponse::EngineError),
         ]
@@ -1665,7 +1786,8 @@ mod tests {
             [
                 format!("{:?}", Reply::Heartbeat),
                 format!("{:?}", Reply::Response(b"body")),
-                format!("{:?}", Reply::BatchEnd),
+                format!("{:?}", Reply::BatchEnd(Ack::Policy)),
+                format!("{:?}", Reply::BatchEnd(Ack::PrimaryOnly)),
                 format!("{:?}", Reply::ServerBusy),
                 format!("{:?}", Reply::EngineError),
             ]
@@ -1844,7 +1966,8 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         let mut chunk = [0u8; 64];
         let mut replies = Vec::new();
-        while !replies.contains(&"BatchEnd".to_string()) {
+        let end = format!("{:?}", Reply::BatchEnd(Ack::Policy));
+        while !replies.contains(&end) {
             let got = stream.read(&mut chunk).unwrap();
             assert_ne!(got, 0, "the node closed the connection");
             decoder.push(&chunk[..got]);
@@ -1855,7 +1978,7 @@ mod tests {
                 });
             }
         }
-        assert_eq!(replies, ["by hand", "BatchEnd"]);
+        assert_eq!(replies, ["by hand".to_string(), end]);
     }
 
     proptest::proptest! {

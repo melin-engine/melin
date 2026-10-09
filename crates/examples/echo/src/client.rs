@@ -26,7 +26,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use melin_client::{Connection, Frame, key};
+use melin_client::{Ack, Connection, Frame, key};
 
 use echo_server::{KIND_RESP_ECHO, KIND_RESP_REJECTED, MAX_PAYLOAD};
 
@@ -137,12 +137,20 @@ fn echo(node: &mut Connection, request: u64, payload: &[u8]) -> Result<Duration,
             }
             elapsed
         }
-        Frame::BatchEnd => return Err("the server ended the batch without a reply".into()),
+        Frame::BatchEnd(_) => return Err("the server ended the batch without a reply".into()),
         Frame::ServerBusy => return Err(melin_client::Error::ServerBusy.into()),
         Frame::EngineError => return Err(melin_client::Error::EngineError.into()),
     };
     match node.next_frame()? {
-        Frame::BatchEnd => Ok(elapsed),
+        Frame::BatchEnd(Ack::Policy) => Ok(elapsed),
+        // A round trip the ack policy did not back is not the sequencer's
+        // latency: the primary lost its replica mid-run. Say so rather
+        // than count it.
+        Frame::BatchEnd(Ack::PrimaryOnly) => Err(format!(
+            "request {request} was answered by a primary that lost its replica: \
+             only its own disk backs the reply"
+        )
+        .into()),
         other => Err(format!("expected the batch to end, got {other:?}").into()),
     }
 }
