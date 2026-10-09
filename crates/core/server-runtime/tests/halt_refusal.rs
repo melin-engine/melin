@@ -1,4 +1,5 @@
-//! End-to-end contract for a halted primary: a write it refuses is gone.
+//! End-to-end contract for a halted primary: a write it refuses is gone,
+//! and what it answers it answers promptly.
 //!
 //! A primary whose last replica has left refuses client writes. The client
 //! is told so, and the refusal has to be the whole truth: the write must
@@ -7,58 +8,36 @@
 //! the refusal was decided after the journal had already recorded the
 //! write — and only a restart shows it.
 //!
-//! A primary and one replica (counter app, `disk` ack policy) over real TCP.
-//! One increment is acked while the replica is attached; the replica is
-//! then stopped, and a second increment must be refused while a query
-//! still answers, and counted on the health endpoint. A replica then
-//! attaches again, and the client resends the refused increment, which is
-//! taken. The primary is restarted standalone on its own journal, and
-//! replay must reach the value the client was told.
+//! A primary and one replica (counter app, `disk` ack policy). One
+//! increment is acked while the replica is attached; the replica is then
+//! stopped, and a second increment must be refused while a query still
+//! answers, and counted on the health endpoint. A replica then attaches
+//! again, and the client resends the refused increment, which is taken.
+//! The primary is restarted standalone on its own journal, and replay must
+//! reach the value the client was told.
 //!
 //! Nodes are started through `melin-test-node`: on kernel TCP by default,
 //! on DPDK with this crate's `dpdk` feature, under
 //! `scripts/dpdk/netns-runner.sh` (see
 //! `docs/internal/dpdk-testing.md`).
 
+#[path = "common/halt_cluster.rs"]
+mod halt_cluster;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use counter_server::{
-    Counter, GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE, RequestDecoder,
-    ResponseEncoder, increment_request,
+    GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE, increment_request,
 };
-use ed25519_dalek::SigningKey;
-use melin_client::Connection;
-use melin_server_runtime::StartupEvents;
+use melin_client::{Connection, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
-use melin_test_node::probe::wait_for_gauge;
-use melin_test_node::{Addrs, Node};
-use melin_transport_core::test_ports::free_addr;
+use melin_test_node::probe::{gauge, wait_for_gauge};
 
-/// Port range for `free_addr`, shared with `replicated_failover.rs`: every
-/// other range below the ephemeral floor is taken. Sharing is safe only
-/// because both binaries are in nextest's `cluster-serial` group, so they
-/// never run at the same time.
-const PORT_BASE: u16 = 10_000;
-
-/// Node `slot`'s addresses (`melin_test_node::addrs`), from this file's
-/// port range on kernel TCP.
-fn addrs(slot: usize) -> Addrs {
-    melin_test_node::addrs(slot, || free_addr(PORT_BASE))
-}
-
-fn spawn_node(addrs: &Addrs, config: ServerConfig) -> Node {
-    melin_test_node::start_at::<Counter>(
-        addrs,
-        config,
-        StartupEvents::none(),
-        (),
-        RequestDecoder,
-        ResponseEncoder,
-    )
-}
+use halt_cluster::{Fixture, addrs, spawn_node};
 
 /// Send one request and return the single frame of its reply.
 fn one_reply(conn: &mut Connection, body: &[u8]) -> Vec<u8> {
@@ -74,54 +53,17 @@ fn value_of(conn: &mut Connection) -> u64 {
 
 #[test]
 fn a_write_refused_while_halted_is_not_replayed() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let primary_key = SigningKey::from_bytes(&[0x71; 32]);
-    let replica_key = SigningKey::from_bytes(&[0x72; 32]);
-    let client_key = SigningKey::from_bytes(&[0x73; 32]);
-
-    let b64 = |k: &SigningKey| {
-        base64::engine::general_purpose::STANDARD.encode(k.verifying_key().to_bytes())
-    };
-    let auth_path = tmp.path().join("authorized_keys");
-    std::fs::write(
-        &auth_path,
-        format!(
-            "replication {} primary\nreplication {} replica\noperator {} client\n",
-            b64(&primary_key),
-            b64(&replica_key),
-            b64(&client_key)
-        ),
-    )
-    .expect("write authorized_keys");
-
-    let node_config = |name: &str, key: &SigningKey| -> ServerConfig {
-        let key_path = tmp.path().join(format!("{name}.key"));
-        std::fs::write(&key_path, key.to_bytes()).expect("write node key");
-        ServerConfig {
-            journal: tmp.path().join(format!("{name}.journal")),
-            authorized_keys: auth_path.clone(),
-            ack_policy: AckPolicy::Disk,
-            // Unpinned, and therefore yielding: both nodes share this
-            // process with the test's own client.
-            cores: PipelineCores::unpinned(),
-            tick_interval_ms: 0,
-            snapshot_interval_ms: 0,
-            health_bind: Some(free_addr(PORT_BASE)),
-            replication_key: Some(key_path),
-            ..melin_test_node::config()
-        }
-    };
-
+    let fx = Fixture::new(0x71);
     let primary_addrs = addrs(0);
-    let mut primary_config = node_config("primary", &primary_key);
-    primary_config.replication_bind = Some(primary_addrs.replication());
-    let primary_health = primary_config.health_bind.expect("set above");
+    let primary_config = fx.primary_config(&primary_addrs, AckPolicy::Disk);
+    let primary_health = primary_config.health_bind.expect("set by the fixture");
     let primary_journal = primary_config.journal.clone();
-    let mut replica_config = node_config("replica", &replica_key);
-    replica_config.replica_of = Some(primary_addrs.replication());
 
     let primary = spawn_node(&primary_addrs, primary_config);
-    let replica = spawn_node(&addrs(1), replica_config);
+    let replica = spawn_node(
+        &addrs(1),
+        fx.replica_config("replica", &primary_addrs, AckPolicy::Disk),
+    );
 
     // --- Taking writes: the replica is attached, the write is taken. ---
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
@@ -129,9 +71,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
     // lineage journaled as it began.
     wait_for_gauge(primary_health, "melin_ack_policy_in_force", 0);
     wait_for_gauge(primary_health, "melin_ack_policy_journaled", 0);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut conn = Connection::connect_by(primary.addr(), &client_key, deadline)
-        .expect("client connects to the primary");
+    let mut conn = fx.client(&primary);
     let ack = one_reply(&mut conn, &increment_request(1));
     assert_eq!(ack[0], KIND_RESP_ACK, "the first increment is acked");
 
@@ -153,9 +93,10 @@ fn a_write_refused_while_halted_is_not_replayed() {
     wait_for_gauge(primary_health, "melin_writes_refused_total", 1);
 
     // --- Taking writes again: a replica attaches, the refused write is resent. ---
-    let mut replica_config = node_config("replica2", &replica_key);
-    replica_config.replica_of = Some(primary_addrs.replication());
-    let replica = spawn_node(&addrs(2), replica_config);
+    let replica = spawn_node(
+        &addrs(2),
+        fx.replica_config("replica2", &primary_addrs, AckPolicy::Disk),
+    );
     wait_for_gauge(primary_health, "melin_replicas_connected", 1);
     let ack = one_reply(&mut conn, &increment_request(5));
     assert_eq!(ack[0], KIND_RESP_ACK, "the resend is taken");
@@ -167,7 +108,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
     // --- Replay: the journal holds only what the client was told. ---
     let restart_config = ServerConfig {
         journal: primary_journal,
-        authorized_keys: auth_path.clone(),
+        authorized_keys: fx.auth_path.clone(),
         standalone: true,
         ack_policy: AckPolicy::Disk,
         cores: PipelineCores::unpinned(),
@@ -177,9 +118,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
         ..melin_test_node::config()
     };
     let restarted = spawn_node(&addrs(0), restart_config);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut conn = Connection::connect_by(restarted.addr(), &client_key, deadline)
-        .expect("client connects to the restarted primary");
+    let mut conn = fx.client(&restarted);
     let replayed = value_of(&mut conn);
     drop(conn);
     restarted.stop();
@@ -188,4 +127,111 @@ fn a_write_refused_while_halted_is_not_replayed() {
         replayed, 6,
         "replay applied a write the halted primary refused"
     );
+}
+
+/// Writes pipelined on their own connection until `stop`: a burst, then
+/// every reply to it. Returns how many requests were answered, and the
+/// error that ended the stream, if one did. A node that leaves a request
+/// unanswered past the client's read timeout ends it with `NoReply`.
+fn pipelined_writer(
+    fx: &Fixture,
+    node: &melin_test_node::Node,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<(u64, Option<String>)> {
+    const BURST: usize = 32;
+    let mut conn = fx.client(node);
+    conn.set_read_timeout(Duration::from_secs(10))
+        .expect("set the read timeout");
+    std::thread::spawn(move || {
+        let mut answered = 0;
+        while !stop.load(Ordering::Relaxed) {
+            for _ in 0..BURST {
+                if let Err(e) = conn.send(&increment_request(1)) {
+                    return (answered, Some(e.to_string()));
+                }
+            }
+            let mut ends = 0;
+            while ends < BURST {
+                match conn.next_frame() {
+                    Ok(Frame::BatchEnd) => ends += 1,
+                    Ok(_) => {}
+                    Err(e) => return (answered, Some(e.to_string())),
+                }
+            }
+            answered += BURST as u64;
+        }
+        (answered, None)
+    })
+}
+
+/// Under `disk` the primary's own journal confirms every reply, so a
+/// primary that loses its replica at load keeps answering: the writes in
+/// flight, the refusals after them, and queries. Its own persisted cursor
+/// keeps passing the ticks it journals with no replica attached (a stall
+/// there, masked while a replica's acks satisfied `disk`, was the leading
+/// hypothesis for a hang reported under this policy).
+#[test]
+fn a_disk_primary_keeps_answering_once_its_replica_is_gone() {
+    let fx = Fixture::new(0x91);
+    let primary_addrs = addrs(0);
+    let mut primary_config = fx.primary_config(&primary_addrs, AckPolicy::Disk);
+    // Ticks on, and frequent: a halted node keeps journaling them.
+    primary_config.tick_interval_ms = 5;
+    let health = primary_config.health_bind.expect("set by the fixture");
+
+    let primary = spawn_node(&primary_addrs, primary_config);
+    let replica = spawn_node(
+        &addrs(1),
+        fx.replica_config("replica", &primary_addrs, AckPolicy::Disk),
+    );
+    wait_for_gauge(health, "melin_replicas_connected", 1);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..2)
+        .map(|_| pipelined_writer(&fx, &primary, Arc::clone(&stop)))
+        .collect();
+    // At load when the replica goes.
+    std::thread::sleep(Duration::from_millis(300));
+    replica.stop();
+    wait_for_gauge(health, "melin_replicas_connected", 0);
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::Relaxed);
+    for writer in writers {
+        let (answered, error) = writer.join().expect("writer thread");
+        assert_eq!(
+            error, None,
+            "a writer's stream ended after {answered} answered requests"
+        );
+    }
+
+    // The primary's own persisted cursor passes the ticks it journals
+    // alone.
+    let alone = gauge(health, "melin_journal_sequence").expect("health is up");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while gauge(health, "melin_journal_sequence").is_none_or(|seq| seq <= alone) {
+        assert!(
+            Instant::now() < deadline,
+            "the primary's persisted cursor stopped at {alone} with no replica attached"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut conn = fx.client(&primary);
+    conn.set_read_timeout(Duration::from_secs(5))
+        .expect("set the read timeout");
+    let before = value_of(&mut conn);
+    assert_eq!(
+        one_reply(&mut conn, &increment_request(1))[0],
+        KIND_RESP_REJECTED,
+        "halted: the write is refused"
+    );
+    let reply = one_reply(&mut conn, &GET_VALUE_REQUEST);
+    assert_eq!(
+        u64::from_le_bytes(reply[1..9].try_into().expect("8 bytes")),
+        before,
+        "the query behind a refusal answers, and the refusal applied nothing"
+    );
+
+    drop(conn);
+    primary.stop();
 }
