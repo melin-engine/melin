@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
-use melin_client::{ByteStream, Frame, PolledConnection};
+use melin_client::{Ack, ByteStream, Frame, PolledConnection};
 
 use crate::app::App;
 
@@ -149,10 +149,18 @@ pub fn run<S: Streams>(
                                 .map_err(|e| format!("histogram: {e}"))?;
                         }
                     }
-                    Frame::BatchEnd => {
+                    Frame::BatchEnd(Ack::Policy) => {
                         client.replied = client.replied.checked_sub(1).ok_or_else(|| {
                             format!("client {id}: a batch ended with no reply in it")
                         })?;
+                    }
+                    // Not the sequencer's latency: the primary lost its
+                    // replica mid-run and answered on its own disk.
+                    Frame::BatchEnd(Ack::PrimaryOnly) => {
+                        return Err(format!(
+                            "client {id}: a reply backed by the primary's disk alone \
+                             (the primary lost its replica mid-run)"
+                        ));
                     }
                     Frame::ServerBusy => return Err(format!("client {id}: the server is busy")),
                     Frame::EngineError => {

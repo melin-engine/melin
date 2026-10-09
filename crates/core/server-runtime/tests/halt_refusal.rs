@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use counter_server::{
     GET_VALUE_REQUEST, KIND_RESP_ACK, KIND_RESP_REJECTED, KIND_RESP_VALUE, increment_request,
 };
-use melin_client::{Connection, Frame};
+use melin_client::{Ack, Connection, Frame};
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
@@ -153,7 +153,12 @@ fn pipelined_writer(
             let mut ends = 0;
             while ends < BURST {
                 match conn.next_frame() {
-                    Ok(Frame::BatchEnd) => ends += 1,
+                    Ok(Frame::BatchEnd(Ack::Policy)) => ends += 1,
+                    // Under `disk` the policy is met by the primary's own
+                    // journal: nothing is ever weaker than it.
+                    Ok(Frame::BatchEnd(Ack::PrimaryOnly)) => {
+                        return (answered, Some("a degraded ack under disk".into()));
+                    }
                     Ok(_) => {}
                     Err(e) => return (answered, Some(e.to_string())),
                 }

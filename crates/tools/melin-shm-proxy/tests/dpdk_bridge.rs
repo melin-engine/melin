@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use echo_server::{Echo, KIND_RESP_ECHO, MAX_PAYLOAD, RequestDecoder, ResponseEncoder};
 use melin_client::framing::split_frame;
 use melin_client::{
-    Connection, Handshake, Reply, RequestFrameError, SigningKey, Step, classify, frame_request, key,
+    Ack, Connection, Handshake, Reply, RequestFrameError, SigningKey, Step, classify,
+    frame_request, key,
 };
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
@@ -633,7 +634,7 @@ fn next_reply(link: &mut Link, proxy: &mut Proxy) -> Vec<u8> {
         match classify(&payload) {
             Ok(Reply::Response(body)) => frames.push(body.to_vec()),
             Ok(Reply::Heartbeat) => {}
-            Ok(Reply::BatchEnd) => break,
+            Ok(Reply::BatchEnd(Ack::Policy)) => break,
             other => proxy.fail(&format!("a reply frame of {other:?}")),
         }
     }

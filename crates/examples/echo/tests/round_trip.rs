@@ -677,7 +677,7 @@ fn drive_streams(
     limit: Duration,
     done: impl Fn(&HandleStream) -> bool,
 ) -> usize {
-    use melin_client::Frame;
+    use melin_client::{Ack, Frame};
 
     let clock = nic.clock();
     let deadline = Instant::now() + limit;
@@ -719,7 +719,7 @@ fn drive_streams(
                 match frame {
                     None => break,
                     Some(Frame::Response(body)) => stream.replies.push(body.to_vec()),
-                    Some(Frame::BatchEnd) => stream.answered += 1,
+                    Some(Frame::BatchEnd(Ack::Policy)) => stream.answered += 1,
                     Some(other) => panic!("stream {index}: {other:?}"),
                 }
             }
