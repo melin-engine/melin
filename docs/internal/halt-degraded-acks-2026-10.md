@@ -18,7 +18,14 @@ way, and refusals stop waiting behind either.
   `ReplicaDisconnected` once the replica count is zero, under every
   policy, `disk` included. The module doc's rationale ("it can no longer
   promise what the ack policy promises") does not hold for `disk`, which
-  the primary's fsync alone satisfies.
+  the primary's fsync alone satisfies. Under `disk` the halt does a
+  different job: it is the only thing that stops a primary a partition
+  has cut off from its replica (see the next bullet).
+- **Fencing is contact-based, and there is no lease.** A serving node is
+  fenced only when it hears from a node that observed a promotion. The
+  raft mesh carries that signal only under auto-promotion
+  (`server-runtime/src/raft.rs`, `SupersessionPolicy`). A primary cut
+  off by a partition hears nothing until the partition heals.
 - **`ACK-POLICY disk` does not resume writes.** `docs/replication.md`
   ("Manual promotion") tells operators that a newly promoted primary
   with no replica can "send `ACK-POLICY disk` to resume writes under the
@@ -55,13 +62,14 @@ way, and refusals stop waiting behind either.
   report, primary + one replica, replica SIGKILLed, on 0.15.0, 0.16.0
   and `main` at `84d1b0eb`). There the primary's journal should confirm
   every slot, so something else is wrong. It is not explained by
-  anything above. The gate's wait loop re-reads every cursor on every
-  spin, so a gate that never re-evaluates is unlikely. The more
-  consistent hypothesis: `disk` is `persisted>=1`, satisfied by whichever
-  connected node fsynced furthest. While the replica is connected, its
-  acks can mask a primary journal cursor that stops advancing on a
-  tick-only batch. Killing the replica removes its cursor from the view
-  and exposes the stall.
+  anything above, and the cause is **not yet known**. The gate's wait
+  loop re-reads every cursor on every spin, which makes a gate that
+  never re-evaluates unlikely. An untested hypothesis that fits the
+  report: `disk` is `persisted>=1`, satisfied by whichever connected
+  node fsynced furthest, so while the replica is connected its acks
+  could mask a primary journal cursor that stops advancing on a
+  tick-only batch, and killing the replica would expose the stall. Step
+  1's test has to confirm or rule this out before anything is fixed.
 - **When a replica counts as gone depends on the transport.** On DPDK
   the primary drops a replica at the replication liveness deadline
   (`REPLICATION_LIVENESS`, `replication/dpdk.rs`). Kernel TCP has no
@@ -229,36 +237,58 @@ and refusals while still holding writes would need a response stage that
 parks each connection's gated reply separately, the redesign this plan
 avoids. That option is left to whoever asks for it.
 
-### 8. The halt follows the policy
+### 8. An explicit swap to `disk` lifts the halt
 
-`HaltGate::verdict` reads the active ack policy and halts only when the
-policy needs a replica and none is connected. Under `disk` a node never
-halts for want of a replica, whether it booted under `disk` or an
-operator swapped to it, so the manual-promotion playbook works as
-documented. An explicit swap is the operator's consent to single-copy
-durability, just as a degraded ack leaves the decision to the client.
+A node that loses its last replica halts under every policy, as today.
+An operator's `ACK-POLICY disk`, sent while the node has no replica,
+lifts the halt: it latches an override that the verdict reads beside
+the replica count. That is the consent the manual-promotion playbook
+already describes, and it makes the playbook work as documented. The
+latch clears when a replica reconnects or the policy is swapped back to
+one that needs a replica. After that, the next loss of the last replica
+halts the node again.
 
-The cost: a `disk` primary cut off from every replica keeps taking
-writes until fencing reaches it. That was already true while a replica
-was connected (`disk` never waited for one), and it is the exposure
-that a raft leader lease would close (see "Not part of this item").
+A swap made while a replica is still connected sets no latch. Consent
+counts only once the operator knows the node has none. So swapping to
+`disk` ahead of maintenance that takes the replica down does not stop
+the node from halting when the replica leaves; the operator swaps again
+once it has.
+
+Making the halt follow the policy value, so that `disk` never halts,
+was considered and rejected. The halt is what stops a `disk` primary a
+partition has cut off. Fencing reaches it only on contact (see "What
+the code shows"), so without the halt it would keep sequencing and
+sending full, unmarked acks for the whole partition while the other
+side promoted: two primaries acking different histories, with nothing
+marked. Whether an unattended, isolated primary should keep writing is
+the lease item's question (see "Not part of this item"). An operator's
+explicit swap answers it for one node, knowingly; a policy value set at
+boot does not.
 
 ## Order of work
 
-0. **The halt follows the policy (decision 8).** Make `verdict` read the
-   shared policy byte (one more relaxed load on the reader path),
-   update the `halt.rs` module doc, and correct `docs/replication.md`'s
-   halt section, which says the halt applies under every policy. Tests:
-   a `disk` node with no replica takes writes; a swap to `disk` lifts a
-   halt in progress; a swap back to a replica-backed policy with no
-   replica halts again. A bug fix on its own, landing first.
+0. **An explicit swap lifts the halt (decision 8).** The admin
+   `ACK-POLICY` handler sets the override latch when it swaps to `disk`
+   while no replica is connected. The replication senders clear it when a
+   replica starts streaming, and a swap to a replica-backed policy clears
+   it too. `verdict` reads it beside the replica count: one more relaxed
+   load on the reader path. Update the `halt.rs` module doc and
+   `docs/replication.md`'s halt and manual-promotion sections, and add a
+   `CHANGELOG.md` entry under **Changed**: operator-visible behavior
+   changes. Tests: a node under `disk` that loses its replica halts; a
+   swap to `disk` during the halt lifts it; a replica reconnecting
+   clears the latch, so its next departure halts the node again; a swap
+   back to a replica-backed policy with no replica halts again; a swap
+   to `disk` made while a replica is connected does not stop the halt
+   when it leaves. A bug fix on its own, landing first.
 1. **Root-cause the `disk` hang.** Write the failing test first: a
    primary and one replica started through `melin-test-node`, policy
    `disk`, replica killed, then a query that must answer within a
    deadline. Also assert directly that the primary's own persisted
-   cursor passes the last tick with no replica attached: the leading
-   hypothesis is that it stops advancing on tick-only batches, masked
-   until now by the replica's acks. Fix whatever the test shows. This is
+   cursor passes the last tick with no replica attached: the leading,
+   untested hypothesis is that it stops advancing on tick-only batches,
+   masked until now by the replica's acks. Fix whatever the test shows,
+   whether or not that is the hypothesis. This is
    a bug fix on its own and lands separately, ahead of the steps below.
 2. **The reply frame.** Add the tag in `melin-wire-protocol`, plus
    `Ack` and the changed `Frame` / `Reply` variants in `melin-client`,
@@ -313,8 +343,9 @@ its operator tooling should show. Its test harness hits the new
 - **A leader lease as the split-brain guard.** Replica count is a poor
   proxy for "still the primary". A lease from the raft control plane
   would let a primary that holds quorum keep writing and stop an
-  isolated one before the other side can promote. It would close the
-  exposure decision 8 accepts under `disk`, and it is what `degrade`
+  isolated one before the other side can promote. It is the real answer
+  to whether an isolated `disk` primary should keep writing unattended,
+  which decision 8 deliberately leaves alone, and it is what `degrade`
   above would need. It deserves its own item and design.
 - **A later "now confirmed" notice.** When a replica catches up, events
   that got degraded acks become fully durable, but their clients have
