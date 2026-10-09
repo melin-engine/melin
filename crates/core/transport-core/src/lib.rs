@@ -33,7 +33,7 @@ mod dispatch;
 pub mod fence;
 /// The replica-loss halt's shared state: the operator's override (a latch
 /// an explicit `ACK-POLICY disk` sets on a node with no replica
-/// connected).
+/// connected), and when the node last lost its last replica.
 pub mod halt_state;
 /// Health / liveness endpoint — plain TCP listener that serves a one-line
 /// status to Kubernetes probes, an HTTP-wrapped status to `GET /`, and a

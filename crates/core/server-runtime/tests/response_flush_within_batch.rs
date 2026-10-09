@@ -186,6 +186,7 @@ fn large_frame_batch_is_delivered_not_disconnected() {
         refusals: halt::refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1,
         ring_sizing: RingSizing::for_max_connections(1).expect("a supported cap"),
         ready: None,
+        degraded_release: None,
     };
 
     thread::scope(|scope| {

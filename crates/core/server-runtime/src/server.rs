@@ -300,6 +300,28 @@ pub struct ServerConfig {
     #[arg(long, value_enum, default_value_t = crate::ack_policy::AckPolicy::DiskAndRam)]
     pub ack_policy: crate::ack_policy::AckPolicy,
 
+    /// Keep a halted primary's held replies waiting for a replica.
+    ///
+    /// A primary that loses its last replica halts: it refuses new
+    /// writes. The replies it holds for the ack policy — writes it took
+    /// before the halt, and queries — cannot be confirmed by a replica
+    /// while none is connected. By default, once the halt has lasted
+    /// `--degraded-ack-grace-ms`, each is sent as soon as this node's own
+    /// journal holds it, ending in `BatchEndDegraded`: the client is told
+    /// only the primary's disk backs it. With this flag every such reply,
+    /// and every refusal and query queued behind one, waits for a replica
+    /// to return or the operator to swap the policy — strict fail-closed,
+    /// with clients seeing only their own read timeout.
+    #[arg(long, default_value_t = false)]
+    pub no_degraded_acks: bool,
+
+    /// How long, in milliseconds, a primary must have had no replica
+    /// before it answers held replies on its own disk (see
+    /// `--no-degraded-acks`). A replica that comes back within it, and
+    /// catches up, confirms them in full.
+    #[arg(long, default_value_t = crate::durability_gate::DEFAULT_DEGRADED_ACK_GRACE_MS)]
+    pub degraded_ack_grace_ms: u64,
+
     // --- DPDK configuration (only used with --features dpdk) ---
     /// DPDK EAL arguments (space-separated). Example: --dpdk-eal-args="-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
@@ -525,6 +547,8 @@ impl Default for ServerConfig {
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
             ack_policy: crate::ack_policy::AckPolicy::DiskAndRam,
+            no_degraded_acks: false,
+            degraded_ack_grace_ms: crate::durability_gate::DEFAULT_DEGRADED_ACK_GRACE_MS,
             dpdk_eal_args: String::new(),
             dpdk_peer_ip: None,
             dpdk_gateway_mac: None,
@@ -581,6 +605,24 @@ impl ServerConfig {
         self.snapshot_path
             .clone()
             .unwrap_or_else(|| self.journal.with_extension("snapshot"))
+    }
+
+    /// What the response stage needs to release a halted primary's held
+    /// replies on its own disk, or `None` when it must not: switched off
+    /// (`--no-degraded-acks`), or a standalone node (no replica count),
+    /// which never halts.
+    fn degraded_release(
+        &self,
+        halt_state: &Arc<melin_transport_core::halt_state::HaltState>,
+        replicas_connected: Option<&Arc<std::sync::atomic::AtomicU32>>,
+    ) -> Option<crate::halt::DegradedRelease> {
+        if self.no_degraded_acks || replicas_connected.is_none() {
+            return None;
+        }
+        Some(crate::halt::DegradedRelease {
+            halt_state: Arc::clone(halt_state),
+            grace: std::time::Duration::from_millis(self.degraded_ack_grace_ms),
+        })
     }
 
     /// Tick generator cadence as a `Duration`. Returns `None` when the tick
@@ -1825,6 +1867,7 @@ where
     // The stage's startup report — see `Response::ready`. Capacity one so
     // the report never blocks the stage on this thread reaching `recv`.
     let (response_ready_tx, response_ready_rx) = std::sync::mpsc::sync_channel(1);
+    let degraded_release = config.degraded_release(&halt_state, replicas_connected.as_ref());
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -1846,6 +1889,7 @@ where
                     refusals: refusal_rx,
                     ring_sizing,
                     ready: Some(response_ready_tx),
+                    degraded_release,
                     #[cfg(test)]
                     pause_after_control_drain: None,
                 },
@@ -3070,6 +3114,7 @@ where
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
+    let degraded_release = config.degraded_release(&halt_state, replicas_connected.as_ref());
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -3089,6 +3134,7 @@ where
                 wait,
                 encoder,
                 refusal_rx,
+                degraded_release,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;

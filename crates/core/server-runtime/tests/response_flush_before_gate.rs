@@ -98,6 +98,7 @@ fn config_for(journal_cursor: DurableWireSeqCursor) -> Response<Counter> {
         refusals: halt::refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1,
         ring_sizing: RingSizing::for_max_connections(1).expect("a supported cap"),
         ready: None,
+        degraded_release: None,
     }
 }
 

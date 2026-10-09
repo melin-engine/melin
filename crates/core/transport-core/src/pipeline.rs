@@ -147,6 +147,13 @@ pub struct StageUtilization {
     /// wasteful and `AtomicU128` isn't available anyway. Only written
     /// by the response stage; read by the health endpoint.
     pub policy_degraded_nanos: AtomicU64,
+    /// Cumulative replies terminated by `BatchEndDegraded`: released by a
+    /// node halted for want of a replica on its own journal's fsync,
+    /// weaker than the ack policy and marked so. One per request, never
+    /// per frame. Each is a client told that only this node's disk holds
+    /// its request, so any growth deserves an operator's attention. Only
+    /// used by the response stage.
+    pub degraded_acks: AtomicU64,
     /// Cumulative journal segment rotations (local triggers and
     /// primary-announced adoptions) that consumed a pre-staged segment
     /// from the background preparer — the fast path: two renames + a
@@ -196,6 +203,7 @@ impl StageUtilization {
             gate_replication: AtomicU64::new(0),
             policy_degraded: AtomicBool::new(false),
             policy_degraded_nanos: AtomicU64::new(0),
+            degraded_acks: AtomicU64::new(0),
             rotations_fast_path: AtomicU64::new(0),
             rotations_sync_fallback: AtomicU64::new(0),
             rotations_failed: AtomicU64::new(0),

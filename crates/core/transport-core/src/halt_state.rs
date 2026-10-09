@@ -1,4 +1,5 @@
-//! The replica-loss halt's shared state: the operator's override.
+//! The replica-loss halt's shared state: the operator's override, and
+//! when the node last lost its last replica.
 //!
 //! A primary whose last replica has left halts: it refuses new client
 //! writes, under every ack policy. Under `disk` the halt is not about the
@@ -23,9 +24,19 @@
 //! one node at one moment, made knowingly; whether an unattended,
 //! isolated primary should keep writing is a question for a leader lease,
 //! not for the policy value.
+//!
+//! # When the replicas went
+//!
+//! The response stage releases a halted node's held replies on the
+//! primary's own fsync once the halt has lasted a grace period, which
+//! starts when the replica count drops to zero. The replication senders
+//! stamp that moment here ([`HaltState::on_replica_leaving`](crate::halt_state::HaltState::on_replica_leaving)), so the
+//! grace is measured from the loss itself rather than from whenever the
+//! response stage next looks.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 /// What a policy swap did to the override. Returned so the admin handler
 /// can log, for the audit trail, whether the operator's swap lifted the
@@ -54,16 +65,18 @@ pub enum SwapEffect {
     },
 }
 
-/// The halt's shared state: the override latch and the replica count it
-/// is judged against. One per process, shared by the admin handler (sets
-/// and clears the latch), the replication senders (clear the latch), and
-/// the readers and the health endpoint (read the latch).
+/// The halt's shared state: the override latch, the replica count it is
+/// judged against, and when that count last dropped to zero. One per
+/// process, shared by the admin handler (sets and clears the latch), the
+/// replication senders (clear the latch, stamp a loss), the readers and
+/// the health endpoint (read the latch) and the response stage (reads the
+/// stamp).
 ///
 /// Atomics rather than anything heavier because the readers fold the
 /// latch into their per-receive halt check, and only when the replica
 /// count is already zero: one relaxed load on a path that is refusing
 /// writes anyway.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HaltState {
     /// The latch. Written with `SeqCst` (see [`HaltState::on_policy_swap`]),
     /// read `Relaxed` by the readers.
@@ -74,6 +87,24 @@ pub struct HaltState {
     /// on a replica too) holds this state; a node becomes a primary at
     /// most once per process.
     replicas_connected: OnceLock<Arc<AtomicU32>>,
+    /// When the replica count last dropped to zero, in nanoseconds since
+    /// `origin`, plus one; `0` when unknown (cleared by a replica joining).
+    /// `u64` nanoseconds rather than an `Instant`, which no atomic holds:
+    /// a `u64` of nanoseconds covers centuries of uptime.
+    last_lost: AtomicU64,
+    /// The zero of `last_lost`.
+    origin: Instant,
+}
+
+impl Default for HaltState {
+    fn default() -> Self {
+        Self {
+            lifted: AtomicBool::new(false),
+            replicas_connected: OnceLock::new(),
+            last_lost: AtomicU64::new(0),
+            origin: Instant::now(),
+        }
+    }
 }
 
 impl HaltState {
@@ -83,13 +114,17 @@ impl HaltState {
     }
 
     /// Attach the replica count of the pipeline this node now serves.
-    /// Called once, when the node starts serving as a replicated primary.
-    /// `Err` if a count is already attached: a node serves as a primary
-    /// once per process, so a second call is a bug in the caller.
+    /// Called once, when the node starts serving as a replicated primary,
+    /// with no replica connected yet: the node starts out halted, and the
+    /// grace period runs from here. `Err` if a count is already attached:
+    /// a node serves as a primary once per process, so a second call is a
+    /// bug in the caller.
     pub fn attach(&self, replicas_connected: Arc<AtomicU32>) -> Result<(), &'static str> {
         self.replicas_connected
             .set(replicas_connected)
-            .map_err(|_| "a replica count is already attached to the halt state")
+            .map_err(|_| "a replica count is already attached to the halt state")?;
+        self.stamp_loss();
+        Ok(())
     }
 
     /// Whether the operator's override is latched. One relaxed load: a
@@ -141,6 +176,66 @@ impl HaltState {
     /// (see [`on_policy_swap`](Self::on_policy_swap)).
     pub fn on_replica_streaming(&self) -> bool {
         self.lifted.swap(false, Ordering::SeqCst)
+    }
+
+    /// A replica has joined the count: forget the last loss. Called by the
+    /// replication senders right after they increment the count, so a
+    /// later loss is never measured from an earlier one's stamp.
+    pub fn on_replica_joined(&self) {
+        self.last_lost.store(0, Ordering::Relaxed);
+    }
+
+    /// A replica is about to leave the count: stamp the moment, in case
+    /// it is the last. Called by the replication senders right *before*
+    /// they decrement the count (with `Release`), so a reader that sees
+    /// the count at zero (with `Acquire`) sees this stamp or a later one,
+    /// never an earlier loss's. A stamp left by a replica that was not
+    /// the last is harmless: nothing reads it while the count is above
+    /// zero, and the next join clears it.
+    pub fn on_replica_leaving(&self) {
+        self.stamp_loss();
+    }
+
+    fn stamp_loss(&self) {
+        // Saturated rather than an error: `u64` nanoseconds overflow only
+        // after centuries of uptime, and the stamp then still reads as a
+        // halt that began long ago.
+        let since_origin = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
+        self.last_lost.store(since_origin + 1, Ordering::Relaxed);
+    }
+
+    /// Whether this node serves as a replicated primary with no replica
+    /// connected. One `Acquire` load once attached: a reader that sees
+    /// the count at zero sees the leaving replica's stamp too (see
+    /// [`on_replica_leaving`](Self::on_replica_leaving)).
+    #[inline]
+    pub fn no_replica(&self) -> bool {
+        self.replicas_connected
+            .get()
+            .is_some_and(|count| count.load(Ordering::Acquire) == 0)
+    }
+
+    /// How long this replicated primary has had no replica connected, or
+    /// `None` while it has one (or is not a replicated primary). The
+    /// halt as the count alone defines it: the operator's override, which
+    /// only ever stands beside the `disk` policy, does not change it.
+    ///
+    /// When the moment of the loss is unknown (a join cleared the stamp
+    /// after the leaving replica wrote it), the halt is reported as having
+    /// just begun, which errs towards a longer wait. A caller that polls
+    /// keeps the earliest start it has seen, so that the halt's age still
+    /// grows from its first observation.
+    #[inline]
+    pub fn halted_for(&self, now: Instant) -> Option<Duration> {
+        if !self.no_replica() {
+            return None;
+        }
+        let stamp = self.last_lost.load(Ordering::Relaxed);
+        if stamp == 0 {
+            return Some(Duration::ZERO);
+        }
+        let lost_at = self.origin + Duration::from_nanos(stamp - 1);
+        Some(now.saturating_duration_since(lost_at))
     }
 
     /// Whether a replicated primary with `replicas_connected` replicas is
@@ -223,6 +318,7 @@ mod tests {
         let state = HaltState::new();
         assert_eq!(state.on_policy_swap(true), SwapEffect::NotServing);
         assert!(!state.is_lifted());
+        assert_eq!(state.halted_for(Instant::now()), None);
     }
 
     #[test]
@@ -235,5 +331,53 @@ mod tests {
     fn a_second_attach_is_refused() {
         let (state, _) = attached(0);
         assert!(state.attach(Arc::new(AtomicU32::new(0))).is_err());
+    }
+
+    /// A primary that starts with no replica is halted from the attach.
+    #[test]
+    fn the_halt_is_timed_from_the_attach_on_a_node_that_starts_alone() {
+        let before = Instant::now();
+        let (state, _) = attached(0);
+        let later = before + Duration::from_secs(5);
+        let halted_for = state.halted_for(later).expect("no replica");
+        assert!(halted_for <= Duration::from_secs(5), "{halted_for:?}");
+        assert!(
+            halted_for >= Duration::from_secs(4),
+            "timed from the attach, not from later: {halted_for:?}"
+        );
+    }
+
+    #[test]
+    fn the_halt_is_timed_from_the_last_replica_leaving() {
+        let (state, replicas) = attached(0);
+        replicas.fetch_add(1, Ordering::SeqCst);
+        state.on_replica_joined();
+        assert_eq!(state.halted_for(Instant::now()), None, "a replica is up");
+
+        std::thread::sleep(Duration::from_millis(20));
+        state.on_replica_leaving();
+        let left = Instant::now();
+        replicas.fetch_sub(1, Ordering::Release);
+        let halted_for = state
+            .halted_for(left + Duration::from_secs(3))
+            .expect("no replica");
+        assert!(
+            halted_for >= Duration::from_secs(3) && halted_for < Duration::from_secs(4),
+            "{halted_for:?}"
+        );
+    }
+
+    /// A join clears the stamp, so a loss whose stamp has not landed yet
+    /// reads as a halt that just began, never as an earlier loss's.
+    #[test]
+    fn an_unknown_loss_reads_as_a_halt_that_just_began() {
+        let (state, replicas) = attached(0);
+        replicas.fetch_add(1, Ordering::SeqCst);
+        state.on_replica_joined();
+        replicas.fetch_sub(1, Ordering::Release);
+        assert_eq!(
+            state.halted_for(Instant::now() + Duration::from_secs(60)),
+            Some(Duration::ZERO)
+        );
     }
 }

@@ -22,7 +22,7 @@ use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
 
 use crate::ack_policy::{Blocker, CursorView, EvalStatus, MAX_CLUSTER_SIZE, Policy};
-use crate::durability_gate::{DurabilityGate, GateInputs, GateOutcome};
+use crate::durability_gate::{Backing, BatchEnds, DurabilityGate, GateInputs, GateOutcome};
 use crate::halt::{Refusal, RefusalQueue};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
@@ -214,6 +214,10 @@ pub struct Response<A: Application> {
     /// learns the outcome before it carries on. `None` when nobody waits
     /// for it; a creation failure is then only logged.
     pub ready: Option<mpsc::SyncSender<std::io::Result<()>>>,
+    /// Release of held replies on this node's own fsync while it is
+    /// halted for want of a replica; `None` when off. See
+    /// [`crate::halt::DegradedRelease`].
+    pub degraded_release: Option<crate::halt::DegradedRelease>,
     /// Test seam: called once per iteration right after the control
     /// channel has been drained, so a test can hold the stage there and
     /// choose what lands while it waits. The drain runs after the
@@ -295,6 +299,7 @@ pub fn run<A: Application>(
         mut refusals,
         ring_sizing,
         ready,
+        degraded_release,
         #[cfg(test)]
         mut pause_after_control_drain,
     } = config;
@@ -340,6 +345,7 @@ pub fn run<A: Application>(
             replica_active,
             utilization: Arc::clone(&utilization),
             wait,
+            degraded_release,
         },
         "response",
     );
@@ -488,17 +494,12 @@ pub fn run<A: Application>(
         buf[..written].to_vec()
     };
 
-    // Pre-encode the BatchEnd terminator once. Unlike the two above this
-    // one is on the hot path — every request ends with it — and its
-    // bytes are a constant, so re-encoding it per request was pure
-    // overhead.
-    let batch_end_wire_frame = {
-        let mut buf = [0u8; 8];
-        let written =
-            control_codec::encode_transport_response(&TransportResponse::BatchEnd, &mut buf)
-                .expect("BatchEnd encodes");
-        buf[..written].to_vec()
-    };
+    // Pre-encode the two request terminators once. Unlike the two above
+    // these are on the hot path — every request ends with one — and their
+    // bytes are constants, so re-encoding per request was pure overhead.
+    // A refusal always ends in the plain one: it is a definite answer,
+    // with nothing on any disk to qualify.
+    let batch_ends = BatchEnds::new();
 
     // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.
     let mut last_heartbeat_scan = Instant::now();
@@ -663,7 +664,7 @@ pub fn run<A: Application>(
                         &*encoder,
                         &mut connections,
                         &mut encode_buf,
-                        &batch_end_wire_frame,
+                        &batch_ends.policy,
                         now,
                         &mut dirty_connections,
                         &mut to_remove,
@@ -894,7 +895,7 @@ pub fn run<A: Application>(
                         &*encoder,
                         &mut connections,
                         &mut encode_buf,
-                        &batch_end_wire_frame,
+                        &batch_ends.policy,
                         batch_now,
                         &mut dirty_connections,
                         &mut to_remove,
@@ -916,6 +917,10 @@ pub fn run<A: Application>(
             #[cfg(feature = "tick-to-trade")]
             let mut gate_tracker = GateCrossTracker::new(slot.wire_seq);
 
+            // What backs this slot's reply: the policy, unless the gate
+            // held it and then released it on this node's own fsync
+            // while halted (see `DurabilityGate`).
+            let mut backing = Backing::Policy;
             if gate.needs_wait(slot) {
                 // Drain buffered sends before blocking, never after.
                 //
@@ -973,13 +978,14 @@ pub fn run<A: Application>(
                 // confirmed, is not appended, and the rest of the batch
                 // goes with it. Those clients see a reset, as after a
                 // crash, and reconcile on reconnect.
-                if let GateOutcome::Shutdown = gate.wait_durable(
+                match gate.wait_durable(
                     slot.wire_seq,
                     shutdown,
                     #[cfg(feature = "tick-to-trade")]
                     &mut gate_tracker,
                 ) {
-                    continue 'run;
+                    GateOutcome::Open(released) => backing = released,
+                    GateOutcome::Shutdown => continue 'run,
                 }
             }
 
@@ -1012,10 +1018,11 @@ pub fn run<A: Application>(
                 // handles them via `is_last_in_request`.
                 let payload_result = encode_slot_payload(&slot.payload, &*encoder, &mut encode_buf);
 
-                // Frame 2: the pre-encoded BatchEnd terminator, appended
-                // with the payload in one call.
+                // Frame 2: the pre-encoded terminator, `BatchEnd` or
+                // `BatchEndDegraded` as the slot is backed, appended with
+                // the payload in one call.
                 let trailer: &[u8] = if slot.is_last_in_request {
-                    &batch_end_wire_frame
+                    gate.batch_end(backing, &batch_ends)
                 } else {
                     &[]
                 };
@@ -3729,6 +3736,7 @@ mod tests {
                 ring_sizing: crate::connection_limit::RingSizing::for_max_connections(1)
                     .expect("a supported cap"),
                 ready: None,
+                degraded_release: None,
                 pause_after_control_drain: Some(Box::new(pause)),
             };
 
@@ -4048,7 +4056,7 @@ mod tests {
             (event, client_sock)
         }
 
-        fn refusal(connection_id: u64, input_seq: u64) -> Refusal<CounterReport> {
+        pub(super) fn refusal(connection_id: u64, input_seq: u64) -> Refusal<CounterReport> {
             Refusal {
                 connection_id,
                 input_seq,
@@ -4078,8 +4086,133 @@ mod tests {
                 ring_sizing: crate::connection_limit::RingSizing::for_max_connections(4)
                     .expect("a supported cap"),
                 ready: None,
+                degraded_release: None,
                 pause_after_control_drain,
             }
+        }
+    }
+
+    /// A halted node past the grace period answers a held write once its
+    /// own journal holds it, ending in `BatchEndDegraded`, and the
+    /// refusals around it keep their place and end in a plain `BatchEnd`.
+    /// With the switch off the held write, and the refusal behind it, wait.
+    mod degraded_release {
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+        use std::time::Duration;
+
+        use counter_server::{
+            Counter, CounterQuery, CounterReport, KIND_RESP_ACK, KIND_RESP_REJECTED,
+        };
+        use melin_pipeline::padding::CachePadded;
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_pipeline::wait::WaitStrategy;
+        use melin_transport_core::fence::FenceState;
+        use melin_transport_core::halt_state::HaltState;
+        use melin_transport_core::pipeline::{OutputPayload, OutputSlot};
+        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+        use melin_wire_protocol::control_codec::{TAG_BATCH_END, TAG_BATCH_END_DEGRADED};
+
+        use super::refusal_order::{Seen, config, connection, read_frame, refusal};
+        use crate::ack_policy::AckPolicy;
+        use crate::halt::{DegradedRelease, refusal_channel};
+        use crate::replication::ReplicationMetrics;
+        use crate::response::run;
+
+        /// Run a stage under `disk+ram` on a primary whose one replica is
+        /// gone, with degraded release `on` (no grace) or off, holding one
+        /// write the primary's journal already holds between two
+        /// refusals. Returns what the client read before `quiet` passed
+        /// with nothing more.
+        fn run_halted(on: bool, quiet: Duration) -> Vec<Seen> {
+            let (mut producer, mut consumers) =
+                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                    .add_consumer()
+                    .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+            let (connected, mut client) = connection(1);
+            let matching_progress = Arc::new(CachePadded::new(AtomicU64::new(0)));
+            let (mut refusals, refusal_rx) = refusal_channel(Arc::clone(&matching_progress));
+
+            let halt_state = Arc::new(HaltState::new());
+            halt_state
+                .attach(Arc::new(AtomicU32::new(0)))
+                .expect("first attach");
+            let journal_cursor = DurableWireSeqCursor::detached(WireSeq::new(1));
+            let mut config = config(
+                journal_cursor,
+                Arc::new(FenceState::new(0)),
+                refusal_rx,
+                None,
+            );
+            config.ack_policy = Arc::new(AtomicU8::new(AckPolicy::DiskAndRam.as_u8()));
+            config.replication_metrics = Some(Arc::new(ReplicationMetrics::default()));
+            config.replica_active = Some([
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ]);
+            config.degraded_release = on.then(|| DegradedRelease {
+                halt_state,
+                grace: Duration::ZERO,
+            });
+
+            let (control_tx, control_rx) = mpsc::channel();
+            control_tx.send(connected).expect("channel open");
+            refusals.try_send(refusal(1, 0)).expect("queue has room");
+            refusals.try_send(refusal(1, 1)).expect("queue has room");
+            refusals.flush();
+            producer.publish(OutputSlot {
+                connection_id: 1,
+                input_seq: 0,
+                wire_seq: 1,
+                payload: OutputPayload::Report(CounterReport::Ack { new_value: 7 }),
+                is_last_in_request: true,
+                ..Default::default()
+            });
+            matching_progress.get().store(1, Ordering::Release);
+
+            let shutdown = AtomicBool::new(false);
+            let mut seen = Vec::new();
+            thread::scope(|scope| {
+                let stage = scope.spawn(|| run::<Counter>(consumer, control_rx, config, &shutdown));
+                client
+                    .set_read_timeout(Some(quiet))
+                    .expect("set read timeout");
+                while let Ok(frame) = read_frame(&mut client) {
+                    seen.push(frame);
+                }
+                shutdown.store(true, Ordering::Relaxed);
+                stage.join().expect("stage panicked");
+            });
+            seen
+        }
+
+        #[test]
+        fn a_held_write_is_answered_degraded_and_refusals_end_in_a_plain_batch_end() {
+            let seen = run_halted(true, Duration::from_millis(500));
+            assert_eq!(
+                seen,
+                [
+                    Seen::App(KIND_RESP_REJECTED),
+                    Seen::Protocol(TAG_BATCH_END),
+                    Seen::App(KIND_RESP_ACK),
+                    Seen::Protocol(TAG_BATCH_END_DEGRADED),
+                    Seen::App(KIND_RESP_REJECTED),
+                    Seen::Protocol(TAG_BATCH_END),
+                ],
+                "in request order, only the held write marked"
+            );
+        }
+
+        #[test]
+        fn with_the_switch_off_the_held_write_and_the_refusal_behind_it_wait() {
+            let seen = run_halted(false, Duration::from_millis(300));
+            assert_eq!(
+                seen,
+                [Seen::App(KIND_RESP_REJECTED), Seen::Protocol(TAG_BATCH_END)],
+                "only the refusal ahead of the held write goes out"
+            );
         }
     }
 

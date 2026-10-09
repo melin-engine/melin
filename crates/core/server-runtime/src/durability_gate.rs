@@ -9,6 +9,26 @@
 //! remembered in the other. What differs between the two stages is
 //! egress (socket buffers vs. the poll thread's TX rings); what a reply
 //! waits *for* does not, so it lives here once.
+//!
+//! # Degraded release
+//!
+//! A primary halted for want of a replica cannot meet a policy that needs
+//! one, so the replies it holds — writes it had sequenced before the
+//! halt, and queries, whose answers may reflect them — would wait for a
+//! replica to come back. Once the halt has lasted a grace period, the
+//! gate releases a held slot on a second, weaker condition: the slot's
+//! event is fsynced on the primary's own journal. Such a reply goes out
+//! with `BatchEndDegraded` ([`Backing::PrimaryOnly`]) instead of
+//! `BatchEnd`, so the client knows only the primary's disk backs it.
+//!
+//! The policy is always evaluated first, on every slot, and a slot it
+//! confirms is a full reply. The degraded release keeps a position of its
+//! own and never writes the cached durable position: were it to, every
+//! later slot would pass the cached check without waiting and go out with
+//! a full `BatchEnd`, an ack the policy never gave. The release is driven
+//! by the halt (no replica connected), never by gate lag: a connected
+//! replica that is merely slow is backpressure, and its replies wait.
+//! It is an operator switch, on by default ([`DegradedRelease`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -20,8 +40,11 @@ use melin_transport_core::DurableWireSeqCursor;
 use melin_transport_core::pipeline::{OutputSlot, StageUtilization};
 #[cfg(feature = "tick-to-trade")]
 use melin_transport_core::trace;
+use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control_codec;
 
 use crate::ack_policy::{AckPolicy, Blocker, Policy};
+use crate::halt::DegradedRelease;
 use crate::replication::ReplicationMetrics;
 use crate::response::{DegradationLogger, evaluate_durability, evaluate_gate, slot_needs_gate};
 #[cfg(feature = "tick-to-trade")]
@@ -47,16 +70,66 @@ const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// one per iteration once the waiter has fallen back to yielding.
 const GATE_ACCRUAL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long a node must have been halted for want of a replica before
+/// the gate releases held replies on the primary's own fsync, unless the
+/// operator sets `--degraded-ack-grace-ms`.
+///
+/// Long enough that a replica dropped by a short blip, which reconnects
+/// and catches up within it, confirms the held replies in full rather
+/// than turning them into degraded ones: a replica's first reconnect
+/// attempt comes a second after it loses its primary. Short enough that
+/// clients of a primary that has really lost its replicas are answered
+/// well inside a typical client timeout. A constant of its own, not the
+/// DPDK replication liveness deadline: kernel TCP has no such deadline,
+/// and the halt itself, which starts the grace, already comes after it.
+pub(crate) const DEFAULT_DEGRADED_ACK_GRACE_MS: u64 = 2_000;
+
+/// What backs a reply the gate released, and so which terminator its
+/// request gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backing {
+    /// The ack policy in force confirmed the slot's event: `BatchEnd`.
+    Policy,
+    /// Released while halted past the grace period, on the primary's own
+    /// fsync alone: `BatchEndDegraded`.
+    PrimaryOnly,
+}
+
 /// How a durability wait ended.
 #[must_use]
 pub(crate) enum GateOutcome {
-    /// The slot's event is durable under the policy in force; its reply
-    /// may be sent.
-    Open,
+    /// The slot's reply may be sent, backed as given.
+    Open(Backing),
     /// Shutdown was requested while the gate was closed. The reply the
     /// policy never confirmed must not be sent; the caller goes straight
     /// back to its shutdown branch.
     Shutdown,
+}
+
+/// The two pre-encoded request terminators, full wire frames (length
+/// prefix and tag), shared by both stages. Encoded once at startup:
+/// every request ends with one, and picking one of two buffers in hand
+/// costs nothing on the normal path.
+pub(crate) struct BatchEnds {
+    /// `BatchEnd`: backed as the policy requires.
+    pub policy: Vec<u8>,
+    /// `BatchEndDegraded`: backed by the primary's disk alone.
+    pub primary_only: Vec<u8>,
+}
+
+impl BatchEnds {
+    pub(crate) fn new() -> Self {
+        let encode = |response| {
+            let mut buf = [0u8; 8];
+            let written = control_codec::encode_transport_response(&response, &mut buf)
+                .expect("a tag-only control frame encodes into eight bytes");
+            buf[..written].to_vec()
+        };
+        Self {
+            policy: encode(TransportResponse::BatchEnd),
+            primary_only: encode(TransportResponse::BatchEndDegraded),
+        }
+    }
 }
 
 /// The cursors and shared state the gate reads. Grouped so the two
@@ -85,6 +158,8 @@ pub(crate) struct GateInputs {
     pub utilization: Arc<StageUtilization>,
     /// How the gate waits on the journal-disk and replication threads.
     pub wait: WaitStrategy,
+    /// Degraded release while halted; `None` when off (or standalone).
+    pub degraded_release: Option<DegradedRelease>,
 }
 
 /// The durability gate and the ack-policy state it evaluates against.
@@ -113,6 +188,18 @@ pub(crate) struct DurabilityGate {
     /// `Instant::now()`; the amortized mask only reads the clock once per
     /// ~65 k cumulative spin iterations.
     accrual_timer: AmortizedTimer,
+    /// Highest wire seq released on the primary's own fsync while
+    /// halted — the degraded release's own position. Never folded into
+    /// `cached_durable_pos`: see the module docs. `u64`, like that cache,
+    /// because it is compared against `OutputSlot::wire_seq`.
+    degraded_pos: u64,
+    /// When the current halt began: the latest loss's stamp, or the
+    /// earliest sighting when the stamp is missing (see
+    /// `HaltState::halted_for`); `None` while a replica is connected.
+    halt_started: Option<Instant>,
+    /// The degraded release is under way: the halt has outlasted the
+    /// grace period. Kept for the `warn!` on entering and leaving it.
+    releasing_degraded: bool,
 }
 
 impl DurabilityGate {
@@ -160,7 +247,101 @@ impl DurabilityGate {
             degraded_logger,
             last_policy_check: now,
             accrual_timer: AmortizedTimer::new(),
+            degraded_pos: 0,
+            halt_started: None,
+            releasing_degraded: false,
         }
+    }
+
+    /// The terminator for the request `backing` closes, from `ends`.
+    /// Counts each degraded one for `melin_degraded_acks_total`: called
+    /// once per request (on its last slot), by both stages.
+    #[inline]
+    pub(crate) fn batch_end<'e>(&self, backing: Backing, ends: &'e BatchEnds) -> &'e [u8] {
+        match backing {
+            Backing::Policy => &ends.policy,
+            Backing::PrimaryOnly => {
+                self.inputs
+                    .utilization
+                    .degraded_acks
+                    .fetch_add(1, Ordering::Relaxed);
+                &ends.primary_only
+            }
+        }
+    }
+
+    /// Whether the degraded release is open now: degraded release on, no
+    /// replica connected, a policy that needs one, and the halt older than
+    /// the grace period. Also tracks the halt's start and logs entering
+    /// and leaving the release.
+    ///
+    /// One acquire load while a replica is connected (the normal path,
+    /// where this runs only once the policy has already failed a slot); a
+    /// clock read on top while halted.
+    fn degraded_release_open(&mut self) -> bool {
+        let Some(release) = self.inputs.degraded_release.as_ref() else {
+            return false;
+        };
+        let halted = release.halt_state.no_replica();
+        let started = if halted {
+            let now = Instant::now();
+            // `None` only if a replica joined since the load above: the
+            // halt is ending, and reads as one that has just begun.
+            let halted_for = release.halt_state.halted_for(now).unwrap_or(Duration::ZERO);
+            // An `Instant` before the process's clock origin is not
+            // representable; such a halt began at the origin at the
+            // latest, and `now` is no later than that by much.
+            let stamped = now.checked_sub(halted_for).unwrap_or(now);
+            // A non-zero age comes from the loss's own stamp, which is
+            // authoritative: it is the *latest* loss, so a replica that
+            // joined and left again between two of the gate's looks
+            // (unseen while idle, checked once a second) restarts the
+            // grace period, as documented. Only a zero age — the stamp
+            // went missing (see `HaltState::halted_for`), or the halt has
+            // just begun — falls back to the earliest start seen, so a
+            // halt whose stamp was cleared still ages from its first
+            // sighting.
+            let started = if halted_for.is_zero() {
+                self.halt_started.map_or(stamped, |seen| seen.min(stamped))
+            } else {
+                stamped
+            };
+            self.halt_started = Some(started);
+            Some((now, started))
+        } else {
+            self.halt_started = None;
+            None
+        };
+        // Under a policy the primary's own disk satisfies (`disk`), the
+        // policy itself confirms on the same cursor: nothing is weaker
+        // than it, and there is nothing to release.
+        let open = match started {
+            Some((now, started)) if self.active_policy.needs_replica() => {
+                now.saturating_duration_since(started) >= release.grace
+            }
+            _ => false,
+        };
+        if !open && self.releasing_degraded {
+            self.releasing_degraded = false;
+            tracing::warn!(
+                stage = self.stage,
+                policy = self.active_policy.as_str(),
+                replica_connected = !halted,
+                "degraded release stopped: held replies wait for the ack policy again"
+            );
+        }
+        if open && !self.releasing_degraded {
+            self.releasing_degraded = true;
+            tracing::warn!(
+                stage = self.stage,
+                policy = self.active_policy.as_str(),
+                grace_ms = release.grace.as_millis() as u64,
+                "no replica for the grace period: replies held for the ack policy are now \
+                 released once this node's own journal holds them, marked as backed by the \
+                 primary alone (BatchEndDegraded)"
+            );
+        }
+        open
     }
 
     /// Observe a runtime policy swap from the admin `ACK-POLICY` command.
@@ -350,7 +531,20 @@ impl DurabilityGate {
                     }
                     None => {}
                 }
-                return GateOutcome::Open;
+                return GateOutcome::Open(Backing::Policy);
+            }
+
+            // The policy has not confirmed the slot. While halted past
+            // the grace period, the primary's own fsync releases it,
+            // marked. Its position is the release's own: `cached_durable_pos`
+            // keeps what the policy confirmed, so the next slot is
+            // evaluated against the policy again rather than waved
+            // through on this weaker condition.
+            if self.degraded_release_open() {
+                self.degraded_pos = self.degraded_pos.max(journal_pos.get());
+                if self.degraded_pos >= needed {
+                    return GateOutcome::Open(Backing::PrimaryOnly);
+                }
             }
             gate_waiter.idle();
         }
@@ -382,6 +576,11 @@ impl DurabilityGate {
             DEGRADED_LOG_INTERVAL,
         );
         self.cached_durable_pos = status.durable_pos;
+        // Track the halt on a quiet node too, so entering and leaving the
+        // degraded release is logged when it happens rather than at the
+        // next held reply. Whether it is open matters only to a slot
+        // being held, and none is.
+        self.degraded_release_open();
     }
 
     /// Log degradation transitions / re-emit the reminder after a batch.
@@ -416,9 +615,11 @@ impl DurabilityGate {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
     use std::sync::mpsc;
 
     use melin_transport_core::WireSeq;
+    use melin_transport_core::halt_state::HaltState;
 
     use super::*;
 
@@ -436,6 +637,7 @@ mod tests {
             replica_active: None,
             utilization: Arc::new(StageUtilization::new()),
             wait: WaitStrategy::SpinThenYield,
+            degraded_release: None,
         };
         DurabilityGate::new(inputs, "test")
     }
@@ -458,8 +660,305 @@ mod tests {
             ]),
             utilization: Arc::new(StageUtilization::new()),
             wait: WaitStrategy::SpinThenYield,
+            degraded_release: None,
         };
         DurabilityGate::new(inputs, "test")
+    }
+
+    /// A replicated primary's gate and the levers a test pulls on it: the
+    /// journal cursor, one replica slot's cursors and active flag, and the
+    /// replica count the halt is judged on.
+    struct Primary {
+        gate: DurabilityGate,
+        journal: DurableWireSeqCursor,
+        metrics: Arc<ReplicationMetrics>,
+        active: Arc<AtomicBool>,
+        replicas: Arc<AtomicU32>,
+        halt_state: Arc<HaltState>,
+    }
+
+    impl Primary {
+        /// One replica slot, connected and caught up to `pos` when
+        /// `connected`, else gone (the node halted since the attach).
+        /// `grace` is the degraded release's, `None` for the switch off.
+        fn new(policy: AckPolicy, pos: u64, connected: bool, grace: Option<Duration>) -> Self {
+            let metrics = Arc::new(ReplicationMetrics::default());
+            let active = Arc::new(AtomicBool::new(connected));
+            let replicas = Arc::new(AtomicU32::new(u32::from(connected)));
+            if connected {
+                metrics.acked_sequence[0].store(pos, Ordering::Relaxed);
+                metrics.in_memory_sequence[0].store(pos, Ordering::Relaxed);
+            }
+            let halt_state = Arc::new(HaltState::new());
+            halt_state
+                .attach(Arc::clone(&replicas))
+                .expect("first attach");
+            let journal = DurableWireSeqCursor::detached(WireSeq::new(pos));
+            let inputs = GateInputs {
+                journal_persisted_wire_seq: journal.clone(),
+                ack_policy: Arc::new(AtomicU8::new(policy.as_u8())),
+                replication_metrics: Some(Arc::clone(&metrics)),
+                replica_active: Some([Arc::clone(&active), Arc::new(AtomicBool::new(false))]),
+                utilization: Arc::new(StageUtilization::new()),
+                wait: WaitStrategy::SpinThenYield,
+                degraded_release: grace.map(|grace| DegradedRelease {
+                    halt_state: Arc::clone(&halt_state),
+                    grace,
+                }),
+            };
+            Self {
+                gate: DurabilityGate::new(inputs, "test"),
+                journal,
+                metrics,
+                active,
+                replicas,
+                halt_state,
+            }
+        }
+
+        /// The replica leaves, as a sender records it.
+        fn replica_leaves(&self) {
+            self.halt_state.on_replica_leaving();
+            self.active.store(false, Ordering::Release);
+            self.replicas.fetch_sub(1, Ordering::Release);
+        }
+
+        /// A replica joins and streams, acked up to `pos`.
+        fn replica_streams(&self, pos: u64) {
+            self.replicas.fetch_add(1, Ordering::SeqCst);
+            self.halt_state.on_replica_joined();
+            self.metrics.acked_sequence[0].store(pos, Ordering::Relaxed);
+            self.metrics.in_memory_sequence[0].store(pos, Ordering::Relaxed);
+            self.active.store(true, Ordering::Release);
+        }
+
+        fn journal_at(&self, pos: u64) {
+            self.journal.store(WireSeq::new(pos));
+        }
+
+        fn degraded_acks(&self) -> u64 {
+            self.gate
+                .inputs
+                .utilization
+                .degraded_acks
+                .load(Ordering::Relaxed)
+        }
+
+        /// Whether a slot at `wire_seq` is released within `patience`,
+        /// and how. A timer thread raises the shutdown flag once patience
+        /// runs out, since a gate that holds the slot never returns on its
+        /// own: `None` is "still held when patience ran out".
+        fn release(self, wire_seq: u64, patience: Duration) -> (Self, Option<Backing>) {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_after = Arc::clone(&stop);
+            let timer = std::thread::spawn(move || {
+                std::thread::sleep(patience);
+                stop_after.store(true, Ordering::Relaxed);
+            });
+            let mut this = self;
+            let outcome = wait(&mut this.gate, wire_seq, &stop);
+            stop.store(true, Ordering::Relaxed);
+            timer.join().expect("timer thread");
+            let backing = match outcome {
+                GateOutcome::Open(backing) => Some(backing),
+                GateOutcome::Shutdown => None,
+            };
+            (this, backing)
+        }
+    }
+
+    /// Long enough for a gate that releases to have done so; short
+    /// enough that a held slot costs the suite little.
+    const PATIENCE: Duration = Duration::from_millis(300);
+
+    /// A grace period that has long passed by the first check: the node
+    /// halted at the attach.
+    const NO_GRACE: Option<Duration> = Some(Duration::ZERO);
+
+    #[test]
+    fn no_degraded_release_before_the_grace_period() {
+        let p = Primary::new(
+            AckPolicy::DiskAndRam,
+            5,
+            false,
+            Some(Duration::from_secs(60)),
+        );
+        let (p, released) = p.release(5, PATIENCE);
+        assert_eq!(released, None, "held for the grace period");
+        assert_eq!(p.degraded_acks(), 0);
+    }
+
+    #[test]
+    fn a_halted_node_past_the_grace_releases_on_its_own_fsync_marked() {
+        for policy in [AckPolicy::Ram, AckPolicy::DiskAndRam, AckPolicy::TwoDisks] {
+            let p = Primary::new(policy, 5, false, NO_GRACE);
+            let (p, released) = p.release(5, PATIENCE);
+            assert_eq!(released, Some(Backing::PrimaryOnly), "{policy}");
+            assert_eq!(p.gate.cached_durable_pos, 0, "the policy confirmed nothing");
+            assert_eq!(p.gate.degraded_pos, 5);
+        }
+    }
+
+    #[test]
+    fn the_grace_period_runs_from_the_loss() {
+        let p = Primary::new(
+            AckPolicy::DiskAndRam,
+            5,
+            true,
+            Some(Duration::from_millis(150)),
+        );
+        p.replica_leaves();
+        let started = Instant::now();
+        let (_, released) = p.release(5, Duration::from_secs(5));
+        assert_eq!(released, Some(Backing::PrimaryOnly));
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "released before the grace ran out: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A replica that joins and leaves again between two of the gate's
+    /// looks, so the gate never sees the halt end, still restarts the
+    /// grace period: it runs from the latest loss, not the first.
+    #[test]
+    fn an_unseen_rejoin_restarts_the_grace_period() {
+        // Wide enough that a stalled runner between the second loss and
+        // the first check still lands well inside the grace from it.
+        let grace = Duration::from_millis(1_000);
+        let mut p = Primary::new(AckPolicy::DiskAndRam, 5, true, Some(grace));
+        p.replica_leaves();
+        assert!(!p.gate.degraded_release_open(), "the halt has just begun");
+        std::thread::sleep(Duration::from_millis(700));
+        // The blip, between two looks.
+        p.replica_streams(5);
+        p.replica_leaves();
+        let second_loss = Instant::now();
+        std::thread::sleep(Duration::from_millis(400));
+        // Past the grace from the first loss, not from the second.
+        assert!(
+            !p.gate.degraded_release_open(),
+            "aged from the first loss: {:?} since the second",
+            second_loss.elapsed()
+        );
+        std::thread::sleep(grace.saturating_sub(second_loss.elapsed()));
+        assert!(
+            p.gate.degraded_release_open(),
+            "past the grace from the second loss"
+        );
+    }
+
+    /// `disk` is met by the same cursor: every reply is a full one, halted
+    /// or not, and nothing is counted as degraded.
+    #[test]
+    fn no_degraded_release_under_disk() {
+        let p = Primary::new(AckPolicy::Disk, 5, false, NO_GRACE);
+        let (p, released) = p.release(5, PATIENCE);
+        assert_eq!(released, Some(Backing::Policy));
+        let (p, released) = p.release(6, PATIENCE);
+        assert_eq!(released, None, "not yet on the journal");
+        assert!(!p.gate.releasing_degraded);
+    }
+
+    #[test]
+    fn no_degraded_release_with_the_switch_off() {
+        let p = Primary::new(AckPolicy::DiskAndRam, 5, false, None);
+        let (p, released) = p.release(5, PATIENCE);
+        assert_eq!(released, None, "today's stall, unchanged");
+        assert_eq!(p.degraded_acks(), 0);
+    }
+
+    /// A replica that is connected but behind is backpressure, not a halt:
+    /// its replies wait however long it lags.
+    #[test]
+    fn no_degraded_release_while_a_replica_is_connected_but_behind() {
+        let p = Primary::new(AckPolicy::TwoDisks, 5, true, NO_GRACE);
+        p.journal_at(9);
+        let (_, released) = p.release(9, PATIENCE);
+        assert_eq!(released, None, "held for the replica");
+    }
+
+    /// Under `ram` an event may be only in the primary's memory: the
+    /// degraded release waits for the primary's fsync like any other.
+    #[test]
+    fn an_unfsynced_slot_under_ram_is_held_until_the_primary_fsyncs_it() {
+        let p = Primary::new(AckPolicy::Ram, 5, false, NO_GRACE);
+        let (p, released) = p.release(6, PATIENCE);
+        assert_eq!(released, None, "the primary's disk does not hold it yet");
+        p.journal_at(6);
+        let (_, released) = p.release(6, PATIENCE);
+        assert_eq!(released, Some(Backing::PrimaryOnly));
+    }
+
+    #[test]
+    fn a_full_ack_resumes_once_a_replica_streams_again() {
+        let p = Primary::new(AckPolicy::DiskAndRam, 5, false, NO_GRACE);
+        let (p, released) = p.release(5, PATIENCE);
+        assert_eq!(released, Some(Backing::PrimaryOnly));
+        assert!(p.gate.releasing_degraded);
+
+        p.journal_at(7);
+        p.replica_streams(7);
+        let (p, released) = p.release(6, PATIENCE);
+        assert_eq!(released, Some(Backing::Policy), "the policy is met again");
+        let (p, released) = p.release(7, PATIENCE);
+        assert_eq!(released, Some(Backing::Policy));
+        assert_eq!(p.gate.cached_durable_pos, 7);
+
+        // A connected replica that falls behind holds replies again: the
+        // degraded release stopped with the halt.
+        p.journal_at(9);
+        let (p, released) = p.release(9, PATIENCE);
+        assert_eq!(released, None);
+        assert!(!p.gate.releasing_degraded);
+    }
+
+    /// The cache trap: a degraded release must not advance the position
+    /// the policy confirmed, or the next slot would pass the cached check
+    /// and go out with a full `BatchEnd`.
+    #[test]
+    fn after_a_degraded_release_the_next_slot_is_still_evaluated_and_still_degraded() {
+        let p = Primary::new(AckPolicy::DiskAndRam, 9, false, NO_GRACE);
+        let (p, released) = p.release(5, PATIENCE);
+        assert_eq!(released, Some(Backing::PrimaryOnly));
+
+        let next = OutputSlot::<u64, u64> {
+            wire_seq: 6,
+            ..OutputSlot::default()
+        };
+        assert!(
+            p.gate.needs_wait(&next),
+            "the next slot is not waved through on the degraded position"
+        );
+        let (p, released) = p.release(6, PATIENCE);
+        assert_eq!(
+            released,
+            Some(Backing::PrimaryOnly),
+            "never a full BatchEnd"
+        );
+        assert_eq!(p.gate.cached_durable_pos, 0);
+    }
+
+    /// The terminator follows the backing, and only degraded ones count.
+    #[test]
+    fn the_terminator_follows_the_backing_and_counts_degraded_acks() {
+        let p = Primary::new(AckPolicy::DiskAndRam, 5, false, NO_GRACE);
+        let ends = BatchEnds::new();
+        assert_eq!(p.gate.batch_end(Backing::Policy, &ends), ends.policy);
+        assert_eq!(p.degraded_acks(), 0);
+        assert_eq!(
+            p.gate.batch_end(Backing::PrimaryOnly, &ends),
+            ends.primary_only
+        );
+        assert_eq!(p.degraded_acks(), 1);
+        assert_eq!(
+            ends.policy[4],
+            melin_wire_protocol::control_codec::TAG_BATCH_END
+        );
+        assert_eq!(
+            ends.primary_only[4],
+            melin_wire_protocol::control_codec::TAG_BATCH_END_DEGRADED
+        );
     }
 
     fn wait(gate: &mut DurabilityGate, needed: u64, shutdown: &AtomicBool) -> GateOutcome {
@@ -553,7 +1052,10 @@ mod tests {
     fn an_open_gate_attributes_exactly_once() {
         let mut g = gate(AckPolicy::Disk, 5);
         let shutdown = AtomicBool::new(false);
-        assert!(matches!(wait(&mut g, 3, &shutdown), GateOutcome::Open));
+        assert!(matches!(
+            wait(&mut g, 3, &shutdown),
+            GateOutcome::Open(Backing::Policy)
+        ));
         assert_eq!(attributions(&g), (1, 0), "disk opens on the journal");
         assert_eq!(g.cached_durable_pos, 5);
     }
@@ -601,7 +1103,10 @@ mod tests {
             .ack_policy
             .store(AckPolicy::Disk.as_u8(), Ordering::Relaxed);
         let shutdown = AtomicBool::new(false);
-        assert!(matches!(wait(&mut g, 3, &shutdown), GateOutcome::Open));
+        assert!(matches!(
+            wait(&mut g, 3, &shutdown),
+            GateOutcome::Open(Backing::Policy)
+        ));
         assert_eq!(g.active_policy, AckPolicy::Disk);
         // Not a mutation guard for "the mid-wait swap keeps the cached
         // position": the evaluation on the same pass overwrites it, so a
@@ -621,7 +1126,10 @@ mod tests {
         let mut g = gate_with_replicas(AckPolicy::Disk, 5);
         g.inputs.ack_policy.store(CORRUPT, Ordering::Relaxed);
         let shutdown = AtomicBool::new(false);
-        assert!(matches!(wait(&mut g, 3, &shutdown), GateOutcome::Open));
+        assert!(matches!(
+            wait(&mut g, 3, &shutdown),
+            GateOutcome::Open(Backing::Policy)
+        ));
         assert_eq!(g.active_policy, AckPolicy::Disk);
         assert_eq!(g.policy, AckPolicy::Disk.to_policy());
     }

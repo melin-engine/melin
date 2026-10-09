@@ -102,8 +102,9 @@ use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, recei
 /// the `Arc<AtomicU32>` and reads it on the matching hot path and for the
 /// `melin_replicas_connected` gauge. This type is only the senders' write
 /// surface, so centralizing it costs nothing on the read side. It carries
-/// the halt's shared state beside the count, because a replica that starts
-/// streaming ends the operator's override of the halt.
+/// the halt's shared state beside the count, because every change to the
+/// count is also news for it: when the halt began, and whether the
+/// operator's override still stands.
 pub(crate) struct ReplicaGate<'a> {
     count: &'a AtomicU32,
     halt_state: &'a HaltState,
@@ -123,6 +124,7 @@ impl<'a> ReplicaGate<'a> {
     /// path.
     pub(crate) fn lift(&self) {
         self.count.fetch_add(1, Ordering::SeqCst);
+        self.halt_state.on_replica_joined();
     }
 
     /// A replica has entered the live stream: clear the operator's halt
@@ -146,8 +148,11 @@ impl<'a> ReplicaGate<'a> {
     /// both senders share the wording. `fetch_sub` returns the *prior* count,
     /// so `== 1` means this call took it to zero; deriving "last one" from the
     /// returned value rather than a follow-up load avoids a TOCTOU race with a
-    /// concurrent reconnect's `lift`.
+    /// concurrent reconnect's `lift`. The moment is stamped on the halt state
+    /// first, in case this is the last: the response stage's grace period
+    /// before degraded acks runs from it (see `HaltState::on_replica_leaving`).
     pub(crate) fn lower(&self) -> bool {
+        self.halt_state.on_replica_leaving();
         let was_last = self.count.fetch_sub(1, Ordering::Release) == 1;
         if was_last {
             tracing::warn!("all replicas disconnected — halted, refusing client writes");

@@ -29,6 +29,23 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   when the loop turns goes out as one segment, so the packet rate follows
   the backlog rather than the message rate. The layout is documented in
   `crates/tools/melin-shm-proxy/src/shm.rs`.
+- **Degraded acks on a halted primary.** A primary that has lost its
+  last replica no longer goes silent on the replies it holds. Once the
+  halt has lasted `--degraded-ack-grace-ms` (2 seconds by default), each
+  held reply — to a write accepted before the halt, or to a query — is
+  sent as soon as the primary's own journal has the event fsynced,
+  ending in the new `BatchEndDegraded` frame: backed by the primary's
+  disk alone, weaker than the ack policy, and marked so. The rejections
+  and queries queued behind them are answered too, in order; a
+  rejection always ends in a plain `BatchEnd`. A replica that returns
+  within the grace period confirms everything in full; under `disk`
+  nothing is ever degraded. The policy itself never changes, and
+  `melin_ack_policy_degraded` stays `1`. `melin_degraded_acks_total`
+  counts degraded acks, and a `warn` marks the start and end of each
+  stretch. `--no-degraded-acks` keeps the previous behaviour: every held
+  reply, and everything behind it, waits for a replica or a policy swap.
+  See "Degraded acks" in `docs/replication.md`, and the source-breaking
+  side under Changed.
 
 ### Changed
 
@@ -74,11 +91,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   lifts nothing: send it again once the node is a primary with no
   replica. The health endpoint reports `trading` while the lift holds,
   and every swap that lifts or restores the halt is logged at `info`. In
-  `melin-transport-core`, `halt_state::HaltState` holds the lift and
-  `HealthState` gains `halt_state`; in `melin-server-runtime`,
-  `HaltGate::new` takes the halt state, `admin::spawn` takes an
-  `admin::AckPolicyControl` (the policy byte and the halt state) where it
-  took the policy atomic, `replication::Sender` gains `halt_state`, and
+  `melin-transport-core`, `halt_state::HaltState` holds the lift (and,
+  for degraded acks, when the halt began) and `HealthState` gains
+  `halt_state`; in `melin-server-runtime`, `HaltGate::new` takes the
+  halt state, `admin::spawn` takes an `admin::AckPolicyControl` (the
+  policy byte and the halt state) where it took the policy atomic,
+  `replication::Sender` gains `halt_state`, and
   `DpdkReplicationDriver::new` takes it. Source-breaking for code that
   builds any of these.
 - **A reply batch says what backs it: a new `BatchEndDegraded` frame,
@@ -86,7 +104,7 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   The wire protocol gains `TAG_BATCH_END_DEGRADED` (`0x0A`) and
   `TransportResponse::BatchEndDegraded`: the end of a reply backed by the
   primary's own disk alone, weaker than the ack policy, which a primary
-  halted for want of a replica sends. In `melin-client`,
+  halted for want of a replica sends (see Added). In `melin-client`,
   `Frame::BatchEnd` and `Reply::BatchEnd` carry an `Ack`, `Policy` or
   `PrimaryOnly`, so every caller that matches a batch end decides what a
   degraded one means to it; `Connection::request_batch` returns a reply's
@@ -97,6 +115,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   client built against an older `melin-client` gets `Error::Protocol` on
   the first degraded reply rather than reading it as a full ack, so
   upgrade clients before nodes.
+- **Degraded acks' configuration and plumbing** (see Added).
+  `ServerConfig` gains `no_degraded_acks` and `degraded_ack_grace_ms`;
+  `response::Response` gains `degraded_release` (a
+  `halt::DegradedRelease`, `None` for off), which `dpdk_response::run`
+  takes too; and `StageUtilization` gains `degraded_acks`.
+  Source-breaking for code that builds any of these without
+  `..Default::default()`.
 
 ### Fixed
 
