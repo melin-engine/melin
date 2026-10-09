@@ -40,7 +40,7 @@ pub mod test_utils;
 pub use buffered_writer::BufferedWriter;
 pub use codec::FileHeaderInfo;
 pub use encoder::JournalEncoder;
-pub use error::JournalError;
+pub use error::{JournalError, write_failure_latched};
 pub use event::JournalEvent;
 pub use preparer::StagingMode;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner, SegmentKind, TornTail};

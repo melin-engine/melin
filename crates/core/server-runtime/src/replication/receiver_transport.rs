@@ -223,9 +223,10 @@ pub(super) fn run_serviced<R: Send>(
 /// the network or the primary: creating, writing or syncing a received
 /// file, or installing it. Reconnecting would not help, so the resync
 /// stops the node instead of retrying. `source` is a
-/// [`JournalError::WriteFailed`] when the kernel refused a write or a
-/// sync (the failure [`crate::exit`] reports with its own exit status)
-/// and a [`JournalError::Io`] for the rest.
+/// [`JournalError::WriteFailed`] when the kernel failed the sync of the
+/// received file (the failure [`crate::exit`] reports with its own exit
+/// status) and a [`JournalError::Io`] for the rest, a refused write
+/// included.
 #[derive(Debug)]
 pub(super) struct LocalTransferError {
     /// What was being stored: "snapshot" or "segment seed".
@@ -234,15 +235,25 @@ pub(super) struct LocalTransferError {
 }
 
 impl LocalTransferError {
-    /// The kernel refused to write or sync `what`.
-    pub(super) fn write(what: &'static str, e: std::io::Error) -> Self {
+    /// The kernel failed the sync of `what`: its write-back failed, on
+    /// the storage this node keeps its snapshots and journal on. The
+    /// temporary file itself is deleted, so nothing of it is misread
+    /// later, but the device just lost writes the kernel had accepted,
+    /// which is the failure a supervisor must not answer with an in-place
+    /// restart. Latches the failure for the process (see
+    /// [`JournalError::write_failed`]).
+    pub(super) fn sync(what: &'static str, e: std::io::Error) -> Self {
         Self {
             what,
-            source: JournalError::WriteFailed(e),
+            source: JournalError::write_failed(e),
         }
     }
 
-    /// Any other local failure: creating or installing `what`.
+    /// Any other local failure: creating, writing or installing `what`.
+    /// A refused write is here, not in [`Self::sync`]: it leaves no
+    /// clean-but-unwritten pages behind, and the file is deleted anyway.
+    /// The likely cause is a full filesystem (the file is not
+    /// preallocated), and a restart once space is freed is safe.
     pub(super) fn io(what: &'static str, e: std::io::Error) -> Self {
         Self {
             what,
@@ -291,7 +302,7 @@ pub(super) fn receive_chunked_body<S: ControlFrameSource>(
             match decode_primary_message(&frame)? {
                 PrimaryMessage::SnapshotChunk(data) => {
                     std::io::Write::write_all(&mut tmp_file, &data)
-                        .map_err(|e| LocalTransferError::write(what, e))?;
+                        .map_err(|e| LocalTransferError::io(what, e))?;
                     received += data.len() as u64;
                     running_crc = crc32c::crc32c_append(running_crc, &data);
                 }
@@ -300,7 +311,7 @@ pub(super) fn receive_chunked_body<S: ControlFrameSource>(
                 } => {
                     tmp_file
                         .sync_all()
-                        .map_err(|e| LocalTransferError::write(what, e))?;
+                        .map_err(|e| LocalTransferError::sync(what, e))?;
                     if received != expected_len {
                         return Err(format!(
                             "{what} length mismatch: expected {expected_len} bytes, got {received}"
@@ -3271,13 +3282,16 @@ mod tests {
             assert!(!tmp.exists());
         }
 
-        /// The kernel refusing to store the body is this node's storage
-        /// failing, not the transfer: a write failure (exit status 74),
-        /// which the resync stops on instead of retrying. The body goes
-        /// through a symlink to `/dev/full`, where every write fails
-        /// with `ENOSPC`; only the symlink is removed.
+        /// A full filesystem refusing to store the body is this node's
+        /// storage failing, not the transfer: a local failure, which the
+        /// resync stops on instead of retrying, but a plain I/O error
+        /// (exit status 1), not a write failure. A refused buffered write
+        /// leaves no unwritten pages behind and the file is deleted, so a
+        /// restart once space is freed is safe. The body goes through a
+        /// symlink to `/dev/full`, where every write fails with `ENOSPC`;
+        /// only the symlink is removed.
         #[test]
-        fn a_refused_write_is_a_local_write_failure() {
+        fn a_full_filesystem_is_a_local_io_failure() {
             let dir = tempfile::tempdir().unwrap();
             let tmp = dir.path().join("body.tmp");
             std::os::unix::fs::symlink("/dev/full", &tmp).unwrap();
@@ -3286,8 +3300,16 @@ mod tests {
 
             let err =
                 receive_chunked_body(&mut src, &tmp, body.len() as u64, "snapshot").unwrap_err();
-            assert!(err.is::<LocalTransferError>(), "{err}");
-            assert!(crate::exit::is_journal_write_failure(&*err), "{err}");
+            let local = err
+                .downcast_ref::<LocalTransferError>()
+                .unwrap_or_else(|| panic!("a local failure, got {err}"));
+            match &local.source {
+                melin_journal::JournalError::Io(e) => {
+                    assert_eq!(e.raw_os_error(), Some(libc::ENOSPC), "{err}")
+                }
+                other => panic!("a plain I/O error, got {other:?}"),
+            }
+            assert!(!crate::exit::is_journal_write_failure(&*err), "{err}");
             assert!(std::fs::symlink_metadata(&tmp).is_err(), "symlink removed");
             assert!(std::path::Path::new("/dev/full").exists());
         }

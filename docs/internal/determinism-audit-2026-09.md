@@ -980,50 +980,104 @@ try to manage storage health (no `O_DIRECT` recovery, no cache dropping,
 no boot-id poison marker); it signals the failure unmistakably and the
 operator documentation says what to do with it:
 
-- `JournalError::WriteFailed` is a new variant for a refused write or
-  sync of the live segment (`SegmentFile::write_batch`/`write_vectored`
-  data writes, `SegmentFile::sync`), for the header write and `sync_all`
-  of a new segment in `create_continuing` (at startup that file stays at
-  the live path, so a restart in place would read its header from the
-  page cache), and for the `sync_all` in `open_append`, the first sync to
-  see a previous run's write. Not for `fallocate` or reads, which leave
-  no unwritten data in the page cache. A rotation that fails, whatever
-  the class, stays non-fatal: its rollback discards the new segment.
+- `JournalError::WriteFailed` is a new variant for a failed sync of
+  journal data: `SegmentFile::sync` (the live segment's `fdatasync`), the
+  `sync_all` of a new segment's header in `create_continuing` (at startup
+  that file stays at the live path, so a restart in place would read its
+  header from the page cache), and the `sync_all` in `open_append`, the
+  first sync to see a previous run's write. A refused `pwrite`/`pwritev`
+  (append or header) is `Io`: a buffered write the kernel refused leaves
+  no clean-but-unwritten pages, and if earlier dirty pages fail
+  write-back after the process exits, Linux reports that error to the
+  first `fsync` on a newly opened descriptor, which is `open_append`'s at
+  the next start, already in the class. Not for `fallocate` or reads
+  either, which leave no unwritten data in the page cache. A rotation
+  that fails, whatever the class, stays non-fatal: its rollback discards
+  the new segment.
 - `run` now returns the journal stage's error, chained under the
   runtime's context, instead of the flat string "pipeline failure"
-  (primary), or a formatted message (replica fatal exit), and a replica
-  shutdown no longer drops a journal failure from its final drain.
-  `melin_server_runtime::exit::exit_code` maps a chain holding
-  `WriteFailed` to status 74 (`EX_IOERR`, `EXIT_JOURNAL_IO_ERROR`) and
-  every other error to 1; the example servers use it. A refused recovery
-  and a read error stay at 1: both are decided from what the device
-  holds and repeat on every start, so a restart cannot present unwritten
-  data as written.
+  (primary), or a formatted message (replica fatal exit). Every replica
+  teardown keeps the outcome: a shutdown, streaming or during the
+  reconnect backoff (`shutdown_result`, which also reports a panicked
+  stage as a failure, as the primary does), a promotion
+  (`take_pipeline_for_promotion`), the teardown before a resync
+  (`resync_teardown_result`: the resync goes ahead only after a clean
+  teardown or the chain divergence it repairs) and both receivers'
+  handshake fatal exits (`fatal_after_teardown`: the journal failure
+  becomes the error's source, the handshake error stays in the
+  message). The TCP receiver's handshake used to return with `?` and
+  leave a pipeline that survived the disconnect untorn; it now tears it
+  down (`or_teardown!`), so the final drain runs there too.
+  `melin_server_runtime::exit::exit_code` maps an error to status 74
+  (`EX_IOERR`, `EXIT_JOURNAL_WRITE_FAILED`) when its chain holds
+  `WriteFailed` or when the process-wide latch in `melin-journal`
+  (`write_failure_latched`, set by `JournalError::write_failed`, which
+  every production site uses) is set, and every other error to 1; the
+  example servers use it. The latch is what makes the status survive a
+  layer that flattens the error into a message (`server.rs` still does in
+  places). The latch also holds a failed rotation sync, which the node
+  survives (the rotation rolls back and the staging file is discarded),
+  so a later unrelated error stop exits 74; kept deliberately (the
+  device refused a write, and the operator should look before a restart
+  in place), with `exit_code` printing a second line naming the earlier
+  sync failure whenever the latch alone decides the status, and
+  `docs/journal.md` saying so. The preparer's own syncs of a staging
+  file stay `Io` and off the latch: the file holds only zeros or an
+  extent allocation, never journal data, and is never adopted after a
+  failure (the next prepare or the next start removes it), whereas the
+  rotation's syncs flush the header the journal wrote into it. A refused
+  recovery and a read error stay at 1: both are decided from what the
+  device holds and repeat on every start, so a restart cannot present
+  unwritten data as written.
 - `docs/journal.md` ("When a journal write fails") tells operators not to
   restart in place on status 74: fail over and re-seed, or reboot the
   host first, with `RestartPreventExitStatus=74` for systemd.
-- The preparer's `wait_for_writeback` now returns its error, failing the
-  prepare through the existing warn-and-back-off path.
+- The preparer's `wait_for_writeback` now fails the prepare on a
+  write-back error (`EIO`, `ENOSPC`, `EDQUOT`), through the existing
+  warn-and-back-off path. Any other errno (`EINVAL`, `ENOSYS`, `ESPIPE`
+  on a filesystem without the call) refuses the call without consuming
+  anything, so it stays best-effort, logged once: failing it would fail
+  every prepare forever on such a filesystem.
 - A replica's resync transfer no longer retries a local storage failure
   as if it were the network's. Creating, writing, syncing or installing
   the received snapshot or segment seed fails with
   `LocalTransferError` (`receiver_transport.rs`), and
-  `handle_resync_verdict` stops the node on it: status 74 when the
-  kernel refused a write or sync, 1 otherwise. The retry itself was
-  safe (it rewrites a fresh file, never re-syncing the failed pages),
-  but on a failing device it looped out of the supervisor's sight.
-  Tests: `chunked_body::a_refused_write_is_a_local_write_failure`
-  (through `/dev/full`), `a_body_that_cannot_be_created_is_local_but_not_a_write_failure`
-  and `a_disconnect_is_not_a_local_failure`.
+  `handle_resync_verdict` stops the node on it: status 74 when the sync
+  of the received file failed, 1 otherwise, a refused write included
+  (the file is not preallocated, so that is most likely a full
+  filesystem, safe to restart once space is freed; the temporary file is
+  deleted, so nothing remains to misread). The retry itself was safe (it
+  rewrites a fresh file, never re-syncing the failed pages), but on a
+  failing device it looped out of the supervisor's sight.
 
 Regression tests: `server-runtime/tests/journal_io_failure.rs` (a primary
 and a replica whose sync fails exit 74, through an injected `EIO` at
 `SegmentFile::sync`, in front of the same classification as the kernel's
-error; a missing keys file and a refused recovery exit 1),
-`segment_file::tests::a_refused_append_is_a_write_failure` (a real
-`pwrite`/`pwritev` refusal), the replica shutdown's
-`replication::tests::a_shutdown_reports_a_journal_that_failed_on_the_way_down`,
-and `preparer::tests::a_writeback_error_fails_the_zero_fill`.
+error; a missing keys file and a refused recovery exit 1; serialized,
+each from a cleared latch), `segment_file::tests::a_refused_append_is_a_plain_io_error`
+(a real `pwrite`/`pwritev` refusal), `journal_disk::tests::a_sync_failure_poisons_without_publishing`
+(through the same path-keyed seam), `exit::tests::{a_latched_write_failure_survives_a_flattened_error, the_latch_note_explains_a_status_the_message_does_not}`,
+the replica teardown's `replication::tests::a_shutdown_reports_a_journal_that_failed_on_the_way_down`,
+`a_fatal_exit_keeps_a_journal_failure_found_at_teardown` and
+`a_resync_stops_on_a_journal_failure_at_teardown`, end to end against a
+scripted primary `tcp_receiver::tests::reconnect_resume::{a_shutdown_during_reconnect_backoff_reports_a_failed_final_drain, a_promotion_during_reconnect_backoff_reports_a_failed_final_drain}`
+and `resync_local_failure::{a_snapshot_that_cannot_be_stored_stops_the_resync, a_seed_on_a_full_filesystem_stops_the_resync}`,
+`chunked_body::a_full_filesystem_is_a_local_io_failure` (through
+`/dev/full`), and `preparer::tests::{a_writeback_error_fails_the_zero_fill, an_unsupported_writeback_wait_is_best_effort, only_a_writeback_error_fails_the_wait}`.
+
+**Known gap: the signal needs a supervisor that reads it.** The approach
+relies on whatever restarts the node keying on its exit status. A
+supervisor that cannot (Kubernetes `restartPolicy`, for one, which
+restarts a container on any non-zero status, and whose container restart
+reuses the host's page cache just as an in-place restart does) loses the
+signal, and so do abnormal exits that never reach `exit_code`: a hung
+shutdown that is SIGKILLed, or a stop timeout. A best-effort boot-id
+marker next to the journal would close it: written when a write failure
+is latched, and refusing to start while it matches the current boot
+(`/proc/sys/kernel/random/boot_id`), so only a reboot, or an operator
+removing it after re-seeding, clears it. Deliberately not done now:
+Kubernetes is not a supported deployment yet, and a systemd unit with
+`RestartPreventExitStatus=74` is covered by the exit status.
 
 A later hardening, for operators who ignore the guidance, is possible
 but not planned: recovery reads the live segment from the device

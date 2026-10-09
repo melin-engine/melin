@@ -323,12 +323,9 @@ pub struct JournalDisk {
     /// How this thread waits for the sequencer to hand over a batch.
     /// Same discipline as the other pipeline stages.
     wait: WaitStrategy,
-    /// Test-only failure injection. The failures this path exists for
-    /// (EIO, ENOSPC) cannot be provoked portably from a unit test, and
-    /// the branch they drive — freeze durability, latch the cause — is
-    /// too important to leave unexercised.
-    #[cfg(test)]
-    fail_next_sync: Option<JournalError>,
+    // A failed sync is injected through the segment itself
+    // (`melin_journal::test_utils::fail_next_sync`), where the kernel's
+    // error would enter, so its classification runs too.
     /// Test-only panic injection, for the same reason: a panic on this
     /// thread cannot be provoked from outside it, and the guarantee it
     /// drives — the sequencer fails instead of spinning forever — is
@@ -352,16 +349,8 @@ impl JournalDisk {
             control,
             wait,
             #[cfg(test)]
-            fail_next_sync: None,
-            #[cfg(test)]
             panic_next_drain: false,
         }
-    }
-
-    /// Make the next sync fail with `error` (tests only).
-    #[cfg(test)]
-    fn inject_sync_failure(&mut self, error: JournalError) {
-        self.fail_next_sync = Some(error);
     }
 
     /// Make the next drain panic (tests only).
@@ -500,10 +489,6 @@ impl JournalDisk {
         // sync — but still publish, because the input-ring slots those
         // events occupy have to be released upstream.
         if bytes_written > 0 {
-            #[cfg(test)]
-            if let Some(injected) = self.fail_next_sync.take() {
-                return Err(injected);
-            }
             self.segment.sync()?;
         }
 
@@ -730,24 +715,23 @@ mod tests {
 
     /// A failed sync must freeze durability: the run loop latches the
     /// error with its cause and returns, and no cursor moves. Anything
-    /// else would let an ack cover data the disk rejected.
+    /// else would let an ack cover data the disk rejected. The failure is
+    /// injected where the kernel's would enter the segment, so the cause
+    /// latched is the real classification: a journal write failure.
     #[test]
     fn a_sync_failure_poisons_without_publishing() {
         let dir = tempfile::tempdir().unwrap();
         let (mut producer, consumer) = build_journal_write_ring(4, WaitStrategy::SpinThenYield);
         let (cursors, progress, durable) = cursors();
         let control = Arc::new(DiskControl::new());
-        let mut disk = JournalDisk::new(
+        let disk = JournalDisk::new(
             segment(dir.path()),
             consumer,
             cursors,
             Arc::clone(&control),
             WaitStrategy::SpinThenYield,
         );
-        disk.inject_sync_failure(JournalError::Io(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            "no space left on device",
-        )));
+        melin_journal::test_utils::fail_next_sync(&dir.path().join("test.journal"));
 
         submit(&mut producer, b"doomed", meta(6, 5, 50));
 
@@ -756,10 +740,10 @@ mod tests {
 
         assert!(control.poisoned(), "the failure must latch");
         let error = control.take_error().expect("cause is preserved");
-        assert!(
-            error.to_string().contains("no space left on device"),
-            "the operator must see the original cause, got: {error}"
-        );
+        match &error {
+            JournalError::WriteFailed(e) => assert_eq!(e.raw_os_error(), Some(libc::EIO)),
+            other => panic!("the cause must be the sync's write failure, got: {other}"),
+        }
         assert!(control.take_error().is_none(), "cause is taken once");
 
         assert_eq!(durable.load(), WireSeq::new(0), "durability must not move");
@@ -859,7 +843,7 @@ mod tests {
         );
         // A sync failure injected but never consumed proves the sync
         // was skipped; the drain still has to do everything else.
-        disk.inject_sync_failure(JournalError::Io(std::io::Error::other("must not fire")));
+        melin_journal::test_utils::fail_next_sync(&dir.path().join("test.journal"));
 
         submit(&mut producer, b"", meta(0, 9, 90));
         assert!(
@@ -867,8 +851,10 @@ mod tests {
             "a cursor-only batch is still work"
         );
 
+        // Still armed, so the drain never synced; consumed here, so it
+        // does not outlive the test.
         assert!(
-            disk.fail_next_sync.is_some(),
+            disk.segment.sync().is_err(),
             "an empty batch must not reach the sync"
         );
         assert_eq!(

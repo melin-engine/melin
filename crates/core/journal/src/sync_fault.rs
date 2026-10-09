@@ -4,7 +4,7 @@
 //! The failure this stands in for (the kernel reporting a writeback error
 //! on `fdatasync`) cannot be provoked from a test without root or a
 //! device-mapper target, and the path it drives (the disk thread latches
-//! the error, the node stops and reports it as a journal I/O failure) is
+//! the error, the node stops and reports it as a journal write failure) is
 //! too important to leave unexercised end to end. The injected error
 //! enters [`crate::SegmentFile::sync`] exactly where the real one would,
 //! so everything above it, its classification included, runs unchanged.

@@ -9,6 +9,11 @@
 //! keys file or a journal recovery refuses, exits with status 1, so a
 //! supervisor that holds back on 74 still restarts it.
 //!
+//! The exit status also reads a process-wide latch that any journal
+//! write failure in the process sets, so the tests here run one at a
+//! time (see [`serial`]), each from a cleared latch: a test expecting
+//! status 1 must not see the latch a parallel test's failure set.
+//!
 //! Not built under `no-persist`, which never syncs the journal and so has
 //! no sync to fail.
 
@@ -18,8 +23,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,7 +35,7 @@ use counter_server::{
 use melin_client::{Connection, SigningKey, key};
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
-use melin_server_runtime::exit::{self, EXIT_JOURNAL_IO_ERROR};
+use melin_server_runtime::exit::{self, EXIT_JOURNAL_WRITE_FAILED};
 use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::{self, ServerConfig};
 use melin_transport_core::test_ports::free_addr;
@@ -42,6 +47,21 @@ use melin_wire_protocol::tcp::BlockingTcpListener;
 const PORT_BASE: u16 = 10_000;
 
 const CLIENT_KEY: [u8; 32] = [0xAA; 32];
+
+/// Run the calling test alone among this file's tests, from a cleared
+/// write-failure latch. A `Mutex<()>` because all it guards is the
+/// process-wide latch, which lives in `melin-journal`.
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    // A test that failed while holding the lock leaves nothing to repair
+    // (the latch is cleared below), so recover it rather than fail every
+    // later test with the poison.
+    let guard = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    melin_journal::test_utils::reset_write_failure_latch();
+    guard
+}
 
 /// What a node's `main` would see: the exit status `exit_code` maps the
 /// result of `run` to, and the error's message. Collected on the node's
@@ -158,7 +178,7 @@ fn assert_write_failure(stopped: &Stopped) {
     );
     assert_eq!(
         stopped.status,
-        ExitCode::from(EXIT_JOURNAL_IO_ERROR),
+        ExitCode::from(EXIT_JOURNAL_WRITE_FAILED),
         "a journal write failure exits with status 74: {}",
         stopped.message
     );
@@ -169,6 +189,30 @@ fn assert_write_failure(stopped: &Stopped) {
     );
 }
 
+/// The latch is what `exit_code` reads: once a write failure has been
+/// classified anywhere in the process, an error that lost its source chain
+/// on the way to `main` (flattened into a message) still maps to 74, and
+/// the same error maps to 1 once the latch is clear.
+#[test]
+fn exit_code_reads_the_write_failure_latch() {
+    let _serial = serial();
+    let flattened = || -> Result<(), Box<dyn std::error::Error>> { Err("flattened".into()) };
+    assert_eq!(exit::exit_code(flattened()), ExitCode::FAILURE);
+
+    // Constructing the error is what sets the latch; the value itself is
+    // not needed, only that side effect.
+    drop(melin_journal::JournalError::write_failed(
+        std::io::Error::from_raw_os_error(libc::EIO),
+    ));
+    assert_eq!(
+        exit::exit_code(flattened()),
+        ExitCode::from(EXIT_JOURNAL_WRITE_FAILED)
+    );
+
+    melin_journal::test_utils::reset_write_failure_latch();
+    assert_eq!(exit::exit_code(flattened()), ExitCode::FAILURE);
+}
+
 /// A standalone primary whose journal sync fails: the write is never
 /// acknowledged, the node stops, and its status is 74. Before this was
 /// distinguished, `run` returned the bare message "pipeline failure",
@@ -176,6 +220,7 @@ fn assert_write_failure(stopped: &Stopped) {
 /// with status 1.
 #[test]
 fn a_failed_journal_sync_stops_a_primary_with_status_74() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("tempdir");
     let config = ServerConfig {
         standalone: true,
@@ -206,6 +251,7 @@ fn a_failed_journal_sync_stops_a_primary_with_status_74() {
 /// keeps serving.
 #[test]
 fn a_failed_journal_sync_stops_a_replica_with_status_74() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("tempdir");
     let primary_key = SigningKey::from_bytes(&[0x81; 32]);
     let replica_key = SigningKey::from_bytes(&[0x82; 32]);
@@ -287,6 +333,7 @@ fn a_failed_journal_sync_stops_a_replica_with_status_74() {
 /// so restarting in place stays the supervisor's call.
 #[test]
 fn other_failures_exit_with_status_1() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Configuration: the keys file does not exist.
