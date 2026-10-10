@@ -12,6 +12,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependencies refreshed to their latest compatible releases** (tokio,
+  serde, thiserror, zerocopy and zeroize among them). Only the committed
+  lockfile moves: no crate's version requirement changes, so a consumer's
+  own resolution is unaffected, and a build from the repository with
+  `--locked` picks up the new set. The resolved tree shrank, dropping
+  transitive crates (rkyv, the wit-bindgen and wasm-tools stack, uuid,
+  bitvec) that nothing needed any more. The minimum supported Rust version
+  is unchanged.
+
 ## [0.19.0] - 2026-10-10
 
 ### Added
