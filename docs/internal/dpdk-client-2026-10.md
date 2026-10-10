@@ -12,6 +12,12 @@ built for clients that cannot host DPDK at all. Neither is what an
 operator measuring the sequencer's floor on kernel bypass should have to
 do, and neither lets this repository measure that floor itself.
 
+Not a goal: replacing the proxy in the Aeron benchmark harness. That
+harness retired an earlier Rust load generator on purpose, so that its one
+client, the Java rig, measures every system the same way, with a separate
+process owning the NIC as Aeron's own DPDK driver does. The proxy stays its
+client; this work gives it a better dialer.
+
 ## What the code shows
 
 - **The client already has the I/O-free half.** `Handshake` is the
@@ -47,6 +53,34 @@ do, and neither lets this repository measure that floor itself.
     request (RFC 5227), so neither is wrong, but the hoisted builder has to
     pick one, and the node's (zeroed, as the RFC writes it) is the one with
     production behind it.
+- **The exchange's benchmark client is a third dialer, and the largest.**
+  The Exchange Core's `melin-ec-bench` has a DPDK module of its own
+  (`crates/exchange/bench/src/dpdk.rs` in that repository) that initialises
+  its EAL, builds pool, ports, device and interface, seeds the neighbour
+  cache with a fourth copy of the ARP frames (a gratuitous request and two
+  synthetic replies, one for the server and one for the gateway), drives
+  the stack clock from the wall clock on every poll, and runs the handshake
+  and the reply loop over the client's I/O-free pieces by hand. It is the
+  client behind the README's headline figures, and it is the one with the
+  demanding shape: several connections on the one DPDK port the bench host
+  has, in one socket set on one interface, polled by one pinned thread,
+  each connection dialed and authenticated in turn because simultaneous
+  SYNs deadlocked the handshakes; the LAN suite's throughput workload runs
+  four of them by default and the module's comments cite sixteen. It takes
+  the node's whole configuration surface, not the proxy's subset: a list of
+  ports for an LACP bond, a VLAN id, a bifurcated peer IP with its steering
+  rule, and a gateway MAC for the L3 mode where the gateway is seeded in
+  place of the server and no gratuitous ARP goes out. And it depends on the
+  smoltcp fork directly to do all of this. The proxy and the bench also
+  repeat the same socket tuning (Nagle off, no delayed ACK, the stack's
+  1 ms retransmit floor, a 64 KiB initial window) with different socket
+  buffer sizes.
+- **The Exchange Core has two more clients built on the I/O-free pieces.**
+  The bench's kernel path, on io_uring, and the order-entry gateway's
+  session, driven from an io_uring completion loop, both run `Handshake`,
+  `FrameDecoder` and `classify` by hand. Neither is polled: bytes arrive
+  in a buffer the completion names. A polled connection that owns its
+  stream cannot serve them; one that is fed its bytes can.
 - **The proxy's transport seam is already the right shape.** Its
   `Transport` trait is non-blocking send, a service step, and receive into
   a caller's buffer, generic rather than dynamic so there is no indirection
@@ -105,49 +139,101 @@ also leak into every consumer that names the type today.
 **(c) Hoist the dialer into `melin-dpdk`, and add a polled connection to
 the client, generic over a byte stream.** Recommended. The dialer lives
 once, next to the device and transport it is built from, and the proxy and
-the client both use it. The protocol logic of the polled connection is
-tested on every host with no libdpdk, against the same fake node as the
-blocking connection, and only the thin binding to the dialer needs the
-DPDK test rig. The blocking connection is untouched.
+the client both use it, and the exchange's bench can. The protocol logic of
+the polled connection is tested on every host with no libdpdk, against the
+same fake node as the blocking connection, and only the thin binding to the
+dialer needs the DPDK test rig. The blocking connection is untouched.
 
 ## Design
 
-### 1. A single-socket dialer in `melin-dpdk`
+### 1. A dialer in `melin-dpdk`
 
 Two pieces, split along the EAL's lifetime.
 
 **The NIC handle** initialises the EAL from arguments, or shares the
 process-wide one (refusing arguments of its own, as a node does), and
-builds the pool, port, device and interface. It outlives any one
-connection. With an owned EAL it is the last thing torn down; on the shared
-EAL it leaves the EAL alone, as a node does.
+builds the pool, the ports, the device and the interface. It outlives any
+one connection. With an owned EAL it is the last thing torn down; on the
+shared EAL it leaves the EAL alone, as a node does.
+
+Its configuration mirrors the node's `DpdkConfig`, field for field and
+name for name, less the listen port: EAL arguments, the list of ports (an
+LACP bond is two ports driven as one, the first for transmit and all of
+them polled), the address and prefix, the gateway, the bifurcated peer IP,
+the gateway MAC, the peer MAC, the MTU and the VLAN id. The exchange's
+bench runs in every mode the node does (SR-IOV with a VLAN, an mlx5 port
+shared with the kernel, L3 through a gateway), and a dialer that knows
+only the proxy's subset cannot take it. The library already has every
+piece: `Port::configure` takes the VLAN and the bifurcated flag,
+`install_src_ipv4_steering` the rule, `DpdkDevice::new` the port list.
+Neighbour seeding has the node's two modes: in L3 mode the gateway is
+seeded from the supplied MAC and nothing is announced, otherwise the
+client announces itself with a gratuitous ARP and the server is seeded
+from a supplied value or the SR-IOV convention (`resolve_peer_mac`). The
+handle reports which it used: a wrong MAC is silent, only a connect that
+times out, so the error for a timed-out dial names the peer MAC as the
+first thing to check, as the proxy's does.
+
+A client's EAL arguments default to a file prefix of the client's own. A
+DPDK process without one shares the runtime directory with every other on
+the host, so a client beside a node, the usual local arrangement, fails
+to take the runtime lock, and the exchange's suite clears that directory
+between runs for exactly this reason. The error for a failed EAL
+initialisation names the prefix.
+
+**The NIC owns the socket set, and a stream is one socket in it.** The
+bench host has one DPDK NIC: one VF, one ENI, one port shared with the
+kernel. A port is configured and started by one owner in a process, so a
+second handle on it is not possible, a VF per connection is a MAC and an
+IP per connection that nothing provisions, and splitting a port by
+hardware queue does not help either, since the return traffic is hashed
+across queues by four-tuple and lands wherever the hash says, not on the
+interface that owns the socket. So several connections on one NIC
+necessarily share its interface, its socket set and its poll thread,
+which is how the bench works today. The handle therefore holds the socket
+set, dials any number of streams on it, and services all of them in one
+device poll. A single-stream client is the degenerate case and pays
+nothing for the generality: one socket in the set, one poll.
 
 **The stream** is one TCP connection dialed from the NIC handle with a
-deadline. Before the first frame the dialer announces the client with a
-gratuitous ARP and seeds the server's MAC into the interface's neighbour
-cache, from a supplied value or the SR-IOV convention (`resolve_peer_mac`),
-and reports which it used: a wrong MAC is silent, only a connect that times
-out, so the error for a timed-out dial names the peer MAC as the first
-thing to check, as the proxy's does. One connection per NIC: the stream
-holds the NIC handle exclusively and gives it back when it is dropped or
-closed, so a reconnect dials again on the same NIC. Whatever the stream's
-state on hand-back, its socket is reset rather than forgotten, so the node
-frees the connection's slot promptly. Aborting a smoltcp socket only queues
-the RST; it goes out on a later poll and flush, and only while the socket
-is still in the interface's socket set. So the hand-back follows the
-node's own reset (`abort_announced`, then a transmit flush): it aborts the
-socket, runs one egress pass and flushes the device, and only then removes
-the socket. One pass, best effort, as on the node: a frame the device
-cannot take at that moment is not retried, and the node's heartbeat covers
-that case. Removing the socket first would drop the RST on the floor every
-time and leave the node holding the slot until its next heartbeat, which is
-the very divergence the next paragraph cites.
+deadline, on a fresh local port, with the socket tuned and sized by the
+dialer: Nagle off, no delayed ACK, the stack's 1 ms retransmit floor and
+initial window, as the proxy and the bench both set by hand today, and a
+socket buffer size the caller chooses (the proxy sizes for a million
+replies a second on one socket, the bench for sixteen sockets at once).
+The dial loop refreshes the stack's clock on every iteration: the connect
+phase runs on retransmit timers, and the bench found that a stale
+timestamp there stalls the handshake. Dials on one NIC are sequential: a
+stream is established and handed back before the next is dialed, which is
+the order the bench settled on after simultaneous SYNs deadlocked its
+handshakes.
 
-Each dial takes a fresh local port. The proxy picks one from its process
-ID, once per process, which is enough for one connection per process; a
-client that reconnects on one NIC would otherwise reuse the four-tuple of a
+A stream is reset when it is dropped or closed, whatever its state, so the
+node frees the connection's slot promptly. Aborting a smoltcp socket only
+queues the RST; it goes out on a later poll and flush, and only while the
+socket is still in the socket set. So the hand-back follows the node's own
+reset (`abort_announced`, then a transmit flush): it aborts the socket,
+runs one egress pass and flushes the device, and only then removes the
+socket. One pass, best effort, as on the node: a frame the device cannot
+take at that moment is not retried, and the node's heartbeat covers that
+case. Removing the socket first would drop the RST on the floor every time
+and leave the node holding the slot until its next heartbeat, which is the
+very divergence the next paragraph cites.
+
+Each dial takes a fresh local port, per socket, not per process. The proxy
+picks one from its process ID, once per process, which is enough for one
+connection per process; the bench adds the connection's index. A client
+that reconnects on one NIC would otherwise reuse the four-tuple of a
 connection the node may still hold (a DPDK node does not see a client's
 close until its next heartbeat; see `transport-divergences-2026-10.md`).
+
+Ownership follows from the shared socket set. A stream cannot hold the
+NIC mutably across calls while its siblings do, so the stream type is a
+short-lived view the handle lends out by stream id, borrowing the handle
+for the duration of one call, and the handle's service step advances every
+stream at once. The polled connection in decision 2 is shaped to take a
+stream per call rather than own one, so that this is the natural fit and
+not a workaround.
 
 The stream offers:
 
@@ -155,8 +241,12 @@ The stream offers:
   room for, possibly nothing;
 - receive into a caller's buffer, nothing yet being a zero and a closed
   connection an error, never a zero;
-- a service step that polls the device, runs the stack, and flushes the
-  transmit queue, taking the caller's timestamp;
+- a service step that polls the device, runs the stack over every socket
+  in the set, and flushes the transmit queue, taking the caller's
+  timestamp. It is the NIC's step offered through the stream, so a
+  single-stream caller never names the NIC in its loop, and a caller with
+  several streams calls it once per iteration, or between streams as the
+  bench does to keep the NIC busy, not once per stream;
 - an in-place send that hands the caller the contiguous free region of the
   socket's transmit buffer to frame a request into, so a request is encoded
   where the stack sends it from.
@@ -170,7 +260,8 @@ its own reading. No TSC code moves into the library.
 
 Everything the dialer exposes is a std type (addresses, byte slices,
 `io::Error`, the MAC as six bytes), so no consumer needs a direct smoltcp
-dependency, and the proxy's goes away.
+dependency: the proxy's goes away, and so can the exchange bench's
+dependency on the fork.
 
 The ARP frame builders move here from the proxy, as plain functions, and
 replace the two inline copies in `transport.rs`. Their tests run ungated,
@@ -193,6 +284,19 @@ classifies replies, skips heartbeats without extending the deadline, and
 frames requests with `frame_request` through the in-place step. Generic,
 not a trait object, so the hot loop pays no indirection.
 
+The connection is protocol state, not stream ownership. It holds the
+handshake, the receive buffer, the scratch buffer and the deadline, and
+every call takes the stream and the caller's timestamp as arguments. Two
+consumers need it this way. The exchange's bench runs many connections on
+one NIC whose socket set the handle owns, so no connection can own its
+stream, and it keeps its own TSC for its samples, so it wants to pass the
+time it already read rather than have the library read another. The
+gateway's session is fed bytes by an io_uring completion loop, so its
+stream is a buffer the caller fills, not a socket the connection polls. A
+wrapper that owns one stream and a cached clock gives the single-stream
+caller (the echo client, a customer's hand-written loop) the ergonomic
+form, and is the one the tests below exercise through the fake node.
+
 No staging copy in either direction on DPDK, and one copy per direction on
 the kernel path, as the blocking connection has: a reply is split where it
 was received, a request is encoded where it is sent from. The one exception
@@ -212,12 +316,13 @@ stall a request that arrives in the same segment as the challenge response
 (see "Scope limits"), so this is the only safe order, and it is the order
 the blocking connection already keeps.
 
-The clock is a `std::time::Instant` refreshed every so many polls, as the
-node transport refreshes its stack's (`TIMESTAMP_REFRESH_INTERVAL`), not
-on every iteration. The read deadline and the stream's service timestamp
-both read that cached value. No TSC in the library: a caller that wants
-nanosecond timestamps for its samples takes its own, as the echo client
-already does.
+The wrapper's clock is a `std::time::Instant` refreshed every so many
+polls, as the node transport refreshes its stack's
+(`TIMESTAMP_REFRESH_INTERVAL`), not on every iteration. The read deadline
+and the stream's service timestamp both read that cached value. No TSC in
+the library: a caller that wants nanosecond timestamps for its samples
+takes its own, as the echo client already does, and a caller that has its
+own clock passes its reading to the state-only form.
 
 Tests run against the existing fake node in `lib.rs`, through a
 non-blocking kernel socket implementing the byte-stream trait: every
@@ -228,9 +333,13 @@ pipelined burst) has a polled twin. An in-memory stream covers what a real
 socket rarely produces on demand: a frame split across every possible
 receive boundary, a send buffer that takes nothing and then a few bytes,
 and, by overriding the in-place step with a ring of its own, a request that
-meets the transmit ring's wrap and falls back to the scratch buffer. The
-non-blocking kernel stream is public: it is also a polled kernel client in
-its own right, the proxy's kernel transport in library form.
+meets the transmit ring's wrap and falls back to the scratch buffer. Both
+test streams are public. The non-blocking kernel stream is a polled kernel
+client in its own right, the proxy's kernel transport in library form. The
+in-memory stream, fed by its caller, is what a completion-driven loop
+needs: the gateway's session pushes the bytes a completion delivered and
+polls the connection for frames, instead of running the handshake and the
+decoder by hand as it does today.
 
 A small session trait, implemented by both connections, carries the calls
 a request loop needs (send, next frame, request), so a caller writes its
@@ -241,13 +350,16 @@ loop once and picks the transport at runtime.
 Off by default. It binds the polled connection to the dialer's stream and
 adds:
 
-- a configuration with one field per DPDK flag of the proxy
-  (`--dpdk-eal-args`, `--dpdk-port`, `--dpdk-ip`, `--dpdk-prefix-len`,
-  `--dpdk-gateway`, `--dpdk-peer-mac`, `--dpdk-mtu`). A plain struct, not a
-  clap one: the client does not depend on clap. Each binary declares its
-  flags and maps them onto it, and the explanation that matters (why the
-  peer MAC is not optional on a fabric that assigns MACs, an AWS ENI among
-  them) lives on the field, so the binaries' copies stay thin;
+- a configuration with one field per DPDK flag of the node
+  (`--dpdk-eal-args`, `--dpdk-ports`, `--dpdk-ip`, `--dpdk-prefix-len`,
+  `--dpdk-gateway`, `--dpdk-peer-ip`, `--dpdk-gateway-mac`,
+  `--dpdk-peer-mac`, `--dpdk-mtu`, `--dpdk-vlan`), the NIC handle's
+  configuration re-exported. A plain struct, not a clap one: the client
+  does not depend on clap. Each binary declares its flags and maps them
+  onto it, and the explanation that matters (why the peer MAC is not
+  optional on a fabric that assigns MACs, an AWS ENI among them; why a
+  client on a host with a node needs a file prefix of its own) lives on the
+  field, so the binaries' copies stay thin;
 - a constructor that brings a NIC up from that configuration, and one that
   takes an existing NIC handle, so a client reconnects without touching the
   EAL and a process that already holds the process-wide EAL (a test hosting
@@ -292,6 +404,14 @@ binary.
   doc steps. The `dpdk` nextest profile already runs one test at a time;
   a client on DPDK adds one more busy-polling thread to a test, beside its
   nodes', on a CI runner whose cores are few.
+- **A TAP smoke script**, under `scripts/`, for a check outside the rig
+  and the test suite. The exchange's smoke test runs a DPDK node on a TAP
+  virtual device (`--vdev=net_tap0 --no-pci`) and talks to it from a
+  kernel client on the TAP's other end, with no NIC and no namespace. The
+  mirror image, a DPDK echo client over TAP against a kernel echo-server,
+  checks the dialer's whole path, EAL to handshake, in a minute on any
+  host with libdpdk. Hugepages and root, as the exchange's script
+  arranges.
 
 ### 5. Consumers
 
@@ -304,7 +424,26 @@ binary.
   keeps its own `Transport` trait (it knows no protocol and does not
   depend on `melin-client`) with the dialer's stream behind it, and keeps
   its TSC clock through the service step's timestamp. Its flags and their
-  defaults do not change.
+  defaults do not change, and neither does what it prints: the Aeron
+  harness's remote runner greps its stderr for the connected line and the
+  error line to sequence the rig's start, and the `--trace` report is
+  quoted throughout that harness's AWS results. Both are a contract, byte
+  for byte. The new node-side flags (`--dpdk-ports`, `--dpdk-peer-ip`,
+  `--dpdk-gateway-mac`, `--dpdk-vlan`) come to it for free and are added.
+- **The exchange's bench**, in its own repository and on the next
+  sequencer release, moves `bench/src/dpdk.rs` onto the NIC handle and its
+  streams, keeping its loop (the window, the pacer, the TSC samples, the
+  outcome tally) and dropping its EAL setup, its ARP frames, its socket
+  tuning and its dependency on the fork. Its handshakes go through the
+  state-only connection, one per stream, fed the stream and the bench's
+  own time. The migration is the acceptance test of the multi-socket
+  handle: the suite's throughput workload on DPDK measures the same before
+  and after.
+- **The exchange's gateway** is a later consumer, not work here: its
+  session would push the bytes each completion delivers into the in-memory
+  stream and poll the connection for frames. A gateway whose node side is
+  on DPDK is the product feature behind that, and it is the same split
+  that makes it possible.
 
 ### 6. Docs
 
@@ -323,33 +462,41 @@ binary.
 
 Each step is a commit, reviewed before the next.
 
-1. **The dialer hoist, with the proxy on it.** The NIC handle and the
-   stream in `melin-dpdk`, the ARP builders as plain tested functions
-   replacing the transport's two inline copies, and the proxy moved onto
-   the dialer with its smoltcp dependency dropped. The proxy's behaviour is
-   the acceptance test: its tests still pass, it still builds with its
-   `dpdk` feature in the CI job, and a DPDK run against a node behaves as
-   before.
-2. **The polled connection, with its tests.** Ungated, against the fake
-   node and the in-memory stream, plus the session trait implemented by
-   both connections.
+1. **The dialer hoist, with the proxy on it.** The NIC handle with its
+   socket set and the node's configuration, the stream as a view by id,
+   the ARP builders as plain tested functions replacing the transport's
+   two inline copies, and the proxy moved onto the dialer with its smoltcp
+   dependency dropped. The proxy's behaviour is the acceptance test: its
+   tests still pass, it still builds with its `dpdk` feature in the CI
+   job, a DPDK run against a node behaves as before, and its stderr reads
+   the same.
+2. **The polled connection, with its tests.** Ungated: the state-only
+   connection and its single-stream wrapper, against the fake node and the
+   in-memory stream, plus the session trait implemented by both
+   connections.
 3. **The `dpdk` feature.** The configuration, the constructors, the new
    `Error` variant, the manifest note, and the changelog entry for the
    variant.
-4. **The test rig and CI.** The runner's client pair, the launcher's
-   helper, the DPDK client cases in the echo and counter round trips, and
-   `melin-client/dpdk` on the CI job.
+4. **The test rig, the TAP smoke script and CI.** The runner's client
+   pair, the launcher's helper, the DPDK client cases in the echo and
+   counter round trips, the smoke script, and `melin-client/dpdk` on the
+   CI job.
 5. **The echo client's transport flag.**
 6. **Docs.**
+7. **The exchange's bench onto the dialer**, in that repository, once the
+   release carrying steps 1 to 3 is out and its sequencer pins move.
 
 ## Scope limits and open questions
 
-- **One connection per NIC** in the first version, as in the proxy. The
-  NIC/stream split is chosen so several sockets on one stack can be added
-  later without changing the connection API. If the exchange's benchmark
-  client needs many connections on one port from the start, that moves
-  into scope, and the NIC handle grows a poll step of its own that services
-  every stream on it once per iteration.
+- **Several sockets per NIC are in scope from the start.** An earlier
+  draft left one connection per NIC, with the split chosen so more could
+  come later. The exchange's bench settles it: it needs them from the
+  first day it can move, and a handle that one stream holds exclusively
+  would be rebuilt, not extended, to take it. The single-stream caller
+  sees none of it.
+- **The exchange's loop stays in the exchange.** The window, the open-loop
+  pacer, the per-connection keys and the outcome tally are the bench's;
+  only the dialer and the handshake move under it.
 - **IPv4 only**, as the transport is.
 - **Node-side divergences stay out of scope**
   (`transport-divergences-2026-10.md`): a DPDK node closes a client
