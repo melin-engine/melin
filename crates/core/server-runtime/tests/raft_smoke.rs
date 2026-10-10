@@ -53,7 +53,6 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
         authorized_keys: auth_path,
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
-        no_mlock: true,
         // Unpinned, and therefore yielding: the suite runs many nodes at
         // once, and the default layout would stack every node's same-role
         // thread on one core while a spinner would starve whatever shares
@@ -67,7 +66,7 @@ fn raft_enabled_server_elects_itself_and_serves_gauges() {
         raft_node_id: Some(1),
         raft_peer: vec![format!("1@{raft_addr}#{pub_b64}")],
         raft_dir: Some(tmp.path().join("smoke.raft")),
-        ..ServerConfig::default()
+        ..melin_test_node::config()
     };
 
     let node = melin_test_node::start::<Counter>(

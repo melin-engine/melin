@@ -184,7 +184,6 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         authorized_keys: auth_path,
         standalone: true,
         ack_policy: AckPolicy::Disk,
-        no_mlock: true,
         // Unpinned, and therefore yielding: the suite runs many nodes at
         // once, and the default layout would stack every node's same-role
         // thread on one core while a spinner would starve whatever shares
@@ -193,7 +192,7 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        ..ServerConfig::default()
+        ..melin_test_node::config()
     };
     configure(&mut config);
     spawn_node(config)
@@ -927,14 +926,13 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
         journal: tmp.path().join(journal),
         authorized_keys: auth_path.clone(),
         ack_policy: AckPolicy::DiskAndRam,
-        no_mlock: true,
         // Two nodes share this machine with the test itself; unpinned and
         // yielding, for the reason the round-trip harness gives.
         cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        ..ServerConfig::default()
+        ..melin_test_node::config()
     };
 
     let primary = {

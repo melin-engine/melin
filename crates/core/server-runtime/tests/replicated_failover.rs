@@ -311,7 +311,6 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             journal: tmp.path().join(format!("node-{i}.journal")),
             authorized_keys: auth_path.clone(),
             ack_policy: AckPolicy::Ram,
-            no_mlock: true,
             // Unpinned, and therefore yielding: three nodes run in this
             // process alongside the rest of the suite, and the default
             // layout would stack every node's same-role thread on one core
@@ -328,7 +327,7 @@ fn acked_events_survive_primary_death_under_ram_policy() {
             raft_peer: peers.clone(),
             raft_dir: Some(tmp.path().join(format!("node-{i}.raft"))),
             raft_auto_promote: true,
-            ..ServerConfig::default()
+            ..melin_test_node::config()
         }
     };
 

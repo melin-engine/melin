@@ -124,7 +124,6 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         authorized_keys: auth_path,
         standalone: true,
         ack_policy: AckPolicy::Disk,
-        no_mlock: true,
         // Unpinned, and therefore yielding: the suite runs many nodes at
         // once, and the default layout would stack every node's same-role
         // thread on one core while a spinner would starve whatever shares
@@ -133,7 +132,7 @@ fn start_server_with(dir: &Path, configure: impl FnOnce(&mut ServerConfig)) -> S
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        ..ServerConfig::default()
+        ..melin_test_node::config()
     };
     configure(&mut config);
 

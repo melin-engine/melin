@@ -244,7 +244,6 @@ fn every_node_sizes_its_own_instances_before_serving() {
             journal: tmp.path().join(format!("{name}.journal")),
             authorized_keys: auth_path.clone(),
             ack_policy: AckPolicy::Disk,
-            no_mlock: true,
             // Unpinned, and therefore yielding: both nodes share this
             // process with the test's own client.
             cores: PipelineCores::unpinned(),
@@ -252,7 +251,7 @@ fn every_node_sizes_its_own_instances_before_serving() {
             snapshot_interval_ms: 0,
             health_bind: Some(free_addr(PORT_BASE)),
             replication_key: Some(key_path),
-            ..ServerConfig::default()
+            ..melin_test_node::config()
         }
     };
     let genesis = || StartupEvents {
