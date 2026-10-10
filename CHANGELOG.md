@@ -67,6 +67,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Added
 
+- **`melin-shm-proxy`** (`crates/tools/melin-shm-proxy`, the `shm-proxy`
+  binary) — a sidecar that holds one connection to a node, over kernel TCP
+  or, with `--features dpdk`, kernel bypass, and offers it to a client in
+  another process through two shared-memory byte rings and a state word in
+  a mapped file (`--shm`). For clients that cannot host DPDK themselves —
+  a JVM, the Aeron benchmark harness's Java rig first among them — and
+  arranged the way Aeron's own DPDK driver is: the client in one process,
+  the NIC in another. It knows no application: nothing is framed or timed
+  in between, the client keeps its own handshake and clock, and the one
+  thing it reads of the bytes is the protocol's tags, for `--trace`, which
+  times the loop and the round trip from a request reaching the stack to
+  the batch-end that closes its reply. Whatever the client has written
+  when the loop turns goes out as one segment, so the packet rate follows
+  the backlog rather than the message rate. The layout is documented in
+  `crates/tools/melin-shm-proxy/src/shm.rs`.
+
 - **Application-defined client roles.** An application declares its
   roles as a type implementing `melin_app::auth::Role`, a table pairing
   each role with the token that names it in `authorized_keys`; the

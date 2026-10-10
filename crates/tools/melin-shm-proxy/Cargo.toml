@@ -1,0 +1,51 @@
+[package]
+name = "melin-shm-proxy"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+description = "A sidecar that holds one connection to a Melin node, over kernel TCP or DPDK, and offers it to a client in another process through shared memory."
+# A tool, not a library anyone links: the clients it serves speak to it
+# through a mapped file. Not published until it has a second user beyond
+# the benchmark harness; publishing it needs a `deny.toml` exception and
+# a crates.io release of `melin-dpdk` at the same version.
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "shm-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# Core pinning, and the clock the trace's calibration anchors to.
+melin-app = { workspace = true }
+# The protocol's tags, which are all the proxy ever reads of the bytes it
+# carries: an application frame on the way out is a request, a batch-end
+# on the way back closes a reply. Nothing of any application.
+melin-wire-protocol = { workspace = true }
+clap = { workspace = true }
+# The link is a file mapped with mmap; nothing in std exposes that.
+libc = { workspace = true }
+# `--trace` percentiles.
+hdrhistogram = "7"
+# The kernel-bypass transport, behind the `dpdk` feature: the NIC through
+# DPDK's poll-mode driver and TCP in userspace via the sequencer's smoltcp
+# fork, the same version `melin-dpdk` builds its device against.
+melin-dpdk = { workspace = true, optional = true }
+smoltcp = { package = "fastcp", version = "0.13.2", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+# `--transport dpdk`. Needs libdpdk to build, like `melin-server-runtime/dpdk`;
+# without the feature the binary still builds and runs over kernel TCP.
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "dep:smoltcp"]

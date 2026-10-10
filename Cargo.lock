@@ -1135,6 +1135,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-shm-proxy"
+version = "0.18.0"
+dependencies = [
+ "clap",
+ "fastcp",
+ "hdrhistogram",
+ "libc",
+ "melin-app",
+ "melin-dpdk",
+ "melin-wire-protocol",
+ "tempfile",
+]
+
+[[package]]
 name = "melin-test-node"
 version = "0.19.0"
 dependencies = [

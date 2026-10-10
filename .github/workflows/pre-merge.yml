@@ -214,7 +214,7 @@ jobs:
       # the SDK.
       - name: DPDK builds
         id: dpdk-builds
-        run: cargo check -p melin-dpdk -p melin-server-runtime -p melin-test-node -p melin-example-echo -p melin-example-counter -p melin-example-notary --all-targets --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk --locked
+        run: cargo check -p melin-dpdk -p melin-server-runtime -p melin-test-node -p melin-example-echo -p melin-example-counter -p melin-example-notary -p melin-shm-proxy --all-targets --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk,melin-shm-proxy/dpdk --locked
 
       # The DPDK test runs put each test in new user, network and mount
       # namespaces (`unshare -rnm`), which Ubuntu 24.04 lets an unprivileged
@@ -272,7 +272,7 @@ jobs:
       # steps, so a doc error cannot hide a test result.
       - name: Rustdoc with DPDK
         if: ${{ !cancelled() && steps.dpdk-builds.outcome == 'success' }}
-        run: cargo doc --workspace --no-deps --locked --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk
+        run: cargo doc --workspace --no-deps --locked --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk,melin-shm-proxy/dpdk
         env:
           RUSTDOCFLAGS: -D warnings
 
