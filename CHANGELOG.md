@@ -29,6 +29,43 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   when the loop turns goes out as one segment, so the packet rate follows
   the backlog rather than the message rate. The layout is documented in
   `crates/tools/melin-shm-proxy/src/shm.rs`.
+- **`melin_dpdk::NicHandle`, a client's DPDK NIC** (`dpdk-sys` feature):
+  the node's DPDK transport listening on no port, dialing TCP streams to a
+  node and servicing all of them in one device poll, for clients that run
+  several connections on the one DPDK port a host has. `NicHandle::open`
+  takes a `NicConfig`, the node's whole NIC surface (LACP bond, VLAN,
+  bifurcated peer IP, the L3 mode's gateway MAC, peer MAC, MTU); it
+  initialises EAL with a file prefix of its own (`melin-client`) unless the
+  arguments name one, or shares the process-wide EAL as a node does.
+  `dial` takes a deadline and the caller's clock, gives every socket a
+  fresh local port, and tells a refusal (`ConnectionRefused`) from a
+  timeout (`TimedOut`, naming the peer MAC as the first thing to check);
+  dials are sequential, since a DPDK node refuses a SYN that arrives during
+  another client's handshake. A `StreamId` lends its stream as a
+  `NicStream` view: a non-blocking `send` with a `can_send` room query, an
+  in-place `send_in_place` that lends the transmit buffer's contiguous free
+  region, a `recv` for which a closed connection is an error, never a
+  zero, and the handle's `service` step at the caller's monotonic
+  nanosecond time. A closed stream, and every stream of a dropped handle,
+  is reset so the node frees its slot at once. The public API is std
+  types only: no smoltcp dependency is needed to use it. `melin-shm-proxy`
+  now runs its DPDK transport on it, dropping its own EAL, pool, port and
+  stack setup and its direct smoltcp dependency, with its flags, their
+  defaults and its output unchanged; it gains the node's `--dpdk-ports`,
+  `--dpdk-peer-ip`, `--dpdk-gateway-mac` and `--dpdk-vlan`. The
+  differences show only on failure or shutdown. A server that closes the
+  connection with a FIN ends the bridge cleanly instead of leaving it
+  waiting. The NIC setup's `error:` lines are now the
+  node's own: an EAL that fails to initialise is reported with its file
+  prefix (`DPDK EAL init failed (file prefix ...; is another DPDK process
+  on this host using it?): ...`, was `EAL init failed: ...`), a missing
+  port as `DPDK port 3 not found (available: 2)` (was `(2 available)`), a
+  pool failure as `mempool <name>: rte_pktmbuf_pool_create failed` (was
+  `mempool: CreateFailed`), and a port failure as `port 0 configure:
+  rte_eth_dev_configure failed: -22` or `port 0 start: rte_eth_dev_start
+  failed: -22` (was `port 0 configure: ConfigureFailed(-22)` and `port 0
+  start: StartFailed(-22)`). Every one still starts `error:`, and the
+  `connected to` line and the `--trace` report are unchanged.
 
 ### Changed
 
@@ -59,6 +96,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   supply them. `response::run` returns a `bool` (whether the stage
   started) instead of `()`, so a `JoinHandle<()>` binding for its thread
   no longer compiles.
+- **A DPDK node's NIC setup errors name their port and pool.** A port
+  that fails to configure, start or take its steering rule is reported as
+  `port <id> configure: ...`, `port <id> start: ...` or `port <id>
+  steering rule for <peer>: ...`, and a pool that cannot be created as
+  `mempool <name>: ...`, where they used to give the DPDK call alone: on
+  an LACP bond, which member failed was not said.
 - **`melin_dpdk::DpdkConfig`'s NIC fields moved into `melin_dpdk::NicConfig`.**
   The EAL arguments, ports, address and prefix, gateway, bifurcated peer
   IP, gateway and peer MACs, MTU and VLAN id are now fields of

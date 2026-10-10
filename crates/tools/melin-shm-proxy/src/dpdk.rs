@@ -1,10 +1,13 @@
 //! The client side over DPDK: TCP in userspace, polled from this thread,
 //! on a NIC the kernel never sees.
 //!
-//! The socket is driven directly -- `send_slice` into it, then the stack
-//! polled and the NIC flushed in the same iteration -- rather than through
-//! the runtime's transport and its queue. Whatever the loop found in the
-//! rings is on the wire before it turns.
+//! The NIC is `melin-dpdk`'s client NIC handle: the node's own transport,
+//! listening on no port, with one stream dialed on it. The stream's send
+//! goes straight into its socket, and the service step polls the device,
+//! runs the stack and flushes the NIC in the same iteration, so whatever
+//! the loop found in the rings is on the wire before it turns. The step
+//! runs on this proxy's calibrated clock: the loop already reads it, and
+//! passes the reading on.
 //!
 //! What the client has to know that the kernel would have found out for
 //! it: its own address (`--dpdk-ip`), and the server's MAC. The second is
@@ -15,19 +18,15 @@
 //! the SR-IOV convention. That convention is wrong wherever the port keeps
 //! a real hardware address -- an AWS ENI does -- and being wrong is silent:
 //! frames go to a MAC nothing owns and the connect times out. On such a
-//! fabric the flag is not optional.
+//! fabric the flag is not optional. Behind a gateway that shares the port
+//! with the kernel (`--dpdk-gateway-mac`), the gateway's MAC is seeded
+//! instead, and that is the one to get right.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use clap::Args;
-use melin_dpdk::arp;
-use melin_dpdk::device::DpdkDevice;
-use melin_dpdk::{Eal, Mempool, PeerMacSource, Port, resolve_peer_mac, try_parse_mac};
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::tcp::{self, State};
-use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use melin_dpdk::{NicConfig, NicHandle, PeerMacSource, StreamId, try_parse_mac};
 
 use crate::transport::Transport;
 use crate::tsc::{TscClock, rdtscp};
@@ -37,8 +36,6 @@ use crate::tsc::{TscClock, rdtscp};
 /// hundred microseconds -- and a full buffer is not an error here, only a
 /// send that takes fewer bytes; this keeps it rare.
 const SOCKET_BUFFER: usize = 256 * 1024;
-/// Packet buffers for one port at one queue. Plenty for one connection.
-const MBUFS: u32 = 8192;
 /// How long the TCP handshake may take before the connect is called off.
 /// Well past any real handshake; long enough to see a wrong peer MAC as
 /// a timeout rather than a hang.
@@ -59,6 +56,11 @@ pub struct DpdkArgs {
     /// DPDK port ID of the NIC to take over.
     #[arg(long, default_value_t = 0)]
     pub dpdk_port: u16,
+    /// DPDK port IDs (comma-separated), in place of `--dpdk-port`, as the
+    /// server's flag: for an LACP bond, both ports, so traffic arriving on
+    /// either member is received. The first one transmits.
+    #[arg(long, value_delimiter = ',', conflicts_with = "dpdk_port")]
+    pub dpdk_ports: Vec<u16>,
     /// This client's IPv4 address on the DPDK interface. Must be the one
     /// the fabric assigned to it: a VPC drops a source it does not own.
     #[arg(long)]
@@ -68,6 +70,19 @@ pub struct DpdkArgs {
     /// Default route, for a server outside the prefix.
     #[arg(long)]
     pub dpdk_gateway: Option<Ipv4Addr>,
+    /// Peer IPv4 for the bifurcated `rte_flow` steering rule, as the
+    /// server's flag: the port opens in isolated mode and only IPv4
+    /// packets from this address are delivered into DPDK; everything else
+    /// stays with the kernel netdev. For a port shared with the kernel.
+    #[arg(long)]
+    pub dpdk_peer_ip: Option<Ipv4Addr>,
+    /// The `--dpdk-gateway`'s MAC (aa:bb:cc:dd:ee:ff), for the L3 mode of a
+    /// port shared with the kernel, as the server's flag: the gateway is
+    /// seeded with it and no gratuitous ARP goes out. Required there
+    /// because the gateway's ARP reply would not match the steering rule
+    /// and would be eaten by the kernel. Source it from `ip neigh`.
+    #[arg(long, requires = "dpdk_gateway")]
+    pub dpdk_gateway_mac: Option<String>,
     /// The server's MAC. See the module documentation for why this is
     /// required on a fabric that assigns addresses itself.
     #[arg(long)]
@@ -75,22 +90,18 @@ pub struct DpdkArgs {
     /// Must match the server's.
     #[arg(long, default_value_t = 1500)]
     pub dpdk_mtu: usize,
+    /// VLAN ID for hardware strip and insert, as the server's flag: for a
+    /// dedicated NIC whose VLAN tags the kernel does not handle. Not
+    /// needed on an SR-IOV VF, whose PF tags.
+    #[arg(long)]
+    pub dpdk_vlan: Option<u16>,
 }
 
 pub struct DpdkTcp {
-    // Declaration order is drop order: the stack and device go before the
-    // port, pool and EAL they were built on.
-    sockets: SocketSet<'static>,
-    iface: Interface,
-    device: DpdkDevice,
-    handle: SocketHandle,
-    /// The stack's clock, refreshed from the calibrated counter on every
-    /// poll: millisecond resolution is all its timers need, and no clock
-    /// call is made for it.
-    now: Instant,
-    _port: Port,
-    _mempool: Mempool,
-    _eal: Eal,
+    /// The one stream, dialed on `nic`. Closed with the handle: dropping
+    /// the handle resets every stream still open before the NIC goes.
+    stream: StreamId,
+    nic: NicHandle,
 }
 
 impl DpdkTcp {
@@ -108,149 +119,83 @@ impl DpdkTcp {
             .map(try_parse_mac)
             .transpose()
             .map_err(|e| format!("--dpdk-peer-mac: {e}"))?;
-
-        let eal_args: Vec<&str> = args.dpdk_eal_args.split_whitespace().collect();
-        let eal = Eal::init(&eal_args).map_err(|e| format!("EAL init failed: {e:?}"))?;
-        if args.dpdk_port >= eal.port_count() {
-            return Err(format!(
-                "DPDK port {} not found ({} available)",
-                args.dpdk_port,
-                eal.port_count()
-            ));
-        }
-
-        let mempool = if args.dpdk_mtu > 1500 {
-            // u16: the largest MTU any NIC takes fits comfortably.
-            Mempool::create_for_mtu("shm-proxy", MBUFS, args.dpdk_mtu as u16, 0)
+        let gateway_mac = args
+            .dpdk_gateway_mac
+            .as_deref()
+            .map(try_parse_mac)
+            .transpose()
+            .map_err(|e| format!("--dpdk-gateway-mac: {e}"))?;
+        let port_ids = if args.dpdk_ports.is_empty() {
+            vec![args.dpdk_port]
         } else {
-            Mempool::create_with_size("shm-proxy", MBUFS, 0)
-        }
-        .map_err(|e| format!("mempool: {e:?}"))?;
-
-        let mut port = Port::configure(args.dpdk_port, &mempool, None, 1, false)
-            .map_err(|e| format!("port {} configure: {e:?}", args.dpdk_port))?;
-        port.start()
-            .map_err(|e| format!("port {} start: {e:?}", args.dpdk_port))?;
-        let mac = port.mac_addr();
-
-        let mut device = DpdkDevice::new(&[args.dpdk_port], mempool.as_raw(), port.offloads, 0);
-        if args.dpdk_mtu != 1500 {
-            device.set_mtu(args.dpdk_mtu);
-        }
-
-        let mut now = stack_time(clock);
-        let mut iface = Interface::new(
-            Config::new(HardwareAddress::Ethernet(EthernetAddress(mac))),
-            &mut device,
-            now,
-        );
-        let ip = ipv4(local_ip);
-        iface.update_ip_addrs(|addrs| {
-            addrs
-                .push(IpCidr::new(IpAddress::Ipv4(ip), args.dpdk_prefix_len))
-                .expect("a fresh interface has room for one address");
-        });
-        if let Some(gateway) = args.dpdk_gateway {
-            iface
-                .routes_mut()
-                .add_default_ipv4_route(ipv4(gateway))
-                .expect("a fresh interface has room for one route");
-        }
-
-        // Announce ourselves to the fabric, and seed the server into our
-        // own neighbour cache by injecting the reply we would like to
-        // have received.
-        device.send_raw_frame(&arp::gratuitous_request(mac, local_ip));
-        let (server_mac, source) = resolve_peer_mac(peer_mac, *server.ip());
-        device.inject_rx(arp::reply(mac, local_ip, server_mac, *server.ip()).to_vec());
-        let mut sockets = SocketSet::new(Vec::new());
-        device.poll_rx();
-        iface.poll(now, &mut device, &mut sockets);
-        device.flush_tx();
-        let source = match source {
-            PeerMacSource::Supplied => "supplied",
-            PeerMacSource::DerivedSrIov => "derived from the IP by the SR-IOV convention",
+            args.dpdk_ports.clone()
         };
-        eprintln!(
-            "DPDK: port {} as {local_ip} ({}), server {server} at {} ({source})",
-            args.dpdk_port,
-            fmt_mac(mac),
-            fmt_mac(server_mac)
-        );
-        if peer_mac.is_none() {
-            eprintln!(
-                "warning: no --dpdk-peer-mac; on a fabric that assigns MACs itself (an AWS ENI) \
-                 the derived address is wrong and the connect below will time out"
-            );
+        let first_port = port_ids[0];
+
+        let mut nic = NicHandle::open(&NicConfig {
+            eal_args: args
+                .dpdk_eal_args
+                .split_whitespace()
+                .map(String::from)
+                .collect(),
+            port_ids,
+            ip_addr: local_ip,
+            prefix_len: args.dpdk_prefix_len,
+            gateway: args.dpdk_gateway,
+            peer_ip: args.dpdk_peer_ip,
+            gateway_mac,
+            peer_mac,
+            mtu: args.dpdk_mtu,
+            vlan_id: args.dpdk_vlan,
+        })
+        .map_err(|e| e.to_string())?;
+        let mac = nic.mac();
+
+        match args.dpdk_gateway.zip(gateway_mac) {
+            Some((gateway, gateway_mac)) => eprintln!(
+                "DPDK: port {first_port} as {local_ip} ({}), server {server} via gateway \
+                 {gateway} at {} (supplied)",
+                fmt_mac(mac),
+                fmt_mac(gateway_mac)
+            ),
+            None => {
+                let (server_mac, source) = nic.peer_mac(*server.ip());
+                let source = match source {
+                    PeerMacSource::Supplied => "supplied",
+                    PeerMacSource::DerivedSrIov => "derived from the IP by the SR-IOV convention",
+                };
+                eprintln!(
+                    "DPDK: port {first_port} as {local_ip} ({}), server {server} at {} ({source})",
+                    fmt_mac(mac),
+                    fmt_mac(server_mac)
+                );
+                if peer_mac.is_none() {
+                    eprintln!(
+                        "warning: no --dpdk-peer-mac; on a fabric that assigns MACs itself (an AWS \
+                         ENI) the derived address is wrong and the connect below will time out"
+                    );
+                }
+            }
         }
 
-        let rx = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUFFER]);
-        let tx = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUFFER]);
-        let mut socket = tcp::Socket::new(rx, tx);
-        tune(&mut socket);
-        // A different ephemeral port per process, so a socket left in
-        // TIME_WAIT by the previous run does not collide. The truncation
-        // is the point: any value in the range will do.
-        let local_port = 49_152 + (std::process::id() as u16 % 8_192);
-        socket
-            .connect(
-                iface.context(),
-                (IpAddress::Ipv4(ipv4(*server.ip())), server.port()),
-                (IpAddress::Ipv4(ip), local_port),
-            )
-            .map_err(|e| format!("connect to {server}: {e:?}"))?;
-        let handle = sockets.add(socket);
-
-        let deadline = rdtscp().saturating_add(clock.ticks(CONNECT_TIMEOUT_NS));
-        loop {
-            let tick = rdtscp();
-            if tick >= deadline {
-                return Err(format!(
+        // The loop's clock drives the stack from the first SYN on.
+        let deadline = clock.unix_ns(rdtscp()).saturating_add(CONNECT_TIMEOUT_NS);
+        let stream = nic
+            .dial(server, SOCKET_BUFFER, deadline, || clock.unix_ns(rdtscp()))
+            .map_err(|e| match e.kind() {
+                // Behind a gateway, the handle's own message, which names
+                // the gateway's MAC, is the one to read.
+                io::ErrorKind::TimedOut if gateway_mac.is_none() => format!(
                     "TCP connect to {server} over DPDK timed out: no SYN-ACK. \
                      Is the server's DPDK interface up, and is --dpdk-peer-mac its real MAC?"
-                ));
-            }
-            now = stack_time_at(clock, tick);
-            device.poll_rx();
-            iface.poll(now, &mut device, &mut sockets);
-            device.flush_tx();
-            match sockets.get_mut::<tcp::Socket>(handle).state() {
-                State::Established => break,
-                State::Closed | State::TimeWait => {
-                    return Err(format!("TCP connect to {server} over DPDK was refused"));
+                ),
+                io::ErrorKind::ConnectionRefused => {
+                    format!("TCP connect to {server} over DPDK was refused")
                 }
-                _ => {}
-            }
-        }
-
-        Ok(Self {
-            sockets,
-            iface,
-            device,
-            handle,
-            now,
-            _port: port,
-            _mempool: mempool,
-            _eal: eal,
-        })
+                _ => e.to_string(),
+            })?;
+        Ok(Self { stream, nic })
     }
-}
-
-/// The runtime's own low-latency TCP settings, applied to this socket.
-fn tune(socket: &mut tcp::Socket<'_>) {
-    socket.set_nagle_enabled(false);
-    socket.set_ack_delay(None);
-    // The stack's retransmit floor. Its estimator is whole milliseconds,
-    // so this is as low as it goes; the default is tuned for the
-    // internet and would stall a lost segment for tens of milliseconds.
-    socket.set_min_rto(smoltcp::time::Duration::from_millis(1));
-    socket.set_initial_rto(smoltcp::time::Duration::from_millis(1));
-    socket.set_initial_congestion_window(64 * 1024);
-}
-
-fn ipv4(addr: Ipv4Addr) -> Ipv4Address {
-    let [a, b, c, d] = addr.octets();
-    Ipv4Address::new(a, b, c, d)
 }
 
 fn fmt_mac(mac: [u8; 6]) -> String {
@@ -260,55 +205,20 @@ fn fmt_mac(mac: [u8; 6]) -> String {
         .join(":")
 }
 
-fn stack_time(clock: &TscClock) -> Instant {
-    stack_time_at(clock, rdtscp())
-}
-
-/// The stack's notion of now, from the counter. i64 micros: what the
-/// stack's `Instant` is made of, and centuries away from overflowing.
-#[inline(always)]
-fn stack_time_at(clock: &TscClock, tick: u64) -> Instant {
-    Instant::from_micros((clock.unix_ns(tick) / 1_000) as i64)
-}
-
 impl Transport for DpdkTcp {
     #[inline(always)]
     fn send(&mut self, data: &[u8]) -> io::Result<usize> {
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.handle);
-        if !socket.can_send() {
-            return Ok(0);
-        }
-        socket
-            .send_slice(data)
-            .map_err(|e| io::Error::other(format!("send: {e:?}")))
+        self.nic.stream(&self.stream).send(data)
     }
 
     #[inline(always)]
     fn service(&mut self, now_unix_ns: u64) {
-        // Same conversion as `stack_time_at`, without a second counter read.
-        self.now = Instant::from_micros((now_unix_ns / 1_000) as i64);
-        self.device.poll_rx();
-        self.iface
-            .poll(self.now, &mut self.device, &mut self.sockets);
-        self.device.flush_tx();
+        self.nic.service(now_unix_ns);
     }
 
     #[inline(always)]
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.handle);
-        if socket.can_recv() {
-            return socket
-                .recv_slice(buf)
-                .map_err(|e| io::Error::other(format!("recv: {e:?}")));
-        }
-        if socket.is_active() {
-            Ok(0)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the server closed the connection",
-            ))
-        }
+        self.nic.stream(&self.stream).recv(buf)
     }
 
     fn name(&self) -> &'static str {

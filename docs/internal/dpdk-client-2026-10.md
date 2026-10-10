@@ -1,7 +1,8 @@
 # DPDK support in `melin-client` (plan)
 
-Status: **in progress** (2026-10): step 1 of the order of work, the
-factoring, is done; step 2 is next. Covers the roadmap item
+Status: **in progress** (2026-10): steps 1 and 2 of the order of work,
+the factoring and the NIC handle with the proxy on it, are done; step 3
+is next. Covers the roadmap item
 "DPDK support in `melin-client`" ([roadmap.md](roadmap.md)).
 
 The one-line goal: **a client links `melin-client`, turns on one feature,

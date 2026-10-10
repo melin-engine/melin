@@ -208,7 +208,7 @@ unsafe impl Sync for DpdkShared {}
 /// An enum rather than always borrowing a process-wide EAL: a node that
 /// owns its EAL must still clean it up last, after its ports and pool, so
 /// that a deployed node's teardown is the one it has always had.
-enum NodeEal {
+pub(crate) enum NodeEal {
     /// Initialized for this node from its EAL arguments and cleaned up
     /// when the node's resources drop: one node per process, as deployed.
     Own(Eal),
@@ -219,6 +219,25 @@ enum NodeEal {
 }
 
 impl NodeEal {
+    /// The EAL for a transport on `config`'s NIC: initialized from its EAL
+    /// arguments, or, in a process that runs a process-wide EAL, that one,
+    /// shared (its arguments must then be empty).
+    pub(crate) fn acquire(config: &NicConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(match Eal::process_wide() {
+            None => {
+                let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
+                NodeEal::Own(Eal::init(&eal_args)?)
+            }
+            Some(eal) => {
+                // A failed process-wide init is final: report its error
+                // rather than attempting a second `rte_eal_init`.
+                let eal = eal?;
+                crate::eal_sharing::check_shared_eal_args(&config.eal_args)?;
+                NodeEal::ProcessWide(eal)
+            }
+        })
+    }
+
     fn eal(&self) -> &Eal {
         match self {
             NodeEal::Own(eal) => eal,
@@ -288,6 +307,21 @@ pub struct DpdkTransport {
     _shared: Arc<DpdkShared>,
 }
 
+/// How a connection's received bytes reach its reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RxPath {
+    /// Held in the received mbufs, read through `recv_into_vec`: the
+    /// node's sockets, polled by [`DpdkTransport::poll`].
+    ZeroCopy,
+    /// Copied into the socket's receive buffer, read with `recv_slice`:
+    /// the client NIC handle's streams, polled by
+    /// [`DpdkTransport::poll_copying`]. A socket on this path registers no
+    /// zero-copy callbacks, so it must never be fed by `poll`, whose
+    /// zero-copy ingress would hold its data where `recv_slice` cannot see
+    /// it.
+    Copying,
+}
+
 /// Per-connection TX queue with cursor to avoid drain() memmoves.
 struct TxQueue {
     buf: Vec<u8>,
@@ -350,20 +384,17 @@ impl DpdkShared {
         config: &NicConfig,
         num_queues: u16,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        let eal = match Eal::process_wide() {
-            None => {
-                let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
-                NodeEal::Own(Eal::init(&eal_args)?)
-            }
-            Some(eal) => {
-                // A failed process-wide init is final: report its error
-                // rather than attempting a second `rte_eal_init`.
-                let eal = eal?;
-                crate::eal_sharing::check_shared_eal_args(&config.eal_args)?;
-                NodeEal::ProcessWide(eal)
-            }
-        };
+        Self::init_on(NodeEal::acquire(config)?, config, num_queues)
+    }
 
+    /// [`Self::init_nic`] on an EAL already acquired, so a caller can tell
+    /// a failure to bring EAL up from a failure of the NIC on it (the
+    /// client's NIC handle names its file prefix for the first).
+    pub(crate) fn init_on(
+        eal: NodeEal,
+        config: &NicConfig,
+        num_queues: u16,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let port_count = eal.eal().port_count();
         if config.port_ids.is_empty() {
             return Err("DPDK transport requires at least one port id".into());
@@ -405,10 +436,11 @@ impl DpdkShared {
             config.port_ids[0],
         );
         let mempool = if config.mtu > 1500 {
-            Mempool::create_for_mtu(&pool_name, num_mbufs, config.mtu as u16, socket_id)?
+            Mempool::create_for_mtu(&pool_name, num_mbufs, config.mtu as u16, socket_id)
         } else {
-            Mempool::create_with_size(&pool_name, num_mbufs, socket_id)?
-        };
+            Mempool::create_with_size(&pool_name, num_mbufs, socket_id)
+        }
+        .map_err(|e| format!("mempool {pool_name}: {e}"))?;
 
         // Configure and start all ports with N queue pairs.
         //
@@ -420,10 +452,14 @@ impl DpdkShared {
         let mut ports = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
-            let mut port = Port::configure(pid, &mempool, config.vlan_id, num_queues, bifurcated)?;
-            port.start()?;
+            // Each failure names its port: on an LACP bond, which member
+            // failed is the first thing to know.
+            let mut port = Port::configure(pid, &mempool, config.vlan_id, num_queues, bifurcated)
+                .map_err(|e| format!("port {pid} configure: {e}"))?;
+            port.start().map_err(|e| format!("port {pid} start: {e}"))?;
             if let Some(peer) = config.peer_ip {
-                port.install_src_ipv4_steering(peer)?;
+                port.install_src_ipv4_steering(peer)
+                    .map_err(|e| format!("port {pid} steering rule for {peer}: {e}"))?;
             }
             combined_offloads = Some(match combined_offloads {
                 None => port.offloads,
@@ -647,12 +683,65 @@ impl DpdkTransport {
         tx_queue_limit: usize,
         dispatch_burst_limit: usize,
     ) -> SocketHandle {
+        self.open_connection(
+            remote_ip,
+            remote_port,
+            local_port,
+            rx_buf_size,
+            tx_buf_size,
+            tx_queue_limit,
+            dispatch_burst_limit,
+            RxPath::ZeroCopy,
+        )
+        .expect("smoltcp connect failed")
+    }
+
+    /// Like [`Self::connect_to_with_buffers`] for a socket read by copy
+    /// ([`Self::tcp_socket`] and `recv_slice`), polled by
+    /// [`Self::poll_copying`] and never by [`Self::poll`]: the client NIC
+    /// handle's dial. Equal receive and transmit buffers, the default
+    /// egress burst, and a connect error returned rather than a panic,
+    /// since the local port is the caller's to choose.
+    pub(crate) fn connect_copying(
+        &mut self,
+        remote: std::net::SocketAddrV4,
+        local_port: u16,
+        buf_size: usize,
+    ) -> Result<SocketHandle, tcp::ConnectError> {
+        self.open_connection(
+            *remote.ip(),
+            remote.port(),
+            local_port,
+            buf_size,
+            buf_size,
+            MAX_TX_QUEUE_SIZE,
+            tcp::DEFAULT_DISPATCH_BURST_LIMIT,
+            RxPath::Copying,
+        )
+    }
+
+    /// The transport's one connect: a tuned socket (see [`tune_socket`]),
+    /// connected and added to the set.
+    #[allow(clippy::too_many_arguments)] // the two public entry points' union
+    fn open_connection(
+        &mut self,
+        remote_ip: std::net::Ipv4Addr,
+        remote_port: u16,
+        local_port: u16,
+        rx_buf_size: usize,
+        tx_buf_size: usize,
+        tx_queue_limit: usize,
+        dispatch_burst_limit: usize,
+        rx_path: RxPath,
+    ) -> Result<SocketHandle, tcp::ConnectError> {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
         tune_socket(&mut socket);
-        socket.set_zero_copy_retain_fn(retain_mbuf);
-        socket.set_zero_copy_release_fn(release_mbuf);
+        if rx_path == RxPath::ZeroCopy {
+            socket.set_zero_copy_retain_fn(retain_mbuf);
+            socket.set_zero_copy_release_fn(release_mbuf);
+        }
         socket.set_dispatch_burst_limit(dispatch_burst_limit);
 
         let remote_addr = Ipv4Address::new(
@@ -662,19 +751,17 @@ impl DpdkTransport {
             remote_ip.octets()[3],
         );
         let local_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
-        socket
-            .connect(
-                self.iface.context(),
-                (IpAddress::Ipv4(remote_addr), remote_port),
-                (IpAddress::Ipv4(local_ip), local_port),
-            )
-            .expect("smoltcp connect failed");
+        socket.connect(
+            self.iface.context(),
+            (IpAddress::Ipv4(remote_addr), remote_port),
+            (IpAddress::Ipv4(local_ip), local_port),
+        )?;
 
         let handle = self.sockets.add(socket);
         if handle.index() < self.tx_queue_limits.len() {
             self.tx_queue_limits[handle.index()] = tx_queue_limit;
         }
-        handle
+        Ok(handle)
     }
 
     /// Check if a socket has completed the TCP handshake and is ready
@@ -790,6 +877,47 @@ impl DpdkTransport {
         }
 
         self.cached_timestamp
+    }
+
+    /// One service step at the caller's time `now`, for the client NIC
+    /// handle: poll the device, run the stack over every socket in the
+    /// set (ingress, then egress and its timers), and flush the device's
+    /// transmit queue. Every call does all three, since a stream's sends
+    /// go straight into its socket, with nothing queued above it for
+    /// [`Self::poll`]'s idle check to see.
+    ///
+    /// Received bytes are copied into the sockets' receive buffers
+    /// ([`RxPath::Copying`]), as the shm-proxy and the exchange's bench
+    /// have always driven the stack. The gateway is re-seeded on its
+    /// interval as in `poll`; neighbours are not learned from received
+    /// frames, which a dialing client does not need: it seeds the one it
+    /// dials.
+    pub(crate) fn poll_copying(&mut self, now: Instant) {
+        self.cached_timestamp = now;
+        if let Some((gw, gw_mac)) = self.gateway
+            && gateway_reseed_due(now, self.gateway_seeded_at)
+        {
+            self.seed_neighbor(gw, gw_mac);
+            self.gateway_seeded_at = now;
+        }
+        self.device.poll_rx();
+        self.iface.poll(now, &mut self.device, &mut self.sockets);
+        self.device.flush_tx();
+    }
+
+    /// The stack's time as of the latest poll.
+    pub(crate) fn stack_now(&self) -> Instant {
+        self.cached_timestamp
+    }
+
+    /// The MAC address of the transport's first port.
+    pub(crate) fn mac(&self) -> [u8; 6] {
+        self._shared.mac
+    }
+
+    /// The TCP socket behind `handle`, if it is still in the set.
+    pub(crate) fn tcp_socket(&mut self, handle: SocketHandle) -> Option<&mut tcp::Socket<'static>> {
+        self.sockets.try_get_mut::<tcp::Socket>(handle)
     }
 
     fn check_listener(&mut self) {
@@ -1139,15 +1267,24 @@ impl DpdkTransport {
         if let Some(q) = self.tx_queues[handle.index()].take() {
             self.pending_tx_bytes -= q.queued_bytes();
         }
-        peer_liveness::abort_announced(
+        // Abort, one egress pass, flush, and only then remove (and forget
+        // in the interface's index, as `close` does): see
+        // `reset_announced` for why the order matters.
+        let removed = peer_liveness::reset_announced(
             &mut self.iface,
             &mut self.device,
             &mut self.sockets,
             handle,
             self.cached_timestamp,
+            DpdkDevice::flush_tx,
         );
-        self.device.flush_tx();
-        self.close(handle);
+        if !removed {
+            tracing::warn!(
+                handle = ?handle,
+                site = "reset",
+                "DPDK: reset called on already-removed handle"
+            );
+        }
     }
 
     /// Arm `liveness` on an established connection: probe it while idle,

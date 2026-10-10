@@ -33,6 +33,12 @@ pub mod arp;
 // or not this build has the transport compiled in.
 mod config;
 pub use config::{DpdkConfig, NicConfig};
+// Ungated for the same reason as `peer_liveness`: the client NIC handle's
+// clock, local ports, dial wait and stream I/O are TCP-stack logic, tested
+// over an in-memory wire. The handle itself is in the gated `dpdk` module.
+mod nic;
+#[cfg(test)]
+mod test_wire;
 
 #[cfg(feature = "dpdk-sys")]
 mod dpdk;
