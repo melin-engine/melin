@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "melin-app"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "melin-client"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "melin-dpdk"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "melin-example-counter"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "clap",
  "melin-app",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "melin-example-echo"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "clap",
  "melin-app",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "melin-example-notary"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "blake3",
  "clap",
@@ -1171,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "melin-journal"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1188,14 +1188,14 @@ dependencies = [
 
 [[package]]
 name = "melin-pipeline"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "melin-raft"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "base64 0.22.1",
  "crc32c",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "melin-server-runtime"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "melin-test-node"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "libc",
  "melin-app",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "melin-transport-core"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "melin-wire-protocol"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "proptest",
  "tempfile",
