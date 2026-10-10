@@ -397,12 +397,8 @@ unless marked accepted.
   already buffered in `parse_buf` — they re-parse only on the next
   recv from that client. Deserves its own ticket.
 - Legacy `ProvideBuffers` fallback mode only (hosts that filter
-  `PBUF_RING`): the SQ-accounting comment undercounts same-drain SQE
-  producers (a pathological drain can hit the SQ-full panic), and a
-  failed re-provision CQE permanently leaks its buffer id.
-- `max_connections` is not validated against the egress ring's
-  `RING_SIZE` (4096); an operator setting it higher converts a fully-
-  dirty flush into a response-thread panic. Clamp at startup.
+  `PBUF_RING`): a failed re-provision CQE permanently leaks its buffer
+  id.
 - Narrow eventfd use-after-close if the reader exits unilaterally on a
   hard submit error while the accept loop still holds the wakeup
   handle.

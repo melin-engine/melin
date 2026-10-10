@@ -1161,13 +1161,12 @@ impl Cluster {
             journal: self.dir.path().join(format!("{name}.journal")),
             authorized_keys: self.authorized_keys.clone(),
             ack_policy: AckPolicy::Disk,
-            no_mlock: true,
             cores: PipelineCores::unpinned(),
             tick_interval_ms: 0,
             snapshot_interval_ms: 0,
             health_bind: Some(Self::health(slot)),
             replication_key: Some(key_path),
-            ..ServerConfig::default()
+            ..melin_test_node::config()
         }
     }
 
@@ -1416,7 +1415,6 @@ fn with_node(body: fn(SocketAddr)) {
         authorized_keys,
         standalone: true,
         ack_policy: AckPolicy::Disk,
-        no_mlock: true,
         // Unpinned: the node shares the host with the test's client, and
         // a CI runner with everything else.
         cores: PipelineCores::unpinned(),
@@ -1426,7 +1424,7 @@ fn with_node(body: fn(SocketAddr)) {
         // came back: the next client gets in only if it did.
         max_connections: 1,
         heartbeat_interval_secs: HEARTBEAT.as_secs(),
-        ..ServerConfig::default()
+        ..melin_test_node::config()
     };
     let node = melin_test_node::start::<Counter>(
         config,

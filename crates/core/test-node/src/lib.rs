@@ -176,16 +176,55 @@ impl Node {
     }
 }
 
+/// Most connections a test node accepts unless its test says otherwise:
+/// far more than any test opens, and small enough that the node's
+/// io_uring rings stay small (see [`config`]).
+pub const MAX_CONNECTIONS: u64 = 64;
+
+/// The configuration a test starts its nodes from: production defaults
+/// ([`ServerConfig::default`]), sized for a test rather than a
+/// deployment. Override fields on top of it as with the default:
+/// `ServerConfig { standalone: true, ..melin_test_node::config() }`.
+///
+/// What differs, and why — a parallel suite runs many nodes on one host,
+/// as one user, and the kernel charges both of these against that user's
+/// locked-memory limit (`RLIMIT_MEMLOCK`, a few megabytes under systemd's
+/// default):
+///
+/// - **`max_connections`** is [`MAX_CONNECTIONS`]. Each node's reader and
+///   response stage size their io_uring rings from it, and ring memory
+///   counts against the limit for every process of the user, until the
+///   kernel has finished tearing a ring down, which happens asynchronously
+///   — the rings of nodes that just stopped still count while the next
+///   ones start. Rings sized for the production cap take a sizeable share
+///   of the default limit each, so a handful of parallel nodes exhausted
+///   it; sized for a test's few clients they are a couple of pages each,
+///   and dozens of nodes fit.
+/// - **`no_mlock`** is set: a node locks all of its memory by default,
+///   which against the default limit fails (and warns) on every node.
+///   [`start`] and [`start_at`] set it whatever the config says.
+///
+/// A test that exercises the connection cap sets its own
+/// `max_connections`.
+pub fn config() -> ServerConfig {
+    ServerConfig {
+        max_connections: MAX_CONNECTIONS,
+        no_mlock: true,
+        ..ServerConfig::default()
+    }
+}
+
 /// Start a node running application `A` with `config`, on this build's
 /// transport, wherever it is free to: on kernel TCP a kernel-assigned
 /// port, on DPDK the first free slot. Returns as soon as its thread is
 /// running: a client retries until the node serves (within
 /// [`STARTUP_LIMIT`]).
 ///
-/// `config.bind` is overwritten with the address the transport gives the
-/// node; on DPDK so are the `dpdk_*` fields. Everything else is the
-/// test's. A node that replicates, or that another must reach before it
-/// starts, wants [`start_at`].
+/// Build `config` from [`config`]. `config.bind` is overwritten with the
+/// address the transport gives the node; on DPDK so are the `dpdk_*`
+/// fields. `no_mlock` is set: a test node never locks its memory (see
+/// [`config`]). Everything else is the test's. A node that replicates, or
+/// that another must reach before it starts, wants [`start_at`].
 ///
 /// Panics when the node cannot be started; that is a failed test.
 pub fn start<A>(
@@ -286,6 +325,8 @@ mod kernel {
             .unwrap_or_else(|e| panic!("bind the client listener on {bind}: {e}"));
         config.bind = listener.local_addr().expect("the listener's address");
         let addr = config.bind;
+        // Never lock a test node's memory: see `config`.
+        config.no_mlock = true;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = Arc::clone(&shutdown);
@@ -546,6 +587,8 @@ mod dpdk {
         config.dpdk_ports = vec![port];
         config.dpdk_ip = slot.ip.to_string();
         config.dpdk_prefix_len = layout.prefix_len;
+        // Never lock a test node's memory: see `config`.
+        config.no_mlock = true;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = Arc::clone(&shutdown);

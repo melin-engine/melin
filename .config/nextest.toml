@@ -1,8 +1,11 @@
 # Nextest configuration.
 #
 # The cluster integration tests each spawn one primary plus one or two
-# replica server processes, each preallocating its own journal and
-# (optionally) mlocking memory. Run in parallel the fan-out is three
+# replica server processes, each preallocating its own journal. (None
+# locks its memory, and their io_uring rings are sized for a test's few
+# clients: both draw on the user's locked-memory limit, which the
+# `melin-test-node` defaults keep a parallel suite inside — so that limit
+# is not what this group protects.) Run in parallel the fan-out is three
 # processes per test, which is why they carry `#[serial]` (serial_test)
 # — but `#[serial]` only serialises *within* one test process, and
 # nextest forks per test, so the annotation has no effect here. The

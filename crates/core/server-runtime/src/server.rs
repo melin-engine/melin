@@ -171,10 +171,17 @@ pub struct ServerConfig {
     /// have not sent any data within this window. Set to 0 to disable.
     #[arg(long, default_value_t = 30)]
     pub connection_timeout_secs: u64,
-    /// Maximum number of concurrent authenticated connections. New
-    /// connections are rejected (closed immediately) when this limit is
-    /// reached. 0 means unlimited. Prevents fd/memory exhaustion (SEC-02).
-    #[arg(long, default_value_t = 1024)]
+    /// Maximum number of concurrent authenticated connections, from 1 to
+    /// 8192. New connections are rejected (closed immediately) when this
+    /// limit is reached. Prevents fd/memory exhaustion (SEC-02). The
+    /// io_uring rings are sized from it, and their memory counts against
+    /// the locked-memory limit, so a cap well above the clients the node
+    /// serves costs memory for nothing. There is no "unlimited".
+    #[arg(
+        long,
+        default_value_t = 1024,
+        value_parser = clap::value_parser!(u64).range(1..=crate::connection_limit::MAX_SUPPORTED_CONNECTIONS)
+    )]
     pub max_connections: u64,
     /// Path to the authorized keys file for Ed25519 challenge-response
     /// authentication. Every connection must authenticate before sending
@@ -1286,6 +1293,10 @@ fn bind_replication_listener(
 /// `run_as_primary`, which a promotion reaches without passing through
 /// boot.
 fn validate_primary_config(config: &ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // The cap sizes the io_uring rings; one they cannot be sized for
+    // (0, once "unlimited", or above the ceiling) is refused here, on
+    // either transport, rather than at the first ring.
+    crate::connection_limit::RingSizing::for_max_connections(config.max_connections)?;
     if config.replication_bind.is_some() && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
     }
@@ -1519,6 +1530,20 @@ fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
     Ok(())
 }
 
+/// Stop the stages a primary already spawned when a later one cannot
+/// start, so the startup error goes back to the caller with no thread
+/// left running behind it.
+fn abort_startup<A: Send + 'static, W: Send + 'static>(
+    handles: PipelineHandles<A, W>,
+    pipeline_healthy: &AtomicBool,
+    shutdown: &AtomicBool,
+) {
+    // Dropped result: the failures it can carry (a panicked thread, a
+    // journal error) are logged by `shutdown_pipeline_stages` itself, and
+    // the stage that could not start is the error the caller returns.
+    let _ = shutdown_pipeline_stages(handles, Vec::new(), pipeline_healthy, shutdown);
+}
+
 /// Used by both the normal primary startup path and the promotion path
 /// (replica → primary transition).
 ///
@@ -1580,6 +1605,10 @@ where
     let enable_replication = config.replication_bind.is_some();
     // Re-checked: a promotion reaches here without the boot-time check.
     validate_primary_config(config)?;
+    // The reader's and the response stage's io_uring sizes, from the
+    // connection cap the accept loop below enforces.
+    let ring_sizing =
+        crate::connection_limit::RingSizing::for_max_connections(config.max_connections)?;
     // The lineage's genesis length, read before the writer moves into
     // the pipeline: the shadow stage stamps it into every snapshot.
     let genesis_entries = writer.read_header_info()?.genesis_entries;
@@ -1776,11 +1805,14 @@ where
     let response_utilization_thread = Arc::clone(&response_utilization);
     let response_fence = Arc::clone(&fence_state);
     let active_connections_response = Arc::clone(&active_connections);
+    // The stage's startup report — see `Response::ready`. Capacity one so
+    // the report never blocks the stage on this thread reaching `recv`.
+    let (response_ready_tx, response_ready_rx) = std::sync::mpsc::sync_channel(1);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("response", cores.response.core);
-            crate::response::run::<A>(
+            let started = crate::response::run::<A>(
                 output_consumer,
                 control_rx,
                 crate::response::Response::<A> {
@@ -1795,11 +1827,18 @@ where
                     fence_state: response_fence,
                     active_connections: active_connections_response,
                     refusals: refusal_rx,
+                    ring_sizing,
+                    ready: Some(response_ready_tx),
                     #[cfg(test)]
                     pause_after_control_drain: None,
                 },
                 &s3,
             );
+            if !started {
+                // Never ran: the reason went back through the startup
+                // report, and the spawner turns it into the node's error.
+                return;
+            }
             let was_shutdown = shutdown_for_response.load(Ordering::Relaxed);
             if was_shutdown {
                 info!("response thread exited cleanly on shutdown");
@@ -1808,6 +1847,25 @@ where
             }
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
+
+    // A stage without its ring is a node that cannot answer anyone:
+    // refuse to start, after stopping the stages already running.
+    if let Err(e) = crate::connection_limit::await_startup("response", &response_ready_rx) {
+        abort_startup(
+            PipelineHandles {
+                journal: journal_handle,
+                matching: matching_handle,
+                response: response_handle,
+                replication: None,
+                event_publisher: None,
+                shadow: None,
+                health: None,
+            },
+            &AtomicBool::new(false),
+            &shutdown,
+        );
+        return Err(e.into());
+    }
 
     // Spawn replication sender thread if enabled. The journal stage publishes
     // encoded batches to a pre-allocated ring; the sender thread consumes them.
@@ -2029,7 +2087,7 @@ where
     // If shutdown was requested while they were draining we still spawn the
     // reader so the unified shutdown sequence below joins every thread.
     let reader_shutdown = Arc::new(AtomicBool::new(false));
-    let mut reader_handle = crate::reader::spawn_reader::<A, _>(
+    let mut reader_handle = match crate::reader::spawn_reader::<A, _>(
         input_producer,
         decoder,
         halt_gate,
@@ -2038,8 +2096,29 @@ where
         config.cores.reader.core,
         connection_timeout,
         config.tick_interval(),
+        ring_sizing,
         Arc::clone(&reader_shutdown),
-    );
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // No reader, no client is ever served: refuse to start, after
+            // stopping every stage already running.
+            abort_startup(
+                PipelineHandles {
+                    journal: journal_handle,
+                    matching: matching_handle,
+                    response: response_handle,
+                    replication: replication_handle,
+                    event_publisher: event_publisher_handle,
+                    shadow: shadow_handle,
+                    health: health_handle,
+                },
+                &pipeline_healthy,
+                &shutdown,
+            );
+            return Err(e.into());
+        }
+    };
 
     // Health endpoint and `pipeline_healthy` were already spawned/created
     // earlier (before `journal_on_primary_events`) so probes can succeed
@@ -2105,9 +2184,10 @@ where
         // Enforce max_connections limit (SEC-02). Reject early before
         // spending time on auth. The counter is decremented by the response
         // stage on disconnect or write error.
-        if config.max_connections > 0
-            && active_connections.load(Ordering::Relaxed) >= config.max_connections
-        {
+        if crate::connection_limit::connection_cap_reached(
+            active_connections.load(Ordering::Relaxed),
+            config.max_connections,
+        ) {
             warn!(addr = %addr, "connection rejected: max_connections reached");
             drop(std_read);
             drop(std_write);
@@ -4945,6 +5025,54 @@ mod genesis_tests {
             ..ServerConfig::default()
         };
         validate_primary_config(&accepted).expect("standalone under disk");
+    }
+
+    /// A connection cap the rings cannot be sized for is a startup error
+    /// on either transport — `0`, which once meant "unlimited", included —
+    /// and the CLI refuses it before the config exists.
+    #[test]
+    fn max_connections_must_be_a_supported_cap() {
+        use crate::connection_limit::MAX_SUPPORTED_CONNECTIONS;
+        use clap::Parser as _;
+
+        for refused in [0, MAX_SUPPORTED_CONNECTIONS + 1] {
+            let config = ServerConfig {
+                max_connections: refused,
+                ..ServerConfig::default()
+            };
+            let err = validate_primary_config(&config).expect_err("an unsupported cap");
+            assert!(err.to_string().contains("--max-connections"), "{err}");
+            assert!(
+                ServerConfig::try_parse_from([
+                    "melin-server",
+                    "--max-connections",
+                    &refused.to_string()
+                ])
+                .is_err(),
+                "the CLI accepted --max-connections {refused}"
+            );
+        }
+        for accepted in [1, 1024, MAX_SUPPORTED_CONNECTIONS] {
+            let config = ServerConfig {
+                max_connections: accepted,
+                ..ServerConfig::default()
+            };
+            validate_primary_config(&config).expect("a supported cap");
+            let parsed = ServerConfig::try_parse_from([
+                "melin-server",
+                "--max-connections",
+                &accepted.to_string(),
+            ])
+            .expect("the CLI accepts a supported cap");
+            assert_eq!(parsed.max_connections, accepted);
+        }
+        assert_eq!(
+            ServerConfig::try_parse_from(["melin-server"])
+                .expect("defaults parse")
+                .max_connections,
+            ServerConfig::default().max_connections,
+            "the CLI default and `Default` agree"
+        );
     }
 
     /// A replica that copied only part of the lineage's genesis — an

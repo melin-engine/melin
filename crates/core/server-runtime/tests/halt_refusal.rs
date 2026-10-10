@@ -126,7 +126,6 @@ fn a_write_refused_while_halted_is_not_replayed() {
             journal: tmp.path().join(format!("{name}.journal")),
             authorized_keys: auth_path.clone(),
             ack_policy: AckPolicy::Disk,
-            no_mlock: true,
             // Unpinned, and therefore yielding: both nodes share this
             // process with the test's own client.
             cores: PipelineCores::unpinned(),
@@ -134,7 +133,7 @@ fn a_write_refused_while_halted_is_not_replayed() {
             snapshot_interval_ms: 0,
             health_bind: Some(free_addr(PORT_BASE)),
             replication_key: Some(key_path),
-            ..ServerConfig::default()
+            ..melin_test_node::config()
         }
     };
 
@@ -192,12 +191,11 @@ fn a_write_refused_while_halted_is_not_replayed() {
         authorized_keys: auth_path.clone(),
         standalone: true,
         ack_policy: AckPolicy::Disk,
-        no_mlock: true,
         cores: PipelineCores::unpinned(),
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        ..ServerConfig::default()
+        ..melin_test_node::config()
     };
     let restarted = spawn_node(&addrs(0), restart_config);
     let deadline = Instant::now() + Duration::from_secs(30);

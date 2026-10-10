@@ -52,6 +52,11 @@ fn value_of(frame: &[u8]) -> u64 {
 /// returned so the caller keeps it alive for as long as the node runs:
 /// the journal lives inside it.
 fn start_server() -> (tempfile::TempDir, Node) {
+    start_server_capped(melin_test_node::MAX_CONNECTIONS)
+}
+
+/// [`start_server`], accepting at most `max_connections` clients.
+fn start_server_capped(max_connections: u64) -> (tempfile::TempDir, Node) {
     // Server logs go to stderr, which the harness only shows for a
     // failing test: what the node did is then in the report.
     // Deliberately ignored: only the first test in the process installs
@@ -81,7 +86,6 @@ fn start_server() -> (tempfile::TempDir, Node) {
         authorized_keys: auth_path,
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
-        no_mlock: true,
         // Unpinned, and therefore yielding: the suite runs many nodes at
         // once, and the default layout would stack every node's same-role
         // thread on one core while a spinner would starve whatever shares
@@ -90,7 +94,8 @@ fn start_server() -> (tempfile::TempDir, Node) {
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        ..ServerConfig::default()
+        max_connections,
+        ..melin_test_node::config()
     };
 
     let server = melin_test_node::start::<Counter>(
@@ -155,6 +160,32 @@ fn overflowing_increment_is_refused() {
 
     drop(node);
     server.stop();
+}
+
+/// A node at the production connection cap, whose rings are the largest
+/// a default deployment runs, starts and serves. The other tests run
+/// small test-sized nodes; this one keeps the production sizing covered.
+#[test]
+fn a_node_at_the_production_cap_serves() {
+    let (_tmp, server) = start_server_capped(ServerConfig::default().max_connections);
+    let key = SigningKey::from_bytes(&[0xAA; 32]);
+    let mut node = connect_authenticated(server.addr(), &key);
+
+    let ack = node.request_one(&increment_request(7)).expect("increment");
+    assert_eq!(ack[0], KIND_RESP_ACK);
+    assert_eq!(value_of(&ack), 7);
+
+    drop(node);
+    server.stop();
+}
+
+/// `0`, which once meant "unlimited", leaves the rings nothing to be
+/// sized from: the node refuses to start, and says so.
+#[test]
+fn a_node_without_a_connection_cap_refuses_to_start() {
+    let (_tmp, server) = start_server_capped(0);
+    let err = server.join().expect_err("a node with no connection cap");
+    assert!(err.contains("unlimited"), "{err}");
 }
 
 #[test]

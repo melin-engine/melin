@@ -22,6 +22,46 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   transitive crates (rkyv, the wit-bindgen and wasm-tools stack, uuid,
   bitvec) that nothing needed any more. The minimum supported Rust version
   is unchanged.
+- **`--max-connections` now sizes the kernel-TCP transport's io_uring
+  rings, and must be between 1 and 8192.** The reader's and the response
+  stage's rings, and the reader's receive-buffer pool, used to be fixed
+  for about a thousand connections; they are now derived from the cap at
+  startup. At the default cap (1024) the sizes are the ones they always
+  were. A smaller cap takes less locked memory: the kernel charges ring
+  memory against `RLIMIT_MEMLOCK`, so a node sized for the clients it
+  actually serves fits a tighter limit, and many such nodes fit on one
+  host. `0`, which meant unlimited, is refused at startup with an error
+  naming the largest supported value, and so is anything above 8192; a
+  deployment passing `--max-connections 0` must pick a cap. The cap now
+  gates the DPDK transport's accepts unconditionally too.
+- **The reader and the response stage take their ring sizes.**
+  `reader::spawn_reader` takes a `connection_limit::RingSizing` and
+  returns an `io::Result`, and `response::Response` has two new fields,
+  `ring_sizing` and `ready`: a caller that builds either directly has to
+  supply them. `response::run` returns a `bool` (whether the stage
+  started) instead of `()`, so a `JoinHandle<()>` binding for its thread
+  no longer compiles.
+
+### Fixed
+
+- **A node that cannot create its io_uring rings refuses to start, and
+  says why.** Ring creation failed on the stage's own thread, which
+  panicked; the node went down later, on noticing the dead thread, with
+  an error that did not name the cause. Each
+  stage now reports whether it holds its ring before startup continues,
+  and a failure stops the node with an error. When the cause is the
+  locked-memory limit, the usual one, the error names `RLIMIT_MEMLOCK`
+  and the systemd `LimitMEMLOCK=` setting that raises it.
+- **A `--max-connections` above about a thousand, or `0`, could panic the
+  reader or the response stage.** The rings were fixed in size, so
+  enough connections flushing or re-arming at once overran the
+  submission queue. The rings are now sized from the cap, and a cap they
+  cannot be sized for is refused at startup.
+- **The reader's legacy receive-buffer fallback could overrun its
+  submission queue.** On hosts that refuse the ring-mapped buffer pool,
+  each recycled buffer takes a submission entry on top of those the
+  ring is sized for; a full queue is now flushed to the kernel instead
+  of panicking the reader.
 
 ## [0.19.0] - 2026-10-10
 

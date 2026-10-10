@@ -135,7 +135,6 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
         ServerConfig {
             journal: tmp.path().join(format!("node-{i}.journal")),
             authorized_keys: auth_path.clone(),
-            no_mlock: true,
             // Unpinned, and therefore yielding: three nodes run in this
             // process alongside the rest of the suite, and the default
             // layout would stack every node's same-role thread on one core
@@ -151,7 +150,7 @@ fn killed_primary_triggers_exactly_one_auto_promotion() {
             raft_peer: peers.clone(),
             raft_dir: Some(tmp.path().join(format!("node-{i}.raft"))),
             raft_auto_promote: true,
-            ..ServerConfig::default()
+            ..melin_test_node::config()
         }
     };
 

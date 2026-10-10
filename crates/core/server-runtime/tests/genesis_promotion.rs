@@ -119,7 +119,6 @@ impl Cluster {
             journal: self.tmp.path().join(format!("{name}.journal")),
             authorized_keys: self.auth_path.clone(),
             ack_policy: AckPolicy::Disk,
-            no_mlock: true,
             // Unpinned, and therefore yielding: the nodes share this
             // process with the test's own clients.
             cores: PipelineCores::unpinned(),
@@ -129,7 +128,7 @@ impl Cluster {
             health_bind: None,
             admin_bind: Some(free_addr(PORT_BASE)),
             replication_key: Some(self.tmp.path().join(format!("{name}.key"))),
-            ..ServerConfig::default()
+            ..melin_test_node::config()
         }
     }
 }

@@ -35,16 +35,11 @@ use melin_transport_core::{DurableWireSeqCursor, WireSeq};
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
+use crate::connection_limit::{RingSizing, ring_setup_error};
 use crate::response_frame::{EncodeBuf, MAX_APP_FRAME, encode_slot_payload, frame_app_response};
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
-
-/// io_uring submission queue depth for sends. Must be ≥ max concurrent
-/// connections to avoid SQ overflow when all connections are dirty.
-/// Power of 2 for io_uring alignment. 4096 supports 1024+ client
-/// benchmarks where all connections flush simultaneously.
-const RING_SIZE: u32 = 4096;
 
 /// Maximum accumulated send buffer per connection (64 KiB). If a client
 /// falls behind and the buffer exceeds this, the connection is dropped.
@@ -206,6 +201,19 @@ pub struct Response<A: Application> {
     /// answered, so a client sees its replies in request order — see
     /// [`crate::halt`].
     pub refusals: RefusalQueue<A::Report>,
+    /// Sizes the stage's io_uring instance. A flush submits at most one
+    /// SEND per dirty connection, and the connection table never holds
+    /// more than `--max-connections` entries (the accept gate counts
+    /// them), so a ring sized from that cap holds a whole flush — see
+    /// [`RingSizing`].
+    pub ring_sizing: RingSizing,
+    /// Startup report: `Ok` once the stage holds its io_uring instance,
+    /// the creation error otherwise (and the stage returns without
+    /// running). The ring is created on the stage's own thread, which is
+    /// the only one allowed to submit to it, so this is how the spawner
+    /// learns the outcome before it carries on. `None` when nobody waits
+    /// for it; a creation failure is then only logged.
+    pub ready: Option<mpsc::SyncSender<std::io::Result<()>>>,
     /// Test seam: called once per iteration right after the control
     /// channel has been drained, so a test can hold the stage there and
     /// choose what lands while it waits. The drain runs after the
@@ -262,12 +270,17 @@ struct ConnectionEntry {
 /// node's persisted) plus per-slot replica cursors (in-memory and
 /// persisted) from `replication_metrics` and feeds them through the
 /// configured [`Policy`]. See `evaluate_durability`.
+///
+/// Returns `true` once the stage has run and stopped on shutdown, `false`
+/// when it never started: its io_uring instance could not be created
+/// (reported through [`Response::ready`]), or nobody was left to report
+/// to.
 pub fn run<A: Application>(
     mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
     config: Response<A>,
     shutdown: &AtomicBool,
-) {
+) -> bool {
     let Response {
         journal_persisted_wire_seq,
         ack_policy,
@@ -280,9 +293,39 @@ pub fn run<A: Application>(
         fence_state,
         active_connections,
         mut refusals,
+        ring_sizing,
+        ready,
         #[cfg(test)]
         mut pause_after_control_drain,
     } = config;
+    // SINGLE_ISSUER: created and submitted from this thread only — the
+    // kernel skips SQ locking and rejects cross-thread submission with
+    // EEXIST instead of racing. Matches the journal/replication rings.
+    // Created first, before anything else the stage builds, so a node
+    // that cannot have it learns so before the stage touches anything.
+    let ring_entries = ring_sizing.ring_entries();
+    let mut ring: IoUring = match IoUring::builder().setup_single_issuer().build(ring_entries) {
+        Ok(ring) => ring,
+        Err(e) => {
+            let err = ring_setup_error("response", ring_entries, e);
+            match ready {
+                // Dropped send: a spawner that stopped waiting is
+                // unwinding, and the stage returns either way.
+                Some(ready) => {
+                    let _ = ready.send(Err(err));
+                }
+                None => error!(error = %err, "response stage cannot start"),
+            }
+            return false;
+        }
+    };
+    // Started. A failed send means the spawner is no longer waiting — it
+    // is unwinding — so nothing would ever stop this stage: return.
+    if let Some(ready) = ready
+        && ready.send(Ok(())).is_err()
+    {
+        return false;
+    }
     // The ack policy in force and the durability gate. The atomic is the
     // single source of truth across the process lifetime; the gate keeps
     // a thread-local copy for cheap per-iteration use and rebuilds it
@@ -300,13 +343,6 @@ pub fn run<A: Application>(
         },
         "response",
     );
-    // SINGLE_ISSUER: created and submitted from this thread only — the
-    // kernel skips SQ locking and rejects cross-thread submission with
-    // EEXIST instead of racing. Matches the journal/replication rings.
-    let mut ring: IoUring = IoUring::builder()
-        .setup_single_issuer()
-        .build(RING_SIZE)
-        .expect("failed to create io_uring instance for response stage");
 
     // Connection table: maps connection IDs to their state.
     //
@@ -425,8 +461,9 @@ pub fn run<A: Application>(
 
     // Pre-allocated CQE collection buffer. Must collect CQEs before
     // processing because the CQ borrow must end before mutating connections.
-    // Pre-sized to RING_SIZE to avoid per-iteration heap allocation.
-    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(RING_SIZE as usize);
+    // Pre-sized to the ring's depth (a flush's most SENDs) to avoid
+    // per-iteration heap allocation.
+    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(ring_entries as usize);
 
     // Pre-encode the heartbeat response frame once. Full wire frame
     // (length prefix + tag) for direct append to send_buf.
@@ -514,7 +551,7 @@ pub fn run<A: Application>(
             utilization.idle.store(idle_count, Ordering::Relaxed);
             #[cfg(feature = "pipeline-stats")]
             print_utilization("response", busy_count, idle_count);
-            return;
+            return true;
         }
 
         // Borrow output slots from the matching stage in place.
@@ -1435,9 +1472,10 @@ fn flush_sends(
         .user_data(conn_id);
 
         unsafe {
-            ring.submission()
-                .push(&sqe)
-                .expect("io_uring SQ full — increase RING_SIZE");
+            ring.submission().push(&sqe).expect(
+                "io_uring SQ full: a flush submits one SEND per connection, and the ring \
+                 is sized above --max-connections",
+            );
         }
         pending += 1;
     }
@@ -1462,9 +1500,11 @@ fn flush_sends(
                 Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
                 Err(e) => {
                     // Submit-phase failure (ENOMEM class — EBUSY cannot
-                    // happen: the CQ is RING_SIZE deep and fully reaped
-                    // every flush, so at most `pending` ≤ RING_SIZE
-                    // entries are ever outstanding). An error here means
+                    // happen: the CQ is twice the ring's depth and fully
+                    // reaped every flush, and `pending` — one SEND per
+                    // connection — is at most `--max-connections`, below
+                    // the depth `RingSizing` derives from it, so the CQ
+                    // never holds more than one flush). An error here means
                     // the SQEs were NOT consumed: continuing would leave
                     // them queued for the next flush's submit, by which
                     // time their addr fields can point at drained or
@@ -3686,6 +3726,9 @@ mod tests {
                     melin_pipeline::padding::CachePadded::new(AtomicU64::new(0)),
                 ))
                 .1,
+                ring_sizing: crate::connection_limit::RingSizing::for_max_connections(1)
+                    .expect("a supported cap"),
+                ready: None,
                 pause_after_control_drain: Some(Box::new(pause)),
             };
 
@@ -4032,6 +4075,9 @@ mod tests {
                 fence_state,
                 active_connections: Arc::new(AtomicU64::new(0)),
                 refusals,
+                ring_sizing: crate::connection_limit::RingSizing::for_max_connections(4)
+                    .expect("a supported cap"),
+                ready: None,
                 pause_after_control_drain,
             }
         }
@@ -4144,6 +4190,62 @@ mod tests {
         #[test]
         fn a_fenced_stage_leaves_the_gate_and_drops_the_held_reply() {
             stop_while_gated(true);
+        }
+    }
+
+    /// The stage reports whether it holds its io_uring instance before it
+    /// runs, so the node can refuse to start instead of losing the stage
+    /// to a panic on a thread nobody is watching.
+    mod startup_report {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::{Arc, mpsc};
+
+        use counter_server::{Counter, CounterQuery, CounterReport};
+        use melin_pipeline::padding::CachePadded;
+        use melin_pipeline::ring::DisruptorBuilder;
+        use melin_pipeline::wait::WaitStrategy;
+        use melin_transport_core::fence::FenceState;
+        use melin_transport_core::pipeline::OutputSlot;
+        use melin_transport_core::{DurableWireSeqCursor, WireSeq};
+
+        use super::refusal_order::config;
+        use crate::connection_limit::RingSizing;
+        use crate::halt::refusal_channel;
+        use crate::response::run;
+
+        /// A zero-entry ring stands in for the locked-memory limit: both
+        /// fail `io_uring_setup`. The stage reports the error and returns
+        /// without running — `run` returning at all is the proof, since a
+        /// running stage only stops on shutdown, which is never set.
+        #[test]
+        fn a_ring_that_cannot_be_created_is_reported_and_the_stage_returns() {
+            let (_producer, mut consumers) =
+                DisruptorBuilder::<OutputSlot<CounterReport, CounterQuery>>::new(64)
+                    .add_consumer()
+                    .build(WaitStrategy::SpinThenYield);
+            let consumer = consumers.pop().expect("one consumer was requested");
+            let (_control_tx, control_rx) = mpsc::channel();
+            let refusals = refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1;
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let mut config = config(
+                DurableWireSeqCursor::detached(WireSeq::new(0)),
+                Arc::new(FenceState::new(0)),
+                refusals,
+                None,
+            );
+            config.ring_sizing = RingSizing::unchecked(0, 32);
+            config.ready = Some(ready_tx);
+
+            let started = run::<Counter>(consumer, control_rx, config, &AtomicBool::new(false));
+            assert!(!started, "the stage reports that it never ran");
+
+            let err = ready_rx
+                .recv()
+                .expect("the stage reports")
+                .expect_err("a zero-entry ring cannot be created");
+            let msg = err.to_string();
+            assert!(msg.contains("response"), "{msg}");
+            assert!(msg.contains("io_uring"), "{msg}");
         }
     }
 }

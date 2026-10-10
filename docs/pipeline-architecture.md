@@ -459,7 +459,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |
-| `--max-connections` | `1024` | Maximum concurrent authenticated connections (0 for unlimited) |
+| `--max-connections` | `1024` | Maximum concurrent authenticated connections, from 1 to 8192. The node's I/O rings are sized from it, and their memory counts against the locked-memory limit (see [Deployment](deployment.md#locked-memory)). There is no unlimited setting: `0` is refused at startup. |
 
 ## Feature Gates
 
@@ -479,4 +479,5 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | `MAX_JOURNAL_BATCH` | `4096` (ceiling; the effective cap is the lesser of this and what fills one ring slot) | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_BATCH` (response) | `1024` | `crates/core/server-runtime/src/response.rs` |
 | `MAX_RESPONSE_BODY` | `512` bytes (one response body, framing excluded) | `crates/core/server-runtime/src/response_frame.rs` |
-| `NUM_BUFFERS` | `2048` | `crates/core/server-runtime/src/reader.rs` (io_uring provided buffer pool) |
+
+The reader's and response writer's io_uring rings, and the reader's provided-buffer pool (two buffers per connection), are not constants: they are sized from `--max-connections` at startup (`RingSizing` in `crates/core/server-runtime/src/connection_limit.rs`). At the default cap the sizes match the former fixed ones.

@@ -28,6 +28,7 @@ use melin_pipeline::ring::DisruptorBuilder;
 use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::ControlEvent;
 use melin_server_runtime::ack_policy::AckPolicy;
+use melin_server_runtime::connection_limit::RingSizing;
 use melin_server_runtime::halt;
 use melin_server_runtime::response::{self, Response};
 use melin_transport_core::fence::FenceState;
@@ -183,6 +184,8 @@ fn large_frame_batch_is_delivered_not_disconnected() {
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         // No reader: nothing is ever refused.
         refusals: halt::refusal_channel(Arc::new(CachePadded::new(AtomicU64::new(0)))).1,
+        ring_sizing: RingSizing::for_max_connections(1).expect("a supported cap"),
+        ready: None,
     };
 
     thread::scope(|scope| {

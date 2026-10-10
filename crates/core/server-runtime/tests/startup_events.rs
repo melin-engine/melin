@@ -75,7 +75,6 @@ fn standalone_config(dir: &Path) -> ServerConfig {
         authorized_keys: auth_path,
         standalone: true,
         ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
-        no_mlock: true,
         // Unpinned, and therefore yielding: the suite runs many nodes at
         // once, and the default layout would stack every node's same-role
         // thread on one core while a spinner would starve whatever shares
@@ -84,7 +83,7 @@ fn standalone_config(dir: &Path) -> ServerConfig {
         tick_interval_ms: 0,
         snapshot_interval_ms: 0,
         health_bind: None,
-        ..ServerConfig::default()
+        ..melin_test_node::config()
     }
 }
 
