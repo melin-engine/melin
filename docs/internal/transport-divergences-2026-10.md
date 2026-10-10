@@ -36,6 +36,27 @@ Replication links no longer close this way: they go through
 client close could use the same call, or a graceful FIN, which needs the
 socket kept until the FIN is acknowledged.
 
+### DPDK refuses a SYN that arrives during another's handshake
+
+`DpdkTransport` keeps one listening socket per port and replaces it only
+once the accepted socket is established (`check_listener` in
+`crates/core/dpdk`), and the stack answers a TCP segment that matches no
+socket with an RST. So while one client's handshake is in progress on a
+port, a second client's SYN to that port is refused outright. The kernel
+queues it in the listen backlog and completes both. A client that dials
+several connections at once, or two clients that connect in the same
+instant, get a refusal on DPDK that they would not get on io_uring; the
+refused side sees connection refused, not a timeout, and retries only if
+it was written to. The Exchange Core's bench dials its connections one at
+a time for this reason, and the DPDK client plan
+(`dpdk-client-2026-10.md`) makes its handle do the same.
+
+The DPDK side looks wrong: a backlog of listeners per port (several
+listening sockets, each replaced as it is accepted) would take as many
+concurrent handshakes as there are listeners, at the cost of their
+buffers. No DPDK test yet; the one to write dials two connections to a
+node in the same poll and expects both to be established.
+
 ### DPDK does not see a client's close (likely bug)
 
 `dpdk_transport.rs`, the read path. A connection is released when a
