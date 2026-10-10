@@ -21,6 +21,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use clap::Args;
+use melin_dpdk::arp;
 use melin_dpdk::device::DpdkDevice;
 use melin_dpdk::{Eal, Mempool, PeerMacSource, Port, resolve_peer_mac, try_parse_mac};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -28,7 +29,6 @@ use smoltcp::socket::tcp::{self, State};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-use crate::arp;
 use crate::transport::Transport;
 use crate::tsc::{TscClock, rdtscp};
 
@@ -160,11 +160,9 @@ impl DpdkTcp {
         // Announce ourselves to the fabric, and seed the server into our
         // own neighbour cache by injecting the reply we would like to
         // have received.
-        device.send_raw_frame(&arp::gratuitous_request(mac, local_ip.octets()));
+        device.send_raw_frame(&arp::gratuitous_request(mac, local_ip));
         let (server_mac, source) = resolve_peer_mac(peer_mac, *server.ip());
-        device.inject_rx(
-            arp::reply(mac, local_ip.octets(), server_mac, server.ip().octets()).to_vec(),
-        );
+        device.inject_rx(arp::reply(mac, local_ip, server_mac, *server.ip()).to_vec());
         let mut sockets = SocketSet::new(Vec::new());
         device.poll_rx();
         iface.poll(now, &mut device, &mut sockets);

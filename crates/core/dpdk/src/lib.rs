@@ -26,6 +26,13 @@ mod eal_sharing;
 // gone is TCP-stack logic, tested over an in-memory wire.
 pub mod peer_liveness;
 pub use peer_liveness::PeerLiveness;
+// Ungated for the same reason: the ARP frames a transport sends and
+// injects are a fixed byte layout, tested on any host.
+pub mod arp;
+// Ungated: configuration is plain data, mapped from the same flags whether
+// or not this build has the transport compiled in.
+mod config;
+pub use config::{DpdkConfig, NicConfig};
 
 #[cfg(feature = "dpdk-sys")]
 mod dpdk;

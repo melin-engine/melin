@@ -48,8 +48,6 @@ use clap::{Parser, ValueEnum};
 use hdrhistogram::Histogram;
 use melin_wire_protocol::control_codec::{TAG_APP, TAG_BATCH_END};
 
-#[cfg(any(feature = "dpdk", test))]
-mod arp;
 #[cfg(feature = "dpdk")]
 mod dpdk;
 mod shm;

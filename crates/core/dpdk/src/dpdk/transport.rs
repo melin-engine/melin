@@ -14,15 +14,22 @@ use smoltcp::socket::tcp::{self, OpaqueFrameHandle, State};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
+use crate::config::NicConfig;
 use crate::device::DpdkDevice;
 use crate::eal::Eal;
 use crate::mempool::Mempool;
 use crate::peer_liveness::{self, PeerLiveness, StackClock};
 use crate::port::{ChecksumOffloads, Port};
 
+// Defined outside the `dpdk-sys` gate (`crate::config`); re-exported here so
+// `melin_dpdk::transport::DpdkConfig` still names it.
+pub use crate::config::DpdkConfig;
+
 /// Apply low-latency TCP tuning to a smoltcp socket.
 ///
-/// Called on every socket (listen + accepted) to configure for low latency:
+/// Called on every socket (listen, accepted and dialed) to configure for
+/// low latency, and crate-visible so that every socket the crate opens on
+/// a NIC carries the same tuning:
 /// - Nagle disabled (TCP_NODELAY): send small messages immediately
 /// - Delayed ACK disabled: ACK every segment without waiting 10ms
 /// - RTO floor and initial RTO both at 1ms — fastcp's minimum (its RTT
@@ -34,7 +41,7 @@ use crate::port::{ChecksumOffloads, Port};
 ///
 /// These settings sacrifice marginal bandwidth efficiency and RFC
 /// compliance for latency on a trusted, dedicated LAN.
-fn tune_socket(socket: &mut tcp::Socket<'_>) {
+pub(crate) fn tune_socket(socket: &mut tcp::Socket<'_>) {
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
     socket.set_min_rto(smoltcp::time::Duration::from_millis(1));
@@ -45,9 +52,6 @@ fn tune_socket(socket: &mut tcp::Socket<'_>) {
 /// Maximum concurrent TCP connections. Exposed so callers can pre-size
 /// per-connection state vectors that parallel the smoltcp socket set.
 pub const MAX_CONNECTIONS: usize = 1024;
-
-/// TCP listen port for client connections.
-const LISTEN_PORT: u16 = 9876;
 
 /// Retain callback for zero-copy RX segments. Called by smoltcp when it
 /// stores a segment in the zero-copy array. Bumps the mbuf refcount so
@@ -140,71 +144,6 @@ const _: () = assert!(GATEWAY_RESEED_INTERVAL_MS < NEIGHBOR_ENTRY_LIFETIME_MS);
 fn gateway_reseed_due(now: Instant, last_seeded: Instant) -> bool {
     let elapsed = now.total_millis() - last_seeded.total_millis();
     !(0..GATEWAY_RESEED_INTERVAL_MS).contains(&elapsed)
-}
-
-/// Configuration for the DPDK transport.
-#[derive(Clone, Debug)]
-pub struct DpdkConfig {
-    pub eal_args: Vec<String>,
-    /// DPDK port IDs to poll. The first port is used for TX; all ports
-    /// are polled for RX. For LACP bonds, pass both VF port IDs (e.g.,
-    /// `vec![0, 1]`) so traffic arriving on either bond member is received.
-    pub port_ids: Vec<u16>,
-    pub ip_addr: Ipv4Addr,
-    pub prefix_len: u8,
-    pub gateway: Option<Ipv4Addr>,
-    /// Peer IPv4 to capture into DPDK via an `rte_flow` steering rule.
-    /// When Some, the port is configured in bifurcated mode: kernel
-    /// keeps every packet that does NOT come from this source IP, so
-    /// the management plane (SSH, ARP, neighbor tenants) keeps working
-    /// while DPDK steals only this peer's traffic. Used for L3 setups
-    /// where the public NIC is shared with the kernel.
-    pub peer_ip: Option<Ipv4Addr>,
-    /// MAC address to seed into smoltcp's neighbor cache for the
-    /// gateway IP. Required in bifurcated L3 mode because the gateway's
-    /// ARP reply would not match our flow rule (different source IP) —
-    /// it would be eaten by the kernel. Operators source this MAC from
-    /// the kernel's existing `ip neigh` cache and pass it in.
-    pub gateway_mac: Option<[u8; 6]>,
-    /// MAC address of the peer this node dials out to — the primary, for
-    /// a replica. Only a connection *initiator* needs it: an acceptor
-    /// learns the peer's address from the inbound frame. When None the
-    /// initiator falls back to the SR-IOV `02:00:<ip>` convention, which
-    /// is wrong on any port that keeps a real hardware address (an mlx5
-    /// in bifurcated mode shares the kernel netdev's). See
-    /// [`crate::mac::resolve_peer_mac`].
-    pub peer_mac: Option<[u8; 6]>,
-    pub listen_port: u16,
-    /// MTU for the DPDK interface. 1500 for standard Ethernet, 9000 for
-    /// jumbo frames (6x fewer TCP segments, ~6x less per-segment overhead).
-    pub mtu: usize,
-    /// VLAN ID for hardware strip/insert. Used in dedicated NIC mode where
-    /// the kernel isn't handling VLAN tags. None = no VLAN offload (SR-IOV
-    /// mode where the PF handles VLAN tagging).
-    pub vlan_id: Option<u16>,
-    /// Number of RX/TX queue pairs per port. Each queue pair is polled
-    /// by a separate thread. When > 1, RSS is enabled on the NIC to
-    /// distribute TCP/IP flows across queues. Default: 1.
-    pub num_queues: u16,
-}
-
-impl Default for DpdkConfig {
-    fn default() -> Self {
-        DpdkConfig {
-            eal_args: Vec::new(),
-            port_ids: vec![0],
-            ip_addr: Ipv4Addr::new(10, 0, 0, 1),
-            prefix_len: 24,
-            gateway: None,
-            peer_ip: None,
-            gateway_mac: None,
-            peer_mac: None,
-            listen_port: LISTEN_PORT,
-            mtu: 1500,
-            vlan_id: None,
-            num_queues: 1,
-        }
-    }
 }
 
 /// A new TCP connection accepted by the transport.
@@ -334,7 +273,7 @@ pub struct DpdkTransport {
     /// When the gateway was last seeded. Only read when `gateway` is set.
     gateway_seeded_at: Instant,
     /// Operator-supplied MAC for the peer this transport dials out to,
-    /// carried over from `DpdkConfig` so an outbound connect can seed the
+    /// carried over from `NicConfig` so an outbound connect can seed the
     /// neighbour cache without the caller having to thread config down.
     /// `None` = fall back to the derived convention.
     peer_mac: Option<[u8; 6]>,
@@ -395,12 +334,22 @@ impl DpdkShared {
     /// Initialize shared DPDK resources: EAL, mempool, ports.
     /// Call once before spawning poll threads.
     ///
-    /// EAL is initialized here from `config.eal_args`, and cleaned up when
-    /// the resources drop — unless the process runs a process-wide EAL
+    /// EAL is initialized here from `config.nic.eal_args`, and cleaned up
+    /// when the resources drop — unless the process runs a process-wide EAL
     /// ([`Eal::init_process_wide`]), which the node then shares: its EAL
     /// arguments must be empty, its ports must be its own, and dropping it
     /// leaves EAL running for the process's other nodes.
     pub fn init(config: &DpdkConfig) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        Self::init_nic(&config.nic, config.num_queues)
+    }
+
+    /// [`Self::init`] from the NIC's configuration and a queue count: all
+    /// it takes of a node's configuration, so a transport that is not a
+    /// node's can bring its NIC up the same way.
+    pub(crate) fn init_nic(
+        config: &NicConfig,
+        num_queues: u16,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let eal = match Eal::process_wide() {
             None => {
                 let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
@@ -450,7 +399,7 @@ impl DpdkShared {
 
         // Scale mempool for number of queues and ports.
         let num_mbufs: u32 =
-            8192 * (config.port_ids.len() as u32).max(1) * (config.num_queues as u32).max(1);
+            8192 * (config.port_ids.len() as u32).max(1) * (num_queues as u32).max(1);
         let pool_name = crate::eal_sharing::mempool_name(
             matches!(eal, NodeEal::ProcessWide(_)),
             config.port_ids[0],
@@ -471,8 +420,7 @@ impl DpdkShared {
         let mut ports = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
-            let mut port =
-                Port::configure(pid, &mempool, config.vlan_id, config.num_queues, bifurcated)?;
+            let mut port = Port::configure(pid, &mempool, config.vlan_id, num_queues, bifurcated)?;
             port.start()?;
             if let Some(peer) = config.peer_ip {
                 port.install_src_ipv4_steering(peer)?;
@@ -514,7 +462,7 @@ impl DpdkTransport {
         config: &DpdkConfig,
         queue_id: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::build(shared, config, queue_id, Some(config.listen_port))
+        Self::build(shared, &config.nic, queue_id, Some(config.listen_port))
     }
 
     /// Like [`Self::from_shared`], but listening on no port: for a
@@ -527,14 +475,16 @@ impl DpdkTransport {
         config: &DpdkConfig,
         queue_id: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::build(shared, config, queue_id, None)
+        Self::build(shared, &config.nic, queue_id, None)
     }
 
     /// The constructors' common body: `listen_port` is the port of the
     /// transport's first listener, with the client buffer sizes, or none.
+    /// Takes only the NIC's configuration: the interface and its neighbour
+    /// seeding need nothing of a node's.
     fn build(
         shared: &Arc<DpdkShared>,
-        config: &DpdkConfig,
+        config: &NicConfig,
         queue_id: u16,
         listen_port: Option<u16>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -1226,23 +1176,7 @@ impl DpdkTransport {
 
         // Gratuitous ARP: Ethernet broadcast + ARP request where
         // sender_ip == target_ip (RFC 5227).
-        let mut frame = [0u8; 42]; // 14 (eth) + 28 (ARP) = 42 bytes
-
-        // Ethernet header: broadcast destination.
-        frame[0..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        frame[6..12].copy_from_slice(&our_mac);
-        frame[12..14].copy_from_slice(&[0x08, 0x06]); // EtherType: ARP
-
-        // ARP payload.
-        frame[14..16].copy_from_slice(&[0x00, 0x01]); // hardware type: Ethernet
-        frame[16..18].copy_from_slice(&[0x08, 0x00]); // protocol type: IPv4
-        frame[18] = 6; // hardware addr len
-        frame[19] = 4; // protocol addr len
-        frame[20..22].copy_from_slice(&[0x00, 0x01]); // operation: request
-        frame[22..28].copy_from_slice(&our_mac); // sender hardware addr
-        frame[28..32].copy_from_slice(&our_ip.octets()); // sender protocol addr
-        frame[32..38].copy_from_slice(&[0x00; 6]); // target hardware addr (zero)
-        frame[38..42].copy_from_slice(&our_ip.octets()); // target protocol addr (= sender)
+        let frame = crate::arp::gratuitous_request(our_mac, our_ip);
 
         if self.device.send_raw_frame(&frame) {
             tracing::info!(
@@ -1274,27 +1208,9 @@ impl DpdkTransport {
         let our_mac = self._shared.mac;
         let our_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
 
-        // Craft an ARP reply Ethernet frame:
-        //   Ethernet: dst=our_mac, src=peer_mac, type=0x0806 (ARP)
-        //   ARP: reply, sender_hw=peer_mac, sender_ip=peer_ip,
-        //        target_hw=our_mac, target_ip=our_ip
-        let mut frame = [0u8; 42]; // 14 (eth) + 28 (ARP) = 42 bytes
-
-        // Ethernet header
-        frame[0..6].copy_from_slice(&our_mac); // dst MAC (us)
-        frame[6..12].copy_from_slice(&mac); // src MAC (peer)
-        frame[12..14].copy_from_slice(&[0x08, 0x06]); // EtherType: ARP
-
-        // ARP payload
-        frame[14..16].copy_from_slice(&[0x00, 0x01]); // hardware type: Ethernet
-        frame[16..18].copy_from_slice(&[0x08, 0x00]); // protocol type: IPv4
-        frame[18] = 6; // hardware addr len
-        frame[19] = 4; // protocol addr len
-        frame[20..22].copy_from_slice(&[0x00, 0x02]); // operation: reply
-        frame[22..28].copy_from_slice(&mac); // sender hardware addr
-        frame[28..32].copy_from_slice(&ip.octets()); // sender protocol addr
-        frame[32..38].copy_from_slice(&our_mac); // target hardware addr
-        frame[38..42].copy_from_slice(&our_ip.octets()); // target protocol addr
+        // An ARP reply from the peer, addressed to us: sender = (mac, ip),
+        // target = (our_mac, our_ip).
+        let frame = crate::arp::reply(our_mac, our_ip, mac, ip);
 
         self.device.inject_rx(frame.to_vec());
 

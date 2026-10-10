@@ -2379,38 +2379,43 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String
         melin_dpdk::try_parse_mac(value).map_err(|e| format!("invalid {flag}: {e}"))
     };
 
+    // A struct expression evaluates its fields in the order written, so
+    // this order is the order the flags are validated in: of several bad
+    // values, the first one here is the one reported.
     Ok(melin_dpdk::DpdkConfig {
-        eal_args: cfg
-            .dpdk_eal_args
-            .split_whitespace()
-            .map(String::from)
-            .collect(),
-        port_ids: cfg.dpdk_ports.clone(),
-        ip_addr: parse_ip(&cfg.dpdk_ip, "--dpdk-ip")?,
-        prefix_len: cfg.dpdk_prefix_len,
-        gateway: cfg
-            .dpdk_gateway
-            .as_deref()
-            .map(|s| parse_ip(s, "--dpdk-gateway"))
-            .transpose()?,
+        nic: melin_dpdk::NicConfig {
+            eal_args: cfg
+                .dpdk_eal_args
+                .split_whitespace()
+                .map(String::from)
+                .collect(),
+            port_ids: cfg.dpdk_ports.clone(),
+            ip_addr: parse_ip(&cfg.dpdk_ip, "--dpdk-ip")?,
+            prefix_len: cfg.dpdk_prefix_len,
+            gateway: cfg
+                .dpdk_gateway
+                .as_deref()
+                .map(|s| parse_ip(s, "--dpdk-gateway"))
+                .transpose()?,
+            mtu: cfg.dpdk_mtu,
+            vlan_id: cfg.dpdk_vlan,
+            peer_ip: cfg
+                .dpdk_peer_ip
+                .as_deref()
+                .map(|s| parse_ip(s, "--dpdk-peer-ip"))
+                .transpose()?,
+            gateway_mac: cfg
+                .dpdk_gateway_mac
+                .as_deref()
+                .map(|s| parse_mac(s, "--dpdk-gateway-mac"))
+                .transpose()?,
+            peer_mac: cfg
+                .dpdk_peer_mac
+                .as_deref()
+                .map(|s| parse_mac(s, "--dpdk-peer-mac"))
+                .transpose()?,
+        },
         listen_port: cfg.bind.port(),
-        mtu: cfg.dpdk_mtu,
-        vlan_id: cfg.dpdk_vlan,
-        peer_ip: cfg
-            .dpdk_peer_ip
-            .as_deref()
-            .map(|s| parse_ip(s, "--dpdk-peer-ip"))
-            .transpose()?,
-        gateway_mac: cfg
-            .dpdk_gateway_mac
-            .as_deref()
-            .map(|s| parse_mac(s, "--dpdk-gateway-mac"))
-            .transpose()?,
-        peer_mac: cfg
-            .dpdk_peer_mac
-            .as_deref()
-            .map(|s| parse_mac(s, "--dpdk-peer-mac"))
-            .transpose()?,
         num_queues: 1,
     })
 }
@@ -3239,7 +3244,7 @@ where
     )?;
 
     info!(
-        ip = %dpdk_config.ip_addr,
+        ip = %dpdk_config.nic.ip_addr,
         port = dpdk_config.listen_port,
         num_dpdk_threads = 1,
         "DPDK transport listening"
@@ -5160,14 +5165,17 @@ mod dpdk_config_tests {
             ..Default::default()
         };
         let dpdk = dpdk_config_from(&cfg).expect("valid config");
-        assert_eq!(dpdk.peer_mac, Some([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80]));
+        assert_eq!(
+            dpdk.nic.peer_mac,
+            Some([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80])
+        );
     }
 
     #[test]
     fn an_absent_peer_mac_leaves_the_transport_to_derive_one() {
         let cfg = ServerConfig::default();
         let dpdk = dpdk_config_from(&cfg).expect("valid config");
-        assert_eq!(dpdk.peer_mac, None);
+        assert_eq!(dpdk.nic.peer_mac, None);
     }
 
     #[test]
@@ -5210,6 +5218,9 @@ mod dpdk_config_tests {
             ..Default::default()
         };
         let dpdk = dpdk_config_from(&cfg).expect("valid config");
-        assert_eq!(dpdk.gateway_mac, Some([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80]));
+        assert_eq!(
+            dpdk.nic.gateway_mac,
+            Some([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80])
+        );
     }
 }

@@ -59,6 +59,21 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   supply them. `response::run` returns a `bool` (whether the stage
   started) instead of `()`, so a `JoinHandle<()>` binding for its thread
   no longer compiles.
+- **`melin_dpdk::DpdkConfig`'s NIC fields moved into `melin_dpdk::NicConfig`.**
+  The EAL arguments, ports, address and prefix, gateway, bifurcated peer
+  IP, gateway and peer MACs, MTU and VLAN id are now fields of
+  `DpdkConfig::nic`; `DpdkConfig` keeps `listen_port` and `num_queues`.
+  Names, types and defaults are unchanged, and so is what the node does
+  with them. Source-breaking for anything that constructs a `DpdkConfig`
+  or reads its NIC fields: `config.peer_mac` becomes
+  `config.nic.peer_mac`. Both types are now available without the
+  `dpdk-sys` feature, so a binary can map its flags onto them in any
+  build. The ARP frames the transport sends and injects are built by the
+  new `melin_dpdk::arp` module, unchanged on the wire. `melin-shm-proxy`
+  uses the same builders, so its gratuitous ARP request now zeroes the
+  target hardware address, as the node's always has, where it sent
+  `ff:ff:ff:ff:ff:ff`; receivers ignore the field. Its flags and output
+  are unchanged.
 
 ### Fixed
 
