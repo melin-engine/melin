@@ -92,10 +92,13 @@ impl BufRing {
         }
     }
 
-    /// Ring memory layout: page-aligned as `IORING_REGISTER_PBUF_RING`
-    /// requires.
+    /// Ring memory layout: aligned to the kernel's page size, as
+    /// `IORING_REGISTER_PBUF_RING` requires (`EINVAL` otherwise). The
+    /// running kernel's page size, not a 4 KiB constant: aarch64 kernels
+    /// are built with 16 KiB or 64 KiB pages, and a 4 KiB-aligned
+    /// allocation lands on one of those boundaries only by chance.
     fn layout(entries: u16) -> Layout {
-        Layout::from_size_align(entries as usize * size_of::<BufRingEntry>(), 4096)
+        Layout::from_size_align(entries as usize * size_of::<BufRingEntry>(), page_size())
             .expect("buf_ring layout")
     }
 
@@ -172,6 +175,17 @@ impl BufRing {
     }
 }
 
+/// The running kernel's page size. `usize` because it is an allocation
+/// alignment. Constant for the life of the process, so `new` and `drop`
+/// compute the same layout from it.
+fn page_size() -> usize {
+    // SAFETY: `sysconf` has no preconditions.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    // `_SC_PAGESIZE` cannot fail on Linux; a non-positive answer would be
+    // a libc bug, not a condition to recover from.
+    usize::try_from(n).expect("sysconf(_SC_PAGESIZE) returned a non-positive page size")
+}
+
 impl Drop for BufRing {
     fn drop(&mut self) {
         // SAFETY: allocated in `new` with this exact layout. The
@@ -223,6 +237,19 @@ mod tests {
     }
 
     // ── Unit: layout and index math, no kernel involved ──
+
+    #[test]
+    fn the_ring_is_aligned_to_the_kernels_page_size() {
+        let page = page_size();
+        assert!(page >= 4096 && page.is_power_of_two(), "page size {page}");
+        assert_eq!(BufRing::layout(8).align(), page);
+        let f = fixture(8, 32);
+        assert_eq!(
+            f.ring.ring as usize % page,
+            0,
+            "ring base is not page-aligned"
+        );
+    }
 
     #[test]
     fn push_writes_entry_fields_and_advances_shared_tail() {

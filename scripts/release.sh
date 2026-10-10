@@ -108,9 +108,11 @@ ORIGINAL_BRANCH=""
 cleanup_hint() {
     echo "    Undo the local work with:"
     (( DID_TAG )) && echo "      git tag -d $TAG"
-    # Before the commit, the bump and the stamped licences are uncommitted
-    # edits; a plain checkout would carry them back onto the original branch.
-    (( DID_BRANCH && ! DID_COMMIT )) && echo "      git checkout -- ."
+    # Before the commit, the bump and the stamped licences are staged but
+    # uncommitted edits (the hook runs after `git add`, so a gate failure
+    # leaves them in the index, where `git checkout -- .` would not touch
+    # them); a plain checkout would carry them back onto the original branch.
+    (( DID_BRANCH && ! DID_COMMIT )) && echo "      git restore --staged --worktree ."
     echo "      git checkout ${ORIGINAL_BRANCH:-main}"
     (( DID_BRANCH )) && echo "      git branch -D $BRANCH"
     return 0

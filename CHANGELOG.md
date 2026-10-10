@@ -422,6 +422,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `melin_journal` `ReplicationConsumer::pending` re-reads the batch a
   consumer holds uncommitted across steps. Both are public for the crate
   boundary, not as a stable interface.
+- **The io_uring reader fell back to legacy buffer recycling on kernels
+  with pages larger than 4 KiB.** The provided-buffer ring was aligned to
+  4 KiB, and the kernel refuses one not aligned to its own page size
+  (16 KiB and 64 KiB are common on aarch64), so registration failed
+  whenever the allocation missed that boundary by chance, with a warning,
+  and the reader paid one extra submission and completion per received
+  chunk. The ring is now aligned to the running kernel's page size.
 
 ## [0.18.0] - 2026-09-27
 
