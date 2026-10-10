@@ -307,6 +307,56 @@ with an error. The stream is contiguous by construction, so this means
 a bug rather than a network fault; the journal is left intact and the
 replica recovers from it on restart.
 
+### Provisioning keys for a cluster
+
+A node reads its `authorized_keys` file once, at startup, and never
+again: there is no reload command and no signal. A key added to the
+file takes effect on the next restart of the node that checks it. For
+replication that node is the primary, which is the one node you do not
+want to restart in order to admit a replacement replica. Provision the
+keys up front so that admitting a node never needs a restart:
+
+- **One replication keypair per cluster slot, not per machine.** A
+  slot is a position in the cluster: "replica 1", "replica 2". The
+  keypair belongs to the slot, and a machine that takes over a slot
+  takes over its private key. A replacement for a dead node reuses the
+  dead node's key, and every node already accepts it. Keep each slot's
+  private key where a replacement can obtain it, on the same footing as
+  the node's other secrets.
+- **Every node carries the same, complete file.** Any replica may be
+  promoted, and from then on it is the node checking the others'
+  keys. A replica whose file lists only the primary's key is a primary
+  that no replica can join. Install one file, listing every slot's
+  public key under the `replication` role plus the operator and client
+  keys, on every node.
+- **Pre-provision spare slots, for data-plane replicas only.** A key
+  listed in the file but held by no node costs nothing: the file
+  refuses a key listed twice, but not a key nobody uses. Generate
+  keypairs for the replicas you expect to add, list their public keys
+  from the start, and a node joining a spare slot later is admitted
+  without touching any running node. This does **not** extend to the
+  control plane, below.
+
+With the control plane enabled, slots are fixed and spares are
+impossible. `--raft-peer` pins each node id to a public key, and every
+node holds that table in memory from its own flags: a replacement
+presenting a new key is refused by its peers as not being a configured
+raft peer, and only a restart of every node with an updated peer list
+would admit it. A spare cannot be listed ahead of time either, because
+every entry in the peer list is a voter from first boot: a listed slot
+that no node holds is an absent voter counting against quorum, and a
+three-voter cluster with one spare loses quorum on its first real
+failure. The control plane's slots are therefore exactly its voters,
+each with its own keypair held for the slot's lifetime, and a
+replacement voter reuses the dead voter's key and node id. The slot
+owns its control-plane address too: the membership stored at first
+boot maps each id to the literal `host:port` from the peer list, and
+a hostname is not accepted there, so the address has to be one you can
+move to the replacement machine, a floating IP or a reassigned one. A
+replacement holding the slot's key, id and address is then simply the
+slot coming back. A node that is not a voter, a plain `--replica-of`
+replica without raft flags, is a data-plane slot and may be a spare.
+
 ### Fault isolation between replica slots
 
 Each replica slot has an independent ring buffer (configurable via
@@ -539,6 +589,12 @@ for a data-plane connection to cross.
 - **Same peer list everywhere.** Identical `--raft-peer` lists
   (including each node's own entry) keep the first-boot membership
   consistent across the cluster.
+- **A voter's key belongs to its slot.** The peer list pins each node
+  id to a public key and makes every listed id a voter, so a spare
+  cannot be listed ahead of time, and a machine that replaces a dead
+  voter must present that voter's key and id at that voter's
+  control-plane address. Then no running node needs a restart to accept
+  it. See "Provisioning keys for a cluster" above.
 - **Arm `--raft-auto-promote` uniformly — every node or none.** The
   flag arms two things on the node that carries it: acting on election
   wins, and the raft-mesh fencing channel described above. A cluster
@@ -717,7 +773,7 @@ requiring the full journal history.
 | `--replication-bind <addr>` | No | — | Address to listen for replica connections. Bound at startup on any node that sets it — including a replica, which holds the port from boot and starts serving on it at promotion. |
 | `--standalone` | No | `false` | Explicitly disable replication. Requires `--ack-policy disk`. |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary. |
-| `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` under the `replication` role. |
+| `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` under the `replication` role. The key belongs to the cluster slot, not the machine: a replacement node reuses it (see "Provisioning keys for a cluster"). |
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `ACK-POLICY <policy>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
 | `--ack-policy <policy>` | Primary | `disk+ram` | Active ack policy at startup: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Can be swapped at runtime via admin `ACK-POLICY`. |
 | `--dpdk-peer-mac <mac>` | Replica on DPDK | derived | Ethernet address of the primary named by `--replica-of`. Only consulted when replicating over DPDK. See below. |
@@ -806,6 +862,20 @@ Most failures resolve without operator action:
   replica's in-memory ack. Under `two-disks` it's satisfied by both
   nodes persisting. The crashed replica reconnects and catches up
   automatically.
+- **A dead node is replaced by a new machine** — give the new machine
+  the dead slot's replication private key and start it with
+  `--replica-of` pointing at the current primary. The primary and every
+  peer already list that key, so nothing running needs a restart; the
+  node catches up from the primary's journal or a snapshot like any
+  joining replica. A machine with a key of its own is refused until
+  the primary, and with the control plane every node, has been
+  restarted with the key listed, so do not generate one (see
+  "Provisioning keys for a cluster"). If the dead node was a voter,
+  the replacement also takes its node id, its control-plane address
+  and the same `--raft-peer` list, and it starts with an empty
+  `--raft-dir`: bring it up only once a leader is established, as the
+  raft-dir deployment rule requires, so that it cannot grant a vote
+  its predecessor already cast.
 
 ### Cluster-wide outage
 
@@ -937,9 +1007,24 @@ triggers on contact, not on a timer.
 The voter set is fixed at first boot (see "Deployment rules"). Runtime
 voter add/remove/replace — and with it automatic re-pointing of
 surviving replicas at a newly promoted primary — is roadmap work.
-Replacing a dead voter today means standing up the whole cluster's
-control plane again with a fresh peer list (fresh `--raft-dir`s), while
-the data plane keeps running unaffected.
+A dead voter can be replaced in place by a machine that takes over its
+key, node id and control-plane address (see "Provisioning keys for a
+cluster"). Replacing it with anything else, a new id, a new key or a
+new address, means standing up the whole cluster's control plane again
+with a fresh peer list (fresh `--raft-dir`s), while the data plane keeps
+running unaffected.
+
+### No `authorized_keys` reload
+
+The key file is read at startup only. Admitting a key that is not yet
+listed means restarting the node that checks it, the primary for a
+replication key, and every raft-enabled node for a control-plane
+peer. The workaround is to provision keys ahead of need: one keypair
+per cluster slot, reused by whichever machine holds the slot, with
+spare data-plane slots listed in advance. Control-plane slots can have
+no spares, since every listed peer is a voter (see "Provisioning keys
+for a cluster"). A reload that takes effect without a restart, and a
+revocation that evicts the key's live connections, are roadmap work.
 
 ### No offline journal inspector
 
