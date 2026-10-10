@@ -350,7 +350,10 @@ pub fn run_dpdk_poll<A: Application>(
             }
 
             // Enforce max_connections limit.
-            if max_connections > 0 && connection_count as u64 >= max_connections {
+            if crate::connection_limit::connection_cap_reached(
+                connection_count as u64,
+                max_connections,
+            ) {
                 warn!(
                     peer = %accepted.peer,
                     "DPDK: connection rejected: max_connections reached"

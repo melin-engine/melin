@@ -47,26 +47,23 @@ use melin_transport_core::tick::TickSchedule;
 
 /// Size of each provided buffer. 4 KiB accommodates multiple frames per
 /// recv (frames are typically <100 bytes).
+///
+/// The number of buffers in the shared pool, and the ring's depth, are
+/// not constants: both are derived from `--max-connections` at startup —
+/// see [`RingSizing`]. The pool is a power of two (buf_ring ABI) with two
+/// buffers per connection. On exhaustion the kernel completes the
+/// multishot with `ENOBUFS` (no data consumed) and the loop re-arms it
+/// after the drain's recycles refill the ring. The ring holds a drain's
+/// worth of SQEs: two per connection (a multishot re-arm and a teardown
+/// cancel) plus housekeeping; buffer recycling goes through the buf_ring,
+/// not the SQ.
 const BUF_SIZE: usize = 4096;
-
-/// Number of provided buffers in the shared pool. Must be a power of two
-/// (buf_ring ABI) and large enough for concurrent in-flight recvs across
-/// all connections. On exhaustion the kernel completes the multishot
-/// with `ENOBUFS` (no data consumed) and the loop re-arms it after the
-/// drain's recycles refill the ring. 2048 supports up to ~1024
-/// connections per reader thread; recycling is now a shared-memory store
-/// (no SQE), so raising this no longer interacts with `RING_SIZE`.
-const NUM_BUFFERS: u16 = 2048;
 
 /// Buffer group ID for the provided recv buffer pool.
 const BUF_GROUP_ID: u16 = 0;
 
 use crate::client_frames::MAX_FRAME_SIZE;
-
-/// io_uring submission queue depth. Power of 2, sized for up to ~1024
-/// connections per reader thread (multishot RECVs + eventfd read; buffer
-/// recycling goes through the buf_ring, not the SQ).
-const RING_SIZE: u32 = 4096;
+use crate::connection_limit::{RingSizing, await_startup, ring_setup_error};
 
 /// User data sentinel for the eventfd read SQE.
 const EVENTFD_TOKEN: u64 = u64::MAX;
@@ -201,6 +198,13 @@ impl<R> UringReaderHandle<R> {
 ///
 /// While `halt` refuses writes, the reader answers them through
 /// `refusals` instead of publishing them — see [`crate::halt`].
+///
+/// `sizing` sets the ring's depth and the provided-buffer pool (see
+/// [`RingSizing`]). Returns once the reader holds its io_uring instance
+/// and buffer pool, or with the error that kept it from getting them —
+/// a startup error, not a dead thread: the kernel charges ring memory
+/// against the locked-memory limit, and running out of it is an
+/// operator-fixable condition the node has to report.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
     producer: ring::Producer<InputSlot<A::Event>>,
@@ -211,8 +215,9 @@ pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
     core: usize,
     connection_timeout: Option<Duration>,
     tick_cadence: Option<Duration>,
+    sizing: RingSizing,
     shutdown: Arc<AtomicBool>,
-) -> UringReaderHandle<R>
+) -> std::io::Result<UringReaderHandle<R>>
 where
     A::Event: Send + Sync + 'static,
     A::Report: Send + 'static,
@@ -220,15 +225,29 @@ where
     let (tx, rx) = mpsc::channel();
 
     let raw_event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
-    assert!(raw_event_fd >= 0, "eventfd creation failed");
+    if raw_event_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            err.kind(),
+            format!("uring-reader: cannot create its wakeup eventfd: {err}"),
+        ));
+    }
 
-    // SAFETY: `eventfd` returned a fresh descriptor (asserted non-negative
+    // SAFETY: `eventfd` returned a fresh descriptor (checked non-negative
     // above) that nothing else owns, so transferring ownership to `OwnedFd`
     // is sound. From here the raw number is never closed by hand — the
     // descriptor lives exactly as long as the last `Arc` holder.
     let event_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_event_fd) });
     let wakeup_fd = Arc::clone(&event_fd);
     let shutdown_clone = Arc::clone(&shutdown);
+
+    // The thread's startup report. The ring has to be created on the
+    // thread that submits to it (it is SINGLE_ISSUER: the kernel binds
+    // it to its creator, and a ring moved across threads fails every
+    // submit), so the spawner cannot create it itself and learns the
+    // outcome here instead. Capacity one so the report never blocks the
+    // worker on the spawner reaching `recv`.
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<std::io::Result<()>>(1);
 
     let handle = std::thread::Builder::new()
         .name("uring-reader".into())
@@ -247,17 +266,32 @@ where
                 &control_tx,
                 connection_timeout,
                 tick_cadence,
+                sizing,
+                ready_tx,
                 &shutdown_clone,
             );
         })
-        .expect("failed to spawn uring reader thread");
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("uring-reader: cannot spawn its thread: {e}"),
+            )
+        })?;
 
-    UringReaderHandle {
+    if let Err(e) = await_startup("uring-reader", &ready_rx) {
+        // The thread has returned (or panicked) by now; a panic was
+        // already reported by the panic hook, and the startup error is
+        // what the caller needs, so the join result adds nothing.
+        let _ = handle.join();
+        return Err(e);
+    }
+
+    Ok(UringReaderHandle {
         tx,
         event_fd,
         join_handle: Some(handle),
         shutdown,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -393,8 +427,15 @@ fn reader_loop<A: Application, R: AsRawFd>(
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
     tick_cadence: Option<Duration>,
+    sizing: RingSizing,
+    // Startup report to `spawn_reader`: `Ok` once the ring and the buffer
+    // pool are in place, the error otherwise (and the loop never starts).
+    ready: mpsc::SyncSender<std::io::Result<()>>,
     shutdown: &AtomicBool,
 ) {
+    let num_buffers = sizing.provided_buffers();
+    let ring_entries = sizing.ring_entries();
+
     // Kernel-referenced memory is declared BEFORE the io_uring so it
     // drops AFTER the ring on every exit path, including panic unwind
     // (locals drop in reverse declaration order). The kernel holds live
@@ -406,15 +447,17 @@ fn reader_loop<A: Application, R: AsRawFd>(
     let mut eventfd_buf: Box<[u8; 8]> = Box::new([0u8; 8]);
 
     // Shared buffer pool for provided buffers. Contiguous allocation of
-    // NUM_BUFFERS × BUF_SIZE bytes. The kernel selects a buffer from this
-    // pool for each recv completion, identified by buffer ID in the CQE.
-    let mut buffer_pool = vec![0u8; NUM_BUFFERS as usize * BUF_SIZE].into_boxed_slice();
+    // `num_buffers × BUF_SIZE` bytes. The kernel selects a buffer from
+    // this pool for each recv completion, identified by buffer ID in the
+    // CQE.
+    let mut buffer_pool = vec![0u8; num_buffers as usize * BUF_SIZE].into_boxed_slice();
 
     // Ring-mapped provided-buffer ring: recycling a consumed buffer is a
     // shared-memory store, not a ProvideBuffers SQE — see `buf_ring`.
-    // Allocated unconditionally (32 KiB) so its declaration precedes the
-    // io_uring's even when the legacy fallback below ends up in use.
-    let mut buf_ring = BufRing::new(NUM_BUFFERS, buffer_pool.as_mut_ptr(), BUF_SIZE);
+    // Allocated unconditionally (16 bytes per buffer, page-aligned) so
+    // its declaration precedes the io_uring's even when the legacy
+    // fallback below ends up in use.
+    let mut buf_ring = BufRing::new(num_buffers, buffer_pool.as_mut_ptr(), BUF_SIZE);
 
     // SINGLE_ISSUER: this thread creates the ring and is the only one
     // that ever submits — lets the kernel skip SQ locking, and turns any
@@ -423,10 +466,19 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // replication rings. (COOP_TASKRUN/DEFER_TASKRUN deliberately not
     // set — see the journal ring's measured rationale in
     // melin-transport-core::pipeline.)
-    let mut ring: IoUring = IoUring::builder()
-        .setup_single_issuer()
-        .build(RING_SIZE)
-        .expect("failed to create io_uring instance");
+    //
+    // A failure here is reported to `spawn_reader` as a startup error
+    // rather than panicking the thread: the usual cause is the
+    // locked-memory limit, which the operator can raise.
+    let mut ring: IoUring = match IoUring::builder().setup_single_issuer().build(ring_entries) {
+        Ok(ring) => ring,
+        Err(e) => {
+            // Dropped send: a spawner that stopped waiting is unwinding,
+            // and the thread returns either way.
+            let _ = ready.send(Err(ring_setup_error("uring-reader", ring_entries, e)));
+            return;
+        }
+    };
 
     // Prefer the buf_ring; fall back to legacy ProvideBuffers SQEs if
     // the kernel rejects the registration. Not theoretical: PBUF_RING
@@ -443,10 +495,24 @@ fn reader_loop<A: Application, R: AsRawFd>(
                  ProvideBuffers recycling (kernel < 5.19, or a hypervisor \
                  filtering io_uring register opcodes)"
             );
-            register_buffer_pool(&mut ring, buffer_pool.as_mut_ptr());
+            if let Err(e) = register_buffer_pool(&mut ring, buffer_pool.as_mut_ptr(), num_buffers) {
+                // Dropped send: as above.
+                let _ = ready.send(Err(std::io::Error::new(
+                    e.kind(),
+                    format!("uring-reader: cannot provide its receive buffers: {e}"),
+                )));
+                return;
+            }
             false
         }
     };
+
+    // Started. A failed send means `spawn_reader` is no longer waiting —
+    // its thread is unwinding — so nothing would ever register a
+    // connection or stop this loop: return instead of running headless.
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
 
     let mut slab = ConnectionSlab::<R>::new();
     // Reverse map for cleanup when a connection's fd needs removal.
@@ -458,7 +524,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // Stores (user_data, result, flags) — flags needed for buffer ID and
     // multishot continuation. Sized to the CQ depth (2× the SQ) so even
     // a maximal drain never reallocates mid-loop.
-    let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(RING_SIZE as usize * 2);
+    let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(ring_entries as usize * 2);
 
     // Submit the initial eventfd read so we wake on first connection.
     // `eventfd_armed` mirrors whether that READ is pushed/armed — the
@@ -561,11 +627,9 @@ fn reader_loop<A: Application, R: AsRawFd>(
                 let sqe = opcode::Timeout::new(&tick_ts)
                     .build()
                     .user_data(TICK_TIMEOUT_TOKEN);
-                unsafe {
-                    ring.submission()
-                        .push(&sqe)
-                        .expect("io_uring SQ full while arming tick timeout");
-                }
+                // SAFETY: `tick_ts` is loop-scoped and outlives the
+                // submit that reads it (see its declaration).
+                unsafe { push_sqe(&mut ring, &sqe, "the tick TIMEOUT") };
                 tick_armed = true;
             }
         }
@@ -1080,47 +1144,99 @@ enum Action {
 // SQE helpers
 // ---------------------------------------------------------------------------
 
+/// Queue an SQE, first handing the already-queued ones to the kernel if
+/// the submission queue is full.
+///
+/// [`RingSizing`] sizes the SQ for a drain's worth of SQEs on the
+/// buf_ring path — two per connection plus housekeeping — so there the
+/// flush fires only when the reader transiently tracks more connections
+/// than the cap: a dying connection stays in the reader until its cancel
+/// completes, while the response stage has already released its slot and
+/// the accept loop may have admitted a replacement. The legacy
+/// ProvideBuffers fallback adds one SQE per
+/// recycled buffer on top, which the sizing does not count; this is what
+/// keeps that path from overrunning the queue. Submitting mid-drain is
+/// harmless: the CQEs being processed were copied out before any SQE was
+/// pushed, and the queued SQEs only reach the kernel sooner.
+///
+/// Panics only if the submit itself fails, which leaves queued SQEs that
+/// point into live buffers with nowhere to go.
+///
+/// # Safety
+///
+/// As for [`io_uring::SubmissionQueue::push`]: every buffer the SQE
+/// references must stay valid until its operation completes.
+unsafe fn push_sqe(ring: &mut IoUring, sqe: &io_uring::squeue::Entry, what: &str) {
+    // SAFETY: forwarded from the caller.
+    if unsafe { ring.submission().push(sqe) }.is_ok() {
+        return;
+    }
+    loop {
+        match ring.submit() {
+            Ok(_) => break,
+            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => panic!("io_uring submit failed while making room for {what}: {e}"),
+        }
+    }
+    // SAFETY: forwarded from the caller.
+    unsafe { ring.submission().push(sqe) }.unwrap_or_else(|_| {
+        panic!("io_uring SQ still full for {what} after submitting every queued SQE")
+    });
+}
+
 /// Register the provided buffer pool via a legacy ProvideBuffers op —
 /// the fallback when buf_ring registration is rejected. Submits
-/// synchronously and panics on failure — called once at startup, and
-/// only after the preferred path already failed.
-fn register_buffer_pool(ring: &mut IoUring, pool_ptr: *mut u8) {
-    let sqe = opcode::ProvideBuffers::new(pool_ptr, BUF_SIZE as i32, NUM_BUFFERS, BUF_GROUP_ID, 0)
+/// synchronously — called once at startup, before the reader reports
+/// that it started, and only after the preferred path already failed.
+fn register_buffer_pool(
+    ring: &mut IoUring,
+    pool_ptr: *mut u8,
+    num_buffers: u16,
+) -> std::io::Result<()> {
+    let sqe = opcode::ProvideBuffers::new(pool_ptr, BUF_SIZE as i32, num_buffers, BUF_GROUP_ID, 0)
         .build()
         .user_data(PROVIDE_BUFS_TOKEN);
 
+    // SAFETY: the pool outlives the ring (declared before it in
+    // `reader_loop`), and ProvideBuffers only records its address.
     unsafe {
-        ring.submission()
-            .push(&sqe)
-            .expect("io_uring SQ full during buffer pool registration");
+        ring.submission().push(&sqe).map_err(|_| {
+            std::io::Error::other("io_uring SQ full during buffer pool registration")
+        })?;
     }
 
-    ring.submit_and_wait(1)
-        .expect("io_uring submit failed during buffer pool registration");
+    loop {
+        match ring.submit_and_wait(1) {
+            Ok(_) => break,
+            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
 
     // Check the completion result.
     let cqe = ring
         .completion()
         .next()
-        .expect("no CQE after ProvideBuffers");
-    assert!(cqe.result() >= 0, "ProvideBuffers failed: {}", cqe.result());
+        .ok_or_else(|| std::io::Error::other("no CQE after ProvideBuffers"))?;
+    if cqe.result() < 0 {
+        return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+    }
+    Ok(())
 }
 
 /// Re-provide a single consumed buffer back to the pool (legacy fallback
 /// mode). Pushed to SQ without immediate submission — batched with the
-/// next submit_and_wait. Safe against SQ overflow only because at most
-/// `NUM_BUFFERS` (< `RING_SIZE`) recycles can accumulate per drain.
+/// next submit_and_wait. A drain can recycle up to the whole pool on top
+/// of the SQEs the ring is sized for, so this is the push that relies on
+/// [`push_sqe`] making room.
 fn re_provide_buffer(ring: &mut IoUring, pool_ptr: *mut u8, buf_id: usize) {
     let buf_ptr = unsafe { pool_ptr.add(buf_id * BUF_SIZE) };
     let sqe = opcode::ProvideBuffers::new(buf_ptr, BUF_SIZE as i32, 1, BUF_GROUP_ID, buf_id as u16)
         .build()
         .user_data(PROVIDE_BUFS_TOKEN);
 
-    unsafe {
-        ring.submission()
-            .push(&sqe)
-            .expect("io_uring SQ full — increase RING_SIZE");
-    }
+    // SAFETY: the buffer lies inside the pool, which outlives the ring.
+    unsafe { push_sqe(ring, &sqe, "a legacy ProvideBuffers recycle") };
 }
 
 /// Return a consumed buffer to the shared pool, in whichever recycle
@@ -1138,7 +1254,7 @@ fn recycle_buffer(
     buf_id: usize,
 ) {
     assert!(
-        buf_id < NUM_BUFFERS as usize,
+        buf_id < buffer_pool.len() / BUF_SIZE,
         "kernel returned out-of-pool buffer id {buf_id}"
     );
     if use_buf_ring {
@@ -1191,11 +1307,8 @@ fn begin_teardown<R>(
         let sqe = opcode::AsyncCancel::new(idx as u64)
             .build()
             .user_data(CANCEL_TOKEN);
-        unsafe {
-            ring.submission()
-                .push(&sqe)
-                .expect("io_uring SQ full — increase RING_SIZE");
-        }
+        // SAFETY: AsyncCancel references no memory.
+        unsafe { push_sqe(ring, &sqe, "a connection teardown's AsyncCancel") };
     } else {
         // No armed op ⇒ no future CQEs can carry this index.
         slab.remove(idx);
@@ -1219,11 +1332,9 @@ fn push_recv_multi<R>(ring: &mut IoUring, slab: &mut ConnectionSlab<R>, idx: usi
         .build()
         .user_data(idx as u64);
 
-    unsafe {
-        ring.submission()
-            .push(&sqe)
-            .expect("io_uring SQ full — increase RING_SIZE");
-    }
+    // SAFETY: buffer-select RECV writes only into the provided-buffer
+    // pool, which outlives the ring.
+    unsafe { push_sqe(ring, &sqe, "a multishot RECV") };
     entry.multishot_active = true;
 }
 
@@ -1233,11 +1344,9 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
         .build()
         .user_data(EVENTFD_TOKEN);
 
-    unsafe {
-        ring.submission()
-            .push(&sqe)
-            .expect("io_uring SQ full — increase RING_SIZE");
-    }
+    // SAFETY: `buf` is the boxed eventfd buffer, declared before the
+    // ring in `reader_loop` so it outlives it.
+    unsafe { push_sqe(ring, &sqe, "the eventfd READ") };
 }
 
 // ---------------------------------------------------------------------------
@@ -2320,8 +2429,13 @@ mod tests {
             0,    // "do not pin" sentinel
             None, // no idle timeout — a CI stall must not disconnect
             None, // no tick generator
+            // Sized for exactly these connections: the smallest pool the
+            // sizing hands out, so the soak runs the pool dry (ENOBUFS,
+            // re-arm) far more often than a production-sized one would.
+            RingSizing::for_max_connections(CONNS).expect("a supported cap"),
             Arc::clone(&shutdown),
-        );
+        )
+        .expect("the reader starts");
 
         let mut writers = Vec::new();
         for id in 0..CONNS {
@@ -2434,8 +2548,10 @@ mod tests {
             0,    // "do not pin" sentinel
             None, // no idle timeout
             None, // no tick generator
+            RingSizing::for_max_connections(CONNS).expect("a supported cap"),
             Arc::clone(&shutdown),
-        );
+        )
+        .expect("the reader starts");
 
         let mut clients = Vec::new();
         for id in 0..CONNS {
@@ -2510,8 +2626,11 @@ mod tests {
             0,
             None,
             None,
+            // A and B, plus room for A's entry to linger while dying.
+            RingSizing::for_max_connections(4).expect("a supported cap"),
             Arc::clone(&shutdown),
-        );
+        )
+        .expect("the reader starts");
 
         const A_ID: u64 = 100;
         const B_ID: u64 = 200;
@@ -2617,5 +2736,62 @@ mod tests {
         let _b = b_writer.join().expect("B writer");
         handle.shutdown();
         handle.join();
+    }
+
+    /// A reader that cannot create its io_uring instance reports it to
+    /// the spawner as an error naming the thread, instead of panicking
+    /// on a thread nobody is watching. A zero-entry ring stands in for
+    /// the locked-memory limit: both fail `io_uring_setup`.
+    #[test]
+    fn a_ring_that_cannot_be_created_is_a_startup_error() {
+        let (producer, _consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build(melin_pipeline::wait::WaitStrategy::SpinThenYield);
+        let (control_tx, _control_rx) = mpsc::channel();
+        let result = spawn_reader::<TestApp, UnixStream>(
+            producer,
+            Arc::new(ByteDecoder),
+            gate(None, false),
+            refusal_channel().0,
+            control_tx,
+            0,
+            None,
+            None,
+            RingSizing::unchecked(0, 32),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let err = match result {
+            Ok(_) => panic!("a zero-entry ring cannot be created"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("uring-reader"), "{msg}");
+        assert!(msg.contains("io_uring"), "{msg}");
+    }
+
+    /// `push_sqe` on a full SQ submits what is queued and pushes again,
+    /// instead of failing: pushing more SQEs than the ring holds must
+    /// lose none of them.
+    #[test]
+    fn push_sqe_makes_room_when_the_sq_is_full() {
+        const ENTRIES: u32 = 8;
+        // Three ring-fulls, so the full-SQ branch is taken more than once.
+        const PUSHES: u64 = 3 * ENTRIES as u64;
+        // The CQ is twice the SQ by default; size it to hold every
+        // completion so none is dropped before it is counted.
+        let mut ring = IoUring::builder()
+            .setup_cqsize(PUSHES as u32)
+            .build(ENTRIES)
+            .expect("create an 8-entry io_uring");
+        for token in 0..PUSHES {
+            let nop = opcode::Nop::new().build().user_data(token);
+            // SAFETY: a NOP references no memory.
+            unsafe { push_sqe(&mut ring, &nop, "test NOP") };
+        }
+        ring.submit_and_wait(PUSHES as usize)
+            .expect("submit the remaining NOPs");
+        let mut seen: Vec<u64> = ring.completion().map(|cqe| cqe.user_data()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..PUSHES).collect::<Vec<_>>());
     }
 }
