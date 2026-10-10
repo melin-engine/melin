@@ -98,16 +98,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Removed
 
-- **The exchange's roles and their helpers: `Permission::Trader`,
-  `Custodian`, `ReadOnly`, `can_trade` and `can_manage_funds`.** They were
+- **`melin_app::auth::Permission`**, the runtime's fixed set of client
+  roles, replaced by `ClientRole<R>` and `KeyRole` (see Changed). With
+  it go the exchange's roles and their helpers, `Permission::Trader`,
+  `Custodian`, `ReadOnly`, `can_trade` and `can_manage_funds`: they were
   one application's separation of duties, in the runtime every
-  application builds on. An application that used them declares them as
-  its own `Role` type (see Changed).
-- **`Permission::may_connect_as_client` and
-  `Permission::is_replication`**, added in 0.18. A replication key is a
-  `KeyRole` now, not a permission: `KeyRole::is_replication`, and
-  `KeyRole::client`, which is `None` exactly where
-  `may_connect_as_client` was false.
+  application builds on, and an application that used them declares them
+  as its own `Role` type. `Permission::is_replication` and
+  `Permission::may_connect_as_client` (the latter added in 0.18) go too:
+  a replication key is a `KeyRole` now, not a permission, so
+  `KeyRole::is_replication` replaces the one, and `KeyRole::client`,
+  which is `None` exactly where `may_connect_as_client` was false, the
+  other.
 - **`set_next_sequence`, from `JournalWrite`, `BufferedWriter` and
   `JournalEncoder`.** It moved a writer's sequence counter anywhere,
   backwards included. `JournalEncoder::adopt_sequence` replaces it for a
@@ -151,8 +153,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   examples admit `writer` and `reader` keys, the notary `submitter` and
   `auditor`, in place of the exchange's `trader` and `readonly`: a keys
   file written for an example needs its role tokens renamed.
-- **`JournalError` gains `ReplicaSequenceMismatch` and
-  `SequenceRegression`,** for the sequence refusals under Fixed.
+- **`JournalError` gains `ReplicaSequenceMismatch`, `SequenceRegression`
+  and `UnrecoverableTail`.** The first two are the sequence refusals
+  under Fixed; the third is a segment whose entries stop early with data
+  after them that no crash can explain (see the recovery rule below).
   Source-breaking for code that matches on `JournalError` exhaustively.
 - **Genesis is journaled as the journal is created, not through the
   pipeline** (see the genesis fixes under Fixed). Visible effects: the
@@ -209,16 +213,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   recovery fixes under Fixed). `JournalReader` applies it: `open` reads
   a live segment, `open_archived` an archive, `open_segment` either
   (`SegmentKind`), and `torn_tail` reports the torn write a live segment
-  ended in (`TornTail`). `JournalError` gains `UnrecoverableTail`, for a
-  segment whose entries stop early with data after them that no crash
-  can explain; source-breaking for code that matches on `JournalError`
-  exhaustively. `segment::LineageReport::live_tail_gap` is replaced by
+  ended in (`TornTail`); a segment whose entries stop early with data
+  after them that no crash can explain is `JournalError::UnrecoverableTail`
+  (see above). `segment::LineageReport::live_tail_gap` is replaced by
   `live_torn_tail`: a sequence gap is now always an error.
   `write_ring::MAX_UNSYNCED_BYTES` names the bound the rule uses.
   `codec::decode` refuses an entry longer than its event type allows,
   so an application must never lower `AppEvent::MAX_ENCODED_SIZE` below
   the width of events in a journal it replays. Recovery now reads the
   live segment to its end, pre-allocated space included, on every start.
+- **`melin_transport_core::tick::TickSchedule`** holds the tick deadline,
+  the monotonic clamp and the stall catch-up rule that the io_uring
+  reader and the DPDK poll thread each kept a copy of; both now drive the
+  one schedule. Public for the crate boundary, not as a stable interface.
 
 ### Fixed
 
@@ -289,9 +296,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   primary's history.
   Catch-up now ships entries exactly as they are on the primary's disk
   rather than re-encoding them. **Breaking on the wire:** the replication
-  protocol is now version 6 and refuses version 5 peers in either
-  direction, so upgrade primaries and replicas together. In
-  `melin-transport-core`, `try_decode_input_batch` and
+  protocol changes, and a node on this release refuses a peer on 0.18 in
+  either direction, so upgrade primaries and replicas together; the
+  version it ships is the one under Changed (the genesis-length entry).
+  In `melin-transport-core`, `try_decode_input_batch` and
   `try_decode_input_batch_into` return the new `InputBatchError`,
   `encode_input_batch` and `append_input_slot` return a `Result`, and
   `decode_journal_to_input_slots` is replaced by
@@ -409,6 +417,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   long as its state needs to load; one that stops reading once its ring
   is active is still evicted when the ring fills, as before. Kernel-TCP
   primaries are unchanged: each replica's join runs on its own thread.
+  The stepped handoff is `melin_transport_core::replication::handoff`
+  (`LiveHandoff`, `HandoffStep`, `PassProgress`, `HandoffIo`), and
+  `melin_journal` `ReplicationConsumer::pending` re-reads the batch a
+  consumer holds uncommitted across steps. Both are public for the crate
+  boundary, not as a stable interface.
 
 ## [0.18.0] - 2026-09-27
 
