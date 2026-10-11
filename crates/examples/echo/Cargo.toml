@@ -63,5 +63,6 @@ hash-chain = ["melin-server-runtime/hash-chain"]
 # The DPDK transport, for the server binary and for the round-trip tests,
 # which then run their nodes on a veth pair and must be run under
 # `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-testing.md`).
-# Needs libdpdk to build, so never on by default.
-dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk"]
+# The client's `dpdk` feature too, for the round trip whose client runs on
+# DPDK beside its node. Needs libdpdk to build, so never on by default.
+dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk", "melin-client/dpdk"]

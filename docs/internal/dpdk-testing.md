@@ -19,7 +19,10 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh"
 The examples run the same way with their own feature
 (`-p melin-example-echo --features melin-example-echo/dpdk`). The `dpdk`
 nextest profile runs one test at a time and leaves out the tests that fail
-on a known divergence (below). The CI `dpdk` job runs both, on every push.
+on a known divergence (below). The CI `dpdk` job runs both, on every push,
+and `melin-client`'s own suite with its `dpdk` feature
+(`-p melin-client --features melin-client/dpdk`), the build a DPDK client
+links.
 
 ## What makes DPDK run on veth
 
@@ -51,14 +54,18 @@ every process it starts (every test, under nextest) it:
 2. builds a bridge, `br0`, carrying the client's address (`10.99.0.1/24`),
    with one veth pair per node slot: `dpdkN` for the node, its peer
    `dpdkN-br` on the bridge, node `N` on `10.99.0.(N+2)`. Three slots, the
-   largest cluster a test runs. Every MAC is fixed
-   (`02:99:00:00:00:NN`) and TX checksum offload is off on every veth
+   largest cluster a test runs. One more pair, built exactly as a slot's,
+   is the DPDK client's: `dpdkc`, its peer `dpdkc-br`, the client on
+   `10.99.0.100`. Every MAC is fixed (`02:99:00:00:00:NN`, the last octet
+   the IP's) and TX checksum offload is off on every veth
    (`scripts/dpdk/veth-setup.py`, Python's standard library only);
 3. mounts the private tmpfs on `/var/run`;
 4. publishes the layout in the environment: `MELIN_NETNS_DPDK_IFACES`,
    `MELIN_NETNS_NODE_IPS`, `MELIN_NETNS_NODE_MACS`, `MELIN_NETNS_PREFIX_LEN`,
    `MELIN_NETNS_CLIENT_IP`, `MELIN_NETNS_CLIENT_MAC`, as space-separated
-   lists with one entry per slot;
+   lists with one entry per slot, and the DPDK client's pair apart from
+   them: `MELIN_NETNS_DPDK_CLIENT_IFACE`, `MELIN_NETNS_DPDK_CLIENT_IP`,
+   `MELIN_NETNS_DPDK_CLIENT_MAC`, one value each;
 5. runs the test binary.
 
 nextest runs each test in a process of its own, so each test gets a fresh
@@ -68,9 +75,20 @@ namespaces were what failed and say how to allow them. A `TMPDIR` under
 `/run`, which the tmpfs would hide, is moved to `/tmp`.
 
 The MACs are published because a DPDK replica must be given its primary's
-(`--dpdk-peer-mac`), as on any port that keeps a hardware address. They are
-deliberately not the `02:00:<ip>` convention a replica falls back to
-without one, so a test passes only if the peer MAC was passed through.
+(`--dpdk-peer-mac`), and a DPDK client its node's (`NicConfig::peer_mac`),
+as on any port that keeps a hardware address. They are deliberately not
+the `02:00:<ip>` convention a dialer falls back to without one, so a test
+passes only if the peer MAC was passed through. A unit test of the
+launcher's layout pins that for every address published.
+
+The DPDK client's pair is a set of its own rather than a fourth node slot,
+so nothing that counts the slots (the launcher's search for a free one)
+can start a node on it, and the slots keep their names and numbers. The
+kernel client's address on the bridge stays, for every test whose client
+is not on DPDK; the cluster tests' own peers bind there too. A runner that
+publishes no client pair (one older than it) still runs every node test:
+the launcher reads the three variables together or not at all, and only a
+test that asks for a DPDK client fails without them, saying why.
 
 ## The launcher
 
@@ -110,6 +128,20 @@ own `dpdk` feature switches its tests over the same way.
   is told.
 - **Startup.** `STARTUP_LIMIT` is how long a client should give a node to
   serve: longer on DPDK, for EAL and port start.
+- **A client on DPDK.** `open_dpdk_client(config)` (DPDK only) opens a
+  `melin_dpdk::NicHandle` on the runner's client pair: an af_packet device
+  attached for `dpdkc` on the process-wide EAL the nodes share, under a
+  name no slot's device takes (`net_af_packet_client`, where a slot's is
+  `net_af_packet<N>`). Like a node's, its EAL arguments are empty (the
+  handle refuses any on the shared EAL), its port and address are the
+  launcher's, and its mbuf pool is named after its port. The rest of the
+  `NicConfig` is the test's, the peer MAC first: `mac_of(node.addr())`
+  gives the node's, and `dpdk_client()` the client's own IP and MAC. A
+  plain handle, so a test dials on it with
+  `StreamConnection::connect_dpdk_on(&mut nic, ...)`, or drives several
+  streams on it as the exchange's bench does. One per process: the device
+  stays attached as the EAL does, and a test reconnects on the handle it
+  has.
 
 ## Several nodes in one process
 
@@ -159,6 +191,34 @@ them). Some assert behaviour that is a known divergence, a server-side close
 that tells the client nothing for example, and are written to fail once the
 divergence is fixed, saying how to flip them.
 
+## A client on DPDK
+
+Every other test talks to its DPDK nodes from the kernel side of the
+bridge. The echo and counter round trips each have one case more, compiled
+only with the example's `dpdk` feature (which turns on `melin-client/dpdk`
+too): `a_dpdk_client_echoes_through_a_dpdk_node` and
+`a_dpdk_client_round_trips_through_a_dpdk_node`, the client on DPDK
+through `melin-client`'s polled connection on the launcher's client NIC,
+against a node on DPDK. Each sends its requests, drops the connection and
+dials again on the same handle, which the next connection of a real client
+would do. The node's MAC is passed through from the layout; the case
+asserts that it is not the fallback convention, so a dial that ignored it
+would time out rather than pass.
+
+The launcher returns before a node serves, and the polled connection has
+no twin of `Connection::connect_by` that retries until a deadline. The
+cases wait for the node with the kernel client, which has, and then dial
+on DPDK once, at a node already serving.
+
+`scripts/dpdk/dpdk-client-tap-smoke.sh` checks the same path outside the
+rig: a DPDK echo client on a TAP virtual device (`--vdev=net_tap0
+--no-pci`) against a kernel echo server on the TAP's other end, with no
+NIC and no namespace, on any host with libdpdk, as root for hugepages and
+the TAP's address. The mirror image of the Exchange Core's TAP smoke test,
+which runs a DPDK node and a kernel client. It runs `echo-client
+--transport dpdk`, so it needs the echo client's DPDK transport, and stops
+after the build, saying so, on an echo client without it.
+
 ## The `dpdk` profile and known divergences
 
 A test that fails on DPDK because of a documented transport divergence is
@@ -189,10 +249,11 @@ what the fix enabled. No test is gated in its own code, and none is
   cannot do. Docker loads both; the CI job loads them and lifts the
   restriction.
 - **CPU.** Every DPDK node busy-polls a core, so the profile runs one test
-  at a time. If the run grows too slow for pre-merge CI it moves to
-  nightly.
-- **Slots.** The runner builds three node slots. A test that needs more
-  needs the runner to build more.
+  at a time. A client on DPDK spins too, one more busy thread beside its
+  test's nodes, on a CI runner whose cores are few. If the run grows too
+  slow for pre-merge CI it moves to nightly.
+- **Slots.** The runner builds three node slots and one DPDK client pair.
+  A test that needs more needs the runner to build more.
 - **One process per test.** Under plain `cargo test` the tests of one
   binary start their nodes in one process one after another, which works
   as long as no test leaves a slot held; a failing test can. nextest, one

@@ -177,11 +177,12 @@ jobs:
   # exercises. See `docs/internal/dpdk-testing.md`.
   dpdk:
     runs-on: ubuntu-latest
-    # Three builds now: the check, the tests' debug build (the runtime and
-    # example suites share it), and the packaging one, which compiles
-    # eight crates from their tarballs with a target directory rust-cache
-    # cannot warm (each package builds under `target/package/`). The DPDK
-    # test runs are serial and take minutes, not tens of them.
+    # Its builds: the check, the tests' debug build (the runtime, client
+    # and example suites share it), the client's doctests, and the
+    # packaging one, which compiles the published crates from their
+    # tarballs with a target directory rust-cache cannot warm (each package
+    # builds under `target/package/`). The DPDK test runs are serial and
+    # take minutes, not tens of them.
     timeout-minutes: 60
 
     steps:
@@ -208,13 +209,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libdpdk-dev
 
-      # The examples and the test launcher too: their `dpdk` features
-      # compile code (the DPDK launcher) that no default build sees.
-      # `melin-dpdk` with all its targets, so its own tests build against
-      # the SDK.
+      # The examples, the test launcher and the client too: their `dpdk`
+      # features compile code (the DPDK launcher, the client's connection
+      # over the NIC handle) that no default build sees. `melin-dpdk` with
+      # all its targets, so its own tests build against the SDK.
       - name: DPDK builds
         id: dpdk-builds
-        run: cargo check -p melin-dpdk -p melin-server-runtime -p melin-test-node -p melin-example-echo -p melin-example-counter -p melin-example-notary -p melin-shm-proxy --all-targets --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk,melin-shm-proxy/dpdk --locked
+        run: cargo check -p melin-dpdk -p melin-server-runtime -p melin-test-node -p melin-client -p melin-example-echo -p melin-example-counter -p melin-example-notary -p melin-shm-proxy --all-targets --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-client/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk,melin-shm-proxy/dpdk --locked
 
       # The DPDK test runs put each test in new user, network and mount
       # namespaces (`unshare -rnm`), which Ubuntu 24.04 lets an unprivileged
@@ -256,15 +257,25 @@ jobs:
         run: cargo nextest run --profile dpdk -p melin-server-runtime --features dpdk -E 'kind(test)' --no-fail-fast --locked
 
       # The example suites, on DPDK the same way, each example's `dpdk`
-      # feature being the switch.
+      # feature being the switch. The echo and counter round trips include
+      # a client on DPDK too, on the runner's client pair, so their
+      # features turn on `melin-client/dpdk`; the client's own suite runs
+      # here with it, built as a DPDK client links it.
       #
       # Runs whatever the runtime suites did, so one cannot hide the other,
       # but not where the build check failed: it would only fail again.
-      - name: Example suites on DPDK
+      - name: Client and example suites on DPDK
         if: ${{ !cancelled() && steps.dpdk-builds.outcome == 'success' }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/dpdk/netns-runner.sh
-        run: cargo nextest run --profile dpdk -p melin-example-echo -p melin-example-counter -p melin-example-notary --features melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk --no-fail-fast --locked
+        run: cargo nextest run --profile dpdk -p melin-client -p melin-example-echo -p melin-example-counter -p melin-example-notary --features melin-client/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk --no-fail-fast --locked
+
+      # nextest runs no doctests, and the client's DPDK binding documents
+      # its multi-stream loop with an example that only a doctest build
+      # compiles. Compiled, not run (`no_run`): it needs a NIC.
+      - name: Client doctests with DPDK
+        if: ${{ !cancelled() && steps.dpdk-builds.outcome == 'success' }}
+        run: cargo test --doc -p melin-client --features melin-client/dpdk --locked
 
       # The test job's Rustdoc step, with the `dpdk` features: the code
       # they compile has docs of its own, which no default build renders,
@@ -272,7 +283,7 @@ jobs:
       # steps, so a doc error cannot hide a test result.
       - name: Rustdoc with DPDK
         if: ${{ !cancelled() && steps.dpdk-builds.outcome == 'success' }}
-        run: cargo doc --workspace --no-deps --locked --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk,melin-shm-proxy/dpdk
+        run: cargo doc --workspace --no-deps --locked --features melin-server-runtime/dpdk,melin-test-node/dpdk,melin-client/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk,melin-shm-proxy/dpdk
         env:
           RUSTDOCFLAGS: -D warnings
 

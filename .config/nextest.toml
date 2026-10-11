@@ -59,7 +59,10 @@ dpdk-serial = { max-threads = 1 }
 # `scripts/dpdk/netns-runner.sh` and `--profile dpdk`.
 #
 # One test at a time: every DPDK node busy-polls a core, and the groups
-# alone would let one test of each run at once.
+# alone would let one test of each run at once. A test whose client runs
+# on DPDK too (the echo and counter round trips) adds one more
+# busy-polling thread, the client's, beside its nodes', on a CI runner
+# whose cores are few.
 #
 # A test that fails on DPDK because of a known transport divergence is
 # left out here, with a `default-filter` of the form

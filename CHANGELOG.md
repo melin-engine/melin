@@ -136,6 +136,16 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   field documentation now names each field's node flag, and says why a
   peer MAC is required on a fabric that assigns MACs (an AWS ENI) and why
   a client beside a node needs an EAL file prefix of its own.
+- **DPDK clients in the DPDK test rig.** `scripts/dpdk/netns-runner.sh`
+  builds a veth pair for a DPDK client beside the node slots and publishes
+  it in `MELIN_NETNS_DPDK_CLIENT_IFACE`, `_IP` and `_MAC` (the node slots
+  and the kernel client's variables are unchanged); `melin-test-node`'s
+  `open_dpdk_client` opens a `NicHandle` on it, on the process-wide EAL;
+  the echo and counter round trips gain a case with the client on DPDK;
+  the CI `dpdk` job builds, tests and documents `melin-client/dpdk`.
+  `scripts/dpdk/dpdk-client-tap-smoke.sh` runs a DPDK echo client over a
+  TAP device against a kernel echo server, once the echo client has a
+  DPDK transport. For contributors; nothing ships with it.
 
 ### Changed
 

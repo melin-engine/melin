@@ -308,6 +308,99 @@ fn a_frame_that_is_not_an_application_frame_is_dropped() {
 }
 
 // ---------------------------------------------------------------------------
+// The client on DPDK too
+// ---------------------------------------------------------------------------
+
+/// A client on DPDK, beside its node on DPDK: `melin-client`'s polled
+/// connection on a NIC handle, from the runner's client pair, through the
+/// whole path (EAL shared with the node, the dial, the handshake, the
+/// in-place send, the reply loop), and again on the same handle once the
+/// first connection has gone.
+///
+/// The node's MAC is passed through. The runner's MACs are not the
+/// `02:00:<ip>` convention the dialer would fall back to without one, so a
+/// dial that took the fallback would time out.
+#[cfg(feature = "dpdk")]
+#[test]
+fn a_dpdk_client_echoes_through_a_dpdk_node() {
+    use melin_client::{NicConfig, PeerMacSource, StreamConnection};
+
+    /// The stream's socket buffers: room for a few full-sized requests.
+    const SOCKET_BUFFER: usize = 64 * 1024;
+
+    let (tmp, server) = start_server();
+    // The launcher returns before the node serves, and the polled
+    // connection has no retry-until-a-deadline twin of `connect_by`: the
+    // kernel client, which has, waits for it, so the DPDK dial below is
+    // one attempt at a node already serving.
+    drop(connect_authenticated(server.addr(), &writer_key()));
+
+    let SocketAddr::V4(node) = server.addr() else {
+        panic!("a DPDK node is on IPv4: {}", server.addr());
+    };
+    let node_mac = melin_test_node::mac_of(server.addr());
+    let o = node.ip().octets();
+    assert_ne!(
+        node_mac,
+        [0x02, 0x00, o[0], o[1], o[2], o[3]],
+        "the runner's MACs must not be the fallback convention, or this test proves nothing"
+    );
+    let mut nic = melin_test_node::open_dpdk_client(NicConfig {
+        peer_mac: Some(node_mac),
+        ..NicConfig::default()
+    });
+    assert_eq!(nic.mac(), melin_test_node::dpdk_client().mac);
+    assert_eq!(
+        nic.peer_mac(*node.ip()),
+        (node_mac, PeerMacSource::Supplied)
+    );
+
+    let timeout = Duration::from_secs(30);
+    let first: Vec<Vec<u8>> = [0, 1, 255, 256, MAX_PAYLOAD]
+        .into_iter()
+        .enumerate()
+        .map(|(i, len)| bytes(len, i as u8))
+        .collect();
+    {
+        let mut client = StreamConnection::connect_dpdk_on(
+            &mut nic,
+            node,
+            &writer_key(),
+            SOCKET_BUFFER,
+            timeout,
+        )
+        .expect("a DPDK client connected to the node");
+        for sent in &first {
+            let reply = client.request_one(sent).expect("one reply");
+            assert_eq!(reply[0], KIND_RESP_ECHO, "{} bytes", sent.len());
+            assert_eq!(&reply[1..], &sent[..], "{} bytes", sent.len());
+        }
+    }
+
+    // The handle outlives its connections: a second one dials on it again,
+    // from a fresh local port.
+    let again = bytes(16, 0x40);
+    {
+        let mut client = StreamConnection::connect_dpdk_on(
+            &mut nic,
+            node,
+            &writer_key(),
+            SOCKET_BUFFER,
+            timeout,
+        )
+        .expect("a second DPDK connection on the same NIC handle");
+        let reply = client.request_one(&again).expect("one reply");
+        assert_eq!(reply, [&[KIND_RESP_ECHO][..], &again].concat());
+    }
+
+    drop(nic);
+    server.stop();
+    let mut expected = first;
+    expected.push(again);
+    assert_eq!(journaled_echoes(tmp.path()), expected);
+}
+
+// ---------------------------------------------------------------------------
 // Against the journal
 // ---------------------------------------------------------------------------
 

@@ -1,8 +1,12 @@
 # DPDK support in `melin-client` (plan)
 
-Status: **in progress** (2026-10): steps 1 to 4 of the order of work,
+Status: **in progress** (2026-10): steps 1 to 5 of the order of work,
 the factoring, the NIC handle with the proxy on it, the polled
-connection, and the client's `dpdk` feature, are done; step 5 is next.
+connection, the client's `dpdk` feature, and the test rig with the TAP
+smoke script and CI, are done; step 6 is next. The smoke script runs the
+echo client's `--transport dpdk`, so it runs from step 6 on. The echo
+example's `dpdk` feature already forwards to `melin-client/dpdk`, for the
+round trip's DPDK client case.
 Covers the roadmap item "DPDK support in `melin-client`"
 ([roadmap.md](roadmap.md)).
 
@@ -548,7 +552,12 @@ Each step is a commit, reviewed before the next.
    pair, the launcher's helper, the DPDK client cases in the echo and
    counter round trips, the smoke script, and `melin-client/dpdk` on the
    CI job.
-6. **The echo client's transport flag.**
+6. **The echo client's transport flag.** Accepted once
+   `scripts/dpdk/dpdk-client-tap-smoke.sh` has passed on a host with
+   libdpdk: the first run is what confirms the script's two runtime
+   assumptions, that its set-then-read-back loop settles the net_tap PMD's
+   MAC rewrite, and that the client's dial deadline outlasts the kernel
+   side's bring-up.
 7. **Docs**, the divergences entry included.
 8. **The exchange's bench onto the handle**, in that repository, once the
    release carrying steps 1 to 4 is out and its sequencer pins move.
