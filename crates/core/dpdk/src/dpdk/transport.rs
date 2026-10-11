@@ -516,8 +516,9 @@ impl DpdkTransport {
 
     /// The constructors' common body: `listen_port` is the port of the
     /// transport's first listener, with the client buffer sizes, or none.
-    /// Takes only the NIC's configuration: the interface and its neighbour
-    /// seeding need nothing of a node's.
+    /// Takes the NIC's configuration rather than a node's whole
+    /// [`DpdkConfig`]: beyond the listen port passed here, the interface
+    /// and its neighbour seeding need nothing of a node's.
     fn build(
         shared: &Arc<DpdkShared>,
         config: &NicConfig,
@@ -652,12 +653,16 @@ impl DpdkTransport {
     /// initiate the TCP handshake, and returns the socket handle. The
     /// caller must poll the transport until `is_connected(handle)` returns
     /// true before sending data.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect_to_with_buffers`].
     pub fn connect_to(
         &mut self,
         remote_ip: std::net::Ipv4Addr,
         remote_port: u16,
         local_port: u16,
-    ) -> SocketHandle {
+    ) -> Result<SocketHandle, tcp::ConnectError> {
         self.connect_to_with_buffers(
             remote_ip,
             remote_port,
@@ -673,6 +678,14 @@ impl DpdkTransport {
     /// egress burst limit. Used for replication connections that need larger
     /// RX/TX buffers. See [`Self::add_listener_with_buffers`] for what
     /// `dispatch_burst_limit` controls.
+    ///
+    /// # Errors
+    ///
+    /// The stack refused to open the socket: an endpoint it cannot address
+    /// (an unspecified address, a zero port) or, in principle, a socket
+    /// not in its closed state, which a fresh one always is. No socket is
+    /// added to the set then, so there is nothing to close. A caller that
+    /// retries its dials treats it as a dial that failed.
     pub fn connect_to_with_buffers(
         &mut self,
         remote_ip: std::net::Ipv4Addr,
@@ -682,7 +695,7 @@ impl DpdkTransport {
         tx_buf_size: usize,
         tx_queue_limit: usize,
         dispatch_burst_limit: usize,
-    ) -> SocketHandle {
+    ) -> Result<SocketHandle, tcp::ConnectError> {
         self.open_connection(
             remote_ip,
             remote_port,
@@ -693,15 +706,13 @@ impl DpdkTransport {
             dispatch_burst_limit,
             RxPath::ZeroCopy,
         )
-        .expect("smoltcp connect failed")
     }
 
     /// Like [`Self::connect_to_with_buffers`] for a socket read by copy
     /// ([`Self::tcp_socket`] and `recv_slice`), polled by
     /// [`Self::poll_copying`] and never by [`Self::poll`]: the client NIC
-    /// handle's dial. Equal receive and transmit buffers, the default
-    /// egress burst, and a connect error returned rather than a panic,
-    /// since the local port is the caller's to choose.
+    /// handle's dial. Equal receive and transmit buffers and the default
+    /// egress burst.
     pub(crate) fn connect_copying(
         &mut self,
         remote: std::net::SocketAddrV4,

@@ -171,6 +171,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   and went with the feature would break a match in one crate when another
   turned it on. Source-breaking for an exhaustive `match` on `Error`: add
   an arm for it.
+- **`DpdkTransport::connect_to` and `connect_to_with_buffers` return a
+  `Result`** instead of panicking when the stack refuses to open the
+  socket (an endpoint it cannot address). A replica whose dial is refused
+  that way now logs it and retries with its usual backoff, where it used
+  to go down. Source-breaking for a caller of either: handle the error.
 - **`melin_dpdk::DpdkConfig`'s NIC fields moved into `melin_dpdk::NicConfig`**,
   the configuration a node and a client's NIC handle share. The EAL
   arguments, ports, address and prefix, gateway, bifurcated peer IP,
