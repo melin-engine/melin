@@ -12,7 +12,7 @@ license = "Apache-2.0"
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Client for a Melin node: framing, Ed25519 authentication, and the request/response batch protocol, blocking or I/O-free"
+description = "Client for a Melin node: framing, Ed25519 authentication, and the request/response batch protocol, blocking, polled or I/O-free"
 
 [lints]
 workspace = true

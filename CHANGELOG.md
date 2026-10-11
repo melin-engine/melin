@@ -66,6 +66,41 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   failed: -22` (was `port 0 configure: ConfigureFailed(-22)` and `port 0
   start: StartFailed(-22)`). Every one still starts `error:`, and the
   `connected to` line and the `--trace` report are unchanged.
+- **A polled connection in `melin-client`**, the blocking `Connection`'s
+  protocol over a non-blocking byte stream, with no blocking call in it.
+  - `ByteStream`, the seam to the transport: a non-blocking `send`, a
+    `service` step at the caller's monotonic nanosecond time, a `recv` for
+    which nothing yet is zero and a closed connection an error, and a
+    `send_in_place` that lends the stream's transmit buffer so a request
+    is encoded where it is sent from. The in-place step defaults to
+    lending nothing, so a stream with no transmit buffer of its own
+    implements the other three.
+  - `PolledConnection`, the protocol state alone (the handshake, the
+    receive buffer, a scratch buffer, the read deadline) with no stream
+    and no clock: `poll` takes the stream and the caller's time and
+    returns the next frame or nothing yet, `feed` takes bytes an I/O loop
+    received itself (an `io_uring` completion's, one copy, as a
+    `FrameDecoder` push is), and `send` and `send_with` frame a request in
+    the room the stream lends, or in the scratch buffer when that room is
+    short of it (a transmit ring about to wrap). The handshake runs inside
+    `poll`, and a request sent before the node is ready is held until it
+    is. The read deadline runs only while a reply is owed, a heartbeat
+    does not push it back, and its expiry is `Error::NoReply`. For a
+    caller with several connections on one NIC, or a clock of its own.
+  - `StreamConnection`, one stream and a cached clock around it, with the
+    blocking connection's `send`, `next_frame`, `request` and
+    `request_one` (spinning on the stream where those block) and their
+    errors, plus a non-blocking `poll`. `StreamConnection::connect` dials
+    a kernel socket.
+  - `Session`, the calls a request loop makes (`send`, `next_frame`,
+    `request`, `request_one`), implemented by `Connection` and
+    `StreamConnection`, so a loop is written once over `&mut dyn Session`
+    and the transport picked at runtime. `Connection` is otherwise
+    unchanged.
+  - Two streams: `NonBlockingTcp`, a kernel socket in non-blocking mode
+    with Nagle off, and `BufferStream`, whose received bytes the caller
+    pushes in and whose sent bytes it takes out, with an optional transmit
+    capacity, for an I/O loop that owns the socket itself.
 
 ### Changed
 

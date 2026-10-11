@@ -46,6 +46,28 @@
 //!   [`REQUEST_HEADER_LEN`] bytes, and [`seal_request`] writes the header
 //!   in front of it ([`frame_request`] does both around a closure).
 //!
+//! Between the two sits the polled connection, the blocking connection's
+//! protocol over a non-blocking [`ByteStream`] with no blocking call in
+//! it:
+//!
+//! - [`PolledConnection`] is the protocol state alone (the handshake, a
+//!   receive buffer frames are split in, a scratch buffer, the read
+//!   deadline) with no stream and no clock: every call takes the stream
+//!   and the caller's monotonic time, and returns at once. For a program
+//!   with several connections on one NIC, or a clock of its own, or bytes
+//!   handed to it by an `io_uring` completion, which
+//!   [`PolledConnection::feed`] takes directly. A request is framed where
+//!   the stream lends room for it ([`ByteStream::send_in_place`]), or in
+//!   the scratch buffer when it lends none.
+//! - [`StreamConnection`] owns one stream and a cached clock and offers
+//!   the blocking connection's calls, spinning on the stream where those
+//!   block, and a non-blocking [`poll`](StreamConnection::poll) besides.
+//! - [`NonBlockingTcp`] is a kernel socket as a byte stream, and
+//!   [`BufferStream`] one whose bytes the caller's own I/O loop moves.
+//! - [`Session`] is what a request loop needs (send, next frame,
+//!   request), implemented by [`Connection`] and [`StreamConnection`],
+//!   so the loop is written once and the transport picked at runtime.
+//!
 //! The request framing is the wire protocol's own, re-exported here: an
 //! application's codec crate that needs only framing can depend on
 //! `melin-wire-protocol` alone, and gets a conversion of its errors into
@@ -96,6 +118,13 @@ use melin_wire_protocol::control_codec::{
 };
 
 pub mod key;
+mod polled;
+
+// The polled connection lives in a module of its own, re-exported item by
+// item so it sits beside the blocking connection at the crate's root.
+pub use polled::{
+    BufferStream, ByteStream, NonBlockingTcp, PolledConnection, Session, StreamConnection,
+};
 
 // The key types a caller needs to hold, so that depending on this crate
 // is enough to authenticate.
@@ -816,6 +845,11 @@ impl Handshake {
     }
 }
 
+/// The longest frame the node sends during the handshake. Its two frames
+/// are a tag and a 32-byte nonce, then a tag: a longer frame is not a
+/// handshake.
+pub(crate) const MAX_HANDSHAKE_FRAME: usize = 64;
+
 /// Answer a node's challenge on a bare stream: read the nonce, sign it,
 /// send the signature with the public key, and wait for the node to say
 /// it is ready. [`Connection::connect`] does this on the socket it
@@ -832,9 +866,7 @@ impl Handshake {
 /// `set_read_timeout`) a peer that never answers hangs the handshake,
 /// and a read that times out under one comes back as [`Error::Io`].
 pub fn authenticate(stream: &mut (impl Read + Write), key: &SigningKey) -> Result<(), Error> {
-    // The node's two frames are a tag and a 32-byte nonce, then a tag: a
-    // frame that does not fit here is not a handshake.
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; MAX_HANDSHAKE_FRAME];
     let mut handshake = Handshake::new(key);
     loop {
         let payload = read_unbuffered_frame(stream, &mut buf)?;
@@ -903,9 +935,12 @@ mod tests {
 
     use super::*;
 
+    // The fake node and its frame builders are `pub(crate)` so the polled
+    // connection's tests (`polled.rs`) run against the same node.
+
     /// How the fake node behaves once a client is authenticated.
     #[derive(Clone, Copy)]
-    enum Behaviour {
+    pub(crate) enum Behaviour {
         /// Reply to every request with its body, then end the batch.
         Echo,
         /// A heartbeat before every reply, and two reply frames per batch.
@@ -934,14 +969,14 @@ mod tests {
         AdminLines,
     }
 
-    fn control(response: TransportResponse) -> Vec<u8> {
+    pub(crate) fn control(response: TransportResponse) -> Vec<u8> {
         let mut buf = [0u8; 64];
         let n = encode_transport_response(&response, &mut buf).unwrap();
         buf[..n].to_vec()
     }
 
     /// A frame under any tag, length prefix included.
-    fn tagged_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+    pub(crate) fn tagged_frame(tag: u8, body: &[u8]) -> Vec<u8> {
         let mut frame = ((TAG_LEN + body.len()) as u32).to_le_bytes().to_vec();
         frame.push(tag);
         frame.extend_from_slice(body);
@@ -949,7 +984,7 @@ mod tests {
     }
 
     /// An application frame carrying `body`, length prefix included.
-    fn app_frame(body: &[u8]) -> Vec<u8> {
+    pub(crate) fn app_frame(body: &[u8]) -> Vec<u8> {
         tagged_frame(TAG_APP, body)
     }
 
@@ -983,7 +1018,7 @@ mod tests {
 
     /// Serve one client on `stream` the way a node does: challenge,
     /// verify, then `behaviour`.
-    fn serve(mut stream: TcpStream, allowed: VerifyingKey, behaviour: Behaviour) {
+    pub(crate) fn serve(mut stream: TcpStream, allowed: VerifyingKey, behaviour: Behaviour) {
         if !challenge(&stream, allowed) {
             return;
         }
@@ -1047,7 +1082,7 @@ mod tests {
 
     /// A fake node on a kernel-assigned port, serving clients on a
     /// thread until the listener is dropped.
-    fn fake_node(allowed: VerifyingKey, behaviour: Behaviour) -> SocketAddr {
+    pub(crate) fn fake_node(allowed: VerifyingKey, behaviour: Behaviour) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1058,7 +1093,7 @@ mod tests {
         addr
     }
 
-    fn client_key() -> SigningKey {
+    pub(crate) fn client_key() -> SigningKey {
         SigningKey::from_bytes(&[0x11; 32])
     }
 
@@ -1444,7 +1479,7 @@ mod tests {
 
     /// A node's control frame as a `Handshake` is fed it: the payload
     /// after the length prefix.
-    fn payload(response: TransportResponse) -> Vec<u8> {
+    pub(crate) fn payload(response: TransportResponse) -> Vec<u8> {
         control(response)[4..].to_vec()
     }
 

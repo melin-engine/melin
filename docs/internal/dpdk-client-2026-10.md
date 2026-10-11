@@ -1,8 +1,8 @@
 # DPDK support in `melin-client` (plan)
 
-Status: **in progress** (2026-10): steps 1 and 2 of the order of work,
-the factoring and the NIC handle with the proxy on it, are done; step 3
-is next. Covers the roadmap item
+Status: **in progress** (2026-10): steps 1 to 3 of the order of work,
+the factoring, the NIC handle with the proxy on it, and the polled
+connection, are done; step 4 is next. Covers the roadmap item
 "DPDK support in `melin-client`" ([roadmap.md](roadmap.md)).
 
 The one-line goal: **a client links `melin-client`, turns on one feature,
@@ -358,7 +358,9 @@ was received, a request is encoded where it is sent from. The one exception
 is a request that does not fit the contiguous room at the end of the
 stack's transmit ring; it is framed in the scratch buffer and copied
 through the plain send, rather than split across the wrap. The encoder
-never sees two regions.
+never sees two regions, nor one shorter than the body bound its caller
+gives (the exchange's codec indexes its buffer on the promise of the
+widest body), so it runs exactly once.
 
 The wrapper offers the blocking connection's calls (send, next frame,
 request) with the same errors, the next-frame call spinning on the stream
