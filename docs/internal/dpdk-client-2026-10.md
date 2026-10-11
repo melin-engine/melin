@@ -1,9 +1,10 @@
 # DPDK support in `melin-client` (plan)
 
-Status: **in progress** (2026-10): steps 1 to 3 of the order of work,
-the factoring, the NIC handle with the proxy on it, and the polled
-connection, are done; step 4 is next. Covers the roadmap item
-"DPDK support in `melin-client`" ([roadmap.md](roadmap.md)).
+Status: **in progress** (2026-10): steps 1 to 4 of the order of work,
+the factoring, the NIC handle with the proxy on it, the polled
+connection, and the client's `dpdk` feature, are done; step 5 is next.
+Covers the roadmap item "DPDK support in `melin-client`"
+([roadmap.md](roadmap.md)).
 
 The one-line goal: **a client links `melin-client`, turns on one feature,
 and talks to a node over kernel bypass with the same protocol code the

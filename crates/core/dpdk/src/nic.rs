@@ -99,6 +99,15 @@ impl NicClock {
     pub fn now_ns(&self) -> u64 {
         u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
+
+    /// The instant [`now_ns`](Self::now_ns) counts from. For a caller that
+    /// keeps a clock of its own on the same origin (a cached reading, say)
+    /// so that its readings and this clock's agree: the handle's stack
+    /// takes them as one clock, where readings from another origin would
+    /// look like a clock stepping back and be clamped.
+    pub fn origin(&self) -> std::time::Instant {
+        self.origin
+    }
 }
 
 /// The stack's clock, driven by the caller's readings.
@@ -497,6 +506,16 @@ mod tests {
             assert!(now >= last);
             last = now;
         }
+    }
+
+    /// A clock kept on the handle's origin reads what the handle's does.
+    #[test]
+    fn the_nic_clock_counts_from_its_origin() {
+        let clock = NicClock::start();
+        let before = clock.now_ns();
+        let on_origin = u64::try_from(clock.origin().elapsed().as_nanos()).unwrap();
+        let after = clock.now_ns();
+        assert!(before <= on_origin && on_origin <= after);
     }
 
     // --- Local ports --------------------------------------------------------

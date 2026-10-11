@@ -68,6 +68,23 @@
 //!   request), implemented by [`Connection`] and [`StreamConnection`],
 //!   so the loop is written once and the transport picked at runtime.
 //!
+//! ## Kernel bypass: the `dpdk` feature
+//!
+//! Off by default. It runs the polled connection over DPDK, on
+//! `melin-dpdk`'s client NIC handle (the node's own DPDK transport,
+//! listening on no port): `StreamConnection::connect_dpdk` brings a NIC up
+//! from a `NicConfig` (the node's DPDK configuration, re-exported) and
+//! dials, `StreamConnection::connect_dpdk_on` dials on a `NicHandle`
+//! already up, and the handle's stream is a [`ByteStream`] whose in-place
+//! send frames a request straight into the socket's transmit buffer, so a
+//! program with several connections on one NIC drives them with
+//! [`PolledConnection`]. Turning it on links `melin-dpdk`, which is
+//! BUSL-1.1, not Apache-2.0 like this crate, into the binary; without it
+//! nothing of `melin-dpdk` is compiled. The build host needs libdpdk
+//! (found through `pkg-config`), and the host it runs on a DPDK-capable
+//! port and hugepages; a DPDK client thread spins at full load, so pin it
+//! to a core of its own.
+//!
 //! The request framing is the wire protocol's own, re-exported here: an
 //! application's codec crate that needs only framing can depend on
 //! `melin-wire-protocol` alone, and gets a conversion of its errors into
@@ -117,6 +134,8 @@ use melin_wire_protocol::control_codec::{
     encode_challenge_response,
 };
 
+#[cfg(feature = "dpdk")]
+mod dpdk;
 pub mod key;
 mod polled;
 
@@ -124,6 +143,19 @@ mod polled;
 // item so it sits beside the blocking connection at the crate's root.
 pub use polled::{
     BufferStream, ByteStream, NonBlockingTcp, PolledConnection, Session, StreamConnection,
+};
+
+// Kernel bypass: the single-stream owned form of a NIC stream, and the NIC
+// handle's own types, re-exported so that a client needs no direct
+// dependency on `melin-dpdk` (nor a second copy of the node's DPDK
+// configuration: `NicConfig` is the node's own). The MAC parser is here for
+// the binaries that map `--dpdk-peer-mac` and `--dpdk-gateway-mac` onto it.
+#[cfg(feature = "dpdk")]
+pub use dpdk::DpdkStream;
+#[cfg(feature = "dpdk")]
+pub use melin_dpdk::{
+    MacParseError, NicClock, NicConfig, NicHandle, NicStream, PeerMacSource, StreamId,
+    try_parse_mac,
 };
 
 // The key types a caller needs to hold, so that depending on this crate
@@ -163,8 +195,19 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum Error {
     /// The socket failed underneath the protocol.
     Io(io::Error),
-    /// The node could not be reached at `addr`.
+    /// The node could not be reached at `addr`. Over DPDK (the `dpdk`
+    /// feature) the source tells a dial nothing answered
+    /// ([`io::ErrorKind::TimedOut`], its message naming the MAC the SYN
+    /// went to as the first thing to check) from one refused
+    /// ([`io::ErrorKind::ConnectionRefused`]).
     Connect { addr: SocketAddr, source: io::Error },
+    /// The DPDK NIC could not be brought up: EAL initialisation (the
+    /// message names the file prefix, the usual culprit when another DPDK
+    /// process runs on the host), a missing port, the mbuf pool, or the
+    /// port's configuration. Only the `dpdk` feature's constructors return
+    /// it; the variant exists in every build, so that a match on this type
+    /// compiles the same whichever crate in a build turns the feature on.
+    Nic(io::Error),
     /// The node was not serving by the deadline given to
     /// [`Connection::connect_by`]; `last` is what the final attempt saw.
     Deadline { addr: SocketAddr, last: Box<Error> },
@@ -216,6 +259,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "connection lost: {e}"),
             Error::Connect { addr, source } => write!(f, "cannot connect to {addr}: {source}"),
+            Error::Nic(e) => write!(f, "cannot bring the DPDK NIC up: {e}"),
             Error::Deadline { addr, last } => {
                 write!(
                     f,
@@ -258,7 +302,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Io(e) | Error::Connect { source: e, .. } => Some(e),
+            Error::Io(e) | Error::Connect { source: e, .. } | Error::Nic(e) => Some(e),
             Error::Deadline { last, .. } => Some(last.as_ref()),
             _ => None,
         }
@@ -1780,6 +1824,23 @@ mod tests {
         let n = seal_request(&mut buf, 3).unwrap();
         assert_eq!(&buf[..n], app_frame(b"abc").as_slice());
         assert!(buf[n..].iter().all(|&b| b == 0xEE));
+    }
+
+    /// The NIC's own message, the EAL's file prefix among it, reaches the
+    /// operator through `Display`, and the error itself through `source`.
+    #[test]
+    fn a_nic_that_cannot_come_up_says_why() {
+        use std::error::Error as _;
+
+        let err = Error::Nic(io::Error::other(
+            "DPDK EAL init failed (file prefix melin-client; is another DPDK process on this \
+             host using it?): code -1",
+        ));
+        let msg = err.to_string();
+        assert!(msg.starts_with("cannot bring the DPDK NIC up: "), "{msg}");
+        assert!(msg.contains("file prefix melin-client"), "{msg}");
+        let source = err.source().expect("the NIC's error is the source");
+        assert!(source.to_string().contains("code -1"), "{source}");
     }
 
     #[test]

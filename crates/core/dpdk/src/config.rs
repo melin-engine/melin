@@ -16,48 +16,86 @@ const LISTEN_PORT: u16 = 9876;
 ///
 /// Nothing here is particular to a node: it is everything a transport on
 /// the NIC needs, whether it listens or only dials out. [`DpdkConfig`]
-/// composes it with what only a node serving connections has.
+/// composes it with what only a node serving connections has, and a
+/// client's NIC handle takes it as it is.
+///
+/// One field per DPDK flag of the node (`--dpdk-eal-args`,
+/// `--dpdk-ports`, `--dpdk-ip`, `--dpdk-prefix-len`, `--dpdk-gateway`,
+/// `--dpdk-peer-ip`, `--dpdk-gateway-mac`, `--dpdk-peer-mac`,
+/// `--dpdk-mtu`, `--dpdk-vlan`). A plain struct rather than a command-line
+/// one: each binary declares its own flags and maps them onto it, and what
+/// an operator has to know about a field is written here, once, so the
+/// flags' help can stay short.
 #[derive(Clone, Debug)]
 pub struct NicConfig {
-    /// Arguments passed to `rte_eal_init`, one per element. Owned strings
-    /// because they come from an operator's flag, split on whitespace.
-    /// Must be empty on a process-wide EAL, which the transport shares.
+    /// Arguments passed to `rte_eal_init`, one per element (`--dpdk-eal-args`,
+    /// split on whitespace). Owned strings because they come from an
+    /// operator's flag. Must be empty on a process-wide EAL, which the
+    /// transport shares.
+    ///
+    /// The file prefix (`--file-prefix`) matters wherever two DPDK
+    /// processes share a host. A process without one of its own shares the
+    /// default runtime directory with every other, and the second to start
+    /// fails to take the runtime lock: a client beside a node, the usual
+    /// local arrangement, needs a prefix the node does not use. A client's
+    /// NIC handle adds one of its own (`melin-client`) when these arguments
+    /// name none; a second client on the same host needs yet another.
     pub eal_args: Vec<String>,
-    /// DPDK port IDs to poll. The first port is used for TX; all ports
-    /// are polled for RX. For LACP bonds, pass both VF port IDs (e.g.,
-    /// `vec![0, 1]`) so traffic arriving on either bond member is received.
-    /// A `Vec` because the order carries meaning (the first transmits) and
-    /// the count is one or two.
+    /// DPDK port IDs to poll (`--dpdk-ports`). The first port is used for
+    /// TX; all ports are polled for RX. For LACP bonds, pass both VF port
+    /// IDs (e.g., `vec![0, 1]`) so traffic arriving on either bond member
+    /// is received. A `Vec` because the order carries meaning (the first
+    /// transmits) and the count is one or two.
     pub port_ids: Vec<u16>,
+    /// This interface's IPv4 address (`--dpdk-ip`). On a cloud fabric, the
+    /// one the fabric assigned to the port: a VPC drops a source address it
+    /// did not assign.
     pub ip_addr: Ipv4Addr,
+    /// The prefix length of [`ip_addr`](Self::ip_addr)'s subnet
+    /// (`--dpdk-prefix-len`): a peer inside it is reached directly, one
+    /// outside it through [`gateway`](Self::gateway).
     pub prefix_len: u8,
+    /// The default route (`--dpdk-gateway`), for a peer outside the
+    /// subnet. With [`gateway_mac`](Self::gateway_mac) as well, the
+    /// transport runs in L3 mode: the gateway is seeded from that MAC, and
+    /// no gratuitous ARP goes out.
     pub gateway: Option<Ipv4Addr>,
-    /// Peer IPv4 to capture into DPDK via an `rte_flow` steering rule.
-    /// When Some, the port is configured in bifurcated mode: kernel
+    /// Peer IPv4 to capture into DPDK via an `rte_flow` steering rule
+    /// (`--dpdk-peer-ip`). When Some, the port is configured in bifurcated mode: kernel
     /// keeps every packet that does NOT come from this source IP, so
     /// the management plane (SSH, ARP, neighbor tenants) keeps working
     /// while DPDK steals only this peer's traffic. Used for L3 setups
     /// where the public NIC is shared with the kernel.
     pub peer_ip: Option<Ipv4Addr>,
     /// MAC address to seed into smoltcp's neighbor cache for the
-    /// gateway IP. Required in bifurcated L3 mode because the gateway's
+    /// gateway IP (`--dpdk-gateway-mac`). Required in bifurcated L3 mode because the gateway's
     /// ARP reply would not match our flow rule (different source IP) —
     /// it would be eaten by the kernel. Operators source this MAC from
     /// the kernel's existing `ip neigh` cache and pass it in.
     pub gateway_mac: Option<[u8; 6]>,
-    /// MAC address of the peer this transport dials out to — the primary,
-    /// for a replica. Only a connection *initiator* needs it: an acceptor
-    /// learns the peer's address from the inbound frame. When None the
-    /// initiator falls back to the SR-IOV `02:00:<ip>` convention, which
-    /// is wrong on any port that keeps a real hardware address (an mlx5
-    /// in bifurcated mode shares the kernel netdev's). See
-    /// [`crate::mac::resolve_peer_mac`].
+    /// MAC address of the peer this transport dials out to
+    /// (`--dpdk-peer-mac`): the primary, for a replica; the node, for a
+    /// client. Only a connection *initiator* needs it: an acceptor learns
+    /// the peer's address from the inbound frame.
+    ///
+    /// The address is seeded into the neighbour cache before the first
+    /// frame rather than resolved by ARP, which a userspace stack on a port
+    /// the kernel does not own cannot rely on (in bifurcated mode ARP never
+    /// reaches DPDK at all). When None the initiator falls back to the
+    /// SR-IOV `02:00:<ip>` convention, which holds only where the VFs were
+    /// given such addresses (`dpdk-setup.sh` does) and is wrong on any port
+    /// that keeps an address the fabric or the hardware assigned: an AWS
+    /// ENI, an mlx5 in bifurcated mode sharing the kernel netdev's. Being
+    /// wrong is silent, the frames go to a MAC nothing owns and the
+    /// connect times out, so on such a fabric this field is not optional.
+    /// See [`crate::mac::resolve_peer_mac`].
     pub peer_mac: Option<[u8; 6]>,
-    /// MTU for the DPDK interface. 1500 for standard Ethernet, 9000 for
-    /// jumbo frames (6x fewer TCP segments, ~6x less per-segment overhead).
-    /// A `usize` because that is what the stack's device capabilities take.
+    /// MTU for the DPDK interface (`--dpdk-mtu`); must match the peer's.
+    /// 1500 for standard Ethernet, 9000 for jumbo frames (6x fewer TCP
+    /// segments, ~6x less per-segment overhead). A `usize` because that is
+    /// what the stack's device capabilities take.
     pub mtu: usize,
-    /// VLAN ID for hardware strip/insert. Used in dedicated NIC mode where
+    /// VLAN ID for hardware strip/insert (`--dpdk-vlan`). Used in dedicated NIC mode where
     /// the kernel isn't handling VLAN tags. None = no VLAN offload (SR-IOV
     /// mode where the PF handles VLAN tagging).
     pub vlan_id: Option<u16>,

@@ -101,8 +101,52 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     with Nagle off, and `BufferStream`, whose received bytes the caller
     pushes in and whose sent bytes it takes out, with an optional transmit
     capacity, for an I/O loop that owns the socket itself.
+- **A `dpdk` feature in `melin-client`**, off by default: the polled
+  connection over kernel bypass, on `melin-dpdk`'s client NIC handle.
+  Turning it on links `melin-dpdk`, which is BUSL-1.1, into the binary
+  (`melin-client` itself stays Apache-2.0, and without the feature nothing
+  of `melin-dpdk` is compiled), and needs libdpdk on the build host.
+  - `StreamConnection::connect_dpdk` brings a NIC up from a `NicConfig`
+    and dials and authenticates, with a socket buffer size and a timeout
+    that bounds the dial, the handshake and every wait after;
+    `StreamConnection::connect_dpdk_on` does the same on a `NicHandle`
+    already up, owned or lent as `&mut`, so a client reconnects without
+    touching EAL and a process that holds the process-wide EAL shares it.
+    One clock drives the handle's stack: the dial runs on the handle's own
+    clock, and the connection's cached clock counts from the same origin.
+    A dial that times out is `Error::Connect` with a timed-out source whose
+    message names the peer MAC to check first, a refused one
+    `Error::Connect` with a refused source.
+  - `DpdkStream`, one stream of a NIC handle owned with the handle (or a
+    `&mut` to it): the stream a `StreamConnection` over DPDK owns. Dropping
+    it closes the stream, so the node frees the connection's slot at once.
+  - `ByteStream` for `DpdkStream` and for the handle's `NicStream` view,
+    whose in-place send is the socket's own, so a request is framed
+    straight into the stack's transmit buffer. A program with several
+    connections on one NIC keeps the handle and drives one
+    `PolledConnection` per stream with the view, per call, on its own
+    clock, calling the handle's service step once per loop iteration.
+  - Re-exported from `melin-dpdk`, so a client needs no direct dependency
+    on it: `NicConfig`, the node's DPDK configuration (one field per
+    `--dpdk-*` flag; a plain struct, each binary maps its own flags onto
+    it), `NicHandle`, `NicStream`, `StreamId`, `NicClock`, `PeerMacSource`,
+    `try_parse_mac` and `MacParseError`.
+- **`melin_dpdk::NicClock::origin`**, the instant the clock counts from,
+  for a caller that keeps a cached clock on the same origin. `NicConfig`'s
+  field documentation now names each field's node flag, and says why a
+  peer MAC is required on a fabric that assigns MACs (an AWS ENI) and why
+  a client beside a node needs an EAL file prefix of its own.
 
 ### Changed
+
+- **`melin_client::Error` has a new variant, `Error::Nic(io::Error)`**,
+  for a DPDK NIC that cannot be brought up (EAL initialisation, a missing
+  port, the mbuf pool, the port's configuration). Only the `dpdk`
+  feature's constructors return it, but the variant exists in every build,
+  since features are unified across a build graph and a variant that came
+  and went with the feature would break a match in one crate when another
+  turned it on. Source-breaking for an exhaustive `match` on `Error`: add
+  an arm for it.
 
 - **Dependencies refreshed to their latest compatible releases** (tokio,
   serde, thiserror, zerocopy and zeroize among them). Only the committed

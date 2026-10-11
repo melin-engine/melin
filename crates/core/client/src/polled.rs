@@ -443,7 +443,7 @@ impl std::fmt::Debug for PolledConnection {
 
 /// `timeout` in nanoseconds, saturating: a timeout past `u64::MAX`
 /// nanoseconds (centuries) is as good as none.
-fn duration_ns(timeout: Duration) -> u64 {
+pub(crate) fn duration_ns(timeout: Duration) -> u64 {
     u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -902,9 +902,11 @@ const CLOCK_REFRESH_POLLS: u32 = 100;
 /// A monotonic clock read once every [`CLOCK_REFRESH_POLLS`] ticks, and on
 /// demand at the start of each blocking call.
 #[derive(Debug)]
-struct CachedClock {
-    /// What the nanosecond counts are counted from: the wrapper's creation.
-    /// An `Instant`, not the wall clock, which can be stepped.
+pub(crate) struct CachedClock {
+    /// What the nanosecond counts are counted from: the wrapper's creation,
+    /// or, over a stream whose stack outlives the wrapper (a DPDK NIC
+    /// handle's), that stack's own origin, so the two agree. An `Instant`,
+    /// not the wall clock, which can be stepped.
     origin: Instant,
     /// The latest reading, in nanoseconds since `origin`.
     now_ns: u64,
@@ -914,12 +916,21 @@ struct CachedClock {
 }
 
 impl CachedClock {
+    /// A clock counting from now.
     fn start() -> Self {
-        Self {
-            origin: Instant::now(),
+        Self::counting_from(Instant::now())
+    }
+
+    /// A clock counting from `origin`, an instant already past: readings
+    /// are the time since it, from the first one on.
+    pub(crate) fn counting_from(origin: Instant) -> Self {
+        let mut clock = Self {
+            origin,
             now_ns: 0,
             ticks: 0,
-        }
+        };
+        clock.refresh();
+        clock
     }
 
     /// Read the clock now.
@@ -954,7 +965,10 @@ impl CachedClock {
 /// on every one, and at the start of each blocking call; the read deadline
 /// and the stream's service step both take that cached reading. A caller
 /// that wants nanosecond timestamps for its own samples reads its own
-/// clock.
+/// clock. Over a DPDK NIC handle (the `dpdk` feature) the clock counts
+/// from the handle's own origin rather than the wrapper's creation, so the
+/// stack, whose timers outlive any one connection, sees one clock across
+/// the dial, this connection and the next.
 ///
 /// After any error the connection's framing can no longer be trusted;
 /// drop it and connect again.
@@ -1000,10 +1014,22 @@ impl<S: ByteStream> StreamConnection<S> {
     /// node that does not answer within it is [`Error::NoReply`], a refused
     /// key [`Error::AuthFailed`].
     pub fn handshake(stream: S, key: &SigningKey, timeout: Duration) -> Result<Self, Error> {
+        Self::handshake_on(stream, key, timeout, CachedClock::start())
+    }
+
+    /// [`handshake`](Self::handshake) on `clock`: the clock the stream's
+    /// service step and the read deadline will run on, from the handshake
+    /// on.
+    pub(crate) fn handshake_on(
+        stream: S,
+        key: &SigningKey,
+        timeout: Duration,
+        clock: CachedClock,
+    ) -> Result<Self, Error> {
         let mut this = Self {
             stream,
             connection: PolledConnection::with_timeout(key, timeout),
-            clock: CachedClock::start(),
+            clock,
         };
         let mut now_ns = this.clock.refresh();
         while !this.connection.is_ready() {
@@ -2170,5 +2196,20 @@ mod tests {
             assert_eq!(clock.tick(), first);
         }
         assert!(clock.tick() > first);
+    }
+
+    /// A clock on an origin already past (a NIC handle's, opened before
+    /// the connection) reads the time since that origin from its first
+    /// reading, so its readings and the origin's owner's agree.
+    #[test]
+    fn a_clock_on_an_earlier_origin_counts_from_it() {
+        let origin = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let mut clock = CachedClock::counting_from(origin);
+        let at_start = clock.tick();
+        assert!(at_start >= 5_000_000, "{at_start}");
+        let reading = clock.refresh();
+        assert!(reading >= at_start);
+        assert!(reading <= duration_ns(origin.elapsed()));
     }
 }
