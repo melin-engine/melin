@@ -1036,6 +1036,7 @@ dependencies = [
  "clap",
  "melin-app",
  "melin-client",
+ "melin-dpdk",
  "melin-journal",
  "melin-server-runtime",
  "melin-test-node",

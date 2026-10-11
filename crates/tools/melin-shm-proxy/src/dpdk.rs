@@ -23,10 +23,10 @@
 //! instead, and that is the one to get right.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 
 use clap::Args;
-use melin_dpdk::{NicConfig, NicHandle, StreamId, fmt_mac, try_parse_mac};
+use melin_dpdk::{DpdkArgsError, NicConfig, NicHandle, StreamId, fmt_mac};
 
 use crate::transport::Transport;
 use crate::tsc::{TscClock, rdtscp};
@@ -41,60 +41,48 @@ const SOCKET_BUFFER: usize = 256 * 1024;
 /// a timeout rather than a hang.
 const CONNECT_TIMEOUT_NS: u64 = 5_000_000_000;
 
-#[derive(Args)]
-pub struct DpdkArgs {
-    /// EAL arguments, space separated, passed straight to `rte_eal_init`.
-    /// The `=` is required, same as the server's flag: the value starts
-    /// with a dash, and requiring the joined form keeps a forgotten value
-    /// from silently swallowing the next flag as the EAL string.
-    #[arg(
-        long,
-        require_equals = true,
-        default_value = "--huge-dir /dev/hugepages --file-prefix shm-proxy"
-    )]
-    pub dpdk_eal_args: String,
+/// The proxy's EAL arguments when `--dpdk-eal-args` is not given (the
+/// node's flag defaults to none): a file prefix of its own, so that it
+/// can start beside a node, and the usual hugepage mount.
+const DEFAULT_EAL_ARGS: &str = "--huge-dir /dev/hugepages --file-prefix shm-proxy";
+
+/// The `--dpdk-*` flags: the node's own declaration (`melin-dpdk`), with
+/// the proxy's EAL default, and its single `--dpdk-port`, which predates
+/// the list and stays as the harness scripts use it. `--dpdk-ports`
+/// replaces it for a bond, the two conflict, and the list has no default
+/// here so that an empty one means it was not given: then the port is
+/// `--dpdk-port`'s, 0 by default.
+// `about = None`: this doc comment is not the proxy's about text.
+#[derive(Args, Debug)]
+#[command(
+    about = None,
+    long_about = None,
+    mut_arg("dpdk_eal_args", |arg| arg.default_value(DEFAULT_EAL_ARGS)),
+    mut_arg("dpdk_ports", |arg| arg.default_value(None::<&'static str>))
+)]
+pub struct ProxyDpdkArgs {
+    #[command(flatten)]
+    pub nic: melin_dpdk::DpdkArgs,
     /// DPDK port ID of the NIC to take over.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, conflicts_with = "dpdk_ports")]
     pub dpdk_port: u16,
-    /// DPDK port IDs (comma-separated), in place of `--dpdk-port`, as the
-    /// server's flag: for an LACP bond, both ports, so traffic arriving on
-    /// either member is received. The first one transmits.
-    #[arg(long, value_delimiter = ',', conflicts_with = "dpdk_port")]
-    pub dpdk_ports: Vec<u16>,
-    /// This client's IPv4 address on the DPDK interface. Must be the one
-    /// the fabric assigned to it: a VPC drops a source it does not own.
-    #[arg(long)]
-    pub dpdk_ip: Option<Ipv4Addr>,
-    #[arg(long, default_value_t = 24)]
-    pub dpdk_prefix_len: u8,
-    /// Default route, for a server outside the prefix.
-    #[arg(long)]
-    pub dpdk_gateway: Option<Ipv4Addr>,
-    /// Peer IPv4 for the bifurcated `rte_flow` steering rule, as the
-    /// server's flag: the port opens in isolated mode and only IPv4
-    /// packets from this address are delivered into DPDK; everything else
-    /// stays with the kernel netdev. For a port shared with the kernel.
-    #[arg(long)]
-    pub dpdk_peer_ip: Option<Ipv4Addr>,
-    /// The `--dpdk-gateway`'s MAC (aa:bb:cc:dd:ee:ff), for the L3 mode of a
-    /// port shared with the kernel, as the server's flag: the gateway is
-    /// seeded with it and no gratuitous ARP goes out. Required there
-    /// because the gateway's ARP reply would not match the steering rule
-    /// and would be eaten by the kernel. Source it from `ip neigh`.
-    #[arg(long, requires = "dpdk_gateway")]
-    pub dpdk_gateway_mac: Option<String>,
-    /// The server's MAC. See the module documentation for why this is
-    /// required on a fabric that assigns addresses itself.
-    #[arg(long)]
-    pub dpdk_peer_mac: Option<String>,
-    /// Must match the server's.
-    #[arg(long, default_value_t = 1500)]
-    pub dpdk_mtu: usize,
-    /// VLAN ID for hardware strip and insert, as the server's flag: for a
-    /// dedicated NIC whose VLAN tags the kernel does not handle. Not
-    /// needed on an SR-IOV VF, whose PF tags.
-    #[arg(long)]
-    pub dpdk_vlan: Option<u16>,
+}
+
+impl ProxyDpdkArgs {
+    /// The flags as the NIC handle's configuration: the node's mapping and
+    /// validation, `--dpdk-ip` required, and `--dpdk-port` as the one port
+    /// when `--dpdk-ports` is not given.
+    fn nic_config(&self) -> Result<NicConfig, DpdkArgsError> {
+        if self.nic.ports.is_empty() {
+            melin_dpdk::DpdkArgs {
+                ports: vec![self.dpdk_port],
+                ..self.nic.clone()
+            }
+            .nic_config()
+        } else {
+            self.nic.nic_config()
+        }
+    }
 }
 
 pub struct DpdkTcp {
@@ -106,49 +94,17 @@ pub struct DpdkTcp {
 
 impl DpdkTcp {
     pub fn connect(
-        args: &DpdkArgs,
+        args: &ProxyDpdkArgs,
         server: SocketAddrV4,
         clock: &TscClock,
     ) -> Result<Self, String> {
-        let local_ip = args
-            .dpdk_ip
-            .ok_or("--dpdk-ip is required with --transport dpdk")?;
-        let peer_mac = args
-            .dpdk_peer_mac
-            .as_deref()
-            .map(try_parse_mac)
-            .transpose()
-            .map_err(|e| format!("--dpdk-peer-mac: {e}"))?;
-        let gateway_mac = args
-            .dpdk_gateway_mac
-            .as_deref()
-            .map(try_parse_mac)
-            .transpose()
-            .map_err(|e| format!("--dpdk-gateway-mac: {e}"))?;
-        let port_ids = if args.dpdk_ports.is_empty() {
-            vec![args.dpdk_port]
-        } else {
-            args.dpdk_ports.clone()
-        };
-        let first_port = port_ids[0];
+        let config = args.nic_config().map_err(|e| e.to_string())?;
+        let local_ip = config.ip_addr;
+        let gateway_mac = config.gateway_mac;
+        // The mapping refuses an empty list, so there is a first port.
+        let first_port = config.port_ids[0];
 
-        let mut nic = NicHandle::open(&NicConfig {
-            eal_args: args
-                .dpdk_eal_args
-                .split_whitespace()
-                .map(String::from)
-                .collect(),
-            port_ids,
-            ip_addr: local_ip,
-            prefix_len: args.dpdk_prefix_len,
-            gateway: args.dpdk_gateway,
-            peer_ip: args.dpdk_peer_ip,
-            gateway_mac,
-            peer_mac,
-            mtu: args.dpdk_mtu,
-            vlan_id: args.dpdk_vlan,
-        })
-        .map_err(|e| e.to_string())?;
+        let mut nic = NicHandle::open(&config).map_err(|e| e.to_string())?;
         // The connect line: where the dial goes, before it goes, since a
         // wrong MAC shows only as a dial that times out.
         let next_hop = nic.next_hop(*server.ip());
@@ -198,5 +154,83 @@ impl Transport for DpdkTcp {
 
     fn name(&self) -> &'static str {
         "DPDK"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Cli;
+    use clap::{CommandFactory, Parser};
+    use std::net::Ipv4Addr;
+
+    fn parse(extra: &[&str]) -> Result<ProxyDpdkArgs, clap::Error> {
+        let mut args = vec!["shm-proxy", "--transport", "dpdk"];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).map(|cli| cli.dpdk)
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    /// The proxy's defaults, which the harness relies on: its own EAL file
+    /// prefix, and port 0 by `--dpdk-port`.
+    #[test]
+    fn the_defaults_are_the_proxy_s() {
+        let args = parse(&["--dpdk-ip", "10.0.0.2"]).unwrap();
+        assert_eq!(args.nic.eal_args, DEFAULT_EAL_ARGS);
+        assert_eq!(args.dpdk_port, 0);
+        assert!(
+            args.nic.ports.is_empty(),
+            "--dpdk-ports has no default here"
+        );
+        let config = args.nic_config().unwrap();
+        assert_eq!(
+            config.eal_args,
+            ["--huge-dir", "/dev/hugepages", "--file-prefix", "shm-proxy"]
+        );
+        assert_eq!(config.port_ids, [0]);
+        assert_eq!(config.ip_addr, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(config.prefix_len, 24);
+        assert_eq!(config.mtu, 1500);
+    }
+
+    #[test]
+    fn one_port_or_a_list_but_not_both() {
+        let one = parse(&["--dpdk-ip", "10.0.0.2", "--dpdk-port", "3"]).unwrap();
+        assert_eq!(one.nic_config().unwrap().port_ids, [3]);
+        let list = parse(&["--dpdk-ip", "10.0.0.2", "--dpdk-ports", "1,0"]).unwrap();
+        assert_eq!(list.nic_config().unwrap().port_ids, [1, 0]);
+
+        for flags in [
+            ["--dpdk-port", "1", "--dpdk-ports", "2"],
+            ["--dpdk-ports", "2", "--dpdk-port", "1"],
+        ] {
+            let error = parse(&flags).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flags:?}"
+            );
+        }
+    }
+
+    /// The node's validation and wording, `--dpdk-ip` required.
+    #[test]
+    fn the_flags_are_checked_by_the_node_s_mapping() {
+        let missing = parse(&[]).unwrap().nic_config().unwrap_err();
+        assert_eq!(missing.to_string(), "--dpdk-ip is required");
+
+        let bad = parse(&["--dpdk-ip", "10.0.0.2", "--dpdk-peer-mac", "02:99"])
+            .unwrap()
+            .nic_config()
+            .unwrap_err()
+            .to_string();
+        assert!(bad.starts_with("invalid --dpdk-peer-mac: "), "{bad}");
+
+        assert!(parse(&["--dpdk-gateway-mac", "0c:42:a1:00:00:01"]).is_err());
+        assert!(parse(&["--dpdk-eal-args", "--no-pci"]).is_err());
     }
 }

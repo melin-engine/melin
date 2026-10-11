@@ -62,7 +62,7 @@ pub struct Layout {
     /// One entry per node slot, indexed by slot. `Vec` because the runner
     /// decides the count; a handful at most, read once.
     slots: Vec<Slot>,
-    /// `u8` because that is `ServerConfig::dpdk_prefix_len`'s width, and
+    /// `u8` because that is `ServerConfig::dpdk.prefix_len`'s width, and
     /// an IPv4 prefix is at most 32.
     pub prefix_len: u8,
     pub client_ip: Ipv4Addr,

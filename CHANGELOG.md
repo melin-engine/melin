@@ -130,8 +130,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     clock, calling the handle's service step once per loop iteration.
   - Re-exported from `melin-dpdk`, so a client needs no direct dependency
     on it: `NicConfig`, the node's DPDK configuration (one field per
-    `--dpdk-*` flag; a plain struct, each binary maps its own flags onto
-    it, and the fields' documentation says why a peer MAC is required on
+    `--dpdk-*` flag; a plain struct, which the flags, `DpdkArgs` below,
+    map onto, and the fields' documentation says why a peer MAC is required on
     a fabric that assigns MACs, an AWS ENI, and why a client beside a node
     needs an EAL file prefix of its own), `NicHandle`, `NicStream`,
     `StreamId`, `NicClock`, `PeerMacSource`, `try_parse_mac` and
@@ -144,6 +144,21 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   connect lines from them, unchanged in text; a client of the handle can
   do the same rather than keep a copy. Re-exported by `melin-client`'s
   `dpdk` feature.
+- **`melin_dpdk::DpdkArgs`, the `--dpdk-*` flags declared once**, behind
+  a new `clap` feature of `melin-dpdk` (off by default; like `NicConfig`
+  it needs no libdpdk and no `dpdk-sys`). A `clap::Args` struct a binary
+  flattens into its command line, with the node's flag names, help and
+  defaults (`--dpdk-eal-args` in the joined form only, `--dpdk-ports 0`,
+  `--dpdk-prefix-len 24`, `--dpdk-mtu 1500`, the rest unset; the
+  addresses typed as IPv4), and the one mapping onto a `NicConfig`:
+  `nic_config` where `--dpdk-ip` is required, `nic_config_or` where the
+  binary has an address to assume, both validating with one wording
+  (`invalid --dpdk-peer-mac: ...` naming the flag and the value,
+  `--dpdk-ip is required`) as a `DpdkArgsError`. `--dpdk-gateway-mac`
+  requires `--dpdk-gateway`. `first_given` names the first flag set away
+  from its default, for a binary that refuses the flags on a run that
+  would ignore them. Its `Default` is an empty command line's. What an
+  operator has to know about each flag stays on `NicConfig`'s fields.
 - **`echo-client --transport dpdk` and `--core`**: the echo example's
   client measures the sequencer's latency floor over kernel bypass, in a
   build with the example's `dpdk` feature, with the node's `--dpdk-*`
@@ -196,6 +211,37 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `dpdk-sys` feature, so a binary can map its flags onto them in any
   build. The ARP frames the transport sends and injects are built by the
   new `melin_dpdk::arp` module, unchanged on the wire.
+- **`ServerConfig`'s DPDK fields moved under `ServerConfig::dpdk`**, a
+  `melin_dpdk::DpdkArgs` (re-exported as
+  `melin_server_runtime::server::DpdkArgs`), flattened into the node's
+  command line. Source-breaking for code that builds or reads a
+  `ServerConfig` by its DPDK fields: `dpdk_peer_mac` becomes
+  `dpdk.peer_mac`, likewise `dpdk.eal_args`, `dpdk.ports`, `dpdk.ip`,
+  `dpdk.prefix_len`, `dpdk.gateway`, `dpdk.peer_ip`, `dpdk.gateway_mac`,
+  `dpdk.mtu` and `dpdk.vlan`; `dpdk.ip`, `dpdk.gateway` and
+  `dpdk.peer_ip` are now `Ipv4Addr`s rather than strings, and `dpdk.ip`
+  an `Option` (the node assumes 10.0.0.1 without one, as before). A
+  struct literal ending in `..ServerConfig::default()` that sets none of
+  them, and a command line flattening `ServerConfig`, are unaffected. The
+  node's command line is unchanged in flags and defaults (its
+  `--dpdk-peer-mac` help is shorter, the full explanation now living on
+  `NicConfig::peer_mac`); a malformed
+  address is now refused by the parser rather than at startup, and
+  `--dpdk-gateway-mac` without `--dpdk-gateway`, which nothing used, is
+  refused. `melin-server-runtime` now depends on `melin-dpdk` in every
+  build, not only with `dpdk` (without `dpdk-sys` that crate needs no
+  libdpdk).
+
+  The shm-proxy and the echo client take the same flags from it, and so
+  the node's validation and error wording: a malformed MAC is reported as
+  `invalid --dpdk-peer-mac: ...` (was `--dpdk-peer-mac: ...`), and a
+  missing address as `--dpdk-ip is required` (was `... with --transport
+  dpdk`); the `error:` prefix and the exit status are unchanged. Their
+  `--dpdk-*` help is now the node's text. The proxy keeps its flag names
+  and defaults (its EAL file prefix, `--dpdk-port 0`, and `--dpdk-ports`
+  in conflict with it), its `link at` and `connected to` lines, and its
+  `--trace` report. The echo client keeps refusing a `--dpdk-*` flag on a
+  kernel run and a loopback `--server` on a DPDK one.
 - **A DPDK node's NIC setup errors name their port and pool.** A port
   that fails to configure, start or take its steering rule is reported as
   `port <id> configure: ...`, `port <id> start: ...` or `port <id>

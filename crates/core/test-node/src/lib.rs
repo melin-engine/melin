@@ -327,7 +327,7 @@ where
 /// On DPDK the node takes `addrs`' slot, which must be free (its last
 /// node stopped or joined), a `replication_bind` must be on the slot's IP,
 /// and a `replica_of` on the runner's network: the launcher fills in the
-/// primary's MAC (`dpdk_peer_mac`) from it.
+/// primary's MAC (`dpdk.peer_mac`) from it.
 pub fn start_at<A>(
     addrs: &Addrs,
     config: ServerConfig,
@@ -691,7 +691,7 @@ mod dpdk {
                  from its own IP; take the address from melin_test_node::addrs"
             );
         }
-        config.dpdk_peer_mac = config.replica_of.map(|primary| {
+        config.dpdk.peer_mac = config.replica_of.map(|primary| {
             let mac = match primary.ip() {
                 IpAddr::V4(ip) => layout.mac_of(ip),
                 IpAddr::V6(_) => None,
@@ -717,10 +717,10 @@ mod dpdk {
         config.bind = addrs.client;
         // The node shares the process-wide EAL: it takes a port, not
         // arguments.
-        config.dpdk_eal_args = String::new();
-        config.dpdk_ports = vec![port];
-        config.dpdk_ip = slot.ip.to_string();
-        config.dpdk_prefix_len = layout.prefix_len;
+        config.dpdk.eal_args = String::new();
+        config.dpdk.ports = vec![port];
+        config.dpdk.ip = Some(slot.ip);
+        config.dpdk.prefix_len = layout.prefix_len;
         // Never lock a test node's memory: see `config`.
         config.no_mlock = true;
 

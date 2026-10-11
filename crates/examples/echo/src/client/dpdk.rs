@@ -1,26 +1,24 @@
-//! The echo client over DPDK: its `--dpdk-*` flags, and the dial.
+//! The echo client over DPDK: the dial, and its `--dpdk-*` flags.
 //!
-//! The flags are the node's and the shm-proxy's, one per field of
-//! `NicConfig` (re-exported by `melin-client`), and mapped onto it field
-//! for field. What an operator has to know about each (why the peer MAC is
-//! not optional on a fabric that assigns MACs, why a client beside a node
+//! The flags are the node's own declaration, `melin-dpdk`'s `DpdkArgs`,
+//! which the client flattens into its command line, with the node's
+//! validation and mapping onto `NicConfig` (re-exported by `melin-client`).
+//! What an operator has to know about each (why the peer MAC is not
+//! optional on a fabric that assigns MACs, why a client beside a node
 //! needs an EAL file prefix of its own) is written on `NicConfig`'s
-//! fields, so the help here stays short.
-//!
-//! The ports are `--dpdk-ports`, a list, as the node's flag and the
-//! Exchange Core bench's: the field is a list (an LACP bond is two ports).
-//! The proxy's single `--dpdk-port` predates the list and is not repeated.
+//! fields. The client differs from the node in one default only: it has
+//! no address of its own to assume, so `--dpdk-ip` is required.
 //!
 //! The connection owns its NIC: the client makes one connection and exits,
 //! so EAL is initialised once and cleaned up with it.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{SocketAddr, SocketAddrV4};
 
-use clap::Args;
 use melin_client::{
     DEFAULT_TIMEOUT, DpdkStream, NicConfig, NicHandle, SigningKey, StreamConnection, fmt_mac,
-    try_parse_mac,
 };
+
+use melin_dpdk::DpdkArgs;
 
 use crate::Error;
 
@@ -34,118 +32,6 @@ use crate::Error;
 /// the connection's scratch buffer and copied, a copy of a few hundred
 /// bytes that the larger buffer would only make rarer.
 const SOCKET_BUFFER: usize = 64 * 1024;
-
-#[derive(Args)]
-pub struct DpdkArgs {
-    /// EAL arguments, space separated, passed to `rte_eal_init`. The `=`
-    /// is required, as on the node: the value starts with a dash. Without
-    /// a `--file-prefix`, the client's own (`melin-client`) is added.
-    #[arg(long, default_value = "", require_equals = true)]
-    pub dpdk_eal_args: String,
-    /// DPDK port IDs, comma separated; the first transmits. Two for an
-    /// LACP bond.
-    // A `Vec`, as the field it maps onto: ordered, one or two entries.
-    #[arg(long, default_value = "0", value_delimiter = ',')]
-    pub dpdk_ports: Vec<u16>,
-    /// This client's IPv4 address on the DPDK interface (required with
-    /// `--transport dpdk`): on a cloud fabric, the one it assigned.
-    #[arg(long)]
-    pub dpdk_ip: Option<Ipv4Addr>,
-    /// The prefix length of `--dpdk-ip`'s subnet.
-    #[arg(long, default_value_t = 24)]
-    pub dpdk_prefix_len: u8,
-    /// Default route, for a server outside the subnet.
-    #[arg(long)]
-    pub dpdk_gateway: Option<Ipv4Addr>,
-    /// Peer IPv4 for the bifurcated `rte_flow` steering rule, on a port
-    /// shared with the kernel: only this source's packets reach DPDK.
-    #[arg(long)]
-    pub dpdk_peer_ip: Option<Ipv4Addr>,
-    /// The `--dpdk-gateway`'s MAC (aa:bb:cc:dd:ee:ff), for the L3 mode of a
-    /// port shared with the kernel. Source it from `ip neigh`.
-    #[arg(long, requires = "dpdk_gateway")]
-    pub dpdk_gateway_mac: Option<String>,
-    /// The server's MAC (aa:bb:cc:dd:ee:ff). Not optional where the fabric
-    /// assigns MACs (an AWS ENI, a port shared with the kernel): without
-    /// it the SR-IOV convention is assumed, and the dial times out.
-    #[arg(long)]
-    pub dpdk_peer_mac: Option<String>,
-    /// MTU of the DPDK interface; must match the server's.
-    #[arg(long, default_value_t = 1500)]
-    pub dpdk_mtu: usize,
-    /// VLAN ID for hardware strip and insert, on a dedicated NIC. Not on an
-    /// SR-IOV VF, whose PF tags.
-    #[arg(long)]
-    pub dpdk_vlan: Option<u16>,
-}
-
-impl DpdkArgs {
-    /// The first `--dpdk-*` flag set away from its default, if any: what a
-    /// kernel run refuses, since it would ignore the flag.
-    ///
-    /// The defaults compared against are `NicConfig`'s, which the flags'
-    /// own are (the tests hold them together). A flag given at its default
-    /// value cannot be told from one not given, and changes nothing.
-    pub fn first_given(&self) -> Option<&'static str> {
-        let node = NicConfig::default();
-        let given = [
-            (
-                "--dpdk-eal-args",
-                self.dpdk_eal_args.split_whitespace().next().is_some(),
-            ),
-            ("--dpdk-ports", self.dpdk_ports != node.port_ids),
-            ("--dpdk-ip", self.dpdk_ip.is_some()),
-            ("--dpdk-prefix-len", self.dpdk_prefix_len != node.prefix_len),
-            ("--dpdk-gateway", self.dpdk_gateway.is_some()),
-            ("--dpdk-peer-ip", self.dpdk_peer_ip.is_some()),
-            ("--dpdk-gateway-mac", self.dpdk_gateway_mac.is_some()),
-            ("--dpdk-peer-mac", self.dpdk_peer_mac.is_some()),
-            ("--dpdk-mtu", self.dpdk_mtu != node.mtu),
-            ("--dpdk-vlan", self.dpdk_vlan.is_some()),
-        ];
-        given
-            .into_iter()
-            .find_map(|(flag, given)| given.then_some(flag))
-    }
-
-    /// The flags as the NIC handle's configuration, field for field.
-    ///
-    /// A struct literal, not `..Default::default()`: a field `NicConfig`
-    /// gains is a flag this client lacks, and should fail the build here.
-    fn nic_config(&self) -> Result<NicConfig, String> {
-        let ip_addr = self
-            .dpdk_ip
-            .ok_or("--dpdk-ip is required with --transport dpdk")?;
-        let gateway_mac = self
-            .dpdk_gateway_mac
-            .as_deref()
-            .map(try_parse_mac)
-            .transpose()
-            .map_err(|e| format!("--dpdk-gateway-mac: {e}"))?;
-        let peer_mac = self
-            .dpdk_peer_mac
-            .as_deref()
-            .map(try_parse_mac)
-            .transpose()
-            .map_err(|e| format!("--dpdk-peer-mac: {e}"))?;
-        Ok(NicConfig {
-            eal_args: self
-                .dpdk_eal_args
-                .split_whitespace()
-                .map(String::from)
-                .collect(),
-            port_ids: self.dpdk_ports.clone(),
-            ip_addr,
-            prefix_len: self.dpdk_prefix_len,
-            gateway: self.dpdk_gateway,
-            peer_ip: self.dpdk_peer_ip,
-            gateway_mac,
-            peer_mac,
-            mtu: self.dpdk_mtu,
-            vlan_id: self.dpdk_vlan,
-        })
-    }
-}
 
 /// The server a DPDK dial can reach: IPv4, as the transport is, and not
 /// loopback. `--server` defaults to loopback, which a kernel socket
@@ -179,7 +65,7 @@ pub fn connect(
     server: SocketAddrV4,
     key: &SigningKey,
 ) -> Result<StreamConnection<DpdkStream>, Error> {
-    let config = args.nic_config()?;
+    let config = args.nic_config().map_err(|e| e.to_string())?;
     let nic = NicHandle::open(&config).map_err(melin_client::Error::Nic)?;
     announce(&nic, &config, server);
     let connection =
@@ -219,80 +105,34 @@ mod tests {
         Cli::try_parse_from(args)
     }
 
-    /// Every flag lands on its own field, and the defaults are the node's.
+    /// The client's flags are the node's (whose mapping `melin-dpdk`
+    /// tests), flattened with no default changed: the address is required,
+    /// and the rest default as the node's do.
     #[test]
-    fn the_flags_map_onto_the_nic_config_one_to_one() {
-        let cli = parse(&[
-            "--dpdk-eal-args=--vdev=net_tap0 --no-pci --file-prefix=x",
-            "--dpdk-ports",
-            "0,1",
-            "--dpdk-ip",
-            "10.0.0.2",
-            "--dpdk-prefix-len",
-            "16",
-            "--dpdk-gateway",
-            "10.0.255.254",
-            "--dpdk-peer-ip",
-            "10.0.0.1",
-            "--dpdk-gateway-mac",
-            "0c:42:a1:00:00:01",
-            "--dpdk-peer-mac",
-            "02:99:01:00:00:01",
-            "--dpdk-mtu",
-            "9000",
-            "--dpdk-vlan",
-            "42",
-        ])
-        .unwrap();
-        let NicConfig {
-            eal_args,
-            port_ids,
-            ip_addr,
-            prefix_len,
-            gateway,
-            peer_ip,
-            gateway_mac,
-            peer_mac,
-            mtu,
-            vlan_id,
-        } = cli.dpdk.nic_config().unwrap();
-        assert_eq!(eal_args, ["--vdev=net_tap0", "--no-pci", "--file-prefix=x"]);
-        assert_eq!(port_ids, [0, 1]);
-        assert_eq!(ip_addr, Ipv4Addr::new(10, 0, 0, 2));
-        assert_eq!(prefix_len, 16);
-        assert_eq!(gateway, Some(Ipv4Addr::new(10, 0, 255, 254)));
-        assert_eq!(peer_ip, Some(Ipv4Addr::new(10, 0, 0, 1)));
-        assert_eq!(gateway_mac, Some([0x0c, 0x42, 0xa1, 0, 0, 1]));
-        assert_eq!(peer_mac, Some([0x02, 0x99, 0x01, 0, 0, 1]));
-        assert_eq!(mtu, 9000);
-        assert_eq!(vlan_id, Some(42));
+    fn the_flags_are_the_node_s_with_the_address_required() {
+        let cli = parse(&["--dpdk-ip", "10.0.0.2", "--dpdk-ports=0,1"]).unwrap();
+        let config = cli.dpdk.nic_config().unwrap();
+        assert_eq!(config.ip_addr, std::net::Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(config.port_ids, [0, 1]);
+        assert_eq!(
+            DpdkArgs {
+                ip: None,
+                ports: vec![0],
+                ..cli.dpdk
+            },
+            DpdkArgs::default()
+        );
 
-        let defaults = parse(&["--dpdk-ip", "10.0.0.2"])
-            .unwrap()
-            .dpdk
-            .nic_config()
-            .unwrap();
-        let node = NicConfig::default();
-        assert_eq!(defaults.eal_args, node.eal_args);
-        assert_eq!(defaults.port_ids, node.port_ids);
-        assert_eq!(defaults.prefix_len, node.prefix_len);
-        assert_eq!(defaults.mtu, node.mtu);
-        assert_eq!(defaults.gateway, None);
-        assert_eq!(defaults.peer_mac, None);
-        assert_eq!(defaults.vlan_id, None);
-    }
-
-    #[test]
-    fn the_address_is_required_and_the_macs_are_checked() {
         let missing = parse(&[]).unwrap().dpdk.nic_config().unwrap_err();
-        assert!(missing.contains("--dpdk-ip"), "{missing}");
+        assert_eq!(missing.to_string(), "--dpdk-ip is required");
 
         let bad = parse(&["--dpdk-ip", "10.0.0.2", "--dpdk-peer-mac", "02:99"])
             .unwrap()
             .dpdk
             .nic_config()
-            .unwrap_err();
-        assert!(bad.starts_with("--dpdk-peer-mac: "), "{bad}");
+            .unwrap_err()
+            .to_string();
+        assert!(bad.starts_with("invalid --dpdk-peer-mac: "), "{bad}");
 
         // The gateway's MAC means nothing without the gateway.
         assert!(parse(&["--dpdk-gateway-mac", "0c:42:a1:00:00:01"]).is_err());

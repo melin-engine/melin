@@ -110,7 +110,7 @@ struct Cli {
     trace: bool,
     #[cfg(feature = "dpdk")]
     #[command(flatten)]
-    dpdk: dpdk::DpdkArgs,
+    dpdk: dpdk::ProxyDpdkArgs,
 }
 
 fn main() -> ExitCode {

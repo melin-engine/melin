@@ -91,9 +91,10 @@ struct Cli {
     // `usize`: what the affinity helper takes a core as.
     #[arg(long)]
     core: Option<usize>,
+    // The node's own `--dpdk-*` flags, `--dpdk-ip` required here.
     #[cfg(feature = "dpdk")]
     #[command(flatten)]
-    dpdk: dpdk::DpdkArgs,
+    dpdk: melin_dpdk::DpdkArgs,
 }
 
 fn main() -> ExitCode {

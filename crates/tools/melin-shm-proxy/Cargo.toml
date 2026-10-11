@@ -32,8 +32,9 @@ libc = { workspace = true }
 hdrhistogram = "7"
 # The kernel-bypass transport, behind the `dpdk` feature: the client NIC
 # handle, the node's own DPDK transport dialing out. Its API is std types
-# only, so the proxy needs no TCP stack of its own.
-melin-dpdk = { workspace = true, optional = true }
+# only, so the proxy needs no TCP stack of its own. `clap` for the
+# `--dpdk-*` flags, which are the node's own declaration.
+melin-dpdk = { workspace = true, optional = true, features = ["clap"] }
 
 [dev-dependencies]
 tempfile = "3"

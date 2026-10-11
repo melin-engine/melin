@@ -39,6 +39,10 @@ melin-server-runtime = { workspace = true }
 melin-client = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The `--dpdk-*` flags of `echo-client --transport dpdk`: the node's own
+# declaration and its mapping onto `NicConfig`, rather than a copy. Only
+# with `dpdk`, like the client's DPDK transport.
+melin-dpdk = { workspace = true, optional = true, features = ["clap"] }
 
 [dev-dependencies]
 # The tests read the journal back to check what was written, the sizing
@@ -71,4 +75,4 @@ hash-chain = ["melin-server-runtime/hash-chain"]
 # To pair a DPDK client with a kernel server, build the two binaries
 # separately, as `scripts/dpdk/dpdk-client-tap-smoke.sh` does. Needs
 # libdpdk to build, so never on by default.
-dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk", "melin-client/dpdk"]
+dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk", "melin-client/dpdk", "dep:melin-dpdk"]

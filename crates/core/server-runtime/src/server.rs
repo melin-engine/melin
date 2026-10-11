@@ -49,6 +49,10 @@ use crate::layout::{DEFAULT_CORES, parse_cores};
 /// `ServerConfig::cores` is one of them and callers reach the config
 /// through this module.
 pub use crate::layout::{PipelineCores, Placement, ReaderThread};
+/// The `--dpdk-*` flags' type, from `melin-dpdk`; re-exported here because
+/// `ServerConfig::dpdk` is one, so that a caller building a config in code
+/// needs no dependency of its own on that crate.
+pub use melin_dpdk::DpdkArgs;
 
 /// How the orchestrator (main) thread waits on pipeline threads during
 /// startup — the on_primary drain and the promotion epoch bump. It is unpinned
@@ -121,11 +125,19 @@ impl From<JournalStagingMode> for melin_journal::StagingMode {
     }
 }
 
+/// The node's DPDK address when `--dpdk-ip` is not given, as the flag's
+/// default on the node's command line (a client's flag has none): the
+/// address of [`melin_dpdk::NicConfig::default`], which is what a config
+/// built in code gets (a test holds the two together). A string because
+/// that is what clap takes a default as.
+const DEFAULT_DPDK_IP: &str = "10.0.0.1";
+
 /// Server configuration, parsed from CLI arguments via clap.
 #[derive(clap::Parser)]
 #[command(
     name = "melin-server",
-    about = "A node of the Melin replicated sequencer"
+    about = "A node of the Melin replicated sequencer",
+    mut_arg("dpdk_ip", |arg| arg.default_value(DEFAULT_DPDK_IP))
 )]
 pub struct ServerConfig {
     /// Address to bind the TCP listener.
@@ -300,69 +312,12 @@ pub struct ServerConfig {
     #[arg(long, value_enum, default_value_t = crate::ack_policy::AckPolicy::DiskAndRam)]
     pub ack_policy: crate::ack_policy::AckPolicy,
 
-    // --- DPDK configuration (only used with --features dpdk) ---
-    /// DPDK EAL arguments (space-separated). Example: --dpdk-eal-args="-l 0-7 --huge-dir /dev/hugepages".
-    /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
-    /// The `=` is required: the value itself starts with a dash, and requiring
-    /// the joined form keeps a forgotten value from silently swallowing the
-    /// next flag as the EAL string.
-    #[arg(long, default_value = "", require_equals = true)]
-    pub dpdk_eal_args: String,
-
-    /// DPDK port IDs (comma-separated). For LACP bonds, pass both VF ports
-    /// (e.g., "0,1") so traffic arriving on either bond member is received.
-    #[arg(long, default_value = "0", value_delimiter = ',')]
-    pub dpdk_ports: Vec<u16>,
-
-    /// IPv4 address for the DPDK interface (e.g., "10.0.0.1").
-    #[arg(long, default_value = "10.0.0.1")]
-    pub dpdk_ip: String,
-
-    /// IPv4 prefix length for the DPDK interface. Default: 24.
-    #[arg(long, default_value_t = 24)]
-    pub dpdk_prefix_len: u8,
-
-    /// IPv4 gateway for the DPDK interface (optional, needed for cross-subnet traffic).
-    #[arg(long)]
-    pub dpdk_gateway: Option<String>,
-
-    /// Peer IPv4 used for the bifurcated `rte_flow` steering rule. When
-    /// set, the DPDK port opens in isolated mode and only IPv4 packets
-    /// sourced from this address are delivered into DPDK queue 0 —
-    /// everything else stays with the kernel netdev. Required for L3
-    /// setups that share the public NIC with the kernel (SSH, etc.).
-    #[arg(long)]
-    pub dpdk_peer_ip: Option<String>,
-
-    /// Gateway MAC (aa:bb:cc:dd:ee:ff) seeded into smoltcp for the
-    /// `--dpdk-gateway` IP. Required in L3 bifurcated mode because the
-    /// gateway's ARP reply would not match the steering rule and would
-    /// be eaten by the kernel. Source from `ip neigh` on the host.
-    #[arg(long)]
-    pub dpdk_gateway_mac: Option<String>,
-
-    /// MAC (aa:bb:cc:dd:ee:ff) of the primary named by `--replica-of`,
-    /// seeded into smoltcp so the replica's first frame is addressed
-    /// before any ARP. Required on ports that keep a real hardware MAC —
-    /// an mlx5 in bifurcated mode shares the kernel netdev's — where the
-    /// SR-IOV `02:00:<ip>` fallback is wrong and the replica would spin
-    /// on connect with no error. Read it from
-    /// `/sys/class/net/<iface>/address` on the primary, or from
-    /// `DPDK_MAC` in `/etc/melin-dpdk.conf`. Ignored on a primary, which
-    /// learns peer MACs from inbound frames.
-    #[arg(long)]
-    pub dpdk_peer_mac: Option<String>,
-
-    /// MTU for the DPDK interface. Use 9000 for jumbo frames (6x fewer TCP
-    /// segments). Requires switch and PF MTU to be set accordingly.
-    #[arg(long, default_value_t = 1500)]
-    pub dpdk_mtu: usize,
-
-    /// VLAN ID for hardware VLAN strip/insert. Required in dedicated NIC
-    /// mode (dpdk-setup-dedicated.sh) where the kernel doesn't handle VLAN
-    /// tags. Not needed for SR-IOV mode (the PF handles VLAN tagging).
-    #[arg(long)]
-    pub dpdk_vlan: Option<u16>,
+    /// The `--dpdk-*` flags (only used with --features dpdk), declared in
+    /// `melin-dpdk` for the node and its clients alike. On the node
+    /// `--dpdk-ip` defaults to 10.0.0.1, `NicConfig::default()`'s address,
+    /// where a client requires it.
+    #[command(flatten)]
+    pub dpdk: DpdkArgs,
 
     /// Address for the output event publisher. Subscribers connect here
     /// to receive a real-time stream of the application's reports, as the
@@ -525,16 +480,10 @@ impl Default for ServerConfig {
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
             ack_policy: crate::ack_policy::AckPolicy::DiskAndRam,
-            dpdk_eal_args: String::new(),
-            dpdk_peer_ip: None,
-            dpdk_gateway_mac: None,
-            dpdk_peer_mac: None,
-            dpdk_ports: vec![0],
-            dpdk_ip: "10.0.0.1".into(),
-            dpdk_prefix_len: 24,
-            dpdk_gateway: None,
-            dpdk_mtu: 1500,
-            dpdk_vlan: None,
+            dpdk: DpdkArgs {
+                ip: Some(melin_dpdk::NicConfig::default().ip_addr),
+                ..DpdkArgs::default()
+            },
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             admin_bind: None,
@@ -2361,60 +2310,23 @@ where
     )
 }
 
-/// Translate the CLI surface into a [`melin_dpdk::DpdkConfig`].
+/// Translate the CLI surface into a [`melin_dpdk::DpdkConfig`]: the NIC
+/// from the `--dpdk-*` flags, with the node's default address where
+/// `--dpdk-ip` is not given, listening on `--bind`'s port with one queue.
 ///
-/// Every operator-supplied string is validated here, before EAL init and
+/// The flags are validated by their own mapping, before EAL init and
 /// before any thread is spawned, and a bad value is returned as an error
 /// rather than a panic. That ordering is the point: the peer MAC is only
 /// consumed inside the replica's reconnect loop, so parsing it there
 /// would turn a typo into a crash of an already-running node.
 #[cfg(feature = "dpdk")]
-fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, String> {
-    let parse_ip = |value: &str, flag: &str| -> Result<std::net::Ipv4Addr, String> {
-        value
-            .parse()
-            .map_err(|e| format!("invalid {flag} address '{value}': {e}"))
-    };
-    let parse_mac = |value: &str, flag: &str| -> Result<[u8; 6], String> {
-        melin_dpdk::try_parse_mac(value).map_err(|e| format!("invalid {flag}: {e}"))
-    };
-
-    // A struct expression evaluates its fields in the order written, so
-    // this order is the order the flags are validated in: of several bad
-    // values, the first one here is the one reported.
+fn dpdk_config_from(
+    cfg: &ServerConfig,
+) -> Result<melin_dpdk::DpdkConfig, melin_dpdk::DpdkArgsError> {
     Ok(melin_dpdk::DpdkConfig {
-        nic: melin_dpdk::NicConfig {
-            eal_args: cfg
-                .dpdk_eal_args
-                .split_whitespace()
-                .map(String::from)
-                .collect(),
-            port_ids: cfg.dpdk_ports.clone(),
-            ip_addr: parse_ip(&cfg.dpdk_ip, "--dpdk-ip")?,
-            prefix_len: cfg.dpdk_prefix_len,
-            gateway: cfg
-                .dpdk_gateway
-                .as_deref()
-                .map(|s| parse_ip(s, "--dpdk-gateway"))
-                .transpose()?,
-            mtu: cfg.dpdk_mtu,
-            vlan_id: cfg.dpdk_vlan,
-            peer_ip: cfg
-                .dpdk_peer_ip
-                .as_deref()
-                .map(|s| parse_ip(s, "--dpdk-peer-ip"))
-                .transpose()?,
-            gateway_mac: cfg
-                .dpdk_gateway_mac
-                .as_deref()
-                .map(|s| parse_mac(s, "--dpdk-gateway-mac"))
-                .transpose()?,
-            peer_mac: cfg
-                .dpdk_peer_mac
-                .as_deref()
-                .map(|s| parse_mac(s, "--dpdk-peer-mac"))
-                .transpose()?,
-        },
+        nic: cfg
+            .dpdk
+            .nic_config_or(melin_dpdk::NicConfig::default().ip_addr)?,
         listen_port: cfg.bind.port(),
         num_queues: 1,
     })
@@ -4185,23 +4097,34 @@ mod tests {
     use super::authenticate_connection;
     use super::{BootstrapSource, choose_bootstrap};
 
-    /// `--dpdk-eal-args` takes its value only in the joined form. The
-    /// value itself starts with a dash, and the space form let a
-    /// forgotten value silently swallow the next flag as the EAL
-    /// string; both mistakes must be startup errors instead.
+    /// The node's `--dpdk-*` flags are `melin-dpdk`'s (whose tests cover
+    /// their mapping), with the node's own default address, 10.0.0.1:
+    /// `NicConfig::default()`'s, and the one `ServerConfig::default()`
+    /// has, so a node built in code and one started bare agree. The
+    /// joined-form rule for `--dpdk-eal-args` holds on the node's command
+    /// line, where `--no-mlock` is the flag a forgotten value would
+    /// swallow.
     #[test]
-    fn dpdk_eal_args_requires_the_joined_form() {
+    fn the_dpdk_flags_are_the_shared_ones_with_the_node_default_address() {
         use clap::Parser;
-        let cfg = super::ServerConfig::try_parse_from([
-            "melin-server",
-            "--dpdk-eal-args=-l 0-7 --huge-dir /dev/hugepages",
-        ])
-        .expect("joined form must parse");
-        assert_eq!(cfg.dpdk_eal_args, "-l 0-7 --huge-dir /dev/hugepages");
+        use std::net::Ipv4Addr;
+        let parsed = super::ServerConfig::try_parse_from(["melin-server"]).expect("parses");
+        let address: Ipv4Addr = super::DEFAULT_DPDK_IP.parse().expect("an IPv4 address");
+        assert_eq!(address, melin_dpdk::NicConfig::default().ip_addr);
+        assert_eq!(parsed.dpdk.ip, Some(address));
+        assert_eq!(parsed.dpdk, super::ServerConfig::default().dpdk);
+        assert_eq!(
+            super::DpdkArgs {
+                ip: None,
+                ..parsed.dpdk
+            },
+            super::DpdkArgs::default(),
+            "only the address default is the node's own"
+        );
 
-        let space_form =
-            super::ServerConfig::try_parse_from(["melin-server", "--dpdk-eal-args", "-l 0-7"]);
-        assert!(space_form.is_err(), "space-separated form must be rejected");
+        let given = super::ServerConfig::try_parse_from(["melin-server", "--dpdk-ip", "10.0.0.7"])
+            .expect("parses");
+        assert_eq!(given.dpdk.ip, Some(Ipv4Addr::new(10, 0, 0, 7)));
 
         let forgotten_value =
             super::ServerConfig::try_parse_from(["melin-server", "--dpdk-eal-args", "--no-mlock"]);
@@ -5147,23 +5070,50 @@ mod genesis_tests {
     }
 }
 
-/// Startup-time validation of the DPDK CLI surface.
+/// The node's DPDK configuration as composed from its own: the flags'
+/// mapping (tested with them, in `melin-dpdk`) plus the node's default
+/// address, `--bind`'s port and one queue.
 ///
-/// The value these pin is *when* a bad flag is caught. `--dpdk-peer-mac`
-/// is consumed inside the replica's reconnect loop, so the failure has to
-/// surface here — during config translation, before EAL init and before
-/// any thread exists — rather than as a panic in a node that is already
-/// serving.
+/// The value the error cases pin is *when* a bad flag is caught.
+/// `--dpdk-peer-mac` is consumed inside the replica's reconnect loop, so
+/// the failure has to surface here — during config translation, before
+/// EAL init and before any thread exists — rather than as a panic in a
+/// node that is already serving.
 #[cfg(all(test, feature = "dpdk"))]
 mod dpdk_config_tests {
-    use super::{ServerConfig, dpdk_config_from};
+    use super::{DpdkArgs, ServerConfig, dpdk_config_from};
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn the_node_listens_on_its_bind_port_with_one_queue() {
+        let cfg = ServerConfig {
+            bind: "127.0.0.1:9999".parse().expect("an address"),
+            ..Default::default()
+        };
+        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        assert_eq!(dpdk.listen_port, 9999);
+        assert_eq!(dpdk.num_queues, 1);
+        assert_eq!(dpdk.nic.ip_addr, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(dpdk.nic.peer_mac, None);
+    }
+
+    /// A config built in code with no address at all (not even the one
+    /// `ServerConfig::default()` carries) still gets the node's.
+    #[test]
+    fn the_address_defaults_to_the_node_s() {
+        let cfg = ServerConfig {
+            dpdk: DpdkArgs::default(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.dpdk.ip, None);
+        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        assert_eq!(dpdk.nic.ip_addr, Ipv4Addr::new(10, 0, 0, 1));
+    }
 
     #[test]
     fn a_supplied_peer_mac_reaches_the_transport_config() {
-        let cfg = ServerConfig {
-            dpdk_peer_mac: Some("0c:42:a1:5b:2e:80".into()),
-            ..Default::default()
-        };
+        let mut cfg = ServerConfig::default();
+        cfg.dpdk.peer_mac = Some("0c:42:a1:5b:2e:80".into());
         let dpdk = dpdk_config_from(&cfg).expect("valid config");
         assert_eq!(
             dpdk.nic.peer_mac,
@@ -5172,55 +5122,12 @@ mod dpdk_config_tests {
     }
 
     #[test]
-    fn an_absent_peer_mac_leaves_the_transport_to_derive_one() {
-        let cfg = ServerConfig::default();
-        let dpdk = dpdk_config_from(&cfg).expect("valid config");
-        assert_eq!(dpdk.nic.peer_mac, None);
-    }
-
-    #[test]
     fn a_malformed_peer_mac_fails_config_translation() {
-        let cfg = ServerConfig {
-            dpdk_peer_mac: Some("0c:42:a1:5b:2e".into()),
-            ..Default::default()
-        };
-        let err = dpdk_config_from(&cfg).expect_err("a 5-octet MAC must be rejected");
-        assert!(err.contains("--dpdk-peer-mac"), "{err}");
-    }
-
-    #[test]
-    fn a_malformed_gateway_mac_fails_config_translation() {
-        // The same guarantee for the pre-existing flag, which used to
-        // panic out of this function.
-        let cfg = ServerConfig {
-            dpdk_gateway_mac: Some("not-a-mac".into()),
-            ..Default::default()
-        };
-        let err = dpdk_config_from(&cfg).expect_err("a non-MAC must be rejected");
-        assert!(err.contains("--dpdk-gateway-mac"), "{err}");
-    }
-
-    #[test]
-    fn a_malformed_ip_names_the_flag_it_came_from() {
-        let cfg = ServerConfig {
-            dpdk_peer_ip: Some("10.0.0".into()),
-            ..Default::default()
-        };
-        let err = dpdk_config_from(&cfg).expect_err("a truncated IPv4 must be rejected");
-        assert!(err.contains("--dpdk-peer-ip"), "{err}");
-    }
-
-    #[test]
-    fn a_valid_configuration_translates() {
-        let cfg = ServerConfig {
-            dpdk_gateway: Some("10.0.0.254".into()),
-            dpdk_gateway_mac: Some("0c:42:a1:5b:2e:80".into()),
-            ..Default::default()
-        };
-        let dpdk = dpdk_config_from(&cfg).expect("valid config");
-        assert_eq!(
-            dpdk.nic.gateway_mac,
-            Some([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80])
-        );
+        let mut cfg = ServerConfig::default();
+        cfg.dpdk.peer_mac = Some("0c:42:a1:5b:2e".into());
+        let err = dpdk_config_from(&cfg)
+            .expect_err("a 5-octet MAC must be rejected")
+            .to_string();
+        assert!(err.starts_with("invalid --dpdk-peer-mac: "), "{err}");
     }
 }

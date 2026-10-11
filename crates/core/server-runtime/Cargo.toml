@@ -33,7 +33,7 @@ io-uring = []
 ## dependent's build never sees it) then run on the network
 ## `scripts/dpdk/netns-runner.sh` builds, and must be run under it (see
 ## `docs/internal/dpdk-testing.md`).
-dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "melin-test-node/dpdk"]
+dpdk = ["melin-dpdk/dpdk-sys", "melin-test-node/dpdk"]
 pipeline-stats = ["melin-transport-core/pipeline-stats"]
 ## Tamper-evident BLAKE3 journal chain and the cross-node divergence
 ## checks built on it (handshake, rotation boundary, periodic ChainCheck).
@@ -72,7 +72,12 @@ rand = { workspace = true }
 rustc-hash = "2"
 tracing = { workspace = true }
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-dpdk = { workspace = true, optional = true }
+# In every build, not only with `dpdk`: `ServerConfig` flattens the
+# `--dpdk-*` flags from it (`clap`), and the node's command line is the
+# same whichever transport it was built with. Without `dpdk-sys` the
+# crate is plain data and needs no libdpdk; the `dpdk` feature adds the
+# transport.
+melin-dpdk = { workspace = true, features = ["clap"] }
 
 [dev-dependencies]
 # The runtime's library API is application-agnostic. Tests that need a
