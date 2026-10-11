@@ -23,9 +23,10 @@ const LISTEN_PORT: u16 = 9876;
 /// `--dpdk-ports`, `--dpdk-ip`, `--dpdk-prefix-len`, `--dpdk-gateway`,
 /// `--dpdk-peer-ip`, `--dpdk-gateway-mac`, `--dpdk-peer-mac`,
 /// `--dpdk-mtu`, `--dpdk-vlan`). A plain struct rather than a command-line
-/// one: each binary declares its own flags and maps them onto it, and what
-/// an operator has to know about a field is written here, once, so the
-/// flags' help can stay short.
+/// one: the flags are declared once, apart from it (`DpdkArgs`, under this
+/// crate's `clap` feature), and mapped onto it; what an operator has to
+/// know about a field is written here, once, so the flags' help can stay
+/// short.
 #[derive(Clone, Debug)]
 pub struct NicConfig {
     /// Arguments passed to `rte_eal_init`, one per element (`--dpdk-eal-args`,

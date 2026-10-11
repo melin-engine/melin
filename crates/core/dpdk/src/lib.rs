@@ -25,6 +25,12 @@
 //! policies tested on any host ([`rx_checksum`], [`peer_liveness`]). A
 //! binary maps its flags onto the configuration in any build, and the
 //! crate lives in the workspace without requiring system dependencies.
+//!
+//! The `clap` feature, independent of `dpdk-sys` and also needing no
+//! libdpdk, adds `DpdkArgs`: the `--dpdk-*` flags as one clap argument
+//! group, which the node, the shm-proxy and the echo client flatten into
+//! their command lines, and its mapping onto a [`NicConfig`] with the one
+//! validation of them.
 
 // Ungated: MAC parsing and the peer-MAC convention are pure logic with
 // no libdpdk dependency, and operators configure them through the same
@@ -51,6 +57,12 @@ pub mod arp;
 // or not this build has the transport compiled in.
 mod config;
 pub use config::{DpdkConfig, NicConfig};
+// Ungated by `dpdk-sys` for the same reason, behind `clap` only: the flags
+// mapped onto that configuration, declared once for every binary.
+#[cfg(feature = "clap")]
+mod args;
+#[cfg(feature = "clap")]
+pub use args::{DpdkArgs, DpdkArgsError};
 // Ungated for the same reason as `peer_liveness`: the client NIC handle's
 // clock, local ports, dial wait and stream I/O are TCP-stack logic, tested
 // over an in-memory wire. The handle itself is in the gated `dpdk` module.

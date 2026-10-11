@@ -143,6 +143,15 @@ jobs:
       - name: no-persist builds (server-runtime)
         run: cargo check -p melin-server-runtime --all-targets --features no-persist --locked
 
+      # `melin-dpdk` on its own. With no feature, it must build without
+      # libdpdk and without clap. With `clap`, its flag declaration's tests:
+      # the Tests step below runs them too, but only because a dependent
+      # happens to turn the feature on, and this does not depend on that.
+      - name: melin-dpdk without libdpdk
+        run: |
+          cargo check -p melin-dpdk --all-targets --locked
+          cargo test -q -p melin-dpdk --features clap --lib --locked
+
       # `--no-fail-fast` so one flaky cluster test cannot hide the verdict on
       # the rest of the suite. Costs nothing when the suite is green.
       - name: Tests
@@ -260,7 +269,9 @@ jobs:
       # feature being the switch. The echo and counter round trips include
       # a client on DPDK too, on the runner's client pair, so their
       # features turn on `melin-client/dpdk`; the client's own suite runs
-      # here with it, built as a DPDK client links it.
+      # here with it, built as a DPDK client links it. The shm-proxy's too,
+      # whose `--dpdk-*` flags (the node's, with its own defaults and its
+      # `--dpdk-port`) exist only with its `dpdk` feature.
       #
       # Runs whatever the runtime suites did, so one cannot hide the other,
       # but not where the build check failed: it would only fail again.
@@ -268,7 +279,7 @@ jobs:
         if: ${{ !cancelled() && steps.dpdk-builds.outcome == 'success' }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/dpdk/netns-runner.sh
-        run: cargo nextest run --profile dpdk -p melin-client -p melin-example-echo -p melin-example-counter -p melin-example-notary --features melin-client/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk --no-fail-fast --locked
+        run: cargo nextest run --profile dpdk -p melin-client -p melin-example-echo -p melin-example-counter -p melin-example-notary -p melin-shm-proxy --features melin-client/dpdk,melin-example-echo/dpdk,melin-example-counter/dpdk,melin-example-notary/dpdk,melin-shm-proxy/dpdk --no-fail-fast --locked
 
       # nextest runs no doctests, and the client's DPDK binding documents
       # its multi-stream loop with an example that only a doctest build
