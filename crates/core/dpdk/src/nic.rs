@@ -16,7 +16,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use smoltcp::socket::tcp;
 
-use crate::mac::{MacAddr, PeerMacSource};
+use crate::mac::{MacAddr, PeerMacSource, fmt_mac};
 
 /// The file prefix a client's EAL takes when its arguments name none.
 ///
@@ -265,10 +265,16 @@ pub(crate) fn wait_for_dial(
     }
 }
 
-/// The MAC a dial's first frame is addressed to, as the error for a
-/// timed-out dial names it.
+/// Where a dial's first frame goes: the MAC it is addressed to, and where
+/// that MAC came from. The error for a timed-out dial names it, and a
+/// binary shows it before dialing (`NicHandle::next_hop`), since a wrong
+/// MAC is silent until the dial times out.
+///
+/// `Display` renders it for a line of the form `server <addr> {next_hop}`:
+/// `at <mac> (supplied)`, `at <mac> (derived from the IP by the SR-IOV
+/// convention)`, or `via gateway <ip> at <mac> (supplied)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NextHop {
+pub enum NextHop {
     /// The peer itself, seeded from a supplied MAC or derived by the
     /// SR-IOV convention.
     Peer { mac: MacAddr, source: PeerMacSource },
@@ -276,10 +282,49 @@ pub(crate) enum NextHop {
     Gateway { ip: Ipv4Addr, mac: MacAddr },
 }
 
-/// `aa:bb:cc:dd:ee:ff`.
-pub(crate) fn fmt_mac(mac: MacAddr) -> String {
-    let [a, b, c, d, e, f] = mac;
-    format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
+impl NextHop {
+    /// The warning to print beside a next hop whose MAC was derived rather
+    /// than given, without its `warning: ` prefix: on a fabric that
+    /// assigns MACs itself the derived one belongs to nobody, and the only
+    /// symptom is a dial that times out. `None` when the MAC was supplied.
+    pub fn warning(&self) -> Option<&'static str> {
+        match self {
+            NextHop::Peer {
+                source: PeerMacSource::DerivedSrIov,
+                ..
+            } => Some(
+                "no --dpdk-peer-mac; on a fabric that assigns MACs itself (an AWS ENI) the \
+                 derived address is wrong and the connect below will time out",
+            ),
+            NextHop::Peer {
+                source: PeerMacSource::Supplied,
+                ..
+            }
+            | NextHop::Gateway { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for NextHop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NextHop::Peer {
+                mac,
+                source: PeerMacSource::Supplied,
+            } => write!(f, "at {} (supplied)", fmt_mac(*mac)),
+            NextHop::Peer {
+                mac,
+                source: PeerMacSource::DerivedSrIov,
+            } => write!(
+                f,
+                "at {} (derived from the IP by the SR-IOV convention)",
+                fmt_mac(*mac)
+            ),
+            NextHop::Gateway { ip, mac } => {
+                write!(f, "via gateway {ip} at {} (supplied)", fmt_mac(*mac))
+            }
+        }
+    }
 }
 
 /// The error for a failed dial: [`io::ErrorKind::TimedOut`] or
@@ -675,6 +720,45 @@ mod tests {
         let err = dial_error(peer(), DialFailure::Refused, next_hop);
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
         assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    /// The next hop prints as the binaries' connect line has always said
+    /// it, and warns only when the MAC was derived.
+    #[test]
+    fn the_next_hop_reads_as_the_connect_line_says() {
+        let mac = [0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80];
+        let supplied = NextHop::Peer {
+            mac,
+            source: PeerMacSource::Supplied,
+        };
+        assert_eq!(supplied.to_string(), "at 0c:42:a1:5b:2e:80 (supplied)");
+        assert_eq!(supplied.warning(), None);
+
+        let derived = NextHop::Peer {
+            mac,
+            source: PeerMacSource::DerivedSrIov,
+        };
+        assert_eq!(
+            derived.to_string(),
+            "at 0c:42:a1:5b:2e:80 (derived from the IP by the SR-IOV convention)"
+        );
+        assert!(
+            derived
+                .warning()
+                .is_some_and(|w| w.starts_with("no --dpdk-peer-mac;")),
+            "{:?}",
+            derived.warning()
+        );
+
+        let gateway = NextHop::Gateway {
+            ip: Ipv4Addr::new(10, 0, 0, 254),
+            mac,
+        };
+        assert_eq!(
+            gateway.to_string(),
+            "via gateway 10.0.0.254 at 0c:42:a1:5b:2e:80 (supplied)"
+        );
+        assert_eq!(gateway.warning(), None);
     }
 
     // --- Streams over a wire --------------------------------------------------

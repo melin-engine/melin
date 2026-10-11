@@ -149,8 +149,12 @@ pub struct DpdkStream<H: BorrowMut<NicHandle> = NicHandle> {
     nic: H,
     /// The stream's id, `Some` for as long as the stream is open: taken
     /// only by `Drop`, since closing a stream consumes its id. An `Option`
-    /// rather than the bare id for that reason alone.
+    /// rather than the bare id for that reason alone; a view asked for
+    /// after the take, which nothing does, is an error, not a panic.
     id: Option<StreamId>,
+    /// The id's peer and local port, copied out so neither needs the id.
+    peer: SocketAddrV4,
+    local_port: u16,
 }
 
 impl<H: BorrowMut<NicHandle>> DpdkStream<H> {
@@ -162,29 +166,23 @@ impl<H: BorrowMut<NicHandle>> DpdkStream<H> {
 
     /// The node this stream is connected to.
     pub fn peer(&self) -> SocketAddrV4 {
-        self.id().peer()
+        self.peer
     }
 
     /// The local port this stream was dialed from.
     pub fn local_port(&self) -> u16 {
-        self.id().local_port()
-    }
-
-    fn id(&self) -> &StreamId {
-        self.id
-            .as_ref()
-            .expect("a DpdkStream's id is taken only when it is dropped")
+        self.local_port
     }
 
     /// The stream's view, for one call.
     #[inline]
-    fn view(&mut self) -> NicStream<'_> {
+    fn view(&mut self) -> io::Result<NicStream<'_>> {
         let id = self
             .id
             .as_ref()
-            .expect("a DpdkStream's id is taken only when it is dropped");
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the DPDK stream is closed"))?;
         let nic: &mut NicHandle = self.nic.borrow_mut();
-        nic.stream(id)
+        Ok(nic.stream(id))
     }
 }
 
@@ -199,19 +197,18 @@ impl<H: BorrowMut<NicHandle>> Drop for DpdkStream<H> {
 
 impl<H: BorrowMut<NicHandle>> fmt::Debug for DpdkStream<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("DpdkStream");
-        if let Some(id) = &self.id {
-            s.field("peer", &id.peer())
-                .field("local_port", &id.local_port());
-        }
-        s.finish_non_exhaustive()
+        f.debug_struct("DpdkStream")
+            .field("peer", &self.peer)
+            .field("local_port", &self.local_port)
+            .field("open", &self.id.is_some())
+            .finish_non_exhaustive()
     }
 }
 
 impl<H: BorrowMut<NicHandle>> ByteStream for DpdkStream<H> {
     #[inline]
     fn send(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.view().send(data)
+        self.view()?.send(data)
     }
 
     /// The handle's service step: every stream on the handle advances, not
@@ -224,12 +221,12 @@ impl<H: BorrowMut<NicHandle>> ByteStream for DpdkStream<H> {
 
     #[inline]
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.view().recv(buf)
+        self.view()?.recv(buf)
     }
 
     #[inline]
     fn send_in_place(&mut self, fill: impl FnOnce(&mut [u8]) -> usize) -> io::Result<usize> {
-        self.view().send_in_place(fill)
+        self.view()?.send_in_place(fill)
     }
 }
 
@@ -331,7 +328,12 @@ impl<H: BorrowMut<NicHandle>> StreamConnection<DpdkStream<H>> {
                 addr: SocketAddr::V4(addr),
                 source,
             })?;
-        let stream = DpdkStream { nic, id: Some(id) };
+        let stream = DpdkStream {
+            peer: id.peer(),
+            local_port: id.local_port(),
+            nic,
+            id: Some(id),
+        };
         Self::handshake_on(
             stream,
             key,

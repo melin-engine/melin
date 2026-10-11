@@ -26,7 +26,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use clap::Args;
-use melin_dpdk::{NicConfig, NicHandle, PeerMacSource, StreamId, try_parse_mac};
+use melin_dpdk::{NicConfig, NicHandle, StreamId, fmt_mac, try_parse_mac};
 
 use crate::transport::Transport;
 use crate::tsc::{TscClock, rdtscp};
@@ -149,33 +149,15 @@ impl DpdkTcp {
             vlan_id: args.dpdk_vlan,
         })
         .map_err(|e| e.to_string())?;
-        let mac = nic.mac();
-
-        match args.dpdk_gateway.zip(gateway_mac) {
-            Some((gateway, gateway_mac)) => eprintln!(
-                "DPDK: port {first_port} as {local_ip} ({}), server {server} via gateway \
-                 {gateway} at {} (supplied)",
-                fmt_mac(mac),
-                fmt_mac(gateway_mac)
-            ),
-            None => {
-                let (server_mac, source) = nic.peer_mac(*server.ip());
-                let source = match source {
-                    PeerMacSource::Supplied => "supplied",
-                    PeerMacSource::DerivedSrIov => "derived from the IP by the SR-IOV convention",
-                };
-                eprintln!(
-                    "DPDK: port {first_port} as {local_ip} ({}), server {server} at {} ({source})",
-                    fmt_mac(mac),
-                    fmt_mac(server_mac)
-                );
-                if peer_mac.is_none() {
-                    eprintln!(
-                        "warning: no --dpdk-peer-mac; on a fabric that assigns MACs itself (an AWS \
-                         ENI) the derived address is wrong and the connect below will time out"
-                    );
-                }
-            }
+        // The connect line: where the dial goes, before it goes, since a
+        // wrong MAC shows only as a dial that times out.
+        let next_hop = nic.next_hop(*server.ip());
+        eprintln!(
+            "DPDK: port {first_port} as {local_ip} ({}), server {server} {next_hop}",
+            fmt_mac(nic.mac())
+        );
+        if let Some(warning) = next_hop.warning() {
+            eprintln!("warning: {warning}");
         }
 
         // The loop's clock drives the stack from the first SYN on.
@@ -196,13 +178,6 @@ impl DpdkTcp {
             })?;
         Ok(Self { stream, nic })
     }
-}
-
-fn fmt_mac(mac: [u8; 6]) -> String {
-    mac.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
 }
 
 impl Transport for DpdkTcp {

@@ -30,7 +30,9 @@
 // no libdpdk dependency, and operators configure them through the same
 // CLI whether or not this build has the transport compiled in.
 pub mod mac;
-pub use mac::{MacAddr, MacParseError, PeerMacSource, parse_mac, resolve_peer_mac, try_parse_mac};
+pub use mac::{
+    MacAddr, MacParseError, PeerMacSource, fmt_mac, parse_mac, resolve_peer_mac, try_parse_mac,
+};
 // Ungated for the same reason: which received frames may reach the TCP
 // stack is decided from offload flags and frame bytes alone, so the
 // policy is tested on any host, with or without libdpdk.

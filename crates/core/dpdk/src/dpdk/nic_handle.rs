@@ -27,11 +27,11 @@ use crate::config::{DpdkConfig, NicConfig};
 use crate::eal::Eal;
 use crate::mac::{MacAddr, PeerMacSource, resolve_peer_mac};
 use crate::nic::{
-    self, DialProgress, LocalPorts, NextHop, StackTime, dial_error, dial_progress, wait_for_dial,
+    self, DialProgress, LocalPorts, StackTime, dial_error, dial_progress, wait_for_dial,
 };
 use crate::transport::{DpdkShared, DpdkTransport, MAX_CONNECTIONS, NodeEal};
 
-pub use crate::nic::NicClock;
+pub use crate::nic::{NextHop, NicClock};
 
 /// Tells handles apart, so that a [`StreamId`] is only honoured by the
 /// handle that dialed it. `u64`: one per handle opened in the process,
@@ -200,9 +200,24 @@ impl NicHandle {
     /// came from: the configured peer MAC, or the SR-IOV convention. A
     /// wrong one is silent until a dial times out, so it is worth showing
     /// before the dial. In L3 mode a dial goes through the gateway's MAC
-    /// instead, and this is not used.
+    /// instead, and this is not used; [`Self::next_hop`] covers both.
     pub fn peer_mac(&self, peer: Ipv4Addr) -> ([u8; 6], PeerMacSource) {
         resolve_peer_mac(self.peer_mac, peer)
+    }
+
+    /// Where a dial to `peer` sends its first frame: the gateway's MAC in
+    /// L3 mode, the peer's otherwise, with where it came from. What a
+    /// binary prints before dialing, with [`NextHop`]'s `Display` and
+    /// [`NextHop::warning`], so a wrong MAC is on the screen when the dial
+    /// times out on it.
+    pub fn next_hop(&self, peer: Ipv4Addr) -> NextHop {
+        match self.gateway {
+            Some((ip, mac)) => NextHop::Gateway { ip, mac },
+            None => {
+                let (mac, source) = resolve_peer_mac(self.peer_mac, peer);
+                NextHop::Peer { mac, source }
+            }
+        }
     }
 
     /// A clock for a caller with none of its own: nanoseconds since the
@@ -276,16 +291,13 @@ impl NicHandle {
                 )
             })?;
 
-        let next_hop = match self.gateway {
-            Some((ip, mac)) => NextHop::Gateway { ip, mac },
-            None => {
-                // Re-seeded on every dial, so an expired neighbour entry
-                // cannot strand a reconnect.
-                let (mac, source) = resolve_peer_mac(self.peer_mac, *peer.ip());
-                self.transport.seed_neighbor(*peer.ip(), mac);
-                NextHop::Peer { mac, source }
-            }
-        };
+        let next_hop = self.next_hop(*peer.ip());
+        if let NextHop::Peer { mac, .. } = next_hop {
+            // Re-seeded on every dial, so an expired neighbour entry
+            // cannot strand a reconnect. (The gateway is seeded by the
+            // transport on its own interval.)
+            self.transport.seed_neighbor(*peer.ip(), mac);
+        }
         // Drain the injected ARP reply through the stack before the SYN is
         // built: from an empty cache the stack would ARP for the server, on
         // a port where the reply never arrives, and the SYN would wait on it.

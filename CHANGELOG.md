@@ -136,6 +136,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     needs an EAL file prefix of its own), `NicHandle`, `NicStream`,
     `StreamId`, `NicClock`, `PeerMacSource`, `try_parse_mac` and
     `MacParseError`.
+- **`melin_dpdk::fmt_mac`, `NextHop` and `NicHandle::next_hop`**: a MAC as
+  `aa:bb:cc:dd:ee:ff`, and where a dial's first frame goes (the server's
+  MAC or the gateway's, with where it came from) as one value with a
+  `Display` for a connect line and a `warning` for a MAC that was derived
+  rather than given. The shm-proxy and the echo client print their
+  connect lines from them, unchanged in text; a client of the handle can
+  do the same rather than keep a copy. Re-exported by `melin-client`'s
+  `dpdk` feature.
 - **`echo-client --transport dpdk` and `--core`**: the echo example's
   client measures the sequencer's latency floor over kernel bypass, in a
   build with the example's `dpdk` feature, with the node's `--dpdk-*`

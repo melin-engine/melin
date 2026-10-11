@@ -165,9 +165,26 @@ pub fn resolve_peer_mac(supplied: Option<MacAddr>, peer_ip: Ipv4Addr) -> (MacAdd
     }
 }
 
+/// `mac` as `aa:bb:cc:dd:ee:ff`: the form the flags take a MAC in, and the
+/// one every log line and error names it by.
+pub fn fmt_mac(mac: MacAddr) -> String {
+    let [a, b, c, d, e, f] = mac;
+    format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mac_prints_as_colon_separated_hex() {
+        assert_eq!(fmt_mac([0x02, 0x99, 0x01, 0, 0, 0xff]), "02:99:01:00:00:ff");
+        // Round trip with the parser, in the parser's lower case.
+        assert_eq!(
+            try_parse_mac(&fmt_mac([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80])),
+            Ok([0x0c, 0x42, 0xa1, 0x5b, 0x2e, 0x80])
+        );
+    }
 
     #[test]
     fn parses_a_lower_case_mac() {

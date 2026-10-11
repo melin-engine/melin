@@ -610,52 +610,28 @@ impl PolledConnection {
         F: FnOnce(&mut [u8]) -> Result<usize, E>,
     {
         let needed = REQUEST_HEADER_LEN + max_body.min(MAX_REQUEST_BODY);
-        // Taken by whichever of the two buffers frames the request.
-        let mut encode = Some(encode);
         // Whatever is queued goes first: requests leave in order.
         self.flush(stream)?;
-        if self.is_ready() && self.tx_head == self.tx.len() {
-            let mut framed: Option<Result<usize, E>> = None;
-            let queued = stream
-                .send_in_place(|region| {
-                    if region.len() < needed {
-                        // Short of what the encoder was promised: the
-                        // scratch buffer frames it instead.
-                        return 0;
-                    }
-                    let Some(encode) = encode.take() else {
-                        return 0;
-                    };
-                    let outcome = frame_request(region, encode);
-                    // Nothing is written on an error, which is returned
-                    // below as it is.
-                    let written = match &outcome {
-                        Ok(written) => *written,
-                        Err(_) => 0,
-                    };
-                    framed = Some(outcome);
-                    written
-                })
-                .map_err(Error::Io)?;
-            match framed {
-                Some(Ok(written)) if queued == written => {
+        let encode = if self.is_ready() && self.tx_head == self.tx.len() {
+            match frame_in_place(stream, needed, encode).map_err(Error::Io)? {
+                InPlace::Framed(Ok(written), queued) if queued == written => {
                     self.request_sent(now_ns);
                     return Ok(());
                 }
-                Some(Ok(written)) => {
+                InPlace::Framed(Ok(written), queued) => {
                     return Err(Error::Io(io::Error::other(format!(
                         "the stream queued {queued} of the {written} bytes framed in place"
                     )))
                     .into());
                 }
-                Some(Err(e)) => return Err(e),
-                // No room lent, or too little of it.
-                None => {}
+                InPlace::Framed(Err(e), _) => return Err(e),
+                // No room lent, or too little of it: the scratch buffer
+                // frames the request instead.
+                InPlace::NotTaken(encode) => encode,
             }
-        }
-        let encode = encode
-            .take()
-            .expect("the in-place step returned above if it took the encoder");
+        } else {
+            encode
+        };
         self.frame_in_scratch(encode)?;
         self.request_sent(now_ns);
         self.flush(stream)?;
@@ -868,6 +844,62 @@ impl PolledConnection {
             self.rx.resize(self.rx_tail + wanted, 0);
         }
     }
+}
+
+/// What the in-place step did with the encoder it was handed.
+enum InPlace<E, F> {
+    /// The request was framed in the lent region: the encoder's outcome,
+    /// and how many bytes the stream queued.
+    Framed(Result<usize, E>, usize),
+    /// No region was lent, or one too short for what the encoder was
+    /// promised: the encoder, untouched, for the scratch buffer.
+    NotTaken(F),
+}
+
+/// The encoder as the in-place step holds it: the step's closure may not
+/// run at all, and an encoder moved into a closure that never runs is
+/// lost, so the closure borrows this slot and swaps the encoder for its
+/// outcome in one move. Two states, no third: after the step the slot
+/// holds exactly one of them.
+enum EncoderSlot<E, F> {
+    Encoder(F),
+    Framed(Result<usize, E>),
+}
+
+/// Frame a request through `stream`'s in-place send, when the region it
+/// lends holds `needed` bytes. Never frames into a shorter region, so the
+/// encoder sees the room it was promised and runs at most once.
+fn frame_in_place<S, E, F>(stream: &mut S, needed: usize, encode: F) -> io::Result<InPlace<E, F>>
+where
+    S: ByteStream,
+    E: From<RequestFrameError>,
+    F: FnOnce(&mut [u8]) -> Result<usize, E>,
+{
+    let mut slot = EncoderSlot::Encoder(encode);
+    let queued = stream.send_in_place(|region| {
+        if region.len() < needed {
+            return 0;
+        }
+        // The placeholder is overwritten below before the closure returns;
+        // the `else` is the closure running twice, which the step's
+        // `FnOnce` contract rules out.
+        let EncoderSlot::Encoder(encode) = std::mem::replace(&mut slot, EncoderSlot::Framed(Ok(0)))
+        else {
+            return 0;
+        };
+        let outcome = frame_request(region, encode);
+        // Nothing is written on an error, which is returned as it is.
+        let written = match &outcome {
+            Ok(written) => *written,
+            Err(_) => 0,
+        };
+        slot = EncoderSlot::Framed(outcome);
+        written
+    })?;
+    Ok(match slot {
+        EncoderSlot::Encoder(encode) => InPlace::NotTaken(encode),
+        EncoderSlot::Framed(outcome) => InPlace::Framed(outcome, queued),
+    })
 }
 
 /// Refuse a frame at the front of `buf` too long for a handshake frame, as

@@ -18,7 +18,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use clap::Args;
 use melin_client::{
-    DEFAULT_TIMEOUT, DpdkStream, NicConfig, NicHandle, PeerMacSource, SigningKey, StreamConnection,
+    DEFAULT_TIMEOUT, DpdkStream, NicConfig, NicHandle, SigningKey, StreamConnection, fmt_mac,
     try_parse_mac,
 };
 
@@ -188,48 +188,23 @@ pub fn connect(
 }
 
 /// The proxy's connect line, on stderr: the port, the client's address and
-/// MAC, and the MAC the dial will address the server (or the gateway) by,
-/// with where it came from. A warning when no peer MAC was given and the
-/// convention's stands in for it.
+/// MAC, and where the dial goes (the server's MAC, or the gateway's) with
+/// where that came from, as the NIC handle says it. A warning when no peer
+/// MAC was given and the convention's stands in for it.
 fn announce(nic: &NicHandle, config: &NicConfig, server: SocketAddrV4) {
     let port = config
         .port_ids
         .first()
         .map_or_else(|| "?".to_owned(), u16::to_string);
-    let local_ip = config.ip_addr;
-    let mac = fmt_mac(nic.mac());
-    match config.gateway.zip(config.gateway_mac) {
-        Some((gateway, gateway_mac)) => eprintln!(
-            "DPDK: port {port} as {local_ip} ({mac}), server {server} via gateway {gateway} \
-             at {} (supplied)",
-            fmt_mac(gateway_mac)
-        ),
-        None => {
-            let (server_mac, source) = nic.peer_mac(*server.ip());
-            let source = match source {
-                PeerMacSource::Supplied => "supplied",
-                PeerMacSource::DerivedSrIov => "derived from the IP by the SR-IOV convention",
-            };
-            eprintln!(
-                "DPDK: port {port} as {local_ip} ({mac}), server {server} at {} ({source})",
-                fmt_mac(server_mac)
-            );
-            if config.peer_mac.is_none() {
-                eprintln!(
-                    "warning: no --dpdk-peer-mac; on a fabric that assigns MACs itself (an AWS \
-                     ENI) the derived address is wrong and the connect below will time out"
-                );
-            }
-        }
+    let next_hop = nic.next_hop(*server.ip());
+    eprintln!(
+        "DPDK: port {port} as {} ({}), server {server} {next_hop}",
+        config.ip_addr,
+        fmt_mac(nic.mac())
+    );
+    if let Some(warning) = next_hop.warning() {
+        eprintln!("warning: {warning}");
     }
-}
-
-/// `aa:bb:cc:dd:ee:ff`.
-fn fmt_mac(mac: [u8; 6]) -> String {
-    mac.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
 }
 
 #[cfg(test)]
@@ -337,10 +312,5 @@ mod tests {
             check_server("10.0.0.1:9876".parse().unwrap()).unwrap(),
             "10.0.0.1:9876".parse::<SocketAddrV4>().unwrap()
         );
-    }
-
-    #[test]
-    fn macs_print_as_colon_separated_hex() {
-        assert_eq!(fmt_mac([0x02, 0x99, 0x01, 0, 0, 0xff]), "02:99:01:00:00:ff");
     }
 }
