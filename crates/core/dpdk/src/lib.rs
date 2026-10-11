@@ -4,11 +4,27 @@
 //! to the NIC via DPDK's userspace Poll Mode Driver (PMD). TCP/IP
 //! processing is handled by smoltcp, a userspace TCP/IP stack.
 //!
+//! Two users of one transport:
+//!
+//! - **A node**: `DpdkTransport`, listening for clients and replicas and
+//!   dialing its primary, configured by a [`DpdkConfig`].
+//! - **A client**: `NicHandle`, the same transport constructed listening on
+//!   no port, which dials TCP streams to a node, one at a time, and
+//!   services all of them in one device poll, configured by the node's own
+//!   [`NicConfig`]. Its API is std types only. `melin-client`'s `dpdk`
+//!   feature runs its polled connection on it, and `melin-shm-proxy` dials
+//!   through it.
+//!
 //! # Feature flag
 //!
-//! Requires the `dpdk-sys` feature and libdpdk installed. Without the
-//! feature this crate is an empty shell, letting it live in the workspace
-//! without requiring system dependencies.
+//! The transport and the NIC handle require the `dpdk-sys` feature and
+//! libdpdk installed (and libclang, for the generated bindings). Without
+//! the feature the crate holds only what needs no libdpdk: the
+//! configuration ([`DpdkConfig`], [`NicConfig`]), MAC parsing and the
+//! peer-MAC convention ([`mac`]), the ARP frames ([`arp`]), and the
+//! policies tested on any host ([`rx_checksum`], [`peer_liveness`]). A
+//! binary maps its flags onto the configuration in any build, and the
+//! crate lives in the workspace without requiring system dependencies.
 
 // Ungated: MAC parsing and the peer-MAC convention are pure logic with
 // no libdpdk dependency, and operators configure them through the same

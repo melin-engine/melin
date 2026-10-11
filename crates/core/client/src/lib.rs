@@ -46,6 +46,18 @@
 //!   [`REQUEST_HEADER_LEN`] bytes, and [`seal_request`] writes the header
 //!   in front of it ([`frame_request`] does both around a closure).
 //!
+//! The request framing is the wire protocol's own, re-exported here: an
+//! application's codec crate that needs only framing can depend on
+//! `melin-wire-protocol` alone, and gets a conversion of its errors into
+//! that crate's `ProtocolError` as well as into this crate's [`Error`].
+//!
+//! The read timeout is then the caller's to keep, and so is the rule
+//! that a heartbeat does not extend it (see [Silence](#silence)). An
+//! error from [`next_reply`] means the connection is to be dropped:
+//! [`Error::FrameTooLarge`] for a length prefix over the limit (the
+//! decoder is poisoned), [`Error::Protocol`] for a frame no reply
+//! carries.
+//!
 //! Between the two sits the polled connection, the blocking connection's
 //! protocol over a non-blocking [`ByteStream`] with no blocking call in
 //! it:
@@ -71,31 +83,44 @@
 //! ## Kernel bypass: the `dpdk` feature
 //!
 //! Off by default. It runs the polled connection over DPDK, on
-//! `melin-dpdk`'s client NIC handle (the node's own DPDK transport,
-//! listening on no port): `StreamConnection::connect_dpdk` brings a NIC up
-//! from a `NicConfig` (the node's DPDK configuration, re-exported) and
-//! dials, `StreamConnection::connect_dpdk_on` dials on a `NicHandle`
-//! already up, and the handle's stream is a [`ByteStream`] whose in-place
-//! send frames a request straight into the socket's transmit buffer, so a
-//! program with several connections on one NIC drives them with
-//! [`PolledConnection`]. Turning it on links `melin-dpdk`, which is
-//! BUSL-1.1, not Apache-2.0 like this crate, into the binary; without it
-//! nothing of `melin-dpdk` is compiled. The build host needs libdpdk
-//! (found through `pkg-config`), and the host it runs on a DPDK-capable
-//! port and hugepages; a DPDK client thread spins at full load, so pin it
-//! to a core of its own.
+//! `melin-dpdk`'s client NIC handle, `NicHandle`: the node's own DPDK
+//! transport, listening on no port, re-exported here with its types so a
+//! client needs no direct dependency on `melin-dpdk`. Its configuration,
+//! `NicConfig`, is the node's own (the NIC half of `melin-dpdk`'s
+//! `DpdkConfig`, one field per `--dpdk-*` flag), not a copy of it. Two
+//! shapes:
 //!
-//! The request framing is the wire protocol's own, re-exported here: an
-//! application's codec crate that needs only framing can depend on
-//! `melin-wire-protocol` alone, and gets a conversion of its errors into
-//! that crate's `ProtocolError` as well as into this crate's [`Error`].
+//! - **One connection**: `StreamConnection::connect_dpdk` brings a NIC up
+//!   from a `NicConfig`, dials and authenticates; the connection owns the
+//!   NIC. `StreamConnection::connect_dpdk_on` does the same on a
+//!   `NicHandle` already up, owned or lent as `&mut`, so a client
+//!   reconnects without touching EAL, which initialises once per process.
+//! - **Several connections on one NIC**: the caller keeps the handle, dials
+//!   each stream with `NicHandle::dial`, and drives one
+//!   [`PolledConnection`] per stream, handing each call the stream's view,
+//!   `NicHandle::stream(&id)`, which is a [`ByteStream`] and borrows the
+//!   handle for that call only. `NicHandle::service` advances every stream
+//!   at once, so it is called once per loop iteration, at the caller's own
+//!   monotonic nanosecond time (a calibrated TSC's will do). Dials are
+//!   sequential: a DPDK node refuses a SYN that arrives during another
+//!   connection's handshake, so a dial returns only once its connection
+//!   is established or has failed.
 //!
-//! The read timeout is then the caller's to keep, and so is the rule
-//! that a heartbeat does not extend it (see [Silence](#silence)). An
-//! error from [`next_reply`] means the connection is to be dropped:
-//! [`Error::FrameTooLarge`] for a length prefix over the limit (the
-//! decoder is poisoned), [`Error::Protocol`] for a frame no reply
-//! carries.
+//! Either way the stream's in-place send frames a request straight into
+//! the socket's transmit buffer. A NIC that cannot be brought up is
+//! [`Error::Nic`]: a variant in every build, with or without the feature,
+//! so a match on [`Error`] compiles the same whichever crate in a build
+//! turns the feature on. A dial that fails is [`Error::Connect`].
+//!
+//! Turning it on links `melin-dpdk`, which is BUSL-1.1, not Apache-2.0
+//! like this crate, into the binary; without it nothing of `melin-dpdk` is
+//! compiled. The build host needs libdpdk (found through `pkg-config`) and
+//! libclang, and the host it runs on a DPDK-capable port and hugepages. A
+//! client beside a node needs an EAL file prefix of its own, which the
+//! handle adds (`melin-client`) when the EAL arguments name none, and a
+//! client on a fabric that assigns MACs (an AWS ENI) must be given the
+//! server's MAC; `NicConfig`'s fields say why. A DPDK client thread spins
+//! at full load, so pin it to a core of its own.
 //!
 //! ## Silence
 //!

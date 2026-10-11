@@ -1,15 +1,17 @@
 # DPDK support in `melin-client` (plan)
 
-Status: **in progress** (2026-10): steps 1 to 6 of the order of work,
-the factoring, the NIC handle with the proxy on it, the polled
-connection, the client's `dpdk` feature, the test rig with the TAP smoke
-script and CI, and the echo client's `--transport dpdk` and `--core`, are
-done; step 7 is next. Step 6's acceptance, a pass of the TAP smoke script
-on a host with libdpdk, is still to come: the step was written on a host
-without libdpdk, where its DPDK code was type-checked against stubs of
-the NIC handle's signatures, not built against libdpdk or run.
-Covers the roadmap item "DPDK support in `melin-client`"
-([roadmap.md](roadmap.md)).
+Status: **implemented in this repository** (2026-10): steps 1 to 7 of the
+order of work, the factoring, the NIC handle with the proxy on it, the
+polled connection, the client's `dpdk` feature, the test rig with the TAP
+smoke script and CI, the echo client's `--transport dpdk` and `--core`,
+and the docs, are done. Two things remain. Step 8, the exchange's bench
+onto the NIC handle, is the Exchange Core's, on the first sequencer
+release that carries steps 1 to 4. And step 6's acceptance, a pass of
+`scripts/dpdk/dpdk-client-tap-smoke.sh` on a host with libdpdk, root,
+hugepages and `/dev/net/tun`, is still to come: the DPDK code has since
+been built against libdpdk and its suites run under the netns runner,
+but the smoke script has not run. Implemented the roadmap item "DPDK
+support in `melin-client`", since removed from the roadmap.
 
 The one-line goal: **a client links `melin-client`, turns on one feature,
 and talks to a node over kernel bypass with the same protocol code the
@@ -24,7 +26,10 @@ Not a goal: replacing the proxy in the Aeron benchmark harness. That
 harness retired an earlier Rust load generator on purpose, so that its one
 client, the Java rig, measures every system the same way, with a separate
 process owning the NIC as Aeron's own DPDK driver does. The proxy stays its
-client; this work gives it a better dialer.
+client; this work gives it a better dialer, the NIC handle, and keeps its
+flags and their defaults, its `connected to` line, the `error:` prefix of
+its failures and its `--trace` report as they were, since the harness
+scripts against them (the proxy's crate documentation says so).
 
 ## What the code shows
 

@@ -48,14 +48,21 @@ several connections at once, or two clients that connect in the same
 instant, get a refusal on DPDK that they would not get on io_uring; the
 refused side sees connection refused, not a timeout, and retries only if
 it was written to. The Exchange Core's bench dials its connections one at
-a time for this reason, and the DPDK client plan
-(`dpdk-client-2026-10.md`) makes its handle do the same.
+a time for this reason, and so does the client NIC handle in
+`crates/core/dpdk` (`NicHandle::dial` returns only once the connection is
+established or has failed, and its documentation gives this reason), so
+every client on `melin-client`'s `dpdk` feature inherits the constraint
+(`dpdk-client-2026-10.md`). Sequential dials keep one client from
+refusing itself; two clients dialing the same node at once can still
+meet it.
 
 The DPDK side looks wrong: a backlog of listeners per port (several
 listening sockets, each replaced as it is accepted) would take as many
 concurrent handshakes as there are listeners, at the cost of their
-buffers. No DPDK test yet; the one to write dials two connections to a
-node in the same poll and expects both to be established.
+buffers. The handle's dial could then stop waiting for one connection
+before the next. No DPDK test yet; the one to write dials two
+connections to a node in the same poll, below the NIC handle since it
+dials one at a time, and expects both to be established.
 
 ### DPDK does not see a client's close (likely bug)
 

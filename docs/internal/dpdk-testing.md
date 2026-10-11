@@ -16,6 +16,9 @@ From the repository root, with libdpdk and libclang installed:
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run --profile dpdk -p melin-server-runtime --features dpdk -E 'kind(test)'
 ```
 
+The runner variable names the target triple: on an aarch64 host it is
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER`, with the same value.
+
 The examples run the same way with their own feature
 (`-p melin-example-echo --features melin-example-echo/dpdk`). The `dpdk`
 nextest profile runs one test at a time and leaves out the tests that fail
@@ -23,6 +26,14 @@ on a known divergence (below). The CI `dpdk` job runs both, on every push,
 and `melin-client`'s own suite with its `dpdk` feature
 (`-p melin-client --features melin-client/dpdk`), the build a DPDK client
 links.
+
+Without nextest, `cargo test` takes the same runner, with two caveats
+(see "One process per test" under Limits): pass `-- --test-threads=1`,
+since the tests of one binary then share a process and its slots, and
+run the runtime's `dpdk_veth` suite one test per process (`--exact`, test
+by test, from its `--list`), since a test that leaves a slot held fails
+the ones after it. Nor does `cargo test` read the profile's filter, so a
+test the profile leaves out on a divergence runs, and fails, there.
 
 ## What makes DPDK run on veth
 
@@ -47,8 +58,9 @@ Inside an unprivileged user, network and mount namespace (`unshare -rnm`):
 ## The runner
 
 `scripts/dpdk/netns-runner.sh` is set as cargo's target runner
-(`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`, which nextest honours). For
-every process it starts (every test, under nextest) it:
+(`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`, or the aarch64 one, which
+nextest honours). For every process it starts (every test, under nextest)
+it:
 
 1. re-executes itself under `unshare -rnm`;
 2. builds a bridge, `br0`, carrying the client's address (`10.99.0.1/24`),
@@ -213,11 +225,11 @@ on DPDK once, at a node already serving.
 `scripts/dpdk/dpdk-client-tap-smoke.sh` checks the same path outside the
 rig: a DPDK echo client on a TAP virtual device (`--vdev=net_tap0
 --no-pci`) against a kernel echo server on the TAP's other end, with no
-NIC and no namespace, on any host with libdpdk, as root for hugepages and
-the TAP's address. The mirror image of the Exchange Core's TAP smoke test,
-which runs a DPDK node and a kernel client. The client is `echo-client
---transport dpdk`, the one an operator runs, built with the echo
-example's `dpdk` feature.
+NIC and no namespace, on any host with libdpdk and `/dev/net/tun`, as
+root for hugepages and the TAP's address. The mirror image of the
+Exchange Core's TAP smoke test, which runs a DPDK node and a kernel
+client. The client is `echo-client --transport dpdk`, the one an
+operator runs, built with the echo example's `dpdk` feature.
 
 ## The `dpdk` profile and known divergences
 

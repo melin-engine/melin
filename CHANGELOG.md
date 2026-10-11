@@ -28,44 +28,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the batch-end that closes its reply. Whatever the client has written
   when the loop turns goes out as one segment, so the packet rate follows
   the backlog rather than the message rate. The layout is documented in
-  `crates/tools/melin-shm-proxy/src/shm.rs`.
-- **`melin_dpdk::NicHandle`, a client's DPDK NIC** (`dpdk-sys` feature):
-  the node's DPDK transport listening on no port, dialing TCP streams to a
-  node and servicing all of them in one device poll, for clients that run
-  several connections on the one DPDK port a host has. `NicHandle::open`
-  takes a `NicConfig`, the node's whole NIC surface (LACP bond, VLAN,
-  bifurcated peer IP, the L3 mode's gateway MAC, peer MAC, MTU); it
-  initialises EAL with a file prefix of its own (`melin-client`) unless the
-  arguments name one, or shares the process-wide EAL as a node does.
-  `dial` takes a deadline and the caller's clock, gives every socket a
-  fresh local port, and tells a refusal (`ConnectionRefused`) from a
-  timeout (`TimedOut`, naming the peer MAC as the first thing to check);
-  dials are sequential, since a DPDK node refuses a SYN that arrives during
-  another client's handshake. A `StreamId` lends its stream as a
-  `NicStream` view: a non-blocking `send` with a `can_send` room query, an
-  in-place `send_in_place` that lends the transmit buffer's contiguous free
-  region, a `recv` for which a closed connection is an error, never a
-  zero, and the handle's `service` step at the caller's monotonic
-  nanosecond time. A closed stream, and every stream of a dropped handle,
-  is reset so the node frees its slot at once. The public API is std
-  types only: no smoltcp dependency is needed to use it. `melin-shm-proxy`
-  now runs its DPDK transport on it, dropping its own EAL, pool, port and
-  stack setup and its direct smoltcp dependency, with its flags, their
-  defaults and its output unchanged; it gains the node's `--dpdk-ports`,
-  `--dpdk-peer-ip`, `--dpdk-gateway-mac` and `--dpdk-vlan`. The
-  differences show only on failure or shutdown. A server that closes the
-  connection with a FIN ends the bridge cleanly instead of leaving it
-  waiting. The NIC setup's `error:` lines are now the
-  node's own: an EAL that fails to initialise is reported with its file
-  prefix (`DPDK EAL init failed (file prefix ...; is another DPDK process
-  on this host using it?): ...`, was `EAL init failed: ...`), a missing
-  port as `DPDK port 3 not found (available: 2)` (was `(2 available)`), a
-  pool failure as `mempool <name>: rte_pktmbuf_pool_create failed` (was
-  `mempool: CreateFailed`), and a port failure as `port 0 configure:
-  rte_eth_dev_configure failed: -22` or `port 0 start: rte_eth_dev_start
-  failed: -22` (was `port 0 configure: ConfigureFailed(-22)` and `port 0
-  start: StartFailed(-22)`). Every one still starts `error:`, and the
-  `connected to` line and the `--trace` report are unchanged.
+  `crates/tools/melin-shm-proxy/src/shm.rs`. Over DPDK it dials through
+  `melin-dpdk`'s client NIC handle (below), with the node's `--dpdk-*`
+  flags (and its own `--dpdk-port`, which `--dpdk-ports` replaces for a
+  bond) and an EAL file prefix of its own by default, and a NIC it cannot
+  bring up is reported with the node's own errors, which name the EAL file
+  prefix, the port or the pool. Its flags, the `connected to` line and the
+  `error:` prefix on stderr, and the `--trace` report are what the Aeron
+  harness scripts against, and are kept stable. On the wire, its
+  gratuitous ARP request now zeroes the target hardware address, as the
+  node's always has, where it sent the broadcast address; receivers ignore
+  the field.
 - **A polled connection in `melin-client`**, the blocking `Connection`'s
   protocol over a non-blocking byte stream, with no blocking call in it.
   - `ByteStream`, the seam to the transport: a non-blocking `send`, a
@@ -101,11 +74,41 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     with Nagle off, and `BufferStream`, whose received bytes the caller
     pushes in and whose sent bytes it takes out, with an optional transmit
     capacity, for an I/O loop that owns the socket itself.
+- **`melin_dpdk::NicHandle`, a client's DPDK NIC** (`dpdk-sys` feature):
+  the node's DPDK transport listening on no port, dialing TCP streams to a
+  node and servicing all of them in one device poll, for clients that run
+  several connections on the one DPDK port a host has. The public API is
+  std types only: no smoltcp dependency is needed to use it.
+  - `NicHandle::open` takes a `NicConfig`, the node's whole NIC surface
+    (LACP bond, VLAN, bifurcated peer IP, the L3 mode's gateway MAC, peer
+    MAC, MTU), the same type a node's `DpdkConfig` holds. It initialises
+    EAL with a file prefix of its own (`melin-client`) unless the
+    arguments name one, so a client beside a node takes no runtime lock
+    the node holds, and an EAL failure names the prefix; or it shares the
+    process-wide EAL, as a node does.
+  - `dial` takes a deadline and the caller's clock, gives every socket a
+    fresh local port, and tells a refusal (`ConnectionRefused`) from a
+    timeout (`TimedOut`, naming the MAC the SYN went to as the first
+    thing to check). Dials are sequential: a DPDK node refuses a SYN that
+    arrives during another client's handshake, so `dial` returns only once
+    its connection is established or has failed.
+  - `stream(&id)` lends the stream a `StreamId` names as a `NicStream`
+    view, for one call: a non-blocking `send` with a `can_send` room
+    query, an in-place `send_in_place` that lends the transmit buffer's
+    contiguous free region, a `recv` for which a closed connection is an
+    error, never a zero, and the handle's `service` step. `service`
+    advances every stream at once, at the caller's monotonic nanosecond
+    time; `NicClock` (`clock()`, with its `origin`) is that time for a
+    caller without a clock of its own. A closed stream, and every stream of
+    a dropped handle, is reset so the node frees its slot at once.
 - **A `dpdk` feature in `melin-client`**, off by default: the polled
-  connection over kernel bypass, on `melin-dpdk`'s client NIC handle.
-  Turning it on links `melin-dpdk`, which is BUSL-1.1, into the binary
-  (`melin-client` itself stays Apache-2.0, and without the feature nothing
-  of `melin-dpdk` is compiled), and needs libdpdk on the build host.
+  connection over kernel bypass, on the client NIC handle. Turning it on
+  links `melin-dpdk`, which is BUSL-1.1, into the binary (`melin-client`
+  itself stays Apache-2.0, and without the feature nothing of
+  `melin-dpdk` is compiled), and needs libdpdk and libclang on the build
+  host. A NIC that cannot be brought up is the new `Error::Nic` (see
+  Changed). `docs/building-an-application.md` covers what a DPDK client
+  needs of its host.
   - `StreamConnection::connect_dpdk` brings a NIC up from a `NicConfig`
     and dials and authenticates, with a socket buffer size and a timeout
     that bounds the dial, the handshake and every wait after;
@@ -114,9 +117,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     touching EAL and a process that holds the process-wide EAL shares it.
     One clock drives the handle's stack: the dial runs on the handle's own
     clock, and the connection's cached clock counts from the same origin.
-    A dial that times out is `Error::Connect` with a timed-out source whose
-    message names the peer MAC to check first, a refused one
-    `Error::Connect` with a refused source.
+    A failed dial is `Error::Connect`, its source the handle's error
+    unchanged, so a timeout and a refusal stay apart.
   - `DpdkStream`, one stream of a NIC handle owned with the handle (or a
     `&mut` to it): the stream a `StreamConnection` over DPDK owns. Dropping
     it closes the stream, so the node frees the connection's slot at once.
@@ -129,13 +131,25 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   - Re-exported from `melin-dpdk`, so a client needs no direct dependency
     on it: `NicConfig`, the node's DPDK configuration (one field per
     `--dpdk-*` flag; a plain struct, each binary maps its own flags onto
-    it), `NicHandle`, `NicStream`, `StreamId`, `NicClock`, `PeerMacSource`,
-    `try_parse_mac` and `MacParseError`.
-- **`melin_dpdk::NicClock::origin`**, the instant the clock counts from,
-  for a caller that keeps a cached clock on the same origin. `NicConfig`'s
-  field documentation now names each field's node flag, and says why a
-  peer MAC is required on a fabric that assigns MACs (an AWS ENI) and why
-  a client beside a node needs an EAL file prefix of its own.
+    it, and the fields' documentation says why a peer MAC is required on
+    a fabric that assigns MACs, an AWS ENI, and why a client beside a node
+    needs an EAL file prefix of its own), `NicHandle`, `NicStream`,
+    `StreamId`, `NicClock`, `PeerMacSource`, `try_parse_mac` and
+    `MacParseError`.
+- **`echo-client --transport dpdk` and `--core`**: the echo example's
+  client measures the sequencer's latency floor over kernel bypass, in a
+  build with the example's `dpdk` feature, with the node's `--dpdk-*`
+  flags (`--dpdk-eal-args`, `--dpdk-ports`, `--dpdk-ip`,
+  `--dpdk-prefix-len`, `--dpdk-gateway`, `--dpdk-peer-ip`,
+  `--dpdk-gateway-mac`, `--dpdk-peer-mac`, `--dpdk-mtu`, `--dpdk-vlan`).
+  Both transports run one measurement loop and print the same result
+  lines; the kernel transport, still the default, behaves and prints as
+  before. A DPDK run prints the MAC it dials the server by on stderr, and
+  warns when that MAC was derived rather than given. Without the feature,
+  `--transport dpdk` is refused with a message naming it. `--core` pins
+  the measuring thread to a core once the connection is up, for either
+  transport: a DPDK client spins at full load, so its figures want a core
+  of its own.
 - **DPDK clients in the DPDK test rig.** `scripts/dpdk/netns-runner.sh`
   builds a veth pair for a DPDK client beside the node slots and publishes
   it in `MELIN_NETNS_DPDK_CLIENT_IFACE`, `_IP` and `_MAC` (the node slots
@@ -146,20 +160,6 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `scripts/dpdk/dpdk-client-tap-smoke.sh` runs a DPDK echo client over a
   TAP device against a kernel echo server. For contributors; nothing ships
   with it.
-- **`echo-client --transport dpdk`**: the echo example's client measures
-  the sequencer's latency floor over kernel bypass, in a build with the
-  example's `dpdk` feature, with the node's and the proxy's `--dpdk-*`
-  flags (`--dpdk-eal-args`, `--dpdk-ports`, `--dpdk-ip`,
-  `--dpdk-prefix-len`, `--dpdk-gateway`, `--dpdk-peer-ip`,
-  `--dpdk-gateway-mac`, `--dpdk-peer-mac`, `--dpdk-mtu`, `--dpdk-vlan`).
-  Both transports run one measurement loop and print the same result
-  lines; the kernel transport, still the default, behaves and prints as
-  before. A DPDK run prints the MAC it dials the server by on stderr, and
-  warns when that MAC was derived rather than given. Without the feature,
-  `--transport dpdk` is refused with a message naming it.
-- **`echo-client --core`** pins the measuring thread to a core once the
-  connection is up, for either transport. A DPDK client spins at full
-  load, so its figures want a core of its own.
 
 ### Changed
 
@@ -171,7 +171,24 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   and went with the feature would break a match in one crate when another
   turned it on. Source-breaking for an exhaustive `match` on `Error`: add
   an arm for it.
-
+- **`melin_dpdk::DpdkConfig`'s NIC fields moved into `melin_dpdk::NicConfig`**,
+  the configuration a node and a client's NIC handle share. The EAL
+  arguments, ports, address and prefix, gateway, bifurcated peer IP,
+  gateway and peer MACs, MTU and VLAN id are now fields of
+  `DpdkConfig::nic`; `DpdkConfig` keeps `listen_port` and `num_queues`.
+  Names, types and defaults are unchanged, and so is what the node does
+  with them. Source-breaking for anything that constructs a `DpdkConfig`
+  or reads its NIC fields: `config.peer_mac` becomes
+  `config.nic.peer_mac`. Both types are now available without the
+  `dpdk-sys` feature, so a binary can map its flags onto them in any
+  build. The ARP frames the transport sends and injects are built by the
+  new `melin_dpdk::arp` module, unchanged on the wire.
+- **A DPDK node's NIC setup errors name their port and pool.** A port
+  that fails to configure, start or take its steering rule is reported as
+  `port <id> configure: ...`, `port <id> start: ...` or `port <id>
+  steering rule for <peer>: ...`, and a pool that cannot be created as
+  `mempool <name>: ...`, where they used to give the DPDK call alone: on
+  an LACP bond, which member failed was not said.
 - **Dependencies refreshed to their latest compatible releases** (tokio,
   serde, thiserror, zerocopy and zeroize among them). Only the committed
   lockfile moves: no crate's version requirement changes, so a consumer's
@@ -199,27 +216,6 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   supply them. `response::run` returns a `bool` (whether the stage
   started) instead of `()`, so a `JoinHandle<()>` binding for its thread
   no longer compiles.
-- **A DPDK node's NIC setup errors name their port and pool.** A port
-  that fails to configure, start or take its steering rule is reported as
-  `port <id> configure: ...`, `port <id> start: ...` or `port <id>
-  steering rule for <peer>: ...`, and a pool that cannot be created as
-  `mempool <name>: ...`, where they used to give the DPDK call alone: on
-  an LACP bond, which member failed was not said.
-- **`melin_dpdk::DpdkConfig`'s NIC fields moved into `melin_dpdk::NicConfig`.**
-  The EAL arguments, ports, address and prefix, gateway, bifurcated peer
-  IP, gateway and peer MACs, MTU and VLAN id are now fields of
-  `DpdkConfig::nic`; `DpdkConfig` keeps `listen_port` and `num_queues`.
-  Names, types and defaults are unchanged, and so is what the node does
-  with them. Source-breaking for anything that constructs a `DpdkConfig`
-  or reads its NIC fields: `config.peer_mac` becomes
-  `config.nic.peer_mac`. Both types are now available without the
-  `dpdk-sys` feature, so a binary can map its flags onto them in any
-  build. The ARP frames the transport sends and injects are built by the
-  new `melin_dpdk::arp` module, unchanged on the wire. `melin-shm-proxy`
-  uses the same builders, so its gratuitous ARP request now zeroes the
-  target hardware address, as the node's always has, where it sent
-  `ff:ff:ff:ff:ff:ff`; receivers ignore the field. Its flags and output
-  are unchanged.
 
 ### Fixed
 
