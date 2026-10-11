@@ -215,9 +215,9 @@ rig: a DPDK echo client on a TAP virtual device (`--vdev=net_tap0
 --no-pci`) against a kernel echo server on the TAP's other end, with no
 NIC and no namespace, on any host with libdpdk, as root for hugepages and
 the TAP's address. The mirror image of the Exchange Core's TAP smoke test,
-which runs a DPDK node and a kernel client. It runs `echo-client
---transport dpdk`, so it needs the echo client's DPDK transport, and stops
-after the build, saying so, on an echo client without it.
+which runs a DPDK node and a kernel client. The client is `echo-client
+--transport dpdk`, the one an operator runs, built with the echo
+example's `dpdk` feature.
 
 ## The `dpdk` profile and known divergences
 

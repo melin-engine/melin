@@ -13,17 +13,15 @@
 # for any host with libdpdk; the rig (`netns-runner.sh`) covers the same
 # path in CI, on af_packet.
 #
-# REQUIRES `echo-client --transport dpdk`, which arrives with step 6 of
-# docs/internal/dpdk-client-2026-10.md. Until then the script stops after
-# the build, saying so: it was written against the flag rather than a
-# throwaway client of its own, so that it checks the client an operator
-# runs. The flags it passes are the shm-proxy's (`--dpdk-eal-args`,
-# `--dpdk-ip`, `--dpdk-prefix-len`, `--dpdk-peer-mac`), which the plan
-# gives the echo client.
+# It runs the client an operator runs, not a throwaway of its own: the
+# echo client's `--transport dpdk`, with the `--dpdk-*` flags it shares
+# with the node and the shm-proxy (`--dpdk-eal-args`, `--dpdk-ip`,
+# `--dpdk-prefix-len`, `--dpdk-peer-mac`). The client's connect line and
+# its DPDK NIC's bring-up (`RUST_LOG`) go to its log; the run passes on
+# the result line it prints on stdout.
 #
 # Flow:
-#   1. build echo-server on kernel TCP and echo-client with `dpdk`, and
-#      stop if the client has no `--transport` flag (before step 6);
+#   1. build echo-server on kernel TCP and echo-client with `dpdk`;
 #   2. hugepages: 2 MB pages allocated and a hugetlbfs mounted, if needed;
 #   3. an Ed25519 key and an authorized_keys file;
 #   4. start echo-server on kernel TCP, on every address;
@@ -140,8 +138,7 @@ echo ""
 # Two builds of one package: the server without `dpdk` (with it, the
 # server would run on DPDK too), the client with it. Each binary is copied
 # out as soon as it is built, since both land in the same target path.
-# Before the hugepages, so a client without the flag leaves the host as it
-# found it.
+# Before the hugepages, so a failed build leaves the host as it found it.
 echo "=== Building ==="
 cd "$PROJECT_DIR"
 cargo build --release -p melin-example-echo --bin echo-server --quiet
@@ -150,14 +147,6 @@ echo "  echo-server (kernel TCP): OK"
 cargo build --release -p melin-example-echo --features dpdk --bin echo-client --quiet
 cp target/release/echo-client "$WORK_DIR/echo-client"
 echo "  echo-client (dpdk): OK"
-# Captured first: with pipefail, `grep -q` quitting early could SIGPIPE
-# the client and read as a missing flag.
-CLIENT_HELP=$("$WORK_DIR/echo-client" --help)
-if ! grep -q -- "--transport" <<<"$CLIENT_HELP"; then
-    echo "  error: this echo-client has no --transport flag. The DPDK echo client arrives" >&2
-    echo "  with step 6 of docs/internal/dpdk-client-2026-10.md; this script needs it." >&2
-    exit 2
-fi
 echo ""
 
 # --- 2. Hugepages ---

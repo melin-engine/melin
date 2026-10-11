@@ -64,5 +64,11 @@ hash-chain = ["melin-server-runtime/hash-chain"]
 # which then run their nodes on a veth pair and must be run under
 # `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-testing.md`).
 # The client's `dpdk` feature too, for the round trip whose client runs on
-# DPDK beside its node. Needs libdpdk to build, so never on by default.
+# DPDK beside its node, and for `echo-client --transport dpdk` and its
+# `--dpdk-*` flags. One feature for both binaries: built with it, the
+# client compiles the runtime's DPDK transport too, which it never calls
+# (it links libdpdk for its own NIC anyway), and the server runs on DPDK.
+# To pair a DPDK client with a kernel server, build the two binaries
+# separately, as `scripts/dpdk/dpdk-client-tap-smoke.sh` does. Needs
+# libdpdk to build, so never on by default.
 dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk", "melin-client/dpdk"]

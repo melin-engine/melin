@@ -144,8 +144,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the echo and counter round trips gain a case with the client on DPDK;
   the CI `dpdk` job builds, tests and documents `melin-client/dpdk`.
   `scripts/dpdk/dpdk-client-tap-smoke.sh` runs a DPDK echo client over a
-  TAP device against a kernel echo server, once the echo client has a
-  DPDK transport. For contributors; nothing ships with it.
+  TAP device against a kernel echo server. For contributors; nothing ships
+  with it.
+- **`echo-client --transport dpdk`**: the echo example's client measures
+  the sequencer's latency floor over kernel bypass, in a build with the
+  example's `dpdk` feature, with the node's and the proxy's `--dpdk-*`
+  flags (`--dpdk-eal-args`, `--dpdk-ports`, `--dpdk-ip`,
+  `--dpdk-prefix-len`, `--dpdk-gateway`, `--dpdk-peer-ip`,
+  `--dpdk-gateway-mac`, `--dpdk-peer-mac`, `--dpdk-mtu`, `--dpdk-vlan`).
+  Both transports run one measurement loop and print the same result
+  lines; the kernel transport, still the default, behaves and prints as
+  before. A DPDK run prints the MAC it dials the server by on stderr, and
+  warns when that MAC was derived rather than given. Without the feature,
+  `--transport dpdk` is refused with a message naming it.
+- **`echo-client --core`** pins the measuring thread to a core once the
+  connection is up, for either transport. A DPDK client spins at full
+  load, so its figures want a core of its own.
 
 ### Changed
 

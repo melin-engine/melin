@@ -1,12 +1,13 @@
 # DPDK support in `melin-client` (plan)
 
-Status: **in progress** (2026-10): steps 1 to 5 of the order of work,
+Status: **in progress** (2026-10): steps 1 to 6 of the order of work,
 the factoring, the NIC handle with the proxy on it, the polled
-connection, the client's `dpdk` feature, and the test rig with the TAP
-smoke script and CI, are done; step 6 is next. The smoke script runs the
-echo client's `--transport dpdk`, so it runs from step 6 on. The echo
-example's `dpdk` feature already forwards to `melin-client/dpdk`, for the
-round trip's DPDK client case.
+connection, the client's `dpdk` feature, the test rig with the TAP smoke
+script and CI, and the echo client's `--transport dpdk` and `--core`, are
+done; step 7 is next. Step 6's acceptance, a pass of the TAP smoke script
+on a host with libdpdk, is still to come: the step was written on a host
+without libdpdk, where its DPDK code was type-checked against stubs of
+the NIC handle's signatures, not built against libdpdk or run.
 Covers the roadmap item "DPDK support in `melin-client`"
 ([roadmap.md](roadmap.md)).
 
@@ -478,11 +479,12 @@ binary.
 
 ### 5. Consumers
 
-- **`echo-client`** gains `--transport dpdk` with the proxy's DPDK flags,
-  and a `--core` pin, so the sequencer's latency floor is measurable on
-  kernel bypass from this repository. The echo example's `dpdk` feature
-  forwards to `melin-client/dpdk`. Its loop goes through the session trait,
-  so the kernel and DPDK runs share one measurement.
+- **`echo-client`** gains `--transport dpdk` with the proxy's DPDK flags
+  (the ports as the node's `--dpdk-ports`, not the proxy's older single
+  `--dpdk-port`), and a `--core` pin, so the sequencer's latency floor is
+  measurable on kernel bypass from this repository. The echo example's
+  `dpdk` feature forwards to `melin-client/dpdk`. Its loop goes through
+  the session trait, so the kernel and DPDK runs share one measurement.
 - **The shm-proxy** drops `dpdk.rs` and `arp.rs` for the hoisted dialer,
   keeps its own `Transport` trait (it knows no protocol and does not
   depend on `melin-client`) with the dialer's stream behind it, and keeps
