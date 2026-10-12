@@ -16,7 +16,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use smoltcp::socket::tcp;
 
-use crate::mac::{MacAddr, PeerMacSource, fmt_mac};
+use crate::mac::{MacAddr, PeerMacSource, fmt_mac, resolve_peer_mac};
 
 /// The file prefix a client's EAL takes when its arguments name none.
 ///
@@ -43,13 +43,23 @@ pub(crate) fn file_prefix(eal_args: &[String]) -> Option<&str> {
 
 /// A client's EAL arguments: `eal_args`, with the client's own file
 /// prefix ([`CLIENT_FILE_PREFIX`]) added when they name none.
-pub(crate) fn with_client_file_prefix(eal_args: &[String]) -> Vec<String> {
+///
+/// # Errors
+///
+/// The arguments end with a `--file-prefix` and no prefix after it: a
+/// forgotten value. Defaulting past it would hand EAL the flag's own name
+/// as the prefix, and an error naming that prefix would point at a lock
+/// collision that does not exist.
+pub(crate) fn with_client_file_prefix(eal_args: &[String]) -> Result<Vec<String>, String> {
+    if eal_args.last().is_some_and(|last| last == "--file-prefix") {
+        return Err("the EAL arguments end with --file-prefix and no prefix after it".to_owned());
+    }
     let mut args = eal_args.to_vec();
     if file_prefix(eal_args).is_none() {
         args.push("--file-prefix".to_owned());
         args.push(CLIENT_FILE_PREFIX.to_owned());
     }
-    args
+    Ok(args)
 }
 
 /// The error for an EAL the handle could not bring up or share. It names
@@ -327,6 +337,42 @@ impl std::fmt::Display for NextHop {
     }
 }
 
+/// Whether `peer` is on `ip`'s network: the two agree on the first
+/// `prefix_len` bits. A prefix of 0 takes every address, one of 32 or
+/// more only the address itself.
+pub(crate) fn in_prefix(ip: Ipv4Addr, prefix_len: u8, peer: Ipv4Addr) -> bool {
+    let mask: u32 = match prefix_len {
+        0 => 0,
+        n if n >= 32 => u32::MAX,
+        n => u32::MAX << (32 - n),
+    };
+    (u32::from(ip) & mask) == (u32::from(peer) & mask)
+}
+
+/// Where a dial from `ip` (on a network `prefix_len` wide) to `peer` sends
+/// its first frame: through the gateway when there is one and the peer is
+/// off the network, since the stack routes a peer on the network directly
+/// whatever the default route says; otherwise to the peer, by its
+/// supplied MAC or the SR-IOV convention.
+pub(crate) fn next_hop(
+    gateway: Option<(Ipv4Addr, MacAddr)>,
+    ip: Ipv4Addr,
+    prefix_len: u8,
+    peer_mac: Option<MacAddr>,
+    peer: Ipv4Addr,
+) -> NextHop {
+    match gateway {
+        Some((gateway_ip, gateway_mac)) if !in_prefix(ip, prefix_len, peer) => NextHop::Gateway {
+            ip: gateway_ip,
+            mac: gateway_mac,
+        },
+        _ => {
+            let (mac, source) = resolve_peer_mac(peer_mac, peer);
+            NextHop::Peer { mac, source }
+        }
+    }
+}
+
 /// The error for a failed dial: [`io::ErrorKind::TimedOut`] or
 /// [`io::ErrorKind::ConnectionRefused`].
 ///
@@ -480,14 +526,14 @@ mod tests {
 
     #[test]
     fn a_client_without_a_file_prefix_gets_its_own() {
-        let defaulted = with_client_file_prefix(&args("--huge-dir /dev/hugepages"));
+        let defaulted = with_client_file_prefix(&args("--huge-dir /dev/hugepages")).unwrap();
         assert_eq!(
             defaulted,
             args("--huge-dir /dev/hugepages --file-prefix melin-client")
         );
         assert_eq!(file_prefix(&defaulted), Some(CLIENT_FILE_PREFIX));
         assert_eq!(
-            with_client_file_prefix(&[]),
+            with_client_file_prefix(&[]).unwrap(),
             args("--file-prefix melin-client")
         );
     }
@@ -495,9 +541,17 @@ mod tests {
     #[test]
     fn a_client_keeps_the_file_prefix_it_was_given() {
         let given = args("--huge-dir /dev/hugepages --file-prefix shm-proxy");
-        assert_eq!(with_client_file_prefix(&given), given);
+        assert_eq!(with_client_file_prefix(&given).unwrap(), given);
         let joined = args("--file-prefix=bench");
-        assert_eq!(with_client_file_prefix(&joined), joined);
+        assert_eq!(with_client_file_prefix(&joined).unwrap(), joined);
+    }
+
+    /// A forgotten value is refused, not defaulted past: EAL would take
+    /// the flag's own name as the prefix.
+    #[test]
+    fn a_dangling_file_prefix_is_refused() {
+        let err = with_client_file_prefix(&args("--no-pci --file-prefix")).unwrap_err();
+        assert!(err.contains("--file-prefix"), "{err}");
     }
 
     #[test]
@@ -720,6 +774,57 @@ mod tests {
         let err = dial_error(peer(), DialFailure::Refused, next_hop);
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
         assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    #[test]
+    fn a_prefix_takes_the_addresses_it_covers() {
+        let ip = Ipv4Addr::new(10, 0, 1, 33);
+        assert!(in_prefix(ip, 24, Ipv4Addr::new(10, 0, 1, 30)));
+        assert!(!in_prefix(ip, 24, Ipv4Addr::new(10, 0, 2, 30)));
+        assert!(in_prefix(ip, 16, Ipv4Addr::new(10, 0, 2, 30)));
+        assert!(in_prefix(ip, 0, Ipv4Addr::new(192, 168, 7, 7)));
+        assert!(in_prefix(ip, 32, ip));
+        assert!(!in_prefix(ip, 32, Ipv4Addr::new(10, 0, 1, 34)));
+        assert!(
+            in_prefix(ip, 40, ip),
+            "a prefix past 32 bits is the address"
+        );
+    }
+
+    /// Behind a gateway, a peer on the client's own network is still
+    /// dialed directly: the stack routes it that way, so the MAC that
+    /// matters is the peer's, not the gateway's.
+    #[test]
+    fn a_peer_on_the_network_is_dialed_directly_even_behind_a_gateway() {
+        let ip = Ipv4Addr::new(10, 0, 1, 33);
+        let gateway = Some((Ipv4Addr::new(10, 0, 1, 1), [0x0c; 6]));
+        let node_mac = [0x02, 0x99, 1, 0, 0, 1];
+
+        let on_network = Ipv4Addr::new(10, 0, 1, 30);
+        assert_eq!(
+            next_hop(gateway, ip, 24, Some(node_mac), on_network),
+            NextHop::Peer {
+                mac: node_mac,
+                source: PeerMacSource::Supplied,
+            }
+        );
+        let off_network = Ipv4Addr::new(10, 0, 2, 30);
+        assert_eq!(
+            next_hop(gateway, ip, 24, Some(node_mac), off_network),
+            NextHop::Gateway {
+                ip: Ipv4Addr::new(10, 0, 1, 1),
+                mac: [0x0c; 6],
+            }
+        );
+        // No gateway: the peer, wherever it is, by the convention if no
+        // MAC was given.
+        assert_eq!(
+            next_hop(None, ip, 24, None, off_network),
+            NextHop::Peer {
+                mac: [0x02, 0x00, 10, 0, 2, 30],
+                source: PeerMacSource::DerivedSrIov,
+            }
+        );
     }
 
     /// The next hop prints as the binaries' connect line has always said

@@ -26,7 +26,7 @@ use std::io;
 use std::net::SocketAddrV4;
 
 use clap::Args;
-use melin_dpdk::{DpdkArgsError, NicConfig, NicHandle, StreamId, fmt_mac};
+use melin_dpdk::{DpdkArgsError, NicConfig, NicHandle, StreamId};
 
 use crate::transport::Transport;
 use crate::tsc::{TscClock, rdtscp};
@@ -99,39 +99,21 @@ impl DpdkTcp {
         clock: &TscClock,
     ) -> Result<Self, String> {
         let config = args.nic_config().map_err(|e| e.to_string())?;
-        let local_ip = config.ip_addr;
-        let gateway_mac = config.gateway_mac;
-        // The mapping refuses an empty list, so there is a first port.
-        let first_port = config.port_ids[0];
-
         let mut nic = NicHandle::open(&config).map_err(|e| e.to_string())?;
         // The connect line: where the dial goes, before it goes, since a
         // wrong MAC shows only as a dial that times out.
-        let next_hop = nic.next_hop(*server.ip());
-        eprintln!(
-            "DPDK: port {first_port} as {local_ip} ({}), server {server} {next_hop}",
-            fmt_mac(nic.mac())
-        );
-        if let Some(warning) = next_hop.warning() {
+        eprintln!("{}", nic.connect_line(server));
+        if let Some(warning) = nic.next_hop(*server.ip()).warning() {
             eprintln!("warning: {warning}");
         }
 
-        // The loop's clock drives the stack from the first SYN on.
+        // The loop's clock drives the stack from the first SYN on. A dial
+        // that fails is reported with the handle's own message: a timeout
+        // names the MAC the SYN went to, the first thing to check.
         let deadline = clock.unix_ns(rdtscp()).saturating_add(CONNECT_TIMEOUT_NS);
         let stream = nic
             .dial(server, SOCKET_BUFFER, deadline, || clock.unix_ns(rdtscp()))
-            .map_err(|e| match e.kind() {
-                // Behind a gateway, the handle's own message, which names
-                // the gateway's MAC, is the one to read.
-                io::ErrorKind::TimedOut if gateway_mac.is_none() => format!(
-                    "TCP connect to {server} over DPDK timed out: no SYN-ACK. \
-                     Is the server's DPDK interface up, and is --dpdk-peer-mac its real MAC?"
-                ),
-                io::ErrorKind::ConnectionRefused => {
-                    format!("TCP connect to {server} over DPDK was refused")
-                }
-                _ => e.to_string(),
-            })?;
+            .map_err(|e| e.to_string())?;
         Ok(Self { stream, nic })
     }
 }

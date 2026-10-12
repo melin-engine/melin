@@ -33,7 +33,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   flags (and its own `--dpdk-port`, which `--dpdk-ports` replaces for a
   bond) and an EAL file prefix of its own by default, and a NIC it cannot
   bring up is reported with the node's own errors, which name the EAL file
-  prefix, the port or the pool. Its flags, the `connected to` line and the
+  prefix, the port or the pool, and a dial that fails with the handle's: a
+  timeout names the MAC the SYN went to and where it came from, the first
+  thing to check. Its flags, the `connected to` line and the
   `error:` prefix on stderr, and the `--trace` report are what the Aeron
   harness scripts against, and are kept stable. On the wire, its
   gratuitous ARP request now zeroes the target hardware address, as the
@@ -136,14 +138,19 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     needs an EAL file prefix of its own), `NicHandle`, `NicStream`,
     `StreamId`, `NicClock`, `PeerMacSource`, `try_parse_mac` and
     `MacParseError`.
-- **`melin_dpdk::fmt_mac`, `NextHop` and `NicHandle::next_hop`**: a MAC as
-  `aa:bb:cc:dd:ee:ff`, and where a dial's first frame goes (the server's
-  MAC or the gateway's, with where it came from) as one value with a
-  `Display` for a connect line and a `warning` for a MAC that was derived
-  rather than given. The shm-proxy and the echo client print their
-  connect lines from them, unchanged in text; a client of the handle can
-  do the same rather than keep a copy. Re-exported by `melin-client`'s
-  `dpdk` feature.
+- **`melin_dpdk::fmt_mac`, `NextHop`, `NicHandle::next_hop` and
+  `NicHandle::connect_line`**: a MAC as `aa:bb:cc:dd:ee:ff`; where a
+  dial's first frame goes (the server's MAC or the gateway's, with where
+  it came from) as one value with a `Display` and a `warning` for a MAC
+  that was derived rather than given; and the connect line a binary
+  prints before dialing, composed by the handle. The shm-proxy and the
+  echo client print it, unchanged in text, and a client of the handle can
+  do the same rather than keep a copy. Behind a gateway, a server on the
+  NIC's own network is dialed directly, as the stack routes it, so the
+  handle seeds the server's MAC on every dial whatever the mode and the
+  next hop names the MAC the dial really goes to. EAL arguments ending in
+  a `--file-prefix` with no prefix are refused rather than defaulted
+  past. Re-exported by `melin-client`'s `dpdk` feature.
 - **`melin_dpdk::DpdkArgs`, the `--dpdk-*` flags declared once**, behind
   a new `clap` feature of `melin-dpdk` (off by default; like `NicConfig`
   it needs no libdpdk and no `dpdk-sys`). A `clap::Args` struct a binary

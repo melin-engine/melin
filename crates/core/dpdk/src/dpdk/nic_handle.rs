@@ -25,7 +25,7 @@ use smoltcp::time::Instant;
 
 use crate::config::{DpdkConfig, NicConfig};
 use crate::eal::Eal;
-use crate::mac::{MacAddr, PeerMacSource, resolve_peer_mac};
+use crate::mac::{MacAddr, PeerMacSource, fmt_mac, resolve_peer_mac};
 use crate::nic::{
     self, DialProgress, LocalPorts, StackTime, dial_error, dial_progress, wait_for_dial,
 };
@@ -99,11 +99,18 @@ pub struct NicHandle {
     time: StackTime,
     clock: NicClock,
     ports: LocalPorts,
-    /// L3 mode's gateway: the next hop of every dial. A tuple for the
-    /// same reason as the transport's: the IP is nothing without its MAC.
+    /// L3 mode's gateway: the next hop of a dial off the NIC's network. A
+    /// tuple for the same reason as the transport's: the IP is nothing
+    /// without its MAC.
     gateway: Option<(Ipv4Addr, MacAddr)>,
     /// The server's MAC, when supplied; derived per dial otherwise.
     peer_mac: Option<MacAddr>,
+    /// The NIC's address and the width of its network, which decide
+    /// whether a dial goes through the gateway; and its first port, for
+    /// the connect line.
+    ip_addr: Ipv4Addr,
+    prefix_len: u8,
+    port: u16,
     /// This handle's tag (see [`NEXT_HANDLE_TAG`]).
     tag: u64,
 }
@@ -153,15 +160,23 @@ impl NicHandle {
     ///
     /// # Errors
     ///
-    /// EAL could not be initialized (the error names the file prefix) or
-    /// shared, or a port, the pool or the port's configuration could not be
-    /// set up.
+    /// [`io::ErrorKind::InvalidInput`] for EAL arguments ending in a
+    /// `--file-prefix` with no prefix, or no port; otherwise EAL could not
+    /// be initialized (the error names the file prefix) or shared, or a
+    /// port, the pool or the port's configuration could not be set up.
     pub fn open(config: &NicConfig) -> io::Result<Self> {
         let shared_eal = Eal::process_wide().is_some();
         let mut config = config.clone();
         if !shared_eal {
-            config.eal_args = nic::with_client_file_prefix(&config.eal_args);
+            config.eal_args = nic::with_client_file_prefix(&config.eal_args)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         }
+        let port = config.port_ids.first().copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DPDK transport requires at least one port id",
+            )
+        })?;
         let eal = NodeEal::acquire(&config).map_err(|e| {
             io::Error::other(nic::eal_init_failed(&config.eal_args, shared_eal, &e))
         })?;
@@ -169,6 +184,8 @@ impl NicHandle {
             DpdkShared::init_on(eal, &config, 1).map_err(|e| io::Error::other(e.to_string()))?;
         let gateway = config.gateway.zip(config.gateway_mac);
         let peer_mac = config.peer_mac;
+        let ip_addr = config.ip_addr;
+        let prefix_len = config.prefix_len;
         let transport_config = DpdkConfig {
             nic: config,
             ..DpdkConfig::default()
@@ -187,6 +204,9 @@ impl NicHandle {
             ports: LocalPorts::starting_from(std::process::id()),
             gateway,
             peer_mac,
+            ip_addr,
+            prefix_len,
+            port,
             tag: NEXT_HANDLE_TAG.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -196,28 +216,42 @@ impl NicHandle {
         self.transport.mac()
     }
 
-    /// The MAC a dial to `peer` seeds for it outside L3 mode, and where it
-    /// came from: the configured peer MAC, or the SR-IOV convention. A
-    /// wrong one is silent until a dial times out, so it is worth showing
-    /// before the dial. In L3 mode a dial goes through the gateway's MAC
-    /// instead, and this is not used; [`Self::next_hop`] covers both.
+    /// The MAC a dial to `peer` seeds for it, and where it came from: the
+    /// configured peer MAC, or the SR-IOV convention. Seeded on every dial
+    /// whatever the mode, since a peer on the NIC's own network is reached
+    /// directly even behind a gateway; [`Self::next_hop`] says which MAC a
+    /// given dial actually goes to.
     pub fn peer_mac(&self, peer: Ipv4Addr) -> ([u8; 6], PeerMacSource) {
         resolve_peer_mac(self.peer_mac, peer)
     }
 
-    /// Where a dial to `peer` sends its first frame: the gateway's MAC in
-    /// L3 mode, the peer's otherwise, with where it came from. What a
-    /// binary prints before dialing, with [`NextHop`]'s `Display` and
-    /// [`NextHop::warning`], so a wrong MAC is on the screen when the dial
-    /// times out on it.
+    /// Where a dial to `peer` sends its first frame: the gateway's MAC when
+    /// there is one and the peer is off the NIC's network, the peer's
+    /// otherwise, with where it came from. What a binary prints before
+    /// dialing ([`Self::connect_line`]), with [`NextHop::warning`] beside
+    /// it, so a wrong MAC is on the screen when the dial times out on it.
     pub fn next_hop(&self, peer: Ipv4Addr) -> NextHop {
-        match self.gateway {
-            Some((ip, mac)) => NextHop::Gateway { ip, mac },
-            None => {
-                let (mac, source) = resolve_peer_mac(self.peer_mac, peer);
-                NextHop::Peer { mac, source }
-            }
-        }
+        nic::next_hop(
+            self.gateway,
+            self.ip_addr,
+            self.prefix_len,
+            self.peer_mac,
+            peer,
+        )
+    }
+
+    /// The line a binary prints before dialing `peer`, as the shm-proxy
+    /// and the echo client print it: the NIC's first port, its address and
+    /// MAC, and the peer with [`Self::next_hop`]. A caller that wants the
+    /// derived-MAC warning as well prints [`NextHop::warning`] after it.
+    pub fn connect_line(&self, peer: SocketAddrV4) -> String {
+        format!(
+            "DPDK: port {} as {} ({}), server {peer} {}",
+            self.port,
+            self.ip_addr,
+            fmt_mac(self.mac()),
+            self.next_hop(*peer.ip())
+        )
     }
 
     /// A clock for a caller with none of its own: nanoseconds since the
@@ -291,13 +325,15 @@ impl NicHandle {
                 )
             })?;
 
+        // The peer's MAC is seeded whatever the mode, as a node seeds its
+        // primary's: behind a gateway a peer on the NIC's own network is
+        // still reached directly, and an entry for one off it goes unused.
+        // Re-seeded on every dial, so an expired neighbour entry cannot
+        // strand a reconnect. (The gateway is seeded by the transport on
+        // its own interval.)
+        let (peer_mac, _) = self.peer_mac(*peer.ip());
+        self.transport.seed_neighbor(*peer.ip(), peer_mac);
         let next_hop = self.next_hop(*peer.ip());
-        if let NextHop::Peer { mac, .. } = next_hop {
-            // Re-seeded on every dial, so an expired neighbour entry
-            // cannot strand a reconnect. (The gateway is seeded by the
-            // transport on its own interval.)
-            self.transport.seed_neighbor(*peer.ip(), mac);
-        }
         // Drain the injected ARP reply through the stack before the SYN is
         // built: from an empty cache the stack would ARP for the server, on
         // a port where the reply never arrives, and the SYN would wait on it.
