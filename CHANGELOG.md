@@ -189,7 +189,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the CI `dpdk` job builds, tests and documents `melin-client/dpdk`.
   `scripts/dpdk/dpdk-client-tap-smoke.sh` runs a DPDK echo client over a
   TAP device against a kernel echo server. For contributors; nothing ships
-  with it.
+  with it. The `shm-proxy` binary's DPDK path is tested there too, end to
+  end, with `melin-test-node`'s `dpdk_client_process_eal_args` putting it
+  on the client pair in a process of its own.
 
 ### Changed
 

@@ -293,6 +293,21 @@ pub fn client_vdev(iface: &str) -> (String, String) {
     (CLIENT_VDEV.to_owned(), format!("iface={iface}"))
 }
 
+/// EAL arguments for a process of its own on the DPDK client's pair: a
+/// sidecar a test runs as a child (the shm-proxy), which initializes EAL
+/// itself where the test process shares the launcher's. The launcher's
+/// own ([`eal_args`]), the client's af_packet device on `iface`
+/// ([`client_vdev`]) as the process's one port, and `file_prefix`, so
+/// that its EAL's runtime files stay apart from the test process's in the
+/// runner's private `/var/run`.
+pub fn client_process_eal_args(cpu: usize, iface: &str, file_prefix: &str) -> Vec<String> {
+    let (device, device_args) = client_vdev(iface);
+    let mut args = eal_args(cpu);
+    args.push(format!("--vdev={device},{device_args}"));
+    args.extend(["--file-prefix".to_owned(), file_prefix.to_owned()]);
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +561,17 @@ mod tests {
         for index in [0, 1, 2, 9, 10, 255] {
             assert_ne!(vdev(index, "dpdkc").0, name);
         }
+    }
+
+    /// A process of its own on the client pair: the launcher's arguments,
+    /// the client's device as its one port, and its own file prefix, as
+    /// one whitespace-separated string a binary's `--dpdk-eal-args` takes.
+    #[test]
+    fn a_client_process_has_the_device_and_a_prefix_of_its_own() {
+        assert_eq!(
+            client_process_eal_args(3, "dpdkc", "sidecar").join(" "),
+            "--no-huge -m 512 --no-pci -l 3 --vdev=net_af_packet_client,iface=dpdkc \
+             --file-prefix sidecar"
+        );
     }
 }

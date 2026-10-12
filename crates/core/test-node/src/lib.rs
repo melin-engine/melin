@@ -141,6 +141,9 @@ pub struct DpdkClient {
     pub ip: std::net::Ipv4Addr,
     /// The MAC of the client's interface, which its DPDK port takes.
     pub mac: [u8; 6],
+    /// The width of the runner's network, which the client's NIC takes
+    /// with its IP. `u8`, as `NicConfig::prefix_len` is.
+    pub prefix_len: u8,
 }
 
 /// The runner's seat for a client on DPDK. Panics when the process is not
@@ -185,11 +188,30 @@ pub fn mac_of(addr: SocketAddr) -> [u8; 6] {
 ///
 /// Panics when `config.eal_args` is not empty (the shared EAL is set up
 /// already, and a handle on it refuses arguments of its own), when called
-/// a second time in the process, when the process is not under the runner,
-/// or when the NIC cannot be brought up; each is a failed test.
+/// a second time in the process, after [`dpdk_client_process_eal_args`]
+/// has handed the device to a child, when the process is not under the
+/// runner, or when the NIC cannot be brought up; each is a failed test.
 #[cfg(feature = "dpdk")]
 pub fn open_dpdk_client(config: melin_dpdk::NicConfig) -> melin_dpdk::NicHandle {
     dpdk::open_client(config)
+}
+
+/// EAL arguments for a process of its own on the runner's client pair,
+/// for a test whose DPDK client is a separate binary it runs as a child
+/// (the shm-proxy): the launcher's (no hugepages, no PCI scan, the main
+/// lcore on the first CPU this process may use), the client's af_packet
+/// device as the process's one port (port 0), and `file_prefix`, which
+/// keeps that EAL's runtime files apart from this process's own. The
+/// child takes [`dpdk_client`]'s IP, prefix and MAC with them, and the
+/// node's MAC from [`mac_of`].
+///
+/// The child owns the client pair's device in its process, so this
+/// process must not open it too: panics if [`open_dpdk_client`] has been
+/// called, and makes a later call to it panic; panics too when the process
+/// is not under the runner.
+#[cfg(feature = "dpdk")]
+pub fn dpdk_client_process_eal_args(file_prefix: &str) -> Vec<String> {
+    dpdk::client_process_eal_args(file_prefix)
 }
 
 /// A node running on its own thread of this process.
@@ -577,6 +599,12 @@ mod dpdk {
     /// is attached once and never detached (see [`open_client`]).
     static CLIENT_OPENED: AtomicBool = AtomicBool::new(false);
 
+    /// Whether this process has handed the client pair's device to a child
+    /// (see [`client_process_eal_args`]), which then owns it: this process
+    /// must not open it as well. Never cleared: the launcher cannot tell
+    /// when the child has let the device go.
+    static CLIENT_HANDED_OUT: AtomicBool = AtomicBool::new(false);
+
     /// `mac`, a MAC the layout has already checked.
     fn mac_bytes(mac: &str) -> [u8; 6] {
         try_parse_mac(mac).unwrap_or_else(|e| panic!("the runner's layout: {e}"))
@@ -591,7 +619,18 @@ mod dpdk {
         DpdkClient {
             ip: seat.ip,
             mac: mac_bytes(&seat.mac),
+            prefix_len: layout().prefix_len,
         }
+    }
+
+    pub(super) fn client_process_eal_args(file_prefix: &str) -> Vec<String> {
+        assert!(
+            !CLIENT_OPENED.load(Ordering::Relaxed),
+            "this process has opened the DPDK client's NIC, so a child cannot take the client \
+             pair's device too: run the child's client in a test binary that does not open one"
+        );
+        CLIENT_HANDED_OUT.store(true, Ordering::Relaxed);
+        layout::client_process_eal_args(first_allowed_cpu(), &client_seat().iface, file_prefix)
     }
 
     pub(super) fn mac_of(addr: SocketAddr) -> [u8; 6] {
@@ -623,6 +662,12 @@ mod dpdk {
             config.eal_args.join(" ")
         );
         let seat = client_seat();
+        assert!(
+            !CLIENT_HANDED_OUT.load(Ordering::Relaxed),
+            "this process has handed the DPDK client pair's device to a child \
+             (dpdk_client_process_eal_args), which owns it: open the client's NIC in a test \
+             binary that does not hand it out"
+        );
         assert!(
             !CLIENT_OPENED.swap(true, Ordering::Relaxed),
             "the DPDK client's NIC is already open in this process: keep the handle and dial \

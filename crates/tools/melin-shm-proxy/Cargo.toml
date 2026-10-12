@@ -38,9 +38,28 @@ melin-dpdk = { workspace = true, optional = true, features = ["clap"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The DPDK bridge test (`tests/dpdk_bridge.rs`): an echo node on DPDK,
+# started through the launcher under the netns runner, for the binary to
+# dial. Path-only, like every crate's dev-dependency on the launcher and
+# the examples: both are `publish = false`.
+melin-test-node = { path = "../../core/test-node" }
+melin-example-echo = { path = "../../examples/echo" }
+melin-server-runtime = { workspace = true }
+# The test's own client on the far side of the rings speaks the protocol
+# with the client crate's I/O-free pieces, as the Java rig does with its
+# own. A dev-dependency only: the binary depends on no client crate.
+melin-client = { workspace = true }
 
 [features]
 default = []
 # `--transport dpdk`. Needs libdpdk to build, like `melin-server-runtime/dpdk`;
 # without the feature the binary still builds and runs over kernel TCP.
-dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
+# The launcher's and the echo example's `dpdk` too, for the bridge test's
+# node (dev-dependencies, so the binary's build is unchanged).
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "melin-test-node/dpdk", "melin-example-echo/dpdk"]
+
+# Runs the binary over DPDK against a node on DPDK, so only with the
+# feature, and only under `scripts/dpdk/netns-runner.sh`.
+[[test]]
+name = "dpdk_bridge"
+required-features = ["dpdk"]
