@@ -37,6 +37,7 @@ use super::{
     take_pipeline_for_promotion, teardown_replica_pipeline,
 };
 use melin_app::auth::AuthorizedKeys;
+use melin_transport_core::replication::PersistWatch;
 use melin_transport_core::replication::catchup::CatchUpPublisher;
 use melin_transport_core::replication::handoff::{
     HandoffIo, HandoffStep, LiveHandoff, PassProgress,
@@ -486,6 +487,9 @@ struct DpdkReplicaSlot {
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
     last_send: std::time::Instant,
+    /// Warns when the replica keeps accepting entries but persists none.
+    /// Fresh for each connection, from the moment it streams live.
+    persist_watch: PersistWatch,
     /// Sent high-water for the current connection — the ack-sanity
     /// bound and the heartbeat sequence. Meaningless while `Idle`;
     /// re-seeded on every handshake. See `SentHighWater`.
@@ -714,6 +718,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     recv_buf: Vec::with_capacity(4096),
                     send_buf: Vec::with_capacity(512 * 1024),
                     last_send: now,
+                    persist_watch: PersistWatch::default(),
                     // Placeholder until the slot engages — re-seeded on
                     // every handshake.
                     sent: SentHighWater::seed(0, 0),
@@ -731,6 +736,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     recv_buf: Vec::with_capacity(4096),
                     send_buf: Vec::with_capacity(512 * 1024),
                     last_send: now,
+                    persist_watch: PersistWatch::default(),
                     // Placeholder until the slot engages — re-seeded on
                     // every handshake.
                     sent: SentHighWater::seed(0, 0),
@@ -1312,6 +1318,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot.sent = sent;
                             slot.join = None;
                             slot.last_send = now;
+                            slot.persist_watch = PersistWatch::default();
                             replica_ready.store(true, Ordering::Release);
                             metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
                             slot.state = SlotState::Streaming(handle);
@@ -1335,6 +1342,8 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // ack's store would only overwrite an earlier one, and
                     // this poll thread is also client ingress.
                     let mut acked = false;
+                    // When this tick's acks arrived, read once, on the first.
+                    let mut ack_received: Option<std::time::Instant> = None;
                     loop {
                         let remaining = &slot.recv_buf[consumed..];
                         match try_extract_frame(remaining, MAX_CONTROL_FRAME) {
@@ -1352,6 +1361,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         break;
                                     }
                                     acked = true;
+                                    let received =
+                                        *ack_received.get_or_insert_with(std::time::Instant::now);
+                                    if let Some(event) = slot.persist_watch.observe(&ack, received)
+                                    {
+                                        event.log(slot_idx);
+                                    }
                                 }
                                 consumed += frame_end;
                             }

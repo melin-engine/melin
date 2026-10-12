@@ -192,6 +192,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   with it. The `shm-proxy` binary's DPDK path is tested there too, end to
   end, with `melin-test-node`'s `dpdk_client_process_eal_args` putting it
   on the client pair in a process of its own.
+- **The primary warns when a replica accepts entries but persists none.**
+  A replica whose journal stops advancing while it keeps taking entries
+  still satisfies an ack policy that counts in-memory confirmations, and
+  used to go unnoticed until its input ring filled and it was evicted for
+  ring backpressure. After 5 s of entries pending with nothing persisted,
+  the primary now logs a warning naming the replica's slot and both
+  positions, and logs again when it persists once more.
 
 ### Changed
 

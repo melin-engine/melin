@@ -871,6 +871,8 @@ fn live_stream_uring(
     let mut send_offset: usize = 0;
     let mut waiter = wait.waiter();
     let mut heartbeat_timer = melin_app::amortized_timer::AmortizedTimer::new();
+    // Warns when the replica keeps accepting entries but persists none.
+    let mut persist_watch = melin_transport_core::replication::PersistWatch::default();
 
     // Diagnostic (RUST_LOG=debug): per-slot TCP_INFO snapshot once a
     // second, slow-SEND detection (CQE elapsed >= threshold), and a
@@ -1034,6 +1036,7 @@ fn live_stream_uring(
                     let n = result as usize;
                     parse_buf.extend_from_slice(&recv_buf[..n]);
 
+                    let received = std::time::Instant::now();
                     drain_ack_frames(&mut parse_buf, |ack| {
                         // Eviction on violation: returning Err tears the
                         // connection down; the accept loop's cleanup
@@ -1043,6 +1046,9 @@ fn live_stream_uring(
                             .map_err(io::Error::other)?;
                         metrics.ack_latency_us[slot_idx]
                             .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        if let Some(event) = persist_watch.observe(&ack, received) {
+                            event.log(slot_idx);
+                        }
                         Ok(())
                     })?;
 
