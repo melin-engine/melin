@@ -4,14 +4,13 @@ Status: **implemented in this repository** (2026-10): steps 1 to 7 of the
 order of work, the factoring, the NIC handle with the proxy on it, the
 polled connection, the client's `dpdk` feature, the test rig with the TAP
 smoke script and CI, the echo client's `--transport dpdk` and `--core`,
-and the docs, are done. Two things remain. Step 8, the exchange's bench
-onto the NIC handle, is the Exchange Core's, on the first sequencer
-release that carries steps 1 to 4. And step 6's acceptance, a pass of
-`scripts/dpdk/dpdk-client-tap-smoke.sh` on a host with libdpdk, root,
-hugepages and `/dev/net/tun`, is still to come: the DPDK code has since
-been built against libdpdk and its suites run under the netns runner,
-but the smoke script has not run. Implemented the roadmap item "DPDK
-support in `melin-client`", since removed from the roadmap.
+and the docs, are done, and accepted: the DPDK suites pass under the
+netns runner, and `scripts/dpdk/dpdk-client-tap-smoke.sh` has passed on
+a host with libdpdk. One thing remains. Step 8, the
+exchange's bench onto the NIC handle, is the Exchange Core's, on the
+first sequencer release that carries steps 1 to 4. Implemented the
+roadmap item "DPDK support in `melin-client`", since removed from the
+roadmap.
 
 The one-line goal: **a client links `melin-client`, turns on one feature,
 and talks to a node over kernel bypass with the same protocol code the
@@ -559,12 +558,11 @@ Each step is a commit, reviewed before the next.
    pair, the launcher's helper, the DPDK client cases in the echo and
    counter round trips, the smoke script, and `melin-client/dpdk` on the
    CI job.
-6. **The echo client's transport flag.** Accepted once
-   `scripts/dpdk/dpdk-client-tap-smoke.sh` has passed on a host with
-   libdpdk: the first run is what confirms the script's two runtime
-   assumptions, that its set-then-read-back loop settles the net_tap PMD's
-   MAC rewrite, and that the client's dial deadline outlasts the kernel
-   side's bring-up.
+6. **The echo client's transport flag.** Accepted on the first pass of
+   `scripts/dpdk/dpdk-client-tap-smoke.sh` on a host with libdpdk, which
+   confirmed the script's two runtime assumptions: its set-then-read-back
+   loop settles the net_tap PMD's MAC rewrite, and the client's dial
+   deadline outlasts the kernel side's bring-up.
 7. **Docs**, the divergences entry included.
 8. **The exchange's bench onto the handle**, in that repository, once the
    release carrying steps 1 to 4 is out and its sequencer pins move.
