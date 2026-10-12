@@ -996,6 +996,7 @@ version = "0.19.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
+ "melin-dpdk",
  "melin-wire-protocol",
  "proptest",
  "socket2",
@@ -1007,6 +1008,7 @@ version = "0.19.0"
 dependencies = [
  "bindgen",
  "cc",
+ "clap",
  "fastcp",
  "libc",
  "pkg-config",
@@ -1034,6 +1036,7 @@ dependencies = [
  "clap",
  "melin-app",
  "melin-client",
+ "melin-dpdk",
  "melin-journal",
  "melin-server-runtime",
  "melin-test-node",
@@ -1139,7 +1142,6 @@ name = "melin-shm-proxy"
 version = "0.19.0"
 dependencies = [
  "clap",
- "fastcp",
  "hdrhistogram",
  "libc",
  "melin-app",

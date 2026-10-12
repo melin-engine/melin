@@ -9,7 +9,8 @@
 #   3. cargo clippy on all targets with warnings as errors
 #   4. cargo doc with warnings as errors (intra-doc links)
 #   5. non-default configurations: the chain-less build
-#      (`--no-default-features`), `no-persist` builds and passes its tests
+#      (`--no-default-features`), `no-persist` builds and passes its tests,
+#      `melin-dpdk` builds bare and passes its tests with `clap`
 #   6. cargo nextest run, falling back to cargo test if nextest is missing
 
 set -e
@@ -118,6 +119,21 @@ fi
 if ! cargo check -p melin-server-runtime --all-targets --features no-persist 2>"$STDERR_LOG"; then
     cat "$STDERR_LOG" >&2
     echo "error: melin-server-runtime does not build with --features no-persist."
+    exit 1
+fi
+
+# `melin-dpdk` on its own: with no feature it must build without libdpdk
+# and without clap, and with `clap` its flag declaration's tests run here
+# whether or not a dependent in the workspace turns the feature on for
+# step 6.
+if ! cargo check -p melin-dpdk --all-targets 2>"$STDERR_LOG"; then
+    cat "$STDERR_LOG" >&2
+    echo "error: melin-dpdk does not build without features."
+    exit 1
+fi
+if ! cargo test -q -p melin-dpdk --features clap --lib >"$STDERR_LOG" 2>&1; then
+    cat "$STDERR_LOG" >&2
+    echo "error: melin-dpdk fails with --features clap."
     exit 1
 fi
 

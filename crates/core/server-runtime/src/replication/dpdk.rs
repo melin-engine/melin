@@ -1744,16 +1744,35 @@ where
         const REPL_RX_BUF: usize = 512 * 1024;
         const REPL_TX_BUF: usize = 64 * 1024;
         const REPL_TX_QUEUE: usize = 64 * 1024;
-        let handle = transport.connect_to_with_buffers(
+        let dial_port = local_port;
+        local_port = local_port.wrapping_add(1).max(40000);
+        let handle = match transport.connect_to_with_buffers(
             primary_ip,
             primary_port,
-            local_port,
+            dial_port,
             REPL_RX_BUF,
             REPL_TX_BUF,
             REPL_TX_QUEUE,
             REPL_DISPATCH_BURST,
-        );
-        local_port = local_port.wrapping_add(1).max(40000);
+        ) {
+            Ok(handle) => handle,
+            // The stack would not open the socket (an endpoint it cannot
+            // address): a dial that failed before its SYN, on the same
+            // retry path as one that got no answer. No socket was added,
+            // so there is nothing to reset.
+            Err(e) => {
+                warn!(
+                    primary_ip = %primary_ip,
+                    primary_port,
+                    local_port = dial_port,
+                    error = ?e,
+                    backoff_secs = backoff.as_secs(),
+                    "the stack refused to open a connection to the primary (DPDK) — retrying"
+                );
+                sleep_then_double_backoff(&mut backoff, shutdown, promote);
+                continue;
+            }
+        };
 
         // Poll until TCP handshake completes (with timeout).
         let connect_start = std::time::Instant::now();

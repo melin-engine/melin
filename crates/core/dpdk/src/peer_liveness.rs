@@ -11,8 +11,9 @@
 //!   handled by the TCP stack. A peer whose stack still answers is alive,
 //!   however long its application stays quiet; a peer that answers
 //!   nothing for the timeout is gone, and the socket is reset.
-//! - **Telling the peer** (`abort_announced`): a socket being closed
-//!   sends its RST before it is removed, rather than vanishing.
+//! - **Telling the peer** (`abort_announced`, and `reset_announced` for
+//!   the whole hand-back): a socket being closed sends its RST before it
+//!   is removed, rather than vanishing.
 //!
 //! `link_up` is the matching test on the receiving side: a link is up
 //! while both halves are open, so a peer's FIN ends it as surely as an
@@ -145,6 +146,36 @@ pub(crate) fn abort_announced<D: Device + ?Sized>(
     true
 }
 
+/// Reset a connection and take its socket out of the set, in the one
+/// order that gets the RST to the peer: abort the socket, run one egress
+/// pass ([`abort_announced`]), `flush` the device, and only then remove
+/// the socket. Returns `false` if `handle` was no longer in the set (the
+/// device is flushed all the same).
+///
+/// Removing the socket before the egress pass would drop its RST on the
+/// floor every time, and leave the peer holding the connection until its
+/// own deadline. One pass, best effort, as in `abort_announced`.
+///
+/// The interface indexes established connections by four-tuple and cannot
+/// see a removal from the set, so the socket is also forgotten there: a
+/// stale entry would hold a slot of the index for the life of the process.
+pub(crate) fn reset_announced<D: Device + ?Sized>(
+    iface: &mut Interface,
+    device: &mut D,
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    now: Instant,
+    flush: impl FnOnce(&mut D),
+) -> bool {
+    let announced = abort_announced(iface, device, sockets, handle, now);
+    flush(device);
+    if announced {
+        sockets.remove(handle);
+        iface.forget_tcp_socket(handle);
+    }
+    announced
+}
+
 /// The TCP stack's clock: milliseconds that only move forward.
 ///
 /// smoltcp's timers (retransmission, keep-alive, the liveness timeout)
@@ -194,84 +225,10 @@ impl StackClock {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::VecDeque;
     use std::rc::Rc;
 
-    use smoltcp::iface::Config;
-    use smoltcp::phy::{DeviceCapabilities, Medium};
-    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-
     use super::*;
-
-    /// Two nodes' frames in flight. `VecDeque`: frames are delivered in
-    /// the order they were sent, from the front.
-    #[derive(Default)]
-    struct Wire {
-        inbox: [VecDeque<Vec<u8>>; 2],
-        /// Frames sent while set are lost: a cut link.
-        cut: bool,
-    }
-
-    /// One node's end of the wire.
-    struct End {
-        wire: Rc<RefCell<Wire>>,
-        side: usize,
-    }
-
-    struct Rx(Vec<u8>);
-
-    struct Tx {
-        wire: Rc<RefCell<Wire>>,
-        to: usize,
-    }
-
-    impl smoltcp::phy::RxToken for Rx {
-        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-            f(&self.0)
-        }
-    }
-
-    impl smoltcp::phy::TxToken for Tx {
-        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-            let mut frame = vec![0u8; len];
-            let r = f(&mut frame);
-            let mut wire = self.wire.borrow_mut();
-            if !wire.cut {
-                wire.inbox[self.to].push_back(frame);
-            }
-            r
-        }
-    }
-
-    impl Device for End {
-        type RxToken<'a> = Rx;
-        type TxToken<'a> = Tx;
-
-        fn receive(&mut self, _: Instant) -> Option<(Rx, Tx)> {
-            let frame = self.wire.borrow_mut().inbox[self.side].pop_front()?;
-            Some((Rx(frame), self.tx()))
-        }
-
-        fn transmit(&mut self, _: Instant) -> Option<Tx> {
-            Some(self.tx())
-        }
-
-        fn capabilities(&self) -> DeviceCapabilities {
-            let mut caps = DeviceCapabilities::default();
-            caps.medium = Medium::Ethernet;
-            caps.max_transmission_unit = 1514;
-            caps
-        }
-    }
-
-    impl End {
-        fn tx(&self) -> Tx {
-            Tx {
-                wire: Rc::clone(&self.wire),
-                to: 1 - self.side,
-            }
-        }
-    }
+    use crate::test_wire::{End, Wire, interface, ip};
 
     struct Node {
         iface: Interface,
@@ -284,21 +241,8 @@ mod tests {
 
     impl Node {
         fn new(wire: &Rc<RefCell<Wire>>, side: usize, now: Instant) -> Self {
-            let mut device = End {
-                wire: Rc::clone(wire),
-                side,
-            };
-            let mac = EthernetAddress([0x02, 0, 0, 0, 0, side as u8 + 1]);
-            let mut iface = Interface::new(
-                Config::new(HardwareAddress::Ethernet(mac)),
-                &mut device,
-                now,
-            );
-            iface.update_ip_addrs(|addrs| {
-                addrs
-                    .push(IpCidr::new(IpAddress::Ipv4(ip(side)), 24))
-                    .unwrap();
-            });
+            let mut device = End::new(wire, side);
+            let iface = interface(&mut device, side, now);
             let mut sockets = SocketSet::new(Vec::new());
             let socket = tcp::Socket::new(
                 tcp::SocketBuffer::new(vec![0; 4096]),
@@ -321,10 +265,6 @@ mod tests {
         fn link_up(&mut self) -> bool {
             link_up(self.socket())
         }
-    }
-
-    fn ip(side: usize) -> Ipv4Address {
-        Ipv4Address::new(10, 0, 0, side as u8 + 1)
     }
 
     const PORT: u16 = 7000;
@@ -555,6 +495,56 @@ mod tests {
             took + RULE.probe_interval() >= RULE.timeout(),
             "took {took:?}"
         );
+    }
+
+    /// The reset's order: by the time the device is flushed the RST is
+    /// already on the wire and the socket still in the set; once the call
+    /// returns the socket is gone, and the peer's link is down at once.
+    #[test]
+    fn a_reset_sends_its_rst_before_the_socket_is_removed() {
+        let mut pair = Pair::connected(RULE);
+        let wire = Rc::clone(&pair.wire);
+        let node = &mut pair.nodes[0];
+        let handle = node.handle;
+        let mut flushed = false;
+        assert!(reset_announced(
+            &mut node.iface,
+            &mut node.device,
+            &mut node.sockets,
+            handle,
+            pair.now,
+            |_device| {
+                flushed = true;
+                assert!(
+                    !wire.borrow().inbox[1].is_empty(),
+                    "the egress pass ran before the flush"
+                );
+            },
+        ));
+        assert!(flushed);
+        assert!(node.sockets.try_get_mut::<tcp::Socket>(handle).is_none());
+        node.alive = false;
+        let took = pair
+            .run_until(RULE.timeout(), |p| !p.nodes[1].link_up())
+            .expect("the peer sees the reset");
+        assert!(took <= STEP * 2, "took {took:?}");
+    }
+
+    #[test]
+    fn resetting_a_removed_socket_still_flushes() {
+        let mut pair = Pair::connected(RULE);
+        let node = &mut pair.nodes[0];
+        node.sockets.remove(node.handle);
+        let mut flushed = false;
+        assert!(!reset_announced(
+            &mut node.iface,
+            &mut node.device,
+            &mut node.sockets,
+            node.handle,
+            pair.now,
+            |_device| flushed = true,
+        ));
+        assert!(flushed);
     }
 
     #[test]

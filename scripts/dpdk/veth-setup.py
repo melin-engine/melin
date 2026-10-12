@@ -12,12 +12,16 @@
 #
 #   BRIDGE  (CLIENT_IP/PREFIX_LEN, MAC CLIENT_MAC: the kernel side)
 #     +-- <DPDK_IFACE>-br <-> DPDK_IFACE (MAC as given, no address: DPDK's
-#     |                                   userspace stack owns the node's IP)
-#     +-- ...one veth pair per node slot
+#     |                                   userspace stack owns the IP)
+#     +-- ...one veth pair per node slot, and one for a DPDK client
+#
+# Every DPDK_IFACE=MAC argument is built alike, whoever attaches to it: the
+# runner passes the node slots' pairs and then the DPDK client's, which
+# differs from a slot only in what the runner publishes about it.
 #
 # MACs are set rather than left random so the layout can be published
-# before any node runs: a DPDK replica dials its primary with the
-# primary's MAC already known.
+# before any node runs: a DPDK replica dials its primary, and a DPDK
+# client its node, with the peer's MAC already known.
 #
 # Every interface comes up, and `lo` too, for the endpoints that stay on
 # kernel TCP.
@@ -50,7 +54,8 @@ IFF_UP = 0x1
 SIOCETHTOOL, ETHTOOL_STXCSUM = 0x8946, 0x17
 # Linux's IFNAMSIZ, NUL included.
 IFNAMSIZ = 16
-# Appended to a node slot's interface to name its bridge-side peer.
+# Appended to a node slot's or the DPDK client's interface to name its
+# bridge-side peer.
 BRIDGE_PORT_SUFFIX = "-br"
 
 

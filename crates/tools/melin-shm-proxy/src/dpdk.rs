@@ -1,10 +1,13 @@
 //! The client side over DPDK: TCP in userspace, polled from this thread,
 //! on a NIC the kernel never sees.
 //!
-//! The socket is driven directly -- `send_slice` into it, then the stack
-//! polled and the NIC flushed in the same iteration -- rather than through
-//! the runtime's transport and its queue. Whatever the loop found in the
-//! rings is on the wire before it turns.
+//! The NIC is `melin-dpdk`'s client NIC handle: the node's own transport,
+//! listening on no port, with one stream dialed on it. The stream's send
+//! goes straight into its socket, and the service step polls the device,
+//! runs the stack and flushes the NIC in the same iteration, so whatever
+//! the loop found in the rings is on the wire before it turns. The step
+//! runs on this proxy's calibrated clock: the loop already reads it, and
+//! passes the reading on.
 //!
 //! What the client has to know that the kernel would have found out for
 //! it: its own address (`--dpdk-ip`), and the server's MAC. The second is
@@ -15,20 +18,16 @@
 //! the SR-IOV convention. That convention is wrong wherever the port keeps
 //! a real hardware address -- an AWS ENI does -- and being wrong is silent:
 //! frames go to a MAC nothing owns and the connect times out. On such a
-//! fabric the flag is not optional.
+//! fabric the flag is not optional. Behind a gateway that shares the port
+//! with the kernel (`--dpdk-gateway-mac`), the gateway's MAC is seeded
+//! instead, and that is the one to get right.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 
 use clap::Args;
-use melin_dpdk::device::DpdkDevice;
-use melin_dpdk::{Eal, Mempool, PeerMacSource, Port, resolve_peer_mac, try_parse_mac};
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::tcp::{self, State};
-use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use melin_dpdk::{DpdkArgsError, NicConfig, NicHandle, StreamId};
 
-use crate::arp;
 use crate::transport::Transport;
 use crate::tsc::{TscClock, rdtscp};
 
@@ -37,283 +36,183 @@ use crate::tsc::{TscClock, rdtscp};
 /// hundred microseconds -- and a full buffer is not an error here, only a
 /// send that takes fewer bytes; this keeps it rare.
 const SOCKET_BUFFER: usize = 256 * 1024;
-/// Packet buffers for one port at one queue. Plenty for one connection.
-const MBUFS: u32 = 8192;
 /// How long the TCP handshake may take before the connect is called off.
 /// Well past any real handshake; long enough to see a wrong peer MAC as
 /// a timeout rather than a hang.
 const CONNECT_TIMEOUT_NS: u64 = 5_000_000_000;
 
-#[derive(Args)]
-pub struct DpdkArgs {
-    /// EAL arguments, space separated, passed straight to `rte_eal_init`.
-    /// The `=` is required, same as the server's flag: the value starts
-    /// with a dash, and requiring the joined form keeps a forgotten value
-    /// from silently swallowing the next flag as the EAL string.
-    #[arg(
-        long,
-        require_equals = true,
-        default_value = "--huge-dir /dev/hugepages --file-prefix shm-proxy"
-    )]
-    pub dpdk_eal_args: String,
+/// The proxy's EAL arguments when `--dpdk-eal-args` is not given (the
+/// node's flag defaults to none): a file prefix of its own, so that it
+/// can start beside a node, and the usual hugepage mount.
+const DEFAULT_EAL_ARGS: &str = "--huge-dir /dev/hugepages --file-prefix shm-proxy";
+
+/// The `--dpdk-*` flags: the node's own declaration (`melin-dpdk`), with
+/// the proxy's EAL default, and its single `--dpdk-port`, which predates
+/// the list and stays as the harness scripts use it. `--dpdk-ports`
+/// replaces it for a bond, the two conflict, and the list has no default
+/// here so that an empty one means it was not given: then the port is
+/// `--dpdk-port`'s, 0 by default.
+// `about = None`: this doc comment is not the proxy's about text.
+#[derive(Args, Debug)]
+#[command(
+    about = None,
+    long_about = None,
+    mut_arg("dpdk_eal_args", |arg| arg.default_value(DEFAULT_EAL_ARGS)),
+    mut_arg("dpdk_ports", |arg| arg.default_value(None::<&'static str>))
+)]
+pub struct ProxyDpdkArgs {
+    #[command(flatten)]
+    pub nic: melin_dpdk::DpdkArgs,
     /// DPDK port ID of the NIC to take over.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, conflicts_with = "dpdk_ports")]
     pub dpdk_port: u16,
-    /// This client's IPv4 address on the DPDK interface. Must be the one
-    /// the fabric assigned to it: a VPC drops a source it does not own.
-    #[arg(long)]
-    pub dpdk_ip: Option<Ipv4Addr>,
-    #[arg(long, default_value_t = 24)]
-    pub dpdk_prefix_len: u8,
-    /// Default route, for a server outside the prefix.
-    #[arg(long)]
-    pub dpdk_gateway: Option<Ipv4Addr>,
-    /// The server's MAC. See the module documentation for why this is
-    /// required on a fabric that assigns addresses itself.
-    #[arg(long)]
-    pub dpdk_peer_mac: Option<String>,
-    /// Must match the server's.
-    #[arg(long, default_value_t = 1500)]
-    pub dpdk_mtu: usize,
+}
+
+impl ProxyDpdkArgs {
+    /// The flags as the NIC handle's configuration: the node's mapping and
+    /// validation, `--dpdk-ip` required, and `--dpdk-port` as the one port
+    /// when `--dpdk-ports` is not given.
+    fn nic_config(&self) -> Result<NicConfig, DpdkArgsError> {
+        if self.nic.ports.is_empty() {
+            melin_dpdk::DpdkArgs {
+                ports: vec![self.dpdk_port],
+                ..self.nic.clone()
+            }
+            .nic_config()
+        } else {
+            self.nic.nic_config()
+        }
+    }
 }
 
 pub struct DpdkTcp {
-    // Declaration order is drop order: the stack and device go before the
-    // port, pool and EAL they were built on.
-    sockets: SocketSet<'static>,
-    iface: Interface,
-    device: DpdkDevice,
-    handle: SocketHandle,
-    /// The stack's clock, refreshed from the calibrated counter on every
-    /// poll: millisecond resolution is all its timers need, and no clock
-    /// call is made for it.
-    now: Instant,
-    _port: Port,
-    _mempool: Mempool,
-    _eal: Eal,
+    /// The one stream, dialed on `nic`. Closed with the handle: dropping
+    /// the handle resets every stream still open before the NIC goes.
+    stream: StreamId,
+    nic: NicHandle,
 }
 
 impl DpdkTcp {
     pub fn connect(
-        args: &DpdkArgs,
+        args: &ProxyDpdkArgs,
         server: SocketAddrV4,
         clock: &TscClock,
     ) -> Result<Self, String> {
-        let local_ip = args
-            .dpdk_ip
-            .ok_or("--dpdk-ip is required with --transport dpdk")?;
-        let peer_mac = args
-            .dpdk_peer_mac
-            .as_deref()
-            .map(try_parse_mac)
-            .transpose()
-            .map_err(|e| format!("--dpdk-peer-mac: {e}"))?;
-
-        let eal_args: Vec<&str> = args.dpdk_eal_args.split_whitespace().collect();
-        let eal = Eal::init(&eal_args).map_err(|e| format!("EAL init failed: {e:?}"))?;
-        if args.dpdk_port >= eal.port_count() {
-            return Err(format!(
-                "DPDK port {} not found ({} available)",
-                args.dpdk_port,
-                eal.port_count()
-            ));
+        let config = args.nic_config().map_err(|e| e.to_string())?;
+        let mut nic = NicHandle::open(&config).map_err(|e| e.to_string())?;
+        // The connect line: where the dial goes, before it goes, since a
+        // wrong MAC shows only as a dial that times out.
+        eprintln!("{}", nic.connect_line(server));
+        if let Some(warning) = nic.next_hop(*server.ip()).warning() {
+            eprintln!("warning: {warning}");
         }
 
-        let mempool = if args.dpdk_mtu > 1500 {
-            // u16: the largest MTU any NIC takes fits comfortably.
-            Mempool::create_for_mtu("shm-proxy", MBUFS, args.dpdk_mtu as u16, 0)
-        } else {
-            Mempool::create_with_size("shm-proxy", MBUFS, 0)
-        }
-        .map_err(|e| format!("mempool: {e:?}"))?;
-
-        let mut port = Port::configure(args.dpdk_port, &mempool, None, 1, false)
-            .map_err(|e| format!("port {} configure: {e:?}", args.dpdk_port))?;
-        port.start()
-            .map_err(|e| format!("port {} start: {e:?}", args.dpdk_port))?;
-        let mac = port.mac_addr();
-
-        let mut device = DpdkDevice::new(&[args.dpdk_port], mempool.as_raw(), port.offloads, 0);
-        if args.dpdk_mtu != 1500 {
-            device.set_mtu(args.dpdk_mtu);
-        }
-
-        let mut now = stack_time(clock);
-        let mut iface = Interface::new(
-            Config::new(HardwareAddress::Ethernet(EthernetAddress(mac))),
-            &mut device,
-            now,
-        );
-        let ip = ipv4(local_ip);
-        iface.update_ip_addrs(|addrs| {
-            addrs
-                .push(IpCidr::new(IpAddress::Ipv4(ip), args.dpdk_prefix_len))
-                .expect("a fresh interface has room for one address");
-        });
-        if let Some(gateway) = args.dpdk_gateway {
-            iface
-                .routes_mut()
-                .add_default_ipv4_route(ipv4(gateway))
-                .expect("a fresh interface has room for one route");
-        }
-
-        // Announce ourselves to the fabric, and seed the server into our
-        // own neighbour cache by injecting the reply we would like to
-        // have received.
-        device.send_raw_frame(&arp::gratuitous_request(mac, local_ip.octets()));
-        let (server_mac, source) = resolve_peer_mac(peer_mac, *server.ip());
-        device.inject_rx(
-            arp::reply(mac, local_ip.octets(), server_mac, server.ip().octets()).to_vec(),
-        );
-        let mut sockets = SocketSet::new(Vec::new());
-        device.poll_rx();
-        iface.poll(now, &mut device, &mut sockets);
-        device.flush_tx();
-        let source = match source {
-            PeerMacSource::Supplied => "supplied",
-            PeerMacSource::DerivedSrIov => "derived from the IP by the SR-IOV convention",
-        };
-        eprintln!(
-            "DPDK: port {} as {local_ip} ({}), server {server} at {} ({source})",
-            args.dpdk_port,
-            fmt_mac(mac),
-            fmt_mac(server_mac)
-        );
-        if peer_mac.is_none() {
-            eprintln!(
-                "warning: no --dpdk-peer-mac; on a fabric that assigns MACs itself (an AWS ENI) \
-                 the derived address is wrong and the connect below will time out"
-            );
-        }
-
-        let rx = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUFFER]);
-        let tx = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUFFER]);
-        let mut socket = tcp::Socket::new(rx, tx);
-        tune(&mut socket);
-        // A different ephemeral port per process, so a socket left in
-        // TIME_WAIT by the previous run does not collide. The truncation
-        // is the point: any value in the range will do.
-        let local_port = 49_152 + (std::process::id() as u16 % 8_192);
-        socket
-            .connect(
-                iface.context(),
-                (IpAddress::Ipv4(ipv4(*server.ip())), server.port()),
-                (IpAddress::Ipv4(ip), local_port),
-            )
-            .map_err(|e| format!("connect to {server}: {e:?}"))?;
-        let handle = sockets.add(socket);
-
-        let deadline = rdtscp().saturating_add(clock.ticks(CONNECT_TIMEOUT_NS));
-        loop {
-            let tick = rdtscp();
-            if tick >= deadline {
-                return Err(format!(
-                    "TCP connect to {server} over DPDK timed out: no SYN-ACK. \
-                     Is the server's DPDK interface up, and is --dpdk-peer-mac its real MAC?"
-                ));
-            }
-            now = stack_time_at(clock, tick);
-            device.poll_rx();
-            iface.poll(now, &mut device, &mut sockets);
-            device.flush_tx();
-            match sockets.get_mut::<tcp::Socket>(handle).state() {
-                State::Established => break,
-                State::Closed | State::TimeWait => {
-                    return Err(format!("TCP connect to {server} over DPDK was refused"));
-                }
-                _ => {}
-            }
-        }
-
-        Ok(Self {
-            sockets,
-            iface,
-            device,
-            handle,
-            now,
-            _port: port,
-            _mempool: mempool,
-            _eal: eal,
-        })
+        // The loop's clock drives the stack from the first SYN on. A dial
+        // that fails is reported with the handle's own message: a timeout
+        // names the MAC the SYN went to, the first thing to check.
+        let deadline = clock.unix_ns(rdtscp()).saturating_add(CONNECT_TIMEOUT_NS);
+        let stream = nic
+            .dial(server, SOCKET_BUFFER, deadline, || clock.unix_ns(rdtscp()))
+            .map_err(|e| e.to_string())?;
+        Ok(Self { stream, nic })
     }
-}
-
-/// The runtime's own low-latency TCP settings, applied to this socket.
-fn tune(socket: &mut tcp::Socket<'_>) {
-    socket.set_nagle_enabled(false);
-    socket.set_ack_delay(None);
-    // The stack's retransmit floor. Its estimator is whole milliseconds,
-    // so this is as low as it goes; the default is tuned for the
-    // internet and would stall a lost segment for tens of milliseconds.
-    socket.set_min_rto(smoltcp::time::Duration::from_millis(1));
-    socket.set_initial_rto(smoltcp::time::Duration::from_millis(1));
-    socket.set_initial_congestion_window(64 * 1024);
-}
-
-fn ipv4(addr: Ipv4Addr) -> Ipv4Address {
-    let [a, b, c, d] = addr.octets();
-    Ipv4Address::new(a, b, c, d)
-}
-
-fn fmt_mac(mac: [u8; 6]) -> String {
-    mac.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-fn stack_time(clock: &TscClock) -> Instant {
-    stack_time_at(clock, rdtscp())
-}
-
-/// The stack's notion of now, from the counter. i64 micros: what the
-/// stack's `Instant` is made of, and centuries away from overflowing.
-#[inline(always)]
-fn stack_time_at(clock: &TscClock, tick: u64) -> Instant {
-    Instant::from_micros((clock.unix_ns(tick) / 1_000) as i64)
 }
 
 impl Transport for DpdkTcp {
     #[inline(always)]
     fn send(&mut self, data: &[u8]) -> io::Result<usize> {
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.handle);
-        if !socket.can_send() {
-            return Ok(0);
-        }
-        socket
-            .send_slice(data)
-            .map_err(|e| io::Error::other(format!("send: {e:?}")))
+        self.nic.stream(&self.stream).send(data)
     }
 
     #[inline(always)]
     fn service(&mut self, now_unix_ns: u64) {
-        // Same conversion as `stack_time_at`, without a second counter read.
-        self.now = Instant::from_micros((now_unix_ns / 1_000) as i64);
-        self.device.poll_rx();
-        self.iface
-            .poll(self.now, &mut self.device, &mut self.sockets);
-        self.device.flush_tx();
+        self.nic.service(now_unix_ns);
     }
 
     #[inline(always)]
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.handle);
-        if socket.can_recv() {
-            return socket
-                .recv_slice(buf)
-                .map_err(|e| io::Error::other(format!("recv: {e:?}")));
-        }
-        if socket.is_active() {
-            Ok(0)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the server closed the connection",
-            ))
-        }
+        self.nic.stream(&self.stream).recv(buf)
     }
 
     fn name(&self) -> &'static str {
         "DPDK"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Cli;
+    use clap::{CommandFactory, Parser};
+    use std::net::Ipv4Addr;
+
+    fn parse(extra: &[&str]) -> Result<ProxyDpdkArgs, clap::Error> {
+        let mut args = vec!["shm-proxy", "--transport", "dpdk"];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).map(|cli| cli.dpdk)
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    /// The proxy's defaults, which the harness relies on: its own EAL file
+    /// prefix, and port 0 by `--dpdk-port`.
+    #[test]
+    fn the_defaults_are_the_proxy_s() {
+        let args = parse(&["--dpdk-ip", "10.0.0.2"]).unwrap();
+        assert_eq!(args.nic.eal_args, DEFAULT_EAL_ARGS);
+        assert_eq!(args.dpdk_port, 0);
+        assert!(
+            args.nic.ports.is_empty(),
+            "--dpdk-ports has no default here"
+        );
+        let config = args.nic_config().unwrap();
+        assert_eq!(
+            config.eal_args,
+            ["--huge-dir", "/dev/hugepages", "--file-prefix", "shm-proxy"]
+        );
+        assert_eq!(config.port_ids, [0]);
+        assert_eq!(config.ip_addr, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(config.prefix_len, 24);
+        assert_eq!(config.mtu, 1500);
+    }
+
+    #[test]
+    fn one_port_or_a_list_but_not_both() {
+        let one = parse(&["--dpdk-ip", "10.0.0.2", "--dpdk-port", "3"]).unwrap();
+        assert_eq!(one.nic_config().unwrap().port_ids, [3]);
+        let list = parse(&["--dpdk-ip", "10.0.0.2", "--dpdk-ports", "1,0"]).unwrap();
+        assert_eq!(list.nic_config().unwrap().port_ids, [1, 0]);
+
+        for flags in [
+            ["--dpdk-port", "1", "--dpdk-ports", "2"],
+            ["--dpdk-ports", "2", "--dpdk-port", "1"],
+        ] {
+            let error = parse(&flags).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flags:?}"
+            );
+        }
+    }
+
+    /// The node's validation and wording, `--dpdk-ip` required.
+    #[test]
+    fn the_flags_are_checked_by_the_node_s_mapping() {
+        let missing = parse(&[]).unwrap().nic_config().unwrap_err();
+        assert_eq!(missing.to_string(), "--dpdk-ip is required");
+
+        let bad = parse(&["--dpdk-ip", "10.0.0.2", "--dpdk-peer-mac", "02:99"])
+            .unwrap()
+            .nic_config()
+            .unwrap_err()
+            .to_string();
+        assert!(bad.starts_with("invalid --dpdk-peer-mac: "), "{bad}");
+
+        assert!(parse(&["--dpdk-gateway-mac", "0c:42:a1:00:00:01"]).is_err());
+        assert!(parse(&["--dpdk-eal-args", "--no-pci"]).is_err());
     }
 }

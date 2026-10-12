@@ -19,22 +19,50 @@
 //! ```sh
 //! echo-client --key /tmp/echo-key.pem --size 288 --count 10000
 //! ```
+//!
+//! # Transports
+//!
+//! `--transport kernel` (the default) is the blocking connection on a
+//! kernel socket. `--transport dpdk`, in a build with the `dpdk` feature,
+//! is the polled connection over kernel bypass, on a NIC the client
+//! brings up from the `--dpdk-*` flags (see `client/dpdk.rs`). Both run
+//! the one measurement loop below, through `melin-client`'s session trait,
+//! so the two report the same figures in the same format.
+//!
+//! `--core` pins the measuring thread once the connection is up. It
+//! matters most on DPDK, where the thread spins at full load polling the
+//! NIC and its samples are only as steady as its core: give it one of its
+//! own, off the server's.
 
 use std::net::SocketAddr;
+#[cfg(feature = "dpdk")]
+use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
-use melin_client::{Connection, Frame, key};
+use clap::{Parser, ValueEnum};
+use melin_client::{Connection, Frame, Session, key};
 
 use echo_server::{KIND_RESP_ECHO, KIND_RESP_REJECTED, MAX_PAYLOAD};
+
+// The DPDK transport's flags and dial: compiled only with the `dpdk`
+// feature, so a default build has no `--dpdk-*` flag it would ignore.
+#[cfg(feature = "dpdk")]
+#[path = "client/dpdk.rs"]
+mod dpdk;
 
 type Error = Box<dyn std::error::Error>;
 
 // ---------------------------------------------------------------------------
 // Command line
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum TransportKind {
+    Kernel,
+    Dpdk,
+}
 
 #[derive(Parser)]
 #[command(
@@ -55,13 +83,41 @@ struct Cli {
     /// Requests to send, one after the other.
     #[arg(long, default_value_t = 1)]
     count: usize,
+    /// What the connection runs on: kernel TCP, or DPDK kernel bypass
+    /// (a build with the `dpdk` feature, configured by the `--dpdk-*`
+    /// flags).
+    #[arg(long, value_enum, default_value_t = TransportKind::Kernel)]
+    transport: TransportKind,
+    /// Pin the measuring thread to this core once connected. On DPDK the
+    /// thread spins at full load: give it a core of its own.
+    // `usize`: what the affinity helper takes a core as.
+    #[arg(long)]
+    core: Option<usize>,
+    // The node's own `--dpdk-*` flags, `--dpdk-ip` required here.
+    #[cfg(feature = "dpdk")]
+    #[command(flatten)]
+    dpdk: melin_dpdk::DpdkArgs,
 }
 
 fn main() -> ExitCode {
+    // Diagnostics on stderr, warnings and up unless `RUST_LOG` says
+    // otherwise: the affinity helper warns when `--core`'s pin is weaker
+    // than asked (SCHED_FIFO refused), which explains a noisy measurement;
+    // the DPDK NIC's bring-up logs at `debug`. stdout carries the figures
+    // alone.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::WARN.into())
+                .from_env_lossy(),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint!("{}", report(e.as_ref()));
             ExitCode::from(2)
         }
     }
@@ -78,17 +134,19 @@ fn run(cli: Cli) -> Result<(), Error> {
     if cli.count == 0 {
         return Err("--count must be at least 1".into());
     }
-    let key = key::load_signing_key(&cli.key)?;
-    let mut node = Connection::connect(cli.server, &key)?;
-
-    // `u64` nanoseconds: what `Duration` converts to losslessly for any
-    // trip shorter than centuries, and what sorts without a comparator.
-    let mut samples: Vec<u64> = Vec::with_capacity(cli.count);
-    let mut payload = vec![0u8; cli.size];
-    for i in 1..=cli.count as u64 {
-        fill(&mut payload, i);
-        samples.push(echo(&mut node, i, &payload)?.as_nanos() as u64);
+    let transport = check_transport(&cli)?;
+    if cli.core.is_some() {
+        // Before anything narrows this thread's CPU mask (EAL pins the
+        // thread that initialises it), as the runtime's helper asks.
+        melin_app::affinity::capture_home_mask();
     }
+    let key = key::load_signing_key(&cli.key)?;
+
+    let mut samples = match transport {
+        Transport::Kernel => measure(&mut Connection::connect(cli.server, &key)?, &cli)?,
+        #[cfg(feature = "dpdk")]
+        Transport::Dpdk(server) => measure(&mut dpdk::connect(&cli.dpdk, server, &key)?, &cli)?,
+    };
 
     if cli.count == 1 {
         println!(
@@ -112,13 +170,88 @@ fn run(cli: Cli) -> Result<(), Error> {
     Ok(())
 }
 
+/// The transport a run goes over, once its flags have been checked: what
+/// [`check_transport`] hands [`run`], so a check made there is not made
+/// again to recover its result.
+enum Transport {
+    Kernel,
+    /// The DPDK transport, with the server as a DPDK dial takes it.
+    #[cfg(feature = "dpdk")]
+    Dpdk(SocketAddrV4),
+}
+
+/// What `--transport dpdk` reports in a build without the feature.
+#[cfg(not(feature = "dpdk"))]
+const NO_DPDK: &str = "this echo-client was built without the `dpdk` feature: rebuild with \
+                       `--features dpdk` (needs libdpdk) for --transport dpdk";
+
+/// Refuse a transport this build cannot run, before the key is read or
+/// anything is dialed.
+#[cfg(not(feature = "dpdk"))]
+fn check_transport(cli: &Cli) -> Result<Transport, Error> {
+    match cli.transport {
+        TransportKind::Kernel => Ok(Transport::Kernel),
+        TransportKind::Dpdk => Err(NO_DPDK.into()),
+    }
+}
+
+/// Refuse DPDK flags on a kernel run: any `--dpdk-*` flag given with the
+/// kernel transport (the default) means `--transport dpdk` was forgotten,
+/// and the run would measure the kernel path under the operator's nose.
+/// And on a DPDK run, a server a NIC cannot reach (the loopback default),
+/// before the key is read.
+#[cfg(feature = "dpdk")]
+fn check_transport(cli: &Cli) -> Result<Transport, Error> {
+    match cli.transport {
+        TransportKind::Kernel => {
+            if let Some(flag) = cli.dpdk.first_given() {
+                return Err(format!(
+                    "{flag} is for --transport dpdk: without it this run would measure the \
+                     kernel path"
+                )
+                .into());
+            }
+            Ok(Transport::Kernel)
+        }
+        TransportKind::Dpdk => Ok(Transport::Dpdk(dpdk::check_server(cli.server)?)),
+    }
+}
+
+/// The measurement, whatever the transport: pin the thread if asked, then
+/// `--count` round trips, one in flight, each sample its round trip in
+/// nanoseconds, in the order taken.
+///
+/// Generic rather than over `&mut dyn Session`: each transport gets its
+/// own copy of the loop with direct calls, so the kernel path runs the
+/// code it ran before the session trait existed, and neither pays an
+/// indirect call per frame.
+fn measure<S: Session>(node: &mut S, cli: &Cli) -> Result<Vec<u64>, Error> {
+    if let Some(core) = cli.core {
+        // After the connection is up: a DPDK NIC's EAL pins the thread
+        // that initialises it to its main lcore, which would undo a pin
+        // taken before.
+        let core =
+            melin_app::affinity::pin_to_core(core).map_err(|e| format!("--core {core}: {e}"))?;
+        eprintln!("pinned to core {core}");
+    }
+    // `u64` nanoseconds: what `Duration` converts to losslessly for any
+    // trip shorter than centuries, and what sorts without a comparator.
+    let mut samples: Vec<u64> = Vec::with_capacity(cli.count);
+    let mut payload = vec![0u8; cli.size];
+    for i in 1..=cli.count as u64 {
+        fill(&mut payload, i);
+        samples.push(echo(node, i, &payload)?.as_nanos() as u64);
+    }
+    Ok(samples)
+}
+
 /// One round trip: send `payload`, check the echo is it, and return how
 /// long the echo took to arrive.
 ///
 /// The clock stops at the reply frame, not at the batch end that follows
 /// it — the reply is what the caller waited for — which is why this
 /// reads frame by frame instead of asking the client for the batch.
-fn echo(node: &mut Connection, request: u64, payload: &[u8]) -> Result<Duration, Error> {
+fn echo<S: Session>(node: &mut S, request: u64, payload: &[u8]) -> Result<Duration, Error> {
     let started = Instant::now();
     node.send(payload)?;
     let elapsed = match node.next_frame()? {
@@ -171,6 +304,40 @@ fn micros(ns: u64) -> String {
     format!("{:.1} µs", ns as f64 / 1_000.0)
 }
 
+/// What a failed run prints: `error: ` and the error, then each cause in
+/// its source chain that the level above does not already end with.
+///
+/// `melin-client`'s errors put their source at the end of their own
+/// message (a failed dial reads `cannot connect to <addr>: <why>`, and
+/// over DPDK the why names the MAC the SYN went to, the first thing to
+/// check; a deadline reads `... (last attempt: <error>)`), so for them
+/// this prints the one line it always did. The chain is walked anyway so
+/// that a cause an error keeps to itself is never lost.
+fn report(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = format!("error: {error}\n");
+    let mut parent = error.to_string();
+    let mut cause = error.source();
+    while let Some(e) = cause {
+        let text = e.to_string();
+        if !ends_with_cause(&parent, &text) {
+            out.push_str(&format!("  caused by: {text}\n"));
+        }
+        parent = text;
+        cause = e.source();
+    }
+    out
+}
+
+/// Whether `parent`'s message already ends with `cause`'s, as
+/// `<context>: <cause>`, or that in parentheses.
+fn ends_with_cause(parent: &str, cause: &str) -> bool {
+    let tail = format!(": {cause}");
+    parent.ends_with(&tail)
+        || parent
+            .strip_suffix(')')
+            .is_some_and(|inner| inner.ends_with(&tail))
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -209,5 +376,214 @@ mod tests {
         assert_eq!(micros(12_345), "12.3 µs");
         assert_eq!(micros(0), "0.0 µs");
         assert_eq!(micros(1_000_000), "1000.0 µs");
+    }
+
+    /// The kernel path's error line is the one it always was: the client's
+    /// errors carry their source in their own message, so the chain adds
+    /// nothing to them.
+    #[test]
+    fn a_client_error_reports_on_one_line() {
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let connect: Error = melin_client::Error::Connect {
+            addr,
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "no SYN-ACK from 02:99"),
+        }
+        .into();
+        assert_eq!(
+            report(connect.as_ref()),
+            "error: cannot connect to 127.0.0.1:9: no SYN-ACK from 02:99\n"
+        );
+
+        // Two levels: the deadline's last attempt, and that attempt's cause.
+        let deadline: Error = melin_client::Error::Deadline {
+            addr,
+            last: Box::new(melin_client::Error::Connect {
+                addr,
+                source: std::io::ErrorKind::ConnectionRefused.into(),
+            }),
+        }
+        .into();
+        let line = report(deadline.as_ref());
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(
+            line.starts_with("error: 127.0.0.1:9 was not serving"),
+            "{line}"
+        );
+
+        let plain: Error = "--count must be at least 1".into();
+        assert_eq!(
+            report(plain.as_ref()),
+            "error: --count must be at least 1\n"
+        );
+    }
+
+    /// A cause the top-level message leaves out gets a line of its own, so
+    /// a hint carried by a source (the peer MAC to check) reaches the
+    /// operator whatever wraps it.
+    #[test]
+    fn a_cause_the_message_omits_is_printed() {
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the dial failed")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let error: Error = Box::new(Wrapper(std::io::Error::other(
+            "no SYN-ACK: is 02:99:01:00:00:01 the server's MAC?",
+        )));
+        assert_eq!(
+            report(error.as_ref()),
+            "error: the dial failed\n  caused by: no SYN-ACK: is 02:99:01:00:00:01 the server's MAC?\n"
+        );
+
+        // A cause whose words merely occur in the message still says
+        // something of its own.
+        assert!(!ends_with_cause("timed out waiting: no route", "timed out"));
+        assert!(ends_with_cause("dial: timed out", "timed out"));
+        assert!(ends_with_cause("x (last attempt: timed out)", "timed out"));
+    }
+
+    /// A session that echoes in memory, in the node's reply shape: one
+    /// echo response, then the batch end. The measurement loop is the
+    /// same code over any `Session`, so this exercises the one both
+    /// transports run.
+    struct Echoing {
+        /// The reply being handed out: the kind byte and the request.
+        reply: Vec<u8>,
+        /// Frames left in the current reply batch.
+        pending: u8,
+        /// Corrupt the echo, for the mismatch check.
+        corrupt: bool,
+    }
+
+    impl Session for Echoing {
+        fn send(&mut self, body: &[u8]) -> Result<(), melin_client::Error> {
+            self.reply.clear();
+            self.reply.push(KIND_RESP_ECHO);
+            self.reply.extend_from_slice(body);
+            if self.corrupt
+                && let Some(last) = self.reply.last_mut()
+            {
+                *last ^= 0xff;
+            }
+            self.pending = 2;
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> Result<Frame<'_>, melin_client::Error> {
+            let frame = match self.pending {
+                2 => Frame::Response(&self.reply),
+                1 => Frame::BatchEnd,
+                _ => return Err(melin_client::Error::Disconnected),
+            };
+            self.pending -= 1;
+            Ok(frame)
+        }
+    }
+
+    #[test]
+    fn the_loop_takes_one_sample_per_round_trip_over_any_session() {
+        let cli = Cli::try_parse_from(["echo-client", "--key", "k.pem", "--count", "5"]).unwrap();
+        let mut session = Echoing {
+            reply: Vec::new(),
+            pending: 0,
+            corrupt: false,
+        };
+        assert_eq!(measure(&mut session, &cli).unwrap().len(), 5);
+
+        session.corrupt = true;
+        let error = measure(&mut session, &cli).unwrap_err().to_string();
+        assert_eq!(error, "the reply to request 1 is not what was sent");
+    }
+
+    #[test]
+    fn the_transport_defaults_to_kernel_and_the_core_to_none() {
+        let cli = Cli::try_parse_from(["echo-client", "--key", "k.pem"]).unwrap();
+        assert_eq!(cli.transport, TransportKind::Kernel);
+        assert_eq!(cli.core, None);
+        let cli = Cli::try_parse_from([
+            "echo-client",
+            "--key",
+            "k.pem",
+            "--transport",
+            "dpdk",
+            "--core",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(cli.transport, TransportKind::Dpdk);
+        assert_eq!(cli.core, Some(3));
+    }
+
+    /// Without the feature there are no `--dpdk-*` flags, and asking for
+    /// the DPDK transport is an error naming the feature, before any
+    /// connection is attempted.
+    #[cfg(not(feature = "dpdk"))]
+    #[test]
+    fn without_the_feature_dpdk_is_refused_by_name() {
+        assert!(
+            Cli::try_parse_from(["echo-client", "--key", "k.pem", "--dpdk-ip", "10.0.0.2"])
+                .is_err()
+        );
+        // Refused before the key is read: the key file does not exist.
+        let cli = Cli::try_parse_from([
+            "echo-client",
+            "--key",
+            "/nonexistent/k.pem",
+            "--transport",
+            "dpdk",
+        ])
+        .unwrap();
+        let error = run(cli).unwrap_err().to_string();
+        assert!(error.contains("`dpdk` feature"), "{error}");
+    }
+
+    /// With the feature, the DPDK flags on a kernel run are refused, before
+    /// the key is read: the operator forgot `--transport dpdk`.
+    #[cfg(feature = "dpdk")]
+    #[test]
+    fn dpdk_flags_on_a_kernel_run_are_refused() {
+        let cli = Cli::try_parse_from([
+            "echo-client",
+            "--key",
+            "/nonexistent/k.pem",
+            "--dpdk-ip",
+            "10.0.0.2",
+        ])
+        .unwrap();
+        let error = run(cli).unwrap_err().to_string();
+        assert!(
+            error.starts_with("--dpdk-ip is for --transport dpdk"),
+            "{error}"
+        );
+
+        // Any of them, not only the address.
+        for flag in [
+            "--dpdk-eal-args=--no-pci",
+            "--dpdk-ports=1",
+            "--dpdk-peer-mac=02:99:01:00:00:01",
+            "--dpdk-mtu=9000",
+        ] {
+            let cli =
+                Cli::try_parse_from(["echo-client", "--key", "/nonexistent/k.pem", flag]).unwrap();
+            let error = run(cli).unwrap_err().to_string();
+            let name = flag.split('=').next().unwrap();
+            assert!(
+                error.starts_with(&format!("{name} is for --transport dpdk")),
+                "{error}"
+            );
+        }
+
+        // The defaults alone are a plain kernel run: it gets as far as the
+        // key.
+        let cli = Cli::try_parse_from(["echo-client", "--key", "/nonexistent/k.pem"]).unwrap();
+        let error = run(cli).unwrap_err().to_string();
+        assert!(!error.contains("--transport dpdk"), "{error}");
     }
 }

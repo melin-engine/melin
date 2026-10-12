@@ -30,16 +30,11 @@ clap = { workspace = true }
 libc = { workspace = true }
 # `--trace` percentiles.
 hdrhistogram = "7"
-# The kernel-bypass transport, behind the `dpdk` feature: the NIC through
-# DPDK's poll-mode driver and TCP in userspace via the sequencer's smoltcp
-# fork, the same version `melin-dpdk` builds its device against.
-melin-dpdk = { workspace = true, optional = true }
-smoltcp = { package = "fastcp", version = "0.13.2", default-features = false, features = [
-    "std",
-    "medium-ethernet",
-    "proto-ipv4",
-    "socket-tcp",
-], optional = true }
+# The kernel-bypass transport, behind the `dpdk` feature: the client NIC
+# handle, the node's own DPDK transport dialing out. Its API is std types
+# only, so the proxy needs no TCP stack of its own. `clap` for the
+# `--dpdk-*` flags, which are the node's own declaration.
+melin-dpdk = { workspace = true, optional = true, features = ["clap"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -48,4 +43,4 @@ tempfile = "3"
 default = []
 # `--transport dpdk`. Needs libdpdk to build, like `melin-server-runtime/dpdk`;
 # without the feature the binary still builds and runs over kernel TCP.
-dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "dep:smoltcp"]
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]

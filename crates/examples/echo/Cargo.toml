@@ -39,6 +39,10 @@ melin-server-runtime = { workspace = true }
 melin-client = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The `--dpdk-*` flags of `echo-client --transport dpdk`: the node's own
+# declaration and its mapping onto `NicConfig`, rather than a copy. Only
+# with `dpdk`, like the client's DPDK transport.
+melin-dpdk = { workspace = true, optional = true, features = ["clap"] }
 
 [dev-dependencies]
 # The tests read the journal back to check what was written, the sizing
@@ -63,5 +67,12 @@ hash-chain = ["melin-server-runtime/hash-chain"]
 # The DPDK transport, for the server binary and for the round-trip tests,
 # which then run their nodes on a veth pair and must be run under
 # `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-testing.md`).
-# Needs libdpdk to build, so never on by default.
-dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk"]
+# The client's `dpdk` feature too, for the round trip whose client runs on
+# DPDK beside its node, and for `echo-client --transport dpdk` and its
+# `--dpdk-*` flags. One feature for both binaries: built with it, the
+# client compiles the runtime's DPDK transport too, which it never calls
+# (it links libdpdk for its own NIC anyway), and the server runs on DPDK.
+# To pair a DPDK client with a kernel server, build the two binaries
+# separately, as `scripts/dpdk/dpdk-client-tap-smoke.sh` does. Needs
+# libdpdk to build, so never on by default.
+dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk", "melin-client/dpdk", "dep:melin-dpdk"]

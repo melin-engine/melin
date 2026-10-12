@@ -12,7 +12,7 @@ license = "Apache-2.0"
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Client for a Melin node: framing, Ed25519 authentication, and the request/response batch protocol, blocking or I/O-free"
+description = "Client for a Melin node: framing, Ed25519 authentication, and the request/response batch protocol, blocking, polled or I/O-free"
 
 [lints]
 workspace = true
@@ -24,6 +24,23 @@ workspace = true
 melin-wire-protocol = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
+# The client NIC handle, for the polled connection over kernel bypass:
+# behind the `dpdk` feature only. melin-dpdk is BUSL-1.1, and this crate
+# is Apache-2.0 so that the runtime's licence does not travel with it. A
+# BSL dependency is acceptable here because it is optional and off by
+# default: without the feature nothing of melin-dpdk is compiled or
+# linked, and a customer who turns it on has chosen to link the runtime's
+# licence into that binary. deny.toml passes it unchanged, since its BSL
+# exception is granted per crate name and melin-dpdk already has one.
+melin-dpdk = { workspace = true, optional = true }
+
+[features]
+default = []
+# The polled connection over DPDK: `StreamConnection::connect_dpdk`, the
+# NIC handle's stream as a `ByteStream`, the NIC configuration re-exported.
+# Links melin-dpdk (BUSL-1.1, see above) and needs libdpdk to build, like
+# `melin-shm-proxy/dpdk`.
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
 
 [dev-dependencies]
 # One test needs a port that refuses connections for as long as it runs.

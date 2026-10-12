@@ -24,6 +24,20 @@ pub const ENV_PREFIX_LEN: &str = "MELIN_NETNS_PREFIX_LEN";
 pub const ENV_CLIENT_IP: &str = "MELIN_NETNS_CLIENT_IP";
 /// The MAC of the kernel side's interface.
 pub const ENV_CLIENT_MAC: &str = "MELIN_NETNS_CLIENT_MAC";
+/// The interface a DPDK client attaches to: a veth pair of its own, built
+/// as a node slot's is but published apart from them, so that no node is
+/// ever started on it.
+pub const ENV_DPDK_CLIENT_IFACE: &str = "MELIN_NETNS_DPDK_CLIENT_IFACE";
+/// The IP the DPDK client owns on its interface.
+pub const ENV_DPDK_CLIENT_IP: &str = "MELIN_NETNS_DPDK_CLIENT_IP";
+/// The MAC of the DPDK client's interface, which its port takes.
+pub const ENV_DPDK_CLIENT_MAC: &str = "MELIN_NETNS_DPDK_CLIENT_MAC";
+
+/// The name of the DPDK client's af_packet device: not of the
+/// `net_af_packet<slot>` form a node slot's takes ([`vdev`]), so the two
+/// cannot collide however many slots the runner builds. The driver is
+/// found by the name's prefix, which this keeps.
+pub const CLIENT_VDEV: &str = "net_af_packet_client";
 
 /// The client port of every DPDK node. Fixed rather than picked: each
 /// node owns its IP outright, in namespaces no other test shares, so
@@ -32,8 +46,9 @@ pub const NODE_PORT: u16 = 9876;
 /// The replication port of every DPDK node, fixed for the same reason.
 pub const REPLICATION_PORT: u16 = 9877;
 
-/// One node slot: the interface its DPDK port attaches to, the IP its
-/// node owns there, and the interface's MAC.
+/// One veth seat on the runner's network, a node slot or the DPDK
+/// client's: the interface its DPDK port attaches to, the IP its owner
+/// takes there, and the interface's MAC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot {
     pub iface: String,
@@ -47,11 +62,16 @@ pub struct Layout {
     /// One entry per node slot, indexed by slot. `Vec` because the runner
     /// decides the count; a handful at most, read once.
     slots: Vec<Slot>,
-    /// `u8` because that is `ServerConfig::dpdk_prefix_len`'s width, and
+    /// `u8` because that is `ServerConfig::dpdk.prefix_len`'s width, and
     /// an IPv4 prefix is at most 32.
     pub prefix_len: u8,
     pub client_ip: Ipv4Addr,
     pub client_mac: String,
+    /// The DPDK client's seat, apart from the node slots. `None` under a
+    /// runner that publishes none (one older than the seat, or another
+    /// project's copy): the node slots stand without it, and only a test
+    /// that asks for a DPDK client fails, saying why.
+    dpdk_client: Option<Slot>,
 }
 
 impl Layout {
@@ -123,20 +143,76 @@ impl Layout {
                 ));
             }
         };
+        let slots: Vec<Slot> = ifaces
+            .into_iter()
+            .zip(ips)
+            .zip(macs)
+            .map(|((iface, ip), mac)| Slot {
+                iface: iface.to_owned(),
+                ip,
+                mac,
+            })
+            .collect();
+        let client_ip = parse_ip(ENV_CLIENT_IP, client_ip.trim())?;
+
+        // All three or none: a runner without the seat publishes none of
+        // them, and a partial set is a broken runner.
+        let dpdk_client = match (
+            var(ENV_DPDK_CLIENT_IFACE)?,
+            var(ENV_DPDK_CLIENT_IP)?,
+            var(ENV_DPDK_CLIENT_MAC)?,
+        ) {
+            (None, None, None) => None,
+            (Some(iface), Some(ip), Some(mac)) => {
+                let seat = Slot {
+                    iface: iface.trim().to_owned(),
+                    ip: parse_ip(ENV_DPDK_CLIENT_IP, ip.trim())?,
+                    mac: check_mac(ENV_DPDK_CLIENT_MAC, mac.trim())?,
+                };
+                if seat.iface.is_empty() || seat.iface.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "{ENV_DPDK_CLIENT_IFACE}: '{iface}' is not one interface name"
+                    ));
+                }
+                let taken = seat.ip == client_ip
+                    || slots
+                        .iter()
+                        .any(|slot| slot.ip == seat.ip || slot.iface == seat.iface);
+                if taken {
+                    return Err(format!(
+                        "{ENV_DPDK_CLIENT_IFACE}/{ENV_DPDK_CLIENT_IP} ({} on {}) collide with a \
+                         node slot or the kernel side: the DPDK client's seat is a pair of its own",
+                        seat.ip, seat.iface
+                    ));
+                }
+                Some(seat)
+            }
+            _ => {
+                return Err(format!(
+                    "{ENV_DPDK_CLIENT_IFACE}, {ENV_DPDK_CLIENT_IP} and {ENV_DPDK_CLIENT_MAC} are \
+                     published together or not at all: a partial runner layout"
+                ));
+            }
+        };
+
         Ok(Layout {
-            slots: ifaces
-                .into_iter()
-                .zip(ips)
-                .zip(macs)
-                .map(|((iface, ip), mac)| Slot {
-                    iface: iface.to_owned(),
-                    ip,
-                    mac,
-                })
-                .collect(),
+            slots,
             prefix_len,
-            client_ip: parse_ip(ENV_CLIENT_IP, client_ip.trim())?,
+            client_ip,
             client_mac: check_mac(ENV_CLIENT_MAC, client_mac.trim())?,
+            dpdk_client,
+        })
+    }
+
+    /// The DPDK client's seat, or an error saying that this runner
+    /// publishes none.
+    pub fn dpdk_client(&self) -> Result<&Slot, String> {
+        self.dpdk_client.as_ref().ok_or_else(|| {
+            format!(
+                "this test runs a client on DPDK, but the runner publishes no seat for one \
+                 ({ENV_DPDK_CLIENT_IFACE}, {ENV_DPDK_CLIENT_IP}, {ENV_DPDK_CLIENT_MAC} unset): \
+                 run it under this repository's scripts/dpdk/netns-runner.sh, which builds one"
+            )
         })
     }
 
@@ -156,18 +232,20 @@ impl Layout {
         })
     }
 
-    /// The MAC behind `ip` on this network (a slot's, or the kernel
-    /// side's), or `None` when `ip` is not on it.
+    /// The MAC behind `ip` on this network (a slot's, the kernel side's,
+    /// or the DPDK client's), or `None` when `ip` is not on it.
     ///
-    /// A replica on DPDK dials its primary with the primary's MAC already
-    /// seeded (`--dpdk-peer-mac`); on af_packet the derived fallback is
-    /// wrong, as on any port that keeps a real hardware address.
+    /// A replica on DPDK dials its primary, and a client on DPDK its node,
+    /// with the peer's MAC already seeded (`--dpdk-peer-mac`,
+    /// `NicConfig::peer_mac`); on af_packet the derived fallback is wrong,
+    /// as on any port that keeps a real hardware address.
     pub fn mac_of(&self, ip: Ipv4Addr) -> Option<&str> {
         if ip == self.client_ip {
             return Some(&self.client_mac);
         }
         self.slots
             .iter()
+            .chain(&self.dpdk_client)
             .find(|slot| slot.ip == ip)
             .map(|slot| slot.mac.as_str())
     }
@@ -195,8 +273,8 @@ fn check_mac(name: &str, mac: &str) -> Result<String, String> {
 ///
 /// `--in-memory` is not among them: EAL refuses it with `--no-huge`,
 /// which implies legacy memory, and the runner's private `/var/run` makes
-/// it unnecessary. 512 MiB holds the mbuf pools of every slot's node at
-/// once with room to spare.
+/// it unnecessary. 512 MiB holds the mbuf pools of every slot's node and
+/// of the DPDK client at once with room to spare.
 pub fn eal_args(cpu: usize) -> Vec<String> {
     ["--no-huge", "-m", "512", "--no-pci", "-l", &cpu.to_string()]
         .map(String::from)
@@ -207,6 +285,12 @@ pub fn eal_args(cpu: usize) -> Vec<String> {
 /// also its port's, and its driver arguments.
 pub fn vdev(index: usize, iface: &str) -> (String, String) {
     (format!("net_af_packet{index}"), format!("iface={iface}"))
+}
+
+/// The DPDK client's af_packet device on `iface`: its name
+/// ([`CLIENT_VDEV`]), which is also its port's, and its driver arguments.
+pub fn client_vdev(iface: &str) -> (String, String) {
+    (CLIENT_VDEV.to_owned(), format!("iface={iface}"))
 }
 
 #[cfg(test)]
@@ -239,6 +323,9 @@ mod tests {
             (ENV_PREFIX_LEN, "24"),
             (ENV_CLIENT_IP, "10.99.0.1"),
             (ENV_CLIENT_MAC, "02:99:00:00:00:01"),
+            (ENV_DPDK_CLIENT_IFACE, "dpdkc"),
+            (ENV_DPDK_CLIENT_IP, "10.99.0.100"),
+            (ENV_DPDK_CLIENT_MAC, "02:99:00:00:00:64"),
         ];
         for &(name, value) in overrides {
             vars.retain(|(n, _)| *n != name);
@@ -280,6 +367,67 @@ mod tests {
         );
         assert_eq!(layout.client_ip, Ipv4Addr::new(10, 99, 0, 1));
         assert_eq!(layout.client_mac, "02:99:00:00:00:01");
+        assert_eq!(
+            layout.dpdk_client().expect("the DPDK client's seat"),
+            &Slot {
+                iface: "dpdkc".into(),
+                ip: Ipv4Addr::new(10, 99, 0, 100),
+                mac: "02:99:00:00:00:64".into(),
+            }
+        );
+    }
+
+    /// The DPDK client's seat is apart from the node slots: it adds no
+    /// slot, so a node started on the first free slot can never take it.
+    #[test]
+    fn the_dpdk_client_is_not_a_node_slot() {
+        let vars = runner_env(&[]);
+        let layout = Layout::parse(env(&vars)).expect("a full layout");
+        let seat = layout.dpdk_client().expect("the DPDK client's seat");
+        assert_eq!(layout.slot_count(), 3);
+        for index in 0..layout.slot_count() {
+            assert_ne!(layout.slot(index).iface, seat.iface);
+            assert_ne!(layout.slot(index).ip, seat.ip);
+        }
+    }
+
+    /// A runner that publishes no seat for a DPDK client still runs every
+    /// node test; only asking for the seat fails, naming what is missing.
+    #[test]
+    fn a_layout_without_a_dpdk_client_serves_the_nodes() {
+        let vars = runner_env(&[
+            (ENV_DPDK_CLIENT_IFACE, None),
+            (ENV_DPDK_CLIENT_IP, None),
+            (ENV_DPDK_CLIENT_MAC, None),
+        ]);
+        let layout = Layout::parse(env(&vars)).expect("a node-only layout");
+        assert_eq!(layout.slot_count(), 3);
+        let err = layout.dpdk_client().expect_err("no seat");
+        assert!(err.contains(ENV_DPDK_CLIENT_IP), "{err}");
+        assert!(err.contains("netns-runner.sh"), "{err}");
+    }
+
+    /// The MACs the runner publishes are not the `02:00:<ip>` convention a
+    /// DPDK dialer falls back to without a peer MAC, so a test whose
+    /// replica or client reaches its peer proves the MAC was passed
+    /// through. This checks `runner_env`, a copy of the scheme
+    /// `netns-runner.sh` uses, not the script itself: the check on the real
+    /// runner's MACs is the `assert_ne!` each DPDK round-trip case makes at
+    /// run time, on the CI `dpdk` job.
+    #[test]
+    fn no_published_mac_is_the_sriov_convention() {
+        let vars = runner_env(&[]);
+        let layout = Layout::parse(env(&vars)).expect("a full layout");
+        let seat = layout.dpdk_client().expect("the DPDK client's seat");
+        let ips = (0..layout.slot_count())
+            .map(|index| layout.slot(index).ip)
+            .chain([layout.client_ip, seat.ip]);
+        for ip in ips {
+            let o = ip.octets();
+            let convention = format!("02:00:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3]);
+            let mac = layout.mac_of(ip).expect("a MAC for every published IP");
+            assert!(!mac.eq_ignore_ascii_case(&convention), "{ip}: {mac}");
+        }
     }
 
     #[test]
@@ -303,6 +451,10 @@ mod tests {
         assert_eq!(
             layout.mac_of(Ipv4Addr::new(10, 99, 0, 1)),
             Some("02:99:00:00:00:01")
+        );
+        assert_eq!(
+            layout.mac_of(Ipv4Addr::new(10, 99, 0, 100)),
+            Some("02:99:00:00:00:64")
         );
         assert_eq!(layout.mac_of(Ipv4Addr::LOCALHOST), None);
     }
@@ -336,6 +488,15 @@ mod tests {
             &[(ENV_PREFIX_LEN, Some("33"))][..],
             &[(ENV_CLIENT_IP, Some("10.99.0"))][..],
             &[(ENV_CLIENT_MAC, Some("02:99:00:00:00"))][..],
+            &[(ENV_DPDK_CLIENT_IFACE, None)][..],
+            &[(ENV_DPDK_CLIENT_IP, None), (ENV_DPDK_CLIENT_MAC, None)][..],
+            &[(ENV_DPDK_CLIENT_IFACE, Some(""))][..],
+            &[(ENV_DPDK_CLIENT_IFACE, Some("dpdkc dpdkd"))][..],
+            &[(ENV_DPDK_CLIENT_IFACE, Some("dpdk1"))][..],
+            &[(ENV_DPDK_CLIENT_IP, Some("10.99.0.3"))][..],
+            &[(ENV_DPDK_CLIENT_IP, Some("10.99.0.1"))][..],
+            &[(ENV_DPDK_CLIENT_IP, Some("10.99.0"))][..],
+            &[(ENV_DPDK_CLIENT_MAC, Some("02:99:00:00:00:6"))][..],
             &[(
                 ENV_NODE_MACS,
                 Some("02:99:00:00:00:02 02:99:00:00:00:03 02:99:00:00:00:zz"),
@@ -366,5 +527,24 @@ mod tests {
             ("net_af_packet1".to_owned(), "iface=dpdk1".to_owned())
         );
         assert_ne!(vdev(0, "dpdk0").0, vdev(1, "dpdk1").0);
+    }
+
+    /// The client's device keeps the driver's name as its prefix, which is
+    /// how EAL finds the driver, and is not of the `net_af_packet<slot>`
+    /// form, so no slot's can be named like it however many there are.
+    #[test]
+    fn the_dpdk_clients_device_is_named_apart_from_every_slots() {
+        let (name, args) = client_vdev("dpdkc");
+        assert_eq!(args, "iface=dpdkc");
+        let suffix = name
+            .strip_prefix("net_af_packet")
+            .expect("the af_packet driver's name as the prefix");
+        assert!(
+            !suffix.is_empty() && !suffix.bytes().all(|b| b.is_ascii_digit()),
+            "{name} could be a slot's"
+        );
+        for index in [0, 1, 2, 9, 10, 255] {
+            assert_ne!(vdev(index, "dpdkc").0, name);
+        }
     }
 }

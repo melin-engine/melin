@@ -27,6 +27,12 @@
 //! Without the runner, a DPDK build fails the first node it is asked for,
 //! saying how to run it.
 //!
+//! A test whose client runs on DPDK too opens the client's NIC with
+//! `open_dpdk_client` (DPDK only): an af_packet device on the runner's
+//! client pair, a veth of its own apart from the node slots, on the same
+//! process-wide EAL as the nodes. The peer MAC is the test's to pass
+//! (`mac_of`), as a replica's is the launcher's.
+//!
 //! See `docs/internal/dpdk-testing.md`.
 
 #[cfg(any(test, feature = "dpdk"))]
@@ -124,6 +130,66 @@ pub fn local_ip() -> IpAddr {
     {
         IpAddr::V4(dpdk::layout().client_ip)
     }
+}
+
+/// Where a client on DPDK sits on the runner's network: its own veth
+/// pair, apart from the node slots ([`dpdk_client`]).
+#[cfg(feature = "dpdk")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DpdkClient {
+    /// The IP the client's NIC takes ([`open_dpdk_client`] sets it).
+    pub ip: std::net::Ipv4Addr,
+    /// The MAC of the client's interface, which its DPDK port takes.
+    pub mac: [u8; 6],
+}
+
+/// The runner's seat for a client on DPDK. Panics when the process is not
+/// under the runner, or under one that builds no such seat.
+#[cfg(feature = "dpdk")]
+pub fn dpdk_client() -> DpdkClient {
+    dpdk::client()
+}
+
+/// The MAC behind `addr`'s IP on the runner's network: a node's (from
+/// [`Node::addr`] or [`Addrs::client`]), the kernel side's, or the DPDK
+/// client's. What a client on DPDK passes as its peer MAC
+/// (`NicConfig::peer_mac`), as the launcher passes a replica its
+/// primary's: the runner's MACs are deliberately not the `02:00:<ip>`
+/// convention a dialer falls back to without one, so a client reaches its
+/// node only if the MAC was passed through. Panics for an address off the
+/// runner's network.
+#[cfg(feature = "dpdk")]
+pub fn mac_of(addr: SocketAddr) -> [u8; 6] {
+    dpdk::mac_of(addr)
+}
+
+/// Open the client's DPDK NIC on the runner's client pair, for a test
+/// whose client runs on DPDK beside its nodes: dial on it with
+/// `melin_client::StreamConnection::connect_dpdk_on`, or drive streams on
+/// it directly.
+///
+/// The NIC is on the process-wide EAL the nodes share (initialized here if
+/// no node has done it yet), on an af_packet device of its own attached
+/// for the client's interface, under a name no node slot's device takes.
+/// Built as a node's is: `config.port_ids` becomes the device's port, and
+/// `config.ip_addr` and `config.prefix_len` the runner's for the client;
+/// everything else is the test's, the peer MAC first ([`mac_of`]). The
+/// handle names its mbuf pool after its port, as a node on the shared EAL
+/// does, so it never collides with a node's.
+///
+/// One per process: the device stays attached for the life of the
+/// process, as the EAL does, so a test keeps the handle and dials again on
+/// it (lend it, `&mut`) rather than opening another. A plain
+/// [`NicHandle`](melin_dpdk::NicHandle), so a test driving several streams
+/// on it uses it as any client would.
+///
+/// Panics when `config.eal_args` is not empty (the shared EAL is set up
+/// already, and a handle on it refuses arguments of its own), when called
+/// a second time in the process, when the process is not under the runner,
+/// or when the NIC cannot be brought up; each is a failed test.
+#[cfg(feature = "dpdk")]
+pub fn open_dpdk_client(config: melin_dpdk::NicConfig) -> melin_dpdk::NicHandle {
+    dpdk::open_client(config)
 }
 
 /// A node running on its own thread of this process.
@@ -261,7 +327,7 @@ where
 /// On DPDK the node takes `addrs`' slot, which must be free (its last
 /// node stopped or joined), a `replication_bind` must be on the slot's IP,
 /// and a `replica_of` on the runner's network: the launcher fills in the
-/// primary's MAC (`dpdk_peer_mac`) from it.
+/// primary's MAC (`dpdk.peer_mac`) from it.
 pub fn start_at<A>(
     addrs: &Addrs,
     config: ServerConfig,
@@ -369,12 +435,12 @@ mod dpdk {
     use melin_app::Application;
     use melin_app::decoder::RequestDecoder;
     use melin_app::encoder::ResponseEncoder;
-    use melin_dpdk::Eal;
+    use melin_dpdk::{Eal, NicConfig, NicHandle, try_parse_mac};
     use melin_server_runtime::StartupEvents;
     use melin_server_runtime::server::{self, ServerConfig};
 
     use super::layout::{self, Layout};
-    use super::{Addrs, Node};
+    use super::{Addrs, DpdkClient, Node};
 
     /// How long a clean shutdown may take.
     const SHUTDOWN_LIMIT: Duration = Duration::from_secs(20);
@@ -507,6 +573,74 @@ mod dpdk {
         init.unwrap_or_else(|e| panic!("initialize the process-wide EAL: {e}"))
     }
 
+    /// Whether this process has opened the DPDK client's NIC: its device
+    /// is attached once and never detached (see [`open_client`]).
+    static CLIENT_OPENED: AtomicBool = AtomicBool::new(false);
+
+    /// `mac`, a MAC the layout has already checked.
+    fn mac_bytes(mac: &str) -> [u8; 6] {
+        try_parse_mac(mac).unwrap_or_else(|e| panic!("the runner's layout: {e}"))
+    }
+
+    fn client_seat() -> &'static layout::Slot {
+        layout().dpdk_client().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    pub(super) fn client() -> DpdkClient {
+        let seat = client_seat();
+        DpdkClient {
+            ip: seat.ip,
+            mac: mac_bytes(&seat.mac),
+        }
+    }
+
+    pub(super) fn mac_of(addr: SocketAddr) -> [u8; 6] {
+        let mac = match addr.ip() {
+            IpAddr::V4(ip) => layout().mac_of(ip),
+            IpAddr::V6(_) => None,
+        };
+        mac_bytes(mac.unwrap_or_else(|| {
+            panic!(
+                "{addr} is not on the runner's network: take a node's address from \
+                 Node::addr or melin_test_node::addrs"
+            )
+        }))
+    }
+
+    /// Attach the client's device on the process-wide EAL and open the NIC
+    /// handle on its port; see [`super::open_dpdk_client`].
+    ///
+    /// The device is never detached. A handle on the shared EAL closes its
+    /// port when it drops but leaves the device attached, and attaching a
+    /// name twice fails, so a second handle would need the first's device
+    /// detached at exactly the right moment, for no test that needs one:
+    /// a client reconnects on the handle it has.
+    pub(super) fn open_client(mut config: NicConfig) -> NicHandle {
+        assert!(
+            config.eal_args.is_empty(),
+            "the DPDK client shares the process-wide EAL, which is already set up, so its own EAL \
+             arguments ({}) cannot take effect: leave NicConfig::eal_args empty",
+            config.eal_args.join(" ")
+        );
+        let seat = client_seat();
+        assert!(
+            !CLIENT_OPENED.swap(true, Ordering::Relaxed),
+            "the DPDK client's NIC is already open in this process: keep the handle and dial \
+             again on it (lend it to StreamConnection::connect_dpdk_on as `&mut`)"
+        );
+        let (device, device_args) = layout::client_vdev(&seat.iface);
+        let port = eal()
+            .attach_vdev(&device, &device_args)
+            .unwrap_or_else(|e| panic!("attach {device} for the DPDK client: {e}"));
+        // As a node's: a port, not EAL arguments (checked empty above), and
+        // the runner's address. The handle names its pool after the port.
+        config.port_ids = vec![port];
+        config.ip_addr = seat.ip;
+        config.prefix_len = layout().prefix_len;
+        NicHandle::open(&config)
+            .unwrap_or_else(|e| panic!("open the DPDK client's NIC on {device} (port {port}): {e}"))
+    }
+
     /// Start a node on `addrs`' slot, which must be free; see
     /// [`start_claimed`].
     pub(super) fn start<A>(
@@ -557,7 +691,7 @@ mod dpdk {
                  from its own IP; take the address from melin_test_node::addrs"
             );
         }
-        config.dpdk_peer_mac = config.replica_of.map(|primary| {
+        config.dpdk.peer_mac = config.replica_of.map(|primary| {
             let mac = match primary.ip() {
                 IpAddr::V4(ip) => layout.mac_of(ip),
                 IpAddr::V6(_) => None,
@@ -583,10 +717,10 @@ mod dpdk {
         config.bind = addrs.client;
         // The node shares the process-wide EAL: it takes a port, not
         // arguments.
-        config.dpdk_eal_args = String::new();
-        config.dpdk_ports = vec![port];
-        config.dpdk_ip = slot.ip.to_string();
-        config.dpdk_prefix_len = layout.prefix_len;
+        config.dpdk.eal_args = String::new();
+        config.dpdk.ports = vec![port];
+        config.dpdk.ip = Some(slot.ip);
+        config.dpdk.prefix_len = layout.prefix_len;
         // Never lock a test node's memory: see `config`.
         config.no_mlock = true;
 

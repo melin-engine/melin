@@ -9,9 +9,11 @@
 #      mount namespaces);
 #   2. builds a bridge carrying the client's address, with one veth pair
 #      per node slot: the node's end for DPDK, the other end on the
-#      bridge. Every interface up, TX checksum offload off on every veth
-#      (veth-setup.py), `lo` up. The nodes reach each other (replication)
-#      and the client reaches every node;
+#      bridge. One more pair, built the same way, is the DPDK client's: a
+#      test whose client runs on DPDK attaches its end. Every interface
+#      up, TX checksum offload off on every veth (veth-setup.py), `lo` up.
+#      The nodes reach each other (replication) and both clients, the
+#      kernel one and the DPDK one, reach every node;
 #   3. mounts a private tmpfs on /var/run, where EAL insists on creating
 #      its runtime directory;
 #   4. publishes the layout in the environment (below);
@@ -48,6 +50,17 @@
 #   MELIN_NETNS_CLIENT_IP     the kernel side's address (on the bridge),
 #                             where clients connect from
 #   MELIN_NETNS_CLIENT_MAC    the bridge's MAC
+#
+# and, apart from the node slots, the DPDK client's pair (one value each).
+# A set of its own rather than a fourth node slot, so that nothing which
+# counts the slots (the launcher's first-free-slot search) can start a
+# node on it. The kernel client above stays for every test whose client
+# is not on DPDK:
+#   MELIN_NETNS_DPDK_CLIENT_IFACE  the interface a DPDK client attaches
+#                                  to (no address)
+#   MELIN_NETNS_DPDK_CLIENT_IP     the IP the DPDK client owns on it
+#   MELIN_NETNS_DPDK_CLIENT_MAC    its MAC, which the client's DPDK port
+#                                  takes
 
 set -euo pipefail
 
@@ -105,11 +118,20 @@ for slot in 0 1 2; do
     NODE_IPS+=("10.99.0.$((slot + 2))")
     NODE_MACS+=("02:99:00:00:00:0$((slot + 2))")
 done
+# The DPDK client's pair: outside the node slots' range of addresses, so
+# that adding slots never reaches it, and on the same MAC scheme (the last
+# octet the IP's), so it is not the `02:00:<ip>` convention either: a
+# node's MAC reaches the client only if the test passed it through.
+DPDK_CLIENT_IFACE=dpdkc
+DPDK_CLIENT_IP=10.99.0.100
+DPDK_CLIENT_MAC=02:99:00:00:00:64
 
+# veth-setup.py builds every pair alike, the client's last.
 slots=()
 for i in "${!DPDK_IFACES[@]}"; do
     slots+=("${DPDK_IFACES[$i]}=${NODE_MACS[$i]}")
 done
+slots+=("$DPDK_CLIENT_IFACE=$DPDK_CLIENT_MAC")
 if ! python3 "$SCRIPT_DIR/veth-setup.py" "$BRIDGE" "$CLIENT_IP/$PREFIX_LEN" "$CLIENT_MAC" "${slots[@]}"; then
     echo "netns-runner: error: network setup failed" >&2
     exit 1
@@ -136,5 +158,8 @@ export MELIN_NETNS_NODE_MACS="${NODE_MACS[*]}"
 export MELIN_NETNS_PREFIX_LEN="$PREFIX_LEN"
 export MELIN_NETNS_CLIENT_IP="$CLIENT_IP"
 export MELIN_NETNS_CLIENT_MAC="$CLIENT_MAC"
+export MELIN_NETNS_DPDK_CLIENT_IFACE="$DPDK_CLIENT_IFACE"
+export MELIN_NETNS_DPDK_CLIENT_IP="$DPDK_CLIENT_IP"
+export MELIN_NETNS_DPDK_CLIENT_MAC="$DPDK_CLIENT_MAC"
 
 exec "$@"

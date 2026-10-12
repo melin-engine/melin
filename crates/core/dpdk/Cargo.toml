@@ -17,6 +17,10 @@ default = []
 # Enable when libdpdk is installed. Without this feature the crate
 # compiles as an empty shell — no bindgen, no C compilation, no linking.
 dpdk-sys = ["dep:libc", "dep:bindgen", "dep:pkg-config", "dep:cc"]
+# `DpdkArgs`: the `--dpdk-*` flags as a clap argument group, for a binary
+# to flatten into its command line. Needs no libdpdk; independent of
+# `dpdk-sys`, since a binary declares its flags in every build.
+clap = ["dep:clap"]
 
 [dependencies]
 # Userspace TCP/IP stack — replaces the kernel TCP stack when using DPDK.
@@ -47,6 +51,8 @@ tracing = "0.1"
 libc = { version = "0.2", optional = true }
 # FxHash: low-cost hasher for integer-keyed maps on the hot path.
 rustc-hash = "2"
+# The `clap` feature's flag declaration (`DpdkArgs`).
+clap = { workspace = true, optional = true }
 
 [build-dependencies]
 # bindgen generates Rust FFI bindings from DPDK C headers at build time.

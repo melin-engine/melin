@@ -58,6 +58,70 @@
 //! decoder is poisoned), [`Error::Protocol`] for a frame no reply
 //! carries.
 //!
+//! Between the two sits the polled connection, the blocking connection's
+//! protocol over a non-blocking [`ByteStream`] with no blocking call in
+//! it:
+//!
+//! - [`PolledConnection`] is the protocol state alone (the handshake, a
+//!   receive buffer frames are split in, a scratch buffer, the read
+//!   deadline) with no stream and no clock: every call takes the stream
+//!   and the caller's monotonic time, and returns at once. For a program
+//!   with several connections on one NIC, or a clock of its own, or bytes
+//!   handed to it by an `io_uring` completion, which
+//!   [`PolledConnection::feed`] takes directly. A request is framed where
+//!   the stream lends room for it ([`ByteStream::send_in_place`]), or in
+//!   the scratch buffer when it lends none.
+//! - [`StreamConnection`] owns one stream and a cached clock and offers
+//!   the blocking connection's calls, spinning on the stream where those
+//!   block, and a non-blocking [`poll`](StreamConnection::poll) besides.
+//! - [`NonBlockingTcp`] is a kernel socket as a byte stream, and
+//!   [`BufferStream`] one whose bytes the caller's own I/O loop moves.
+//! - [`Session`] is what a request loop needs (send, next frame,
+//!   request), implemented by [`Connection`] and [`StreamConnection`],
+//!   so the loop is written once and the transport picked at runtime.
+//!
+//! ## Kernel bypass: the `dpdk` feature
+//!
+//! Off by default. It runs the polled connection over DPDK, on
+//! `melin-dpdk`'s client NIC handle, `NicHandle`: the node's own DPDK
+//! transport, listening on no port, re-exported here with its types so a
+//! client needs no direct dependency on `melin-dpdk`. Its configuration,
+//! `NicConfig`, is the node's own (the NIC half of `melin-dpdk`'s
+//! `DpdkConfig`, one field per `--dpdk-*` flag), not a copy of it. Two
+//! shapes:
+//!
+//! - **One connection**: `StreamConnection::connect_dpdk` brings a NIC up
+//!   from a `NicConfig`, dials and authenticates; the connection owns the
+//!   NIC. `StreamConnection::connect_dpdk_on` does the same on a
+//!   `NicHandle` already up, owned or lent as `&mut`, so a client
+//!   reconnects without touching EAL, which initialises once per process.
+//! - **Several connections on one NIC**: the caller keeps the handle, dials
+//!   each stream with `NicHandle::dial`, and drives one
+//!   [`PolledConnection`] per stream, handing each call the stream's view,
+//!   `NicHandle::stream(&id)`, which is a [`ByteStream`] and borrows the
+//!   handle for that call only. `NicHandle::service` advances every stream
+//!   at once, so it is called once per loop iteration, at the caller's own
+//!   monotonic nanosecond time (a calibrated TSC's will do). Dials are
+//!   sequential: a DPDK node refuses a SYN that arrives during another
+//!   connection's handshake, so a dial returns only once its connection
+//!   is established or has failed.
+//!
+//! Either way the stream's in-place send frames a request straight into
+//! the socket's transmit buffer. A NIC that cannot be brought up is
+//! [`Error::Nic`]: a variant in every build, with or without the feature,
+//! so a match on [`Error`] compiles the same whichever crate in a build
+//! turns the feature on. A dial that fails is [`Error::Connect`].
+//!
+//! Turning it on links `melin-dpdk`, which is BUSL-1.1, not Apache-2.0
+//! like this crate, into the binary; without it nothing of `melin-dpdk` is
+//! compiled. The build host needs libdpdk (found through `pkg-config`) and
+//! libclang, and the host it runs on a DPDK-capable port and hugepages. A
+//! client beside a node needs an EAL file prefix of its own, which the
+//! handle adds (`melin-client`) when the EAL arguments name none, and a
+//! client on a fabric that assigns MACs (an AWS ENI) must be given the
+//! server's MAC; `NicConfig`'s fields say why. A DPDK client thread spins
+//! at full load, so pin it to a core of its own.
+//!
 //! ## Silence
 //!
 //! A node does not answer a request it refuses — a key whose role may
@@ -95,7 +159,29 @@ use melin_wire_protocol::control_codec::{
     encode_challenge_response,
 };
 
+#[cfg(feature = "dpdk")]
+mod dpdk;
 pub mod key;
+mod polled;
+
+// The polled connection lives in a module of its own, re-exported item by
+// item so it sits beside the blocking connection at the crate's root.
+pub use polled::{
+    BufferStream, ByteStream, NonBlockingTcp, PolledConnection, Session, StreamConnection,
+};
+
+// Kernel bypass: the single-stream owned form of a NIC stream, and the NIC
+// handle's own types, re-exported so that a client needs no direct
+// dependency on `melin-dpdk` (nor a second copy of the node's DPDK
+// configuration: `NicConfig` is the node's own). The MAC parser is here for
+// the binaries that map `--dpdk-peer-mac` and `--dpdk-gateway-mac` onto it.
+#[cfg(feature = "dpdk")]
+pub use dpdk::DpdkStream;
+#[cfg(feature = "dpdk")]
+pub use melin_dpdk::{
+    MacParseError, NextHop, NicClock, NicConfig, NicHandle, NicStream, PeerMacSource, StreamId,
+    fmt_mac, try_parse_mac,
+};
 
 // The key types a caller needs to hold, so that depending on this crate
 // is enough to authenticate.
@@ -134,8 +220,19 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum Error {
     /// The socket failed underneath the protocol.
     Io(io::Error),
-    /// The node could not be reached at `addr`.
+    /// The node could not be reached at `addr`. Over DPDK (the `dpdk`
+    /// feature) the source tells a dial nothing answered
+    /// ([`io::ErrorKind::TimedOut`], its message naming the MAC the SYN
+    /// went to as the first thing to check) from one refused
+    /// ([`io::ErrorKind::ConnectionRefused`]).
     Connect { addr: SocketAddr, source: io::Error },
+    /// The DPDK NIC could not be brought up: EAL initialisation (the
+    /// message names the file prefix, the usual culprit when another DPDK
+    /// process runs on the host), a missing port, the mbuf pool, or the
+    /// port's configuration. Only the `dpdk` feature's constructors return
+    /// it; the variant exists in every build, so that a match on this type
+    /// compiles the same whichever crate in a build turns the feature on.
+    Nic(io::Error),
     /// The node was not serving by the deadline given to
     /// [`Connection::connect_by`]; `last` is what the final attempt saw.
     Deadline { addr: SocketAddr, last: Box<Error> },
@@ -187,6 +284,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "connection lost: {e}"),
             Error::Connect { addr, source } => write!(f, "cannot connect to {addr}: {source}"),
+            Error::Nic(e) => write!(f, "cannot bring the DPDK NIC up: {e}"),
             Error::Deadline { addr, last } => {
                 write!(
                     f,
@@ -229,7 +327,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Io(e) | Error::Connect { source: e, .. } => Some(e),
+            Error::Io(e) | Error::Connect { source: e, .. } | Error::Nic(e) => Some(e),
             Error::Deadline { last, .. } => Some(last.as_ref()),
             _ => None,
         }
@@ -816,6 +914,11 @@ impl Handshake {
     }
 }
 
+/// The longest frame the node sends during the handshake. Its two frames
+/// are a tag and a 32-byte nonce, then a tag: a longer frame is not a
+/// handshake.
+pub(crate) const MAX_HANDSHAKE_FRAME: usize = 64;
+
 /// Answer a node's challenge on a bare stream: read the nonce, sign it,
 /// send the signature with the public key, and wait for the node to say
 /// it is ready. [`Connection::connect`] does this on the socket it
@@ -832,9 +935,7 @@ impl Handshake {
 /// `set_read_timeout`) a peer that never answers hangs the handshake,
 /// and a read that times out under one comes back as [`Error::Io`].
 pub fn authenticate(stream: &mut (impl Read + Write), key: &SigningKey) -> Result<(), Error> {
-    // The node's two frames are a tag and a 32-byte nonce, then a tag: a
-    // frame that does not fit here is not a handshake.
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; MAX_HANDSHAKE_FRAME];
     let mut handshake = Handshake::new(key);
     loop {
         let payload = read_unbuffered_frame(stream, &mut buf)?;
@@ -903,9 +1004,12 @@ mod tests {
 
     use super::*;
 
+    // The fake node and its frame builders are `pub(crate)` so the polled
+    // connection's tests (`polled.rs`) run against the same node.
+
     /// How the fake node behaves once a client is authenticated.
     #[derive(Clone, Copy)]
-    enum Behaviour {
+    pub(crate) enum Behaviour {
         /// Reply to every request with its body, then end the batch.
         Echo,
         /// A heartbeat before every reply, and two reply frames per batch.
@@ -934,14 +1038,14 @@ mod tests {
         AdminLines,
     }
 
-    fn control(response: TransportResponse) -> Vec<u8> {
+    pub(crate) fn control(response: TransportResponse) -> Vec<u8> {
         let mut buf = [0u8; 64];
         let n = encode_transport_response(&response, &mut buf).unwrap();
         buf[..n].to_vec()
     }
 
     /// A frame under any tag, length prefix included.
-    fn tagged_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+    pub(crate) fn tagged_frame(tag: u8, body: &[u8]) -> Vec<u8> {
         let mut frame = ((TAG_LEN + body.len()) as u32).to_le_bytes().to_vec();
         frame.push(tag);
         frame.extend_from_slice(body);
@@ -949,7 +1053,7 @@ mod tests {
     }
 
     /// An application frame carrying `body`, length prefix included.
-    fn app_frame(body: &[u8]) -> Vec<u8> {
+    pub(crate) fn app_frame(body: &[u8]) -> Vec<u8> {
         tagged_frame(TAG_APP, body)
     }
 
@@ -983,7 +1087,7 @@ mod tests {
 
     /// Serve one client on `stream` the way a node does: challenge,
     /// verify, then `behaviour`.
-    fn serve(mut stream: TcpStream, allowed: VerifyingKey, behaviour: Behaviour) {
+    pub(crate) fn serve(mut stream: TcpStream, allowed: VerifyingKey, behaviour: Behaviour) {
         if !challenge(&stream, allowed) {
             return;
         }
@@ -1047,7 +1151,7 @@ mod tests {
 
     /// A fake node on a kernel-assigned port, serving clients on a
     /// thread until the listener is dropped.
-    fn fake_node(allowed: VerifyingKey, behaviour: Behaviour) -> SocketAddr {
+    pub(crate) fn fake_node(allowed: VerifyingKey, behaviour: Behaviour) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1058,7 +1162,7 @@ mod tests {
         addr
     }
 
-    fn client_key() -> SigningKey {
+    pub(crate) fn client_key() -> SigningKey {
         SigningKey::from_bytes(&[0x11; 32])
     }
 
@@ -1444,7 +1548,7 @@ mod tests {
 
     /// A node's control frame as a `Handshake` is fed it: the payload
     /// after the length prefix.
-    fn payload(response: TransportResponse) -> Vec<u8> {
+    pub(crate) fn payload(response: TransportResponse) -> Vec<u8> {
         control(response)[4..].to_vec()
     }
 
@@ -1745,6 +1849,23 @@ mod tests {
         let n = seal_request(&mut buf, 3).unwrap();
         assert_eq!(&buf[..n], app_frame(b"abc").as_slice());
         assert!(buf[n..].iter().all(|&b| b == 0xEE));
+    }
+
+    /// The NIC's own message, the EAL's file prefix among it, reaches the
+    /// operator through `Display`, and the error itself through `source`.
+    #[test]
+    fn a_nic_that_cannot_come_up_says_why() {
+        use std::error::Error as _;
+
+        let err = Error::Nic(io::Error::other(
+            "DPDK EAL init failed (file prefix melin-client; is another DPDK process on this \
+             host using it?): code -1",
+        ));
+        let msg = err.to_string();
+        assert!(msg.starts_with("cannot bring the DPDK NIC up: "), "{msg}");
+        assert!(msg.contains("file prefix melin-client"), "{msg}");
+        let source = err.source().expect("the NIC's error is the source");
+        assert!(source.to_string().contains("code -1"), "{source}");
     }
 
     #[test]

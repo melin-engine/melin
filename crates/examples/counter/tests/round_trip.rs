@@ -188,6 +188,77 @@ fn a_node_without_a_connection_cap_refuses_to_start() {
     assert!(err.contains("unlimited"), "{err}");
 }
 
+/// A client on DPDK, beside its node on DPDK: increments and a query
+/// through `melin-client`'s polled connection on a NIC handle from the
+/// runner's client pair, and a second connection on the same handle that
+/// sees the state the first left.
+///
+/// The node's MAC is passed through. The runner's MACs are not the
+/// `02:00:<ip>` convention the dialer would fall back to without one, so a
+/// dial that took the fallback would time out.
+#[cfg(feature = "dpdk")]
+#[test]
+fn a_dpdk_client_round_trips_through_a_dpdk_node() {
+    use melin_client::{NicConfig, PeerMacSource, StreamConnection};
+
+    /// The stream's socket buffers: the counter's frames are a few bytes.
+    const SOCKET_BUFFER: usize = 16 * 1024;
+
+    let (_tmp, server) = start_server();
+    let key = SigningKey::from_bytes(&[0xAA; 32]);
+    // The launcher returns before the node serves, and the polled
+    // connection has no retry-until-a-deadline twin of `connect_by`: the
+    // kernel client, which has, waits for it, so the DPDK dial below is
+    // one attempt at a node already serving.
+    drop(connect_authenticated(server.addr(), &key));
+
+    let SocketAddr::V4(node) = server.addr() else {
+        panic!("a DPDK node is on IPv4: {}", server.addr());
+    };
+    let node_mac = melin_test_node::mac_of(server.addr());
+    let o = node.ip().octets();
+    assert_ne!(
+        node_mac,
+        [0x02, 0x00, o[0], o[1], o[2], o[3]],
+        "the runner's MACs must not be the fallback convention, or this test proves nothing"
+    );
+    let mut nic = melin_test_node::open_dpdk_client(NicConfig {
+        peer_mac: Some(node_mac),
+        ..NicConfig::default()
+    });
+    assert_eq!(
+        nic.peer_mac(*node.ip()),
+        (node_mac, PeerMacSource::Supplied)
+    );
+
+    let timeout = Duration::from_secs(30);
+    {
+        let mut client =
+            StreamConnection::connect_dpdk_on(&mut nic, node, &key, SOCKET_BUFFER, timeout)
+                .expect("a DPDK client connected to the node");
+        let ack = client
+            .request_one(&increment_request(10))
+            .expect("increment");
+        assert_eq!(ack[0], KIND_RESP_ACK);
+        assert_eq!(value_of(&ack), 10);
+        let ack = client
+            .request_one(&increment_request(32))
+            .expect("increment");
+        assert_eq!(value_of(&ack), 42);
+    }
+    {
+        let mut client =
+            StreamConnection::connect_dpdk_on(&mut nic, node, &key, SOCKET_BUFFER, timeout)
+                .expect("a second DPDK connection on the same NIC handle");
+        let value = client.request_one(&GET_VALUE_REQUEST).expect("query");
+        assert_eq!(value[0], KIND_RESP_VALUE);
+        assert_eq!(value_of(&value), 42);
+    }
+
+    drop(nic);
+    server.stop();
+}
+
 #[test]
 fn second_connection_sees_persisted_state() {
     let (_tmp, server) = start_server();

@@ -13,6 +13,16 @@
 //! what crosses the seam is bytes, and the proxy knows nothing of the
 //! application on either side of them.
 //!
+//! A Rust client that can host DPDK itself has no need of it:
+//! `melin-client`'s `dpdk` feature runs a connection in-process on the
+//! same NIC handle the proxy dials through (`dpdk.rs`). The proxy stays the
+//! harness's client all the same, a separate process owning the NIC being
+//! the point, and what the harness scripts against is a contract: the
+//! flags and their defaults; on stderr the `connected to` line and the
+//! `error:` prefix, which its runner reads to sequence the rig's start; and
+//! the `--trace` report, which its published results quote. A change to
+//! any of them is a change to that harness.
+//!
 //! The file holds two rings and a state word (see `shm.rs` for the
 //! layout). The loop here is one thread, pinned if asked, busy-spinning:
 //! whatever the client has written goes to the socket, the stack is
@@ -48,8 +58,6 @@ use clap::{Parser, ValueEnum};
 use hdrhistogram::Histogram;
 use melin_wire_protocol::control_codec::{TAG_APP, TAG_BATCH_END};
 
-#[cfg(any(feature = "dpdk", test))]
-mod arp;
 #[cfg(feature = "dpdk")]
 mod dpdk;
 mod shm;
@@ -102,7 +110,7 @@ struct Cli {
     trace: bool,
     #[cfg(feature = "dpdk")]
     #[command(flatten)]
-    dpdk: dpdk::DpdkArgs,
+    dpdk: dpdk::ProxyDpdkArgs,
 }
 
 fn main() -> ExitCode {
