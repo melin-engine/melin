@@ -2078,16 +2078,11 @@ where
             let cur_app = app.take().expect("application initialized");
             let cur_writer = journal_writer.take().expect("journal_writer initialized");
 
-            // Unpin before spawning the pipeline. Same rationale as the
-            // kernel-TCP receiver: on post-snapshot rebuilds this thread is
-            // already pinned to `cores.reader`, so children would inherit that
-            // affinity mask (and, on an isolated core, the SCHED_FIFO priority
-            // `pin_to_core` granted there) and never preempt the busy-spinning
-            // receiver to reach their own self-pin.
-            if let Err(e) = melin_app::affinity::clear_affinity() {
-                tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
-            }
-
+            // On a post-snapshot rebuild this thread is pinned to
+            // `cores.reader`, at real-time priority on an isolated core.
+            // The builder creates every pipeline thread in its own
+            // placement and puts this thread back afterwards, so none
+            // inherits that context.
             pipeline = match build_replica_pipeline_with_threads::<A>(
                 cur_app,
                 cur_writer,

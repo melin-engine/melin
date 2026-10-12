@@ -995,34 +995,13 @@ impl<E: AppEvent> JournalStage<E> {
         // codebase already fixed once, in "configure spawned threads from
         // the parent, not the child".
         //
-        // So: adopt the child's context, spawn, put ours back. The
-        // window is a few microseconds at startup.
-        let saved = melin_app::affinity::take_context();
-        if let Err(ref e) = saved {
-            tracing::warn!(error = %e, "journal-disk: cannot snapshot scheduling context");
-        }
-        if let Err(e) = melin_app::affinity::prepare_child_context(disk_core) {
-            tracing::warn!(error = %e, "journal-disk: cannot prepare child context");
-        }
-        let spawned = std::thread::Builder::new()
-            .name("journal-disk".into())
-            .spawn(move || {
-                // Already on the right core under SCHED_OTHER, courtesy
-                // of the parent. This only promotes to SCHED_FIFO when
-                // the core is isolated.
-                melin_app::affinity::pin_thread("journal-disk", disk_core);
-                disk.run()
-            });
-        // Restore before handling the spawn result: a failed spawn must
-        // not leave the calling thread on the disk core.
-        if let Ok(ctx) = saved
-            && let Err(e) = melin_app::affinity::restore_context(&ctx)
-        {
-            tracing::error!(
-                error = %e,
-                "journal-disk: the starting thread could not restore its own affinity"
-            );
-        }
+        // So: adopt the child's context, spawn, put ours back — CPU
+        // included, or the calling thread stays on the disk core and
+        // every thread it spawns next starts there. The window is a few
+        // microseconds at startup. The child's own pin only promotes it
+        // to SCHED_FIFO, when the core is isolated.
+        let spawned =
+            melin_app::affinity::spawn_placed("journal-disk", disk_core, move || disk.run());
         let disk_thread = DiskThread::new(
             Arc::clone(&control),
             spawned.map_err(|e| {

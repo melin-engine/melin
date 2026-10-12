@@ -15,17 +15,22 @@
 //!
 //! **A pipeline core of `0` means "unpinned"**, and unpinned means the
 //! process's *home mask*: the CPU set it was started with (see
-//! [`capture_home_mask`](crate::affinity::capture_home_mask)). That set
-//! already reflects everything that restricts the process — `isolcpus`
-//! confines pid 1, and so every process, to the non-isolated CPUs; a
-//! cgroup cpuset, systemd's `CPUAffinity=` or `taskset` narrow it
-//! further — so an unpinned thread runs where the operator left room and
-//! never on an isolated core. [`pin_thread`](crate::affinity::pin_thread)
-//! and [`prepare_child_context`](crate::affinity::prepare_child_context)
+//! [`capture_home_mask`](crate::affinity::capture_home_mask)), less the
+//! CPUs the kernel reports isolated. The startup set reflects what the
+//! operator restricted the process to — a cgroup cpuset, systemd's
+//! `CPUAffinity=`, `taskset` — so an unpinned thread runs where they left
+//! room. It does not reliably exclude isolated CPUs: `isolcpus` confines
+//! pid 1 to the housekeeping CPUs, but a process started under
+//! `numactl --cpunodebind` or `taskset` is handed isolated ones back. An
+//! isolated CPU is never load-balanced, so a thread that lands on one
+//! stays, and a thread spawned from there starts there — beside whatever
+//! real-time thread spins on it, and never runs. So the isolated CPUs
+//! come out of the home mask, unless they are all the process was given.
+//! [`pin_thread`](crate::affinity::pin_thread) and
+//! [`prepare_child_context`](crate::affinity::prepare_child_context)
 //! with `0`, and [`clear_affinity`](crate::affinity::clear_affinity), all
-//! apply it. Handing out "every CPU" instead is not the same thing: a
-//! thread whose mask allows its creator's isolated core starts on that
-//! core, and the scheduler never moves it off. Production deployments
+//! apply it. Handing out "every CPU" instead is not the same thing, for
+//! the same reason. Production deployments
 //! never run pipeline threads on core 0 (it is reserved for the kernel,
 //! IRQ handlers, and other system processes), so the value is free to
 //! repurpose. This lets the
@@ -41,19 +46,21 @@
 
 /// The process's home mask — the CPU set an unpinned thread runs on.
 ///
-/// The calling thread's affinity at capture, taken before anything here
-/// changes a thread's placement: explicitly by [`capture_home_mask`] at
-/// startup, or else implicitly by the first function here that changes
-/// one. `None` when the mask could not be read, in which case unpinned
-/// threads get every CPU, as they did before there was a home mask.
+/// The calling thread's affinity at capture, less the isolated CPUs (see
+/// [`without_isolated`]), taken before anything here changes a thread's
+/// placement: explicitly by [`capture_home_mask`] at startup, or else
+/// implicitly by the first function here that changes one. `None` when
+/// the mask could not be read, in which case unpinned threads get every
+/// housekeeping CPU.
 ///
 /// A `OnceLock` because it is written once and read from threads that may
 /// start concurrently; `cpu_set_t` because it is what the affinity
 /// syscalls take, so applying it converts nothing.
 static HOME_MASK: std::sync::OnceLock<Option<libc::cpu_set_t>> = std::sync::OnceLock::new();
 
-/// Record the calling thread's CPU mask as the process's home mask, unless
-/// one is already recorded.
+/// Record the calling thread's CPU mask, less the isolated CPUs, as the
+/// process's home mask, unless one is already recorded; then move the
+/// calling thread into it.
 ///
 /// Call it first thing at startup, on the main thread: before any thread is
 /// pinned, and before initialising anything that narrows the main thread's
@@ -62,22 +69,99 @@ static HOME_MASK: std::sync::OnceLock<Option<libc::cpu_set_t>> = std::sync::Once
 /// call, the first function here that changes a thread's placement captures
 /// it from its caller, which is right as long as nothing outside this
 /// module narrowed that thread first.
+///
+/// The move matters as much as the record: every thread the main thread
+/// spawns without a placement of its own starts on the CPU the main thread
+/// is on, and if that CPU is isolated, it starts — and stays — there. The
+/// caller is only ever narrowed, never widened, so a second call from a
+/// thread the EAL already pinned leaves it alone.
 pub fn capture_home_mask() {
-    home_mask();
+    let Some(home) = home_mask() else {
+        return;
+    };
+    let current = match current_mask() {
+        Ok(mask) => mask,
+        Err(e) => {
+            tracing::warn!(error = e, "cannot read the startup thread's CPU mask");
+            return;
+        }
+    };
+    let narrowed = intersection(&current, &home);
+    if count(&narrowed) > 0
+        && count(&narrowed) < count(&current)
+        && let Err(e) = set_mask(&narrowed, "home")
+    {
+        tracing::warn!(
+            error = e,
+            "cannot move the startup thread off the isolated CPUs; threads it spawns \
+             may start on one"
+        );
+    }
 }
 
 /// The home mask, captured from the calling thread on first use.
 fn home_mask() -> Option<libc::cpu_set_t> {
     *HOME_MASK.get_or_init(|| match current_mask() {
-        Ok(mask) => Some(mask),
+        Ok(mask) => Some(home_from(&mask, &isolated_cpu_list())),
         Err(e) => {
             tracing::warn!(
                 error = e,
-                "cannot read the process CPU mask; unpinned threads get every CPU"
+                "cannot read the process CPU mask; unpinned threads get every housekeeping CPU"
             );
             None
         }
     })
+}
+
+/// The home mask a startup mask makes, given the kernel's isolated-CPU
+/// list: the startup mask without the isolated CPUs, or the whole startup
+/// mask, with a warning, when it holds nothing else.
+fn home_from(startup: &libc::cpu_set_t, isolated: &str) -> libc::cpu_set_t {
+    match without_isolated(startup, isolated) {
+        Some(home) => home,
+        None => {
+            tracing::warn!(
+                isolated,
+                "every CPU this process may use is isolated; unpinned threads share \
+                 isolated CPUs, which the scheduler does not balance — a thread placed \
+                 beside a real-time pipeline thread there will not run"
+            );
+            *startup
+        }
+    }
+}
+
+/// `mask` without the CPUs in `isolated` (a Linux CPU list, as in
+/// `/sys/devices/system/cpu/isolated`), or `None` when that leaves no CPU.
+fn without_isolated(mask: &libc::cpu_set_t, isolated: &str) -> Option<libc::cpu_set_t> {
+    let mut kept = *mask;
+    for cpu in cpus_of(mask) {
+        if cpu_list_contains(isolated, cpu) {
+            unsafe { libc::CPU_CLR(cpu, &mut kept) };
+        }
+    }
+    (count(&kept) > 0).then_some(kept)
+}
+
+/// The CPUs in both masks.
+fn intersection(a: &libc::cpu_set_t, b: &libc::cpu_set_t) -> libc::cpu_set_t {
+    let mut both = *a;
+    for cpu in cpus_of(a) {
+        if !unsafe { libc::CPU_ISSET(cpu, b) } {
+            unsafe { libc::CPU_CLR(cpu, &mut both) };
+        }
+    }
+    both
+}
+
+/// The CPUs in a mask, in ascending order.
+fn cpus_of(mask: &libc::cpu_set_t) -> impl Iterator<Item = usize> + '_ {
+    (0..libc::CPU_SETSIZE as usize).filter(move |&cpu| unsafe { libc::CPU_ISSET(cpu, mask) })
+}
+
+/// How many CPUs a mask holds.
+fn count(mask: &libc::cpu_set_t) -> usize {
+    cpus_of(mask).count()
 }
 
 /// The calling thread's affinity mask.
@@ -119,21 +203,32 @@ fn set_mask(mask: &libc::cpu_set_t, what: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Every housekeeping CPU the mask type can name: [`all_cpus`] without the
+/// isolated ones, for the same reason the home mask leaves them out.
+fn housekeeping_cpus() -> libc::cpu_set_t {
+    home_from(&all_cpus(), &isolated_cpu_list())
+}
+
 /// Put the calling thread on the home mask. If the kernel refuses it — the
 /// process's cpuset shrank since startup, leaving no CPU in common — fall
-/// back to every CPU, which the kernel intersects with whatever the process
-/// may still use.
+/// back to every housekeeping CPU, which the kernel intersects with
+/// whatever the process may still use.
 fn set_unpinned_mask() -> Result<(), String> {
     let Some(home) = home_mask() else {
-        return set_mask(&all_cpus(), "unpin");
+        return set_mask(&housekeeping_cpus(), "unpin");
     };
-    set_mask(&home, "unpin").or_else(|e| {
-        tracing::warn!(
-            error = e,
-            "the home CPU mask no longer applies; unpinning across every CPU instead"
-        );
-        set_mask(&all_cpus(), "unpin")
-    })
+    set_mask(&home, "unpin")
+        .or_else(|e| {
+            tracing::warn!(
+                error = e,
+                "the home CPU mask no longer applies; unpinning across every housekeeping CPU \
+                 instead"
+            );
+            set_mask(&housekeeping_cpus(), "unpin")
+        })
+        // The cpuset now holds isolated CPUs only: those are all the
+        // kernel will let the thread run on.
+        .or_else(|_| set_mask(&all_cpus(), "unpin"))
 }
 
 /// Drop the calling thread to default `SCHED_OTHER` scheduling. `what`
@@ -229,10 +324,16 @@ pub fn pin_to_core(core_id: usize) -> Result<usize, String> {
 /// isolated" (the safe default — affinity without real-time priority), which
 /// is the reality on any host booted without `isolcpus`.
 fn core_is_isolated(core_id: usize) -> bool {
+    cpu_list_contains(&isolated_cpu_list(), core_id)
+}
+
+/// The kernel's isolated-CPU list, `/sys/devices/system/cpu/isolated`;
+/// empty when nothing is isolated.
+fn isolated_cpu_list() -> String {
     match std::fs::read_to_string("/sys/devices/system/cpu/isolated") {
-        Ok(list) => cpu_list_contains(list.trim(), core_id),
-        // No isolcpus configured (or sysfs unavailable) → not isolated.
-        Err(_) => false,
+        Ok(list) => list.trim().to_owned(),
+        // No isolcpus configured (or sysfs unavailable) → nothing isolated.
+        Err(_) => String::new(),
     }
 }
 
@@ -295,17 +396,22 @@ pub fn pin_thread(name: &str, core: usize) {
     }
 }
 
-/// A thread's scheduling context: CPU affinity mask plus policy and
-/// priority. Captured by [`take_context`] and put back by
+/// A thread's scheduling context: CPU affinity mask, the CPU it is on,
+/// policy and priority. Captured by [`take_context`] and put back by
 /// [`restore_context`].
 pub struct SchedContext {
     mask: libc::cpu_set_t,
+    /// The CPU the thread was running on, when the kernel could say. A
+    /// mask alone does not say where a thread is, and the handover in
+    /// [`prepare_child_context`] moves it — see [`restore_context`].
+    /// `usize` because it indexes a `cpu_set_t`.
+    cpu: Option<usize>,
     policy: libc::c_int,
     priority: libc::c_int,
 }
 
-/// Snapshot the calling thread's affinity mask, scheduling policy and
-/// priority.
+/// Snapshot the calling thread's affinity mask, the CPU it is on,
+/// scheduling policy and priority.
 pub fn take_context() -> Result<SchedContext, String> {
     unsafe {
         let mut mask: libc::cpu_set_t = std::mem::zeroed();
@@ -315,6 +421,9 @@ pub fn take_context() -> Result<SchedContext, String> {
                 std::io::Error::last_os_error()
             ));
         }
+        // -1 when the kernel cannot say; restoring then falls back to
+        // the mask alone, which is all there was before this field.
+        let cpu = usize::try_from(libc::sched_getcpu()).ok();
         let policy = libc::sched_getscheduler(0);
         if policy < 0 {
             return Err(format!(
@@ -331,21 +440,52 @@ pub fn take_context() -> Result<SchedContext, String> {
         }
         Ok(SchedContext {
             mask,
+            cpu,
             policy,
             priority: param.sched_priority,
         })
     }
 }
 
-/// Put a snapshot from [`take_context`] back on the calling thread.
+/// Put a snapshot from [`take_context`] back on the calling thread: its
+/// policy and mask, and the CPU it was on.
+///
+/// The CPU is the part a mask cannot restore. [`prepare_child_context`]
+/// moves the thread onto the child's core; widening the mask back would
+/// leave it there whenever the mask allows that core, because the kernel
+/// moves a thread only off CPUs its new mask excludes. On an isolated core
+/// nothing moves it later, so it would stay beside the child it just
+/// spawned — which turns real-time and spins — and so would every thread
+/// it spawns after.
 pub fn restore_context(ctx: &SchedContext) -> Result<(), String> {
+    // Back to the CPU first, while still at the handover's SCHED_OTHER,
+    // so the thread is never real-time on the child's core.
+    if let Some(cpu) = ctx.cpu.filter(|&cpu| {
+        cpu < libc::CPU_SETSIZE as usize && unsafe { libc::CPU_ISSET(cpu, &ctx.mask) }
+    }) {
+        let only = unsafe {
+            let mut only: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut only);
+            only
+        };
+        if let Err(e) = set_mask(&only, "restore") {
+            // The CPU went away since the snapshot (offline, or the
+            // cpuset shrank). The mask below still applies; only the
+            // return to that exact CPU is lost.
+            tracing::warn!(
+                cpu,
+                error = e,
+                "could not move back to the CPU the thread was on"
+            );
+        }
+    }
     unsafe {
         let param = libc::sched_param {
             sched_priority: ctx.priority,
         };
-        // Policy first: dropping out of `SCHED_FIFO` while holding a
-        // single-core mask is the safe ordering — the reverse briefly
-        // leaves an RT thread on a wider mask.
+        // Policy before the mask widens: the thread is on its own CPU
+        // again (or still on the single core it was handed), so even a
+        // real-time policy never lands on a wider mask than it had.
         if libc::sched_setscheduler(0, ctx.policy, &param) != 0 {
             return Err(format!(
                 "sched_setscheduler (restore) failed: {}",
@@ -379,17 +519,12 @@ pub fn restore_context(ctx: &SchedContext) -> Result<(), String> {
 /// `Builder::name` is applied from inside the new thread.
 ///
 /// The only place that ordering can be broken is the parent, before the
-/// child exists. Call this, spawn, then [`restore_context`]:
-///
-/// ```text
-/// let saved = take_context()?;
-/// prepare_child_context(child_core);
-/// let handle = std::thread::Builder::new().spawn(move || { … })?;
-/// restore_context(&saved)?;
-/// ```
-///
-/// The child then starts already on its own core under `SCHED_OTHER`,
-/// free to run and promote itself with [`pin_thread`].
+/// child exists: take the context, call this, spawn, restore. The child
+/// then starts already on its own core under `SCHED_OTHER`, free to run
+/// and promote itself with [`pin_thread`]. Spawn through [`spawn_placed`]
+/// or [`with_child_context`], which do all four steps; a thread that pins
+/// itself and is spawned any other way is this bug waiting for a host
+/// that triggers it.
 pub fn prepare_child_context(core: usize) -> Result<(), String> {
     // Record the home mask while this thread still has its own placement.
     home_mask();
@@ -414,6 +549,78 @@ pub fn prepare_child_context(core: usize) -> Result<(), String> {
         set
     };
     set_mask(&set, "child prep")
+}
+
+/// Run `spawn`, which creates the thread `name`, with the calling thread
+/// in the scheduling context that thread must start in — pinned to
+/// `core`, or on the home mask for the `0` sentinel, at `SCHED_OTHER` —
+/// then put the calling thread back where it was, CPU included.
+///
+/// For a spawn [`spawn_placed`] cannot express, such as a scoped thread.
+/// The spawned thread still has to [`pin_thread`] itself to `core` first
+/// thing, which is what promotes it to real-time on an isolated core.
+///
+/// A failed snapshot skips the handover rather than strand the calling
+/// thread on the child's core: the child then inherits the caller's
+/// context, as every thread did before this existed.
+pub fn with_child_context<R>(name: &str, core: usize, spawn: impl FnOnce() -> R) -> R {
+    let saved = match take_context() {
+        Ok(saved) => saved,
+        Err(e) => {
+            tracing::warn!(
+                thread = name,
+                error = e,
+                "cannot snapshot the spawning thread's scheduling context; the thread \
+                 starts in it instead of its own"
+            );
+            return spawn();
+        }
+    };
+    if let Err(e) = prepare_child_context(core) {
+        tracing::warn!(
+            thread = name,
+            error = e,
+            "cannot prepare the thread's scheduling context"
+        );
+    }
+    let spawned = spawn();
+    // Restored whatever the spawn returned: a failed spawn must not leave
+    // the calling thread on the child's core either.
+    if let Err(e) = restore_context(&saved) {
+        tracing::error!(
+            thread = name,
+            error = e,
+            "the spawning thread could not restore its own scheduling context"
+        );
+    }
+    spawned
+}
+
+/// Spawn the thread `name` placed on `core` (`0` = unpinned): created
+/// already in that placement's context by [`with_child_context`], and
+/// pinned by [`pin_thread`] before it runs `f`.
+///
+/// The way to spawn any thread that has a placement. See
+/// [`prepare_child_context`] for why the placement cannot be left to the
+/// thread itself.
+pub fn spawn_placed<T, F>(
+    name: &str,
+    core: usize,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let thread_name = name.to_owned();
+    with_child_context(name, core, || {
+        std::thread::Builder::new()
+            .name(thread_name.clone())
+            .spawn(move || {
+                pin_thread(&thread_name, core);
+                f()
+            })
+    })
 }
 
 /// Put the calling thread on the home mask under default `SCHED_OTHER`
@@ -527,9 +734,7 @@ mod tests {
 
     /// A mask as a sorted core list.
     fn cores(set: &libc::cpu_set_t) -> Vec<usize> {
-        (0..libc::CPU_SETSIZE as usize)
-            .filter(|&c| unsafe { libc::CPU_ISSET(c, set) })
-            .collect()
+        cpus_of(set).collect()
     }
 
     /// The property the journal's disk thread actually depends on: a
@@ -659,6 +864,137 @@ mod tests {
         })
         .join()
         .expect("thread");
+    }
+
+    /// A mask holding exactly `cpus`.
+    fn mask_of(cpus: &[usize]) -> libc::cpu_set_t {
+        let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        for &cpu in cpus {
+            unsafe { libc::CPU_SET(cpu, &mut mask) };
+        }
+        mask
+    }
+
+    /// The CPU the calling thread is running on.
+    fn current_cpu() -> usize {
+        usize::try_from(unsafe { libc::sched_getcpu() }).expect("sched_getcpu")
+    }
+
+    /// The calling thread's scheduling policy.
+    fn current_policy() -> libc::c_int {
+        let policy = unsafe { libc::sched_getscheduler(0) };
+        assert!(policy >= 0, "sched_getscheduler failed");
+        policy
+    }
+
+    /// Put the calling thread at `SCHED_BATCH`: a policy no thread here
+    /// is ever given, that needs no privilege, and that pinning to a core
+    /// that is not isolated leaves alone — so a thread found at it after
+    /// pinning itself inherited it.
+    fn set_batch_policy() {
+        let param = libc::sched_param { sched_priority: 0 };
+        assert_eq!(
+            unsafe { libc::sched_setscheduler(0, libc::SCHED_BATCH, &param) },
+            0,
+            "sched_setscheduler(SCHED_BATCH) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// The home mask is the startup mask without the isolated CPUs: an
+    /// isolated CPU is never balanced, so an unpinned thread that lands on
+    /// one stays, beside whatever real-time thread spins there. A process
+    /// started on isolated CPUs only keeps them — that was the operator's
+    /// choice, and there is nowhere else to run.
+    #[test]
+    fn the_home_mask_leaves_out_isolated_cpus_unless_nothing_else_is_left() {
+        let startup = mask_of(&[0, 1, 2, 3, 8, 9]);
+        assert_eq!(cores(&home_from(&startup, "1-3,9-15")), vec![0, 8]);
+        assert_eq!(cores(&home_from(&startup, "")), vec![0, 1, 2, 3, 8, 9]);
+        assert_eq!(cores(&home_from(&startup, "4-7")), vec![0, 1, 2, 3, 8, 9]);
+
+        let isolated_only = mask_of(&[2, 3]);
+        assert!(without_isolated(&isolated_only, "1-7").is_none());
+        assert_eq!(cores(&home_from(&isolated_only, "1-7")), vec![2, 3]);
+    }
+
+    /// The handover moves the spawning thread onto the child's core, and
+    /// restoring has to move it back — not only widen its mask again,
+    /// which leaves it wherever the wider mask allows. On an isolated core
+    /// that is for good, beside the child it just spawned; every plain
+    /// spawn after that starts there too. That is how four replica stage
+    /// threads came to start, and starve, on the journal disk thread's
+    /// core.
+    #[test]
+    fn restore_context_returns_the_thread_to_the_cpu_it_was_on() {
+        let [a, b, ..] = affinity_cores()[..] else {
+            return; // one CPU: nowhere to move to and back from
+        };
+
+        let (cpu_after, mask_after) = std::thread::spawn(move || {
+            // On `a`, with a mask that also allows the child's core `b`.
+            set_mask(&mask_of(&[a]), "test").expect("move to a");
+            set_mask(&mask_of(&[a, b]), "test").expect("widen to a and b");
+
+            let saved = take_context().expect("snapshot context");
+            prepare_child_context(b).expect("prepare child context");
+            std::thread::spawn(|| {}).join().expect("child thread");
+            restore_context(&saved).expect("restore context");
+
+            (current_cpu(), affinity_cores())
+        })
+        .join()
+        .expect("spawning thread");
+
+        assert_eq!(
+            cpu_after, a,
+            "the spawning thread must be back on its own CPU, not left on the child's"
+        );
+        assert_eq!(mask_after, vec![a, b], "and on its own mask");
+    }
+
+    /// [`spawn_placed`] creates the thread already in its placement's
+    /// context — not the spawner's — and leaves the spawner as it found
+    /// it: same CPU, same mask, same policy.
+    #[test]
+    fn spawn_placed_starts_the_thread_in_its_own_context_and_puts_the_spawner_back() {
+        let available = affinity_cores();
+        // The child's core must not be the `0` "unpinned" sentinel.
+        let Some(&child_core) = available.iter().find(|&&cpu| cpu != 0) else {
+            return; // no CPU but 0
+        };
+        let Some(&spawner_cpu) = available.iter().find(|&&cpu| cpu != child_core) else {
+            return; // one CPU: the spawner and the child cannot be told apart
+        };
+
+        let ((child_policy, child_cores), spawner) = std::thread::spawn(move || {
+            set_mask(&mask_of(&[spawner_cpu]), "test").expect("move to the spawner's CPU");
+            set_mask(&mask_of(&[spawner_cpu, child_core]), "test").expect("widen");
+            set_batch_policy();
+
+            let child = spawn_placed("placed-test", child_core, || {
+                (current_policy(), affinity_cores())
+            })
+            .expect("spawn");
+            let spawner = (current_cpu(), affinity_cores(), current_policy());
+            (child.join().expect("child thread"), spawner)
+        })
+        .join()
+        .expect("spawning thread");
+
+        assert_eq!(
+            child_policy,
+            libc::SCHED_OTHER,
+            "the child must start in its own context, not inherit the spawner's"
+        );
+        assert_eq!(child_cores, vec![child_core], "and run pinned to its core");
+        let mut spawner_mask = vec![spawner_cpu, child_core];
+        spawner_mask.sort_unstable();
+        assert_eq!(
+            spawner,
+            (spawner_cpu, spawner_mask, libc::SCHED_BATCH),
+            "the spawner must be left on its own CPU, mask and policy"
+        );
     }
 
     #[test]

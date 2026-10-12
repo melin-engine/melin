@@ -313,6 +313,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   each recycled buffer takes a submission entry on top of those the
   ring is sized for; a full queue is now flushed to the kernel instead
   of panicking the reader.
+- **Pipeline threads could start on an isolated core held by a real-time
+  thread, and never run.** On a host with `isolcpus`, real-time
+  throttling off and the node running with `CAP_SYS_NICE`, a replica's
+  sequencing, matching, drain and shadow threads could be created on the
+  journal disk thread's core and wait there forever behind it. The
+  replica kept acknowledging until its input ring filled, then stalled
+  and was evicted, without logging anything. Every thread with a core
+  assignment is now created on that core, and the thread that spawns it
+  is put back where it was, CPU included. Threads with no core of their
+  own now stay off isolated CPUs even when the process was started on
+  them (`numactl --cpunodebind`, `taskset`), unless isolated CPUs are
+  all it was given.
 
 ## [0.19.0] - 2026-10-10
 

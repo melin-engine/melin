@@ -138,22 +138,9 @@ pub(super) fn spawn_unpinned(
     // Hand the worker its scheduling context before it exists. `0` is the
     // unpinned sentinel: these threads sleep and do blocking file I/O, so
     // they want the process's home CPU mask, not a reserved core.
-    let saved = melin_app::affinity::take_context();
-    if let Err(ref e) = saved {
-        tracing::warn!(worker = %name, error = %e, "cannot snapshot scheduling context");
-    }
-    if let Err(e) = melin_app::affinity::prepare_child_context(0) {
-        tracing::warn!(worker = %name, error = %e, "cannot prepare child context");
-    }
-    let spawned = std::thread::Builder::new().name(name.clone()).spawn(body);
-    // Restore before propagating a spawn failure: a failed spawn must
-    // not strand the caller on the child's (unpinned) context.
-    if let Ok(ctx) = saved
-        && let Err(e) = melin_app::affinity::restore_context(&ctx)
-    {
-        tracing::error!(worker = %name, error = %e, "caller could not restore its own affinity");
-    }
-    spawned
+    melin_app::affinity::with_child_context(&name, 0, || {
+        std::thread::Builder::new().name(name.clone()).spawn(body)
+    })
 }
 
 /// A parked replication worker's thread is gone (it panicked); nothing

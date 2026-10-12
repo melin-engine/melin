@@ -315,37 +315,16 @@ pub fn run_sender<A: Application>(
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
                     let connected_flag = replicas_connected as *const AtomicU32 as usize;
-                    let handle = std::thread::Builder::new()
-                        .name(format!("repl-{slot_idx}"))
-                        .spawn(move || {
-                            // Pin to a dedicated core if configured (> 0),
-                            // otherwise clear inherited affinity from the
-                            // accept thread so the OS can schedule freely.
-                            //
-                            // Both branches only work because the accept
-                            // thread is left unpinned (see its spawn in
-                            // `server.rs`). A child inherits its creator's
-                            // affinity and scheduling policy at creation,
-                            // and cannot fix that itself if the parent is
-                            // pinned real-time and never yields — fixing
-                            // itself requires running. Pin the accept
-                            // thread and this handler may never start.
-                            if handler.is_pinned() {
-                                match melin_app::affinity::pin_to_core(handler.core) {
-                                    Ok(c) => tracing::info!(
-                                        core = c,
-                                        slot = slot_idx,
-                                        "replication handler pinned to core"
-                                    ),
-                                    Err(e) => tracing::warn!(
-                                        error = e,
-                                        slot = slot_idx,
-                                        "failed to pin handler"
-                                    ),
-                                }
-                            } else if let Err(e) = melin_app::affinity::clear_affinity() {
-                                tracing::warn!(error = e, "failed to clear handler affinity");
-                            }
+                    // Pinned to a dedicated core if configured (> 0),
+                    // otherwise on the home mask — created in that
+                    // placement rather than inheriting the accept
+                    // thread's, which it could not undo itself if the
+                    // accept thread sat on a core a real-time thread
+                    // never yields.
+                    let handle = melin_app::affinity::spawn_placed(
+                        &format!("repl-{slot_idx}"),
+                        handler.core,
+                        move || {
                             // Safety: shutdown and replica_ready outlive this thread
                             // (they're on the parent's stack, which blocks on join
                             // during shutdown).
@@ -374,8 +353,9 @@ pub fn run_sender<A: Application>(
                                 authenticated: &slot_authenticated,
                             };
                             run_replica_slot::<A>(stream, consumer, &ctx)
-                        })
-                        .expect("spawn replica handler thread");
+                        },
+                    )
+                    .expect("spawn replica handler thread");
                     slots[slot_idx].handle = Some(handle);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

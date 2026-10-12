@@ -1691,14 +1691,13 @@ where
     let shutdown_for_journal = Arc::clone(&shutdown);
     // Start the journal's disk and preparer threads here rather than on
     // journal-seq, which is pinned by the time it runs: a thread inherits
-    // its creator's placement. See `JournalStage::start`.
+    // its creator's placement. See `JournalStage::start`. For the same
+    // reason every stage thread below is spawned placed, never plainly.
     let sequencer = journal_stage
         .start()
         .map_err(|e| format!("start the journal stage: {e}"))?;
-    let journal_handle = std::thread::Builder::new()
-        .name("journal-seq".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("journal-seq", cores.journal_seq.core);
+    let journal_handle =
+        melin_app::affinity::spawn_placed("journal-seq", cores.journal_seq.core, move || {
             let result = sequencer.run(&s1);
             let was_shutdown = shutdown_for_journal.load(Ordering::Relaxed);
             match &result {
@@ -1712,10 +1711,8 @@ where
 
     let s2 = Arc::clone(&shutdown);
     let shutdown_for_matching = Arc::clone(&shutdown);
-    let matching_handle = std::thread::Builder::new()
-        .name("matching".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("matching", cores.matching.core);
+    let matching_handle =
+        melin_app::affinity::spawn_placed("matching", cores.matching.core, move || {
             let app = matching_stage.run(&s2);
             let was_shutdown = shutdown_for_matching.load(Ordering::Relaxed);
             if was_shutdown {
@@ -1757,10 +1754,8 @@ where
     // The stage's startup report — see `Response::ready`. Capacity one so
     // the report never blocks the stage on this thread reaching `recv`.
     let (response_ready_tx, response_ready_rx) = std::sync::mpsc::sync_channel(1);
-    let response_handle = std::thread::Builder::new()
-        .name("response".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("response", cores.response.core);
+    let response_handle =
+        melin_app::affinity::spawn_placed("response", cores.response.core, move || {
             let started = crate::response::run::<A>(
                 output_consumer,
                 control_rx,
@@ -1887,17 +1882,9 @@ where
             .spawn(move || {
                 // Deliberately NOT pinned. Reserving a core — at
                 // SCHED_FIFO, on an isolated one — for a thread that idles
-                // 99.9% of the time bought nothing.
-                //
-                // Staying unpinned is now load-bearing, not just thrifty.
-                // The handler threads are spawned from here and inherit
-                // this thread's affinity and scheduling policy at
-                // creation; a child of a pinned real-time parent cannot
-                // move itself off that core, because moving itself
-                // requires running. That is the DPDK handshake hang, and
-                // this path escaped it only because the 50 ms sleep
-                // happened to yield the core. See
-                // `replication::validation_worker`.
+                // 99.9% of the time bought nothing. The handler threads it
+                // spawns are created in their own placement, so this
+                // thread's does not reach them.
                 //
                 // `PipelineCores` consequently has no field for it, and
                 // `--cores` no name.
@@ -2911,23 +2898,20 @@ where
 
     let s1 = Arc::clone(&shutdown);
     // As on kernel TCP: start the journal's helper threads here, not on
-    // journal-seq. See `JournalStage::start`.
+    // journal-seq, and spawn every stage thread placed. See
+    // `JournalStage::start`.
     let sequencer = journal_stage
         .start()
         .map_err(|e| format!("start the journal stage: {e}"))?;
-    let journal_handle = std::thread::Builder::new()
-        .name("journal-seq".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("journal-seq", cores.journal_seq.core);
+    let journal_handle =
+        melin_app::affinity::spawn_placed("journal-seq", cores.journal_seq.core, move || {
             sequencer.run(&s1)
         })
         .map_err(|e| format!("spawn journal-seq thread: {e}"))?;
 
     let s2 = Arc::clone(&shutdown);
-    let matching_handle = std::thread::Builder::new()
-        .name("matching".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("matching", cores.matching.core);
+    let matching_handle =
+        melin_app::affinity::spawn_placed("matching", cores.matching.core, move || {
             matching_stage.run(&s2)
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
@@ -2956,10 +2940,8 @@ where
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
-    let response_handle = std::thread::Builder::new()
-        .name("response".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("response", cores.response.core);
+    let response_handle =
+        melin_app::affinity::spawn_placed("response", cores.response.core, move || {
             crate::dpdk_response::run::<A>(
                 output_consumer,
                 control_rx,
@@ -3737,23 +3719,20 @@ where
     let s_shadow = Arc::clone(shutdown);
     let shadow = cores.shadow;
     let shadow_initial_epoch = initial_epoch;
-    let handle = std::thread::Builder::new()
-        .name("shadow".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("shadow", shadow.core);
-            melin_transport_core::shadow::run(
-                shadow_cons,
-                shadow_ex,
-                snap_path,
-                interval,
-                chain_hash,
-                &s_shadow,
-                shadow.wait,
-                shadow_initial_epoch,
-                genesis_entries,
-            );
-        })
-        .map_err(|e| format!("spawn shadow thread: {e}"))?;
+    let handle = melin_app::affinity::spawn_placed("shadow", shadow.core, move || {
+        melin_transport_core::shadow::run(
+            shadow_cons,
+            shadow_ex,
+            snap_path,
+            interval,
+            chain_hash,
+            &s_shadow,
+            shadow.wait,
+            shadow_initial_epoch,
+            genesis_entries,
+        );
+    })
+    .map_err(|e| format!("spawn shadow thread: {e}"))?;
 
     info!(
         interval_ms = config.snapshot_interval_ms,
@@ -3854,10 +3833,8 @@ where
     let s_event = Arc::clone(shutdown);
     let event_keys = Arc::clone(authorized_keys);
     let publisher = cores.event_publisher;
-    let event_handle = std::thread::Builder::new()
-        .name("event-publisher".into())
-        .spawn(move || {
-            melin_app::affinity::pin_thread("event-publisher", publisher.core);
+    let event_handle =
+        melin_app::affinity::spawn_placed("event-publisher", publisher.core, move || {
             run_fn(
                 event_consumer,
                 event_bind,

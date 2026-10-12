@@ -249,34 +249,30 @@ where
     // worker on the spawner reaching `recv`.
     let (ready_tx, ready_rx) = mpsc::sync_channel::<std::io::Result<()>>(1);
 
-    let handle = std::thread::Builder::new()
-        .name("uring-reader".into())
-        .spawn(move || {
-            // `core == 0` is the unpinned sentinel, which puts the thread
-            // on the process's home CPU mask — see the `melin_app::affinity`
-            // module docs.
-            melin_app::affinity::pin_thread("uring-reader", core);
-            reader_loop::<A, R>(
-                rx,
-                wakeup_fd,
-                producer,
-                &*decoder,
-                &halt,
-                refusals,
-                &control_tx,
-                connection_timeout,
-                tick_cadence,
-                sizing,
-                ready_tx,
-                &shutdown_clone,
-            );
-        })
-        .map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("uring-reader: cannot spawn its thread: {e}"),
-            )
-        })?;
+    // `core == 0` is the unpinned sentinel, which puts the thread on the
+    // process's home CPU mask — see the `melin_app::affinity` module docs.
+    let handle = melin_app::affinity::spawn_placed("uring-reader", core, move || {
+        reader_loop::<A, R>(
+            rx,
+            wakeup_fd,
+            producer,
+            &*decoder,
+            &halt,
+            refusals,
+            &control_tx,
+            connection_timeout,
+            tick_cadence,
+            sizing,
+            ready_tx,
+            &shutdown_clone,
+        );
+    })
+    .map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("uring-reader: cannot spawn its thread: {e}"),
+        )
+    })?;
 
     if let Err(e) = await_startup("uring-reader", &ready_rx) {
         // The thread has returned (or panicked) by now; a panic was
