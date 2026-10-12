@@ -14,9 +14,7 @@
 
 use std::net::{SocketAddr, SocketAddrV4};
 
-use melin_client::{
-    DEFAULT_TIMEOUT, DpdkStream, NicConfig, NicHandle, SigningKey, StreamConnection, fmt_mac,
-};
+use melin_client::{DEFAULT_TIMEOUT, DpdkStream, NicHandle, SigningKey, StreamConnection};
 
 use melin_dpdk::DpdkArgs;
 
@@ -67,28 +65,19 @@ pub fn connect(
 ) -> Result<StreamConnection<DpdkStream>, Error> {
     let config = args.nic_config().map_err(|e| e.to_string())?;
     let nic = NicHandle::open(&config).map_err(melin_client::Error::Nic)?;
-    announce(&nic, &config, server);
+    announce(&nic, server);
     let connection =
         StreamConnection::connect_dpdk_on(nic, server, key, SOCKET_BUFFER, DEFAULT_TIMEOUT)?;
     Ok(connection)
 }
 
-/// The proxy's connect line, on stderr: the port, the client's address and
-/// MAC, and where the dial goes (the server's MAC, or the gateway's) with
-/// where that came from, as the NIC handle says it. A warning when no peer
-/// MAC was given and the convention's stands in for it.
-fn announce(nic: &NicHandle, config: &NicConfig, server: SocketAddrV4) {
-    let port = config
-        .port_ids
-        .first()
-        .map_or_else(|| "?".to_owned(), u16::to_string);
-    let next_hop = nic.next_hop(*server.ip());
-    eprintln!(
-        "DPDK: port {port} as {} ({}), server {server} {next_hop}",
-        config.ip_addr,
-        fmt_mac(nic.mac())
-    );
-    if let Some(warning) = next_hop.warning() {
+/// The connect line the NIC handle composes, the proxy's, on stderr: the
+/// port, the client's address and MAC, and where the dial goes with where
+/// that MAC came from. A warning when no peer MAC was given and the
+/// convention's stands in for it.
+fn announce(nic: &NicHandle, server: SocketAddrV4) {
+    eprintln!("{}", nic.connect_line(server));
+    if let Some(warning) = nic.next_hop(*server.ip()).warning() {
         eprintln!("warning: {warning}");
     }
 }

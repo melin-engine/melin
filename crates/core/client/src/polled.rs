@@ -632,7 +632,7 @@ impl PolledConnection {
         } else {
             encode
         };
-        self.frame_in_scratch(encode)?;
+        self.frame_in_scratch(needed, encode)?;
         self.request_sent(now_ns);
         self.flush(stream)?;
         Ok(())
@@ -788,8 +788,11 @@ impl PolledConnection {
     }
 
     /// Frame a request at the end of the scratch buffer, behind anything
-    /// still queued there.
-    fn frame_in_scratch<E, F>(&mut self, encode: F) -> Result<(), E>
+    /// still queued there, in `needed` bytes of room: the header and the
+    /// widest body the encoder was promised, not the widest frame, so the
+    /// kernel path (every request of which goes through here) zeroes only
+    /// what the request can take.
+    fn frame_in_scratch<E, F>(&mut self, needed: usize, encode: F) -> Result<(), E>
     where
         E: From<RequestFrameError>,
         F: FnOnce(&mut [u8]) -> Result<usize, E>,
@@ -801,7 +804,7 @@ impl PolledConnection {
             self.tx_head = 0;
         }
         let start = self.tx.len();
-        self.tx.resize(start + MAX_WIRE_FRAME, 0);
+        self.tx.resize(start + needed, 0);
         match frame_request(&mut self.tx[start..], encode) {
             Ok(written) => {
                 self.tx.truncate(start + written);

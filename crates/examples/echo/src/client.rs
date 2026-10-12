@@ -35,12 +35,14 @@
 //! own, off the server's.
 
 use std::net::SocketAddr;
+#[cfg(feature = "dpdk")]
+use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use melin_client::{Connection, Frame, Session, SigningKey, key};
+use melin_client::{Connection, Frame, Session, key};
 
 use echo_server::{KIND_RESP_ECHO, KIND_RESP_REJECTED, MAX_PAYLOAD};
 
@@ -132,7 +134,7 @@ fn run(cli: Cli) -> Result<(), Error> {
     if cli.count == 0 {
         return Err("--count must be at least 1".into());
     }
-    check_transport(&cli)?;
+    let transport = check_transport(&cli)?;
     if cli.core.is_some() {
         // Before anything narrows this thread's CPU mask (EAL pins the
         // thread that initialises it), as the runtime's helper asks.
@@ -140,9 +142,10 @@ fn run(cli: Cli) -> Result<(), Error> {
     }
     let key = key::load_signing_key(&cli.key)?;
 
-    let mut samples = match cli.transport {
-        TransportKind::Kernel => measure(&mut Connection::connect(cli.server, &key)?, &cli)?,
-        TransportKind::Dpdk => measure_dpdk(&cli, &key)?,
+    let mut samples = match transport {
+        Transport::Kernel => measure(&mut Connection::connect(cli.server, &key)?, &cli)?,
+        #[cfg(feature = "dpdk")]
+        Transport::Dpdk(server) => measure(&mut dpdk::connect(&cli.dpdk, server, &key)?, &cli)?,
     };
 
     if cli.count == 1 {
@@ -167,6 +170,16 @@ fn run(cli: Cli) -> Result<(), Error> {
     Ok(())
 }
 
+/// The transport a run goes over, once its flags have been checked: what
+/// [`check_transport`] hands [`run`], so a check made there is not made
+/// again to recover its result.
+enum Transport {
+    Kernel,
+    /// The DPDK transport, with the server as a DPDK dial takes it.
+    #[cfg(feature = "dpdk")]
+    Dpdk(SocketAddrV4),
+}
+
 /// What `--transport dpdk` reports in a build without the feature.
 #[cfg(not(feature = "dpdk"))]
 const NO_DPDK: &str = "this echo-client was built without the `dpdk` feature: rebuild with \
@@ -175,9 +188,9 @@ const NO_DPDK: &str = "this echo-client was built without the `dpdk` feature: re
 /// Refuse a transport this build cannot run, before the key is read or
 /// anything is dialed.
 #[cfg(not(feature = "dpdk"))]
-fn check_transport(cli: &Cli) -> Result<(), Error> {
+fn check_transport(cli: &Cli) -> Result<Transport, Error> {
     match cli.transport {
-        TransportKind::Kernel => Ok(()),
+        TransportKind::Kernel => Ok(Transport::Kernel),
         TransportKind::Dpdk => Err(NO_DPDK.into()),
     }
 }
@@ -188,7 +201,7 @@ fn check_transport(cli: &Cli) -> Result<(), Error> {
 /// And on a DPDK run, a server a NIC cannot reach (the loopback default),
 /// before the key is read.
 #[cfg(feature = "dpdk")]
-fn check_transport(cli: &Cli) -> Result<(), Error> {
+fn check_transport(cli: &Cli) -> Result<Transport, Error> {
     match cli.transport {
         TransportKind::Kernel => {
             if let Some(flag) = cli.dpdk.first_given() {
@@ -198,27 +211,10 @@ fn check_transport(cli: &Cli) -> Result<(), Error> {
                 )
                 .into());
             }
+            Ok(Transport::Kernel)
         }
-        TransportKind::Dpdk => {
-            dpdk::check_server(cli.server)?;
-        }
+        TransportKind::Dpdk => Ok(Transport::Dpdk(dpdk::check_server(cli.server)?)),
     }
-    Ok(())
-}
-
-/// The DPDK run: bring the NIC up, dial, and run the same loop as the
-/// kernel's.
-#[cfg(feature = "dpdk")]
-fn measure_dpdk(cli: &Cli, key: &SigningKey) -> Result<Vec<u64>, Error> {
-    let server = dpdk::check_server(cli.server)?;
-    measure(&mut dpdk::connect(&cli.dpdk, server, key)?, cli)
-}
-
-/// Never reached: [`check_transport`] refuses `--transport dpdk` first.
-/// An error rather than a panic all the same.
-#[cfg(not(feature = "dpdk"))]
-fn measure_dpdk(_cli: &Cli, _key: &SigningKey) -> Result<Vec<u64>, Error> {
-    Err(NO_DPDK.into())
 }
 
 /// The measurement, whatever the transport: pin the thread if asked, then
@@ -545,12 +541,6 @@ mod tests {
         ])
         .unwrap();
         let error = run(cli).unwrap_err().to_string();
-        assert!(error.contains("`dpdk` feature"), "{error}");
-
-        let cli =
-            Cli::try_parse_from(["echo-client", "--key", "k.pem", "--transport", "dpdk"]).unwrap();
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let error = measure_dpdk(&cli, &key).unwrap_err().to_string();
         assert!(error.contains("`dpdk` feature"), "{error}");
     }
 
