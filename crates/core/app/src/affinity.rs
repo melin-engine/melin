@@ -596,31 +596,160 @@ pub fn with_child_context<R>(name: &str, core: usize, spawn: impl FnOnce() -> R)
     spawned
 }
 
+/// How long [`spawn_placed`] waits for a new thread to start and pin
+/// itself. A thread that cannot start never does — something on its core
+/// never yields — so any bound catches it; this one is generous so that a
+/// loaded machine (a CI host running many nodes at once) never trips it on
+/// a thread that is merely slow to be scheduled. It is paid only by a
+/// thread that is stuck.
+const PLACED_START_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why [`spawn_placed`] did not hand back a running thread.
+pub enum SpawnPlacedError<T> {
+    /// The thread could not be created.
+    Spawn(std::io::Error),
+    /// The thread was created but did not start and pin itself within
+    /// the bound: whatever holds its core never yields. It carries the
+    /// thread's handle, because the thread exists and may yet run; the
+    /// caller decides whether that fails it or is kept and reported.
+    NotStarted {
+        name: String,
+        core: usize,
+        handle: std::thread::JoinHandle<T>,
+    },
+}
+
+impl<T> SpawnPlacedError<T> {
+    /// For a caller that keeps a stuck thread rather than fail on it:
+    /// reports it at `error!` and hands its handle back. A thread that
+    /// could not be created at all is still an error.
+    pub fn keep_stuck(self) -> std::io::Result<std::thread::JoinHandle<T>> {
+        match self {
+            Self::Spawn(e) => Err(e),
+            Self::NotStarted { name, core, handle } => {
+                tracing::error!(
+                    "{}; kept, in case it runs later",
+                    not_started_message(&name, core)
+                );
+                Ok(handle)
+            }
+        }
+    }
+}
+
+/// What [`SpawnPlacedError::NotStarted`] says.
+fn not_started_message(name: &str, core: usize) -> String {
+    let bound = PLACED_START_BOUND.as_secs();
+    if core == 0 {
+        format!(
+            "thread {name} did not start within {bound}s on the home CPU mask; \
+             something there never yields the CPU"
+        )
+    } else {
+        format!(
+            "thread {name} did not start within {bound}s on core {core}; another \
+             thread is likely spinning there at real-time priority — check the \
+             --cores layout and what else is pinned to that core"
+        )
+    }
+}
+
+impl<T> std::fmt::Display for SpawnPlacedError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(e) => write!(f, "cannot create the thread: {e}"),
+            Self::NotStarted { name, core, .. } => f.write_str(&not_started_message(name, *core)),
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for SpawnPlacedError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl<T> std::error::Error for SpawnPlacedError<T> {}
+
+impl<T> From<SpawnPlacedError<T>> for std::io::Error {
+    fn from(e: SpawnPlacedError<T>) -> Self {
+        match e {
+            SpawnPlacedError::Spawn(e) => e,
+            not_started => {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, not_started.to_string())
+            }
+        }
+    }
+}
+
 /// Spawn the thread `name` placed on `core` (`0` = unpinned): created
 /// already in that placement's context by [`with_child_context`], and
-/// pinned by [`pin_thread`] before it runs `f`.
+/// pinned by [`pin_thread`] before it runs `f`. Returns once the thread
+/// has pinned itself, or with [`SpawnPlacedError::NotStarted`] when it has
+/// not within a bound.
 ///
 /// The way to spawn any thread that has a placement. See
 /// [`prepare_child_context`] for why the placement cannot be left to the
-/// thread itself.
+/// thread itself. The wait turns the failure that remains — a thread whose
+/// core is held by something that never yields — from a silent stall,
+/// noticed only when the work it never does backs up, into an error that
+/// names the thread and its core.
 pub fn spawn_placed<T, F>(
     name: &str,
     core: usize,
     f: F,
-) -> std::io::Result<std::thread::JoinHandle<T>>
+) -> Result<std::thread::JoinHandle<T>, SpawnPlacedError<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    spawn_checked_in(name, core, PLACED_START_BOUND, pin_thread, f)
+}
+
+/// [`spawn_placed`] with its bound and the thread's first step, `start`
+/// (pinning, in production), as parameters, so a test can stand in for a
+/// thread that cannot start.
+fn spawn_checked_in<T, F>(
+    name: &str,
+    core: usize,
+    bound: std::time::Duration,
+    start: fn(&str, usize),
+    f: F,
+) -> Result<std::thread::JoinHandle<T>, SpawnPlacedError<T>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     let thread_name = name.to_owned();
-    with_child_context(name, core, || {
+    // Capacity one so the check-in never blocks the thread, whether or
+    // not the spawner is still waiting for it.
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let handle = with_child_context(name, core, || {
         std::thread::Builder::new()
             .name(thread_name.clone())
             .spawn(move || {
-                pin_thread(&thread_name, core);
+                start(&thread_name, core);
+                // Fails only when the spawner gave up waiting and dropped
+                // the receiver; it has reported the thread stuck by then,
+                // and the thread runs on regardless.
+                let _ = started_tx.send(());
                 f()
             })
     })
+    .map_err(SpawnPlacedError::Spawn)?;
+    // Waited for after the spawner is back in its own context, so the
+    // wait is not spent on the thread's core.
+    match started_rx.recv_timeout(bound) {
+        Ok(()) => Ok(handle),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(SpawnPlacedError::NotStarted {
+            name: name.to_owned(),
+            core,
+            handle,
+        }),
+        // The sender went away unsent: the thread ran, and panicked in
+        // `start`. Joining the handle reports the panic.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(handle),
+    }
 }
 
 /// Put the calling thread on the home mask under default `SCHED_OTHER`
@@ -954,8 +1083,15 @@ mod tests {
     }
 
     /// [`spawn_placed`] creates the thread already in its placement's
-    /// context — not the spawner's — and leaves the spawner as it found
-    /// it: same CPU, same mask, same policy.
+    /// context — not the spawner's — and leaves the spawner with its own
+    /// mask and policy.
+    ///
+    /// Not its CPU: `spawn_placed` sleeps until the thread checks in, and
+    /// a thread that wakes may be placed on any CPU its mask allows (here,
+    /// often the child's, which woke it). An isolated CPU is outside the
+    /// scheduler domains a wakeup searches, so that never lands it on one.
+    /// The return to its CPU, before the wait, is [`restore_context`]'s,
+    /// tested in [`restore_context_returns_the_thread_to_the_cpu_it_was_on`].
     #[test]
     fn spawn_placed_starts_the_thread_in_its_own_context_and_puts_the_spawner_back() {
         let available = affinity_cores();
@@ -976,7 +1112,7 @@ mod tests {
                 (current_policy(), affinity_cores())
             })
             .expect("spawn");
-            let spawner = (current_cpu(), affinity_cores(), current_policy());
+            let spawner = (affinity_cores(), current_policy());
             (child.join().expect("child thread"), spawner)
         })
         .join()
@@ -992,9 +1128,38 @@ mod tests {
         spawner_mask.sort_unstable();
         assert_eq!(
             spawner,
-            (spawner_cpu, spawner_mask, libc::SCHED_BATCH),
-            "the spawner must be left on its own CPU, mask and policy"
+            (spawner_mask, libc::SCHED_BATCH),
+            "the spawner must be left with its own mask and policy"
         );
+    }
+
+    /// A thread that does not start within the bound comes back as
+    /// `NotStarted`, naming it and its core and carrying its handle — and
+    /// the thread still runs once it can. A first step that sleeps past
+    /// the bound stands in for a core held by a real-time spinner, which
+    /// a test cannot get without privilege.
+    #[test]
+    fn spawn_placed_reports_a_thread_that_does_not_start_in_time() {
+        fn stuck(_: &str, _: usize) {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+
+        let spawned = spawn_checked_in(
+            "stuck-test",
+            0,
+            std::time::Duration::from_millis(20),
+            stuck,
+            || 7,
+        );
+
+        match spawned {
+            Err(SpawnPlacedError::NotStarted { name, core, handle }) => {
+                assert_eq!((name.as_str(), core), ("stuck-test", 0));
+                assert_eq!(handle.join().expect("thread"), 7, "it runs once it can");
+            }
+            Err(e) => panic!("expected NotStarted, got: {e}"),
+            Ok(_) => panic!("a thread that never checked in was reported started"),
+        }
     }
 
     #[test]

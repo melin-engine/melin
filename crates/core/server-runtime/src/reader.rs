@@ -268,9 +268,10 @@ where
         );
     })
     .map_err(|e| {
+        let e = std::io::Error::from(e);
         std::io::Error::new(
             e.kind(),
-            format!("uring-reader: cannot spawn its thread: {e}"),
+            format!("uring-reader: cannot start its thread: {e}"),
         )
     })?;
 

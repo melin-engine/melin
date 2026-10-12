@@ -321,7 +321,7 @@ pub fn run_sender<A: Application>(
                     // thread's, which it could not undo itself if the
                     // accept thread sat on a core a real-time thread
                     // never yields.
-                    let handle = melin_app::affinity::spawn_placed(
+                    let spawned = melin_app::affinity::spawn_placed(
                         &format!("repl-{slot_idx}"),
                         handler.core,
                         move || {
@@ -354,8 +354,13 @@ pub fn run_sender<A: Application>(
                             };
                             run_replica_slot::<A>(stream, consumer, &ctx)
                         },
-                    )
-                    .expect("spawn replica handler thread");
+                    );
+                    // A stuck handler is kept in the slot: it exists, owns
+                    // the slot's consumer and may yet run, and the slot
+                    // stays occupied until it does and finishes.
+                    let handle = spawned
+                        .or_else(melin_app::affinity::SpawnPlacedError::keep_stuck)
+                        .expect("spawn replica handler thread");
                     slots[slot_idx].handle = Some(handle);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

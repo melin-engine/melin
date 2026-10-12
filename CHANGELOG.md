@@ -321,7 +321,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   replica kept acknowledging until its input ring filled, then stalled
   and was evicted, without logging anything. Every thread with a core
   assignment is now created on that core, and the thread that spawns it
-  is put back where it was, CPU included. Threads with no core of their
+  is put back where it was, CPU included, and a pipeline thread that
+  still does not start within 10 s fails the node's startup with an
+  error naming the thread and its core. Threads with no core of their
   own now stay off isolated CPUs even when the process was started on
   them (`numactl --cpunodebind`, `taskset`), unless isolated CPUs are
   all it was given. On such a node DPDK, given no core list of its own

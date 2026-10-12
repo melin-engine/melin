@@ -270,9 +270,13 @@ impl SegmentPreparer {
         // which may be pinned. A child cannot move itself off a core
         // whose real-time occupant never yields, because moving itself
         // requires running — so the reset cannot happen inside the worker.
+        // A stuck preparer is kept rather than fail the journal: it is an
+        // optimisation, and until it runs, rotation takes the synchronous
+        // path it falls back to whenever no segment is staged.
         let handle = melin_app::affinity::spawn_placed("journal-prep", pin_core, move || {
             worker_loop(worker_state)
         })
+        .or_else(melin_app::affinity::SpawnPlacedError::keep_stuck)
         .expect("failed to spawn journal-prep thread");
 
         Self {

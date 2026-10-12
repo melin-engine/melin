@@ -648,6 +648,14 @@ where
     // to inherit it, a stage thread starts wherever this thread is — after
     // `start` above, possibly on the disk thread's isolated core, where
     // that thread spins at real-time priority and the stage never runs.
+    //
+    // A stage thread that cannot be created, or does not start, fails the
+    // build. The stages already running are told to stop first, so a
+    // failed build leaves nothing spinning behind it.
+    let abandon = |e: String| -> Box<dyn std::error::Error> {
+        pipeline_shutdown.store(true, Ordering::Release);
+        e.into()
+    };
     let journal_handle =
         melin_app::affinity::spawn_placed("journal-seq", journal_core, move || {
             run_journal_stage(
@@ -656,7 +664,7 @@ where
                 &pipeline_healthy,
             )
         })
-        .expect("spawn journal thread");
+        .map_err(|e| abandon(format!("start the replica's journal-seq thread: {e}")))?;
 
     let ps = Arc::clone(&pipeline_shutdown);
     let matching_core = cores.matching.core;
@@ -664,7 +672,7 @@ where
     let matching_handle = melin_app::affinity::spawn_placed("matching", matching_core, move || {
         matching_stage.run(&ps)
     })
-    .expect("spawn matching thread");
+    .map_err(|e| abandon(format!("start the replica's matching thread: {e}")))?;
 
     // Drain thread uses the response core — replicas have no response stage,
     // but the consumer needs to be drained so the output ring doesn't fill.
@@ -687,7 +695,7 @@ where
             }
         }
     })
-    .expect("spawn drain thread");
+    .map_err(|e| abandon(format!("start the replica's drain thread: {e}")))?;
 
     let shadow_handle = if let Some(shadow_cons) = pipeline.shadow_consumer {
         let snap_path = snapshot_path;
@@ -708,7 +716,7 @@ where
                     genesis_entries,
                 );
             })
-            .expect("spawn shadow thread"),
+            .map_err(|e| abandon(format!("start the replica's shadow thread: {e}")))?,
         )
     } else {
         None
