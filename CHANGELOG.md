@@ -324,7 +324,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   is put back where it was, CPU included. Threads with no core of their
   own now stay off isolated CPUs even when the process was started on
   them (`numactl --cpunodebind`, `taskset`), unless isolated CPUs are
-  all it was given.
+  all it was given. On such a node DPDK, given no core list of its own
+  (`-l`), now sees only those housekeeping cores, as under the earlier
+  `numactl --physcpubind` workaround, and no longer starts idle workers
+  on the isolated ones.
 
 ## [0.19.0] - 2026-10-10
 

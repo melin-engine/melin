@@ -2080,9 +2080,15 @@ where
 
             // On a post-snapshot rebuild this thread is pinned to
             // `cores.reader`, at real-time priority on an isolated core.
-            // The builder creates every pipeline thread in its own
-            // placement and puts this thread back afterwards, so none
-            // inherits that context.
+            // The builder creates its own threads in their own placement,
+            // but it also runs application code here (`prefault`,
+            // `clone_via_snapshot`), and a thread that code spawns would
+            // inherit this context and never run. Unpinned first; the
+            // receiver pins itself again after the build.
+            if let Err(e) = melin_app::affinity::clear_affinity() {
+                tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
+            }
+
             pipeline = match build_replica_pipeline_with_threads::<A>(
                 cur_app,
                 cur_writer,
