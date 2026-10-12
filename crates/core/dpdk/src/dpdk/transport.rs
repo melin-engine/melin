@@ -1233,6 +1233,18 @@ impl DpdkTransport {
         }
     }
 
+    /// Whether the peer has closed its side of an established connection:
+    /// its FIN has arrived and the socket is half-closed (close-wait),
+    /// which the stack still counts as active. With nothing left to read,
+    /// the connection is over, as it is on kernel TCP at EOF. A stale
+    /// handle reads as closed.
+    pub fn peer_closed(&mut self, handle: SocketHandle) -> bool {
+        match self.sockets.try_get_mut::<tcp::Socket>(handle) {
+            Some(socket) => !socket.may_recv(),
+            None => true,
+        }
+    }
+
     /// Close a connection (abort, discarding unsent data; no FIN) and
     /// remove it from the socket set.
     /// The socket is fully removed so its tuple doesn't block future

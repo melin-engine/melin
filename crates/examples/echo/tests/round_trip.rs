@@ -367,12 +367,16 @@ fn a_dpdk_client_echoes_through_a_dpdk_node() {
     // kernel client, which has, waits for it, so the DPDK dial below is
     // one attempt at a node already serving.
     drop(connect_authenticated(server.addr(), &writer_key()));
-    // That kernel client's slot stays held: the node's stack takes its FIN,
-    // but a half-closed socket still counts as active, so only a reset
-    // frees the slot, which here only a heartbeat would provoke, and this
-    // node sends none. Every count below is on top of it.
-    let idle = active_connections(health);
-    assert_eq!(idle, 1, "the kernel client that waited for the node");
+    // That kernel client's close frees its slot: the node takes the FIN as
+    // kernel TCP takes EOF, without waiting for a heartbeat, which this
+    // node never sends. Every count below is on top of an idle node.
+    let idle = 0;
+    wait_for_active(
+        health,
+        idle,
+        SLOT_FREED_WITHIN,
+        "once the kernel client that waited for the node closed",
+    );
 
     let SocketAddr::V4(node) = server.addr() else {
         panic!("a DPDK node is on IPv4: {}", server.addr());

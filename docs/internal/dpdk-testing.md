@@ -243,9 +243,9 @@ with a health endpoint on the namespace's loopback, and the case reads
 its count of authenticated connections: it falls by one within a bound
 of a couple of seconds after each of the streams is closed, and after a
 connection that owns its stream is dropped. The node runs with no
-heartbeat and no idle timeout, so nothing but the reset can free a slot,
-and the case checks that the bound is well under the defaults of both,
-which would free it eventually.
+heartbeat and no idle timeout, so nothing but the client's own close can
+free a slot, and the case checks that the bound is well under the
+defaults of both, which would free it eventually.
 
 The launcher returns before a node serves, and the polled connection has
 no twin of `Connection::connect_by` that retries until a deadline. The

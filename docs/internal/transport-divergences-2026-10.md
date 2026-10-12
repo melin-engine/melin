@@ -64,21 +64,6 @@ before the next. No DPDK test yet; the one to write dials two
 connections to a node in the same poll, below the NIC handle since it
 dials one at a time, and expects both to be established.
 
-### DPDK does not see a client's close (likely bug)
-
-`dpdk_transport.rs`, the read path. A connection is released when a
-zero-byte read finds the socket no longer active. A client's FIN moves the
-smoltcp socket to CloseWait, which still counts as active, so the node keeps
-the connection, its slot and its socket. They are released only when the
-next heartbeat is answered with an RST, at the idle timeout with heartbeats
-off, or never with both off. Until then a node at `max_connections` turns
-new clients away. io_uring releases the connection on EOF. The fix is to treat a
-zero-byte read on a socket that can no longer receive as a close.
-
-Pinned by `a_client_close_is_seen_only_at_the_next_heartbeat` in the DPDK
-veth tests: no slot within a few seconds of the close, one after the
-heartbeat. The fix flips that test to require the slot back promptly.
-
 ### DPDK `PipelineFull` drops the client instead of sending ServerBusy
 
 `dpdk_transport.rs`, the `FrameAction::PipelineFull` arm. On a full input ring

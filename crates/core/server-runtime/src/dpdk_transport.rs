@@ -550,7 +550,13 @@ pub fn run_dpdk_poll<A: Application>(
                 }
             }
             if n == 0 {
-                if !transport.is_active(conn.handle) {
+                // Gone, or half-closed: the client's FIN leaves the socket
+                // in close-wait, which the stack still counts as active,
+                // and with its data drained the connection is over, as it
+                // is on kernel TCP at EOF. Without this the slot was held
+                // until the next heartbeat's RST, or for good with
+                // heartbeats off.
+                if !transport.is_active(conn.handle) || transport.peer_closed(conn.handle) {
                     debug!(
                         connection_id = conn.connection_id.0,
                         addr = %conn.addr,
