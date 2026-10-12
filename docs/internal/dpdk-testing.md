@@ -215,7 +215,13 @@ against a node on DPDK. Each sends its requests, drops the connection and
 dials again on the same handle, which the next connection of a real client
 would do. The node's MAC is passed through from the layout; the case
 asserts that it is not the fallback convention, so a dial that ignored it
-would time out rather than pass.
+would time out rather than pass. The echo case goes on to every way a dial
+can fail, on the same handle: a port of the node nothing listens on (a
+DPDK node's stack answers the SYN with an RST, so the dial is refused, not
+timed out), an address on the runner's network nothing owns (timed out,
+the error naming the MAC the SYN went to), and a key the node refuses;
+after each, the handle dials and echoes again. One case rather than
+several because the launcher opens the client NIC once per process.
 
 The launcher returns before a node serves, and the polled connection has
 no twin of `Connection::connect_by` that retries until a deadline. The

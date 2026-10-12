@@ -315,7 +315,13 @@ fn a_frame_that_is_not_an_application_frame_is_dropped() {
 /// connection on a NIC handle, from the runner's client pair, through the
 /// whole path (EAL shared with the node, the dial, the handshake, the
 /// in-place send, the reply loop), and again on the same handle once the
-/// first connection has gone.
+/// first connection has gone. Then every way a dial can fail, on that same
+/// handle: a port nothing listens on (refused, not timed out), an address
+/// nothing answers for (timed out, the error naming the MAC the SYN went
+/// to), and a key the node refuses; and after each, the handle dials
+/// again. One test rather than several: the launcher opens the client NIC
+/// once per process, and the rest of the case is what a client does with
+/// the handle it has.
 ///
 /// The node's MAC is passed through. The runner's MACs are not the
 /// `02:00:<ip>` convention the dialer would fall back to without one, so a
@@ -393,10 +399,88 @@ fn a_dpdk_client_echoes_through_a_dpdk_node() {
         assert_eq!(reply, [&[KIND_RESP_ECHO][..], &again].concat());
     }
 
+    // --- The ways a dial fails, each leaving the handle good for the next.
+
+    // Nothing listens on this port of the node, and a DPDK node's stack
+    // answers a SYN that matches no listener with an RST: refused, at once,
+    // and told apart from a timeout. Not the replication port, which a
+    // standalone node does not open either but which a replica's would.
+    let nobody = std::net::SocketAddrV4::new(*node.ip(), node.port() + 100);
+    let refused =
+        StreamConnection::connect_dpdk_on(&mut nic, nobody, &writer_key(), SOCKET_BUFFER, timeout)
+            .expect_err("nothing listens there");
+    match refused {
+        melin_client::Error::Connect { addr, source } => {
+            assert_eq!(addr, SocketAddr::V4(nobody));
+            assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::ConnectionRefused,
+                "{source}"
+            );
+        }
+        other => panic!("expected a refused dial, got {other}"),
+    }
+
+    // An address on the runner's network (a /24; the last octet is free)
+    // that nothing owns. The SYN goes to the node's MAC, the one seeded for
+    // every peer, with an IP the node's stack does not answer for, so
+    // nothing comes back: a timeout, whose error names that MAC and where
+    // it came from as the first thing to check.
+    let o = node.ip().octets();
+    let nowhere =
+        std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(o[0], o[1], o[2], 250), node.port());
+    let timed_out = StreamConnection::connect_dpdk_on(
+        &mut nic,
+        nowhere,
+        &writer_key(),
+        SOCKET_BUFFER,
+        Duration::from_secs(3),
+    )
+    .expect_err("nothing answers there");
+    match timed_out {
+        melin_client::Error::Connect { source, .. } => {
+            assert_eq!(source.kind(), std::io::ErrorKind::TimedOut, "{source}");
+            let message = source.to_string();
+            assert!(
+                message.contains(&melin_client::fmt_mac(node_mac)),
+                "{message}"
+            );
+            assert!(message.contains("supplied"), "{message}");
+        }
+        other => panic!("expected a timed-out dial, got {other}"),
+    }
+
+    // A key the node has never heard of: the dial succeeds, the handshake
+    // is refused, and the stream is closed with the error.
+    let stranger = SigningKey::from_bytes(&[0xCC; 32]);
+    let unauthorized =
+        StreamConnection::connect_dpdk_on(&mut nic, node, &stranger, SOCKET_BUFFER, timeout)
+            .expect_err("an unauthorized key");
+    assert!(
+        matches!(unauthorized, melin_client::Error::AuthFailed { .. }),
+        "{unauthorized}"
+    );
+
+    // After all three, the handle dials and echoes as before.
+    let last = bytes(32, 0x50);
+    {
+        let mut client = StreamConnection::connect_dpdk_on(
+            &mut nic,
+            node,
+            &writer_key(),
+            SOCKET_BUFFER,
+            timeout,
+        )
+        .expect("a DPDK connection after the failed dials");
+        let reply = client.request_one(&last).expect("one reply");
+        assert_eq!(reply, [&[KIND_RESP_ECHO][..], &last].concat());
+    }
+
     drop(nic);
     server.stop();
     let mut expected = first;
     expected.push(again);
+    expected.push(last);
     assert_eq!(journaled_echoes(tmp.path()), expected);
 }
 
