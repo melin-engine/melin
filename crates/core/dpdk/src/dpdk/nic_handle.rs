@@ -76,7 +76,7 @@ static NEXT_HANDLE_TAG: AtomicU64 = AtomicU64::new(0);
 ///
 /// A stream is reset when it is closed ([`Self::close`]) or the handle is
 /// dropped, whatever its state, so the node frees the connection's slot at
-/// once rather than at its next heartbeat. The socket is aborted, one
+/// once, whatever it had queued for it. The socket is aborted, one
 /// egress pass sends its RST, the device is flushed, and only then is the
 /// socket removed from the set: removed first, it would take its RST with
 /// it. Best effort, as on the node: a frame the device cannot take at that
@@ -268,8 +268,8 @@ impl NicHandle {
     /// [`NicStream::send`] and [`NicStream::send_in_place`] have), the
     /// node's TCP tuning, and a local port of its own: each dial takes the
     /// next one along the ephemeral range, so a reconnect never reuses the
-    /// four-tuple of a connection the node may still hold (a DPDK node does
-    /// not see a client's close until its next heartbeat).
+    /// four-tuple of a connection the node may still hold (one whose close
+    /// it has not yet taken in, or that was never closed at all).
     ///
     /// `now_ns` is the caller's clock (see the type's documentation on
     /// time), read on every iteration of the wait, each reading driving one

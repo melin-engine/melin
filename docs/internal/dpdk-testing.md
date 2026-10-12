@@ -148,12 +148,15 @@ own `dpdk` feature switches its tests over the same way.
   handle refuses any on the shared EAL), its port and address are the
   launcher's, and its mbuf pool is named after its port. The rest of the
   `NicConfig` is the test's, the peer MAC first: `mac_of(node.addr())`
-  gives the node's, and `dpdk_client()` the client's own IP and MAC. A
-  plain handle, so a test dials on it with
+  gives the node's, and `dpdk_client()` the client's own IP, MAC and
+  prefix length. A plain handle, so a test dials on it with
   `StreamConnection::connect_dpdk_on(&mut nic, ...)`, or drives several
   streams on it as the exchange's bench does. One per process: the device
   stays attached as the EAL does, and a test reconnects on the handle it
-  has.
+  has. A test whose DPDK client is a child process takes
+  `dpdk_client_process_eal_args(file_prefix)` for it instead, and then
+  opens no handle of its own: the launcher panics on either call after the
+  other.
 
 ## Several nodes in one process
 
@@ -220,13 +223,52 @@ can fail, on the same handle: a port of the node nothing listens on (a
 DPDK node's stack answers the SYN with an RST, so the dial is refused, not
 timed out), an address on the runner's network nothing owns (timed out,
 the error naming the MAC the SYN went to), and a key the node refuses;
-after each, the handle dials and echoes again. One case rather than
-several because the launcher opens the client NIC once per process.
+after each, the handle dials and echoes again. Then it drives several
+streams on the handle at once, the shape of the exchange's bench, which
+otherwise runs only on a real rig: the streams dialed in turn, one
+polled connection each, and one loop that services the handle once per
+iteration and polls every stream, the handshakes inside the polls. Every
+stream keeps several requests in flight together, each stream's payloads
+its own, and every reply must come back on the stream that sent it, in
+that stream's order; the journal holds each stream's echoes in its
+order, the order across streams being the node's. The streams are closed
+with the handle's own close, and the handle dials once more. One case
+rather than several because the launcher opens the client NIC once per
+process.
+
+Each close is also checked to free the node's slot at once, which is
+what the close's reset ordering (abort, egress pass, flush, then remove)
+is for and which the in-memory wire alone tested before. The node runs
+with a health endpoint on the namespace's loopback, and the case reads
+its count of authenticated connections: it falls by one within a bound
+of a couple of seconds after each of the streams is closed, and after a
+connection that owns its stream is dropped. The node runs with no
+heartbeat and no idle timeout, so nothing but the client's own close can
+free a slot, and the case checks that the bound is well under the
+defaults of both, which would free it eventually.
 
 The launcher returns before a node serves, and the polled connection has
 no twin of `Connection::connect_by` that retries until a deadline. The
 cases wait for the node with the kernel client, which has, and then dial
 on DPDK once, at a node already serving.
+
+The shm-proxy's DPDK path has a test of its own,
+`crates/tools/melin-shm-proxy/tests/dpdk_bridge.rs`, built only with the
+proxy's `dpdk` feature. It starts an echo node on DPDK through the
+launcher and runs the `shm-proxy` binary as a child, with
+`--transport dpdk` on the runner's client pair: the binary owns that
+pair's device in a process of its own, with an EAL of its own, so the
+test opens no client NIC itself. `dpdk_client_process_eal_args` gives
+the child's EAL arguments: the launcher's, the client's af_packet device
+as the child's one port, and a file prefix apart from the test process's
+in the shared private `/var/run` (the proxy's default names a hugepage
+mount the runner has none of). The test then maps the link file from its
+documented layout and is the client on the rings, as the Aeron harness's
+Java rig is: the handshake, requests framed and replies split with
+`melin-client`'s I/O-free pieces (a dev-dependency only; the binary
+depends on no client crate), echoes of every size through rings small
+enough to wrap, then the close asked through the header, a clean exit,
+and the `connected to <addr> over DPDK` line the harness waits for.
 
 `scripts/dpdk/dpdk-client-tap-smoke.sh` checks the same path outside the
 rig: a DPDK echo client on a TAP virtual device (`--vdev=net_tap0

@@ -271,7 +271,9 @@ jobs:
       # features turn on `melin-client/dpdk`; the client's own suite runs
       # here with it, built as a DPDK client links it. The shm-proxy's too,
       # whose `--dpdk-*` flags (the node's, with its own defaults and its
-      # `--dpdk-port`) exist only with its `dpdk` feature.
+      # `--dpdk-port`) exist only with its `dpdk` feature, and whose
+      # `dpdk_bridge` test, the only coverage of its DPDK path end to end,
+      # runs only here.
       #
       # Runs whatever the runtime suites did, so one cannot hide the other,
       # but not where the build check failed: it would only fail again.

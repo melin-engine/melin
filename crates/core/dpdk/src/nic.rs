@@ -178,9 +178,9 @@ const EPHEMERAL_SPREAD: u32 = 8_192;
 
 /// Local ports for dials: a fresh one per socket, not per process.
 ///
-/// A DPDK node does not see a client's close until its next heartbeat, so
-/// a reconnect from the four-tuple of a connection it may still hold would
-/// be taken for that connection. Each dial therefore takes the next port
+/// A node may still hold a connection whose close it has not yet taken in
+/// (or that was never closed), and a reconnect from that connection's
+/// four-tuple would be taken for it. Each dial therefore takes the next port
 /// along the ephemeral range, wrapping at its end and skipping any port an
 /// open stream holds, so a port comes round again only after the whole
 /// range has been dialed from.

@@ -210,33 +210,21 @@ veth_test!(
 );
 
 veth_test!(
-    /// When an authorised client closes its connection, the node does not
-    /// see the FIN. The connection, and its slot, are released only when
-    /// the node's next heartbeat is answered with an RST.
-    ///
-    /// This pins a known divergence from the kernel-TCP transport, which
-    /// releases the connection on EOF ("DPDK does not see a client's
-    /// close", `docs/internal/transport-divergences-2026-10.md`). When that
-    /// is fixed this test fails, and is to be flipped to require the slot
-    /// back within [`SLOT_FREED_WITHIN`].
-    a_client_close_is_seen_only_at_the_next_heartbeat,
+    /// When an authorised client closes its connection, the node sees the
+    /// FIN and releases the connection and its slot at once, as the
+    /// kernel-TCP transport does at EOF: the next client is served well
+    /// before the node's heartbeat, which used to be what freed the slot
+    /// (the client's FIN left the socket half-closed, which the stack
+    /// counts as active, and only the heartbeat's RST ended it).
+    a_client_close_frees_its_slot_at_once,
     |node| {
         let conn = served_within(node, STARTUP_LIMIT, "the first client");
         // Closes the socket: the client's FIN goes out now.
         drop(conn);
 
-        if challenge_within(node, SLOT_FREED_WITHIN).is_ok() {
-            panic!(
-                "the node freed a closed client's slot within {SLOT_FREED_WITHIN:?}, before \
-                 its heartbeat: DPDK now sees a client's FIN. Flip this test to require the \
-                 slot back promptly and close the entry in \
-                 docs/internal/transport-divergences-2026-10.md"
-            );
-        }
-
-        // The heartbeat goes out within a second of HEARTBEAT after the
-        // last reply; the margin covers that and the RST's way back.
-        served_within(node, HEARTBEAT + FRAME_LIMIT, "after the node's heartbeat");
+        // Well under the heartbeat, or this proves nothing about the FIN.
+        assert!(SLOT_FREED_WITHIN * 3 <= HEARTBEAT);
+        served_within(node, SLOT_FREED_WITHIN, "after the client's close");
     }
 );
 

@@ -1145,7 +1145,11 @@ dependencies = [
  "hdrhistogram",
  "libc",
  "melin-app",
+ "melin-client",
  "melin-dpdk",
+ "melin-example-echo",
+ "melin-server-runtime",
+ "melin-test-node",
  "melin-wire-protocol",
  "tempfile",
 ]

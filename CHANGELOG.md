@@ -189,7 +189,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   the CI `dpdk` job builds, tests and documents `melin-client/dpdk`.
   `scripts/dpdk/dpdk-client-tap-smoke.sh` runs a DPDK echo client over a
   TAP device against a kernel echo server. For contributors; nothing ships
-  with it.
+  with it. The `shm-proxy` binary's DPDK path is tested there too, end to
+  end, with `melin-test-node`'s `dpdk_client_process_eal_args` putting it
+  on the client pair in a process of its own.
 
 ### Changed
 
@@ -285,6 +287,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Fixed
 
+- **A DPDK node frees a client's slot when the client closes.** The
+  client's FIN left the node's socket half-closed, which its stack still
+  counts as active, so the connection and its slot were held until the
+  next heartbeat was answered with a reset, until the idle timeout with
+  heartbeats off, or for good with both off; a node at `--max-connections`
+  turned new clients away meanwhile. The node now takes a drained,
+  half-closed socket as the end of the connection, as kernel TCP takes
+  EOF. The divergence entry is closed and its test flipped.
 - **A node that cannot create its io_uring rings refuses to start, and
   says why.** Ring creation failed on the stage's own thread, which
   panicked; the node went down later, on noticing the dead thread, with
