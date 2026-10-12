@@ -319,9 +319,15 @@ fn a_frame_that_is_not_an_application_frame_is_dropped() {
 /// handle: a port nothing listens on (refused, not timed out), an address
 /// nothing answers for (timed out, the error naming the MAC the SYN went
 /// to), and a key the node refuses; and after each, the handle dials
-/// again. One test rather than several: the launcher opens the client NIC
-/// once per process, and the rest of the case is what a client does with
-/// the handle it has.
+/// again. Then several streams on the handle at once, as a load generator
+/// runs them: one polled connection per stream, driven from one loop that
+/// services the handle once per iteration, with requests in flight on
+/// every stream together; each closed with the handle's own close. Every
+/// close, and a dropped connection's, frees its slot on the node at once,
+/// as the node's health endpoint counts them. Last, the handle dials once
+/// more. One test rather than several: the
+/// launcher opens the client NIC once per process, and the rest of the
+/// case is what a client does with the handle it has.
 ///
 /// The node's MAC is passed through. The runner's MACs are not the
 /// `02:00:<ip>` convention the dialer would fall back to without one, so a
@@ -331,15 +337,42 @@ fn a_frame_that_is_not_an_application_frame_is_dropped() {
 fn a_dpdk_client_echoes_through_a_dpdk_node() {
     use melin_client::{NicConfig, PeerMacSource, StreamConnection};
 
-    /// The stream's socket buffers: room for a few full-sized requests.
-    const SOCKET_BUFFER: usize = 64 * 1024;
-
-    let (tmp, server) = start_server();
+    // The node's count of authenticated connections, read from its health
+    // endpoint, is how the case sees a closed stream free its slot. With
+    // no heartbeat and no idle timeout, nothing but the client's reset can
+    // free one, however long the case runs; the bound it is given is in
+    // any case well under the defaults of both, which would free it
+    // eventually.
+    let defaults = ServerConfig::default();
+    for (what, eventually) in [
+        ("heartbeat", defaults.heartbeat_interval()),
+        ("idle timeout", defaults.connection_timeout()),
+    ] {
+        let eventually = eventually.expect("on by default");
+        assert!(
+            SLOT_FREED_WITHIN * 4 <= eventually,
+            "the bound on a freed slot ({SLOT_FREED_WITHIN:?}) must be well under the default \
+             {what} ({eventually:?}), or it proves nothing about the reset"
+        );
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let health = free_loopback_addr();
+    let server = start_server_with(tmp.path(), |config| {
+        config.health_bind = Some(health);
+        config.heartbeat_interval_secs = 0;
+        config.connection_timeout_secs = 0;
+    });
     // The launcher returns before the node serves, and the polled
     // connection has no retry-until-a-deadline twin of `connect_by`: the
     // kernel client, which has, waits for it, so the DPDK dial below is
     // one attempt at a node already serving.
     drop(connect_authenticated(server.addr(), &writer_key()));
+    // That kernel client's slot stays held: the node's stack takes its FIN,
+    // but a half-closed socket still counts as active, so only a reset
+    // frees the slot, which here only a heartbeat would provoke, and this
+    // node sends none. Every count below is on top of it.
+    let idle = active_connections(health);
+    assert_eq!(idle, 1, "the kernel client that waited for the node");
 
     let SocketAddr::V4(node) = server.addr() else {
         panic!("a DPDK node is on IPv4: {}", server.addr());
@@ -476,12 +509,396 @@ fn a_dpdk_client_echoes_through_a_dpdk_node() {
         assert_eq!(reply, [&[KIND_RESP_ECHO][..], &last].concat());
     }
 
+    // --- Several streams on the handle, driven from one loop, each closed
+    // with the handle's own close.
+    let interleaved = several_streams_on_one_handle(&mut nic, node, timeout, health, idle);
+
+    // --- A closed stream frees the node's slot at once: here a connection
+    // that owns its stream, which it closes as it drops.
+    let dropped = bytes(24, 0x58);
+    {
+        let mut client = StreamConnection::connect_dpdk_on(
+            &mut nic,
+            node,
+            &writer_key(),
+            SOCKET_BUFFER,
+            timeout,
+        )
+        .expect("a DPDK connection for the slot check");
+        let reply = client.request_one(&dropped).expect("one reply");
+        assert_eq!(reply, [&[KIND_RESP_ECHO][..], &dropped].concat());
+        wait_for_active(
+            health,
+            idle + 1,
+            SLOT_FREED_WITHIN,
+            "with the connection open",
+        );
+    }
+    wait_for_active(
+        health,
+        idle,
+        SLOT_FREED_WITHIN,
+        "once the connection dropped",
+    );
+
+    // With every stream closed, the handle dials once more.
+    let closing = bytes(48, 0x60);
+    {
+        let mut client = StreamConnection::connect_dpdk_on(
+            &mut nic,
+            node,
+            &writer_key(),
+            SOCKET_BUFFER,
+            timeout,
+        )
+        .expect("a DPDK connection after the handle's streams were closed");
+        let reply = client.request_one(&closing).expect("one reply");
+        assert_eq!(reply, [&[KIND_RESP_ECHO][..], &closing].concat());
+    }
+
     drop(nic);
     server.stop();
-    let mut expected = first;
-    expected.push(again);
-    expected.push(last);
-    assert_eq!(journaled_echoes(tmp.path()), expected);
+
+    // The sections that ran one connection at a time are in the journal in
+    // the order they ran. The interleaved section's order across streams is
+    // the node's to choose, so its echoes are checked stream by stream:
+    // each stream's in the order it sent them, and nothing else among them.
+    let mut sequential = first;
+    sequential.push(again);
+    sequential.push(last);
+    let interleaved_count: usize = interleaved.iter().map(Vec::len).sum();
+    let journal = journaled_echoes(tmp.path());
+    assert_eq!(
+        journal.len(),
+        sequential.len() + interleaved_count + 2,
+        "every echo the case was answered for is journaled, and nothing else"
+    );
+    let (before, rest) = journal.split_at(sequential.len());
+    assert_eq!(before, sequential);
+    let (during, after) = rest.split_at(interleaved_count);
+    assert_eq!(after, [dropped, closing]);
+    for (stream, sent) in interleaved.iter().enumerate() {
+        let journaled: Vec<&Vec<u8>> = during
+            .iter()
+            .filter(|echo| echo.first() == Some(&stream_marker(stream)))
+            .collect();
+        assert_eq!(
+            journaled,
+            sent.iter().collect::<Vec<_>>(),
+            "stream {stream}'s echoes, in its order"
+        );
+    }
+}
+
+/// A DPDK stream's socket buffers, in the DPDK client case: room for a few
+/// full-sized requests.
+#[cfg(feature = "dpdk")]
+const SOCKET_BUFFER: usize = 64 * 1024;
+
+/// How many streams the multi-stream section dials on the one handle: a
+/// handful, as a bench's connections are, within the runner's one client
+/// pair.
+#[cfg(feature = "dpdk")]
+const STREAMS: usize = 4;
+
+/// Requests each stream sends in the multi-stream section.
+#[cfg(feature = "dpdk")]
+const REQUESTS_PER_STREAM: usize = 8;
+
+/// Requests a stream keeps in flight at once in the multi-stream section:
+/// more than one, so the node has several streams' requests queued
+/// together and a reply can only be told apart by the stream it comes
+/// back on.
+#[cfg(feature = "dpdk")]
+const IN_FLIGHT_PER_STREAM: usize = 3;
+
+/// The first byte of every request stream `stream` sends: no other stream's
+/// request starts with it, so a reply that came back on the wrong stream,
+/// or a journal entry, names the stream it belongs to.
+#[cfg(feature = "dpdk")]
+fn stream_marker(stream: usize) -> u8 {
+    0xE0 + stream as u8
+}
+
+/// Request `request` of stream `stream`: its marker, its index, then
+/// filler, at a length that cycles through the sizes the single-stream
+/// section uses (the `u8` boundary of the length, and the cap), so the
+/// streams' replies differ in size as well as content at any one moment.
+#[cfg(feature = "dpdk")]
+fn stream_request(stream: usize, request: usize) -> Vec<u8> {
+    const LENGTHS: [usize; 5] = [2, 17, 255, 256, MAX_PAYLOAD];
+    let len = LENGTHS[(stream + request) % LENGTHS.len()];
+    let mut payload = bytes(len, (stream * 31 + request * 7) as u8);
+    payload[0] = stream_marker(stream);
+    payload[1] = request as u8;
+    payload
+}
+
+/// One stream of the client's NIC handle and the protocol state over it,
+/// as a load generator holds them: the stream is the handle's, lent per
+/// call by its id, and the [`melin_client::PolledConnection`] is handed
+/// the view and the loop's time on every call.
+#[cfg(feature = "dpdk")]
+struct HandleStream {
+    id: melin_client::StreamId,
+    connection: melin_client::PolledConnection,
+    /// The requests this stream sends, in order. `Vec`s: a handful each,
+    /// compared whole at the end.
+    requests: Vec<Vec<u8>>,
+    /// How many of `requests` have been sent.
+    sent: usize,
+    /// The application frames that came back, in order.
+    replies: Vec<Vec<u8>>,
+    /// How many reply batches have ended.
+    answered: usize,
+    /// The most requests this stream has had sent and unanswered at once,
+    /// measured as its sends of an iteration end: the proof that its own
+    /// requests were in flight together, not one at a time.
+    deepest: usize,
+}
+
+#[cfg(feature = "dpdk")]
+impl HandleStream {
+    /// Requests sent and not yet answered.
+    fn owed(&self) -> usize {
+        self.sent - self.answered
+    }
+}
+
+/// One loop over every stream of `nic`, until `done` holds for each, as a
+/// client with several connections on one NIC runs it (the shape of the
+/// client binding's multi-stream example, and of the exchange's bench):
+/// the handle's service step once per iteration, at the handle's clock,
+/// then for each stream in turn its queued requests topped up to `depth`
+/// in flight and every frame that has arrived for it taken. The
+/// handshakes run inside the polls; a request waits for its stream's.
+///
+/// Returns the most streams that owed a reply at the end of one
+/// iteration: the proof that their requests were in flight together.
+#[cfg(feature = "dpdk")]
+fn drive_streams(
+    nic: &mut melin_client::NicHandle,
+    streams: &mut [HandleStream],
+    depth: usize,
+    limit: Duration,
+    done: impl Fn(&HandleStream) -> bool,
+) -> usize {
+    use melin_client::Frame;
+
+    let clock = nic.clock();
+    let deadline = Instant::now() + limit;
+    let mut most_owing = 0;
+    while !streams.iter().all(&done) {
+        assert!(
+            Instant::now() < deadline,
+            "the streams did not get through within {limit:?}: {:?}",
+            streams
+                .iter()
+                .map(|s| (s.id.local_port(), s.sent, s.answered, &s.connection))
+                .collect::<Vec<_>>()
+        );
+        let now_ns = clock.now_ns();
+        // Once per iteration, for every stream: the views below only lend
+        // the stream, and their own service step is the same handle's.
+        nic.service(now_ns);
+        for (index, stream) in streams.iter_mut().enumerate() {
+            while stream.connection.is_ready()
+                && stream.sent < stream.requests.len()
+                && stream.owed() < depth
+            {
+                stream
+                    .connection
+                    .send(
+                        &mut nic.stream(&stream.id),
+                        now_ns,
+                        &stream.requests[stream.sent],
+                    )
+                    .unwrap_or_else(|e| panic!("stream {index}: send: {e}"));
+                stream.sent += 1;
+            }
+            stream.deepest = stream.deepest.max(stream.owed());
+            loop {
+                let frame = stream
+                    .connection
+                    .poll(&mut nic.stream(&stream.id), now_ns)
+                    .unwrap_or_else(|e| panic!("stream {index}: poll: {e}"));
+                match frame {
+                    None => break,
+                    Some(Frame::Response(body)) => stream.replies.push(body.to_vec()),
+                    Some(Frame::BatchEnd) => stream.answered += 1,
+                    Some(other) => panic!("stream {index}: {other:?}"),
+                }
+            }
+        }
+        most_owing = most_owing.max(streams.iter().filter(|s| s.owed() > 0).count());
+        std::hint::spin_loop();
+    }
+    most_owing
+}
+
+/// The multi-stream section of the DPDK client case: [`STREAMS`] streams
+/// dialed on `nic` in turn, driven from one loop ([`drive_streams`]) with
+/// several requests in flight on each at once, then closed with the
+/// handle's own close, each freeing its slot on the node at once: the
+/// node's health endpoint, `health`, counts `idle` connections beside
+/// these. Returns each stream's requests, in the order sent, for the
+/// journal check.
+#[cfg(feature = "dpdk")]
+fn several_streams_on_one_handle(
+    nic: &mut melin_client::NicHandle,
+    node: std::net::SocketAddrV4,
+    timeout: Duration,
+    health: SocketAddr,
+    idle: u64,
+) -> Vec<Vec<Vec<u8>>> {
+    use melin_client::PolledConnection;
+
+    let clock = nic.clock();
+    let timeout_ns = u64::try_from(timeout.as_nanos()).expect("a timeout of seconds");
+    // A `Vec`: a handful of streams, iterated in order every turn.
+    let mut streams: Vec<HandleStream> = Vec::with_capacity(STREAMS);
+    for index in 0..STREAMS {
+        let id = nic
+            .dial(node, SOCKET_BUFFER, clock.now_ns() + timeout_ns, || {
+                clock.now_ns()
+            })
+            .unwrap_or_else(|e| panic!("dial stream {index}: {e}"));
+        streams.push(HandleStream {
+            id,
+            connection: PolledConnection::with_timeout(&writer_key(), timeout),
+            requests: (0..REQUESTS_PER_STREAM)
+                .map(|request| stream_request(index, request))
+                .collect(),
+            sent: 0,
+            replies: Vec::new(),
+            answered: 0,
+            deepest: 0,
+        });
+        // The loop runs until this stream's handshake is done before the
+        // next dial, the earlier streams serviced meanwhile. Dials are
+        // sequential on the handle (one returns once the connection is
+        // established), and the node's side is stricter still: its one
+        // listener on the port is replaced only once it has taken the
+        // connection, so a SYN that reached it in the same burst as the
+        // previous dial's last ACK would be refused. The node's challenge,
+        // which the ready stream has answered, comes after that.
+        drive_streams(nic, &mut streams, 0, timeout, |s| s.connection.is_ready());
+    }
+
+    let ports: std::collections::BTreeSet<u16> =
+        streams.iter().map(|s| s.id.local_port()).collect();
+    assert_eq!(ports.len(), STREAMS, "a local port per stream: {ports:?}");
+    assert!(
+        streams.iter().all(|s| s.id.peer() == node),
+        "every stream is to the node"
+    );
+
+    let most_owing = drive_streams(nic, &mut streams, IN_FLIGHT_PER_STREAM, timeout, |s| {
+        s.answered == s.requests.len()
+    });
+    assert_eq!(
+        most_owing, STREAMS,
+        "every stream had requests in flight at once"
+    );
+    for (index, stream) in streams.iter().enumerate() {
+        assert_eq!(
+            stream.deepest, IN_FLIGHT_PER_STREAM,
+            "stream {index} had {IN_FLIGHT_PER_STREAM} of its own requests in flight at once"
+        );
+    }
+
+    // Each reply came back on the stream that sent its request, in that
+    // stream's order: the request's marker and index are in the echo.
+    for (index, stream) in streams.iter().enumerate() {
+        let expected: Vec<Vec<u8>> = stream
+            .requests
+            .iter()
+            .map(|request| [&[KIND_RESP_ECHO][..], request].concat())
+            .collect();
+        assert_eq!(stream.replies, expected, "stream {index}'s replies");
+    }
+
+    // Closed one at a time, the node's count falling by one each time
+    // without the handle being serviced again: the close sends the reset
+    // itself.
+    wait_for_active(
+        health,
+        idle + STREAMS as u64,
+        SLOT_FREED_WITHIN,
+        "with every stream open",
+    );
+    let mut open = STREAMS as u64;
+    let mut requests = Vec::with_capacity(STREAMS);
+    for (index, stream) in streams.into_iter().enumerate() {
+        nic.close(stream.id);
+        open -= 1;
+        wait_for_active(
+            health,
+            idle + open,
+            SLOT_FREED_WITHIN,
+            &format!("once stream {index} was closed"),
+        );
+        requests.push(stream.requests);
+    }
+    requests
+}
+
+/// How soon a closed DPDK stream's slot must be free on the node: the
+/// close resets the stream, and the node frees the slot on the reset.
+/// Without the reset only the node's heartbeat or idle timeout would free
+/// it; the case checks that this bound is well under the default of each,
+/// and runs its node with neither.
+#[cfg(feature = "dpdk")]
+const SLOT_FREED_WITHIN: Duration = Duration::from_secs(2);
+
+/// An address on the loopback that nothing listens on, for a node's health
+/// endpoint. Under the runner the loopback is the test process's own.
+#[cfg(feature = "dpdk")]
+fn free_loopback_addr() -> SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free loopback port")
+}
+
+/// The node's count of authenticated connections, from the line its health
+/// endpoint answers a plain connection with:
+/// `OK <active_connections> <journal_seq> <replication_lag> trading|halted`.
+#[cfg(feature = "dpdk")]
+fn active_connections(health: SocketAddr) -> u64 {
+    let mut stream = std::net::TcpStream::connect_timeout(&health, Duration::from_secs(2))
+        .unwrap_or_else(|e| panic!("connect to the health endpoint at {health}: {e}"));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set timeout");
+    let mut line = String::new();
+    stream
+        .read_to_string(&mut line)
+        .unwrap_or_else(|e| panic!("read the health line from {health}: {e}"));
+    let mut fields = line.split_whitespace();
+    assert_eq!(fields.next(), Some("OK"), "the health line: {line:?}");
+    fields
+        .next()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("no connection count in the health line: {line:?}"))
+}
+
+/// Wait, at most `within`, for the node's count of authenticated
+/// connections to be `expected`, reading it again every few milliseconds.
+/// Panics with the last count read, and `when`.
+#[cfg(feature = "dpdk")]
+fn wait_for_active(health: SocketAddr, expected: u64, within: Duration, when: &str) {
+    let started = Instant::now();
+    loop {
+        let count = active_connections(health);
+        if count == expected {
+            return;
+        }
+        assert!(
+            started.elapsed() < within,
+            "{when}: the node counts {count} connections, not {expected}, after {within:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 // ---------------------------------------------------------------------------
