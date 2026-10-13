@@ -29,7 +29,7 @@ use melin_client::Connection;
 use melin_server_runtime::StartupEvents;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::layout::{PipelineCores, Placement};
-use melin_server_runtime::server::ServerConfig;
+use melin_server_runtime::server::{JournalStagingMode, ServerConfig};
 use melin_test_node::sched::{first_pinnable_cpu, set_batch_policy, threads_named};
 use melin_test_node::{Addrs, Node};
 use melin_transport_core::test_ports::free_addr;
@@ -135,6 +135,10 @@ fn node_config(dir: &Path, name: &str, key: &SigningKey, keys_file: &Path) -> Se
         // Off unless a test asks for one: the default is a fixed port,
         // which two nodes in one process would both take.
         health_bind: None,
+        // Staged segments allocated, not zero-filled: a zero fill is a pass
+        // over a whole segment, from every node at once, on a CI runner's
+        // disk, and nothing here measures the journal.
+        journal_staging_mode: JournalStagingMode::Allocate,
         replication_key: Some(key_path),
         ..melin_test_node::config()
     }
@@ -241,9 +245,12 @@ fn placed_threads_start_in_their_own_scheduling_context() {
     };
     let config = |name: &str, key: &SigningKey| ServerConfig {
         cores,
-        // A client write is acked only once both nodes have journaled it,
-        // so one acked write means both pipelines are running.
-        ack_policy: AckPolicy::TwoDisks,
+        // A client write is acked only once the replica holds it too, so
+        // one acked write means the replica's pipeline is built. Not
+        // `TwoDisks`: waiting on the replica's fsync proves nothing more
+        // about where its threads started, and on a slow disk it outlasts
+        // a client's read.
+        ack_policy: AckPolicy::Ram,
         // Non-zero so the shadow threads exist; long enough that neither
         // takes a snapshot.
         snapshot_interval_ms: 3_600_000,
@@ -263,6 +270,11 @@ fn placed_threads_start_in_their_own_scheduling_context() {
     let deadline = Instant::now() + LIMIT;
     let mut conn = Connection::connect_by(primary.addr(), &keys.client, deadline)
         .expect("client connects to the primary");
+    // Bounded by the test's own limit, not the client's default: two
+    // nodes' threads share one core here, beside DPDK's busy-polling
+    // threads on that build, on a runner with few cores.
+    conn.set_read_timeout(LIMIT)
+        .expect("set the client's read timeout");
     // Refused until the replica is attached.
     loop {
         let reply = conn
@@ -444,6 +456,10 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
         std::thread::spawn(move || {
             let deadline = Instant::now() + LIMIT;
             let mut conn = Connection::connect_by(addr, &key, deadline).expect("client connects");
+            // The test's own bound, as in the placement test: a CI
+            // runner's disk sets the pace of a `disk` ack.
+            conn.set_read_timeout(LIMIT)
+                .expect("set the client's read timeout");
             while !stop.load(Ordering::Relaxed) {
                 let reply = conn
                     .request_one(&increment_request(1))
