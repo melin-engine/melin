@@ -3598,23 +3598,6 @@ mod tests {
         assert!(consumer.try_consume().is_none(), "exactly one sentinel");
     }
 
-    /// The first CPU other than 0 that the calling thread may run on: a
-    /// core a test can pin a child to that is not the `0` "unpinned"
-    /// sentinel. `None` on a host, or in a cpuset, that offers no such CPU.
-    fn first_pinnable_cpu() -> Option<usize> {
-        let mask = unsafe {
-            let mut mask: libc::cpu_set_t = std::mem::zeroed();
-            assert_eq!(
-                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut mask),
-                0,
-                "sched_getaffinity failed: {}",
-                std::io::Error::last_os_error()
-            );
-            mask
-        };
-        (1..libc::CPU_SETSIZE as usize).find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &mask) })
-    }
-
     /// The scheduling policy a running thread has now.
     fn policy_of<T>(handle: &std::thread::JoinHandle<T>) -> libc::c_int {
         use std::os::unix::thread::JoinHandleExt;
@@ -3641,14 +3624,14 @@ mod tests {
     /// the same.
     ///
     /// Where a child started cannot be read back once it has pinned
-    /// itself, but its policy can: pinning to a core that is not isolated
-    /// leaves the policy alone. So the builder runs at `SCHED_BATCH`,
-    /// which needs no privilege. A child that inherited the builder's
-    /// context keeps it after its own pin; one handed its own context
-    /// starts at `SCHED_OTHER`.
+    /// itself, but its policy can (see `melin_test_node::sched`): the
+    /// builder runs at `SCHED_BATCH`, and a child that inherited its
+    /// context keeps it after its own pin, while one handed its own starts
+    /// at `SCHED_OTHER`. The end-to-end form, both nodes on both
+    /// transports, is `tests/stall_guards.rs`.
     #[test]
     fn replica_pipeline_threads_start_in_their_own_scheduling_context() {
-        let Some(core) = first_pinnable_cpu() else {
+        let Some(core) = melin_test_node::sched::first_pinnable_cpu() else {
             // No core to place a child on but the `0` sentinel.
             eprintln!("skipped: this thread may run on CPU 0 only");
             return;
@@ -3657,13 +3640,7 @@ mod tests {
 
         let policies = std::thread::spawn(move || {
             // The context no child may start in.
-            let param = libc::sched_param { sched_priority: 0 };
-            assert_eq!(
-                unsafe { libc::sched_setscheduler(0, libc::SCHED_BATCH, &param) },
-                0,
-                "sched_setscheduler(SCHED_BATCH) failed: {}",
-                std::io::Error::last_os_error()
-            );
+            melin_test_node::sched::set_batch_policy();
 
             let writer = melin_journal::BufferedWriter::<CounterEvent>::create_continuing(
                 &dir.path().join("replica.journal"),
