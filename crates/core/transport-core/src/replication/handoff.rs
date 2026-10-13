@@ -45,7 +45,7 @@ use super::sent::SentHighWater;
 pub trait HandoffIo {
     /// Start a journal pass: every entry on disk past `from`, framed as the
     /// catch-up frames them, to the replica in order. Exactly what one
-    /// [`catch_up_from_journal_with`](super::catchup::catch_up_from_journal_with)
+    /// [`handoff_pass_from_journal`](super::catchup::handoff_pass_from_journal)
     /// call from `from` streams. At most one pass runs at a time; the
     /// handoff starts the next only once [`Self::pump_pass`] has reported
     /// the last one done.
@@ -297,7 +297,7 @@ mod tests {
 
     use super::*;
     use crate::pipeline::InputSlot;
-    use crate::replication::catchup::{CatchUpResult, catch_up_from_journal_with};
+    use crate::replication::catchup::handoff_pass_from_journal;
     use crate::replication::protocol::{PrimaryMessage, decode_primary_message, encode_rotate};
     use crate::replication_wire::{
         MSG_INPUT_BATCH, encode_input_batch, peek_frame_tag, try_decode_input_batch,
@@ -447,7 +447,7 @@ mod tests {
         }
     }
 
-    /// A pass over a real journal: what `catch_up_from_journal_with`
+    /// A pass over a real journal: what `handoff_pass_from_journal`
     /// streams from `from`.
     fn journal_disk(path: &Path) -> Disk<'_> {
         Box::new(move |from| {
@@ -457,10 +457,8 @@ mod tests {
                 frames.push(f.to_vec());
                 Ok(())
             };
-            match catch_up_from_journal_with::<TestEvent>(path, from, &mut publish, &never)? {
-                CatchUpResult::Ok(end) => Ok((frames, end)),
-                CatchUpResult::NeedSnapshot => Err(io::Error::other("pruned")),
-            }
+            let end = handoff_pass_from_journal::<TestEvent>(path, from, &mut publish, &never)?;
+            Ok((frames, end))
         })
     }
 

@@ -39,7 +39,7 @@ use melin_app::AppEvent;
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::replication::catchup::{
     CatchUpPublisher, CatchUpResult, can_catch_up_from_journal, catch_up_from_journal_with,
-    lineage_origin, preflight_snapshot_transfer, snapshot_transfer_with,
+    handoff_pass_from_journal, lineage_origin, preflight_snapshot_transfer, snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
     encode_hash_mismatch, encode_need_snapshot, encode_stream_start,
@@ -420,16 +420,7 @@ pub(crate) fn stream_join<E: AppEvent>(
             divergent,
         } => (last_sequence, divergent),
         JoinRequest::HandoffPass { from } => {
-            return match catch_up_from_journal_with::<E>(journal_path, from, publish, cancel)? {
-                CatchUpResult::Ok(end) => Ok(end),
-                // The pass before this one streamed up to `from`; only a
-                // concurrent archive prune loses its start point. The
-                // replica re-handshakes and is routed to a snapshot.
-                CatchUpResult::NeedSnapshot => Err(io::Error::other(
-                    "journal history pruned during catch-up handoff — reconnect for snapshot \
-                     transfer",
-                )),
-            };
+            return handoff_pass_from_journal::<E>(journal_path, from, publish, cancel);
         }
     };
     let can_catch_up = !divergent

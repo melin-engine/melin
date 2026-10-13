@@ -715,14 +715,7 @@ fn a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped() {
     let cluster = Cluster::new();
     let primary_health = Cluster::health(0);
 
-    let journal = cluster.dir.path().join("primary.journal");
-    append_increments(&journal, 200_000);
-    let history = catch_up_bytes(&journal);
-    assert!(
-        history > 2 * JOIN_HISTORY_WIRE_BYTES,
-        "the history's catch-up is {history} bytes, too little to outlast what the primary \
-         queues for a replica"
-    );
+    write_history_outlasting_the_queue(&cluster.dir.path().join("primary.journal"));
     let primary = cluster.start_primary();
     let streaming = cluster.start_replica(1, "streaming");
     wait_for_gauge(primary_health, "melin_replicas_connected", 1, STARTUP_LIMIT);
@@ -795,6 +788,116 @@ fn a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped() {
     drop(conn);
     streaming.stop();
     primary.stop();
+}
+
+/// An ack a joining replica sends during its catch-up still counts once it
+/// is live: the primary's view of what the replica holds starts from it.
+///
+/// Acks are cumulative, and a replica acks only when it holds something
+/// new. So an ack the primary reads and drops while the catch-up is still
+/// being sent is never repeated: on a quiet primary nothing more is
+/// journaled, the replica sends nothing more, and the primary goes on
+/// believing the replica holds only what its handshake said. A write held
+/// for that replica's ack is then never answered. That is what a primary
+/// with a fresh replica, ticks off and one client write did,
+/// intermittently, when the replica's last ack beat the end of the
+/// catch-up.
+///
+/// Here the race is forced: the history outlasts what the primary queues
+/// for a replica, so with the joiner reading only its start the catch-up
+/// cannot end while the joiner holds still after acking.
+#[test]
+fn an_ack_sent_during_the_catch_up_counts_once_the_joiner_is_live() {
+    let _serial = serialise();
+    let cluster = Cluster::new();
+    let primary_health = Cluster::health(0);
+
+    write_history_outlasting_the_queue(&cluster.dir.path().join("primary.journal"));
+    let primary = cluster.start_primary();
+    let deadline = Instant::now() + STARTUP_LIMIT;
+    let history_end = loop {
+        if let Some(sequence) = gauge(primary_health, "melin_journal_sequence") {
+            break sequence;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the primary's health endpoint never came up"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // The joiner, the primary's only replica (slot 0), reads the catch-up's
+    // first entries and acks them as a replica that has journaled them
+    // does. Then it holds still, long enough for the primary to read the
+    // ack, and well under the join stall limit, which the ack arms.
+    let mut joiner = RawReplica::join(
+        Cluster::addrs(0).replication(),
+        &Cluster::node_key(2),
+        FRAME_LIMIT,
+    );
+    let acked = joiner.read_through(1);
+    assert!(
+        acked < history_end,
+        "the first entries the joiner read ran to the history's end ({acked})"
+    );
+    joiner.ack(acked);
+    let pause = Duration::from_millis(500);
+    assert!(pause * 4 < melin_dpdk::PeerLiveness::REPLICATION.timeout());
+    std::thread::sleep(pause);
+    assert_eq!(
+        gauge(primary_health, "melin_replica_catching_up{slot=\"0\"}"),
+        Some(1),
+        "the joiner's catch-up ended while it was reading nothing: the history no longer \
+         exceeds what the primary queues for a replica"
+    );
+
+    // The joiner reads the rest of its catch-up, and acks nothing more:
+    // nothing new is journaled, so a replica would have nothing more to
+    // ack. Its join ends, and it streams.
+    assert_eq!(joiner.read_through(history_end), history_end);
+    wait_for_gauge(
+        primary_health,
+        "melin_replica_catching_up{slot=\"0\"}",
+        0,
+        STARTUP_LIMIT,
+    );
+
+    // The primary holds the joiner at what it acked: its handshake said 0.
+    let deadline = Instant::now() + FRAME_LIMIT;
+    loop {
+        let in_memory = gauge(
+            primary_health,
+            "melin_replica_in_memory_sequence{slot=\"0\"}",
+        );
+        let persisted = gauge(primary_health, "melin_replica_acked_sequence{slot=\"0\"}");
+        if in_memory == Some(acked) && persisted == Some(acked) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the joiner acked {acked} during its catch-up, but once live the primary holds it \
+             at in-memory {in_memory:?}, persisted {persisted:?}: the ack was dropped, and a \
+             write waiting on it would never be answered"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    drop(joiner);
+    primary.stop();
+}
+
+/// Write a journal at `path` whose catch-up is several times what the
+/// primary queues for a replica that reads nothing (see
+/// [`JOIN_HISTORY_WIRE_BYTES`]): a joiner reading only its start keeps the
+/// catch-up from ending.
+fn write_history_outlasting_the_queue(path: &std::path::Path) {
+    append_increments(path, 200_000);
+    let history = catch_up_bytes(path);
+    assert!(
+        history > 2 * JOIN_HISTORY_WIRE_BYTES,
+        "the history's catch-up is {history} bytes, too little to outlast what the primary \
+         queues for a replica"
+    );
 }
 
 /// How much catch-up the history of

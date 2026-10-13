@@ -672,6 +672,7 @@ fn handle_replica_connection<A: Application>(
 
     // Catch-up complete — replica is entering the live streaming loop.
     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+    super::log_replica_live(slot_idx, &sent);
 
     // Signal that this replica is ready to consume from the replication
     // ring. A primary that began a new history waits on this (its

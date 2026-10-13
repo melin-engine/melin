@@ -131,6 +131,17 @@ impl<'a> ReplicaGate<'a> {
     }
 }
 
+/// Log a replica's join ending, on either sender: from here its slot
+/// streams live and the replica's acks count. Without it, a join that
+/// never ends and one that ended look alike in the log.
+pub(crate) fn log_replica_live(slot: usize, sent: &SentHighWater) {
+    tracing::info!(
+        slot,
+        sent_sequence = sent.get(),
+        "replica caught up, streaming live"
+    );
+}
+
 // Wire-protocol types, auth, catch-up, ack queueing, dual-track
 // cursor management, and per-replica metrics now live in
 // `melin_transport_core::replication`. Re-export the public types
