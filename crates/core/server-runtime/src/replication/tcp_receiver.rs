@@ -904,41 +904,50 @@ where
             let stream_marks = &p.stream_marks;
             let journal_failed = &p.journal_failed;
             std::thread::scope(|s| {
-                let handle = std::thread::Builder::new()
-                    .name("replica-receiver".into())
-                    .spawn_scoped(s, || {
-                        melin_app::affinity::pin_thread("replica-receiver", cores.reader.core);
-                        let mut transport = match UringTransport::new(&tcp_writer) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                tracing::error!(error = %e, "UringTransport init failed");
-                                // Synthetic result: streaming never started,
-                                // so `heard_from_primary` stays false and the
-                                // reconnect keeps its escalated backoff — this
-                                // failure is local (io_uring setup), and a
-                                // persistent one must not redial at 1 Hz.
-                                return super::receiver_transport::StreamingResult {
-                                    exit: SessionExit::Disconnected,
-                                    heard_from_primary: false,
-                                };
-                            }
-                        };
-                        streaming_loop::<UringTransport, A::Event>(
-                            &mut transport,
-                            input_producer,
-                            journal_cursor,
-                            shutdown,
-                            control,
-                            pipeline_depth,
-                            cores.reader.wait,
-                            session_start,
-                            Vec::with_capacity(MAX_DATA_FRAME + 4),
-                            None,
-                            stream_marks,
-                            journal_failed,
-                        )
-                    })
-                    .expect("spawn replica-receiver thread");
+                let receiver = || {
+                    melin_app::affinity::pin_thread("replica-receiver", cores.reader.core);
+                    let mut transport = match UringTransport::new(&tcp_writer) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::error!(error = %e, "UringTransport init failed");
+                            // Synthetic result: streaming never started,
+                            // so `heard_from_primary` stays false and the
+                            // reconnect keeps its escalated backoff — this
+                            // failure is local (io_uring setup), and a
+                            // persistent one must not redial at 1 Hz.
+                            return super::receiver_transport::StreamingResult {
+                                exit: SessionExit::Disconnected,
+                                heard_from_primary: false,
+                            };
+                        }
+                    };
+                    streaming_loop::<UringTransport, A::Event>(
+                        &mut transport,
+                        input_producer,
+                        journal_cursor,
+                        shutdown,
+                        control,
+                        pipeline_depth,
+                        cores.reader.wait,
+                        session_start,
+                        Vec::with_capacity(MAX_DATA_FRAME + 4),
+                        None,
+                        stream_marks,
+                        journal_failed,
+                    )
+                };
+                // Created in its own placement, not this thread's — see
+                // `melin_app::affinity::spawn_placed`.
+                let handle = melin_app::affinity::with_child_context(
+                    "replica-receiver",
+                    cores.reader.core,
+                    || {
+                        std::thread::Builder::new()
+                            .name("replica-receiver".into())
+                            .spawn_scoped(s, receiver)
+                    },
+                )
+                .expect("spawn replica-receiver thread");
                 handle.join().expect("replica-receiver thread panicked")
             })
         };

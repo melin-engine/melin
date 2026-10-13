@@ -44,6 +44,10 @@ use melin_server_runtime::layout::PipelineCores;
 use melin_server_runtime::server::ServerConfig;
 use melin_wire_protocol::control_codec::{TAG_AUTH_FAILED, TAG_CHALLENGE};
 
+#[path = "../common/raw_replica.rs"]
+mod raw_replica;
+use raw_replica::RawReplica;
+
 // ---------------------------------------------------------------------------
 // Time limits
 //
@@ -545,7 +549,11 @@ fn a_joiner_that_stops_reading_mid_handoff_holds_up_nothing() {
     // second: the streaming replica's is 0.
     let stall_limit = melin_dpdk::PeerLiveness::REPLICATION.timeout();
     let joined = Instant::now();
-    let mut joiner = RawReplica::join(Cluster::addrs(0).replication(), &Cluster::node_key(2));
+    let mut joiner = RawReplica::join(
+        Cluster::addrs(0).replication(),
+        &Cluster::node_key(2),
+        FRAME_LIMIT,
+    );
     wait_for_gauge(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
     // Time for the worker to read the history to its end.
     std::thread::sleep(Duration::from_secs(1));
@@ -722,7 +730,11 @@ fn a_joiner_that_acks_then_stops_reading_its_catch_up_is_dropped() {
 
     // The joiner reads the catch-up's first entries, acks them as a
     // replica that has journaled them does, and stops reading.
-    let mut joiner = RawReplica::join(Cluster::addrs(0).replication(), &Cluster::node_key(2));
+    let mut joiner = RawReplica::join(
+        Cluster::addrs(0).replication(),
+        &Cluster::node_key(2),
+        FRAME_LIMIT,
+    );
     wait_for_gauge(primary_health, "melin_replicas_connected", 2, STARTUP_LIMIT);
     let read = joiner.read_through(1);
     joiner.ack(read);
@@ -879,143 +891,6 @@ impl Flood {
             writer.join().expect("a flooding client failed");
         }
     }
-}
-
-/// A replica written by hand: it authenticates and handshakes as a fresh
-/// replica, then reads the stream only when told to. A real replica reads
-/// as fast as its journal allows; this one is what one that has stopped
-/// reading looks like to its primary.
-struct RawReplica {
-    stream: TcpStream,
-}
-
-impl RawReplica {
-    /// The receive buffer asked for: small, so that what the replica holds
-    /// unread is a known, small part of what the primary has queued.
-    const RECEIVE_BUFFER: libc::c_int = 32 * 1024;
-
-    fn join(primary: SocketAddr, key: &SigningKey) -> Self {
-        use ed25519_dalek::Signer;
-        use melin_transport_core::replication::protocol::{
-            Handshake as ReplicaHandshake, decode_auth_result, decode_challenge,
-            encode_challenge_response, encode_handshake,
-        };
-
-        let mut stream = connect_with_receive_buffer(primary, Self::RECEIVE_BUFFER);
-        stream
-            .set_read_timeout(Some(FRAME_LIMIT))
-            .expect("set read timeout");
-        let challenge = read_any_frame(&mut stream).expect("the primary's challenge");
-        let nonce = decode_challenge(&challenge).expect("a challenge");
-        let mut out = Vec::new();
-        encode_challenge_response(
-            &key.sign(&nonce).to_bytes(),
-            key.verifying_key().as_bytes(),
-            &mut out,
-        );
-        stream.write_all(&out).expect("send the challenge response");
-        let verdict = read_any_frame(&mut stream).expect("the primary's verdict");
-        assert!(
-            decode_auth_result(&verdict).expect("an auth result"),
-            "the primary refused the replication key"
-        );
-        out.clear();
-        encode_handshake(
-            &ReplicaHandshake {
-                last_sequence: 0,
-                chain_hash: [0; 32],
-                epoch: 0,
-            },
-            &mut out,
-        );
-        stream.write_all(&out).expect("send the handshake");
-        RawReplica { stream }
-    }
-
-    /// Read the stream until an entry batch carries `sequence`, and return
-    /// that batch's last sequence.
-    fn read_through(&mut self, sequence: u64) -> u64 {
-        use melin_transport_core::replication_wire::{MSG_INPUT_BATCH, try_decode_input_batch};
-        loop {
-            let frame = read_any_frame(&mut self.stream).expect("the catch-up");
-            if frame.first() != Some(&MSG_INPUT_BATCH) {
-                continue; // StreamStart, and any other control frame.
-            }
-            let slots = try_decode_input_batch::<CounterEvent>(&frame).expect("an entry batch");
-            let last = slots.last().expect("a batch carries entries").sequence;
-            if last >= sequence {
-                return last;
-            }
-        }
-    }
-
-    /// Ack `sequence` as journaled, as a replica streaming does: the first
-    /// sign the primary has that the replica is past its install.
-    fn ack(&mut self, sequence: u64) {
-        use melin_transport_core::replication::protocol::{Ack, encode_ack};
-        let mut out = Vec::new();
-        encode_ack(
-            &Ack {
-                acked_sequence: sequence,
-                in_memory_sequence: sequence,
-            },
-            &mut out,
-        );
-        self.stream.write_all(&out).expect("send an ack");
-    }
-}
-
-/// A kernel-TCP connection to `peer` whose receive buffer was set before
-/// connecting, when it still bounds the window offered.
-fn connect_with_receive_buffer(peer: SocketAddr, receive_buffer: libc::c_int) -> TcpStream {
-    use std::os::fd::FromRawFd;
-    let SocketAddr::V4(peer) = peer else {
-        panic!("the runner's network is IPv4");
-    };
-    // SAFETY: a plain socket(2); its descriptor is owned by the `TcpStream`
-    // at once, which closes it on every path out.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
-    // SAFETY: `fd` is a fresh socket that nothing else owns.
-    let stream = unsafe { TcpStream::from_raw_fd(fd) };
-    // SAFETY: the option value is a live `c_int`, of the length passed.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            (&receive_buffer as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    assert_eq!(rc, 0, "SO_RCVBUF: {}", io::Error::last_os_error());
-    let address = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: peer.port().to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from(*peer.ip()).to_be(),
-        },
-        sin_zero: [0; 8],
-    };
-    // SAFETY: `address` is a live `sockaddr_in`, of the length passed.
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            (&address as *const libc::sockaddr_in).cast(),
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-    assert_eq!(rc, 0, "connect to {peer}: {}", io::Error::last_os_error());
-    stream
-}
-
-/// One length-prefixed frame's payload, of any size.
-fn read_any_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut prefix = [0u8; 4];
-    stream.read_exact(&mut prefix)?;
-    let mut payload = vec![0u8; u32::from_le_bytes(prefix) as usize];
-    stream.read_exact(&mut payload)?;
-    Ok(payload)
 }
 
 /// How long a request may take while another replica's join is stalled:

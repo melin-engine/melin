@@ -122,8 +122,8 @@ pub enum ReaderThread {
 /// A `core` of 0 = unpinned (OS scheduled) for any field.
 ///
 /// The thread that accepts replica connections (`repl-accept`) has no
-/// field: it accepts, reaps finished handlers and sleeps, and it must stay
-/// unpinned because the handlers it spawns inherit its placement.
+/// field: it accepts, reaps finished handlers and sleeps, so a core of its
+/// own would buy nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineCores {
     /// The journal's sequencing thread: orders, encodes and hash-chains
