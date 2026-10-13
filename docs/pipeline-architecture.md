@@ -418,6 +418,8 @@ Give the disk thread a core on the same CCD as `journal-seq`: the two exchange a
 
 Each pipeline thread is created on its own core and pinned there before it enters its main loop. Pinning eliminates involuntary context switches and keeps hot data in L1/L2 cache, removing the latency jitter each core migration adds at p99/p99.9. A thread is never created on another thread's core and left to move itself: on an isolated core held by a real-time thread it would never get to run.
 
+The node waits for each pipeline thread to start and pin itself before it starts the next. One that has not within 10 seconds fails the node's startup, with an error naming the thread and its core: something on that core never yields it, most often another thread spinning there at real-time priority, of this node or of another process pinned to the same core. Check the `--cores` layout against what else the host pins there. A replication handler that does not start is logged as an error rather than failing the node, and the replica it was started for is not served until it runs.
+
 A thread given `0` in `--cores` is not pinned. It runs on the CPUs the node process was started with — the set it inherited from whatever launched it, which `taskset`, systemd's `CPUAffinity=` or a container's cpuset narrow — less any isolated cores, and that holds for every unpinned thread, including the ones the runtime starts from pinned threads. What that set is depends on the host:
 
 - **Without isolated cores**, the scheduler places it on any core and moves it as load changes, including onto cores other threads are pinned to. Pinned threads have no real-time priority on such a host, so the two share that core by timeslice.

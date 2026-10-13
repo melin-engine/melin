@@ -199,6 +199,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   ring backpressure. After 5 s of entries pending with nothing persisted,
   the primary now logs a warning naming the replica's slot and both
   positions, and logs again when it persists once more.
+- **`melin_app::affinity::spawn_placed` and `with_child_context`**: the
+  one way to spawn a thread that has a placement (a core, or `0` for
+  unpinned). The thread is created already in that placement's
+  scheduling context, its spawner is put back where it was, CPU
+  included, and `spawn_placed` returns once the thread has pinned itself,
+  or a `SpawnPlacedError` naming the thread and its core when it has not
+  within 10 s. `with_child_context` runs the same handover around a spawn
+  of the caller's own, such as a scoped thread.
 
 ### Changed
 
@@ -291,6 +299,21 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   supply them. `response::run` returns a `bool` (whether the stage
   started) instead of `()`, so a `JoinHandle<()>` binding for its thread
   no longer compiles.
+- **`melin_app::affinity::capture_home_mask` leaves out isolated CPUs and
+  moves its caller.** The home mask, the CPU set an unpinned thread runs
+  on, is the startup mask without the CPUs the kernel reports isolated,
+  unless those are all the process was given, and `capture_home_mask`
+  now also narrows the calling thread to it, so the threads it spawns
+  start off the isolated CPUs too. It only ever narrows, never widens.
+
+### Removed
+
+- **`melin_app::affinity::take_context`, `prepare_child_context`,
+  `restore_context` and `SchedContext`** are private. They were the
+  steps of the handover that `spawn_placed` and `with_child_context` now
+  run; done by hand they were done partly, which is how pipeline threads
+  came to start on a core a real-time thread held. Spawn through either
+  function instead.
 
 ### Fixed
 
@@ -337,6 +360,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   (`-l`), now sees only those housekeeping cores, as under the earlier
   `numactl --physcpubind` workaround, and no longer starts idle workers
   on the isolated ones.
+- **A primary that failed to start could leave its pipeline threads
+  running.** When a stage that starts later (the replication sender, the
+  shadow or the event publisher, the health endpoint, the reader) could
+  not, startup returned with the stages already started still spinning.
+  A process that exits on the error ends them with it; one that hosts
+  several nodes through `run_with_shutdown` kept them past the node's
+  failure. Every early return now stops and joins the threads started.
 
 ## [0.19.0] - 2026-10-10
 
