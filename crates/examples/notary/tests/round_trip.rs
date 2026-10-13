@@ -34,7 +34,7 @@ use melin_transport_core::test_ports::free_addr;
 use notary_server::receipt::Receipt as SavedReceipt;
 use notary_server::{
     GENESIS_HEAD, HEAD_LEN, KIND_GET_HEAD, KIND_NOTARIZE, KIND_RESP_HEAD, KIND_RESP_RECEIPT,
-    LEAF_LEN, Notary, NotaryEvent, RequestDecoder, ResponseEncoder,
+    KIND_RESP_REJECTED, LEAF_LEN, Notary, NotaryEvent, RequestDecoder, ResponseEncoder,
 };
 
 // ---------------------------------------------------------------------------
@@ -940,17 +940,34 @@ fn a_promoted_replica_reports_the_head_the_primary_receipted() {
         spawn_node_at(&replica_addrs, config)
     };
 
-    // Notarize on the primary. Under `disk+ram` the first receipt is
-    // released only once the replica has attached, so nothing polls for
-    // readiness — but that wait is longer than a local round trip.
+    // Notarize on the primary. Under `disk+ram` a receipt is released
+    // only once the replica holds the entry too. Before the replica has
+    // authenticated, a write may instead be refused outright: a DPDK
+    // primary takes clients from the start, and refuses writes while no
+    // replica is connected (a kernel-TCP primary that began a new history
+    // serves no client until its replica has caught up). A refused write
+    // is not journaled, so the first is retried until it is taken.
     let documents: [&[u8]; 3] = [b"deed", b"codicil", b"witness statement"];
     let mut last: Option<Receipt> = None;
     {
         let mut stream = connect_authenticated(primary.addr(), &submitter_key());
         let mut expected = GENESIS_HEAD;
+        let deadline = Instant::now() + melin_test_node::STARTUP_LIMIT;
         for (i, document) in documents.iter().enumerate() {
             let leaf = digest(document);
-            let receipt = receipt_of(&request(&mut stream, KIND_NOTARIZE, &leaf));
+            let reply = loop {
+                let reply = request(&mut stream, KIND_NOTARIZE, &leaf);
+                if reply[0] != KIND_RESP_REJECTED {
+                    break reply;
+                }
+                assert!(
+                    i == 0 && Instant::now() < deadline,
+                    "notarize {} refused: the replica never attached, or detached",
+                    i + 1
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            let receipt = receipt_of(&reply);
             expected = fold(&expected, &leaf, receipt.timestamp_ns);
             assert_eq!(receipt.head, expected, "primary head at entry {}", i + 1);
             last = Some(receipt);
