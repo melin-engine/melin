@@ -27,9 +27,8 @@
 //! real-time thread spins on it, and never runs. So the isolated CPUs
 //! come out of the home mask, unless they are all the process was given.
 //! [`pin_thread`](crate::affinity::pin_thread) and
-//! [`prepare_child_context`](crate::affinity::prepare_child_context)
-//! with `0`, and [`clear_affinity`](crate::affinity::clear_affinity), all
-//! apply it. Handing out "every CPU" instead is not the same thing, for
+//! [`spawn_placed`](crate::affinity::spawn_placed) with `0`, and
+//! [`clear_affinity`](crate::affinity::clear_affinity), all apply it. Handing out "every CPU" instead is not the same thing, for
 //! the same reason. Production deployments
 //! never run pipeline threads on core 0 (it is reserved for the kernel,
 //! IRQ handlers, and other system processes), so the value is free to
@@ -399,7 +398,13 @@ pub fn pin_thread(name: &str, core: usize) {
 /// A thread's scheduling context: CPU affinity mask, the CPU it is on,
 /// policy and priority. Captured by [`take_context`] and put back by
 /// [`restore_context`].
-pub struct SchedContext {
+///
+/// This and the three steps of the handover (take, prepare, restore) are
+/// private: [`spawn_placed`] and [`with_child_context`] are the only way to
+/// spawn a placed thread, so the handover cannot be done by hand and done
+/// partly, which is how pipeline threads came to start on a core a
+/// real-time thread held.
+struct SchedContext {
     mask: libc::cpu_set_t,
     /// The CPU the thread was running on, when the kernel could say. A
     /// mask alone does not say where a thread is, and the handover in
@@ -412,7 +417,7 @@ pub struct SchedContext {
 
 /// Snapshot the calling thread's affinity mask, the CPU it is on,
 /// scheduling policy and priority.
-pub fn take_context() -> Result<SchedContext, String> {
+fn take_context() -> Result<SchedContext, String> {
     unsafe {
         let mut mask: libc::cpu_set_t = std::mem::zeroed();
         if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut mask) != 0 {
@@ -457,7 +462,7 @@ pub fn take_context() -> Result<SchedContext, String> {
 /// nothing moves it later, so it would stay beside the child it just
 /// spawned — which turns real-time and spins — and so would every thread
 /// it spawns after.
-pub fn restore_context(ctx: &SchedContext) -> Result<(), String> {
+fn restore_context(ctx: &SchedContext) -> Result<(), String> {
     // Back to the CPU first, while still at the handover's SCHED_OTHER,
     // so the thread is never real-time on the child's core.
     if let Some(cpu) = ctx.cpu.filter(|&cpu| {
@@ -504,28 +509,10 @@ pub fn restore_context(ctx: &SchedContext) -> Result<(), String> {
 
 /// Put the calling thread into the scheduling context a thread spawned
 /// *next* should inherit: pinned to `core`, or on the home mask when
-/// `core` is the `0` sentinel, and always `SCHED_OTHER`.
-///
-/// # Why this exists
-///
-/// A new thread inherits its creator's affinity mask and scheduling
-/// policy at creation, and Linux offers no way to set another thread's
-/// affinity before it is first scheduled. So a child spawned from a
-/// pinned `SCHED_FIFO` thread starts life sharing one core with a
-/// busy-spinning real-time thread — and cannot fix itself, because
-/// fixing itself requires running. On an isolated core the parent never
-/// yields, so the child never executes its first instruction. Its
-/// `comm` still reads as the parent's name, because even
-/// `Builder::name` is applied from inside the new thread.
-///
-/// The only place that ordering can be broken is the parent, before the
-/// child exists: take the context, call this, spawn, restore. The child
-/// then starts already on its own core under `SCHED_OTHER`, free to run
-/// and promote itself with [`pin_thread`]. Spawn through [`spawn_placed`]
-/// or [`with_child_context`], which do all four steps; a thread that pins
-/// itself and is spawned any other way is this bug waiting for a host
-/// that triggers it.
-pub fn prepare_child_context(core: usize) -> Result<(), String> {
+/// `core` is the `0` sentinel, and always `SCHED_OTHER`. The middle step
+/// of the handover [`with_child_context`] runs; see [`spawn_placed`] for
+/// why it exists.
+fn prepare_child_context(core: usize) -> Result<(), String> {
     // Record the home mask while this thread still has its own placement.
     home_mask();
     const MAX_CPUS: usize = 1024;
@@ -688,12 +675,35 @@ impl<T> From<SpawnPlacedError<T>> for std::io::Error {
 /// has pinned itself, or with [`SpawnPlacedError::NotStarted`] when it has
 /// not within a bound.
 ///
-/// The way to spawn any thread that has a placement. See
-/// [`prepare_child_context`] for why the placement cannot be left to the
-/// thread itself. The wait turns the failure that remains — a thread whose
-/// core is held by something that never yields — from a silent stall,
-/// noticed only when the work it never does backs up, into an error that
-/// names the thread and its core.
+/// The way to spawn any thread that has a placement.
+///
+/// # Why the placement cannot be left to the thread itself
+///
+/// A new thread inherits its creator's affinity mask and scheduling
+/// policy at creation, and Linux offers no way to set another thread's
+/// affinity before it is first scheduled. So a child spawned from a
+/// pinned `SCHED_FIFO` thread starts life sharing one core with a
+/// busy-spinning real-time thread — and cannot fix itself, because
+/// fixing itself requires running. On an isolated core the parent never
+/// yields, so the child never executes its first instruction. Its
+/// `comm` still reads as the parent's name, because even
+/// `Builder::name` is applied from inside the new thread.
+///
+/// The only place that ordering can be broken is the parent, before the
+/// child exists: it adopts the child's context, spawns, and goes back to
+/// its own, CPU included (left on the child's core, it would create every
+/// later thread there). The child then starts already on its own core
+/// under `SCHED_OTHER`, free to run and promote itself with
+/// [`pin_thread`]. That handover is private to this function and
+/// [`with_child_context`]: a thread that pins itself and is spawned any
+/// other way is this bug waiting for a host that triggers it.
+///
+/// # The wait
+///
+/// It turns the failure that remains — a thread whose core is held by
+/// something that never yields — from a silent stall, noticed only when
+/// the work it never does backs up, into an error that names the thread
+/// and its core.
 pub fn spawn_placed<T, F>(
     name: &str,
     core: usize,
@@ -762,9 +772,9 @@ where
 /// moves off its current core at once if that core is not in the home
 /// mask, so threads it spawns afterwards start inside the home mask too.
 ///
-/// Only usable by a child that can actually run — see
-/// [`prepare_child_context`] for why a child of a pinned RT parent
-/// cannot, and must be handed its context instead.
+/// Only usable by a child that can actually run — see [`spawn_placed`]
+/// for why a child of a pinned RT parent cannot, and must be handed its
+/// context instead.
 pub fn clear_affinity() -> Result<(), String> {
     home_mask();
     // Policy before mask, as in `prepare_child_context`: a non-pinned

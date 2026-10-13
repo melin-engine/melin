@@ -937,7 +937,7 @@ where
                     )
                 };
                 // Created in its own placement, not this thread's — see
-                // `melin_app::affinity::prepare_child_context`.
+                // `melin_app::affinity::spawn_placed`.
                 let handle = melin_app::affinity::with_child_context(
                     "replica-receiver",
                     cores.reader.core,
