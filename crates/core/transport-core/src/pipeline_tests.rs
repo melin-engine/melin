@@ -2776,8 +2776,9 @@ fn primary_emits_chain_check_every_interval() {
 fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     // The stages log every adoption, and a failed one with its cause, at
     // info level and up; captured, so a timeout below explains itself.
-    // Deliberately ignored: another test in this process may have
-    // installed the subscriber already.
+    // Not `melin_test_node::logs`: that crate is built on this one, and a
+    // unit test here cannot take it. Deliberately ignored: another test in
+    // this process may have installed the subscriber already.
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let dir = tempfile::tempdir().unwrap();

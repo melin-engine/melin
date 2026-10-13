@@ -52,15 +52,18 @@ const FRAME_LIMIT: Duration = Duration::from_secs(10);
 
 /// One test at a time within this process: they read every thread of the
 /// process and its one log. (Under nextest each test is a process of its
-/// own; under `cargo test` they would otherwise share it.)
+/// own; under `cargo test` they would otherwise share it.) Installs the
+/// log (see [`log`]), so a failing test reports what its nodes did.
 fn serial() -> MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
     // A test that failed while holding the lock leaves nothing behind that
     // the next one depends on, so recover the guard rather than fail every
     // later test with the poison.
-    SERIAL
+    let serial = SERIAL
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    log();
+    serial
 }
 
 /// Node `slot`'s addresses, from this file's port range on kernel TCP.
@@ -372,8 +375,12 @@ fn a_primary_that_fails_to_start_leaves_no_stage_running() {
     }
 }
 
-/// What the nodes in this process log, at `info` and above, for the test
-/// that checks a warning. Installed once, the first time it is asked for.
+/// What the nodes in this process log, at `info` and above: kept for the
+/// test that checks a warning, and copied to the test's output, which the
+/// harness shows when a test fails. Installed once, by the first test to
+/// take its turn (see [`serial`]). This file's own subscriber, not
+/// `melin_test_node::logs`: a process has one, and this one also keeps
+/// what it logs.
 fn log() -> &'static Arc<Mutex<Vec<u8>>> {
     static LOG: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
     LOG.get_or_init(|| {
@@ -389,11 +396,14 @@ fn log() -> &'static Arc<Mutex<Vec<u8>>> {
     })
 }
 
-/// A `tracing` writer into the shared log.
+/// A `tracing` writer into the shared log, and to the test's output.
 struct LogSink(Arc<Mutex<Vec<u8>>>);
 
 impl Write for LogSink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // `print!`, which the harness captures, as the test writer of
+        // `tracing_subscriber` does.
+        print!("{}", String::from_utf8_lossy(bytes));
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -428,7 +438,6 @@ fn a_replica_that_takes_entries_but_persists_none_is_reported() {
     const RESUMED: &str = "replica persisting again";
 
     let _serial = serial();
-    log();
     let tmp = tempfile::tempdir().expect("tempdir");
     let keys = Keys::new();
     let keys_file = keys.authorized_keys(tmp.path());

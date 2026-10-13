@@ -31,6 +31,8 @@ melin-wire-protocol = { workspace = true }
 melin-dpdk = { workspace = true, optional = true, features = ["dpdk-sys"] }
 # The CPU set for EAL's lcore, and the scheduling helpers in `sched`.
 libc = { workspace = true }
+# The nodes' log in a failing test's report (`logs`).
+tracing-subscriber = { workspace = true }
 
 [features]
 ## Start nodes on the DPDK transport, on the network

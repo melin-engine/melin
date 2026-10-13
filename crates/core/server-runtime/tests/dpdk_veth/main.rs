@@ -1215,19 +1215,7 @@ fn serialise() -> MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // Deliberately ignored: a subscriber an earlier test in this process
-    // installed is just as good.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,melin_server_runtime::dpdk_transport=debug",
-                )
-            }),
-        )
-        .with_test_writer()
-        .with_thread_names(true)
-        .try_init();
+    melin_test_node::logs::capture("info,melin_server_runtime::dpdk_transport=debug");
     serial
 }
 

@@ -152,15 +152,7 @@ fn start_server_in(dir: &Path) -> Server {
 /// failing test: what a node did is then in the report. Every test that
 /// starts a node calls this first.
 fn capture_node_logs() {
-    // Deliberately ignored: only the first test in the process installs
-    // the subscriber, the rest reuse it.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
-        )
-        .with_test_writer()
-        .try_init();
+    melin_test_node::logs::capture("debug");
 }
 
 /// [`start_server_in`], with `configure` applied to the config first.

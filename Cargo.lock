@@ -1163,6 +1163,7 @@ dependencies = [
  "melin-dpdk",
  "melin-server-runtime",
  "melin-wire-protocol",
+ "tracing-subscriber",
 ]
 
 [[package]]
