@@ -65,12 +65,9 @@ check "an eviction degrades the run even once the replica is back" \
 check "a sample the endpoint did not answer is not judged" \
     "0 ok: 1 samples, 0 evictions, 0 short of replicas, 0 catching up" \
     "$(verdict 2 "" "$LIVE2")"
-check "a replicated run with nothing to judge is unjudged" \
+check "a run with nothing to judge is unjudged" \
     "1 UNJUDGED: no health samples" \
-    "$(verdict 1 "" "")"
-check "a standalone run passes without replicas" \
-    "0 ok: 1 samples, 0 evictions, 0 short of replicas, 0 catching up" \
-    "$(verdict 0 'melin_replicas_connected 0')"
+    "$(verdict 2 "" "")"
 
 echo ""
 echo "=== conf_value ==="
@@ -86,11 +83,6 @@ check "a quoted multi-word value, unquoted" \
 check "a key absent is empty" "" "$(conf_value "$CONF" DPDK_GATEWAY)"
 check "a key is matched whole, not by prefix" "" "$(conf_value "$CONF" DPDK)"
 
-echo ""
-echo "=== replicas_of ==="
-for pair in tcp:0 dpdk:0 tcp-repl:1 dpdk-repl:1 tcp-dual-repl:2 dpdk-dual-repl:2; do
-    check "${pair%%:*}" "${pair##*:}" "$(replicas_of "${pair%%:*}")"
-done
 
 echo ""
 echo "=== ${PASSED} passed, ${FAILED} failed ==="

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Benchmark a Melin application across a LAN: a primary, up to two
+# Benchmark a Melin application across a LAN: a primary, two synchronous
 # replicas and a load-generating host, over kernel TCP and DPDK.
 #
 # The binaries are built here, on the machine running the suite, for the
@@ -14,13 +14,9 @@
 #   ec       the Exchange Core's melin-ec-server and melin-ec-bench, built
 #            from a sibling checkout (EC_REPO, default ../exchange-core)
 #
-# Transports (how the cluster runs):
-#   tcp             kernel TCP, standalone
-#   tcp-repl        kernel TCP, one synchronous replica
-#   tcp-dual-repl   kernel TCP, two synchronous replicas
-#   dpdk            DPDK, standalone; the load generator on DPDK too
-#   dpdk-repl       DPDK, one replica, replication over DPDK
-#   dpdk-dual-repl  DPDK, two replicas
+# Transports (how the cluster runs, always a primary and two replicas):
+#   kernel  kernel TCP, clients and replication
+#   dpdk    DPDK, clients and replication; the load generator on DPDK too
 #
 # Workloads (what the load generator does):
 #   throughput  THROUGHPUT_CLIENTS × THROUGHPUT_WINDOW in flight
@@ -28,28 +24,28 @@
 #
 # Usage:
 #   ./scripts/bench/lan-bench-suite.sh <app> <server-pub-ip> <bench-pub-ip> <server-vlan-ip> \
-#       [user] [replica-pub-ip] [replica-vlan-ip] [replica2-pub-ip] [replica2-vlan-ip]
+#       <replica-pub-ip> <replica2-pub-ip>
 #
 # Examples:
-#   # echo, two replicas, kernel TCP throughput (the default):
-#   ./scripts/bench/lan-bench-suite.sh echo 84.32.176.142 84.32.176.143 10.0.0.1 root \
-#       84.32.176.144 10.0.0.3 84.32.176.145 10.0.0.4
+#   # echo, kernel TCP throughput (the default):
+#   ./scripts/bench/lan-bench-suite.sh echo 84.32.176.142 84.32.176.143 10.0.0.1 \
+#       84.32.176.144 84.32.176.145
 #
-#   # notary, standalone, both workloads on both transports:
-#   TRANSPORTS=tcp,dpdk WORKLOADS=throughput,single ./scripts/bench/lan-bench-suite.sh notary ...
+#   # notary, both workloads on both transports:
+#   TRANSPORTS=kernel,dpdk WORKLOADS=throughput,single ./scripts/bench/lan-bench-suite.sh notary ...
 #
 # Environment:
-#   TRANSPORTS=<list>     comma-separated, or `all` (default: the most
-#                         replicated kernel transport the hosts given allow)
+#   TRANSPORTS=<list>     comma-separated, or `all` (default: kernel)
 #   WORKLOADS=<list>      comma-separated, or `all` (default: throughput)
+#   SSH_USER              the user the hosts are reached as (default root;
+#                         another needs passwordless sudo)
 #   THROUGHPUT_DURATION   measured phase of a throughput run (default 60s)
 #   THROUGHPUT_CLIENTS    connections (default 4)
 #   THROUGHPUT_WINDOW     requests in flight per connection (default 56)
 #   SINGLE_DURATION       measured phase of a single run (default 30s)
 #   WARMUP_DURATION       load before the measured phase (default 5s)
 #   COOLDOWN_DURATION     load after it, untimed (default 5s)
-#   ACK_POLICY            the replicated transports' ack policy (default
-#                         disk+ram); standalone runs use `disk`
+#   ACK_POLICY            the cluster's ack policy (default disk+ram)
 #   BENCH_CORE            core the load generator's loop is pinned to
 #                         (default 7)
 #   SERVER_EXTRA_ARGS     appended to the primary's command line
@@ -70,32 +66,34 @@
 # Local prerequisites: rustup (the x86_64-unknown-linux-gnu target is
 # added if missing), clang, lld, python3, ssh. Remote: server-setup.sh on
 # every host, root or passwordless sudo, and a private network between
-# them (the VLAN addresses). DPDK transports also need
-# /etc/melin-dpdk.conf on each host involved; a host without one gets
+# them (the VLAN addresses). The DPDK transport also needs
+# /etc/melin-dpdk.conf on each host; a host without one gets
 # scripts/dpdk/dpdk-setup.sh run on it, which configures SR-IOV on its
 # own and needs DPDK_IP for mlx5 (run it by hand there).
 #
-# Replicated runs wait for every replica to be live before the load
-# starts, and sample the primary's health metrics throughout: a replica
+# Each run waits for both replicas to be live before the load starts,
+# and samples the primary's health metrics throughout: a replica
 # evicted, missing or catching up at any point marks the run degraded.
 # The suite exits non-zero if any run was degraded or could not start.
 
 set -euo pipefail
 
-if [[ $# -lt 4 ]]; then
-    echo "usage: $0 <echo|notary|ec> <server-pub-ip> <bench-pub-ip> <server-vlan-ip> [user] [replica-pub-ip] [replica-vlan-ip] [replica2-pub-ip] [replica2-vlan-ip]" >&2
+if [[ $# -ne 6 ]]; then
+    echo "usage: $0 <echo|notary|ec> <server-pub-ip> <bench-pub-ip> <server-vlan-ip> <replica-pub-ip> <replica2-pub-ip>" >&2
     exit 1
 fi
 
 APP="$1"
 SERVER_PUB="$2"
 BENCH_PUB="$3"
+# The primary's address on the private network: where clients and
+# replicas reach it on kernel TCP, and its health endpoint on both
+# transports. The replicas need none of theirs: they dial out, and on
+# DPDK their addresses come from their own /etc/melin-dpdk.conf.
 SERVER_VLAN="$4"
-SSH_USER="${5:-root}"
-REPLICA_PUB="${6:-}"
-REPLICA_VLAN="${7:-}"
-REPLICA2_PUB="${8:-}"
-REPLICA2_VLAN="${9:-}"
+REPLICA_PUB="$5"
+REPLICA2_PUB="$6"
+SSH_USER="${SSH_USER:-root}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MELIN_REPO="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -178,8 +176,8 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLeve
     -o ControlMaster=auto -o "ControlPath=${SSH_CONTROL_DIR}/%r@%h:%p" -o ControlPersist=5m)
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
-REPLICA="${REPLICA_PUB:+${SSH_USER}@${REPLICA_PUB}}"
-REPLICA2="${REPLICA2_PUB:+${SSH_USER}@${REPLICA2_PUB}}"
+REPLICA="${SSH_USER}@${REPLICA_PUB}"
+REPLICA2="${SSH_USER}@${REPLICA2_PUB}"
 # Root-only remote work (journals, launching nodes, DPDK, IRQs) goes
 # through this: nothing for root, `sudo -n` otherwise, which fails loudly
 # rather than prompting when sudo needs a password.
@@ -188,9 +186,7 @@ if [[ "$SSH_USER" == "root" ]]; then SUDO=""; else SUDO="sudo -n"; fi
 rssh() { local host="$1"; shift; ssh "${SSH_OPTS[@]}" "$host" "$@" </dev/null; }
 rscp() { scp -q "${SSH_OPTS[@]}" "$@"; }
 
-ALL_HOSTS=("$SERVER" "$BENCH")
-[[ -n "$REPLICA" ]] && ALL_HOSTS+=("$REPLICA")
-[[ -n "$REPLICA2" ]] && ALL_HOSTS+=("$REPLICA2")
+HOSTS=("$SERVER" "$BENCH" "$REPLICA" "$REPLICA2")
 
 # Every process this suite starts runs a binary from REMOTE_DIR, so one
 # pattern stops them all and nothing else. Bracketed so it does not match
@@ -202,12 +198,12 @@ DEGRADED_RUNS=()
 
 cleanup() {
     local host
-    for host in "${ALL_HOSTS[@]}"; do
+    for host in "${HOSTS[@]}"; do
         # Best-effort: a host may be unreachable or already clean.
         rssh "$host" "${SUDO} pkill -INT -f '${BIN_PATTERN}'" 2>/dev/null || true
     done
     jobs -p | xargs -r kill 2>/dev/null || true
-    for host in "${ALL_HOSTS[@]}"; do
+    for host in "${HOSTS[@]}"; do
         ssh "${SSH_OPTS[@]}" -O exit "$host" 2>/dev/null || true
     done
     rm -rf "$SSH_CONTROL_DIR"
@@ -217,37 +213,27 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # The matrix
 # ---------------------------------------------------------------------------
-ALL_TRANSPORTS=(tcp tcp-repl tcp-dual-repl dpdk dpdk-repl dpdk-dual-repl)
+ALL_TRANSPORTS=(kernel dpdk)
 ALL_WORKLOADS=(throughput single)
 
-AVAILABLE_REPLICAS=0
-[[ -n "$REPLICA" ]] && AVAILABLE_REPLICAS=1
-[[ -n "$REPLICA" && -n "$REPLICA2" ]] && AVAILABLE_REPLICAS=2
-
-if [[ -z "${TRANSPORTS:-}" ]]; then
-    case "$AVAILABLE_REPLICAS" in
-        2) TRANSPORTS=tcp-dual-repl ;;
-        1) TRANSPORTS=tcp-repl ;;
-        *) TRANSPORTS=tcp ;;
-    esac
-fi
+TRANSPORTS="${TRANSPORTS:-kernel}"
 [[ "$TRANSPORTS" == all ]] && TRANSPORTS=$(IFS=,; echo "${ALL_TRANSPORTS[*]}")
 WORKLOADS="${WORKLOADS:-throughput}"
 [[ "$WORKLOADS" == all ]] && WORKLOADS=$(IFS=,; echo "${ALL_WORKLOADS[*]}")
 
-IFS=, read -ra REQ_TRANSPORTS <<< "$TRANSPORTS"
+IFS=, read -ra RUN_TRANSPORTS <<< "$TRANSPORTS"
 IFS=, read -ra REQ_WORKLOADS <<< "$WORKLOADS"
-RUN_TRANSPORTS=()
-for t in "${REQ_TRANSPORTS[@]}"; do
-    if [[ ! " ${ALL_TRANSPORTS[*]} " == *" $t "* ]]; then
-        echo "error: unknown transport '$t': ${ALL_TRANSPORTS[*]}" >&2
-        exit 1
-    fi
-    if (( $(replicas_of "$t") > AVAILABLE_REPLICAS )); then
-        echo "  skipping $t: needs $(replicas_of "$t") replica host(s), ${AVAILABLE_REPLICAS} given"
-        continue
-    fi
-    RUN_TRANSPORTS+=("$t")
+NEED_KERNEL=0
+NEED_DPDK=0
+for t in "${RUN_TRANSPORTS[@]}"; do
+    case "$t" in
+        kernel) NEED_KERNEL=1 ;;
+        dpdk) NEED_DPDK=1 ;;
+        *)
+            echo "error: unknown transport '$t': ${ALL_TRANSPORTS[*]}" >&2
+            exit 1
+            ;;
+    esac
 done
 for w in "${REQ_WORKLOADS[@]}"; do
     if [[ ! " ${ALL_WORKLOADS[*]} " == *" $w "* ]]; then
@@ -255,21 +241,6 @@ for w in "${REQ_WORKLOADS[@]}"; do
         exit 1
     fi
 done
-if [[ ${#RUN_TRANSPORTS[@]} -eq 0 ]]; then
-    echo "error: nothing to run" >&2
-    exit 1
-fi
-NEED_KERNEL=0
-NEED_DPDK=0
-MAX_REPLICAS=0
-for t in "${RUN_TRANSPORTS[@]}"; do
-    if [[ "$t" == dpdk* ]]; then NEED_DPDK=1; else NEED_KERNEL=1; fi
-    (( $(replicas_of "$t") > MAX_REPLICAS )) && MAX_REPLICAS=$(replicas_of "$t")
-done
-# The hosts the runs use: the replicas only when a run needs them.
-HOSTS=("$SERVER" "$BENCH")
-(( MAX_REPLICAS >= 1 )) && HOSTS+=("$REPLICA")
-(( MAX_REPLICAS >= 2 )) && HOSTS+=("$REPLICA2")
 
 echo "=== Melin LAN suite: ${APP} ==="
 echo "  transports: ${RUN_TRANSPORTS[*]}"
@@ -605,8 +576,8 @@ load_dpdk_hosts() {
     [[ "$DPDK_LOADED" == 1 ]] && return 0
     load_dpdk_config "$SERVER" SERVER
     load_dpdk_config "$BENCH" BENCH
-    (( MAX_REPLICAS >= 1 )) && load_dpdk_config "$REPLICA" REPLICA
-    (( MAX_REPLICAS >= 2 )) && load_dpdk_config "$REPLICA2" REPLICA2
+    load_dpdk_config "$REPLICA" REPLICA
+    load_dpdk_config "$REPLICA2" REPLICA2
     DPDK_LOADED=1
 }
 
@@ -617,69 +588,50 @@ load_dpdk_hosts() {
 # transport flags.
 CLIENT_ADDR=""
 BENCH_TRANSPORT_ARGS=""
-CLUSTER_HOSTS=()
 
 start_cluster() {
-    local transport="$1" replicas bin primary_ready repl_ready primary_flags replica_hosts=()
-    replicas=$(replicas_of "$transport")
-    (( replicas >= 1 )) && replica_hosts+=("$REPLICA")
-    (( replicas >= 2 )) && replica_hosts+=("$REPLICA2")
-    CLUSTER_HOSTS=("$SERVER" "${replica_hosts[@]}")
+    local transport="$1" bin primary_ready repl_ready primary_flags host
 
     clean_journal "$SERVER" "${JOURNAL_DIR}/primary.journal"
-    local i=0 host
-    for host in "${replica_hosts[@]}"; do
-        i=$((i + 1))
-        clean_journal "$host" "${JOURNAL_DIR}/replica${i}.journal"
-    done
-    for host in "${CLUSTER_HOSTS[@]}" "$BENCH"; do pin_irqs "$host"; done
+    clean_journal "$REPLICA" "${JOURNAL_DIR}/replica1.journal"
+    clean_journal "$REPLICA2" "${JOURNAL_DIR}/replica2.journal"
+    for host in "${HOSTS[@]}"; do pin_irqs "$host"; done
 
-    local common="--journal ${JOURNAL_DIR}/primary.journal --authorized-keys ${REMOTE_DIR}/authorized_keys --health-bind ${SERVER_VLAN}:${HEALTH_PORT} ${APP_SERVER_ARGS}"
-    local policy="--ack-policy ${ACK_POLICY}"
-    (( replicas == 0 )) && policy="--standalone --ack-policy disk"
-
-    if [[ "$transport" == dpdk* ]]; then
+    if [[ "$transport" == dpdk ]]; then
         load_dpdk_hosts
         DPDK_RAN=1
         bin="${SERVER_BIN}.dpdk"
-        primary_flags="--bind 0.0.0.0:${CLIENT_PORT} $(dpdk_flags SERVER)"
-        (( replicas > 0 )) && primary_flags+=" --replication-bind ${SERVER_DPDK_IP}:${REPL_PORT}"
+        primary_flags="--bind 0.0.0.0:${CLIENT_PORT} --replication-bind ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags SERVER)"
         primary_ready="DPDK transport listening"
         repl_ready="DPDK replication sender started"
         CLIENT_ADDR="${SERVER_DPDK_IP}:${CLIENT_PORT}"
         BENCH_TRANSPORT_ARGS="$(dpdk_flags BENCH) --dpdk-peer-mac ${SERVER_DPDK_MAC}"
     else
         bin="$SERVER_BIN"
-        primary_flags="--bind ${SERVER_VLAN}:${CLIENT_PORT}"
-        (( replicas > 0 )) && primary_flags+=" --replication-bind ${SERVER_VLAN}:${REPL_PORT}"
+        primary_flags="--bind ${SERVER_VLAN}:${CLIENT_PORT} --replication-bind ${SERVER_VLAN}:${REPL_PORT}"
         primary_ready="listening addr=${SERVER_VLAN}:${CLIENT_PORT}"
         repl_ready="replication sender listening"
         CLIENT_ADDR="${SERVER_VLAN}:${CLIENT_PORT}"
         BENCH_TRANSPORT_ARGS=""
     fi
 
-    launch "$SERVER" "${bin} ${primary_flags} ${common} ${policy} ${SERVER_EXTRA_ARGS}"
-    if (( replicas > 0 )); then
-        wait_for_log "$SERVER" "$repl_ready" 30 || return 1
-        i=0
-        for host in "${replica_hosts[@]}"; do
-            i=$((i + 1))
-            local replica_flags prefix
-            prefix=REPLICA; (( i == 2 )) && prefix=REPLICA2
-            if [[ "$transport" == dpdk* ]]; then
-                replica_flags="--replica-of ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags "$prefix") --dpdk-peer-mac ${SERVER_DPDK_MAC}"
-            else
-                replica_flags="--replica-of ${SERVER_VLAN}:${REPL_PORT}"
-            fi
-            launch "$host" "${bin} ${replica_flags} --replication-key ${REMOTE_DIR}/repl.key --journal ${JOURNAL_DIR}/replica${i}.journal --authorized-keys ${REMOTE_DIR}/authorized_keys ${APP_SERVER_ARGS} ${REPLICA_EXTRA_ARGS}"
-        done
-    fi
-    # On a fresh journal a replicated primary serves clients only once a
-    # replica is live, so this waits for the replicas too.
+    launch "$SERVER" "${bin} ${primary_flags} --journal ${JOURNAL_DIR}/primary.journal --authorized-keys ${REMOTE_DIR}/authorized_keys --health-bind ${SERVER_VLAN}:${HEALTH_PORT} --ack-policy ${ACK_POLICY} ${APP_SERVER_ARGS} ${SERVER_EXTRA_ARGS}"
+    wait_for_log "$SERVER" "$repl_ready" 30 || return 1
+    local i prefix replica_flags
+    for i in 1 2; do
+        host="$REPLICA"; prefix=REPLICA
+        (( i == 2 )) && { host="$REPLICA2"; prefix=REPLICA2; }
+        if [[ "$transport" == dpdk ]]; then
+            replica_flags="--replica-of ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags "$prefix") --dpdk-peer-mac ${SERVER_DPDK_MAC}"
+        else
+            replica_flags="--replica-of ${SERVER_VLAN}:${REPL_PORT}"
+        fi
+        launch "$host" "${bin} ${replica_flags} --replication-key ${REMOTE_DIR}/repl.key --journal ${JOURNAL_DIR}/replica${i}.journal --authorized-keys ${REMOTE_DIR}/authorized_keys ${APP_SERVER_ARGS} ${REPLICA_EXTRA_ARGS}"
+    done
+    # On a fresh journal the primary serves clients only once a replica is
+    # live, so this waits for the replicas too.
     wait_for_log "$SERVER" "$primary_ready" 120 || return 1
-    if (( replicas > 0 )); then
-        wait_for_replicas "$replicas" || return 1
-    fi
+    wait_for_replicas 2
 }
 
 # ---------------------------------------------------------------------------
@@ -689,11 +641,11 @@ start_cluster() {
 # The load generator's command line for `workload` on `transport`.
 bench_command() {
     local transport="$1" clients="$2" window="$3" duration="$4" bin="$BENCH_BIN"
-    [[ "$transport" == dpdk* ]] && bin="${BENCH_BIN}.dpdk"
+    [[ "$transport" == dpdk ]] && bin="${BENCH_BIN}.dpdk"
     local args="--addr ${CLIENT_ADDR} --key ${REMOTE_DIR}/bench.key --json ${BENCH_JSON} --clients ${clients} --window ${window} --duration ${duration} --warmup-duration ${WARMUP_DURATION} --cooldown-duration ${COOLDOWN_DURATION}"
     if [[ "$APP" == ec ]]; then
         args+=" --accounts ${EC_ACCOUNTS} --health-addr ${SERVER_VLAN}:${HEALTH_PORT}"
-        if [[ "$transport" == dpdk* ]]; then
+        if [[ "$transport" == dpdk ]]; then
             args+=" --dpdk-core ${BENCH_CORE} ${BENCH_TRANSPORT_ARGS}"
         else
             args+=" --bench-cores ${BENCH_CORE}"
@@ -701,7 +653,7 @@ bench_command() {
     else
         args+=" --app ${APP} --core ${BENCH_CORE}"
         [[ "$APP" == echo ]] && args+=" --size ${ECHO_SIZE}"
-        [[ "$transport" == dpdk* ]] && args+=" --transport dpdk ${BENCH_TRANSPORT_ARGS}"
+        [[ "$transport" == dpdk ]] && args+=" --transport dpdk ${BENCH_TRANSPORT_ARGS}"
     fi
     echo "${REMOTE_DIR}/bin/${bin} ${args} ${BENCH_EXTRA_ARGS}"
 }
@@ -734,7 +686,7 @@ run_workload() {
         return
     fi
     local verdict
-    if verdict=$(judge_health "$samples" "$(replicas_of "$transport")"); then
+    if verdict=$(judge_health "$samples" 2); then
         echo "  cluster ${verdict}"
     else
         echo "  cluster ${verdict}"
@@ -751,11 +703,11 @@ for transport in "${RUN_TRANSPORTS[@]}"; do
         if ! start_cluster "$transport"; then
             DEGRADED_RUNS+=("${transport}-${workload}: the cluster did not start")
             rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${transport}-${workload}.primary.log" 2>/dev/null || true
-            stop_nodes "${CLUSTER_HOSTS[@]}" "$BENCH"
+            stop_nodes "${HOSTS[@]}"
             continue
         fi
         run_workload "$transport" "$workload"
-        stop_nodes "${CLUSTER_HOSTS[@]}" "$BENCH"
+        stop_nodes "${HOSTS[@]}"
         rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${transport}-${workload}.primary.log" 2>/dev/null || true
     done
 done

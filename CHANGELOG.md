@@ -193,9 +193,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   end, with `melin-test-node`'s `dpdk_client_process_eal_args` putting it
   on the client pair in a process of its own.
 - **A LAN benchmark suite and a load generator.**
-  `scripts/bench/lan-bench-suite.sh` runs a primary, up to two replicas
-  and a load-generating host through a transport × workload matrix
-  (kernel TCP or DPDK, standalone or replicated; throughput or a single
+  `scripts/bench/lan-bench-suite.sh` runs a primary, two replicas and a
+  load-generating host through a transport × workload matrix (kernel TCP
+  or DPDK for clients and replication alike; throughput or a single
   request in flight), for the echo and notary examples or the Exchange
   Core. It builds every binary on the machine running it, for the bench
   hosts' CPU and against a sysroot taken from them, and copies them

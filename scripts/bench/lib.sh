@@ -1,15 +1,6 @@
 # The LAN suite's logic that needs no host: sourced by lan-bench-suite.sh
 # and by test-lan-bench-suite.sh, which runs it against fixtures.
 
-# The replicas a transport runs with.
-replicas_of() {
-    case "$1" in
-        *-dual-repl) echo 2 ;;
-        *-repl) echo 1 ;;
-        *) echo 0 ;;
-    esac
-}
-
 # `conf_value <conf text> <key>`: a value of /etc/melin-dpdk.conf, its
 # surrounding double quotes stripped (multi-word values are quoted).
 conf_value() {
@@ -19,8 +10,8 @@ conf_value() {
 # `judge_health <samples file> <expected replicas>`: the verdict on a
 # run's health samples, each a `# sample` line followed by the primary's
 # replica metrics. A replica evicted, missing or catching up in any
-# sample degrades the run; a replicated run with no sample to judge is
-# unjudged. Prints the verdict; fails unless it is `ok`.
+# sample degrades the run; a run with no sample to judge is unjudged.
+# Prints the verdict; fails unless it is `ok`.
 judge_health() {
     awk -v expected="$2" '
         function tally() {
@@ -35,8 +26,8 @@ judge_health() {
         END {
             if (n) tally()
             judged = n - missing
-            if (expected > 0 && judged == 0) { print "UNJUDGED: no health samples"; exit 1 }
-            verdict = (expected > 0 && evictions + short + behind > 0) ? "DEGRADED" : "ok"
+            if (judged == 0) { print "UNJUDGED: no health samples"; exit 1 }
+            verdict = (evictions + short + behind > 0) ? "DEGRADED" : "ok"
             printf "%s: %d samples, %d evictions, %d short of replicas, %d catching up\n",
                 verdict, judged, evictions, short, behind
             exit verdict != "ok"
