@@ -290,6 +290,23 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   config that lists every field: add the new one, or end it in
   `..Default::default()`.
 
+- **`--cores` has a new thread, `repl-poll`, which every layout must
+  name.** It is reserved for the DPDK replication poll thread that runs
+  when replication has a queue or a NIC of its own, which no
+  configuration runs yet. A `--cores` value from an earlier release no
+  longer parses: add `repl-poll=5` (its default core, the default layout's
+  free one), or `repl-poll=0` to leave it unpinned. Where it does not run
+  it is checked like any other thread a node's flags leave unused (the
+  event publisher without `--event-bind`): a busy-spinning `repl-poll`
+  may not share a core, and a `y` is accepted. Where it runs, a `y` is
+  refused, as on the DPDK reader. The default layout gains `repl-poll=5`
+  and the boot log shows it. In code, `PipelineCores` gains a `repl_poll`
+  field, and `ReaderThread` is replaced by `NodeTransport` (`KernelTcp`,
+  or `Dpdk { repl_poll }`, built from the replication mode by
+  `NodeTransport::dpdk`) as the argument of `PipelineCores::resolve` and
+  `ServerConfig::resolved_cores`. Source-breaking for a `PipelineCores`
+  literal and for a caller of either function.
+
 - **`melin_client::Error` has a new variant, `Error::Nic(io::Error)`**,
   for a DPDK NIC that cannot be brought up (EAL initialisation, a missing
   port, the mbuf pool, the port's configuration). Only the `dpdk`

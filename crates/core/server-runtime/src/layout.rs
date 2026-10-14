@@ -23,16 +23,18 @@
 //! later is one more name rather than one more position.
 
 use melin_app::AppEvent;
+use melin_dpdk::ReplicationNic;
 use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::pipeline::{JournalStage, StageWaits};
 
 /// The layout a node runs when `--cores` is not given.
 pub(crate) const DEFAULT_CORES: &str = "journal-seq=1,matching=2,response=3,reader=4,\
-     event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11";
+     repl-poll=5,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,\
+     journal-disk=11";
 
 /// How many threads a layout places. `usize` because it is an array
 /// length: every per-thread list here is a fixed array of this size.
-const THREAD_COUNT: usize = 10;
+const THREAD_COUNT: usize = 11;
 
 /// The threads every node runs, whatever its flags, and that the operator
 /// docs say need a core to themselves: a request passes through each of
@@ -99,26 +101,49 @@ impl Placement {
     }
 }
 
-/// What the `reader` entry of `--cores` pins on a given transport. The
-/// two threads wait differently, and one of them cannot take a policy
-/// at all.
+/// The transport a layout is resolved against: what the `reader` and
+/// `repl-poll` entries of `--cores` pin on it. A thread that polls a NIC
+/// cannot take a wait policy at all, so which entries pin one decides
+/// which of them may carry a `y`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReaderThread {
-    /// The io_uring reader (kernel TCP). It blocks in the kernel between
-    /// completions, so its entry's policy governs only the input ring it
-    /// produces into.
-    IoUring,
-    /// The DPDK NIC poll thread. It polls the device unconditionally and
-    /// never idles, so it busy-spins whatever its entry says; a `y` on
-    /// the reader is refused rather than silently ignored.
-    DpdkPoll,
+pub enum NodeTransport {
+    /// Kernel TCP. `reader` pins the io_uring reader, which blocks in the
+    /// kernel between completions, so its entry's policy governs only the
+    /// input ring it produces into. `repl-poll` places nothing.
+    KernelTcp,
+    /// DPDK. `reader` pins the client NIC's poll thread, and `repl-poll`
+    /// the replication poll thread when replication has a queue or a NIC
+    /// of its own. Each polls its device unconditionally and never idles,
+    /// so it busy-spins whatever its entry says, and a `y` on the entry of
+    /// one that runs is refused rather than silently ignored.
+    Dpdk {
+        /// Whether replication runs on a poll thread of its own. A `bool`
+        /// because the thread either runs or does not; which of the
+        /// replication modes put it there is [`dpdk`](Self::dpdk)'s to say.
+        repl_poll: bool,
+    },
+}
+
+impl NodeTransport {
+    /// DPDK, with replication where `replication` puts it: on the client
+    /// poll thread in shared mode, on a poll thread of its own on a queue
+    /// or a NIC of its own.
+    pub fn dpdk(replication: &ReplicationNic) -> Self {
+        let repl_poll = match replication {
+            ReplicationNic::Shared => false,
+            ReplicationNic::Queue | ReplicationNic::Port(_) => true,
+        };
+        Self::Dpdk { repl_poll }
+    }
 }
 
 /// Core assignments for pipeline threads, each with its wait policy.
 ///
 /// All fields are always stored; event-publisher is only used when
-/// `--event-bind` is set, and shadow only when `--snapshot-interval-ms` > 0.
-/// repl-handler-0/1 are spawned on replica connect, not at startup.
+/// `--event-bind` is set, shadow only when `--snapshot-interval-ms` > 0,
+/// and repl-poll only on DPDK with replication on a queue or a NIC of its
+/// own (see [`NodeTransport`]). repl-handler-0/1 are spawned on replica
+/// connect, not at startup.
 /// A `core` of 0 = unpinned (OS scheduled) for any field.
 ///
 /// The thread that accepts replica connections (`repl-accept`) has no
@@ -132,8 +157,13 @@ pub struct PipelineCores {
     pub matching: Placement,
     pub response: Placement,
     /// io_uring reader thread (TCP) or DPDK poll thread — see
-    /// [`ReaderThread`] for how the two differ.
+    /// [`NodeTransport`] for how the two differ.
     pub reader: Placement,
+    /// The DPDK replication poll thread, run when replication has a queue
+    /// or a NIC of its own. Like the DPDK reader it polls its device flat
+    /// out, so where it runs a `y` on it is refused; see
+    /// [`NodeTransport`].
+    pub repl_poll: Placement,
     pub event_publisher: Placement,
     pub shadow: Placement,
     /// Replication handler thread 0.
@@ -171,6 +201,7 @@ impl PipelineCores {
             matching: unpinned,
             response: unpinned,
             reader: unpinned,
+            repl_poll: unpinned,
             event_publisher: unpinned,
             shadow: unpinned,
             repl_handler_0: unpinned,
@@ -191,6 +222,7 @@ impl PipelineCores {
             matching,
             response,
             reader,
+            repl_poll,
             event_publisher,
             shadow,
             repl_handler_0,
@@ -203,6 +235,7 @@ impl PipelineCores {
             ("matching", matching),
             ("response", response),
             ("reader", reader),
+            ("repl-poll", repl_poll),
             ("event-publisher", event_publisher),
             ("shadow", shadow),
             ("repl-handler-0", repl_handler_0),
@@ -255,7 +288,8 @@ impl PipelineCores {
     /// that only needs the node out of everyone's way wants
     /// [`unpinned`](Self::unpinned) instead, which spreads the threads
     /// rather than stacking them on the layout's cores. Not valid for a
-    /// DPDK reader, which cannot yield; see [`resolve`](Self::resolve).
+    /// DPDK reader, or a DPDK replication poll thread that runs, neither
+    /// of which can yield; see [`resolve`](Self::resolve).
     pub fn all_yielding(mut self) -> Self {
         for (_, placement) in self.named_mut() {
             *placement = Placement::yielding(placement.core);
@@ -285,31 +319,36 @@ impl PipelineCores {
             .all(|(_, placement)| !placement.is_pinned())
     }
 
-    /// The layout the node actually runs: the reader entry checked
-    /// against what the transport's reader thread can do, then the whole
-    /// thing checked with [`validate`](Self::validate). Every spawn site
-    /// reads the result, so no thread waits under a policy the operator
-    /// did not ask for.
+    /// The layout the node actually runs: the entries of the threads that
+    /// poll a NIC on `transport` checked against what those threads can
+    /// do, then the whole thing checked with [`validate`](Self::validate).
+    /// Every spawn site reads the result, so no thread waits under a
+    /// policy the operator did not ask for.
     ///
-    /// On DPDK the reader is the NIC poll thread, which busy-polls
-    /// whatever its entry says, so a `y` there is a contradiction and is
-    /// refused. An unpinned DPDK reader is accepted as written: it polls
-    /// flat out wherever the scheduler puts it, which is the one
-    /// placement this module cannot make honest, and the operator docs
-    /// say so.
+    /// On DPDK the reader is the NIC poll thread, and the replication
+    /// poll thread runs when replication has a queue or a NIC of its own.
+    /// Each busy-polls whatever its entry says, so a `y` on either is a
+    /// contradiction and is refused where the thread runs. Where
+    /// `repl-poll` places nothing, its entry is held to the same rules as
+    /// any other thread a node's flags leave unused. An unpinned poll
+    /// thread is accepted as written: it polls flat out wherever the
+    /// scheduler puts it, which is the one placement this module cannot
+    /// make honest, and the operator docs say so.
     ///
     /// An `Err` is a configuration the node refuses to start with.
-    pub fn resolve(self, reader: ReaderThread) -> Result<Self, String> {
-        if reader == ReaderThread::DpdkPoll
-            && self.reader.is_pinned()
-            && self.reader.wait == WaitStrategy::SpinThenYield
-        {
-            return Err(format!(
-                "--cores: the reader entry is `reader={core}y`, but on DPDK the reader is the \
-                 NIC poll thread, which busy-polls whatever its entry says. Drop the suffix and \
-                 give it core {core} to itself",
-                core = self.reader.core
-            ));
+    pub fn resolve(self, transport: NodeTransport) -> Result<Self, String> {
+        match transport {
+            NodeTransport::KernelTcp => {}
+            NodeTransport::Dpdk { repl_poll } => {
+                refuse_a_yielding_poller("reader", "the NIC poll thread", self.reader)?;
+                if repl_poll {
+                    refuse_a_yielding_poller(
+                        "repl-poll",
+                        "the replication poll thread",
+                        self.repl_poll,
+                    )?;
+                }
+            }
         }
         self.validate()?;
         Ok(self)
@@ -386,6 +425,8 @@ impl PipelineCores {
             matching: Placement::spinning(2),
             response: Placement::spinning(3),
             reader: Placement::spinning(4),
+            // Not spawned in compact, as the repl handlers below; unpinned.
+            repl_poll: Placement::unpinned(),
             event_publisher: Placement::spinning(5),
             shadow: Placement::spinning(6),
             // repl handlers not spawned in compact; unpinned.
@@ -405,6 +446,22 @@ impl PipelineCores {
         };
         Ok((cores, 7))
     }
+}
+
+/// Refuse a `y` on the entry `name` of a thread that polls a NIC, `what`
+/// in the message: it busy-polls whatever the entry says, so the suffix
+/// asks for something the thread cannot do. An unpinned placement is
+/// left alone; see [`PipelineCores::resolve`].
+fn refuse_a_yielding_poller(name: &str, what: &str, placement: Placement) -> Result<(), String> {
+    if placement.is_pinned() && placement.wait == WaitStrategy::SpinThenYield {
+        return Err(format!(
+            "--cores: the {name} entry is `{name}={core}y`, but on DPDK it pins {what}, which \
+             busy-polls whatever its entry says. Drop the suffix and give it core {core} to \
+             itself",
+            core = placement.core
+        ));
+    }
+    Ok(())
 }
 
 /// Renders the layout in `--cores` syntax, suffixes included, so what
@@ -557,8 +614,24 @@ mod tests {
     /// acknowledgement path (the four stages, the disk thread, the two
     /// replication handlers) spins on a core of its own; the event
     /// publisher, the shadow and the preparer share one core and yield.
+    /// The replication poll thread, which no mode that layout is for
+    /// runs, is left unpinned.
     const MIXED: &str = "journal-seq=1,matching=2,response=3,reader=4,journal-disk=5,\
-         repl-handler-0=6,repl-handler-1=7,event-publisher=8y,shadow=8y,journal-prep=8";
+         repl-handler-0=6,repl-handler-1=7,event-publisher=8y,shadow=8y,journal-prep=8,repl-poll=0";
+
+    /// Every transport a layout is resolved against: kernel TCP, and DPDK
+    /// with replication on the client poll thread and on its own.
+    const TRANSPORTS: [NodeTransport; 3] = [
+        NodeTransport::KernelTcp,
+        NodeTransport::Dpdk { repl_poll: false },
+        NodeTransport::Dpdk { repl_poll: true },
+    ];
+
+    /// The transports on which `repl-poll` places nothing.
+    const WITHOUT_REPL_POLL: [NodeTransport; 2] = [
+        NodeTransport::KernelTcp,
+        NodeTransport::Dpdk { repl_poll: false },
+    ];
 
     /// `entries` completed with `=0` for each thread it does not name, so
     /// a test spells out only the threads it is about.
@@ -583,11 +656,12 @@ mod tests {
     /// list, so a thread that stops being required is a test failure.
     #[test]
     fn parse_cores_requires_every_thread() {
-        const REQUIRED: [&str; 10] = [
+        const REQUIRED: [&str; 11] = [
             "journal-seq",
             "matching",
             "response",
             "reader",
+            "repl-poll",
             "event-publisher",
             "shadow",
             "repl-handler-0",
@@ -606,10 +680,10 @@ mod tests {
             assert!(err.starts_with(&format!("missing {missing}:")), "{err}");
         }
 
-        let err = parse_cores("journal-seq=1,matching=2").expect_err("eight threads missing");
+        let err = parse_cores("journal-seq=1,matching=2").expect_err("nine threads missing");
         assert!(
             err.starts_with(
-                "missing response, reader, event-publisher, shadow, repl-handler-0, \
+                "missing response, reader, repl-poll, event-publisher, shadow, repl-handler-0, \
                  repl-handler-1, journal-prep, journal-disk:"
             ),
             "{err}"
@@ -631,6 +705,7 @@ mod tests {
         assert_eq!(forward.journal_disk, Placement::spinning(3));
 
         let every = parse_cores(DEFAULT_CORES).expect("the default parses");
+        assert_eq!(every.repl_poll, Placement::spinning(5));
         assert_eq!(every.event_publisher, Placement::spinning(6));
         assert_eq!(every.journal_prep, Placement::yielding(10));
         assert_eq!(every.journal_disk, Placement::spinning(11));
@@ -782,8 +857,8 @@ mod tests {
     #[test]
     fn validate_allows_yielders_to_share_a_core() {
         parse_cores(
-            "journal-seq=1,matching=2,response=3,reader=4,event-publisher=7y,shadow=7y,\
-             repl-handler-0=7y,repl-handler-1=7y,journal-prep=7,journal-disk=7y",
+            "journal-seq=1,matching=2,response=3,reader=4,repl-poll=7y,event-publisher=7y,\
+             shadow=7y,repl-handler-0=7y,repl-handler-1=7y,journal-prep=7,journal-disk=7y",
         )
         .expect("parses")
         .validate()
@@ -836,18 +911,16 @@ mod tests {
             .expect("nor is an unpinned preparer an unpinned spinner");
     }
 
-    /// The layouts the runtime ships must pass their own check, on both
-    /// transports.
+    /// The layouts the runtime ships must pass their own check, on every
+    /// transport.
     #[test]
     fn shipped_layouts_validate() {
         let default = ServerConfig::default().cores;
-        for reader in [ReaderThread::IoUring, ReaderThread::DpdkPoll] {
-            default.resolve(reader).expect("default layout");
-        }
         let (compact, _) = PipelineCores::compact(16).expect("compact fits 16 cores");
-        compact
-            .resolve(ReaderThread::DpdkPoll)
-            .expect("compact layout");
+        for transport in TRANSPORTS {
+            default.resolve(transport).expect("default layout");
+            compact.resolve(transport).expect("compact layout");
+        }
         assert_eq!(
             compact.journal_disk,
             Placement::unpinned(),
@@ -894,8 +967,8 @@ mod tests {
         // One of the five unpinned among pinned auxiliaries: it is named,
         // and nothing else is.
         let disk_unpinned = parse_cores(
-            "journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,\
-             repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=0",
+            "journal-seq=1,matching=2,response=3,reader=4,repl-poll=5,event-publisher=6,\
+             shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=0",
         )
         .expect("parses");
         assert_eq!(disk_unpinned.unpinned_mandatory(), ["journal-disk"]);
@@ -911,24 +984,25 @@ mod tests {
     #[test]
     fn all_yielding_makes_a_packed_layout_legal() {
         let packed = parse_cores(
-            "journal-seq=1,matching=1,response=1,reader=1,event-publisher=1,shadow=1,\
-             repl-handler-0=1,repl-handler-1=1,journal-prep=0,journal-disk=0",
+            "journal-seq=1,matching=1,response=1,reader=1,repl-poll=1,event-publisher=1,\
+             shadow=1,repl-handler-0=1,repl-handler-1=1,journal-prep=0,journal-disk=0",
         )
         .expect("parses");
         assert!(
-            packed.resolve(ReaderThread::IoUring).is_err(),
-            "eight spinners on core 1 must be refused"
+            packed.resolve(NodeTransport::KernelTcp).is_err(),
+            "nine spinners on core 1 must be refused"
         );
         let cores = packed
             .all_yielding()
-            .resolve(ReaderThread::IoUring)
+            .resolve(NodeTransport::KernelTcp)
             .expect("the same cores, all yielding, are legal");
         assert_eq!(cores.journal_seq, Placement::yielding(1));
+        assert_eq!(cores.repl_poll, Placement::yielding(1));
         assert_eq!(cores.journal_disk, Placement::unpinned());
         assert_eq!(
             cores.to_string(),
-            "journal-seq=1y,matching=1y,response=1y,reader=1y,event-publisher=1y,shadow=1y,\
-             repl-handler-0=1y,repl-handler-1=1y,journal-prep=0,journal-disk=0",
+            "journal-seq=1y,matching=1y,response=1y,reader=1y,repl-poll=1y,event-publisher=1y,\
+             shadow=1y,repl-handler-0=1y,repl-handler-1=1y,journal-prep=0,journal-disk=0",
             "every pinned entry carries the suffix"
         );
     }
@@ -941,27 +1015,135 @@ mod tests {
     #[test]
     fn dpdk_reader_never_yields() {
         let explicit = parse_cores(&complete("reader=4y")).expect("parses");
-        let err = explicit
-            .resolve(ReaderThread::DpdkPoll)
-            .expect_err("`4y` on the DPDK reader must be refused");
-        assert!(err.contains("reader=4y"), "{err}");
-        assert!(err.contains("poll"), "{err}");
+        for dpdk in [
+            NodeTransport::Dpdk { repl_poll: false },
+            NodeTransport::Dpdk { repl_poll: true },
+        ] {
+            let err = explicit
+                .resolve(dpdk)
+                .expect_err("`4y` on the DPDK reader must be refused");
+            assert!(err.contains("reader=4y"), "{err}");
+            assert!(err.contains("the NIC poll thread"), "{err}");
+            assert!(err.contains("core 4 to itself"), "{err}");
+
+            let shared = parse_cores(&complete("reader=4,event-publisher=4y")).expect("parses");
+            let err = shared
+                .resolve(dpdk)
+                .expect_err("a core shared with the poll thread is refused");
+            assert!(err.contains("reader busy-spins"), "{err}");
+
+            let unpinned = parse_cores(&complete("journal-seq=1,matching=2,response=3,reader=0"))
+                .expect("parses");
+            let cores = unpinned
+                .resolve(dpdk)
+                .expect("an unpinned reader is accepted as written");
+            assert_eq!(cores.reader, Placement::unpinned());
+        }
         explicit
-            .resolve(ReaderThread::IoUring)
+            .resolve(NodeTransport::KernelTcp)
             .expect("the io_uring reader may yield");
+    }
 
-        let shared = parse_cores(&complete("reader=4,event-publisher=4y")).expect("parses");
+    /// The replication poll thread is held to the reader's rule where it
+    /// runs, DPDK in queue or port mode: it busy-polls whatever its entry
+    /// says, so a `y` is refused with the same message the reader gets,
+    /// it may not share a core, and unpinned is accepted as written.
+    #[test]
+    fn repl_poll_never_yields_where_it_runs() {
+        let own = NodeTransport::Dpdk { repl_poll: true };
+        let explicit = parse_cores(&complete("reader=4,repl-poll=5y")).expect("parses");
+        let err = explicit
+            .resolve(own)
+            .expect_err("`5y` on a running replication poll thread must be refused");
+        assert_eq!(
+            err,
+            "--cores: the repl-poll entry is `repl-poll=5y`, but on DPDK it pins the \
+             replication poll thread, which busy-polls whatever its entry says. Drop the \
+             suffix and give it core 5 to itself"
+        );
+
+        let shared = parse_cores(&complete("reader=4,repl-poll=5,shadow=5y")).expect("parses");
         let err = shared
-            .resolve(ReaderThread::DpdkPoll)
-            .expect_err("a core shared with the poll thread is refused");
-        assert!(err.contains("reader busy-spins"), "{err}");
+            .resolve(own)
+            .expect_err("a core shared with the replication poll thread is refused");
+        assert!(err.contains("repl-poll busy-spins"), "{err}");
 
-        let unpinned =
-            parse_cores(&complete("journal-seq=1,matching=2,response=3,reader=0")).expect("parses");
-        let cores = unpinned
-            .resolve(ReaderThread::DpdkPoll)
-            .expect("an unpinned reader is accepted as written");
-        assert_eq!(cores.reader, Placement::unpinned());
+        let cores = parse_cores(&complete("reader=4,repl-poll=0"))
+            .expect("parses")
+            .resolve(own)
+            .expect("an unpinned replication poll thread is accepted as written");
+        assert_eq!(cores.repl_poll, Placement::unpinned());
+
+        let cores = parse_cores(&complete("reader=4,repl-poll=5"))
+            .expect("parses")
+            .resolve(own)
+            .expect("a core of its own");
+        assert_eq!(cores.repl_poll, Placement::spinning(5));
+    }
+
+    /// Where `repl-poll` places nothing (kernel TCP, DPDK shared mode) its
+    /// entry constrains a layout exactly as much as event-publisher's
+    /// does on a node without `--event-bind`: a `y` is accepted, and a
+    /// spinner sharing a core is refused like any other, since a layout
+    /// is meant to be right whichever threads the flags spawn. Each case
+    /// is checked with the entry on event-publisher instead, and must
+    /// resolve the same way.
+    #[test]
+    fn an_unused_repl_poll_is_held_to_the_rules_of_any_unused_thread() {
+        let swap = |entries: &str| entries.replace("repl-poll", "event-publisher");
+        for transport in WITHOUT_REPL_POLL {
+            for (entries, legal) in [
+                // A yielder, alone or sharing with yielders.
+                ("repl-poll=5y", true),
+                ("repl-poll=8y,shadow=8y", true),
+                // Unpinned.
+                ("repl-poll=0", true),
+                // A spinner sharing a core, either way round.
+                ("repl-poll=8,shadow=8y", false),
+                ("repl-poll=8y,shadow=8", false),
+                ("reader=4,repl-poll=4", false),
+            ] {
+                let as_repl_poll = parse_cores(&complete(entries))
+                    .expect("parses")
+                    .resolve(transport);
+                let as_event_publisher = parse_cores(&complete(&swap(entries)))
+                    .expect("parses")
+                    .resolve(transport);
+                assert_eq!(as_repl_poll.is_ok(), legal, "{transport:?} {entries}");
+                assert_eq!(
+                    as_repl_poll.is_ok(),
+                    as_event_publisher.is_ok(),
+                    "{transport:?} {entries}: repl-poll is held to event-publisher's rules"
+                );
+            }
+            let cores = parse_cores(&complete("repl-poll=5y"))
+                .expect("parses")
+                .resolve(transport)
+                .expect("a yielding repl-poll where it does not run");
+            assert_eq!(
+                cores.repl_poll,
+                Placement::yielding(5),
+                "resolved as written"
+            );
+        }
+    }
+
+    /// Which replication modes run the poll thread: queue and port, not
+    /// shared.
+    #[test]
+    fn node_transport_runs_repl_poll_on_its_own_queue_or_nic() {
+        assert_eq!(
+            NodeTransport::dpdk(&ReplicationNic::Shared),
+            NodeTransport::Dpdk { repl_poll: false }
+        );
+        assert_eq!(
+            NodeTransport::dpdk(&ReplicationNic::Queue),
+            NodeTransport::Dpdk { repl_poll: true }
+        );
+        assert_eq!(
+            NodeTransport::dpdk(&ReplicationNic::Port(melin_dpdk::NicConfig::default())),
+            NodeTransport::Dpdk { repl_poll: true }
+        );
     }
 
     /// The disk thread's suffix has to reach the disk thread, and the
@@ -1035,15 +1217,18 @@ mod tests {
         );
     }
 
-    /// The mixed layout through the CLI, resolved on both transports.
+    /// The mixed layout through the CLI, resolved on every transport.
     #[test]
     fn mixed_layout_parses_and_resolves() {
         let config =
             ServerConfig::try_parse_from(["melin-server", "--cores", MIXED]).expect("parses");
-        for reader in [ReaderThread::IoUring, ReaderThread::DpdkPoll] {
-            let cores = config.resolved_cores(reader).expect("a legal mixed layout");
+        for transport in TRANSPORTS {
+            let cores = config
+                .resolved_cores(transport)
+                .expect("a legal mixed layout");
             assert_eq!(cores.journal_seq, Placement::spinning(1));
             assert_eq!(cores.reader, Placement::spinning(4));
+            assert_eq!(cores.repl_poll, Placement::unpinned());
             assert_eq!(cores.journal_disk, Placement::spinning(5));
             assert_eq!(cores.repl_handler_0, Placement::spinning(6));
             assert_eq!(cores.repl_handler_1, Placement::spinning(7));
