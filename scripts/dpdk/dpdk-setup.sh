@@ -37,6 +37,12 @@
 # Usage (mlx5):
 #   DPDK_IP=10.0.0.10/24 ./scripts/dpdk/dpdk-setup.sh
 #   DPDK_IP=10.0.0.10/24 DPDK_NIC=enp193s0f1np1 ./scripts/dpdk/dpdk-setup.sh
+#   DPDK_IP=10.9.0.102/24 ./scripts/dpdk/dpdk-setup.sh --vlan 2170
+#
+# Pass --vlan whenever the fabric expects 802.1Q tags (Latitude private
+# networks do, on bare metal). Untagged frames are dropped by the switch
+# without an error on either side, so the symptom is a client that
+# connects to nothing rather than a diagnosable failure.
 #
 # After running this script, start the server with:
 #   sudo ./scripts/dpdk/dpdk-server.sh
@@ -55,10 +61,11 @@ HUGEPAGES="${HUGEPAGES:-1024}"
 # switches do NOT — test before deploying).
 MTU="${MTU:-1500}"
 
-# Parse CLI overrides. --vlan is only meaningful in the sriov-bond path;
-# --nic is only meaningful in the mlx5 path. Each path ignores the other's
-# flag silently rather than rejecting it — keeps the wrapper interface
-# uniform.
+# Parse CLI overrides. --vlan applies to both the sriov-bond and mlx5
+# paths (the sriov path derives it from the bond VLAN when omitted; mlx5
+# has nothing to derive from, so it stays untagged unless given). --nic
+# is only meaningful in the mlx5 path, and is ignored silently elsewhere
+# rather than rejected — keeps the wrapper interface uniform.
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --vlan) VLAN_ID="$2"; shift 2 ;;
@@ -213,6 +220,16 @@ run_mlx5_setup() {
     # (dpdk-server.sh, dpdk-test.sh, dpdk-lan-bench.sh) don't misparse
     # them as `VAR=word1 command word2…`. Single-word values are left
     # unquoted to match the existing SR-IOV / TAP conf shape.
+    #
+    # DPDK_MAC is the port's real hardware address. In bifurcated mode
+    # the kernel netdev keeps it and the DPDK side shares it, so peers
+    # cannot derive it the way they can for an SR-IOV VF (02:00:<ip>).
+    # Consumers pass it to the client as `--dpdk-peer-mac`.
+    #
+    # VLAN_ID is written only when the operator supplied `--vlan`. On a
+    # tagged fabric (Latitude private networks tag on bare metal) an
+    # untagged frame is dropped by the switch with no error anywhere, so
+    # omitting it fails silently rather than loudly.
     cat > "$conf" <<EOF
 DPDK_IP=${DPDK_IP%%/*}
 DPDK_PREFIX=${DPDK_IP##*/}
@@ -220,10 +237,17 @@ DPDK_PORT=0
 DPDK_MODE=mlx5
 DPDK_PCI=${pci}
 DPDK_NIC=${DPDK_NIC}
+DPDK_MAC=${mac}
 HUGE_DIR=/mnt/huge_2m
 MTU=${MTU}
 DPDK_EAL_ARGS="-a ${pci} --huge-dir=/mnt/huge_2m"
 EOF
+    if [[ -n "${VLAN_ID:-}" ]]; then
+        echo "VLAN_ID=${VLAN_ID}" >> "$conf"
+        echo "  VLAN:    ${VLAN_ID} (802.1Q tag inserted/stripped in hardware)"
+    else
+        echo "  VLAN:    untagged — pass --vlan <id> if the fabric expects a tag"
+    fi
     echo "  Config written to ${conf}"
     echo ""
     echo "=== Setup complete (mlx5 bifurcated) ==="
@@ -499,7 +523,14 @@ run_sriov_bond_setup() {
     VF0_PCI=$(readlink -f "/sys/bus/pci/devices/${PF0_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
     VF1_PCI=$(readlink -f "/sys/bus/pci/devices/${PF1_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
 
-    # Save DPDK config for use by dpdk-server.sh and dpdk-lan-bench.sh.
+    # Save DPDK config for use by dpdk-server.sh and the LAN suite.
+    #
+    # DPDK_MAC duplicates VF_MAC deliberately: every mode writes the
+    # address a peer must send to under the same key, so consumers read
+    # one name instead of branching on mode. VF_MAC stays for existing
+    # readers. Anything that derives the 02:00:<ip> form itself is
+    # working around this key being absent — the derivation belongs here
+    # and nowhere else.
     DPDK_CONF="/etc/melin-dpdk.conf"
     cat > "$DPDK_CONF" <<EOF
 DPDK_IP=${DPDK_IP%%/*}
@@ -509,6 +540,7 @@ DPDK_MODE=sriov
 HUGE_DIR=/mnt/huge_2m
 MTU=${MTU}
 VF_MAC=${VF_MAC}
+DPDK_MAC=${VF_MAC}
 VLAN_ID=${VLAN_ID}
 EOF
     echo "  Config written to ${DPDK_CONF}"

@@ -192,10 +192,25 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   with it. The `shm-proxy` binary's DPDK path is tested there too, end to
   end, with `melin-test-node`'s `dpdk_client_process_eal_args` putting it
   on the client pair in a process of its own.
+- **A LAN benchmark suite and a load generator.**
+  `scripts/bench/lan-bench-suite.sh` runs a primary, up to two replicas
+  and a load-generating host through a transport × workload matrix
+  (kernel TCP or DPDK, standalone or replicated; throughput or a single
+  request in flight), for the echo and notary examples or the Exchange
+  Core. It builds every binary on the machine running it, for the bench
+  hosts' CPU and against a sysroot taken from them, and copies them
+  over; each run starts from fresh journals, and a replica evicted,
+  missing or catching up during it fails the suite.
+  `scripts/bench/server-setup.sh` and `server-deploy.sh` prepare the
+  hosts. The load generator is the new `melin-bench` tool
+  (`crates/tools/melin-bench`, unpublished): clients × window in flight
+  from one pinned loop, over kernel TCP or, with `--features dpdk`, one
+  DPDK NIC, writing its throughput and latency percentiles as JSON. See
+  [docs/benchmarking.md](docs/benchmarking.md).
 - **`melin_dpdk::dial_addr`** (re-exported by `melin-client`'s `dpdk`
   feature): the address check a DPDK dial needs before a NIC comes up,
-  IPv4 and not loopback, with the reason to print. The echo client and
-  the `shm-proxy` share it.
+  IPv4 and not loopback, with the reason to print. The echo client, the
+  `shm-proxy` and `melin-bench` share it.
 - **`ByteStream` is implemented for `&mut S`** where `S: ByteStream`, so
   a caller holding its streams in a collection lends one per call.
 
@@ -298,6 +313,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **The `shm-proxy` refuses a loopback `--server` on DPDK** before
   bringing the NIC up, as the echo client does; a NIC never reaches
   loopback, and the dial used to wait out its timeout instead.
+- **`scripts/dpdk/dpdk-setup.sh` writes `DPDK_MAC`** in every mode (the
+  address a peer sends to), and `VLAN_ID` on the mlx5 path when `--vlan`
+  is given.
 
 ### Fixed
 
