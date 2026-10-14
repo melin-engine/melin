@@ -56,13 +56,13 @@ pub mod arp;
 // Ungated: configuration is plain data, mapped from the same flags whether
 // or not this build has the transport compiled in.
 mod config;
-pub use config::{DpdkConfig, NicConfig};
+pub use config::{DpdkConfig, NicConfig, ReplicationNic};
 // Ungated by `dpdk-sys` for the same reason, behind `clap` only: the flags
 // mapped onto that configuration, declared once for every binary.
 #[cfg(feature = "clap")]
 mod args;
 #[cfg(feature = "clap")]
-pub use args::{DpdkArgs, DpdkArgsError};
+pub use args::{DpdkArgs, DpdkArgsError, parse_mac_flag};
 // Ungated for the same reason as `peer_liveness`: the client NIC handle's
 // clock, local ports, dial wait and stream I/O are TCP-stack logic, tested
 // over an in-memory wire. The handle itself is in the gated `dpdk` module.

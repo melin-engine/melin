@@ -123,14 +123,14 @@ struct ConnectionState {
 ///
 /// Called from a dedicated OS thread pinned to its own core.
 ///
-/// **Single-poll-thread invariant.** Today `dpdk_num_queues` returns at
-/// most 2 (one client queue + one replication-sender queue), so there is
-/// always exactly one client poll thread. If we ever add multi-queue RSS
-/// (multiple client poll threads), every poll thread would emit ticks
-/// concurrently — re-introducing the multi-producer ordering race that
-/// embedding tick into the poll thread was designed to eliminate. Gate
-/// tick emission to a single thread (e.g. `thread_id == 0`) before
-/// scaling out client queues.
+/// **Single-poll-thread invariant.** The node asks for one client queue
+/// (`dpdk_config_from`) and refuses to start with any other count, so
+/// there is always exactly one client poll thread. If we ever add
+/// multi-queue RSS (multiple client poll threads), every poll thread would
+/// emit ticks concurrently — re-introducing the multi-producer ordering
+/// race that embedding tick into the poll thread was designed to
+/// eliminate. Gate tick emission to a single thread (e.g.
+/// `thread_id == 0`) before scaling out client queues.
 ///
 /// Top-level thread entry point — the wide arg list mirrors transport
 /// state owned elsewhere; bundling into a config struct adds indirection

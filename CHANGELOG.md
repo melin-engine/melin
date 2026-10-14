@@ -217,6 +217,26 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 
 ### Changed
 
+- **The node's command line has `--dpdk-replication-*` flags, reserved
+  for running DPDK replication on a queue or a NIC of its own**:
+  `--dpdk-replication-queue`, and `--dpdk-replication-ports`,
+  `--dpdk-replication-ip` and `--dpdk-replication-peer-mac` together. Not
+  usable yet: a DPDK node given any of them refuses to start, saying the
+  mode is not implemented, before EAL init. A contradictory set (queue and
+  port flags together, ports without an address or the reverse, a port or
+  the address the client NIC already has, an address outside the client
+  NIC's subnet) is refused with an error naming the flag. Without them a
+  node runs exactly as before, replication on the client queue; a
+  kernel-TCP node ignores them, as it does the `--dpdk-*` flags. In code,
+  `melin_dpdk::DpdkConfig` gains a `replication` field
+  (`melin_dpdk::ReplicationNic`, `Shared` by default) and `ServerConfig` a
+  `dpdk_replication` field (`DpdkReplicationArgs`, unset by default);
+  `NicConfig` now implements `PartialEq` and `Eq`, and
+  `melin_dpdk::parse_mac_flag` parses a binary's own MAC flag the way the
+  `--dpdk-*-mac` flags are. Source-breaking for a struct literal of either
+  config that lists every field: add the new one, or end it in
+  `..Default::default()`.
+
 - **`melin_client::Error` has a new variant, `Error::Nic(io::Error)`**,
   for a DPDK NIC that cannot be brought up (EAL initialisation, a missing
   port, the mbuf pool, the port's configuration). Only the `dpdk`

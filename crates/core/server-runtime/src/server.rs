@@ -44,6 +44,10 @@ use melin_app::{AppEvent, Application};
 use melin_pipeline::ring::Consumer;
 use melin_pipeline::wait::WaitStrategy;
 
+/// The node's `--dpdk-replication-*` flags' type, and the error of the
+/// node's DPDK flags as a whole; the module is private, and
+/// `ServerConfig::dpdk_replication` is one.
+pub use crate::dpdk_replication_args::{DpdkReplicationArgs, NodeDpdkArgsError};
 use crate::layout::{DEFAULT_CORES, parse_cores};
 /// The layout types live in [`crate::layout`]; re-exported here because
 /// `ServerConfig::cores` is one of them and callers reach the config
@@ -319,6 +323,14 @@ pub struct ServerConfig {
     #[command(flatten)]
     pub dpdk: DpdkArgs,
 
+    /// The `--dpdk-replication-*` flags (only used with --features dpdk):
+    /// where the node's replication runs on DPDK, beside the client NIC
+    /// above. The node's alone, so not part of `dpdk`, which clients
+    /// share. Only the default is run yet: a DPDK node given any of them
+    /// refuses to start.
+    #[command(flatten)]
+    pub dpdk_replication: DpdkReplicationArgs,
+
     /// Address for the output event publisher. Subscribers connect here
     /// to receive a real-time stream of the application's reports, as the
     /// application's publisher encodes them. Ed25519 auth against the
@@ -484,6 +496,7 @@ impl Default for ServerConfig {
                 ip: Some(melin_dpdk::NicConfig::default().ip_addr),
                 ..DpdkArgs::default()
             },
+            dpdk_replication: DpdkReplicationArgs::default(),
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             admin_bind: None,
@@ -2296,6 +2309,7 @@ where
 {
     check_keys_match_decoder(&*decoder, &authorized_keys)?;
     let dpdk_config = dpdk_config_from(&config)?;
+    crate::dpdk_replication_args::check_replication_nic_implemented(&dpdk_config.replication)?;
 
     run_dpdk_impl::<A>(
         config,
@@ -2312,23 +2326,29 @@ where
 
 /// Translate the CLI surface into a [`melin_dpdk::DpdkConfig`]: the NIC
 /// from the `--dpdk-*` flags, with the node's default address where
-/// `--dpdk-ip` is not given, listening on `--bind`'s port with one queue.
+/// `--dpdk-ip` is not given, listening on `--bind`'s port with one queue,
+/// and replication where the `--dpdk-replication-*` flags put it beside
+/// that NIC.
 ///
-/// The flags are validated by their own mapping, before EAL init and
+/// The flags are validated by their own mappings, before EAL init and
 /// before any thread is spawned, and a bad value is returned as an error
 /// rather than a panic. That ordering is the point: the peer MAC is only
 /// consumed inside the replica's reconnect loop, so parsing it there
 /// would turn a typo into a crash of an already-running node.
-#[cfg(feature = "dpdk")]
-fn dpdk_config_from(
-    cfg: &ServerConfig,
-) -> Result<melin_dpdk::DpdkConfig, melin_dpdk::DpdkArgsError> {
+///
+/// Ungated, so that its tests run without libdpdk; only the DPDK node
+/// calls it.
+#[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, NodeDpdkArgsError> {
+    let nic = cfg
+        .dpdk
+        .nic_config_or(melin_dpdk::NicConfig::default().ip_addr)?;
+    let replication = cfg.dpdk_replication.replication_nic(&nic)?;
     Ok(melin_dpdk::DpdkConfig {
-        nic: cfg
-            .dpdk
-            .nic_config_or(melin_dpdk::NicConfig::default().ip_addr)?,
+        nic,
         listen_port: cfg.bind.port(),
         num_queues: 1,
+        replication,
     })
 }
 
@@ -4134,6 +4154,35 @@ mod tests {
         );
     }
 
+    /// The replication flags are on the node's command line, unset by
+    /// default as in `ServerConfig::default()`, and flattening them leaves
+    /// the node its own about text.
+    #[test]
+    fn the_dpdk_replication_flags_are_the_node_s_and_unset_by_default() {
+        use clap::{CommandFactory, Parser};
+        let parsed = super::ServerConfig::try_parse_from(["melin-server"]).expect("parses");
+        assert_eq!(
+            parsed.dpdk_replication,
+            super::DpdkReplicationArgs::default()
+        );
+        assert_eq!(
+            parsed.dpdk_replication,
+            super::ServerConfig::default().dpdk_replication
+        );
+
+        let given =
+            super::ServerConfig::try_parse_from(["melin-server", "--dpdk-replication-queue"])
+                .expect("parses");
+        assert!(given.dpdk_replication.queue);
+
+        let command = super::ServerConfig::command();
+        assert_eq!(
+            command.get_about().map(|about| about.to_string()),
+            Some("A node of the Melin replicated sequencer".to_owned())
+        );
+        command.debug_assert();
+    }
+
     /// Full bootstrap decision matrix. The two archive-only cells are
     /// the regression guard: a post-rotation crash leaves archives with
     /// no live segment, and bootstrapping "snapshot only" (or "fresh")
@@ -5071,7 +5120,8 @@ mod genesis_tests {
 }
 
 /// The node's DPDK configuration as composed from its own: the flags'
-/// mapping (tested with them, in `melin-dpdk`) plus the node's default
+/// mappings (`DpdkArgs`'s tested with it, in `melin-dpdk`, the
+/// replication flags' in `dpdk_replication_args`) plus the node's default
 /// address, `--bind`'s port and one queue.
 ///
 /// The value the error cases pin is *when* a bad flag is caught.
@@ -5079,9 +5129,14 @@ mod genesis_tests {
 /// the failure has to surface here — during config translation, before
 /// EAL init and before any thread exists — rather than as a panic in a
 /// node that is already serving.
-#[cfg(all(test, feature = "dpdk"))]
+///
+/// Ungated: the translation needs no libdpdk, so it is tested on every
+/// host.
+#[cfg(test)]
 mod dpdk_config_tests {
-    use super::{DpdkArgs, ServerConfig, dpdk_config_from};
+    use super::{DpdkArgs, DpdkReplicationArgs, NodeDpdkArgsError, ServerConfig, dpdk_config_from};
+    use clap::Parser;
+    use melin_dpdk::ReplicationNic;
     use std::net::Ipv4Addr;
 
     #[test]
@@ -5095,6 +5150,118 @@ mod dpdk_config_tests {
         assert_eq!(dpdk.num_queues, 1);
         assert_eq!(dpdk.nic.ip_addr, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(dpdk.nic.peer_mac, None);
+        assert_eq!(dpdk.replication, ReplicationNic::Shared);
+    }
+
+    /// Each mode from the node's own command line, the replication NIC
+    /// composed with the client NIC the `--dpdk-*` flags give.
+    #[test]
+    fn the_replication_flags_reach_the_transport_config() {
+        let parse = |flags: &[&str]| {
+            let cfg = ServerConfig::try_parse_from(
+                ["melin-server", "--dpdk-ports=0", "--dpdk-mtu=9000"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+            .expect("the flags parse");
+            dpdk_config_from(&cfg)
+        };
+
+        let shared = parse(&[]).expect("valid config");
+        assert_eq!(shared.replication, ReplicationNic::Shared);
+
+        let queue = parse(&["--dpdk-replication-queue"]).expect("valid config");
+        assert_eq!(queue.replication, ReplicationNic::Queue);
+        // The client NIC is the same in every mode.
+        assert_eq!(queue.nic, shared.nic);
+
+        let port = parse(&[
+            "--dpdk-replication-ports=1",
+            "--dpdk-replication-ip=10.0.0.2",
+        ])
+        .expect("valid config");
+        assert_eq!(port.nic, shared.nic);
+        let ReplicationNic::Port(nic) = port.replication else {
+            panic!("port mode");
+        };
+        assert_eq!(nic.port_ids, [1]);
+        assert_eq!(nic.ip_addr, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(nic.mtu, 9000);
+    }
+
+    /// The replication NIC is checked against the client NIC as the node
+    /// has it: its default address where `--dpdk-ip` is not given.
+    #[test]
+    fn the_replication_address_is_checked_against_the_node_default() {
+        let cfg = ServerConfig {
+            dpdk: DpdkArgs::default(),
+            dpdk_replication: DpdkReplicationArgs {
+                ports: vec![1],
+                ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                ..DpdkReplicationArgs::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            dpdk_config_from(&cfg).unwrap_err(),
+            NodeDpdkArgsError::IpIsClientIp {
+                ip: Ipv4Addr::new(10, 0, 0, 1)
+            }
+        );
+    }
+
+    /// A bad client NIC flag is reported as `DpdkArgs` words it, ahead of
+    /// anything wrong with the replication flags.
+    #[test]
+    fn a_client_nic_error_comes_first() {
+        let mut cfg = ServerConfig::default();
+        cfg.dpdk.peer_mac = Some("bad".into());
+        cfg.dpdk_replication.queue = true;
+        cfg.dpdk_replication.ports = vec![0];
+        let err = dpdk_config_from(&cfg).expect_err("refused").to_string();
+        assert!(err.starts_with("invalid --dpdk-peer-mac: "), "{err}");
+    }
+
+    /// Every refused combination is refused here, before EAL init; their
+    /// wording is pinned with the mapping.
+    #[test]
+    fn a_refused_replication_combination_fails_config_translation() {
+        for (replication, expected) in [
+            (
+                DpdkReplicationArgs {
+                    queue: true,
+                    ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+                    ..DpdkReplicationArgs::default()
+                },
+                NodeDpdkArgsError::QueueWithPortFlag {
+                    flag: "--dpdk-replication-ip",
+                },
+            ),
+            (
+                DpdkReplicationArgs {
+                    ports: vec![1],
+                    ..DpdkReplicationArgs::default()
+                },
+                NodeDpdkArgsError::Requires {
+                    flag: "--dpdk-replication-ports",
+                    required: "--dpdk-replication-ip",
+                },
+            ),
+            (
+                DpdkReplicationArgs {
+                    ports: vec![0],
+                    ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+                    ..DpdkReplicationArgs::default()
+                },
+                NodeDpdkArgsError::PortIsClientPort { port: 0 },
+            ),
+        ] {
+            let cfg = ServerConfig {
+                dpdk_replication: replication,
+                ..Default::default()
+            };
+            assert_eq!(dpdk_config_from(&cfg).unwrap_err(), expected);
+        }
     }
 
     /// A config built in code with no address at all (not even the one
@@ -5129,5 +5296,64 @@ mod dpdk_config_tests {
             .expect_err("a 5-octet MAC must be rejected")
             .to_string();
         assert!(err.starts_with("invalid --dpdk-peer-mac: "), "{err}");
+    }
+
+    /// A DPDK node given a replication mode not implemented yet refuses to
+    /// start, through the public entry point, rather than run it as shared.
+    /// The refusal comes before EAL init, so no NIC or hugepage is needed;
+    /// the wording is pinned with the check itself.
+    #[cfg(feature = "dpdk")]
+    #[test]
+    fn a_dpdk_node_refuses_an_unimplemented_replication_mode() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        use counter_server::{Counter, RequestDecoder, ResponseEncoder};
+
+        use crate::StartupEvents;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let authorized_keys = dir.path().join("authorized_keys");
+        std::fs::write(&authorized_keys, "").expect("write authorized_keys");
+        for (flags, mode) in [
+            (&["--dpdk-replication-queue"][..], "on a queue of its own"),
+            (
+                &[
+                    "--dpdk-replication-ports=1",
+                    "--dpdk-replication-ip=10.0.0.2",
+                ][..],
+                "on a NIC of its own",
+            ),
+        ] {
+            let cfg = ServerConfig {
+                journal: dir.path().join("counter.journal"),
+                authorized_keys: authorized_keys.clone(),
+                no_mlock: true,
+                ..ServerConfig::try_parse_from(
+                    ["melin-server", "--dpdk-ports=0"]
+                        .into_iter()
+                        .chain(flags.iter().copied()),
+                )
+                .expect("the flags parse")
+            };
+            let err = super::run_with_shutdown::<Counter>(
+                cfg,
+                StartupEvents::none(),
+                (),
+                RequestDecoder,
+                ResponseEncoder,
+                None,
+                // Already set: on a host where the EAL could come up, a
+                // node that wrongly got past the check stops at once and
+                // fails the test, rather than hangs it.
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect_err("refused before EAL init")
+            .to_string();
+            assert!(
+                err.starts_with(&format!("DPDK replication {mode} is not implemented yet")),
+                "{err}"
+            );
+        }
     }
 }

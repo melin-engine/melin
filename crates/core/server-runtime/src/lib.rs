@@ -18,6 +18,9 @@ mod buf_ring;
 pub mod client_auth;
 mod client_frames;
 pub mod connection_limit;
+// Ungated: the node's replication flags are declared and mapped in every
+// build, as `--dpdk-*` are; re-exported from `server`, beside `DpdkArgs`.
+mod dpdk_replication_args;
 mod durability_gate;
 pub mod halt;
 pub mod layout;
