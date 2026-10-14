@@ -226,6 +226,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `--dpdk-replication-ports` check now uses too. Groundwork for
   replication on a NIC of its own: no node runs it yet, and
   `DpdkShared::init` still brings up the client NIC alone, as before.
+- **`melin_dpdk::steering`**: how a NIC's ports split their traffic
+  across queues, decided from the configuration alone and installed as
+  decided. `SteeringPlan::for_client_nic` gives a node's client NIC its
+  queue pairs (`QueuePlan`) and its ordered `rte_flow` rules
+  (`SteeringRule`, logged at info as each is installed); in shared and
+  port modes that is the bring-up as before. With replication on a queue
+  of its own (mlx5), the client NIC gets two queue pairs: queue 1 takes TCP
+  to the node's replication port and from its primary's, queue 0
+  everything else, a client whose ephemeral port is a replication port
+  included; unless the port is isolated (bifurcated), its RSS
+  redirection table is pinned to queue 0 alone once it starts. In
+  isolated mode the replication rules capture replication addressed to the
+  node from every host, not only the peer's. A NIC offering fewer than two
+  queue pairs, or no redirection table to pin, fails the bring-up naming
+  the port, and a rule the NIC refuses names the rule and the PMD's
+  reason. No node runs the mode yet (it is still refused at start).
 
 ### Changed
 
@@ -265,6 +281,22 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `NodeTransport::dpdk`) as the argument of `PipelineCores::resolve` and
   `ServerConfig::resolved_cores`. Source-breaking for a `PipelineCores`
   literal and for a caller of either function.
+
+- **`--dpdk-replication-queue` requires `--replication-bind` or
+  `--replica-of`**, whose ports the NIC steers to replication's queue,
+  and a replication port other than the client port: a standalone node, or
+  one whose `--replication-bind` port is `--bind`'s, is refused before EAL
+  init with an error naming the flags. In code, `ReplicationNic::Queue`
+  carries those ports (`melin_dpdk::ReplicationPorts`), and
+  `DpdkReplicationArgs::replication_nic` takes them;
+  `NodeDpdkArgsError` gains a `Steering` variant. `melin_dpdk::port::Port`
+  is steered by a plan: `Port::configure` takes a `QueuePlan` instead of a
+  queue count (`QueuePlan::Rss(n)` is the old behaviour),
+  `Port::install_src_ipv4_steering` is replaced by
+  `Port::install_steering_rule`, `Port::pin_rss_reta` is new, and
+  `PortError` gains `TooFewQueues` and `RetaPinFailed` and a `message` on
+  `FlowRuleFailed`. Source-breaking for a direct user of `Port` and for a
+  match on either error.
 
 - **`melin_client::Error` has a new variant, `Error::Nic(io::Error)`**,
   for a DPDK NIC that cannot be brought up (EAL initialisation, a missing

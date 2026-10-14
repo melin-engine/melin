@@ -12,7 +12,9 @@
 
 use std::net::Ipv4Addr;
 
-use melin_dpdk::{DpdkArgsError, NicConfig, ReplicationNic, parse_mac_flag};
+use melin_dpdk::{
+    DpdkArgsError, NicConfig, ReplicationNic, ReplicationPorts, SteeringError, parse_mac_flag,
+};
 
 /// The replication flags, flattened into the node's command line.
 ///
@@ -30,7 +32,9 @@ use melin_dpdk::{DpdkArgsError, NicConfig, ReplicationNic, parse_mac_flag};
 #[command(about = None, long_about = None)]
 pub struct DpdkReplicationArgs {
     /// Run replication on a second queue of the client NIC's ports,
-    /// steered to it by the NIC (mlx5). Not with the port-mode flags.
+    /// steered to it by the NIC (mlx5). Requires --replication-bind (on a
+    /// port other than --bind's) or --replica-of. Not with the port-mode
+    /// flags.
     #[arg(long = "dpdk-replication-queue", id = "dpdk_replication_queue")]
     pub queue: bool,
 
@@ -115,6 +119,10 @@ pub enum NodeDpdkArgsError {
         /// The client NIC's prefix length.
         prefix_len: u8,
     },
+    /// `--dpdk-replication-queue` with replication the NIC cannot steer
+    /// to a queue of its own, as the steering plan refuses it; displayed
+    /// naming the node's flags, which the plan's own wording cannot.
+    Steering(SteeringError),
 }
 
 impl std::fmt::Display for NodeDpdkArgsError {
@@ -149,6 +157,20 @@ impl std::fmt::Display for NodeDpdkArgsError {
                  ({client_ip}/{prefix_len}); the replication NIC takes its prefix length and \
                  gateway, so it must be in that subnet"
             ),
+            NodeDpdkArgsError::Steering(SteeringError::NoReplicationPort) => write!(
+                f,
+                "invalid {QUEUE_FLAG}: it requires --replication-bind or --replica-of; a node \
+                 with neither (a standalone one) has no replication to steer to a queue of its \
+                 own"
+            ),
+            NodeDpdkArgsError::Steering(SteeringError::ReplicationPortIsClientPort { port }) => {
+                write!(
+                    f,
+                    "invalid --replication-bind: port {port} is also --bind's; with {QUEUE_FLAG} \
+                     the NIC tells replication from client traffic by port, so the two must differ"
+                )
+            }
+            NodeDpdkArgsError::Steering(error) => write!(f, "invalid {QUEUE_FLAG}: {error}"),
         }
     }
 }
@@ -181,14 +203,21 @@ impl DpdkReplicationArgs {
     /// beside, and the validation of them, before any NIC is touched.
     ///
     /// No flag is [`ReplicationNic::Shared`], `--dpdk-replication-queue`
-    /// alone [`ReplicationNic::Queue`], and the port-mode flags
+    /// alone [`ReplicationNic::Queue`], steering `replication_ports` (the node's
+    /// replication ports, from `--replication-bind` and `--replica-of`;
+    /// whether they can be steered is the steering plan's to say, see
+    /// [`NodeDpdkArgsError::Steering`]), and the port-mode flags
     /// [`ReplicationNic::Port`], a NIC with its own ports, address and peer
     /// MAC and everything else the client NIC's. Of several problems, the
     /// one reported is the first of: a mix of the modes, a port-mode flag
     /// missing another it needs, a malformed peer MAC, a port the client
     /// NIC has, the client NIC's address, an address outside the client
     /// NIC's subnet.
-    pub fn replication_nic(&self, client: &NicConfig) -> Result<ReplicationNic, NodeDpdkArgsError> {
+    pub fn replication_nic(
+        &self,
+        client: &NicConfig,
+        replication_ports: ReplicationPorts,
+    ) -> Result<ReplicationNic, NodeDpdkArgsError> {
         // Destructured, so that a flag added here must be mapped.
         let DpdkReplicationArgs {
             queue,
@@ -206,7 +235,7 @@ impl DpdkReplicationArgs {
             .find_map(|(flag, given)| given.then_some(flag));
         let Some(first_port_flag) = first_port_flag else {
             return Ok(if *queue {
-                ReplicationNic::Queue
+                ReplicationNic::Queue(replication_ports)
             } else {
                 ReplicationNic::Shared
             });
@@ -284,7 +313,7 @@ pub(crate) fn check_replication_nic_implemented(
 ) -> Result<(), String> {
     let (mode, flags) = match replication {
         ReplicationNic::Shared => return Ok(()),
-        ReplicationNic::Queue => ("on a queue of its own", QUEUE_FLAG.to_owned()),
+        ReplicationNic::Queue(_) => ("on a queue of its own", QUEUE_FLAG.to_owned()),
         ReplicationNic::Port(_) => (
             "on a NIC of its own",
             format!("{PORTS_FLAG}, {IP_FLAG} and {PEER_MAC_FLAG}"),
@@ -330,10 +359,17 @@ mod tests {
         }
     }
 
+    /// A replica that listens for replicas of its own once promoted, on a
+    /// port other than its primary's.
+    const PORTS: ReplicationPorts = ReplicationPorts {
+        listen: Some(9877),
+        primary: Some(9900),
+    };
+
     fn map(flags: &[&str]) -> Result<ReplicationNic, NodeDpdkArgsError> {
         parse(flags)
             .expect("the flags parse")
-            .replication_nic(&client())
+            .replication_nic(&client(), PORTS)
     }
 
     #[test]
@@ -343,11 +379,50 @@ mod tests {
         assert_eq!(map(&[]), Ok(ReplicationNic::Shared));
     }
 
+    /// Queue mode carries the replication ports it steers, as given.
     #[test]
-    fn the_queue_flag_alone_is_queue() {
+    fn the_queue_flag_alone_is_queue_with_the_replication_ports() {
         assert_eq!(
             map(&["--dpdk-replication-queue"]),
-            Ok(ReplicationNic::Queue)
+            Ok(ReplicationNic::Queue(PORTS))
+        );
+        // Whether they can be steered is the plan's to say, not the
+        // mapping's.
+        let none = ReplicationPorts::default();
+        assert_eq!(
+            parse(&["--dpdk-replication-queue"])
+                .unwrap()
+                .replication_nic(&client(), none),
+            Ok(ReplicationNic::Queue(none))
+        );
+    }
+
+    /// The plan's refusals, worded with the node's flags.
+    #[test]
+    fn a_steering_error_names_the_node_s_flags() {
+        let message = NodeDpdkArgsError::Steering(SteeringError::NoReplicationPort).to_string();
+        assert!(
+            message.starts_with("invalid --dpdk-replication-queue: "),
+            "{message}"
+        );
+        for flag in ["--replication-bind", "--replica-of"] {
+            assert!(message.contains(flag), "{message}");
+        }
+
+        let message =
+            NodeDpdkArgsError::Steering(SteeringError::ReplicationPortIsClientPort { port: 9876 })
+                .to_string();
+        assert!(
+            message.starts_with("invalid --replication-bind: port 9876 "),
+            "{message}"
+        );
+        assert!(message.contains("--bind"), "{message}");
+        assert!(message.contains(QUEUE_FLAG), "{message}");
+
+        let error = SteeringError::SeveralClientQueues { num_queues: 2 };
+        assert_eq!(
+            NodeDpdkArgsError::Steering(error).to_string(),
+            format!("invalid --dpdk-replication-queue: {error}")
         );
     }
 
@@ -604,7 +679,7 @@ mod tests {
             check_replication_nic_implemented(&ReplicationNic::Shared),
             Ok(())
         );
-        let queue = check_replication_nic_implemented(&ReplicationNic::Queue).unwrap_err();
+        let queue = check_replication_nic_implemented(&ReplicationNic::Queue(PORTS)).unwrap_err();
         assert!(queue.contains("not implemented yet"), "{queue}");
         assert!(queue.contains(QUEUE_FLAG), "{queue}");
         let port = check_replication_nic_implemented(&ReplicationNic::Port(client())).unwrap_err();

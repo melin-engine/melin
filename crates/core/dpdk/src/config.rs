@@ -145,14 +145,36 @@ pub enum ReplicationNic {
     Shared,
     /// On a second queue of the client NIC's ports, steered to it by the
     /// NIC (`--dpdk-replication-queue`). For a NIC with flow steering
-    /// (mlx5).
-    Queue,
+    /// (mlx5). The NIC tells replication from client traffic by TCP port,
+    /// so the mode carries the replication ports it steers
+    /// ([`crate::SteeringPlan::for_client_nic`] decides the rules).
+    Queue(ReplicationPorts),
     /// On a NIC of its own, with its own ports, MAC and address
     /// (`--dpdk-replication-ports`, `--dpdk-replication-ip`,
     /// `--dpdk-replication-peer-mac`): a second ENI on AWS, or any second
     /// port. The prefix length, gateway and its MAC, MTU and VLAN are the
     /// client NIC's, and so are the EAL arguments, which are process-wide.
     Port(NicConfig),
+}
+
+/// The TCP ports a node's replication links use, by which the NIC steers
+/// them to a queue of their own in [`ReplicationNic::Queue`] mode.
+///
+/// Two ports, not one: a replica's link to its primary runs from the
+/// primary's replication port, which need not be the replica's own.
+/// Each is optional on its own (a primary has no primary; a replica may
+/// listen for no replicas), but queue mode needs at least one, or it has
+/// nothing to steer. `u16`, as TCP ports are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationPorts {
+    /// The port the node's own replication listener takes
+    /// (`--replication-bind`'s), which its replicas dial: as a primary,
+    /// or once promoted.
+    pub listen: Option<u16>,
+    /// The port of the primary's replication listener (`--replica-of`'s),
+    /// which a replica dials: the source port of everything its primary
+    /// sends it.
+    pub primary: Option<u16>,
 }
 
 /// Configuration for the DPDK transport of a node: its NIC, the port it
@@ -165,7 +187,8 @@ pub struct DpdkConfig {
     pub listen_port: u16,
     /// Number of RX/TX queue pairs per port. Each queue pair is polled
     /// by a separate thread. When > 1, RSS is enabled on the NIC to
-    /// distribute TCP/IP flows across queues. Default: 1.
+    /// distribute TCP/IP flows across queues. Default: 1. Must be 1 in
+    /// [`ReplicationNic::Queue`] mode, whose second queue is replication's.
     pub num_queues: u16,
     /// Where replication runs. Default: [`ReplicationNic::Shared`].
     pub replication: ReplicationNic,

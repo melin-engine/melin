@@ -22,7 +22,8 @@
 //! the feature the crate holds only what needs no libdpdk: the
 //! configuration ([`DpdkConfig`], [`NicConfig`]), MAC parsing and the
 //! peer-MAC convention ([`mac`]), the ARP frames ([`arp`]), and the
-//! policies tested on any host ([`rx_checksum`], [`peer_liveness`]). A
+//! policies tested on any host ([`rx_checksum`], [`peer_liveness`],
+//! [`steering`]). A
 //! binary maps its flags onto the configuration in any build, and the
 //! crate lives in the workspace without requiring system dependencies.
 //!
@@ -57,7 +58,12 @@ pub mod arp;
 // Ungated: configuration is plain data, mapped from the same flags whether
 // or not this build has the transport compiled in.
 mod config;
-pub use config::{DpdkConfig, NicConfig, ReplicationNic};
+pub use config::{DpdkConfig, NicConfig, ReplicationNic, ReplicationPorts};
+// Ungated for the same reason as `rx_checksum`: which queues a NIC's ports
+// get and which flow rules steer traffic to them is decided from the
+// configuration alone, and the gated port code installs what it says.
+pub mod steering;
+pub use steering::{QueuePlan, SteeringError, SteeringPlan, SteeringRule};
 // Ungated by `dpdk-sys` for the same reason, behind `clap` only: the flags
 // mapped onto that configuration, declared once for every binary.
 #[cfg(feature = "clap")]

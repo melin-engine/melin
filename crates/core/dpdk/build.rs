@@ -13,6 +13,11 @@ fn main() {
     generate_bindings();
 }
 
+/// Where the C wrappers and the header they share with the bindings are,
+/// relative to the package root, which a build script runs in.
+#[cfg(feature = "dpdk-sys")]
+const WRAPPER_DIR: &str = "src/dpdk";
+
 #[cfg(feature = "dpdk-sys")]
 fn generate_bindings() {
     // Cargo re-runs a build script whenever any file in the package changes —
@@ -24,6 +29,7 @@ fn generate_bindings() {
     // and a binary can be built against a stale object.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/dpdk/inline_wrappers.c");
+    println!("cargo:rerun-if-changed=src/dpdk/steering_rule.h");
 
     // Locate DPDK via pkg-config.
     let dpdk = pkg_config::Config::new()
@@ -49,6 +55,7 @@ fn generate_bindings() {
     let system_clang = find_system_clang();
     let mut cc = cc::Build::new();
     cc.file("src/dpdk/inline_wrappers.c");
+    cc.include(WRAPPER_DIR);
     if let Some(ref clang) = system_clang {
         cc.compiler(clang);
     }
@@ -167,12 +174,11 @@ fn generate_bindings() {
             uint64_t dpdk_eth_rss_tcp(void);\n\
             uint64_t dpdk_eth_mq_rx_rss(void);\n\
             int dpdk_flow_isolate(uint16_t port_id);\n\
-            int dpdk_install_src_ipv4_steering(uint16_t port_id,\n\
-                                                uint32_t src_ipv4_be,\n\
-                                                int *err_type);\n\
+            #include \"steering_rule.h\"\n\
             ",
         )
         .clang_args(&include_args)
+        .clang_arg(format!("-I{WRAPPER_DIR}"))
         // Non-inline DPDK functions.
         .allowlist_function("rte_eal_init")
         .allowlist_function("rte_eal_cleanup")
@@ -234,8 +240,10 @@ fn generate_bindings() {
         .allowlist_function("dpdk_eth_mq_rx_rss")
         // rte_flow steering for bifurcated PMD mode.
         .allowlist_function("dpdk_flow_isolate")
-        .allowlist_function("dpdk_install_src_ipv4_steering")
+        .allowlist_function("dpdk_install_steering_rule")
+        .allowlist_function("dpdk_pin_rss_reta")
         // Types.
+        .allowlist_type("dpdk_steering_rule")
         .allowlist_type("rte_mbuf")
         .allowlist_type("rte_mempool")
         .allowlist_type("rte_eth_conf")

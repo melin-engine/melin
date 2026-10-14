@@ -42,3 +42,17 @@ dpdk = ["melin-server-runtime/dpdk", "dep:melin-dpdk", "dep:libc"]
 name = "nic_groups"
 path = "tests/nic_groups.rs"
 required-features = ["dpdk"]
+
+# Replication on a queue of its own refused on a NIC that cannot steer,
+# under the netns runner (see the file). Only with `dpdk`, as above.
+[[test]]
+name = "queue_split"
+path = "tests/queue_split.rs"
+required-features = ["dpdk"]
+
+# The replication split refused on a port with one queue pair, under the
+# netns runner (see the file). Only with `dpdk`, as above.
+[[test]]
+name = "queue_split_one_queue"
+path = "tests/queue_split_one_queue.rs"
+required-features = ["dpdk"]

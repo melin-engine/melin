@@ -182,7 +182,16 @@ pub fn dpdk_slot(slot: usize) -> DpdkSeat {
 /// runner.
 #[cfg(feature = "dpdk")]
 pub fn dpdk_slots_eal_args(slots: &[usize]) -> Vec<String> {
-    dpdk::slots_eal_args(slots)
+    dpdk::slots_eal_args(slots, 1)
+}
+
+/// [`dpdk_slots_eal_args`], each device with `queue_pairs` RX/TX queue
+/// pairs rather than one: for a test of a NIC brought up with several
+/// queues. An af_packet device spreads its traffic across them by its own
+/// hash, and supports neither `rte_flow` nor an RSS redirection table.
+#[cfg(feature = "dpdk")]
+pub fn dpdk_slots_eal_args_with_queue_pairs(slots: &[usize], queue_pairs: u16) -> Vec<String> {
+    dpdk::slots_eal_args(slots, queue_pairs)
 }
 
 /// The MAC behind `addr`'s IP on the runner's network: a node's (from
@@ -674,7 +683,7 @@ mod dpdk {
     /// process.
     static OWN_EAL_HANDED_OUT: AtomicBool = AtomicBool::new(false);
 
-    pub(super) fn slots_eal_args(slots: &[usize]) -> Vec<String> {
+    pub(super) fn slots_eal_args(slots: &[usize], queue_pairs: u16) -> Vec<String> {
         assert!(
             Eal::process_wide().is_none(),
             "this process shares the launcher's process-wide EAL (it started a node or opened \
@@ -685,7 +694,12 @@ mod dpdk {
         // A `Vec`, in the slots' order, which is their ports' order.
         let devices: Vec<(String, String)> = slots
             .iter()
-            .map(|&slot| layout::vdev(slot, &layout().slot(slot).iface))
+            .map(|&slot| {
+                layout::with_queue_pairs(
+                    layout::vdev(slot, &layout().slot(slot).iface),
+                    queue_pairs,
+                )
+            })
             .collect();
         layout::own_eal_args(first_allowed_cpu(), &devices)
     }

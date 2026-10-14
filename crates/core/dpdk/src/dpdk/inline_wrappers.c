@@ -11,7 +11,12 @@
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "steering_rule.h"
 
 uint16_t dpdk_eth_rx_burst(uint16_t port_id, uint16_t queue_id,
                            struct rte_mbuf **rx_pkts, uint16_t nb_pkts) {
@@ -201,45 +206,83 @@ int dpdk_flow_isolate(uint16_t port_id) {
     return rte_flow_isolate(port_id, 1, &err);
 }
 
-/* Install a flow rule that captures all IPv4 packets with the given
- * source IPv4 address (in network byte order) into RX queue 0. Used
- * by bifurcated transports: the peer's public IP is the trigger, so
- * the kernel keeps SSH (different source IP), ARP, and anything else.
- * Returns 0 on success, a negative value on failure. Stores the
- * DPDK error type in *err_type when non-NULL on failure (for diagnostics). */
-int dpdk_install_src_ipv4_steering(uint16_t port_id, uint32_t src_ipv4_be,
-                                    int *err_type) {
+/* Install `rule` (see steering_rule.h) on `port_id`. The pattern is ETH (any) / IPV4 (the
+ * addresses given, or any) / TCP (the ports given; only when a port is)
+ * / END, and the one action QUEUE. Without TCP ports this is the rule
+ * bifurcated transports have always installed: IPv4 from the peer into
+ * queue 0, so the kernel keeps SSH (different source IP), ARP, and
+ * anything else.
+ *
+ * The flow handle is not kept: the rule lives as long as the port, and
+ * goes when the port is closed.
+ *
+ * Returns 0 on success, a negative value on failure; on failure stores
+ * the rte_flow error type in *err_type and its message (empty when the
+ * PMD gives none) in err_msg, NUL-terminated and truncated to
+ * err_msg_len bytes. */
+int dpdk_install_steering_rule(uint16_t port_id,
+                               const struct dpdk_steering_rule *rule,
+                               int *err_type, char *err_msg,
+                               size_t err_msg_len) {
     struct rte_flow_attr attr;
     struct rte_flow_item_eth eth_spec, eth_mask;
     struct rte_flow_item_ipv4 ipv4_spec, ipv4_mask;
-    struct rte_flow_item pattern[3];
+    struct rte_flow_item_tcp tcp_spec, tcp_mask;
+    struct rte_flow_item pattern[4];
     struct rte_flow_action_queue queue;
     struct rte_flow_action actions[2];
     struct rte_flow_error err;
     struct rte_flow *flow;
+    int n = 0;
 
     memset(&attr, 0, sizeof(attr));
     attr.ingress = 1;
+    attr.priority = rule->priority;
 
     memset(&eth_spec, 0, sizeof(eth_spec));
     memset(&eth_mask, 0, sizeof(eth_mask));
 
     memset(&ipv4_spec, 0, sizeof(ipv4_spec));
     memset(&ipv4_mask, 0, sizeof(ipv4_mask));
-    ipv4_spec.hdr.src_addr = src_ipv4_be;
-    ipv4_mask.hdr.src_addr = 0xffffffff;
+    if (rule->has_src_ipv4) {
+        ipv4_spec.hdr.src_addr = rule->src_ipv4_be;
+        ipv4_mask.hdr.src_addr = 0xffffffff;
+    }
+    if (rule->has_dst_ipv4) {
+        ipv4_spec.hdr.dst_addr = rule->dst_ipv4_be;
+        ipv4_mask.hdr.dst_addr = 0xffffffff;
+    }
+
+    memset(&tcp_spec, 0, sizeof(tcp_spec));
+    memset(&tcp_mask, 0, sizeof(tcp_mask));
+    if (rule->has_tcp_src_port) {
+        tcp_spec.hdr.src_port = rule->tcp_src_port_be;
+        tcp_mask.hdr.src_port = 0xffff;
+    }
+    if (rule->has_tcp_dst_port) {
+        tcp_spec.hdr.dst_port = rule->tcp_dst_port_be;
+        tcp_mask.hdr.dst_port = 0xffff;
+    }
 
     memset(pattern, 0, sizeof(pattern));
-    pattern[0].type = RTE_FLOW_ITEM_TYPE_ETH;
-    pattern[0].spec = &eth_spec;
-    pattern[0].mask = &eth_mask;
-    pattern[1].type = RTE_FLOW_ITEM_TYPE_IPV4;
-    pattern[1].spec = &ipv4_spec;
-    pattern[1].mask = &ipv4_mask;
-    pattern[2].type = RTE_FLOW_ITEM_TYPE_END;
+    pattern[n].type = RTE_FLOW_ITEM_TYPE_ETH;
+    pattern[n].spec = &eth_spec;
+    pattern[n].mask = &eth_mask;
+    n++;
+    pattern[n].type = RTE_FLOW_ITEM_TYPE_IPV4;
+    pattern[n].spec = &ipv4_spec;
+    pattern[n].mask = &ipv4_mask;
+    n++;
+    if (rule->has_tcp_src_port || rule->has_tcp_dst_port) {
+        pattern[n].type = RTE_FLOW_ITEM_TYPE_TCP;
+        pattern[n].spec = &tcp_spec;
+        pattern[n].mask = &tcp_mask;
+        n++;
+    }
+    pattern[n].type = RTE_FLOW_ITEM_TYPE_END;
 
     memset(&queue, 0, sizeof(queue));
-    queue.index = 0;
+    queue.index = rule->queue;
 
     memset(actions, 0, sizeof(actions));
     actions[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
@@ -252,7 +295,50 @@ int dpdk_install_src_ipv4_steering(uint16_t port_id, uint32_t src_ipv4_be,
         if (err_type) {
             *err_type = (int)err.type;
         }
+        if (err_msg && err_msg_len > 0) {
+            snprintf(err_msg, err_msg_len, "%s", err.message ? err.message : "");
+        }
         return -1;
     }
     return 0;
+}
+
+/* Point every entry of `port_id`'s RSS redirection table at `queue`, so
+ * that whatever the default RSS receives lands there, however it hashes.
+ * Call after rte_eth_dev_start(): the table's size is known then on every
+ * PMD (mlx5 reports its real size only once started), and a PMD that
+ * rebuilds the table on start cannot undo the update. Needs the port
+ * configured with RTE_ETH_MQ_RX_RSS, which ethdev requires for any RETA
+ * update.
+ *
+ * Returns 0 on success, -ENOTSUP when the port has no redirection table
+ * to update, or the negative error of rte_eth_dev_info_get() or
+ * rte_eth_dev_rss_reta_update(). */
+int dpdk_pin_rss_reta(uint16_t port_id, uint16_t queue) {
+    struct rte_eth_dev_info info;
+    struct rte_eth_rss_reta_entry64 *conf;
+    uint16_t groups, g, i;
+    int ret;
+
+    ret = rte_eth_dev_info_get(port_id, &info);
+    if (ret != 0) {
+        return ret;
+    }
+    if (info.reta_size == 0) {
+        return -ENOTSUP;
+    }
+    groups = (info.reta_size + RTE_ETH_RETA_GROUP_SIZE - 1) / RTE_ETH_RETA_GROUP_SIZE;
+    conf = calloc(groups, sizeof(*conf));
+    if (!conf) {
+        return -ENOMEM;
+    }
+    for (g = 0; g < groups; g++) {
+        conf[g].mask = ~0ULL;
+        for (i = 0; i < RTE_ETH_RETA_GROUP_SIZE; i++) {
+            conf[g].reta[i] = queue;
+        }
+    }
+    ret = rte_eth_dev_rss_reta_update(port_id, conf, info.reta_size);
+    free(conf);
+    return ret;
 }

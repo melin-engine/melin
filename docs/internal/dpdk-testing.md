@@ -165,7 +165,9 @@ own `dpdk` feature switches its tests over the same way.
   the EAL it owns, in a binary of its own: such a process cannot share the
   launcher's process-wide EAL as well, and the launcher panics on a node
   or a client NIC asked for after it, or on the arguments asked for after
-  either.
+  either. `dpdk_slots_eal_args_with_queue_pairs` gives each device several
+  queue pairs (af_packet's `qpairs`), for a NIC brought up with several
+  queues.
 
 ## Several NICs on one EAL
 
@@ -180,6 +182,19 @@ group is dropped and the replication group still serves a kernel-TCP
 client, so the EAL outlives the first group; it is cleaned up after the
 last. The `melin-test-node` suite runs it, with its `dpdk` feature, beside
 the runtime's suites in the CI `dpdk` job.
+
+## Replication on a queue of its own
+
+Not testable here: af_packet has no `rte_flow` and no RSS redirection
+table, so the steering rules and the table's pin to queue 0 are checked
+on an mlx5 rig, per-queue counters first. Which rules a configuration
+gets is a pure function, unit-tested on every host
+(`melin_dpdk::steering`). Under the runner,
+`crates/core/test-node/tests/queue_split.rs` brings a client NIC up in
+queue mode on a device given two queue pairs: configure and start run,
+and the pin's refusal fails the bring-up naming the port.
+`queue_split_one_queue.rs` does the same on a device given one queue
+pair, which configure refuses, naming the port and the pairs missing.
 
 ## Several nodes in one process
 
