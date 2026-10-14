@@ -145,10 +145,13 @@ own `dpdk` feature switches its tests over the same way.
   slot's replication seat (on kernel TCP, `addrs`' own). `start_at` then
   attaches a second af_packet device there (`net_af_packet_repl<N>`) and
   gives the node its port and IP as `--dpdk-replication-ports` and
-  `--dpdk-replication-ip`: a primary in port mode. Its replicas take its
-  `replication()` as `replica_of` and dial it from their client NICs; the
-  launcher passes them the seat's MAC. Both devices are detached when the
-  node returns, and `cut_off` cuts both links.
+  `--dpdk-replication-ip`: a node in port mode. Its replicas take its
+  `replication()` as `replica_of`, and the launcher passes them the
+  seat's MAC: as `--dpdk-peer-mac` to a replica dialing from its client
+  NIC, as `--dpdk-replication-peer-mac` to a replica with a replication NIC
+  of its own (its addresses from `addrs_with_replication_nic` too), which
+  dials from there. Both devices are detached when the node returns, and
+  `cut_off` cuts both links.
 - **Slots.** On DPDK a node holds its slot until it is stopped or joined.
   Starting a second node on a held slot panics.
 - **Stopping.** A node is stopped by setting its shutdown flag, on both
@@ -156,7 +159,8 @@ own `dpdk` feature switches its tests over the same way.
   expected to fail, or to fence itself).
 - **Cutting a node off.** `Node::cut_off` brings the bridge side of its
   links down, as a pulled cable would: nothing it sends arrives, and no
-  peer is told.
+  peer is told. They come back up once the node has returned, so that the
+  next node on the slot, in a later test of the process too, is reachable.
 - **Startup.** `STARTUP_LIMIT` is how long a client should give a node to
   serve: longer on DPDK, for EAL and port start.
 - **A client on DPDK.** `open_dpdk_client(config)` (DPDK only) opens a
@@ -202,10 +206,15 @@ last. The `melin-test-node` suite runs it, with its `dpdk` feature, beside
 the runtime's suites in the CI `dpdk` job. Beside it, each in a binary of
 its own since each owns its EAL: `nic_groups_replication_fails.rs`, a
 replication NIC that cannot come up once the client NIC has, which fails
-the bring-up naming the replication NIC; and `nic_groups_shared.rs`, shared
+the bring-up naming the replication NIC; `nic_groups_shared.rs`, shared
 mode bringing up the client NIC alone, with one client queue, and a thread
 registering with the EAL as an lcore of its own and giving the lcore back,
-as the replication poll thread does.
+as the replication poll thread does; and `transport_rebuild.rs`, a
+transport dropped with a connection open and data unread, which gives
+every mbuf back to its pool (the pool's own count says so), and a new
+transport on the same queue carrying TCP after it, as a promoted replica's
+replication poll thread does. The binaries share their helpers in
+`tests/common/`.
 
 ## Replication on a NIC of its own
 
@@ -214,10 +223,19 @@ suite starts it on a slot's replication seat (above) and runs replication
 cases with it as with a primary in shared mode: two replicas under an ack
 policy that needs a replica's fsync, a replica dropped and re-admitted, a
 replica cut off and dropped by the liveness deadline, large joins, and a
-clean stop with the replication poll thread joined. The replicas stay in
-shared mode, which is all a replica runs yet. The case with two replicas
-also reads the per-queue counts on `/metrics`: one queue per NIC, each
-having moved packets both ways.
+clean stop with the replication poll thread joined. The case with two
+replicas also reads the per-queue counts on `/metrics`: one queue per NIC,
+each having moved packets both ways.
+
+Replicas in port mode run end to end too: following a primary in port
+mode and one in shared mode, under an ack policy that needs a replica's
+fsync; promoted by the operator's `PROMOTE` once the primary has gone,
+the promoted node serving clients on its client NIC, refusing writes
+until a replica attaches, and the other replica rejoining it on its
+replication NIC, with the per-queue counts showing both NICs polled
+(`dpdk_veth`); and promoted by raft, every node in port mode, in the
+`replicated_failover` cluster test. A client connecting to such a replica
+gets no answer (`dpdk_veth` pins that too).
 
 ## Replication on a queue of its own
 
@@ -232,9 +250,13 @@ queue mode on a device given two queue pairs: configure and start run,
 and the pin's refusal fails the bring-up naming the port.
 `queue_split_one_queue.rs` does the same on a device given one queue
 pair, which configure refuses, naming the port and the pairs missing, and
-the runtime's `dpdk_veth` suite starts a primary in queue mode on a slot's
-one queue pair, which refuses to start with that error and leaves the slot
-clean for the next node.
+the runtime's `dpdk_veth` suite starts a primary, and a replica, in queue
+mode on a slot's one queue pair, each refusing to start with that error
+and leaving the slot clean for the next node. That a queue-mode replica
+never dials its primary from a port the NIC steers by destination (the
+client port) is unit-tested (`ReplicaDialPorts`, and the steering plan's
+`destination_ports`); its receiver on queue 1 and its unpolled queue 0 are
+checked on the rig.
 
 ## Several nodes in one process
 

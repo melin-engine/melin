@@ -277,7 +277,7 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   node from every host, not only the peer's. A NIC offering fewer than two
   queue pairs, or no redirection table to pin, fails the bring-up naming
   the port, and a rule the NIC refuses names the rule and the PMD's
-  reason. A primary runs the mode (below); a replica does not yet.
+  reason. Primaries and replicas run the mode (below).
 - **DPDK replication on a queue or a NIC of its own, on a primary.** With
   `--dpdk-replication-queue` (mlx5), or `--dpdk-replication-ports` and
   `--dpdk-replication-ip` (a second ENI, any second port), a DPDK
@@ -296,10 +296,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   there (`--replica-of`). The replication ring, the ack cursors behind
   the ack policy and the client clock ticks are unchanged. A primary
   stopping closes its replicas' links from that thread, as from the
-  client poll thread before. A replica in either mode still refuses to
-  start, saying the mode is not implemented yet for a replica, before EAL
-  init; without the flags nothing changes. On a NIC with fewer than two
-  queue pairs, queue mode fails the boot naming the port.
+  client poll thread before. Replicas run the modes too (below); without
+  the flags nothing changes. On a NIC with fewer than two queue pairs,
+  queue mode fails the boot naming the port.
   - **Per-queue packet counts on `/metrics`**:
     `melin_dpdk_queue_rx_packets_total` and
     `melin_dpdk_queue_tx_packets_total`, labelled by DPDK port and queue,
@@ -331,6 +330,39 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     `melin_test_node::addrs_with_replication_nic` starts a node with its
     replication NIC there, and the DPDK replication cases run with such a
     primary as well.
+- **DPDK replication on a queue or a NIC of its own, on a replica, and
+  through promotion.** The `--dpdk-replication-*` modes now run on every
+  node. A replica in queue or port mode brings up both its transports at
+  boot: it follows its primary from the client NIC's second queue or from
+  its replication NIC (dialing `--replica-of`, with the primary's MAC
+  from `--dpdk-replication-peer-mac` in port mode), and leaves its client
+  NIC unread until it is promoted. Promoted, by the operator's `PROMOTE`
+  or by raft, it serves exactly as a primary booted in the mode: clients
+  on its client NIC from the client poll thread, its own replicas from the
+  `repl-poll` thread on the queue or NIC its receiver ran on, under the
+  same ack policy. Its replicas point `--replica-of` at its replication
+  address. A replica in either mode follows a primary in any mode, and the
+  reverse. Two differences from a shared-mode DPDK replica: a client
+  connecting to it is left unanswered rather than refused, and in queue
+  mode it answers no ARP until promoted. A DPDK primary on its subnet
+  learns its MAC from its frames; a kernel-TCP primary does not, and needs
+  a static neighbour entry for it (or `arp_accept=1`); a router between
+  them must already know its MAC. A
+  replica never dials its primary from a local port the NIC steers by
+  destination (in queue mode, the client port), which would have the
+  primary's answers steered to the client queue. In code:
+  `melin_dpdk::SteeringPlan::for_replication` (the plan of the NIC
+  replication runs on) and `SteeringPlan::destination_ports`;
+  `melin_dpdk::LocalPorts`, the local ports a dial takes, now public, with
+  `LocalPorts::from_first` for a range of the caller's own;
+  `melin_server_runtime::replication::ReplicaDialPorts`, a replica's; and
+  `DpdkShared::mbufs_in_use`, how many of a NIC's mbufs are out of its
+  pool.
+  - For contributors: `melin_test_node` passes a replica with a
+    replication NIC its primary's MAC as `--dpdk-replication-peer-mac`,
+    and brings a node's links back up when it has returned, so that a node
+    cut off (`Node::cut_off`) leaves its slot reachable for the next one,
+    in a later test of the same process too.
 
 ### Changed
 
@@ -354,10 +386,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
 - **The node's command line has `--dpdk-replication-*` flags, for running
   DPDK replication on a queue or a NIC of its own**:
   `--dpdk-replication-queue`, and `--dpdk-replication-ports`,
-  `--dpdk-replication-ip` and `--dpdk-replication-peer-mac` together. A
-  primary runs them (see Added); a DPDK replica given any of them refuses
-  to start, saying the mode is not implemented yet for a replica, before
-  EAL init. A contradictory set (queue and
+  `--dpdk-replication-ip` and `--dpdk-replication-peer-mac` together.
+  Every DPDK node runs them, primary and replica (see Added). A
+  contradictory set (queue and
   port flags together, ports without an address or the reverse, a port or
   the address the client NIC already has, an address outside the client
   NIC's subnet) is refused with an error naming the flag. Without them a
@@ -419,6 +450,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   and went with the feature would break a match in one crate when another
   turned it on. Source-breaking for an exhaustive `match` on `Error`: add
   an arm for it.
+- **`melin_server_runtime::replication::run_receiver_dpdk` takes the
+  replica's dial ports** (`ReplicaDialPorts`, from its DPDK
+  configuration) after the transport. Source-breaking for a direct
+  caller.
 - **`DpdkTransport::connect_to` and `connect_to_with_buffers` return a
   `Result`** instead of panicking when the stack refuses to open the
   socket (an endpoint it cannot address). A replica whose dial is refused
@@ -560,6 +595,13 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   poll thread, and a connection its peer closed or reset in the poll
   that completed its handshake no longer leaves its port without a
   listener for good.
+- **A dropped DPDK transport gives back every mbuf it holds.** Received
+  data a connection had not read stayed out of the NIC's mbuf pool when
+  the transport was dropped with the connection open, as did frames still
+  waiting for a TX burst. Nothing rebuilt a transport on a live queue
+  before, so it cost nothing until a promoted replica in queue or port
+  mode does exactly that (see Added); `DpdkTransport` now aborts its
+  connections, silently, as it drops, and its device frees what it held.
 - **A DPDK node frees a client's slot when the client closes.** The
   client's FIN left the node's socket half-closed, which its stack still
   counts as active, so the connection and its slot were held until the

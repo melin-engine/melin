@@ -27,10 +27,9 @@ use smoltcp::time::Instant;
 use crate::config::{DpdkConfig, NicConfig};
 use crate::eal::Eal;
 use crate::eal_sharing::EalGroup;
+use crate::local_ports::LocalPorts;
 use crate::mac::{MacAddr, PeerMacSource, fmt_mac, resolve_peer_mac};
-use crate::nic::{
-    self, DialProgress, LocalPorts, StackTime, dial_error, dial_progress, wait_for_dial,
-};
+use crate::nic::{self, DialProgress, StackTime, dial_error, dial_progress, wait_for_dial};
 use crate::transport::{DpdkShared, DpdkTransport, MAX_CONNECTIONS, NodeEal};
 
 pub use crate::nic::{NextHop, NicClock};

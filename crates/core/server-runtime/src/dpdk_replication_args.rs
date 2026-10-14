@@ -13,7 +13,8 @@
 use std::net::Ipv4Addr;
 
 use melin_dpdk::{
-    DpdkArgsError, NicConfig, ReplicationNic, ReplicationPorts, SteeringError, parse_mac_flag,
+    DpdkArgsError, DpdkConfig, LocalPorts, NicConfig, ReplicationNic, ReplicationPorts,
+    SteeringError, SteeringPlan, parse_mac_flag,
 };
 
 /// The replication flags, flattened into the node's command line.
@@ -304,32 +305,50 @@ fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix_len: u8) -> bool {
     u32::from(a) & mask == u32::from(b) & mask
 }
 
-/// Refuse a replication mode this build cannot run yet in the node's role,
-/// rather than run it as [`ReplicationNic::Shared`] and leave the operator
-/// believing replication has a queue or a NIC of its own. Checked before
-/// EAL init.
+/// The local ports a DPDK replica dials its primary from: a fresh one per
+/// dial, up the ports from [`Self::FIRST`] and round again from there,
+/// skipping every port the NIC its replication runs on steers by
+/// destination ([`SteeringPlan::destination_ports`]).
 ///
-/// A primary runs every mode. A replica (`--replica-of`, so `replica` is
-/// true) runs shared mode only: in queue and port modes its receiver would
-/// have to run on the replication queue or NIC, which it does not yet.
-// The replica's arm becomes `Ok(())` when a replica runs the split modes.
-pub(crate) fn check_replication_nic_implemented(
-    replication: &ReplicationNic,
-    replica: bool,
-) -> Result<(), String> {
-    let (mode, flags) = match replication {
-        ReplicationNic::Shared => return Ok(()),
-        _ if !replica => return Ok(()),
-        ReplicationNic::Queue(_) => ("on a queue of its own", QUEUE_FLAG.to_owned()),
-        ReplicationNic::Port(_) => (
-            "on a NIC of its own",
-            format!("{PORTS_FLAG}, {IP_FLAG} and {PEER_MAC_FLAG}"),
-        ),
-    };
-    Err(format!(
-        "DPDK replication {mode} is not implemented yet on a replica (--replica-of); omit \
-         {flags} to run its replication on the client queue"
-    ))
+/// In queue mode that is the client port: the NIC tells a replica's link to
+/// its primary from client traffic by port, and the rule sending client
+/// traffic to the client queue outranks the one sending the primary's
+/// segments to the replication queue, so a link dialed from the client port
+/// would have its primary's answers steered to the client queue, which
+/// nothing polls on a replica. In shared and port modes the NIC steers by
+/// no port, and every port of the range is dialed from in turn.
+#[derive(Debug)]
+pub struct ReplicaDialPorts {
+    ports: LocalPorts,
+    /// The ports skipped. A `Vec`: a plan's rules name a port or two, so a
+    /// scan is cheaper than any lookup structure, once per dial.
+    reserved: Vec<u16>,
+}
+
+impl ReplicaDialPorts {
+    /// The first port a replica dials from, as it always has.
+    pub const FIRST: u16 = 40_000;
+
+    /// The dial ports of a replica whose DPDK configuration is `config`.
+    ///
+    /// # Errors
+    /// The configuration has no steering plan; the node refuses it before
+    /// EAL init, so a replica never sees this.
+    pub fn for_node(config: &DpdkConfig) -> Result<Self, SteeringError> {
+        Ok(Self {
+            ports: LocalPorts::from_first(Self::FIRST),
+            reserved: SteeringPlan::for_replication(config)?
+                .destination_ports()
+                .collect(),
+        })
+    }
+
+    /// The port the next dial takes, or `None` when every port of the range
+    /// is steered elsewhere, which no plan comes near.
+    pub fn take(&mut self) -> Option<u16> {
+        let reserved = &self.reserved;
+        self.ports.take(|port| reserved.contains(&port))
+    }
 }
 
 #[cfg(test)]
@@ -680,39 +699,86 @@ mod tests {
         assert_eq!(error.to_string(), DpdkArgsError::NoPorts.to_string());
     }
 
-    /// A primary runs every mode; a replica only shared mode until a
-    /// replica runs the split ones, and the refusal says it is the role.
-    #[test]
-    fn a_primary_runs_every_mode_and_a_replica_only_shared() {
-        let queue = ReplicationNic::Queue(PORTS);
-        let port = ReplicationNic::Port(client());
-        for mode in [&ReplicationNic::Shared, &queue, &port] {
-            assert_eq!(check_replication_nic_implemented(mode, false), Ok(()));
+    /// A replica's DPDK configuration, listening on `client_port`, in
+    /// `replication` mode.
+    fn replica_config(client_port: u16, replication: ReplicationNic) -> DpdkConfig {
+        DpdkConfig {
+            nic: client(),
+            listen_port: client_port,
+            num_queues: 1,
+            replication,
+            ..DpdkConfig::default()
         }
-        assert_eq!(
-            check_replication_nic_implemented(&ReplicationNic::Shared, true),
-            Ok(())
-        );
+    }
 
-        let queue = check_replication_nic_implemented(&queue, true).unwrap_err();
-        assert!(
-            queue.starts_with(
-                "DPDK replication on a queue of its own is not implemented yet on a replica \
-                 (--replica-of)"
-            ),
-            "{queue}"
+    /// Dial ports taken by `ports` over one whole round of the range and a
+    /// little more, in order.
+    fn round(ports: &mut ReplicaDialPorts) -> Vec<u16> {
+        let range = usize::from(u16::MAX - ReplicaDialPorts::FIRST) + 1;
+        (0..range + 2)
+            .map(|_| ports.take().expect("a dial port"))
+            .collect()
+    }
+
+    /// In queue mode a replica never dials from the client port, nor from
+    /// its own replication port, the ports the NIC steers by destination,
+    /// however far round the range its dials go; every other port is
+    /// dialed from once per round.
+    #[test]
+    fn a_queue_mode_replica_never_dials_from_a_port_the_nic_steers() {
+        // A client port and a replication port inside the dial range, as
+        // an operator may choose them.
+        let (client_port, listen) = (40_001, 40_003);
+        let config = replica_config(
+            client_port,
+            ReplicationNic::Queue(ReplicationPorts {
+                listen: Some(listen),
+                primary: Some(9900),
+            }),
         );
-        assert!(queue.contains(QUEUE_FLAG), "{queue}");
-        let port = check_replication_nic_implemented(&port, true).unwrap_err();
-        assert!(
-            port.starts_with(
-                "DPDK replication on a NIC of its own is not implemented yet on a replica"
-            ),
-            "{port}"
-        );
-        for flag in [PORTS_FLAG, IP_FLAG, PEER_MAC_FLAG] {
-            assert!(port.contains(flag), "{port}");
+        let mut ports = ReplicaDialPorts::for_node(&config).expect("a plan");
+        let dialed = round(&mut ports);
+        assert_eq!(dialed[..3], [40_000, 40_002, 40_004]);
+        assert!(!dialed.contains(&client_port));
+        assert!(!dialed.contains(&listen));
+        // One round is every port of the range but the two, the last port
+        // last; then round again from the first.
+        let round_len = usize::from(u16::MAX - ReplicaDialPorts::FIRST) + 1 - 2;
+        assert_eq!(dialed[round_len - 1], u16::MAX);
+        assert_eq!(dialed[round_len..], [40_000, 40_002, 40_004, 40_005]);
+    }
+
+    /// Shared and port modes steer by no port: every port of the range is
+    /// dialed from, the client port included, as replicas always have.
+    #[test]
+    fn shared_and_port_mode_replicas_dial_from_every_port() {
+        for replication in [ReplicationNic::Shared, ReplicationNic::Port(client())] {
+            let config = replica_config(40_001, replication);
+            let mut ports = ReplicaDialPorts::for_node(&config).expect("a plan");
+            let dialed = round(&mut ports);
+            let range = usize::from(u16::MAX - ReplicaDialPorts::FIRST) + 1;
+            let expected: Vec<u16> = (ReplicaDialPorts::FIRST..=u16::MAX)
+                .chain([ReplicaDialPorts::FIRST, ReplicaDialPorts::FIRST + 1])
+                .collect();
+            assert_eq!(dialed.len(), range + 2);
+            assert_eq!(dialed, expected);
         }
+    }
+
+    /// A configuration with no steering plan has no dial ports either.
+    #[test]
+    fn dial_ports_need_a_steering_plan() {
+        let config = replica_config(
+            9876,
+            ReplicationNic::Queue(ReplicationPorts {
+                listen: Some(9876),
+                primary: Some(9877),
+            }),
+        );
+        assert_eq!(
+            ReplicaDialPorts::for_node(&config).unwrap_err(),
+            SteeringError::ReplicationPortIsClientPort { port: 9876 }
+        );
     }
 
     #[test]

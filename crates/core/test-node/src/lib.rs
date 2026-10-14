@@ -20,9 +20,10 @@
 //! starting any of them, so that it can point a replica at its primary
 //! (`replica_of`, `replication_bind`) the same way on both transports; on
 //! DPDK the launcher fills in what the replica needs on top (the
-//! primary's MAC). A primary whose replication runs on a NIC of its own
-//! takes its addresses from [`addrs_with_replication_nic`] instead: on
-//! DPDK that NIC is on the slot's replication seat, a second veth pair.
+//! primary's MAC). A node whose replication runs on a NIC of its own, a
+//! primary or a replica, takes its addresses from
+//! [`addrs_with_replication_nic`] instead: on DPDK that NIC is on the
+//! slot's replication seat, a second veth pair.
 //! Endpoints that are kernel TCP by design (health, admin, events, raft)
 //! are left as the test configures them: under the runner they bind on
 //! the namespace's own loopback.
@@ -149,8 +150,8 @@ pub fn addrs(slot: usize, free_addr: impl FnMut() -> SocketAddr) -> Addrs {
 ///   the slot's replication seat, a veth pair of its own beside the slot's.
 ///   [`start_at`] attaches a device there and gives the node its port and
 ///   IP as its replication NIC. A replica takes [`Addrs::replication`] as
-///   its `replica_of`, and dials it from its own client NIC (a replica on
-///   a NIC of its own is not run yet).
+///   its `replica_of`, and dials it from its replication NIC if it has one
+///   (its own addresses from here too), from its client NIC otherwise.
 pub fn addrs_with_replication_nic(slot: usize, free_addr: impl FnMut() -> SocketAddr) -> Addrs {
     #[cfg(not(feature = "dpdk"))]
     {
@@ -509,7 +510,9 @@ where
 /// On DPDK the node takes `addrs`' slot, which must be free (its last
 /// node stopped or joined), a `replication_bind` must be on the slot's IP,
 /// and a `replica_of` on the runner's network: the launcher fills in the
-/// primary's MAC (`dpdk.peer_mac`) from it.
+/// primary's MAC from it, as `dpdk.peer_mac`, or as
+/// `dpdk_replication.peer_mac` on a node with a replication NIC
+/// ([`addrs_with_replication_nic`]), which dials from there.
 pub fn start_at<A>(
     addrs: &Addrs,
     config: ServerConfig,
@@ -743,8 +746,10 @@ mod dpdk {
 
     /// Detach the slot's device, and its replication seat's when the node
     /// had a replication NIC there (`replication_nic`), which its node has
-    /// closed, so that the next node on the slot can attach them again, and
-    /// free the slot.
+    /// closed, so that the next node on the slot can attach them again,
+    /// bring their links back up should the node have been cut off
+    /// ([`Node::cut_off`]), so that the next node on the slot is reachable
+    /// (a later test of the process included), and free the slot.
     pub(super) fn release(slot: usize, replication_nic: bool) {
         try_release(slot, replication_nic).unwrap_or_else(|e| panic!("{e}"));
     }
@@ -758,8 +763,27 @@ mod dpdk {
         if replication_nic {
             detach(&layout::replication_vdev(slot, &replication_seat(slot).iface).0)?;
         }
+        for iface in node_ifaces(slot, replication_nic) {
+            let port = bridge_port(iface);
+            set_link(&port, true).unwrap_or_else(|e| panic!("bring {port} back up: {e}"));
+        }
         in_use()[slot] = false;
         Ok(())
+    }
+
+    /// The interfaces a node on `slot` has: the slot's, and its
+    /// replication seat's when it has a replication NIC there.
+    fn node_ifaces(slot: usize, replication_nic: bool) -> Vec<&'static str> {
+        let mut ifaces = vec![layout().slot(slot).iface.as_str()];
+        if replication_nic {
+            ifaces.push(replication_seat(slot).iface.as_str());
+        }
+        ifaces
+    }
+
+    /// The bridge-side peer of interface `iface`.
+    fn bridge_port(iface: &str) -> String {
+        format!("{iface}{BRIDGE_PORT_SUFFIX}")
     }
 
     /// Detach `device`, which a node that has returned closed.
@@ -974,7 +998,11 @@ mod dpdk {
                  from melin_test_node::addrs or addrs_with_replication_nic"
             );
         }
-        config.dpdk.peer_mac = config.replica_of.map(|primary| {
+        // The primary's MAC, given to the NIC the replica dials it from:
+        // its replication NIC when it has one (`--dpdk-replication-peer-mac`),
+        // its client NIC otherwise (`--dpdk-peer-mac`). Only that one: the
+        // node must take the MAC from the flag of the NIC it dials on.
+        let primary_mac = config.replica_of.map(|primary| {
             let mac = match primary.ip() {
                 IpAddr::V4(ip) => layout.mac_of(ip),
                 IpAddr::V6(_) => None,
@@ -988,6 +1016,11 @@ mod dpdk {
             })
             .to_owned()
         });
+        if addrs.replication_nic {
+            config.dpdk_replication.peer_mac = primary_mac;
+        } else {
+            config.dpdk.peer_mac = primary_mac;
+        }
 
         let (device, device_args) = layout::vdev(addrs.slot, &slot.iface);
         let port = eal()
@@ -996,8 +1029,8 @@ mod dpdk {
         // The replication seat's device, for a node whose replication has a
         // NIC of its own: its port and IP are that NIC's, everything else
         // the client NIC's (`--dpdk-replication-ports`,
-        // `--dpdk-replication-ip`). No peer MAC: the node does not dial out
-        // on it, its replicas dial it.
+        // `--dpdk-replication-ip`), and on a replica the primary's MAC,
+        // above.
         if addrs.replication_nic {
             let seat = replication_seat(addrs.slot);
             let (repl_device, repl_args) = layout::replication_vdev(addrs.slot, &seat.iface);
@@ -1084,19 +1117,16 @@ mod dpdk {
         /// down, so nothing it sends arrives and nothing reaches it, and
         /// no peer is told. For the deadlines a link's ends keep on a peer
         /// that has gone without a word. The node itself runs on; stop it
-        /// as usual (its last words go nowhere).
+        /// as usual (its last words go nowhere); the links come back up
+        /// when it has returned, for the next node on the slot.
         ///
         /// DPDK only: a kernel-TCP node shares the host's loopback with
         /// every other, so there is no link of its own to cut. A node with
         /// a replication NIC of its own loses both links.
         pub fn cut_off(&self) {
-            let mut ifaces = vec![&layout().slot(self.slot).iface];
-            if self.replication_nic {
-                ifaces.push(&replication_seat(self.slot).iface);
-            }
-            for iface in ifaces {
-                let port = format!("{iface}{BRIDGE_PORT_SUFFIX}");
-                set_link_down(&port).unwrap_or_else(|e| panic!("bring {port} down: {e}"));
+            for iface in node_ifaces(self.slot, self.replication_nic) {
+                let port = bridge_port(iface);
+                set_link(&port, false).unwrap_or_else(|e| panic!("bring {port} down: {e}"));
             }
         }
     }
@@ -1106,10 +1136,10 @@ mod dpdk {
     /// them).
     const BRIDGE_PORT_SUFFIX: &str = "-br";
 
-    /// Clear `IFF_UP` on interface `name`, as `ip link set NAME down` does.
-    /// The runner's user namespace owns the network namespace, so the
-    /// test may.
-    fn set_link_down(name: &str) -> io::Result<()> {
+    /// Set or clear `IFF_UP` on interface `name`, as `ip link set NAME up`
+    /// or `down` does. The runner's user namespace owns the network
+    /// namespace, so the test may.
+    fn set_link(name: &str, up: bool) -> io::Result<()> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
         // SAFETY: `ifreq` is plain old data; all-zero is a valid value
@@ -1139,7 +1169,11 @@ mod dpdk {
             if libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut req) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            req.ifr_ifru.ifru_flags &= !(libc::IFF_UP as libc::c_short);
+            if up {
+                req.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+            } else {
+                req.ifr_ifru.ifru_flags &= !(libc::IFF_UP as libc::c_short);
+            }
             if libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS as _, &req) != 0 {
                 return Err(io::Error::last_os_error());
             }

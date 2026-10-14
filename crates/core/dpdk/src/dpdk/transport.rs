@@ -229,6 +229,7 @@ impl NodeNics {
             }
         };
         let client_plan = SteeringPlan::for_client_nic(config)?;
+        let replication_plan = SteeringPlan::for_replication(config)?;
         let eal = Arc::new(NodeEal::acquire(&config.nic)?);
         // The client group first, as `DpdkShared::init` brings it up: it
         // keeps the pool name of a node with one NIC. Should the
@@ -237,9 +238,7 @@ impl NodeNics {
         let client =
             DpdkShared::init_on(Arc::clone(&eal), EalGroup::First, &config.nic, &client_plan)?;
         let replication = replication_nic
-            .map(|nic| {
-                DpdkShared::init_on(eal, EalGroup::Further, nic, &SteeringPlan::for_nic(nic, 1))
-            })
+            .map(|nic| DpdkShared::init_on(eal, EalGroup::Further, nic, &replication_plan))
             .transpose()
             .map_err(|e| format!("replication NIC: {e}"))?;
         Ok(NodeNics {
@@ -351,6 +350,31 @@ pub struct DpdkTransport {
     /// teardown (e.g. an error-exit from the receiver loop, or graceful
     /// shutdown). Keep it pinned to the end.
     _shared: Arc<DpdkShared>,
+}
+
+/// Gives back every mbuf the transport's sockets still hold, so that a
+/// transport dropped while connections are open (a promoted replica's,
+/// whose queue the replication poll thread then builds a new transport on)
+/// leaks none of its pool.
+///
+/// A zero-copy socket keeps the mbufs of received bytes not yet read, and
+/// returns them only when it is reset, aborted or read: dropping it frees
+/// its buffers but not those mbufs. Each socket is therefore aborted here,
+/// which returns them; no RST goes out, since nothing polls the stack
+/// again. The device then gives back what it holds itself (frames not yet
+/// sent, frames received and not yet taken): see `DpdkDevice`'s `Drop`.
+/// The pool and the ports outlive both, in `_shared`.
+impl Drop for DpdkTransport {
+    fn drop(&mut self) {
+        use smoltcp::socket::AnySocket;
+        // Through the downcast rather than a match on the socket enum: the
+        // enum's variants are smoltcp's features, which the build may unify.
+        for (_, socket) in self.sockets.iter_mut() {
+            if let Some(socket) = tcp::Socket::downcast_mut(socket) {
+                socket.abort();
+            }
+        }
+    }
 }
 
 /// How a connection's received bytes reach its reader.
@@ -566,6 +590,17 @@ impl DpdkShared {
         self.queue_plan.client_queues(self.num_queues)
     }
 
+    /// How many of the group's mbufs are out of its pool: held by its
+    /// queues' rings, by transports (received data not yet read, frames
+    /// not yet sent) and by anything else that took one. Mbufs in a
+    /// per-lcore cache count as in the pool. A diagnostic, and what a test
+    /// checks to see that a dropped transport gave its mbufs back.
+    pub fn mbufs_in_use(&self) -> u32 {
+        // SAFETY: the pool is alive for as long as `self` is (the group
+        // owns it), and the call only reads its counts.
+        unsafe { ffi::rte_mempool_in_use_count(self.mempool_raw) }
+    }
+
     /// Register the calling thread with the EAL this group sits on, as an
     /// lcore of its own, for as long as the registration is held (see
     /// [`LcoreRegistration`]): for a poll thread the node spawns itself,
@@ -714,7 +749,12 @@ impl DpdkTransport {
             tx_queue_limits: vec![MAX_TX_QUEUE_SIZE; MAX_CONNECTIONS],
             clock,
             cached_timestamp: now,
-            poll_count: 0,
+            // One short of a refresh, so the first poll reads the clock: a
+            // transport built long before it is first polled (a replica's
+            // client transport, unread until promotion) would otherwise
+            // take its first polls' frames at its build time, and seed the
+            // neighbours learned from them already expired.
+            poll_count: TIMESTAMP_REFRESH_INTERVAL - 1,
             pending_tx_bytes: 0,
             gateway: config.gateway.zip(config.gateway_mac),
             gateway_seeded_at: now,

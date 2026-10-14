@@ -22,17 +22,15 @@
 //! CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/dpdk/netns-runner.sh" cargo nextest run --profile dpdk -p melin-test-node --features dpdk --test nic_groups
 //! ```
 
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use melin_dpdk::{DpdkConfig, DpdkTransport, NicConfig, NodeNics, ReplicationNic, SocketHandle};
+use common::{LIMIT, dial, exchange, poll_until};
+use melin_dpdk::{DpdkConfig, DpdkTransport, NicConfig, NodeNics, ReplicationNic};
 use melin_test_node::{DpdkSeat, dpdk_slot, dpdk_slots_eal_args};
-
-/// How long any one step may take: generous for a shared CI runner, and
-/// bounded so that a hang fails here, naming the step.
-const LIMIT: Duration = Duration::from_secs(20);
 
 /// The ports the client NIC's and the replication NIC's transports listen
 /// on. Any two would do: the process owns both addresses outright.
@@ -123,25 +121,6 @@ fn two_nic_groups_on_one_eal_each_carry_tcp_on_their_own_port() {
     drop(replication);
 }
 
-/// Poll every transport in `transports` until `done` holds, failing the
-/// test after [`LIMIT`], naming `what`.
-fn poll_until(
-    what: &str,
-    transports: &mut [&mut DpdkTransport],
-    mut done: impl FnMut(&mut [&mut DpdkTransport]) -> bool,
-) {
-    let deadline = Instant::now() + LIMIT;
-    loop {
-        for transport in transports.iter_mut() {
-            transport.poll();
-        }
-        if done(transports) {
-            return;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-    }
-}
-
 /// Dial `to`, `acceptor`'s listener, from `dialer`, whose address is
 /// `dialer_ip`, send [`REQUEST`] and answer it with [`REPLY`], then close
 /// both ends.
@@ -152,55 +131,11 @@ fn round_trip(
     to: SocketAddrV4,
 ) {
     // Any port: the dialer has no other connection.
-    let local_port = 40_000;
-    // As a replica dials its primary: the peer's MAC seeded, not resolved.
-    assert_eq!(
-        dialer.seed_peer_neighbor(*to.ip()),
-        melin_dpdk::PeerMacSource::Supplied
-    );
-    let dialed = dialer
-        .connect_to(*to.ip(), to.port(), local_port)
-        .unwrap_or_else(|e| panic!("dial {to}: {e:?}"));
-    let mut accepted = Vec::new();
-    poll_until(
-        &format!("the connection to {to}"),
-        &mut [&mut *dialer, &mut *acceptor],
-        |transports| {
-            accepted.extend(transports[1].take_accepted());
-            !accepted.is_empty() && transports[0].is_connected(dialed)
-        },
-    );
-    assert_eq!(accepted.len(), 1, "one connection dialed");
-    let accepted = accepted.remove(0);
-    assert_eq!(accepted.listen_port, to.port());
-    assert_eq!(accepted.peer, SocketAddr::from((dialer_ip, local_port)));
-
-    exchange(dialer, dialed, acceptor, accepted.handle, REQUEST);
-    exchange(acceptor, accepted.handle, dialer, dialed, REPLY);
+    let (dialed, accepted) = dial(dialer, acceptor, dialer_ip, to, 40_000);
+    exchange(dialer, dialed, acceptor, accepted, REQUEST);
+    exchange(acceptor, accepted, dialer, dialed, REPLY);
     dialer.close(dialed);
-    acceptor.close(accepted.handle);
-}
-
-/// Send `message` from `from`'s connection to `to`'s, and check that it
-/// arrives whole.
-fn exchange(
-    from: &mut DpdkTransport,
-    sender: SocketHandle,
-    to: &mut DpdkTransport,
-    receiver: SocketHandle,
-    message: &[u8],
-) {
-    assert!(from.queue_send(sender, message), "queue {message:?}");
-    let mut received = Vec::new();
-    poll_until(
-        &format!("{:?}", String::from_utf8_lossy(message)),
-        &mut [&mut *from, &mut *to],
-        |transports| {
-            transports[1].recv_into_vec(receiver, &mut received);
-            received.len() >= message.len()
-        },
-    );
-    assert_eq!(received, message);
+    acceptor.close(accepted);
 }
 
 /// Accept a kernel-TCP client on `transport`'s listener at `addr`, from

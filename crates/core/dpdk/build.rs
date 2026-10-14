@@ -190,6 +190,8 @@ fn generate_bindings() {
         .allowlist_function("rte_eal_hotplug_remove")
         .allowlist_function("rte_eth_dev_get_port_by_name")
         .allowlist_function("rte_pktmbuf_pool_create")
+        // How many of a pool's mbufs are out of it (`DpdkShared::mbufs_in_use`).
+        .allowlist_function("rte_mempool_in_use_count")
         .allowlist_function("rte_eth_dev_configure")
         .allowlist_function("rte_eth_dev_count_avail")
         .allowlist_function("rte_eth_dev_info_get")

@@ -1564,12 +1564,18 @@ impl<A: Application> DpdkReplicationDriver<A> {
 /// fsync-then-ack-then-replay pattern. Only the I/O primitives differ.
 ///
 /// `transport` is borrowed, not consumed: on a promotion the node goes on
-/// to serve as a DPDK primary on the same transport. Every session this
-/// loop opens is reset before it returns, so the caller gets the
-/// transport back holding no connection of the receiver's.
+/// to serve as a DPDK primary, on the same transport in shared mode, and in
+/// queue and port modes on the client transport beside it, this one being
+/// dropped for the replication poll thread to build its own on the same
+/// queue. Every session this loop opens is reset before it returns, so the
+/// caller gets the transport back holding no connection of the receiver's.
+///
+/// Each dial to the primary takes its local port from `dial_ports`, which
+/// skips the ports `transport`'s NIC steers elsewhere.
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver_dpdk<A>(
     transport: &mut melin_dpdk::DpdkTransport,
+    mut dial_ports: super::ReplicaDialPorts,
     primary_ip: std::net::Ipv4Addr,
     primary_port: u16,
     signing_key: &ed25519_dalek::SigningKey,
@@ -1634,9 +1640,6 @@ where
     // Reusable buffers — survive across reconnections.
     let mut send_buf = Vec::with_capacity(64);
     let mut recv_buf: Vec<u8> = Vec::with_capacity(4096);
-    // Ephemeral port counter for outbound connections. Each reconnect uses
-    // a different local port to avoid smoltcp TIME_WAIT conflicts.
-    let mut local_port: u16 = 40000;
 
     // Live pipeline state — built once on first connect (or after a snapshot
     // transfer), persists across `Disconnected` reconnects so we don't pay
@@ -1765,8 +1768,21 @@ where
         const REPL_RX_BUF: usize = 512 * 1024;
         const REPL_TX_BUF: usize = 64 * 1024;
         const REPL_TX_QUEUE: usize = 64 * 1024;
-        let dial_port = local_port;
-        local_port = local_port.wrapping_add(1).max(40000);
+        // A different local port on every dial, so that a reconnect is
+        // never taken for a connection the primary still holds (or one in
+        // TIME_WAIT here), and never one the NIC steers elsewhere.
+        let Some(dial_port) = dial_ports.take() else {
+            // Unreachable with any steering plan (its rules name a port or
+            // two of the range's thousands): a bug, reported and retried
+            // rather than run on a port whose answers go elsewhere.
+            error!(
+                backoff_secs = backoff.as_secs(),
+                "no local port left to dial the primary from (DPDK): the NIC steers every \
+                 one elsewhere — retrying"
+            );
+            sleep_then_double_backoff(&mut backoff, shutdown, promote);
+            continue;
+        };
         let handle = match transport.connect_to_with_buffers(
             primary_ip,
             primary_port,

@@ -77,11 +77,11 @@ pub use queue_counters::{QueueCounters, packets_moved};
 mod args;
 #[cfg(feature = "clap")]
 pub use args::{DpdkArgs, DpdkArgsError, parse_mac_flag};
-// The client NIC handle's clock, local ports, dial wait and stream I/O are
-// TCP-stack logic, tested over an in-memory wire on any host; the handle
-// itself is in the gated `dpdk` module, and is their only caller, so they
-// are compiled for it and for the tests. So is `dial_addr`, whose callers
-// all dial over a NIC.
+// The client NIC handle's clock, dial wait and stream I/O are TCP-stack
+// logic, tested over an in-memory wire on any host; the handle itself is in
+// the gated `dpdk` module, and is their only caller, so they are compiled
+// for it and for the tests. So is `dial_addr`, whose callers all dial over
+// a NIC.
 #[cfg(any(test, feature = "dpdk-sys"))]
 mod nic;
 #[cfg(feature = "dpdk-sys")]
@@ -93,6 +93,11 @@ pub use nic::dial_addr;
 // the tests.
 #[cfg(any(test, feature = "dpdk-sys"))]
 mod listen_backlog;
+// Ungated, though the handle is their other user: a node's replica dials
+// along a range of local ports too, mapped from its configuration in any
+// build.
+mod local_ports;
+pub use local_ports::LocalPorts;
 #[cfg(test)]
 mod test_wire;
 

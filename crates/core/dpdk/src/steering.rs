@@ -236,7 +236,8 @@ impl SteeringPlan {
     ///    port, so a client whose ephemeral port happens to be that port
     ///    still reaches the client queue. The reverse collision, the
     ///    replica dialing its primary from the client port, the replica
-    ///    avoids by choosing its own dial port.
+    ///    avoids: it dials from no port a rule matches as a destination
+    ///    ([`Self::destination_ports`]).
     /// 2. TCP to the node's own replication port → [`REPLICATION_QUEUE`]:
     ///    its replicas' links, as a primary or once promoted; and, on a
     ///    replica, TCP from its primary's replication port →
@@ -266,6 +267,33 @@ impl SteeringPlan {
                 Self::replication_split(&config.nic, config.listen_port, config.num_queues, *ports)
             }
         }
+    }
+
+    /// The plan of the NIC a node's replication runs on: in
+    /// [`ReplicationNic::Port`] mode the replication NIC's, brought up
+    /// with one queue pair ([`Self::for_nic`]); otherwise the client NIC's
+    /// ([`Self::for_client_nic`]), whose queue 0, or queue 1 in
+    /// [`ReplicationNic::Queue`] mode, carries replication.
+    ///
+    /// Refused as [`Self::for_client_nic`] refuses the client NIC's.
+    pub fn for_replication(config: &DpdkConfig) -> Result<Self, SteeringError> {
+        match &config.replication {
+            ReplicationNic::Port(nic) => Ok(Self::for_nic(nic, 1)),
+            ReplicationNic::Shared | ReplicationNic::Queue(_) => Self::for_client_nic(config),
+        }
+    }
+
+    /// The TCP destination ports this plan's rules match on, in rule
+    /// order, a port given once per rule naming it.
+    ///
+    /// A connection dialed out on this NIC must not take one of them as
+    /// its local port: the NIC would steer the replies, addressed to that
+    /// port, by the rule matching it, to whichever queue that rule names,
+    /// rather than to the queue the connection was dialed from. In queue
+    /// mode a replica dialing its primary from the client port would have
+    /// the primary's segments steered to the client queue.
+    pub fn destination_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        self.rules.iter().filter_map(|rule| rule.tcp_dst_port)
     }
 
     fn replication_split(
@@ -791,6 +819,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Replication runs on the client NIC but in port mode, whose
+    /// replication NIC is brought up as a NIC of one queue.
+    #[test]
+    fn replication_runs_on_the_client_nic_but_in_port_mode() {
+        for replication in [
+            ReplicationNic::Shared,
+            queue_mode(Some(LISTEN_PORT), Some(PRIMARY_PORT)),
+        ] {
+            for peer_ip in [None, Some(PEER_IP)] {
+                let config = config(peer_ip, replication.clone());
+                assert_eq!(
+                    SteeringPlan::for_replication(&config),
+                    SteeringPlan::for_client_nic(&config)
+                );
+            }
+        }
+        let replication_nic = NicConfig {
+            ip_addr: Ipv4Addr::new(10, 0, 0, 2),
+            peer_ip: None,
+            ..NicConfig::default()
+        };
+        // The client NIC's bifurcated capture is not the replication NIC's.
+        let port_mode = config(Some(PEER_IP), ReplicationNic::Port(replication_nic.clone()));
+        assert_eq!(
+            SteeringPlan::for_replication(&port_mode),
+            Ok(SteeringPlan::for_nic(&replication_nic, 1))
+        );
+        // Refused as the client NIC's plan is.
+        let refused = config(None, queue_mode(Some(CLIENT_PORT), None));
+        assert_eq!(
+            SteeringPlan::for_replication(&refused),
+            Err(SteeringError::ReplicationPortIsClientPort { port: CLIENT_PORT })
+        );
+    }
+
+    /// The ports a dial on the NIC must not take: those its rules steer as
+    /// a destination, the client port first on a replica in queue mode.
+    #[test]
+    fn destination_ports_are_the_rules_destination_ports() {
+        for peer_ip in [None, Some(PEER_IP)] {
+            let replica = plan(peer_ip, queue_mode(Some(LISTEN_PORT), Some(PRIMARY_PORT)));
+            assert_eq!(
+                replica.destination_ports().collect::<Vec<_>>(),
+                [CLIENT_PORT, LISTEN_PORT]
+            );
+            let replica = plan(peer_ip, queue_mode(None, Some(PRIMARY_PORT)));
+            assert_eq!(
+                replica.destination_ports().collect::<Vec<_>>(),
+                [CLIENT_PORT]
+            );
+            let primary = plan(peer_ip, queue_mode(Some(LISTEN_PORT), None));
+            assert_eq!(
+                primary.destination_ports().collect::<Vec<_>>(),
+                [LISTEN_PORT]
+            );
+            // Shared and port modes steer by no port.
+            for replication in [ReplicationNic::Shared, ReplicationNic::Port(nic(None))] {
+                let config = config(peer_ip, replication);
+                for plan in [
+                    SteeringPlan::for_client_nic(&config),
+                    SteeringPlan::for_replication(&config),
+                ] {
+                    assert_eq!(plan.expect("a plan").destination_ports().count(), 0);
+                }
+            }
+        }
+    }
+
+    /// A dial whose local port no rule matches as a destination is answered
+    /// on the queue it was dialed from: on a replica in queue mode, the
+    /// replication queue, whatever its port, where the client port would
+    /// have the answers steered to the client queue.
+    #[test]
+    fn a_dial_from_a_port_no_rule_steers_is_answered_on_its_own_queue() {
+        let plan = plan(None, queue_mode(Some(LISTEN_PORT), Some(PRIMARY_PORT)));
+        let reserved: Vec<u16> = plan.destination_ports().collect();
+        let from_primary = |dst_port| Segment {
+            src_ip: OTHER_IP,
+            dst_ip: OWN_IP,
+            src_port: PRIMARY_PORT,
+            dst_port,
+        };
+        let mut ports = crate::LocalPorts::from_first(CLIENT_PORT - 1);
+        for _ in 0..4 {
+            let port = ports.take(|p| reserved.contains(&p)).expect("a local port");
+            assert_ne!(port, CLIENT_PORT);
+            assert_eq!(steer(&plan, from_primary(port)), Some(REPLICATION_QUEUE));
+        }
+        // What the exclusion prevents.
+        assert_eq!(steer(&plan, from_primary(CLIENT_PORT)), Some(CLIENT_QUEUE));
     }
 
     /// Installed highest priority first.

@@ -136,9 +136,9 @@ IP. On a replica, a rule matching the client port, destination → queue 0
 source-port rule, so a client whose ephemeral port happens to equal the
 primary's replication port still lands on queue 0. The mirror case, the
 replica dialing its primary from the client port, looks the same to the
-NIC: **step 6's replica must not dial from the client port** (today's
-dial loop starts at 40000 and wraps there, so a client port in that range
-can collide).
+NIC: **a replica must not dial from the client port** (the dial loop
+starts at 40000 and wraps there, so a client port in that range could
+collide; step 6 made it skip every port the plan steers by destination).
 
 Priorities are numbered densely from 0 and only as many are used as the
 rules need: two in queue mode, three on an isolated replica. mlx5's root
@@ -165,20 +165,107 @@ devices (ENA: both PCI addresses; the runner: both vdevs). `shared` and
 In `queue` and `port` modes, a replica brings up both transports at boot:
 - **The replication transport** carries its receiver. The replica dials
   the primary's replication address from its own replication NIC or
-  queue, with `--replica-of` naming that address.
+  queue, with `--replica-of` naming that address, and the primary's MAC
+  seeded from `--dpdk-replication-peer-mac` in port mode (the NIC it dials
+  from), `--dpdk-peer-mac` in queue mode.
 - **The client transport** stays unlistening and unpolled until promotion.
   Clients do not connect to replicas. What arrives meanwhile is dropped
   at the RX ring.
 
 At promotion, the client transport gains the client listener and becomes
-the client poll thread's. The replication transport gains the replication
-listener and moves to the `repl-poll` thread with a new driver. Each
-transport keeps its role in both directions, so promotion swaps no
-queues.
+the client poll thread's. The replication transport is dropped on the
+receiver's thread, and the `repl-poll` thread builds a transport of its
+own on the same queue, with the replication listener and a new driver,
+exactly as at a primary's boot (step 6 corrected "moves to the
+`repl-poll` thread": a transport never crosses threads). Each queue keeps
+its role in both directions, so promotion swaps no queues.
 
 How a surviving replica finds the new primary is unchanged and outside
 this work. In `port` mode, the address it is given must be the new
 primary's replication address.
+
+What step 6 found, and settled:
+
+- **An unpolled client queue costs nothing a polled one does not hold.**
+  Its RX ring keeps the descriptors it was set up with, polled or not; once
+  full, the NIC drops what else arrives for it (on mlx5 that is believed
+  to be a per-queue drop, `rx_out_of_buffer`, not a pause of the port:
+  check on the rig that queue 1 keeps flowing on a replica whose queue 0
+  is flooded). No mbuf leaves the pool for it beyond the ring's. At
+  promotion the client poll thread's first polls take whatever stale
+  frames the ring held: old SYNs, answered and then reset by their
+  long-gone clients, and old ARP requests, answered late. They are taken
+  at the stack's time as of the promotion, not the transport's build: a
+  transport's first poll reads the clock (it used to wait for the
+  periodic refresh, so a neighbour learned from those frames was seeded
+  already expired, and its re-seeding held off by the device's cooldown).
+- **Nothing the replica needs arrives only on the unpolled queue**, on the
+  same subnet. Its dial needs no ARP reply (the primary's MAC is seeded,
+  as it always was: ARP is not relied on, for SR-IOV's sake), and a DPDK
+  primary learns the replica's MAC from its frames (the device's MAC
+  learning, not smoltcp, which only refreshes entries it already has),
+  re-learned for as long as the link carries heartbeats. A **kernel-TCP
+  primary** does not: Linux makes no neighbour entry from an incoming
+  SYN, and with the default `arp_accept=0` ignores the replica's
+  gratuitous ARP, so it ARPs for the replica. In port mode and shared
+  mode the replica's polled transport answers; in queue mode the request
+  lands on the unpolled queue 0 and the link never comes up. A
+  queue-mode DPDK replica of a kernel-TCP primary therefore needs a
+  static neighbour entry for the replica on the primary (or
+  `arp_accept=1` there, to take the gratuitous ARP). Reasoned from the
+  kernel's behaviour, not yet run on the rig (a kernel-TCP primary with
+  an empty ARP cache and a queue-mode replica would confirm it); step 8
+  must state it. Two further consequences, both in queue mode
+  only, where queue 0 is the port's default queue: ARP requests for the
+  replica's address go unanswered until promotion, so a **router between a
+  queue-mode replica and its primary cannot resolve the replica** unless
+  it has a static entry (or learns from the gratuitous ARP each transport
+  sends at boot); and in both split modes a **client connecting to a
+  replica sees no answer** rather than the refusal a shared-mode DPDK
+  replica sends (its stack is what refuses, and it is not polled), as a
+  kernel-TCP replica leaves it waiting. Port mode's replication NIC is
+  polled from boot and answers ARP for its own address. Neither is fixed
+  here: a replica could poll its client queue from the receiver's thread
+  (on every step of the receiver's loops, the replica's ack path), or an
+  ARP rule could send ARP to queue 1 on a replica; both are larger than
+  their gap, which the operator docs (step 8) must state instead.
+- **A dropped transport gave back too little.** A zero-copy socket keeps
+  the mbufs of received data not yet read until it is read, reset or
+  aborted, and dropping it did none of these; nor did the device free the
+  frames still queued for a TX burst. Harmless when the process exits
+  next, a leak once a transport is rebuilt on its queue. `DpdkTransport`
+  now aborts its sockets on drop, and `DpdkDevice` frees what it holds.
+  The receiver already resets every link it opened before it returns, so
+  the leak needed a receiver that forgot one; the test
+  (`melin-test-node`'s `transport_rebuild`) drops a transport with data
+  unread and finds the pool whole. That covers the socket abort only: the
+  device's two freeing loops (frames left in its TX batch, received
+  frames not yet handed to the stack) are untested, as both are empty
+  whenever a poll loop has finished, which is when a transport is
+  dropped, and af_packet offers no deterministic way to stage a frame
+  there; they are guards for a drop mid-poll.
+- **The replica must not dial from a port the NIC steers by destination**
+  (the step 4 correction). The dial loop's local ports (40000 up, wrapping
+  back to 40000) now skip every TCP destination port of the steering
+  plan of the NIC replication runs on (`SteeringPlan::for_replication`,
+  `destination_ports`): in queue mode the client port, and the node's own
+  replication port, which steers to the right queue but is not the dial's
+  to take. Shared and port modes steer by no port, and dial as before.
+- **A promoted queue-mode replica keeps its replica's rules.** Rules are
+  installed once, at boot, so the client-port rule and the rule on the
+  old primary's replication port stay. Both are harmless to a primary: the
+  client-port rule sends to the queue the default RSS would, and the
+  source-port rule outranks no client (the client-port rule is above it)
+  and matches nothing else a primary is sent but replication, which it
+  sends to the replication queue. The driver and the `repl-poll` placement
+  are the boot-time primary's: the same function builds them, from the
+  same configuration.
+- **Mixed clusters work both ways.** A split-mode replica dials the
+  primary's replication address whatever mode the primary runs: a
+  shared-mode primary's is on its client NIC, and is reached from the
+  replica's replication queue or NIC as any address is. In port mode the
+  replica's replication NIC dials it with
+  `--dpdk-replication-peer-mac` naming that primary's client NIC.
 
 ## Order of work
 
@@ -208,8 +295,16 @@ unchanged after every step.
    slot (`veth-setup.py`, the test-node layout), and the existing
    replication cases run in `port` mode as well as `shared`.
 6. **Replica and promotion.** Both transports at boot, the receiver on the
-   replication one, and promotion handing each transport to its thread.
-   Netns runner: the failover cases in `port` mode.
+   replication one, and promotion handing each queue to its thread (the
+   client transport to the client poll thread; the replication one
+   dropped, and rebuilt by `repl-poll`). The dial-port exclusion, a
+   transport's drop giving back its mbufs, and the replica refusal of
+   step 1 removed. Netns runner: the failover cases in `port` mode (raft
+   auto-promotion and the operator's `PROMOTE`, the primary in `port` and
+   in `shared` mode, the other replica rejoining the promoted node), a
+   `queue`-mode replica refused on one queue pair, and a transport rebuilt
+   on its queue. Hardware-only: a `queue`-mode replica end to end (the
+   rules, queue 1's receiver, the unpolled queue 0).
 7. **Bench suite.** `DPDK_REPLICATION=shared,queue[,port]` runs each value
    as its own pass of the DPDK transport, from one build. Results are
    named `dpdk-shared`, `dpdk-queue`, and so on. `port` mode reads
@@ -229,7 +324,12 @@ unchanged after every step.
    `dpdk-dumpcap`, `dpdk-pdump`): `repl-poll` registers with EAL as an
    lcore, and DPDK turns multi-process off for a primary that registers
    one. The node's per-queue counters on `/metrics` take the place of
-   `dpdk-proc-info` for checking steering.
+   `dpdk-proc-info` for checking steering. And they must say what a
+   replica in `queue` or `port` mode does differently (step 6): a client
+   connecting to it is left unanswered rather than refused (the sentence
+   in `replication.md` step 6 qualified), and in `queue` mode it answers
+   no ARP until promoted, so its primary must reach it without a router
+   resolving it.
 
 ## The measurement
 
@@ -264,3 +364,11 @@ cost is one more spinning core per node.
 - **Driver and transport `Send`.** The driver ran on its own thread
   before April. The transport is built on the thread that polls it, so it
   never crosses a thread boundary.
+- **A `queue`-mode replica behind a router** answers no ARP until it is
+  promoted (see "Replica and promotion"). Check whether the rig's
+  replicas reach their primary through one; if a deployment needs it,
+  steer ARP to queue 1 on a replica, or poll queue 0 from the receiver's
+  thread.
+- **mlx5 with an unpolled queue**: confirm on the rig that a full queue 0
+  drops per queue (`rx_out_of_buffer`) and never pauses the port, so a
+  replica's queue 1 keeps flowing under a client flood to its address.

@@ -1,6 +1,5 @@
 //! The part of the client's NIC handle that needs no NIC: the stack's
-//! clock as the caller drives it, the local ports dials take, the wait
-//! for a dial to be answered, what a stream's send and receive do with a
+//! clock as the caller drives it, the wait for a dial to be answered, what a stream's send and receive do with a
 //! socket, and how the handle's EAL arguments and errors read.
 //!
 //! Plain smoltcp and std with no libdpdk in it, so it is tested on every
@@ -160,58 +159,6 @@ impl StackTime {
                 .max(self.base_micros.saturating_add(elapsed));
         }
         self.last_micros
-    }
-}
-
-/// The first port of the IANA ephemeral range, where dials take their
-/// local ports.
-const EPHEMERAL_FIRST: u16 = 49_152;
-/// Where in the range a process starts: one of this many ports, picked
-/// from the process ID, so that a process restarted on the same host does
-/// not dial from the four-tuple its predecessor's connection may still
-/// hold on the node. The shm-proxy and the exchange's bench have always
-/// started there.
-const EPHEMERAL_SPREAD: u32 = 8_192;
-
-/// Local ports for dials: a fresh one per socket, not per process.
-///
-/// A node may still hold a connection whose close it has not yet taken in
-/// (or that was never closed), and a reconnect from that connection's
-/// four-tuple would be taken for it. Each dial therefore takes the next port
-/// along the ephemeral range, wrapping at its end and skipping any port an
-/// open stream holds, so a port comes round again only after the whole
-/// range has been dialed from.
-#[derive(Debug)]
-pub(crate) struct LocalPorts {
-    next: u16,
-}
-
-impl LocalPorts {
-    /// Ports starting at a point picked from `seed`, the process ID.
-    pub(crate) fn starting_from(seed: u32) -> Self {
-        // In range by construction: the spread is under the range's size.
-        let offset = (seed % EPHEMERAL_SPREAD) as u16;
-        Self {
-            next: EPHEMERAL_FIRST + offset,
-        }
-    }
-
-    /// The next port no open stream holds, or `None` if every port of the
-    /// range is held.
-    pub(crate) fn take(&mut self, in_use: impl Fn(u16) -> bool) -> Option<u16> {
-        // Every port of the range once: `u16::MAX` is its last port.
-        for _ in EPHEMERAL_FIRST..=u16::MAX {
-            let port = self.next;
-            self.next = if port == u16::MAX {
-                EPHEMERAL_FIRST
-            } else {
-                port + 1
-            };
-            if !in_use(port) {
-                return Some(port);
-            }
-        }
-        None
     }
 }
 
@@ -627,45 +574,6 @@ mod tests {
         let on_origin = u64::try_from(clock.origin().elapsed().as_nanos()).unwrap();
         let after = clock.now_ns();
         assert!(before <= on_origin && on_origin <= after);
-    }
-
-    // --- Local ports --------------------------------------------------------
-
-    #[test]
-    fn the_first_port_is_picked_from_the_process_id() {
-        // As the shm-proxy and the exchange's bench always picked theirs.
-        let seed = 123_456;
-        let mut ports = LocalPorts::starting_from(seed);
-        assert_eq!(ports.take(|_| false), Some(49_152 + (seed % 8_192) as u16));
-        let mut highest = LocalPorts::starting_from(EPHEMERAL_SPREAD - 1);
-        assert_eq!(highest.take(|_| false), Some(49_152 + 8_191));
-    }
-
-    /// A reconnect never reuses the four-tuple of the connection before it.
-    #[test]
-    fn every_dial_takes_a_fresh_port() {
-        let mut ports = LocalPorts::starting_from(7);
-        let first = ports.take(|_| false).expect("a port");
-        let second = ports.take(|_| false).expect("a port");
-        let third = ports.take(|_| false).expect("a port");
-        assert_eq!(second, first + 1);
-        assert_eq!(third, first + 2);
-    }
-
-    #[test]
-    fn ports_wrap_at_the_end_of_the_range_and_skip_those_in_use() {
-        let mut ports = LocalPorts { next: u16::MAX - 1 };
-        assert_eq!(ports.take(|_| false), Some(u16::MAX - 1));
-        assert_eq!(ports.take(|p| p == u16::MAX), Some(EPHEMERAL_FIRST));
-        assert_eq!(ports.take(|_| false), Some(EPHEMERAL_FIRST + 1));
-    }
-
-    #[test]
-    fn a_range_held_entirely_has_no_port() {
-        let mut ports = LocalPorts::starting_from(0);
-        assert_eq!(ports.take(|_| true), None);
-        // And the range is still served once a port frees up.
-        assert_eq!(ports.take(|p| p != 60_000), Some(60_000));
     }
 
     // --- Dials ---------------------------------------------------------------
