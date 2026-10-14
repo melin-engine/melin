@@ -233,15 +233,17 @@ pub(crate) fn ring_setup_error(stage: &str, entries: u32, err: io::Error) -> io:
     }
 }
 
-/// Wait for a worker thread's startup report: `Ok` once it holds its
-/// io_uring instance, the creation error otherwise.
+/// Wait for a worker thread's startup report: `Ok` once it holds what it
+/// needs to run (its io_uring instance; for the replication poll thread,
+/// its listening transport, whose packet counts it hands back as `T`), the
+/// error that kept it from starting otherwise.
 ///
 /// A worker that dies before reporting (a panic during setup) drops its
 /// sender, which ends the wait with an error rather than a hang.
-pub(crate) fn await_startup(
+pub(crate) fn await_startup<T>(
     stage: &str,
-    report: &std::sync::mpsc::Receiver<io::Result<()>>,
-) -> io::Result<()> {
+    report: &std::sync::mpsc::Receiver<io::Result<T>>,
+) -> io::Result<T> {
     match report.recv() {
         Ok(result) => result,
         Err(std::sync::mpsc::RecvError) => Err(io::Error::other(format!(

@@ -6,7 +6,7 @@ pub mod nic_handle;
 pub mod port;
 pub mod transport;
 
-pub use eal::{Eal, EalError};
+pub use eal::{Eal, EalError, LcoreRegisterError, LcoreRegistration};
 pub use mempool::{Mempool, MempoolError};
 pub use nic_handle::{NextHop, NicClock, NicHandle, NicStream, StreamId};
 pub use port::{Port, PortError};

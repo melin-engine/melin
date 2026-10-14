@@ -6,8 +6,10 @@
  * that get compiled and linked into the Rust binary.
  */
 
+#include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_flow.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 
@@ -341,4 +343,25 @@ int dpdk_pin_rss_reta(uint16_t port_id, uint16_t queue) {
     ret = rte_eth_dev_rss_reta_update(port_id, conf, info.reta_size);
     free(conf);
     return ret;
+}
+
+/* Register the calling thread with EAL as a non-EAL lcore, so that it has
+ * an lcore id and with it a mempool cache of its own. Its cpuset is read
+ * from the thread's affinity, so call it once the thread is pinned.
+ *
+ * Returns 0 on success, or rte_errno (positive) on failure: ENOMEM when
+ * every lcore id is taken, EINVAL before EAL init or when multi-process
+ * is in use (DPDK 22.11, eal_common_thread.c). rte_errno is a per-lcore
+ * variable, which is why this is not left to the bindings. */
+int dpdk_thread_register(void) {
+    if (rte_thread_register() == 0) {
+        return 0;
+    }
+    return rte_errno;
+}
+
+/* The calling thread's lcore id (rte_lcore_id(), an inline read of a
+ * per-thread variable), or LCORE_ID_ANY when it has none. */
+unsigned int dpdk_lcore_id(void) {
+    return rte_lcore_id();
 }

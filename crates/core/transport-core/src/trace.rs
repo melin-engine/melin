@@ -477,9 +477,114 @@ pub fn register_stage(_name: &'static str) -> StageRecorder {
     StageRecorder
 }
 
+/// A busy-polling loop's iteration-time histogram, recorded over the
+/// iterations that did work only. Idle iterations would otherwise drown the
+/// percentiles in ~100ns samples; what we want is "how long does a poll
+/// cycle take when there's actual work to do", which is the cycle an
+/// in-flight request, or a replication batch, experiences. One per loop:
+/// the DPDK client poll loop's, and the replication poll thread's beside
+/// it.
+#[cfg(feature = "latency-trace")]
+pub struct WorkIterations {
+    recorder: StageRecorder,
+    /// When the iteration under way began. Nanoseconds from
+    /// [`mono_trace_ns`], as the recorder takes them.
+    start_ns: u64,
+    /// When the recorder was last flushed. A busy-polling thread never
+    /// idles, but it stops *recording* as soon as traffic stops, which is
+    /// enough to strand its samples in the thread-local buffer (see the
+    /// module docs), so the flush is paced here. Nanoseconds rather than
+    /// `Instant` so the pacing reuses the read the iteration's end already
+    /// takes.
+    last_flush_ns: u64,
+}
+
+#[cfg(feature = "latency-trace")]
+impl WorkIterations {
+    /// Record into `recorder` (a stage's, from [`register_stage`]), and
+    /// begin the first iteration.
+    pub fn new(recorder: StageRecorder) -> Self {
+        let now = mono_trace_ns();
+        WorkIterations {
+            recorder,
+            start_ns: now,
+            last_flush_ns: now,
+        }
+    }
+
+    /// End the iteration under way and begin the next: its time is
+    /// recorded when it did `work`, unless shutdown has been observed
+    /// (which matches the gate on the journal / matching / response stages
+    /// and keeps diagnostic numbers comparable across runs). Flushes the
+    /// recorder every [`IDLE_FLUSH_INTERVAL`], and returns whether it did,
+    /// so that the loop flushes its other recorders with it.
+    pub fn end(&mut self, work: bool, shutdown: &std::sync::atomic::AtomicBool) -> bool {
+        let now = mono_trace_ns();
+        if work && !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            self.recorder.record_elapsed(self.start_ns, now);
+        }
+        self.start_ns = now;
+        let interval_ns = IDLE_FLUSH_INTERVAL.as_nanos() as u64;
+        if now.saturating_sub(self.last_flush_ns) < interval_ns {
+            return false;
+        }
+        self.last_flush_ns = now;
+        self.recorder.flush();
+        true
+    }
+}
+
 #[cfg(all(test, feature = "latency-trace"))]
 mod tests {
     use super::*;
+
+    /// Only the iterations that did work, before shutdown, are recorded.
+    #[test]
+    fn work_iterations_record_work_before_shutdown_only() {
+        use std::sync::atomic::AtomicBool;
+
+        let reg = StatsRegistry::new();
+        {
+            let mut iterations = WorkIterations::new(reg.register("test::work_iterations"));
+            let running = AtomicBool::new(false);
+            let stopping = AtomicBool::new(true);
+            iterations.end(true, &running);
+            iterations.end(false, &running);
+            iterations.end(true, &running);
+            iterations.end(true, &stopping);
+            // Dropped: the recorder ships its samples.
+        }
+        let snaps = reg.snapshot_all();
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::work_iterations")
+            .expect("stage registered");
+        assert_eq!(stage.samples, 2);
+    }
+
+    /// The flush is paced: not before `IDLE_FLUSH_INTERVAL` has passed,
+    /// then once, and a snapshot taken while the loop still holds its
+    /// recorder sees the flushed samples.
+    #[test]
+    fn work_iterations_flush_once_an_interval() {
+        use std::sync::atomic::AtomicBool;
+
+        let reg = StatsRegistry::new();
+        let mut iterations = WorkIterations::new(reg.register("test::work_iterations_flush"));
+        let running = AtomicBool::new(false);
+        assert!(!iterations.end(true, &running), "too soon to flush");
+        std::thread::sleep(IDLE_FLUSH_INTERVAL);
+        assert!(iterations.end(false, &running), "an interval has passed");
+        assert!(!iterations.end(false, &running), "just flushed");
+
+        let snaps = reg.snapshot_all();
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::work_iterations_flush")
+            .expect("stage registered");
+        assert_eq!(stage.samples, 1, "flushed, with the recorder still held");
+        drop(iterations);
+    }
 
     // SyncHistogram caveat for tests: `refresh` waits for active
     // recorders to acknowledge the phase shift via their next

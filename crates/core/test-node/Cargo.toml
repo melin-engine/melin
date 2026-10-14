@@ -59,3 +59,18 @@ required-features = ["dpdk"]
 name = "queue_split_one_queue"
 path = "tests/queue_split_one_queue.rs"
 required-features = ["dpdk"]
+
+# A node's NICs in shared mode, one group, and a poll thread registered
+# with its EAL, under the netns runner (see the file). Only with `dpdk`,
+# as above.
+[[test]]
+name = "nic_groups_shared"
+path = "tests/nic_groups_shared.rs"
+required-features = ["dpdk"]
+
+# A replication NIC that fails to come up after the client NIC has, under
+# the netns runner (see the file). Only with `dpdk`, as above.
+[[test]]
+name = "nic_groups_replication_fails"
+path = "tests/nic_groups_replication_fails.rs"
+required-features = ["dpdk"]

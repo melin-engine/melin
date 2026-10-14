@@ -87,6 +87,19 @@ impl QueuePlan {
             QueuePlan::ReplicationSplit => 2,
         }
     }
+
+    /// How many of `configured` queue pairs (what a port configured under
+    /// this plan has) carry clients, and so how many client poll threads
+    /// the NIC needs, on queues `0..` that count: every one of
+    /// [`QueuePlan::Rss`]'s, and only [`CLIENT_QUEUE`] of
+    /// [`QueuePlan::ReplicationSplit`]'s, whose other queue is
+    /// replication's and has a poll thread of its own.
+    pub fn client_queues(self, configured: u16) -> u16 {
+        match self {
+            QueuePlan::Rss(_) => configured,
+            QueuePlan::ReplicationSplit => 1,
+        }
+    }
 }
 
 /// A port offers fewer queue pairs than a [`QueuePlan`] cannot do without.
@@ -864,6 +877,33 @@ mod tests {
         }
         assert_eq!(QueuePlan::Rss(3).requested_queue_pairs(), 3);
         assert_eq!(QueuePlan::ReplicationSplit.requested_queue_pairs(), 2);
+    }
+
+    /// The client poll threads a NIC needs: one per queue the default RSS
+    /// spreads clients over, as many as the port was configured with, and
+    /// in the replication split one, whatever the port has, since its
+    /// second queue is replication's.
+    #[test]
+    fn the_split_has_one_client_queue_and_rss_has_every_queue() {
+        assert_eq!(QueuePlan::Rss(1).client_queues(1), 1);
+        // The configured count, not the requested one: a NIC that clamped
+        // the request has fewer queues to poll.
+        assert_eq!(QueuePlan::Rss(4).client_queues(2), 2);
+        assert_eq!(QueuePlan::ReplicationSplit.client_queues(2), 1);
+        // The split's queue count as a port reports it is not the client
+        // queue count, which is what a node used to spawn from.
+        let split = plan(None, queue_mode(Some(LISTEN_PORT), None));
+        let configured = split
+            .queues
+            .queue_pairs_on(16, 16)
+            .expect("two queue pairs");
+        assert_eq!(configured, 2);
+        assert_eq!(split.queues.client_queues(configured), 1);
+        assert_eq!(
+            usize::from(split.queues.client_queues(configured)),
+            usize::from(CLIENT_QUEUE) + 1,
+            "the one client queue is queue 0"
+        );
     }
 
     #[test]

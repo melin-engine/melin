@@ -304,15 +304,22 @@ fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix_len: u8) -> bool {
     u32::from(a) & mask == u32::from(b) & mask
 }
 
-/// Refuse a replication mode this build cannot run yet, rather than run
-/// it as [`ReplicationNic::Shared`] and leave the operator believing
-/// replication has a queue or a NIC of its own. Checked before EAL init.
-// The modes land one at a time; each arm becomes `Ok(())` as its mode does.
+/// Refuse a replication mode this build cannot run yet in the node's role,
+/// rather than run it as [`ReplicationNic::Shared`] and leave the operator
+/// believing replication has a queue or a NIC of its own. Checked before
+/// EAL init.
+///
+/// A primary runs every mode. A replica (`--replica-of`, so `replica` is
+/// true) runs shared mode only: in queue and port modes its receiver would
+/// have to run on the replication queue or NIC, which it does not yet.
+// The replica's arm becomes `Ok(())` when a replica runs the split modes.
 pub(crate) fn check_replication_nic_implemented(
     replication: &ReplicationNic,
+    replica: bool,
 ) -> Result<(), String> {
     let (mode, flags) = match replication {
         ReplicationNic::Shared => return Ok(()),
+        _ if !replica => return Ok(()),
         ReplicationNic::Queue(_) => ("on a queue of its own", QUEUE_FLAG.to_owned()),
         ReplicationNic::Port(_) => (
             "on a NIC of its own",
@@ -320,8 +327,8 @@ pub(crate) fn check_replication_nic_implemented(
         ),
     };
     Err(format!(
-        "DPDK replication {mode} is not implemented yet; omit {flags} to run replication on \
-         the client queue"
+        "DPDK replication {mode} is not implemented yet on a replica (--replica-of); omit \
+         {flags} to run its replication on the client queue"
     ))
 }
 
@@ -673,17 +680,36 @@ mod tests {
         assert_eq!(error.to_string(), DpdkArgsError::NoPorts.to_string());
     }
 
+    /// A primary runs every mode; a replica only shared mode until a
+    /// replica runs the split ones, and the refusal says it is the role.
     #[test]
-    fn only_shared_runs_until_the_other_modes_land() {
+    fn a_primary_runs_every_mode_and_a_replica_only_shared() {
+        let queue = ReplicationNic::Queue(PORTS);
+        let port = ReplicationNic::Port(client());
+        for mode in [&ReplicationNic::Shared, &queue, &port] {
+            assert_eq!(check_replication_nic_implemented(mode, false), Ok(()));
+        }
         assert_eq!(
-            check_replication_nic_implemented(&ReplicationNic::Shared),
+            check_replication_nic_implemented(&ReplicationNic::Shared, true),
             Ok(())
         );
-        let queue = check_replication_nic_implemented(&ReplicationNic::Queue(PORTS)).unwrap_err();
-        assert!(queue.contains("not implemented yet"), "{queue}");
+
+        let queue = check_replication_nic_implemented(&queue, true).unwrap_err();
+        assert!(
+            queue.starts_with(
+                "DPDK replication on a queue of its own is not implemented yet on a replica \
+                 (--replica-of)"
+            ),
+            "{queue}"
+        );
         assert!(queue.contains(QUEUE_FLAG), "{queue}");
-        let port = check_replication_nic_implemented(&ReplicationNic::Port(client())).unwrap_err();
-        assert!(port.contains("not implemented yet"), "{port}");
+        let port = check_replication_nic_implemented(&port, true).unwrap_err();
+        assert!(
+            port.starts_with(
+                "DPDK replication on a NIC of its own is not implemented yet on a replica"
+            ),
+            "{port}"
+        );
         for flag in [PORTS_FLAG, IP_FLAG, PEER_MAC_FLAG] {
             assert!(port.contains(flag), "{port}");
         }

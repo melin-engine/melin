@@ -143,6 +143,13 @@ jobs:
       - name: no-persist builds (server-runtime)
         run: cargo check -p melin-server-runtime --all-targets --features no-persist --locked
 
+      # The stats registry, `/stats-dump` and the poll loops' work-iteration
+      # histogram exist only under `latency-trace`, which no other step
+      # turns on: a bench-only feature, whose numbers go wrong rather than
+      # failing when it regresses.
+      - name: latency-trace tests (transport-core)
+        run: cargo test -q -p melin-transport-core --features latency-trace --lib --locked
+
       # `melin-dpdk` on its own. With no feature, it must build without
       # libdpdk and without clap. With `clap`, its flag declaration's tests:
       # the Tests step below runs them too, but only because a dependent

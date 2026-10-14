@@ -174,6 +174,8 @@ fn generate_bindings() {
             uint64_t dpdk_eth_rss_tcp(void);\n\
             uint64_t dpdk_eth_mq_rx_rss(void);\n\
             int dpdk_flow_isolate(uint16_t port_id);\n\
+            int dpdk_thread_register(void);\n\
+            unsigned int dpdk_lcore_id(void);\n\
             #include \"steering_rule.h\"\n\
             ",
         )
@@ -201,6 +203,11 @@ fn generate_bindings() {
         .allowlist_function("rte_eth_promiscuous_enable")
         .allowlist_function("rte_eth_link_get_nowait")
         .allowlist_function("rte_socket_id")
+        // A poll thread of the node's own registered as an lcore
+        // (`LcoreRegistration`), for its mempool cache.
+        .allowlist_function("rte_thread_unregister")
+        .allowlist_function("dpdk_thread_register")
+        .allowlist_function("dpdk_lcore_id")
         // Our C wrapper functions.
         .allowlist_function("dpdk_eth_rx_burst")
         .allowlist_function("dpdk_eth_tx_burst")

@@ -8,9 +8,12 @@
 //! The device is single-threaded — it's called from the DPDK poll thread
 //! only. No synchronization needed.
 
+use std::sync::Arc;
+
 use smoltcp::phy::{self, Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
+use crate::QueueCounters;
 use crate::ffi;
 use crate::port::ChecksumOffloads;
 use crate::rx_checksum::{RxChecksumFlags, RxChecksumPolicy};
@@ -34,6 +37,10 @@ struct RxPort {
     /// NIC queue index for this port. With RSS, each poll thread reads
     /// from a different queue on the same port.
     queue_id: u16,
+    /// This queue's packet counts, for `/metrics`: received here, and sent
+    /// here too on the first port, the one every frame is sent on. This
+    /// device is the queue's only writer.
+    counters: Arc<QueueCounters>,
     /// Staging buffer for received mbufs.
     rx_buf: [*mut ffi::rte_mbuf; BURST_SIZE],
     rx_count: usize,
@@ -170,6 +177,7 @@ impl DpdkDevice {
             .map(|&port_id| RxPort {
                 port_id,
                 queue_id,
+                counters: Arc::new(QueueCounters::new(port_id, queue_id)),
                 rx_buf: [std::ptr::null_mut(); BURST_SIZE],
                 rx_count: 0,
                 rx_cursor: 0,
@@ -217,6 +225,10 @@ impl DpdkDevice {
                 count as u16,
             )
         } as usize;
+        if sent > 0 {
+            // The first port's queue: the one `tx_port_id` names.
+            self.rx_ports[0].counters.add_tx(sent as u64);
+        }
         if sent == count {
             self.tx_batch.clear();
         } else {
@@ -252,6 +264,9 @@ impl DpdkDevice {
                     BURST_SIZE as u16,
                 )
             };
+            if count > 0 {
+                port.counters.add_rx(u64::from(count));
+            }
 
             // Screen the burst in place, keeping admitted frames in
             // arrival order.
@@ -271,6 +286,16 @@ impl DpdkDevice {
                 return;
             }
         }
+    }
+
+    /// The packet counts of this device's queue, one per port, in the
+    /// order of the ports it was given: what each received, and on the
+    /// first, the one every frame is sent on, what it sent.
+    pub fn queue_counters(&self) -> Vec<Arc<QueueCounters>> {
+        self.rx_ports
+            .iter()
+            .map(|port| Arc::clone(&port.counters))
+            .collect()
     }
 
     /// Received frames dropped so far because a checksum failed — by the
@@ -316,6 +341,11 @@ impl DpdkDevice {
                     BURST_SIZE as u16,
                 )
             };
+            // Before admission: the queue received them, whatever the
+            // checksum screen then makes of them.
+            if count > 0 {
+                port.counters.add_rx(u64::from(count));
+            }
 
             for i in 0..count as usize {
                 let mbuf = port.rx_buf[i];
