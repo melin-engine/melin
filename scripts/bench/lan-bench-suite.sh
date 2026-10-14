@@ -18,6 +18,13 @@
 #   kernel  kernel TCP, clients and replication
 #   dpdk    DPDK, clients and replication; the load generator on DPDK too
 #
+# DPDK replication (where a DPDK primary and its replicas run replication;
+# each mode is a pass of the dpdk transport of its own, from one build):
+#   shared  on the client queue and its poll thread (no flag, the default)
+#   queue   on a second queue of the client NIC, steered to it by the NIC
+#           (--dpdk-replication-queue): mlx5 only, refused on SR-IOV hosts;
+#           the primary's per-queue packet counters are judged too
+#
 # Workloads (what the load generator does):
 #   throughput  THROUGHPUT_CLIENTS × THROUGHPUT_WINDOW in flight
 #   single      one client, one request in flight: the latency floor
@@ -34,9 +41,15 @@
 #   # notary, both workloads on both transports:
 #   TRANSPORTS=kernel,dpdk WORKLOADS=throughput,single ./scripts/bench/lan-bench-suite.sh notary ...
 #
+#   # echo on DPDK, replication on the client queue and on its own, side by side:
+#   TRANSPORTS=dpdk DPDK_REPLICATION=shared,queue ./scripts/bench/lan-bench-suite.sh echo ...
+#
 # Environment:
 #   TRANSPORTS=<list>     comma-separated, or `all` (default: kernel)
 #   WORKLOADS=<list>      comma-separated, or `all` (default: throughput)
+#   DPDK_REPLICATION=<list>  the dpdk transport's replication modes,
+#                         comma-separated, or `all` (default: shared);
+#                         `port` is not supported by the suite yet
 #   SSH_USER              the user the hosts are reached as (default root;
 #                         another needs passwordless sudo)
 #   SSH_CONFIG            an ssh_config file the hosts are reached through,
@@ -77,7 +90,13 @@
 # Each run waits for both replicas to be live before the load starts,
 # and samples the primary's health metrics throughout: a replica
 # evicted, missing or catching up at any point marks the run degraded.
-# The suite exits non-zero if any run was degraded or could not start.
+# On DPDK it samples the primary's per-queue packet counters too, and in
+# queue mode a run whose replication did not move on queue 1, or whose
+# clients did not on queue 0, is degraded as well. The suite exits
+# non-zero if any run was degraded or could not start.
+#
+# Results are named `kernel-<workload>` on kernel TCP and
+# `dpdk-<replication mode>-<workload>` on DPDK.
 
 set -euo pipefail
 
@@ -244,9 +263,15 @@ for w in "${REQ_WORKLOADS[@]}"; do
         exit 1
     fi
 done
+# Each a pass of the dpdk transport; validated even when it runs none.
+DPDK_REPLICATION_LIST=$(dpdk_replication_modes "${DPDK_REPLICATION:-}") || exit 1
+read -ra DPDK_REPLICATION_MODES <<< "$DPDK_REPLICATION_LIST"
+QUEUE_MODE=0
+[[ "$NEED_DPDK" == 1 && " ${DPDK_REPLICATION_MODES[*]} " == *" queue "* ]] && QUEUE_MODE=1
 
 echo "=== Melin LAN suite: ${APP} ==="
 echo "  transports: ${RUN_TRANSPORTS[*]}"
+[[ "$NEED_DPDK" == 1 ]] && echo "  dpdk replication: ${DPDK_REPLICATION_MODES[*]}"
 echo "  workloads:  ${REQ_WORKLOADS[*]}"
 echo "  results:    ${RESULTS_DIR}"
 echo ""
@@ -306,6 +331,15 @@ for host in "${HOSTS[@]}"; do
         DETECTED_CPU="$cpu"
     fi
 done
+# Queue mode needs every node's NIC to steer (the load generator's host
+# runs no replication). The confs are read, not set up: the DPDK setup
+# waits for the first DPDK pass.
+if [[ "$QUEUE_MODE" == 1 ]]; then
+    for host in "$SERVER" "$REPLICA" "$REPLICA2"; do
+        # No conf is empty text, which refuse_queue_mode reads as such.
+        refuse_queue_mode "$host" "$(rssh "$host" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)" || exit 1
+    done
+fi
 TARGET_CPU="${TARGET_CPU:-$DETECTED_CPU}"
 # The hosts' Rust target, and its multiarch directory under /usr/lib.
 TARGET="${ARCH}-unknown-linux-gnu"
@@ -559,17 +593,17 @@ load_dpdk_config() {
         rssh "$host" "${SUDO} bash ${REMOTE_DIR}/dpdk-setup.sh"
     fi
     conf=$(rssh "$host" "cat /etc/melin-dpdk.conf")
-    mode=$(conf_value "$conf" DPDK_MODE)
+    mode=$(dpdk_conf_mode "$conf")
     ports=$(conf_value "$conf" DPDK_PORT)
     # An SR-IOV host bonds two ports, a VF on each: both are the node's.
-    if [[ "${mode:-sriov}" == sriov ]]; then
+    if [[ "$mode" == sriov ]]; then
         vfs=$(rssh "$host" "ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l")
         (( vfs >= 2 )) && ports="0,1"
     fi
     eal=$(conf_value "$conf" DPDK_EAL_ARGS)
     [[ -z "$eal" ]] && eal="--huge-dir=$(conf_value "$conf" HUGE_DIR)"
     [[ "$eal" == "--huge-dir=" ]] && eal="--huge-dir=/mnt/huge_2m"
-    printf -v "${prefix}_DPDK_MODE" '%s' "${mode:-sriov}"
+    printf -v "${prefix}_DPDK_MODE" '%s' "$mode"
     printf -v "${prefix}_DPDK_IP" '%s' "$(conf_value "$conf" DPDK_IP)"
     printf -v "${prefix}_DPDK_PREFIX" '%s' "$(conf_value "$conf" DPDK_PREFIX)"
     printf -v "${prefix}_DPDK_PORTS" '%s' "${ports:-0}"
@@ -611,8 +645,14 @@ load_dpdk_hosts() {
 CLIENT_ADDR=""
 BENCH_TRANSPORT_ARGS=""
 
+# `start_cluster <transport> <DPDK replication mode>`: the mode is empty
+# on kernel TCP.
 start_cluster() {
-    local transport="$1" bin primary_ready repl_ready primary_flags host
+    local transport="$1" replication="$2" bin primary_ready repl_ready primary_flags host
+    # The flag that puts a node's replication where the mode says, on the
+    # primary and the replicas alike (none in shared mode).
+    local repl_mode_flag=""
+    [[ "$replication" == queue ]] && repl_mode_flag=" --dpdk-replication-queue"
 
     clean_journal "$SERVER" "${JOURNAL_DIR}/primary.journal"
     clean_journal "$REPLICA" "${JOURNAL_DIR}/replica1.journal"
@@ -623,9 +663,11 @@ start_cluster() {
         load_dpdk_hosts
         DPDK_RAN=1
         bin="${SERVER_BIN}.dpdk"
-        primary_flags="--bind 0.0.0.0:${CLIENT_PORT} --replication-bind ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags SERVER)"
+        # In queue mode the NIC steers the replication port given here to
+        # queue 1.
+        primary_flags="--bind 0.0.0.0:${CLIENT_PORT} --replication-bind ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags SERVER)${repl_mode_flag}"
         primary_ready="DPDK transport listening"
-        repl_ready="DPDK replication sender started"
+        repl_ready="$DPDK_REPLICATION_READY"
         CLIENT_ADDR="${SERVER_DPDK_IP}:${CLIENT_PORT}"
         BENCH_TRANSPORT_ARGS="$(dpdk_flags BENCH) --dpdk-peer-mac ${SERVER_DPDK_MAC}"
     else
@@ -644,7 +686,7 @@ start_cluster() {
         host="$REPLICA"; prefix=REPLICA
         (( i == 2 )) && { host="$REPLICA2"; prefix=REPLICA2; }
         if [[ "$transport" == dpdk ]]; then
-            replica_flags="--replica-of ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags "$prefix") --dpdk-peer-mac ${SERVER_DPDK_MAC}"
+            replica_flags="--replica-of ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags "$prefix") --dpdk-peer-mac ${SERVER_DPDK_MAC}${repl_mode_flag}"
         else
             replica_flags="--replica-of ${SERVER_VLAN}:${REPL_PORT}"
         fi
@@ -680,58 +722,105 @@ bench_command() {
     echo "${REMOTE_DIR}/bin/${bin} ${args} ${BENCH_EXTRA_ARGS}"
 }
 
+# `sample_metrics <file> <pattern>`: in the background, the primary's
+# /metrics lines matching `pattern` (an extended regex), every second
+# until stop_samplers, into `file`, each scrape after a `# sample` line.
+SAMPLERS=()
+sample_metrics() {
+    rssh "$SERVER" "while :; do echo '# sample'; curl -s --max-time 1 http://${SERVER_VLAN}:${HEALTH_PORT}/metrics | grep -E '$2'; sleep 1; done" > "$1" 2>/dev/null &
+    SAMPLERS+=("$!")
+}
+
+# Stop every sampler sample_metrics started. Each is a subshell running
+# rssh, whose ssh outlives it unless stopped first: left running, it would
+# keep appending to its file for the rest of the suite.
+stop_samplers() {
+    local sampler
+    for sampler in "${SAMPLERS[@]}"; do
+        pkill -P "$sampler" 2>/dev/null || true
+        kill "$sampler" 2>/dev/null || true
+        wait "$sampler" 2>/dev/null || true
+    done
+    SAMPLERS=()
+}
+
+# `judge_run <name> <what> <judge> <args...>`: a judge's verdict on run
+# `name`, printed as `what`'s; a run it does not pass is recorded as such.
+judge_run() {
+    local name="$1" what="$2" verdict
+    shift 2
+    if verdict=$("$@"); then
+        echo "  ${what} ${verdict}"
+    else
+        echo "  ${what} ${verdict}"
+        DEGRADED_RUNS+=("${name}: ${verdict}")
+    fi
+}
+
+# `run_workload <transport> <DPDK replication mode> <workload> <name>`:
+# the mode is empty on kernel TCP; `name` names the run's results.
 run_workload() {
-    local transport="$1" workload="$2" clients window duration name
+    local transport="$1" replication="$2" workload="$3" name="$4" clients window duration
     case "$workload" in
         throughput) clients="$THROUGHPUT_CLIENTS"; window="$THROUGHPUT_WINDOW"; duration="$THROUGHPUT_DURATION" ;;
         single) clients=1; window=1; duration="$SINGLE_DURATION" ;;
     esac
-    name="${transport}-${workload}"
     echo ""
     echo "--- ${name}: ${clients} × ${window} for ${duration} ---"
 
-    # The primary's health, sampled every second for the run's length.
-    local samples="${RESULTS_DIR}/${name}.health"
-    rssh "$SERVER" "while :; do echo '# sample'; curl -s --max-time 1 http://${SERVER_VLAN}:${HEALTH_PORT}/metrics | grep -E '^melin_replica(s_connected|_catching_up|_evictions_total)'; sleep 1; done" > "$samples" 2>/dev/null &
-    local sampler=$!
+    # The primary's health, sampled every second for the run's length,
+    # and on DPDK its per-queue packet counters, beside it.
+    local samples="${RESULTS_DIR}/${name}.health" queues="${RESULTS_DIR}/${name}.queues"
+    sample_metrics "$samples" '^melin_replica(s_connected|_catching_up|_evictions_total)'
+    [[ "$transport" == dpdk ]] && sample_metrics "$queues" '^melin_dpdk_queue_(rx|tx)_packets_total'
 
     local rc=0
     rssh "$BENCH" "${SUDO} rm -f ${BENCH_JSON}"
     rssh "$BENCH" "${SUDO} $(bench_command "$transport" "$clients" "$window" "$duration")" \
         | tee "${RESULTS_DIR}/${name}.txt" || rc=$?
-    kill "$sampler" 2>/dev/null || true
-    wait "$sampler" 2>/dev/null || true
+    stop_samplers
 
     if (( rc != 0 )) || ! rscp "${BENCH}:${BENCH_JSON}" "${RESULTS_DIR}/${name}.json" 2>/dev/null; then
         echo "  FAILED: the load generator exited ${rc}"
         DEGRADED_RUNS+=("${name}: the load generator failed")
         return
     fi
-    local verdict
-    if verdict=$(judge_health "$samples" 2); then
-        echo "  cluster ${verdict}"
-    else
-        echo "  cluster ${verdict}"
-        DEGRADED_RUNS+=("${name}: ${verdict}")
-    fi
+    judge_run "$name" cluster judge_health "$samples" 2
+    [[ "$transport" == dpdk ]] && judge_run "$name" steering judge_steering "$replication" "$queues"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
 # The runs
 # ---------------------------------------------------------------------------
-for transport in "${RUN_TRANSPORTS[@]}"; do
+# `run_pass <transport> <DPDK replication mode> <pass>`: every workload
+# on one transport and mode (empty on kernel TCP), each run's results
+# named `<pass>-<workload>`.
+run_pass() {
+    local transport="$1" replication="$2" pass="$3" workload name
     for workload in "${REQ_WORKLOADS[@]}"; do
+        name="${pass}-${workload}"
         # A fresh cluster per run: each run starts from an empty journal.
-        if ! start_cluster "$transport"; then
-            DEGRADED_RUNS+=("${transport}-${workload}: the cluster did not start")
-            rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${transport}-${workload}.primary.log" 2>/dev/null || true
+        if ! start_cluster "$transport" "$replication"; then
+            DEGRADED_RUNS+=("${name}: the cluster did not start")
+            rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${name}.primary.log" 2>/dev/null || true
             stop_nodes "${HOSTS[@]}"
             continue
         fi
-        run_workload "$transport" "$workload"
+        run_workload "$transport" "$replication" "$workload" "$name"
         stop_nodes "${HOSTS[@]}"
-        rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${transport}-${workload}.primary.log" 2>/dev/null || true
+        rssh "$SERVER" "cat ${NODE_LOG}" > "${RESULTS_DIR}/${name}.primary.log" 2>/dev/null || true
     done
+}
+
+for transport in "${RUN_TRANSPORTS[@]}"; do
+    if [[ "$transport" == dpdk ]]; then
+        for replication in "${DPDK_REPLICATION_MODES[@]}"; do
+            run_pass dpdk "$replication" "dpdk-${replication}"
+        done
+    else
+        run_pass "$transport" "" "$transport"
+    fi
 done
 
 # SR-IOV leaves the VFs bound to vfio-pci and the hugepages taken; a

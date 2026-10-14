@@ -74,6 +74,27 @@ connections, each keeping `THROUGHPUT_WINDOW` requests in flight; 4 × 56
 by default) and `single` (one request in flight). The script's header
 lists every setting.
 
+On DPDK, `DPDK_REPLICATION` picks where the nodes run replication, from
+`shared` and `queue` (comma-separated, or `all`; `shared` by default),
+each a pass of the DPDK transport of its own, from the same build:
+
+- `shared`: on the client queue and its poll thread, as a DPDK node
+  does without a replication flag.
+- `queue`: on a second queue of the client NIC, served by a poll thread
+  of its own (`--dpdk-replication-queue` on the primary and the
+  replicas), the NIC steering replication to it. It needs a Mellanox
+  (mlx5) NIC on the primary and both replicas: an SR-IOV virtual
+  function cannot steer, and the suite refuses to start when a node's
+  `/etc/melin-dpdk.conf` says SR-IOV, or when a node has none (the setup
+  the suite runs on its own can only configure SR-IOV, and an mlx5 NIC
+  needs its address given: run `scripts/dpdk/dpdk-setup.sh` with
+  `DPDK_IP` on it first), naming the host. The primary's
+  replication poll thread takes a core of its own, `repl-poll` in the
+  node's `--cores` layout.
+
+Replication on a NIC of its own (`port` mode) is not run by the suite
+yet, and is refused.
+
 Each run starts a fresh cluster on empty journals, acknowledging under
 `ACK_POLICY` (`disk+ram` by default). The load generator warms up,
 measures, then keeps the load on through a cool-down so that the last
@@ -92,14 +113,17 @@ prints measure nothing, and it does not exercise DPDK.
 
 ## Results
 
-Each run leaves, in `bench-results/lan-<app>-<timestamp>/`:
+Each run leaves, in `bench-results/lan-<app>-<timestamp>/`, under the
+run's name (`kernel-<workload>` on kernel TCP, `dpdk-<mode>-<workload>`
+on DPDK, so that the summary lists the replication modes side by side):
 
-- `<transport>-<workload>.json`: throughput and latency percentiles, the
-  shape every application's load generator writes;
-- `<transport>-<workload>.txt`: the load generator's console output;
-- `<transport>-<workload>.health`: the primary's replica metrics,
-  sampled every second;
-- `<transport>-<workload>.primary.log`: the primary's log.
+- `<run>.json`: throughput and latency percentiles, the shape every
+  application's load generator writes;
+- `<run>.txt`: the load generator's console output;
+- `<run>.health`: the primary's replica metrics, sampled every second;
+- `<run>.queues` (DPDK only): the primary's packet counts per NIC port
+  and queue, received and sent, sampled every second;
+- `<run>.primary.log`: the primary's log.
 
 A latency is a full round trip as the client sees it, from the request
 leaving the client to its reply arriving. A run whose replicas were
@@ -107,6 +131,22 @@ evicted, missing or catching up at any point is reported
 as degraded, and the suite exits non-zero, as it does when a cluster
 does not start or the load generator fails: a number measured on a
 cluster that was not whole is not the number it claims to be.
+
+In `queue` mode the run is also judged on its steering, from the
+primary's packet counts: between the first and the last sample, queue 1
+must have moved replication both ways (out to the replicas, their acks
+back) and queue 0 the clients' requests and replies, each at least 100
+packets per sampled second in each direction. That is well above what
+an idle queue sees (heartbeats, ARP, stray frames) and well below what
+any run makes it carry. A queue under it marks the run degraded, naming
+the queue, as does a primary with no queue 1. The counts cannot tell
+which connection a packet belonged to, so a connection steered to the
+wrong queue while the right one carries the rest is caught by what it
+causes instead: a replication link landing on the client queue is reset
+and the replica drops out (the health verdict), and a client landing on
+the replication queue is reset and the load generator fails. In `shared`
+mode there is nothing to steer, and the counts are kept for reading
+only.
 
 After a run on SR-IOV the hosts are rebooted, to release the NIC's
 virtual functions before the kernel transport uses it again; set
