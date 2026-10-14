@@ -97,6 +97,19 @@ use melin_wire_protocol::transport::BlockingTransportListener;
 /// hiccup rather than to save memory.
 const DEFAULT_REPLICATION_PIPELINE_DEPTH: usize = 256;
 
+/// A transport buffer size as the `--dpdk-client-*-kib` flags spell it:
+/// their defaults are the transport's own sizes, which are whole KiB (a
+/// test maps them back and compares).
+const fn kib_of(bytes: usize) -> u32 {
+    (bytes / 1024) as u32
+}
+
+/// A `--dpdk-client-*-kib` value as the transport's size in bytes.
+#[cfg(feature = "dpdk")]
+fn kib(value: u32) -> usize {
+    value as usize * 1024
+}
+
 /// CLI spelling of [`melin_journal::StagingMode`].
 ///
 /// A separate enum rather than a `clap::ValueEnum` derive on the journal
@@ -319,6 +332,40 @@ pub struct ServerConfig {
     #[command(flatten)]
     pub dpdk: DpdkArgs,
 
+    /// Receive buffer, in KiB, of each client connection on the DPDK
+    /// client port: the window advertised to the client.
+    // On the node rather than in `DpdkArgs`: only a node accepts client
+    // connections. `u32` KiB rather than bytes: a value an operator types,
+    // and at most 4 TiB once multiplied out on a 64-bit target.
+    #[arg(
+        long,
+        default_value_t = kib_of(melin_dpdk::SocketBuffers::DEFAULT.rx_buf_size),
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub dpdk_client_rx_buf_kib: u32,
+
+    /// Send buffer, in KiB, of each client connection on the DPDK client
+    /// port: the in-flight window, which caps one connection's response
+    /// bandwidth at this much per round trip. The default carries one
+    /// client at a million responses a second with headroom; a single
+    /// connection driven at the stack's full rate wants more (256). Every
+    /// client connection holds one, so it multiplies by their number.
+    #[arg(
+        long,
+        default_value_t = kib_of(melin_dpdk::SocketBuffers::DEFAULT.tx_buf_size),
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub dpdk_client_tx_buf_kib: u32,
+
+    /// Responses, in KiB, that may queue behind a client connection's
+    /// send buffer before the connection is dropped as fallen behind.
+    #[arg(
+        long,
+        default_value_t = kib_of(melin_dpdk::SocketBuffers::DEFAULT.tx_queue_limit),
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub dpdk_client_tx_queue_kib: u32,
+
     /// Address for the output event publisher. Subscribers connect here
     /// to receive a real-time stream of the application's reports, as the
     /// application's publisher encodes them. Ed25519 auth against the
@@ -484,6 +531,9 @@ impl Default for ServerConfig {
                 ip: Some(melin_dpdk::NicConfig::default().ip_addr),
                 ..DpdkArgs::default()
             },
+            dpdk_client_rx_buf_kib: kib_of(melin_dpdk::SocketBuffers::DEFAULT.rx_buf_size),
+            dpdk_client_tx_buf_kib: kib_of(melin_dpdk::SocketBuffers::DEFAULT.tx_buf_size),
+            dpdk_client_tx_queue_kib: kib_of(melin_dpdk::SocketBuffers::DEFAULT.tx_queue_limit),
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             admin_bind: None,
@@ -2307,7 +2357,8 @@ where
 
 /// Translate the CLI surface into a [`melin_dpdk::DpdkConfig`]: the NIC
 /// from the `--dpdk-*` flags, with the node's default address where
-/// `--dpdk-ip` is not given, listening on `--bind`'s port with one queue.
+/// `--dpdk-ip` is not given, listening on `--bind`'s port with one queue,
+/// its client connections sized by the `--dpdk-client-*-kib` flags.
 ///
 /// The flags are validated by their own mapping, before EAL init and
 /// before any thread is spawned, and a bad value is returned as an error
@@ -2323,6 +2374,11 @@ fn dpdk_config_from(
             .dpdk
             .nic_config_or(melin_dpdk::NicConfig::default().ip_addr)?,
         listen_port: cfg.bind.port(),
+        client_buffers: melin_dpdk::SocketBuffers {
+            rx_buf_size: kib(cfg.dpdk_client_rx_buf_kib),
+            tx_buf_size: kib(cfg.dpdk_client_tx_buf_kib),
+            tx_queue_limit: kib(cfg.dpdk_client_tx_queue_kib),
+        },
         num_queues: 1,
     })
 }
@@ -2571,7 +2627,7 @@ where
                 // replication listener is added with the primary's other
                 // replication wiring, as at boot.
                 transport
-                    .add_listener(dpdk_config.listen_port)
+                    .add_client_listener(&dpdk_config)
                     .map_err(|e| format!("add the client listener on promotion: {e}"))?;
                 // As at boot: the switch may have aged out this port's MAC
                 // while the node only dialled out.
@@ -4152,6 +4208,68 @@ mod tests {
         );
     }
 
+    /// The `--dpdk-client-*-kib` defaults are the transport's own sizes,
+    /// whole KiB, on a bare command line and in `ServerConfig::default()`
+    /// alike; a given value parses, and zero is refused.
+    #[test]
+    fn the_dpdk_client_buffer_flags_default_to_the_transport_sizes() {
+        use clap::Parser;
+        let sizes = melin_dpdk::SocketBuffers::DEFAULT;
+        for (flag_kib, bytes) in [
+            (super::kib_of(sizes.rx_buf_size), sizes.rx_buf_size),
+            (super::kib_of(sizes.tx_buf_size), sizes.tx_buf_size),
+            (super::kib_of(sizes.tx_queue_limit), sizes.tx_queue_limit),
+        ] {
+            assert_eq!(
+                flag_kib as usize * 1024,
+                bytes,
+                "a default not in whole KiB"
+            );
+        }
+
+        let parsed = super::ServerConfig::try_parse_from(["melin-server"]).expect("parses");
+        let built = super::ServerConfig::default();
+        for config in [&parsed, &built] {
+            assert_eq!(
+                (
+                    config.dpdk_client_rx_buf_kib,
+                    config.dpdk_client_tx_buf_kib,
+                    config.dpdk_client_tx_queue_kib,
+                ),
+                (
+                    super::kib_of(sizes.rx_buf_size),
+                    super::kib_of(sizes.tx_buf_size),
+                    super::kib_of(sizes.tx_queue_limit),
+                )
+            );
+        }
+
+        let given = super::ServerConfig::try_parse_from([
+            "melin-server",
+            "--dpdk-client-rx-buf-kib",
+            "256",
+            "--dpdk-client-tx-buf-kib",
+            "512",
+            "--dpdk-client-tx-queue-kib",
+            "32768",
+        ])
+        .expect("parses");
+        assert_eq!(given.dpdk_client_rx_buf_kib, 256);
+        assert_eq!(given.dpdk_client_tx_buf_kib, 512);
+        assert_eq!(given.dpdk_client_tx_queue_kib, 32768);
+
+        for flag in [
+            "--dpdk-client-rx-buf-kib",
+            "--dpdk-client-tx-buf-kib",
+            "--dpdk-client-tx-queue-kib",
+        ] {
+            assert!(
+                super::ServerConfig::try_parse_from(["melin-server", flag, "0"]).is_err(),
+                "{flag} 0 must be refused"
+            );
+        }
+    }
+
     /// Full bootstrap decision matrix. The two archive-only cells are
     /// the regression guard: a post-rotation crash leaves archives with
     /// no live segment, and bootstrapping "snapshot only" (or "fresh")
@@ -5113,6 +5231,31 @@ mod dpdk_config_tests {
         assert_eq!(dpdk.num_queues, 1);
         assert_eq!(dpdk.nic.ip_addr, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(dpdk.nic.peer_mac, None);
+    }
+
+    #[test]
+    fn the_client_buffers_default_to_the_transport_s() {
+        let dpdk = dpdk_config_from(&ServerConfig::default()).expect("valid config");
+        assert_eq!(dpdk.client_buffers, melin_dpdk::SocketBuffers::default());
+    }
+
+    #[test]
+    fn the_client_buffer_flags_are_in_kib() {
+        let cfg = ServerConfig {
+            dpdk_client_rx_buf_kib: 256,
+            dpdk_client_tx_buf_kib: 512,
+            dpdk_client_tx_queue_kib: 32768,
+            ..Default::default()
+        };
+        let dpdk = dpdk_config_from(&cfg).expect("valid config");
+        assert_eq!(
+            dpdk.client_buffers,
+            melin_dpdk::SocketBuffers {
+                rx_buf_size: 256 * 1024,
+                tx_buf_size: 512 * 1024,
+                tx_queue_limit: 32768 * 1024,
+            }
+        );
     }
 
     /// A config built in code with no address at all (not even the one

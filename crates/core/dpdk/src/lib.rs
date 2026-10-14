@@ -56,7 +56,7 @@ pub mod arp;
 // Ungated: configuration is plain data, mapped from the same flags whether
 // or not this build has the transport compiled in.
 mod config;
-pub use config::{DpdkConfig, NicConfig};
+pub use config::{DpdkConfig, NicConfig, SocketBuffers};
 // Ungated by `dpdk-sys` for the same reason, behind `clap` only: the flags
 // mapped onto that configuration, declared once for every binary.
 #[cfg(feature = "clap")]
