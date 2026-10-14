@@ -80,6 +80,16 @@ measures, then keeps the load on through a cool-down so that the last
 measured replies arrive under the same load as the first. On the DPDK
 transport it runs on DPDK too.
 
+## Rehearsing without hosts
+
+`scripts/bench/test-containers.sh [echo|notary|ec]` runs the suite end to
+end against four podman containers on the machine you run it from, over
+kernel TCP, with short phases: the sysroot, the build, the deployment,
+the cluster's start and the health verdict all run as they would on
+bench hosts. The containers use your machine's architecture, so on an
+ARM machine the build is for ARM rather than x86_64. The figures it
+prints measure nothing, and it does not exercise DPDK.
+
 ## Results
 
 Each run leaves, in `bench-results/lan-<app>-<timestamp>/`:

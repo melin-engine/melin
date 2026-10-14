@@ -202,7 +202,8 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   over; each run starts from fresh journals, and a replica evicted,
   missing or catching up during it fails the suite.
   `scripts/bench/server-setup.sh` and `server-deploy.sh` prepare the
-  hosts. The load generator is the new `melin-bench` tool
+  hosts; `scripts/bench/test-containers.sh` rehearses the whole suite
+  against podman containers. The load generator is the new `melin-bench` tool
   (`crates/tools/melin-bench`, unpublished): clients × window in flight
   from one pinned loop, over kernel TCP or, with `--features dpdk`, one
   DPDK NIC, writing its throughput and latency percentiles as JSON. See

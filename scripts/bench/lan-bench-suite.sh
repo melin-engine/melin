@@ -39,6 +39,9 @@
 #   WORKLOADS=<list>      comma-separated, or `all` (default: throughput)
 #   SSH_USER              the user the hosts are reached as (default root;
 #                         another needs passwordless sudo)
+#   SSH_CONFIG            an ssh_config file the hosts are reached through,
+#                         their addresses then being its Host aliases (the
+#                         container rig, test-containers.sh, uses one)
 #   THROUGHPUT_DURATION   measured phase of a throughput run (default 60s)
 #   THROUGHPUT_CLIENTS    connections (default 4)
 #   THROUGHPUT_WINDOW     requests in flight per connection (default 56)
@@ -63,8 +66,8 @@
 #   RUST_LOG              the nodes' log filter (default info)
 #   SKIP_REBOOT=1         skip the reboot that follows SR-IOV DPDK runs
 #
-# Local prerequisites: rustup (the x86_64-unknown-linux-gnu target is
-# added if missing), clang, lld, python3, ssh. Remote: server-setup.sh on
+# Local prerequisites: rustup (the hosts' target, x86_64-unknown-linux-gnu
+# on bench hardware, is added if missing), clang, lld, python3, ssh. Remote: server-setup.sh on
 # every host, root or passwordless sudo, and a private network between
 # them (the VLAN addresses). The DPDK transport also needs
 # /etc/melin-dpdk.conf on each host; a host without one gets
@@ -101,7 +104,6 @@ MELIN_REPO="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
 EC_REPO="${EC_REPO:-${MELIN_REPO}/../exchange-core}"
 
-TARGET=x86_64-unknown-linux-gnu
 # On every host, under the SSH user's home: the binaries, keys and
 # authorized_keys this suite copies there. Relative for scp; through `~`
 # in a remote shell's command.
@@ -174,6 +176,7 @@ SSH_CONTROL_DIR="$(mktemp -d -t melin-bench-ssh.XXXXXX)"
 # connection: dozens of calls per run, one handshake per host.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
     -o ControlMaster=auto -o "ControlPath=${SSH_CONTROL_DIR}/%r@%h:%p" -o ControlPersist=5m)
+[[ -n "${SSH_CONFIG:-}" ]] && SSH_OPTS=(-F "$SSH_CONFIG" "${SSH_OPTS[@]}")
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
 REPLICA="${SSH_USER}@${REPLICA_PUB}"
@@ -257,36 +260,35 @@ for tool in clang ld.lld python3 rustup; do
         exit 1
     fi
 done
-if ! rustup target list --installed | grep -qx "$TARGET"; then
-    echo "=== Adding the ${TARGET} Rust target ==="
-    rustup target add "$TARGET"
-fi
 
 # What gcc on `host` takes `-march=native` to be: the host's CPU by the
-# name LLVM also uses.
+# name LLVM also uses. x86 only: elsewhere gcc names an architecture
+# level rather than a CPU LLVM knows, and the build targets `generic`
+# unless TARGET_CPU says otherwise.
 host_cpu() {
-    rssh "$1" "gcc -march=native -Q --help=target 2>/dev/null | awk '\$1 == \"-march=\" { print \$2; exit }'"
+    case "$2" in
+        x86_64) rssh "$1" "gcc -march=native -Q --help=target 2>/dev/null | awk '\$1 == \"-march=\" { print \$2; exit }'" ;;
+        *) echo generic ;;
+    esac
 }
 
-# The distribution and libdpdk the sysroot must match.
+# The architecture, distribution and libdpdk the sysroot must match.
 host_platform() {
-    rssh "$1" '. /etc/os-release && printf "%s-%s-dpdk%s\n" "$ID" "$VERSION_ID" "$(dpkg-query -W -f="\${Version}" libdpdk-dev 2>/dev/null || echo none)"'
+    rssh "$1" '. /etc/os-release && printf "%s-%s-%s-dpdk%s\n" "$(uname -m)" "$ID" "$VERSION_ID" "$(dpkg-query -W -f="\${Version}" libdpdk-dev 2>/dev/null || echo none)"'
 }
 
 echo "=== Inspecting the hosts ==="
 PLATFORM=""
 DETECTED_CPU=""
+ARCH=""
 for host in "${HOSTS[@]}"; do
     arch=$(rssh "$host" uname -m)
-    if [[ "$arch" != x86_64 ]]; then
-        echo "error: ${host} is ${arch}; the suite builds for x86_64" >&2
-        exit 1
-    fi
+    ARCH="${ARCH:-$arch}"
     platform=$(host_platform "$host")
-    cpu=$(host_cpu "$host")
+    cpu=$(host_cpu "$host" "$arch")
     echo "  ${host}: ${platform}, cpu ${cpu:-unknown}"
     if [[ -n "$PLATFORM" && "$platform" != "$PLATFORM" ]]; then
-        echo "error: the hosts run different distributions or libdpdk versions" >&2
+        echo "error: the hosts run different architectures, distributions or libdpdk versions" >&2
         echo "       (${PLATFORM} and ${platform}); one build cannot serve both" >&2
         exit 1
     fi
@@ -305,6 +307,16 @@ for host in "${HOSTS[@]}"; do
     fi
 done
 TARGET_CPU="${TARGET_CPU:-$DETECTED_CPU}"
+# The hosts' Rust target, and its multiarch directory under /usr/lib.
+TARGET="${ARCH}-unknown-linux-gnu"
+MULTIARCH="${ARCH}-linux-gnu"
+# The target in the spellings cargo's and the cc crate's variables take.
+TARGET_ENV="${TARGET//-/_}"
+TARGET_ENV_UPPER="${TARGET_ENV^^}"
+if ! rustup target list --installed | grep -qx "$TARGET"; then
+    echo "=== Adding the ${TARGET} Rust target ==="
+    rustup target add "$TARGET"
+fi
 if ! rustc --print target-cpus --target "$TARGET" | awk '{print $1}' | grep -qx "$TARGET_CPU"; then
     echo "error: rustc does not know the CPU '${TARGET_CPU}'; set TARGET_CPU" >&2
     exit 1
@@ -312,9 +324,11 @@ fi
 echo "  building for ${TARGET_CPU}"
 
 # The sysroot: the server host's headers and libraries, taken once per
-# distribution and libdpdk version and kept. `tar -h` follows symlinks,
-# so a library reached through an absolute link (or /lib64, itself one)
-# arrives as a file; the merged-/usr /lib link is recreated after.
+# architecture, distribution and libdpdk version and kept. `tar -h`
+# follows symlinks, so a library reached through an absolute link (or
+# /lib64, itself one) arrives as a file; the merged-/usr /lib link is
+# recreated after. The dynamic loader comes too (/lib64's on x86_64,
+# /usr/lib's elsewhere): glibc's linker script names it.
 if [[ -z "${SYSROOT:-}" ]]; then
     SYSROOT="${XDG_CACHE_HOME:-${HOME}/.cache}/melin-bench/sysroot-${PLATFORM}"
     if [[ ! -f "${SYSROOT}/.complete" ]]; then
@@ -323,14 +337,14 @@ if [[ -z "${SYSROOT:-}" ]]; then
         mkdir -p "$SYSROOT"
         # `--ignore-failed-read`: a dangling link among the libraries is
         # not ours to fix and is never linked against.
-        rssh "$SERVER" "tar -chf - --ignore-failed-read --warning=no-failed-read \
-            --exclude='usr/lib/x86_64-linux-gnu/perl*' --exclude='usr/lib/x86_64-linux-gnu/dri' \
-            --exclude='usr/lib/x86_64-linux-gnu/libLLVM*' --exclude='usr/lib/x86_64-linux-gnu/gconv' \
-            --exclude='usr/lib/x86_64-linux-gnu/python3*' \
-            -C / usr/include usr/lib/x86_64-linux-gnu usr/lib/gcc/x86_64-linux-gnu \
-            usr/share/pkgconfig lib64 2>/dev/null" | tar -xf - -C "$SYSROOT"
+        rssh "$SERVER" "cd / && tar -chf - --ignore-failed-read --warning=no-failed-read \
+            --exclude='usr/lib/${MULTIARCH}/perl*' --exclude='usr/lib/${MULTIARCH}/dri' \
+            --exclude='usr/lib/${MULTIARCH}/libLLVM*' --exclude='usr/lib/${MULTIARCH}/gconv' \
+            --exclude='usr/lib/${MULTIARCH}/python3*' \
+            usr/include usr/lib/${MULTIARCH} usr/lib/gcc/${MULTIARCH} usr/share/pkgconfig \
+            \$(ls -d lib64 usr/lib/ld-linux* 2>/dev/null) 2>/dev/null" | tar -xf - -C "$SYSROOT"
         ln -s usr/lib "${SYSROOT}/lib"
-        for needed in usr/lib/x86_64-linux-gnu/libc.so.6 usr/include/stdio.h; do
+        for needed in "usr/lib/${MULTIARCH}/libc.so.6" usr/include/stdio.h; do
             if [[ ! -e "${SYSROOT}/${needed}" ]]; then
                 echo "error: the sysroot has no ${needed}; is build-essential installed on ${SERVER}?" >&2
                 exit 1
@@ -339,7 +353,7 @@ if [[ -z "${SYSROOT:-}" ]]; then
         touch "${SYSROOT}/.complete"
     fi
 fi
-if [[ "$NEED_DPDK" == 1 && ! -f "${SYSROOT}/usr/lib/x86_64-linux-gnu/pkgconfig/libdpdk.pc" ]]; then
+if [[ "$NEED_DPDK" == 1 && ! -f "${SYSROOT}/usr/lib/${MULTIARCH}/pkgconfig/libdpdk.pc" ]]; then
     echo "error: the sysroot has no libdpdk; install libdpdk-dev on the hosts (server-setup.sh does)" >&2
     exit 1
 fi
@@ -366,14 +380,14 @@ cross_build() {
         # RUSTFLAGS wins over them): its `target-cpu=native` would name
         # this machine.
         export RUSTFLAGS="-C target-cpu=${TARGET_CPU} -C link-arg=--target=${TARGET} -C link-arg=--sysroot=${SYSROOT} -C link-arg=-fuse-ld=lld"
-        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
-        export CC_x86_64_unknown_linux_gnu=clang
-        export AR_x86_64_unknown_linux_gnu="$ar"
-        export CFLAGS_x86_64_unknown_linux_gnu="--sysroot=${SYSROOT}"
-        export BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu="--sysroot=${SYSROOT}"
+        export "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=clang"
+        export "CC_${TARGET_ENV}=clang"
+        export "AR_${TARGET_ENV}=${ar}"
+        export "CFLAGS_${TARGET_ENV}=--sysroot=${SYSROOT}"
+        export "BINDGEN_EXTRA_CLANG_ARGS_${TARGET_ENV}=--sysroot=${SYSROOT}"
         export PKG_CONFIG_ALLOW_CROSS=1
         export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
-        export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/x86_64-linux-gnu/pkgconfig:${SYSROOT}/usr/share/pkgconfig"
+        export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/${MULTIARCH}/pkgconfig:${SYSROOT}/usr/share/pkgconfig"
         cargo build --release --target "$TARGET" "$@"
     )
 }
@@ -468,9 +482,10 @@ clean_journal() {
 
 # Every retargetable IRQ to core 0, and the writeback workqueue with them:
 # the pinned threads' cores stay quiet. EIOs on IRQs that cannot move are
-# expected.
+# expected, as is a read-only /proc in a container. Stderr is redirected
+# first, so that it takes a failing redirect's own error.
 pin_irqs() {
-    rssh "$1" "${SUDO} bash -c 'for irq in /proc/irq/[0-9]*; do printf 1 > \$irq/smp_affinity 2>/dev/null; done; echo 1 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null; true'"
+    rssh "$1" "${SUDO} bash -c 'for irq in /proc/irq/[0-9]*; do printf 1 2>/dev/null > \$irq/smp_affinity; done; echo 1 2>/dev/null > /sys/bus/workqueue/devices/writeback/cpumask; true'"
 }
 
 # Start a node on `host`: the binary, then its flags.
@@ -480,12 +495,19 @@ launch() {
     rssh "$host" "${SUDO} env NO_COLOR=1 RUST_LOG=${NODE_RUST_LOG} nohup ${REMOTE_DIR}/bin/$* >${NODE_LOG} 2>&1 </dev/null &"
 }
 
-# Wait for `pattern` in `host`'s node log; on a timeout show the log's
-# tail and fail.
+# Wait for `pattern` in `host`'s node log; if the node exits first or the
+# wait times out, show the log's tail and fail.
 wait_for_log() {
-    local host="$1" pattern="$2" timeout="${3:-120}"
-    if ! rssh "$host" "for _ in \$(seq ${timeout}); do grep -q -- '${pattern}' ${NODE_LOG} && exit 0; sleep 1; done; exit 1"; then
-        echo "  timed out after ${timeout}s waiting for '${pattern}' on ${host}:" >&2
+    local host="$1" pattern="$2" timeout="${3:-120}" rc=0
+    rssh "$host" "for _ in \$(seq ${timeout}); do grep -q -- '${pattern}' ${NODE_LOG} && exit 0; pgrep -f '${BIN_PATTERN}' >/dev/null || exit 2; sleep 1; done; exit 1" || rc=$?
+    if (( rc != 0 )); then
+        if (( rc == 2 )); then
+            # A node that logs no error of its own was killed: on a host
+            # short of memory, by the OOM killer.
+            echo "  the node on ${host} exited before '${pattern}' (with no error below, it was killed: out of memory?):" >&2
+        else
+            echo "  no '${pattern}' on ${host} within ${timeout}s:" >&2
+        fi
         rssh "$host" "tail -20 ${NODE_LOG}" >&2 || true
         return 1
     fi
