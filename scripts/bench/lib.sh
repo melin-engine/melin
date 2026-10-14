@@ -19,9 +19,11 @@ dpdk_conf_mode() {
 }
 
 # The DPDK replication modes the suite runs, in the order `all` runs
-# them. `port` mode (a NIC of replication's own) is the node's too, but
-# not yet the suite's.
-SUITE_DPDK_REPLICATION=(shared queue)
+# them: every mode, so `all` asks every node host for what each needs
+# (an mlx5 NIC for queue mode, a second one for port mode) and is refused
+# up front, naming the host, where one lacks it, rather than quietly
+# running fewer modes than asked for.
+SUITE_DPDK_REPLICATION=(shared queue port)
 
 # `dpdk_replication_modes <DPDK_REPLICATION>`: the setting's modes, a
 # comma-separated list of SUITE_DPDK_REPLICATION or `all`, each once;
@@ -36,10 +38,6 @@ dpdk_replication_modes() {
     IFS=, read -ra modes <<< "$list"
     local chosen=() known seen
     for mode in "${modes[@]}"; do
-        if [[ "$mode" == port ]]; then
-            echo "error: DPDK_REPLICATION mode 'port' is not supported by the suite yet: ${SUITE_DPDK_REPLICATION[*]}" >&2
-            return 1
-        fi
         # Compared whole, not as a substring of the list: `shared queue`
         # (a space for the comma) is one unknown mode, not two.
         known=
@@ -64,7 +62,8 @@ dpdk_replication_modes() {
 
 # What a DPDK primary logs once its replication listener is up, whichever
 # thread serves it: the shared mode's line (the client poll thread) and
-# the split modes' (the replication poll thread) both begin with it, so
+# the split modes' (queue and port: the replication poll thread) both
+# begin with it, so
 # one wait holds in every mode. test-lan-bench-suite.sh checks the node's
 # source for both.
 DPDK_REPLICATION_READY="DPDK replication sender started"
@@ -83,6 +82,60 @@ refuse_queue_mode() {
         echo "error: DPDK_REPLICATION=queue: ${host} runs DPDK on SR-IOV (DPDK_MODE=sriov in /etc/melin-dpdk.conf), whose VFs cannot steer replication to a queue of its own; queue mode needs mlx5" >&2
     fi
     return 1
+}
+
+# The /etc/melin-dpdk.conf keys of a replication NIC, which dpdk-setup.sh
+# writes when given one (DPDK_REPL_NIC and DPDK_REPL_IP, mlx5 only): its
+# DPDK port id, address, MAC and PCI address.
+DPDK_REPL_CONF_KEYS=(DPDK_REPL_PORT DPDK_REPL_IP DPDK_REPL_MAC DPDK_REPL_PCI)
+
+# `refuse_port_mode <host> <conf text>`: whether `host` can run DPDK
+# replication on a NIC of its own, which needs one: every
+# DPDK_REPL_CONF_KEYS key in its /etc/melin-dpdk.conf (empty text: it has
+# none), and DPDK_EAL_ARGS allowing the replication NIC's device beside
+# the client NIC's (the node's one EAL brings up both). Says why on
+# stderr and fails for a host that cannot. The rest (another port and
+# address than the client NIC's, in its subnet) the node checks itself,
+# before it touches a NIC, and its log says so.
+refuse_port_mode() {
+    local host="$1" conf="$2" key missing=() pci
+    local setup="run scripts/dpdk/dpdk-setup.sh with DPDK_IP, DPDK_REPL_NIC and DPDK_REPL_IP there (a second mlx5 port, see docs/benchmarking.md)"
+    if [[ -z "$conf" ]]; then
+        echo "error: DPDK_REPLICATION=port: ${host} has no /etc/melin-dpdk.conf, so no NIC of replication's own; ${setup}" >&2
+        return 1
+    fi
+    for key in "${DPDK_REPL_CONF_KEYS[@]}"; do
+        [[ -z "$(conf_value "$conf" "$key")" ]] && missing+=("$key")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        echo "error: DPDK_REPLICATION=port: ${host}'s /etc/melin-dpdk.conf has no ${missing[*]}, so no NIC of replication's own; ${setup}" >&2
+        return 1
+    fi
+    pci=$(conf_value "$conf" DPDK_REPL_PCI)
+    # Allowed bare or with devargs (`-a <pci>,<key>=<value>`).
+    local eal=" $(conf_value "$conf" DPDK_EAL_ARGS) "
+    if [[ "$eal" != *" -a ${pci} "* && "$eal" != *" -a ${pci},"* ]]; then
+        echo "error: DPDK_REPLICATION=port: ${host}'s /etc/melin-dpdk.conf has DPDK_EAL_ARGS not allowing the replication NIC's device (-a ${pci}); ${setup}" >&2
+        return 1
+    fi
+}
+
+# `replication_flags <DPDK replication mode> <replication ports>
+# <replication IP> [<primary's replication MAC>]`: what a DPDK node adds
+# to its command line to run replication where the mode says, each flag
+# after a space; nothing in shared mode. The ports, IP and MAC are port
+# mode's (the node's replication NIC, and on a replica the primary's
+# replication NIC's MAC, which its own dials), and are ignored elsewhere.
+replication_flags() {
+    local mode="$1" ports="$2" ip="$3" peer_mac="${4:-}"
+    case "$mode" in
+        queue) printf ' --dpdk-replication-queue' ;;
+        port)
+            printf ' --dpdk-replication-ports %s --dpdk-replication-ip %s' "$ports" "$ip"
+            [[ -n "$peer_mac" ]] && printf ' --dpdk-replication-peer-mac %s' "$peer_mac"
+            ;;
+    esac
+    return 0
 }
 
 # `judge_health <samples file> <expected replicas>`: the verdict on a
@@ -112,63 +165,113 @@ judge_health() {
         }' "$1"
 }
 
-# The least a queue must move each way, in packets per sampled second, to
-# count as carrying its traffic in judge_steering. Between the idle
-# chatter a queue sees and the least a run makes it carry: idle, queue 1
-# carries a heartbeat per replica every 5 s (only while no batch goes
-# out) and the TCP acks for them, and queue 0 the subnet's ARP and stray
-# frames, a few packets a second between them; under load, every request
-# is replicated to two replicas and acknowledged by both on queue 1, and
-# arrives and is answered on queue 0, so even one request in flight at a
+# The least replication's queue or port, and the clients', must each move
+# each way, in packets per sampled second, to count as carrying its
+# traffic in judge_steering. Between the idle chatter each sees and the
+# least a run makes it carry: idle, replication's carries a heartbeat per
+# replica every 5 s (only while no batch goes out) and the TCP acks for
+# them, and the clients' the subnet's ARP and stray frames, a few packets
+# a second between them (a NIC of its own, in port mode, gets its share
+# of the ARP too); under load, every request is replicated to two
+# replicas and acknowledged by both on replication's, and arrives and is
+# answered on the clients', so even one request in flight at a
 # millisecond a round trip moves a thousand packets a second each way on
-# each queue. An order of magnitude from either.
+# each. An order of magnitude from either, in either mode.
 STEERING_MIN_PACKETS_PER_SECOND=100
 
-# `judge_steering <DPDK replication mode> <samples file>`: the verdict on
-# how the primary's NIC split a run's traffic across its queues, from
-# samples of its per-queue packet counters, each sample a `# sample` line
-# followed by the `melin_dpdk_queue_{rx,tx}_packets_total` lines of one
-# scrape. Only queue mode steers: in any other mode there is nothing to
+# `judge_steering <DPDK replication mode> <samples file> [<client ports>
+# <replication ports>]`: the verdict on how the primary split a run's
+# traffic between replication and its clients, from samples of its
+# per-queue packet counters, each sample a `# sample` line followed by
+# the `melin_dpdk_queue_{rx,tx}_packets_total` lines of one scrape,
+# labelled by DPDK port and queue. In queue mode replication is queue 1
+# of the client NIC's ports, the clients queue 0; in port mode
+# replication is the replication NIC's ports (the third and fourth
+# arguments, comma-separated DPDK port ids, as the node's flags take
+# them; needed in port mode only), the clients the client NIC's, every
+# queue of each. Shared mode puts both on one queue: there is nothing to
 # judge, and it passes.
 #
 # The counters are cumulative per port and queue, and say nothing of
-# which flow a packet was on, so the verdict is on volume: what each
-# queue moved, summed over the primary's ports (one in queue mode, which
-# runs on no bond, but the sum costs nothing), between the first and
-# the last complete samples (those with every line the fullest has: a
-# scrape cut short by its timeout is not used), against
-# STEERING_MIN_PACKETS_PER_SECOND times the samples between them. Queue 1
-# must have moved replication, both ways (out to the replicas, their acks
-# in), and queue 0 the clients', both ways; a queue that moved less in a
-# direction degrades the run, as does a primary with no queue 1 at all.
-# A flow steered to the wrong queue while the right one carries the rest
-# is left to its consequences, which the counters cannot see but the
-# suite does: a replication segment on queue 0 is reset by the client
-# stack and the replica's link drops (the health verdict), and a client
-# segment on queue 1 is reset by the replication stack and the load
-# generator's connection fails (the run fails).
+# which flow a packet was on, so the verdict is on volume: what each side
+# moved, summed over its queues and ports (one port each on mlx5, which
+# runs no bond, but the sum costs nothing), between the first and the
+# last complete samples (those with every line the fullest has: a scrape
+# cut short by its timeout is not used), against
+# STEERING_MIN_PACKETS_PER_SECOND times the samples between them.
+# Replication's queue or port must have moved replication, both ways (out
+# to the replicas, their acks in), and the clients' theirs, both ways;
+# one that moved less in a direction degrades the run, as does a primary
+# with no replication queue or port at all. A flow on the wrong side
+# while the right one carries the rest is left to its consequences, which
+# the counters cannot see but the suite does: in queue mode a replication
+# segment on queue 0 is reset by the client stack and the replica's link
+# drops (the health verdict), and a client segment on queue 1 is reset by
+# the replication stack and the load generator's connection fails (the
+# run fails); in port mode each NIC answers for its own address only, so
+# a flow on the wrong one is one sent to the wrong address, and fails the
+# same ways.
 #
 # Prints the verdict; fails unless it is `ok` (or not judged, in a mode
-# with nothing to judge). Fewer than two complete samples is unjudged.
+# with nothing to judge). Fewer than two complete samples is unjudged, as
+# is port mode without the ports to tell the sides apart.
 judge_steering() {
-    local mode="$1"
-    if [[ "$mode" != queue ]]; then
-        echo "not judged: ${mode} mode steers no traffic"
-        return 0
-    fi
-    awk -v floor="$STEERING_MIN_PACKETS_PER_SECOND" '
+    local mode="$1" client_ports="${3:-}" replication_ports="${4:-}"
+    case "$mode" in
+        queue) ;;
+        port)
+            if [[ -z "$client_ports" || -z "$replication_ports" ]]; then
+                echo "UNJUDGED: port mode needs the client and replication NICs' DPDK ports"
+                return 1
+            fi
+            ;;
+        *)
+            echo "not judged: ${mode} mode steers no traffic"
+            return 0
+            ;;
+    esac
+    awk -v floor="$STEERING_MIN_PACKETS_PER_SECOND" -v mode="$mode" \
+        -v client_ports="$client_ports" -v replication_ports="$replication_ports" '
+        # `ports <list>`: how a comma-separated list of ports is named.
+        function ports(list) { return (index(list, ",") ? "ports " : "port ") list }
+        BEGIN {
+            if (mode == "port") {
+                count = split(client_ports, list, ",")
+                for (i = 1; i <= count; i++) side_of_port[list[i]] = "clients"
+                count = split(replication_ports, list, ",")
+                for (i = 1; i <= count; i++) side_of_port[list[i]] = "replication"
+                where["clients"] = ports(client_ports)
+                where["replication"] = ports(replication_ports)
+                absent = "the primary has no " where["replication"] ": replication is not on a NIC of its own"
+            } else {
+                where["clients"] = "queue 0"
+                where["replication"] = "queue 1"
+                absent = "the primary has no queue 1: replication is not on a queue of its own"
+            }
+        }
+        # `label <name>`: the value of label `name` on the current line.
+        function label(name,   value) {
+            value = $1
+            sub(".*[{,]" name "=\"", "", value)
+            sub(/".*/, "", value)
+            return value
+        }
         /^# sample/ { n++; next }
         n && $1 ~ /^melin_dpdk_queue_(rx|tx)_packets_total\{/ {
-            dir = ($1 ~ /_rx_/) ? "in" : "out"
-            queue = $1
-            sub(/.*queue="/, "", queue)
-            sub(/".*/, "", queue)
-            moved[n, dir, queue] += $2
             lines[n]++
-            if (queue == 1) has_replication_queue = 1
+            dir = ($1 ~ /_rx_/) ? "in" : "out"
+            if (mode == "port") {
+                side = side_of_port[label("port")]
+            } else {
+                queue = label("queue")
+                side = (queue == 1) ? "replication" : (queue == 0) ? "clients" : ""
+            }
+            if (side == "") next
+            moved[n, dir, side] += $2
+            if (side == "replication") has_replication = 1
         }
-        function delta(dir, queue) {
-            return moved[last, dir, queue] - moved[first, dir, queue]
+        function delta(dir, side) {
+            return moved[last, dir, side] - moved[first, dir, side]
         }
         END {
             for (i = 1; i <= n; i++) if (lines[i] > fullest) fullest = lines[i]
@@ -176,19 +279,17 @@ judge_steering() {
                 if (fullest && lines[i] == fullest) { if (!first) first = i; last = i }
             }
             if (first == last) { print "UNJUDGED: fewer than two samples of the queue counters"; exit 1 }
-            if (!has_replication_queue) {
-                print "DEGRADED: the primary has no queue 1: replication is not on a queue of its own"
-                exit 1
-            }
+            if (!has_replication) { print "DEGRADED: " absent; exit 1 }
             seconds = last - first
             least = floor * seconds
             # %.0f, not %d: some awks print %d through a 32-bit int.
-            summary = sprintf("queue 0 (clients) %.0f in, %.0f out; queue 1 (replication) %.0f in, %.0f out; over %d sampled seconds",
-                delta("in", 0), delta("out", 0), delta("in", 1), delta("out", 1), seconds)
-            if (delta("in", 1) < least || delta("out", 1) < least)
-                reasons = reasons "; replication is not on queue 1"
-            if (delta("in", 0) < least || delta("out", 0) < least)
-                reasons = reasons "; client traffic is not on queue 0"
+            summary = sprintf("%s (clients) %.0f in, %.0f out; %s (replication) %.0f in, %.0f out; over %d sampled seconds",
+                where["clients"], delta("in", "clients"), delta("out", "clients"),
+                where["replication"], delta("in", "replication"), delta("out", "replication"), seconds)
+            if (delta("in", "replication") < least || delta("out", "replication") < least)
+                reasons = reasons "; replication is not on " where["replication"]
+            if (delta("in", "clients") < least || delta("out", "clients") < least)
+                reasons = reasons "; client traffic is not on " where["clients"]
             if (reasons == "") { print "ok: " summary; exit 0 }
             printf "DEGRADED: %s%s (each needs %.0f packets each way, %d a second)\n",
                 summary, reasons, least, floor

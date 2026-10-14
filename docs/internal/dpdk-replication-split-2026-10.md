@@ -395,7 +395,7 @@ unchanged after every step.
    rules, queue 1's receiver, the unpolled queue 0). Followed by the
    replica's ARP rule, removed at promotion (see "ARP on a queue-mode
    replica"), its own change.
-7. **Bench suite, shared and queue modes.** `DPDK_REPLICATION=shared,queue`
+7. **Bench suite, shared, queue and port modes.** `DPDK_REPLICATION=shared,queue,port`
    (or `all`; `shared` by default, so an invocation without it runs as
    before) runs each value as its own pass of the DPDK transport, from one
    build, validated up front with the other settings. Runs are named
@@ -417,12 +417,38 @@ unchanged after every step.
    summed over ports, or the run is degraded. The counters cannot
    attribute a packet to a flow, so a flow misrouted beside correctly
    steered traffic is left to its consequences (a reset link: the health
-   verdict, or the load generator failing). Deferred, each its own
-   commit: `port` mode (refused by the suite until then; it is to read
-   `DPDK_REPL_PORTS`, `DPDK_REPL_IP` and `DPDK_REPL_MAC` from
-   `/etc/melin-dpdk.conf`, and skip a host without them), and a
-   `TRACE=1` pass on a `latency-trace` build. Untested until the rig:
-   the DPDK passes themselves (the podman rehearsal runs kernel TCP only).
+   verdict, or the load generator failing). `port` mode followed as its
+   own commit. `dpdk-setup.sh` (mlx5 path only; SR-IOV and L3 refuse it)
+   takes a second port, `DPDK_REPL_NIC` and `DPDK_REPL_IP`, refused on
+   the default-route port, on the client port, and outside the client
+   port's subnet, and writes `DPDK_REPL_{NIC,PCI,IP,MAC,PORT}` with
+   `DPDK_EAL_ARGS` allowing both devices. The port ids follow EAL's
+   probe order, PCI address order for PCI devices, not the `-a` order,
+   so `DPDK_PORT` is the client port's id among the two and may be 1;
+   without a second port the conf is byte for byte what it was
+   (`test-dpdk-setup.sh`, which extracts the script's pure functions, as
+   `test-server-setup.sh` does). The suite refuses, by name and before
+   the build, a node host whose conf lacks the `DPDK_REPL_*` keys or
+   whose EAL arguments do not allow the second device, rather than skip
+   it: `all` is every mode, so a rig without a second port lists its
+   modes. In port mode the primary binds replication on its replication
+   NIC's address and the replicas dial it there (`--replica-of`), each
+   node adding `--dpdk-replication-ports` and `--dpdk-replication-ip`,
+   and each replica `--dpdk-replication-peer-mac` with the primary's
+   replication MAC; the client NIC's flags are unchanged. The readiness
+   waits needed no change (the split modes' replication line, then the
+   client listener's and the health endpoint's, are the same in port
+   mode). `judge_steering` tells the sides apart by port in port mode
+   (the replication NIC's ports against the client NIC's, every queue of
+   each) with queue mode's threshold, and degrades a primary with no
+   replication port. The counters judge volume only, so ports recorded
+   the wrong way round pass the verdict: that shows as a cluster that
+   does not start, each port then holding the other's address, so that
+   no replica connects. Still deferred: a `TRACE=1` pass on a `latency-trace` build.
+   The suite does not provision AWS ENIs; port mode there is for hosts
+   with a second mlx5 port. Untested until the rig: the DPDK passes
+   themselves (the podman rehearsal runs kernel TCP only) and
+   `dpdk-setup.sh`'s hardware path, including the port ids it derives.
 8. **Docs.** The modes, flags and the `repl-poll` core in the operator
    docs (`deployment.md`, `replication.md`); `dpdk-replication.md`; the
    roadmap item (removed or rewritten once measured); `CHANGELOG.md`
@@ -454,8 +480,9 @@ and the health verdict (a degraded run means a replica was evicted or
 caught up). Then a second pass with a `latency-trace` build, for the
 client loop's iteration time in both modes. The first thing to check on
 the rig is the per-queue counters: replication on queue 1 only, client
-traffic on queue 0 only. `port` mode is measured when an AWS rig with a
-second ENI is up.
+traffic on queue 0 only. `port` mode is measured on a rig whose hosts
+have a second mlx5 port (`DPDK_REPLICATION=port`), or when an AWS rig
+with a second ENI is up.
 
 Expectation, to be confirmed or refuted: no change at the single-client
 median, and lower p99/p99.9 and no evictions under throughput. Client

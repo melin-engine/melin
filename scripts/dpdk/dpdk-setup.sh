@@ -30,6 +30,18 @@
 #                      doesn't carry the default route.
 #   DPDK_IP=<ip/cidr>  IP for the DPDK transport. Required: there is no
 #                      bond VLAN to derive from in this mode.
+#   DPDK_REPL_NIC=<iface>  optional: a second mlx5 netdev, for a node's
+#                      replication on a NIC of its own (the node's port
+#                      mode, --dpdk-replication-ports). Neither the
+#                      default-route port nor DPDK_NIC. Needs DPDK_REPL_IP.
+#   DPDK_REPL_IP=<ip[/cidr]>  the replication NIC's IP, in DPDK_IP's
+#                      subnet (the node gives the replication NIC the
+#                      client NIC's prefix length, gateway, MTU and VLAN),
+#                      other than DPDK_IP. Needs DPDK_REPL_NIC.
+#   With both, /etc/melin-dpdk.conf also gets DPDK_REPL_{NIC,PCI,IP,MAC,PORT},
+#   DPDK_EAL_ARGS allows both devices, and DPDK_PORT is the client NIC's
+#   port id among the two, which need not be 0 (see dpdk_pci_port_ids).
+#   The SR-IOV and L3 paths refuse them.
 #
 # Usage (sriov-bond):
 #   ./scripts/dpdk/dpdk-setup.sh [--vlan 1461] [--ip 10.189.210.100/24]
@@ -38,6 +50,9 @@
 #   DPDK_IP=10.0.0.10/24 ./scripts/dpdk/dpdk-setup.sh
 #   DPDK_IP=10.0.0.10/24 DPDK_NIC=enp193s0f1np1 ./scripts/dpdk/dpdk-setup.sh
 #   DPDK_IP=10.9.0.102/24 ./scripts/dpdk/dpdk-setup.sh --vlan 2170
+#   DPDK_IP=10.0.0.10/24 DPDK_NIC=enp193s0f0np0 DPDK_REPL_NIC=enp193s0f1np1 \
+#       DPDK_REPL_IP=10.0.0.20 ./scripts/dpdk/dpdk-setup.sh
+#   (--repl-nic and --repl-ip are the flag spellings of the last two)
 #
 # Pass --vlan whenever the fabric expects 802.1Q tags (Latitude private
 # networks do, on bare metal). Untagged frames are dropped by the switch
@@ -65,13 +80,18 @@ MTU="${MTU:-1500}"
 # paths (the sriov path derives it from the bond VLAN when omitted; mlx5
 # has nothing to derive from, so it stays untagged unless given). --nic
 # is only meaningful in the mlx5 path, and is ignored silently elsewhere
-# rather than rejected — keeps the wrapper interface uniform.
+# rather than rejected — keeps the wrapper interface uniform. --repl-nic
+# and --repl-ip are mlx5-only too, but refused elsewhere: a node set up
+# without the NIC it was asked for would fail only once started in port
+# mode.
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --vlan) VLAN_ID="$2"; shift 2 ;;
         --ip)   DPDK_IP="$2"; shift 2 ;;
         --mtu)  MTU="$2"; shift 2 ;;
         --nic)  DPDK_NIC="$2"; shift 2 ;;
+        --repl-nic) DPDK_REPL_NIC="$2"; shift 2 ;;
+        --repl-ip)  DPDK_REPL_IP="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -139,6 +159,171 @@ detect_mode() {
 }
 
 # ---------------------------------------------------------------------------
+# The replication NIC's pure checks and the mlx5 conf, host-free so that
+# test-dpdk-setup.sh runs them (it extracts these functions, each a
+# column-0 `name() {` .. `}`, and sources them).
+# ---------------------------------------------------------------------------
+
+# `refuse_repl_nic_outside_mlx5 <mode> <DPDK_REPL_NIC> <DPDK_REPL_IP>`:
+# fails, saying why, when a replication NIC is asked for on the SR-IOV
+# or L3 path. SR-IOV is no longer deployed, and L3 shares the public NIC.
+# Any other mode passes: mlx5 takes one, and an undetected topology is
+# left to the dispatch's own error, which says what was not found.
+refuse_repl_nic_outside_mlx5() {
+    local mode="$1" repl_nic="$2" repl_ip="$3"
+    [[ ( "$mode" != sriov-bond && "$mode" != l3 ) || ( -z "$repl_nic" && -z "$repl_ip" ) ]] && return 0
+    echo "error: a replication NIC (DPDK_REPL_NIC / DPDK_REPL_IP, --repl-nic / --repl-ip) is supported on the mlx5 path only, not ${mode}" >&2
+    echo "  The SR-IOV and L3 paths set up one NIC; run without them there." >&2
+    return 1
+}
+
+# `ipv4_to_int <a.b.c.d>`: the address as a 32-bit integer; fails on
+# anything else, an octet with a leading zero included: the node parses
+# its addresses as Rust's Ipv4Addr does, which refuses one, so an
+# address accepted here and written to the config must be one it starts
+# with.
+ipv4_to_int() {
+    local o='(0|[1-9][0-9]{0,2})'
+    [[ "$1" =~ ^$o\.$o\.$o\.$o$ ]] || return 1
+    local octet value=0
+    for octet in "${BASH_REMATCH[@]:1}"; do
+        (( octet <= 255 )) || return 1
+        value=$(( (value << 8) | octet ))
+    done
+    echo "$value"
+}
+
+# `check_repl_nic_args <DPDK_NIC> <DPDK_IP> <default-route iface>
+# <DPDK_REPL_NIC> <DPDK_REPL_IP>`: whether the replication NIC asked for
+# is one the node can run (its flags' rules, checked before anything is
+# touched): both given, neither the default-route port nor the client
+# NIC, an address other than the client NIC's in its subnet, and no
+# prefix length other than the client NIC's (the node gives the
+# replication NIC the client NIC's). Says why on stderr and fails
+# otherwise.
+check_repl_nic_args() {
+    local nic="$1" ip="$2" def_iface="$3" repl_nic="$4" repl_ip="$5"
+    if [[ -z "$repl_nic" || -z "$repl_ip" ]]; then
+        echo "error: DPDK_REPL_NIC and DPDK_REPL_IP go together: the replication NIC needs both" >&2
+        return 1
+    fi
+    if [[ "$repl_nic" == "$def_iface" ]]; then
+        echo "error: $repl_nic carries the default route; refusing to bind it to DPDK" >&2
+        echo "  Handing it to DPDK would break management connectivity." >&2
+        echo "  Pick a different port (DPDK_REPL_NIC=<other-iface>)." >&2
+        return 1
+    fi
+    if [[ "$repl_nic" == "$nic" ]]; then
+        echo "error: DPDK_REPL_NIC=$repl_nic is the client NIC (DPDK_NIC); the replication NIC must be another port" >&2
+        return 1
+    fi
+    local addr="${ip%%/*}" prefix="${ip#*/}" repl_addr="${repl_ip%%/*}" a b mask
+    if [[ "$ip" != */* ]] || ! [[ "$prefix" =~ ^[0-9]{1,2}$ ]] || (( 10#$prefix > 32 )) \
+        || ! a=$(ipv4_to_int "$addr"); then
+        echo "error: DPDK_IP=$ip is not an IPv4 address with a prefix length (a.b.c.d/len)" >&2
+        return 1
+    fi
+    prefix=$(( 10#$prefix ))
+    if ! b=$(ipv4_to_int "$repl_addr") \
+        || { [[ "$repl_ip" == */* ]] && ! [[ "${repl_ip#*/}" =~ ^[0-9]{1,2}$ ]]; }; then
+        echo "error: DPDK_REPL_IP=$repl_ip is not an IPv4 address (a.b.c.d, or a.b.c.d/len)" >&2
+        return 1
+    fi
+    if [[ "$repl_ip" == */* ]] && (( 10#${repl_ip#*/} != prefix )); then
+        echo "error: DPDK_REPL_IP=$repl_ip: the replication NIC takes the client NIC's prefix length (/$prefix, from DPDK_IP); give it /$prefix or none" >&2
+        return 1
+    fi
+    if (( a == b )); then
+        echo "error: DPDK_REPL_IP=$repl_addr is the client NIC's address (DPDK_IP); the replication NIC needs an address of its own" >&2
+        return 1
+    fi
+    # A prefix of 0 is an empty mask: a shift by 32 is not one in bash.
+    mask=$(( prefix == 0 ? 0 : (0xffffffff << (32 - prefix)) & 0xffffffff ))
+    if (( (a & mask) != (b & mask) )); then
+        echo "error: DPDK_REPL_IP=$repl_addr is outside the client NIC's subnet ($ip); the replication NIC takes its prefix length and gateway, so it must be in that subnet" >&2
+        return 1
+    fi
+}
+
+# `dpdk_pci_port_ids <client PCI> <replication PCI>`: the DPDK port ids
+# the two devices get when DPDK_EAL_ARGS allows both, printed as
+# `<client id> <replication id>`.
+#
+# EAL keeps the PCI devices it scans sorted by address (domain, bus,
+# device, function), the PCI bus probes them in that order, and ethdev
+# gives each port probed the lowest free id, from 0. `-a` filters what is
+# probed but does not order it, so the lower address is port 0 whichever
+# `-a` comes first. One port per device: mlx5 makes no representor or
+# multiport ports without devargs saying so, and none are written here.
+# Fails, saying why, on an address that is not a PCI one or on one device
+# given twice.
+dpdk_pci_port_ids() {
+    local client="$1" repl="$2" pci key keys=()
+    for pci in "$client" "$repl"; do
+        if ! [[ "$pci" =~ ^([0-9a-fA-F]{4,8}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])$ ]]; then
+            echo "error: '$pci' is not a PCI address (domain:bus:device.function); cannot tell the DPDK port ids" >&2
+            return 1
+        fi
+        # Each field numerically, in the order EAL compares them (a
+        # domain can be wider than four digits).
+        key=$(( ((16#${BASH_REMATCH[1]} * 256 + 16#${BASH_REMATCH[2]}) * 256 + 16#${BASH_REMATCH[3]}) * 8 + ${BASH_REMATCH[4]} ))
+        keys+=("$key")
+    done
+    if (( keys[0] == keys[1] )); then
+        echo "error: the client and replication NICs are one PCI device ($client); the replication NIC must be another port" >&2
+        return 1
+    fi
+    if (( keys[0] < keys[1] )); then echo "0 1"; else echo "1 0"; fi
+}
+
+# `write_mlx5_conf <DPDK_IP> <PCI> <NIC> <MAC> <MTU> [<port> <repl NIC>
+# <repl PCI> <repl IP> <repl MAC> <repl port>]`: /etc/melin-dpdk.conf's
+# text on the mlx5 path, without VLAN_ID (appended only when given).
+# Without a replication NIC, DPDK_PORT is 0 and the text is what it has
+# always been; with one, DPDK_PORT is the client NIC's id and the
+# DPDK_REPL_* keys follow.
+#
+# EAL allowlists the DPDK port by PCI address so the mlx5 PMD picks
+# up just that device (both, with a replication NIC) and leaves any
+# other Mellanox ports (e.g. the SSH port on a dual-port card) untouched.
+# Multi-word values are double-quoted so `source` / `eval` consumers
+# (dpdk-server.sh, dpdk-test.sh, dpdk-lan-bench.sh) don't misparse
+# them as `VAR=word1 command word2…`. Single-word values are left
+# unquoted to match the existing SR-IOV / TAP conf shape.
+#
+# DPDK_MAC is the port's real hardware address. In bifurcated mode
+# the kernel netdev keeps it and the DPDK side shares it, so peers
+# cannot derive it the way they can for an SR-IOV VF (02:00:<ip>).
+# Consumers pass it to the client as `--dpdk-peer-mac`; DPDK_REPL_MAC,
+# likewise, to a replica as `--dpdk-replication-peer-mac`.
+write_mlx5_conf() {
+    local ip="$1" pci="$2" nic="$3" mac="$4" mtu="$5" port="${6:-0}"
+    local repl_nic="${7:-}" repl_pci="${8:-}" repl_ip="${9:-}" repl_mac="${10:-}" repl_port="${11:-}"
+    local allowed="-a ${pci}"
+    [[ -n "$repl_nic" ]] && allowed+=" -a ${repl_pci}"
+    cat <<EOF
+DPDK_IP=${ip%%/*}
+DPDK_PREFIX=${ip##*/}
+DPDK_PORT=${port}
+DPDK_MODE=mlx5
+DPDK_PCI=${pci}
+DPDK_NIC=${nic}
+DPDK_MAC=${mac}
+HUGE_DIR=/mnt/huge_2m
+MTU=${mtu}
+DPDK_EAL_ARGS="${allowed} --huge-dir=/mnt/huge_2m"
+EOF
+    [[ -z "$repl_nic" ]] && return 0
+    cat <<EOF
+DPDK_REPL_NIC=${repl_nic}
+DPDK_REPL_PCI=${repl_pci}
+DPDK_REPL_IP=${repl_ip%%/*}
+DPDK_REPL_MAC=${repl_mac}
+DPDK_REPL_PORT=${repl_port}
+EOF
+}
+
+# ---------------------------------------------------------------------------
 # mlx5 bifurcated path
 # ---------------------------------------------------------------------------
 run_mlx5_setup() {
@@ -146,15 +331,15 @@ run_mlx5_setup() {
     def_iface=$(default_route_iface)
 
     # Auto-pick the first mlx5 netdev that isn't carrying the default
-    # route, unless the operator overrode with DPDK_NIC. Cheapest way to
-    # avoid stealing the SSH port.
+    # route (nor asked for as the replication NIC), unless the operator
+    # overrode with DPDK_NIC. Cheapest way to avoid stealing the SSH port.
     if [[ -z "${DPDK_NIC:-}" ]]; then
         for drv_link in /sys/class/net/*/device/driver; do
             local drv ifname
             drv=$(basename "$(readlink "$drv_link" 2>/dev/null)" 2>/dev/null)
             [[ "$drv" == "mlx5_core" ]] || continue
             ifname=$(basename "$(dirname "$(dirname "$drv_link")")")
-            if [[ "$ifname" != "$def_iface" ]]; then
+            if [[ "$ifname" != "$def_iface" && "$ifname" != "${DPDK_REPL_NIC:-}" ]]; then
                 DPDK_NIC="$ifname"
                 break
             fi
@@ -190,20 +375,52 @@ run_mlx5_setup() {
     # address. smoltcp on the DPDK side advertises the same MAC for ARP.
     mac=$(cat "/sys/class/net/${DPDK_NIC}/address")
 
+    # The replication NIC, when asked for: checked whole before anything
+    # is touched, and its port id and the client NIC's derived from the
+    # two PCI addresses.
+    local repl_nic="${DPDK_REPL_NIC:-}" repl_pci="" repl_mac="" port=0 repl_port="" ids
+    if [[ -n "$repl_nic" || -n "${DPDK_REPL_IP:-}" ]]; then
+        check_repl_nic_args "$DPDK_NIC" "$DPDK_IP" "$def_iface" "$repl_nic" "${DPDK_REPL_IP:-}" || exit 1
+        if [[ "$(basename "$(readlink "/sys/class/net/${repl_nic}/device/driver" 2>/dev/null)" 2>/dev/null)" != "mlx5_core" ]]; then
+            echo "error: DPDK_REPL_NIC=$repl_nic is not an mlx5 netdev (no such interface, or another driver)" >&2
+            exit 1
+        fi
+        repl_pci=$(ethtool -i "$repl_nic" 2>/dev/null | awk '/^bus-info:/{print $2}')
+        if [[ -z "$repl_pci" ]]; then
+            echo "error: could not read PCI address for $repl_nic" >&2
+            exit 1
+        fi
+        repl_mac=$(cat "/sys/class/net/${repl_nic}/address")
+        ids=$(dpdk_pci_port_ids "$pci" "$repl_pci") || exit 1
+        read -r port repl_port <<< "$ids"
+    fi
+
     echo "=== DPDK Mellanox bifurcated mode ==="
     echo "  NIC:     ${DPDK_NIC} (default route on ${def_iface:-<none>}, untouched)"
     echo "  PCI:     ${pci}"
     echo "  DPDK IP: ${DPDK_IP}"
     echo "  MAC:     ${mac} (kernel netdev keeps ownership)"
     echo "  MTU:     ${MTU}"
+    if [[ -n "$repl_nic" ]]; then
+        echo "  DPDK port: ${port} (of the two allowed devices, by PCI address)"
+        echo "  Replication NIC: ${repl_nic} (DPDK port ${repl_port})"
+        echo "  Replication PCI: ${repl_pci}"
+        echo "  Replication IP:  ${DPDK_REPL_IP%%/*}"
+        echo "  Replication MAC: ${repl_mac} (kernel netdev keeps ownership)"
+    fi
     echo ""
 
     setup_hugepages
 
     # Bring the port up and set MTU. mlx5's bifurcated PMD reads link
     # state from the kernel; a down netdev means DPDK sees link-down.
+    # The replication NIC takes the client NIC's MTU, as the node does.
     ip link set "${DPDK_NIC}" mtu "${MTU}"
     ip link set "${DPDK_NIC}" up
+    if [[ -n "$repl_nic" ]]; then
+        ip link set "${repl_nic}" mtu "${MTU}"
+        ip link set "${repl_nic}" up
+    fi
 
     # No vfio-pci rebind. The netdev stays bound to mlx5_core; the DPDK
     # PMD attaches via the ib_uverbs / rdma-core path and shares the
@@ -213,35 +430,19 @@ run_mlx5_setup() {
     # Write conf
     # ---------------------------------------------------------------------
     local conf="/etc/melin-dpdk.conf"
-    # EAL allowlists the DPDK port by PCI address so the mlx5 PMD picks
-    # up just that device and leaves any other Mellanox ports (e.g. the
-    # SSH port on a dual-port card) untouched.
-    # Multi-word values are double-quoted so `source` / `eval` consumers
-    # (dpdk-server.sh, dpdk-test.sh, dpdk-lan-bench.sh) don't misparse
-    # them as `VAR=word1 command word2…`. Single-word values are left
-    # unquoted to match the existing SR-IOV / TAP conf shape.
-    #
-    # DPDK_MAC is the port's real hardware address. In bifurcated mode
-    # the kernel netdev keeps it and the DPDK side shares it, so peers
-    # cannot derive it the way they can for an SR-IOV VF (02:00:<ip>).
-    # Consumers pass it to the client as `--dpdk-peer-mac`.
+    # What it holds, and why, is write_mlx5_conf's to say.
     #
     # VLAN_ID is written only when the operator supplied `--vlan`. On a
     # tagged fabric (Latitude private networks tag on bare metal) an
     # untagged frame is dropped by the switch with no error anywhere, so
-    # omitting it fails silently rather than loudly.
-    cat > "$conf" <<EOF
-DPDK_IP=${DPDK_IP%%/*}
-DPDK_PREFIX=${DPDK_IP##*/}
-DPDK_PORT=0
-DPDK_MODE=mlx5
-DPDK_PCI=${pci}
-DPDK_NIC=${DPDK_NIC}
-DPDK_MAC=${mac}
-HUGE_DIR=/mnt/huge_2m
-MTU=${MTU}
-DPDK_EAL_ARGS="-a ${pci} --huge-dir=/mnt/huge_2m"
-EOF
+    # omitting it fails silently rather than loudly. The replication NIC
+    # takes the client NIC's VLAN, as the node does.
+    if [[ -n "$repl_nic" ]]; then
+        write_mlx5_conf "$DPDK_IP" "$pci" "$DPDK_NIC" "$mac" "$MTU" \
+            "$port" "$repl_nic" "$repl_pci" "$DPDK_REPL_IP" "$repl_mac" "$repl_port" > "$conf"
+    else
+        write_mlx5_conf "$DPDK_IP" "$pci" "$DPDK_NIC" "$mac" "$MTU" > "$conf"
+    fi
     if [[ -n "${VLAN_ID:-}" ]]; then
         echo "VLAN_ID=${VLAN_ID}" >> "$conf"
         echo "  VLAN:    ${VLAN_ID} (802.1Q tag inserted/stripped in hardware)"
@@ -662,6 +863,7 @@ EOF
 # the visible kernel topology. L3 must be explicit — we won't grab the
 # public NIC without being told to.
 MODE="${DPDK_MODE:-$(detect_mode)}"
+refuse_repl_nic_outside_mlx5 "$MODE" "${DPDK_REPL_NIC:-}" "${DPDK_REPL_IP:-}" || exit 1
 case "$MODE" in
     sriov-bond) run_sriov_bond_setup ;;
     mlx5)       run_mlx5_setup ;;

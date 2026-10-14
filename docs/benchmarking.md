@@ -75,8 +75,9 @@ by default) and `single` (one request in flight). The script's header
 lists every setting.
 
 On DPDK, `DPDK_REPLICATION` picks where the nodes run replication, from
-`shared` and `queue` (comma-separated, or `all`; `shared` by default),
-each a pass of the DPDK transport of its own, from the same build:
+`shared`, `queue` and `port` (comma-separated, or `all`; `shared` by
+default), each a pass of the DPDK transport of its own, from the same
+build:
 
 - `shared`: on the client queue and its poll thread, as a DPDK node
   does without a replication flag.
@@ -91,9 +92,44 @@ each a pass of the DPDK transport of its own, from the same build:
   `DPDK_IP` on it first), naming the host. The primary's
   replication poll thread takes a core of its own, `repl-poll` in the
   node's `--cores` layout.
+- `port`: on a second NIC of its own, with its own address, served by a
+  poll thread of its own (`--dpdk-replication-ports`,
+  `--dpdk-replication-ip` on the primary and the replicas, and
+  `--dpdk-replication-peer-mac` on the replicas, naming the primary's
+  replication NIC). The primary listens for its replicas on its
+  replication NIC's address, and the replicas dial it from theirs;
+  clients reach the primary on its client NIC, as in the other modes.
+  The replication poll thread takes `repl-poll`, as in `queue` mode.
 
-Replication on a NIC of its own (`port` mode) is not run by the suite
-yet, and is refused.
+`all` runs every mode, so it needs every node host ready for each; list
+the modes instead on a rig without a second NIC.
+
+### A second NIC for `port` mode
+
+`port` mode needs a second Mellanox (mlx5) port on the primary and on
+both replicas (the load generator's host needs none), on the same
+private network as the first, with an address of its own in the first
+port's subnet: the node gives the replication NIC the client NIC's
+prefix length, gateway, MTU and VLAN. Set both up with one run of
+`dpdk-setup.sh` on each node host, naming the second port and its
+address:
+
+```sh
+DPDK_IP=10.0.0.101/24 DPDK_REPL_NIC=<second-port> DPDK_REPL_IP=10.0.0.111 ./dpdk-setup.sh [--vlan <id>]
+```
+
+The script refuses a second port that carries the default route or is
+the first port, and an address outside the first port's subnet or equal
+to its address. It allows both ports' devices to DPDK and records which
+DPDK port each one is: DPDK numbers the two by their PCI addresses, so
+the client port is not always port 0. The suite reads this from
+`/etc/melin-dpdk.conf`. It refuses to start a `port` pass, naming the
+host, when a node host's configuration has no replication NIC. Only the
+mlx5 setup takes a second NIC; the SR-IOV setup refuses one.
+
+The suite does not provision the second NIC: `port` mode here is for
+hosts with a second mlx5 port. Adding a second network interface to a
+cloud instance (an AWS ENI, say) is done outside the suite.
 
 Each run starts a fresh cluster on empty journals, acknowledging under
 `ACK_POLICY` (`disk+ram` by default). The load generator warms up,
@@ -160,9 +196,14 @@ which connection a packet belonged to, so a connection steered to the
 wrong queue while the right one carries the rest is caught by what it
 causes instead: a replication link landing on the client queue is reset
 and the replica drops out (the health verdict), and a client landing on
-the replication queue is reset and the load generator fails. In `shared`
-mode there is nothing to steer, and the counts are kept for reading
-only.
+the replication queue is reset and the load generator fails.
+
+In `port` mode the run is judged the same way, by NIC rather than by
+queue: the replication NIC's port must have moved replication both ways
+and the client NIC's port the clients' traffic both ways, at the same
+least rate, or the run is degraded, naming the port, as it is when the
+primary has no replication port at all. In `shared` mode there is
+nothing to steer, and the counts are kept for reading only.
 
 After a run on SR-IOV the hosts are rebooted, to release the NIC's
 virtual functions before the kernel transport uses it again; set

@@ -24,6 +24,13 @@
 #   queue   on a second queue of the client NIC, steered to it by the NIC
 #           (--dpdk-replication-queue): mlx5 only, refused on SR-IOV hosts;
 #           the primary's per-queue packet counters are judged too
+#   port    on a second NIC (--dpdk-replication-ports, -ip, -peer-mac):
+#           every node host needs one in /etc/melin-dpdk.conf (the
+#           DPDK_REPL_* keys dpdk-setup.sh writes given DPDK_REPL_NIC and
+#           DPDK_REPL_IP), refused up front by name otherwise; the
+#           primary's per-port packet counters are judged too
+#
+# `all` is every mode, so it needs both on every node host.
 #
 # Workloads (what the load generator does):
 #   throughput  THROUGHPUT_CLIENTS × THROUGHPUT_WINDOW in flight
@@ -48,8 +55,7 @@
 #   TRANSPORTS=<list>     comma-separated, or `all` (default: kernel)
 #   WORKLOADS=<list>      comma-separated, or `all` (default: throughput)
 #   DPDK_REPLICATION=<list>  the dpdk transport's replication modes,
-#                         comma-separated, or `all` (default: shared);
-#                         `port` is not supported by the suite yet
+#                         comma-separated, or `all` (default: shared)
 #   SSH_USER              the user the hosts are reached as (default root;
 #                         another needs passwordless sudo)
 #   SSH_CONFIG            an ssh_config file the hosts are reached through,
@@ -98,7 +104,8 @@
 # evicted, missing or catching up at any point marks the run degraded.
 # On DPDK it samples the primary's per-queue packet counters too, and in
 # queue mode a run whose replication did not move on queue 1, or whose
-# clients did not on queue 0, is degraded as well. The suite exits
+# clients did not on queue 0, is degraded as well; in port mode, the same
+# of the replication NIC's port and the client NIC's. The suite exits
 # non-zero if any run was degraded or could not start.
 #
 # Results are named `kernel-<workload>` on kernel TCP and
@@ -302,8 +309,10 @@ done
 # Each a pass of the dpdk transport; validated even when it runs none.
 DPDK_REPLICATION_LIST=$(dpdk_replication_modes "${DPDK_REPLICATION:-}") || exit 1
 read -ra DPDK_REPLICATION_MODES <<< "$DPDK_REPLICATION_LIST"
-QUEUE_MODE=0
-[[ "$NEED_DPDK" == 1 && " ${DPDK_REPLICATION_MODES[*]} " == *" queue "* ]] && QUEUE_MODE=1
+# `runs_replication_mode <mode>`: whether a dpdk pass runs in `mode`.
+runs_replication_mode() {
+    [[ "$NEED_DPDK" == 1 && " ${DPDK_REPLICATION_MODES[*]} " == *" $1 "* ]]
+}
 
 echo "=== Melin LAN suite: ${APP} ==="
 echo "  transports: ${RUN_TRANSPORTS[*]}"
@@ -367,13 +376,15 @@ for host in "${HOSTS[@]}"; do
         DETECTED_CPU="$cpu"
     fi
 done
-# Queue mode needs every node's NIC to steer (the load generator's host
-# runs no replication). The confs are read, not set up: the DPDK setup
-# waits for the first DPDK pass.
-if [[ "$QUEUE_MODE" == 1 ]]; then
+# Queue mode needs every node's NIC to steer, and port mode every node a
+# second NIC (the load generator's host runs no replication). The confs
+# are read, not set up: the DPDK setup waits for the first DPDK pass.
+if runs_replication_mode queue || runs_replication_mode port; then
     for host in "$SERVER" "$REPLICA" "$REPLICA2"; do
-        # No conf is empty text, which refuse_queue_mode reads as such.
-        refuse_queue_mode "$host" "$(rssh "$host" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)" || exit 1
+        # No conf is empty text, which the refusals read as such.
+        conf=$(rssh "$host" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
+        if runs_replication_mode queue; then refuse_queue_mode "$host" "$conf" || exit 1; fi
+        if runs_replication_mode port; then refuse_port_mode "$host" "$conf" || exit 1; fi
     done
 fi
 TARGET_CPU="${TARGET_CPU:-$DETECTED_CPU}"
@@ -641,7 +652,9 @@ stop_nodes() {
 # ---------------------------------------------------------------------------
 # DPDK configuration, per host, from /etc/melin-dpdk.conf
 # ---------------------------------------------------------------------------
-# Load `host`'s DPDK configuration into <PREFIX>_DPDK_{IP,PREFIX,PORTS,MAC,VLAN,EAL}.
+# Load `host`'s DPDK configuration into <PREFIX>_DPDK_{IP,PREFIX,PORTS,MAC,VLAN,EAL},
+# and its replication NIC's, if it has one, into
+# <PREFIX>_DPDK_REPL_{PORTS,IP,MAC} (empty without one).
 load_dpdk_config() {
     local host="$1" prefix="$2" conf mode vfs ports eal
     if ! rssh "$host" "test -f /etc/melin-dpdk.conf"; then
@@ -666,6 +679,9 @@ load_dpdk_config() {
     printf -v "${prefix}_DPDK_MAC" '%s' "$(conf_value "$conf" DPDK_MAC)"
     printf -v "${prefix}_DPDK_VLAN" '%s' "$(conf_value "$conf" VLAN_ID)"
     printf -v "${prefix}_DPDK_EAL" '%s' "$eal"
+    printf -v "${prefix}_DPDK_REPL_PORTS" '%s' "$(conf_value "$conf" DPDK_REPL_PORT)"
+    printf -v "${prefix}_DPDK_REPL_IP" '%s' "$(conf_value "$conf" DPDK_REPL_IP)"
+    printf -v "${prefix}_DPDK_REPL_MAC" '%s' "$(conf_value "$conf" DPDK_REPL_MAC)"
     local ip_var="${prefix}_DPDK_IP" mac_var="${prefix}_DPDK_MAC"
     if [[ -z "${!ip_var}" || -z "${!mac_var}" ]]; then
         echo "error: ${host}'s /etc/melin-dpdk.conf has no DPDK_IP or DPDK_MAC; rerun scripts/dpdk/dpdk-setup.sh there" >&2
@@ -681,6 +697,16 @@ dpdk_flags() {
     printf "%s" "--dpdk-eal-args='${!eal}' --dpdk-ip ${!ip} --dpdk-prefix-len ${!prefix_len:-24} --dpdk-ports ${!ports}"
     [[ -n "${!vlan}" ]] && printf " --dpdk-vlan %s" "${!vlan}"
     return 0
+}
+
+# `node_replication_flags <DPDK replication mode> <PREFIX> [<peer MAC>]`:
+# what the node on host <PREFIX> adds to run replication where the mode
+# says (replication_flags, from its replication NIC's configuration in
+# port mode); a replica gives the primary's replication NIC's MAC.
+node_replication_flags() {
+    local mode="$1" prefix="$2" ports ip
+    ports="${prefix}_DPDK_REPL_PORTS"; ip="${prefix}_DPDK_REPL_IP"
+    replication_flags "$mode" "${!ports}" "${!ip}" "${3:-}"
 }
 
 DPDK_LOADED=0
@@ -705,10 +731,10 @@ BENCH_TRANSPORT_ARGS=""
 # on kernel TCP.
 start_cluster() {
     local transport="$1" replication="$2" bin primary_ready repl_ready primary_flags host
-    # The flag that puts a node's replication where the mode says, on the
-    # primary and the replicas alike (none in shared mode).
-    local repl_mode_flag=""
-    [[ "$replication" == queue ]] && repl_mode_flag=" --dpdk-replication-queue"
+    # On DPDK, where the primary's replication listens and the replicas
+    # dial it: its client NIC's address, or in port mode its replication
+    # NIC's.
+    local repl_ip
 
     clean_journal "$SERVER" "${JOURNAL_DIR}/primary.journal"
     clean_journal "$REPLICA" "${JOURNAL_DIR}/replica1.journal"
@@ -719,10 +745,18 @@ start_cluster() {
         load_dpdk_hosts
         DPDK_RAN=1
         bin="${SERVER_BIN}.dpdk"
+        repl_ip="$SERVER_DPDK_IP"
+        [[ "$replication" == port ]] && repl_ip="$SERVER_DPDK_REPL_IP"
         # In queue mode the NIC steers the replication port given here to
-        # queue 1.
-        primary_flags="--bind 0.0.0.0:${CLIENT_PORT} --replication-bind ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags SERVER)${repl_mode_flag}"
+        # queue 1; in port mode the replication NIC listens on it. The
+        # client NIC's flags are the same in every mode.
+        primary_flags="--bind 0.0.0.0:${CLIENT_PORT} --replication-bind ${repl_ip}:${REPL_PORT} $(dpdk_flags SERVER)$(node_replication_flags "$replication" SERVER)"
         primary_ready="DPDK transport listening"
+        # Logged once replication listens, in every mode (in queue and
+        # port modes by the replication poll thread, on its queue or NIC);
+        # the replicas are started once it is. The primary's client listener
+        # and health endpoint, waited for next, are its client NIC's and
+        # its private address's in every mode.
         repl_ready="$DPDK_REPLICATION_READY"
         CLIENT_ADDR="${SERVER_DPDK_IP}:${CLIENT_PORT}"
         BENCH_TRANSPORT_ARGS="$(dpdk_flags BENCH) --dpdk-peer-mac ${SERVER_DPDK_MAC}"
@@ -742,7 +776,10 @@ start_cluster() {
         host="$REPLICA"; prefix=REPLICA
         (( i == 2 )) && { host="$REPLICA2"; prefix=REPLICA2; }
         if [[ "$transport" == dpdk ]]; then
-            replica_flags="--replica-of ${SERVER_DPDK_IP}:${REPL_PORT} $(dpdk_flags "$prefix") --dpdk-peer-mac ${SERVER_DPDK_MAC}${repl_mode_flag}"
+            # In port mode the replica dials from its replication NIC,
+            # which takes the primary's replication NIC's MAC; its client
+            # NIC keeps the primary's client NIC's.
+            replica_flags="--replica-of ${repl_ip}:${REPL_PORT} $(dpdk_flags "$prefix") --dpdk-peer-mac ${SERVER_DPDK_MAC}$(node_replication_flags "$replication" "$prefix" "$SERVER_DPDK_REPL_MAC")"
         else
             replica_flags="--replica-of ${SERVER_VLAN}:${REPL_PORT}"
         fi
@@ -824,7 +861,8 @@ run_workload() {
         return
     fi
     judge_run "$name" cluster judge_health "$samples" 2
-    [[ "$transport" == dpdk ]] && judge_run "$name" steering judge_steering "$replication" "$queues"
+    [[ "$transport" == dpdk ]] && judge_run "$name" steering judge_steering "$replication" "$queues" \
+        "$SERVER_DPDK_PORTS" "$SERVER_DPDK_REPL_PORTS"
     return 0
 }
 
