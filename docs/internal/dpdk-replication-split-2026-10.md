@@ -1,9 +1,47 @@
 # Replication off the DPDK client poll thread (plan)
 
-Status: **planned** (2026-10), on branch `feat/dpdk-replication-split`,
+Status: **implemented, steps 1-8 done; the measurement and the rig
+checks are pending** (2026-10), on branch `feat/dpdk-replication-split`,
 stacked on `feat/lan-bench-suite` so that the suite can compare the
 variants on one rig. Implements the roadmap item "Split replication off
-the DPDK client poll thread".
+the DPDK client poll thread", which stays open until the measurement
+decides the default (`shared` until then). The sections below are the
+plan as written and what each step found; contributor notes on the
+result are in [dpdk-replication.md](dpdk-replication.md) ("Replication
+on a queue or a NIC of its own"), operator docs in `docs/replication.md`
+and `docs/deployment.md`.
+
+Owed on the rig (mlx5 hosts), each one hardware-only:
+
+1. **The measurement** ("The measurement" below): `TRANSPORTS=dpdk
+   DPDK_REPLICATION=shared,queue`, then with `TRACE=1`; `port` on hosts
+   with a second mlx5 port.
+2. **Steering at start, in queue mode:** the rules installed (each
+   logged), the RSS table pinned, and the per-queue counters showing
+   replication on queue 1 only and client traffic on queue 0 only, which
+   is what settles rule-versus-RSS precedence on mlx5.
+3. **A queue-mode replica end to end:** its rules, its receiver on queue
+   1, its client queue 0 unpolled until promotion, and a promotion.
+4. **Three flow levels on an isolated (bifurcated) replica**, which
+   mlx5's root table may not offer.
+5. **The ARP rule:** mlx5 accepts the EtherType-only rule at level 0
+   beside the client-port rule (a refusal fails the replica's boot,
+   naming the rule); a kernel-TCP primary with an empty ARP cache
+   (`ip neigh flush`) resolves a queue-mode replica and the link comes
+   up, queue 1 counting the ARP frames; the same with `--dpdk-vlan`
+   (if queue 1 counts nothing there, the rule needs an
+   ETH / VLAN(inner type 0x0806) variant for VLAN deployments); and at
+   promotion the log names the rule removed (`rte_flow steering rule
+   removed`, `replica steering removed at promotion`) and an `arping` of
+   the promoted node is counted on queue 0, not queue 1. That log line
+   is the only check on the removal: the netns promotions run it with
+   nothing to remove.
+6. **An unpolled queue on mlx5:** a full queue 0 drops per queue
+   (`rx_out_of_buffer`) and never pauses the port, so a replica's queue
+   1 keeps flowing under a client flood to its address.
+7. **The suite's DPDK passes** (its podman rehearsal runs kernel TCP
+   only): every mode, a traced pass, and `dpdk-setup.sh`'s second-port
+   path, including the port ids it derives.
 
 The one-line goal: **on DPDK, a primary's replication runs on a core, a
 queue and a TCP stack of its own, chosen by a flag, so that one ephemeral
