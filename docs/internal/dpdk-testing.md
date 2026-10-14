@@ -67,18 +67,24 @@ it:
 2. builds a bridge, `br0`, carrying the client's address (`10.99.0.1/24`),
    with one veth pair per node slot: `dpdkN` for the node, its peer
    `dpdkN-br` on the bridge, node `N` on `10.99.0.(N+2)`. Three slots, the
-   largest cluster a test runs. One more pair, built exactly as a slot's,
-   is the DPDK client's: `dpdkc`, its peer `dpdkc-br`, the client on
-   `10.99.0.100`. Every MAC is fixed (`02:99:00:00:00:NN`, the last octet
-   the IP's) and TX checksum offload is off on every veth
-   (`scripts/dpdk/veth-setup.py`, Python's standard library only);
+   largest cluster a test runs. Each slot has a second pair, built the
+   same way, its replication seat: `dpdkNr`, its peer `dpdkNr-br`, on
+   `10.99.0.(N+12)`, where a node whose replication has a NIC of its own
+   (port mode) attaches that NIC. One more pair is the DPDK client's:
+   `dpdkc`, its peer `dpdkc-br`, the client on `10.99.0.100`. Every MAC is
+   fixed (`02:99:00:00:00:NN`, the last octet the IP's) and TX checksum
+   offload is off on every veth (`scripts/dpdk/veth-setup.py`, Python's
+   standard library only);
 3. mounts the private tmpfs on `/var/run`;
 4. publishes the layout in the environment: `MELIN_NETNS_DPDK_IFACES`,
    `MELIN_NETNS_NODE_IPS`, `MELIN_NETNS_NODE_MACS`, `MELIN_NETNS_PREFIX_LEN`,
    `MELIN_NETNS_CLIENT_IP`, `MELIN_NETNS_CLIENT_MAC`, as space-separated
-   lists with one entry per slot, and the DPDK client's pair apart from
-   them: `MELIN_NETNS_DPDK_CLIENT_IFACE`, `MELIN_NETNS_DPDK_CLIENT_IP`,
-   `MELIN_NETNS_DPDK_CLIENT_MAC`, one value each;
+   lists with one entry per slot; the replication seats, apart from them,
+   as lists in slot order: `MELIN_NETNS_REPLICATION_IFACES`,
+   `MELIN_NETNS_REPLICATION_IPS`, `MELIN_NETNS_REPLICATION_MACS`; and the
+   DPDK client's pair: `MELIN_NETNS_DPDK_CLIENT_IFACE`,
+   `MELIN_NETNS_DPDK_CLIENT_IP`, `MELIN_NETNS_DPDK_CLIENT_MAC`, one value
+   each;
 5. runs the test binary.
 
 nextest runs each test in a process of its own, so each test gets a fresh
@@ -101,7 +107,10 @@ kernel client's address on the bridge stays, for every test whose client
 is not on DPDK; the cluster tests' own peers bind there too. A runner that
 publishes no client pair (one older than it) still runs every node test:
 the launcher reads the three variables together or not at all, and only a
-test that asks for a DPDK client fails without them, saying why.
+test that asks for a DPDK client fails without them, saying why. The
+replication seats are apart from the slots for the same reason, and read
+the same way: a runner without them still runs every test but those that
+ask for one.
 
 ## The launcher
 
@@ -131,14 +140,23 @@ own `dpdk` feature switches its tests over the same way.
   The launcher refuses addresses off the runner's network, saying how to
   take them from `addrs`. `local_ip()` is where a test binds a socket a
   node must reach.
+- **A replication NIC of its own.** `addrs_with_replication_nic(slot,
+  free_addr)` gives a node's addresses with its replication address on the
+  slot's replication seat (on kernel TCP, `addrs`' own). `start_at` then
+  attaches a second af_packet device there (`net_af_packet_repl<N>`) and
+  gives the node its port and IP as `--dpdk-replication-ports` and
+  `--dpdk-replication-ip`: a primary in port mode. Its replicas take its
+  `replication()` as `replica_of` and dial it from their client NICs; the
+  launcher passes them the seat's MAC. Both devices are detached when the
+  node returns, and `cut_off` cuts both links.
 - **Slots.** On DPDK a node holds its slot until it is stopped or joined.
   Starting a second node on a held slot panics.
 - **Stopping.** A node is stopped by setting its shutdown flag, on both
   transports. `Node::join` waits for a node that returns on its own (one
   expected to fail, or to fence itself).
 - **Cutting a node off.** `Node::cut_off` brings the bridge side of its
-  link down, as a pulled cable would: nothing it sends arrives, and no peer
-  is told.
+  links down, as a pulled cable would: nothing it sends arrives, and no
+  peer is told.
 - **Startup.** `STARTUP_LIMIT` is how long a client should give a node to
   serve: longer on DPDK, for EAL and port start.
 - **A client on DPDK.** `open_dpdk_client(config)` (DPDK only) opens a
@@ -181,20 +199,42 @@ never sends a frame back out of the port it came in on). Then the client
 group is dropped and the replication group still serves a kernel-TCP
 client, so the EAL outlives the first group; it is cleaned up after the
 last. The `melin-test-node` suite runs it, with its `dpdk` feature, beside
-the runtime's suites in the CI `dpdk` job.
+the runtime's suites in the CI `dpdk` job. Beside it, each in a binary of
+its own since each owns its EAL: `nic_groups_replication_fails.rs`, a
+replication NIC that cannot come up once the client NIC has, which fails
+the bring-up naming the replication NIC; and `nic_groups_shared.rs`, shared
+mode bringing up the client NIC alone, with one client queue, and a thread
+registering with the EAL as an lcore of its own and giving the lcore back,
+as the replication poll thread does.
+
+## Replication on a NIC of its own
+
+A primary in port mode runs end to end here: the runtime's `dpdk_veth`
+suite starts it on a slot's replication seat (above) and runs replication
+cases with it as with a primary in shared mode: two replicas under an ack
+policy that needs a replica's fsync, a replica dropped and re-admitted, a
+replica cut off and dropped by the liveness deadline, large joins, and a
+clean stop with the replication poll thread joined. The replicas stay in
+shared mode, which is all a replica runs yet. The case with two replicas
+also reads the per-queue counts on `/metrics`: one queue per NIC, each
+having moved packets both ways.
 
 ## Replication on a queue of its own
 
 Not testable here: af_packet has no `rte_flow` and no RSS redirection
 table, so the steering rules and the table's pin to queue 0 are checked
-on an mlx5 rig, per-queue counters first. Which rules a configuration
-gets is a pure function, unit-tested on every host
+on an mlx5 rig, per-queue counters first, and so is a primary running in
+the mode. Which rules a configuration gets, and how many client queues it
+has (one), are pure functions, unit-tested on every host
 (`melin_dpdk::steering`). Under the runner,
 `crates/core/test-node/tests/queue_split.rs` brings a client NIC up in
 queue mode on a device given two queue pairs: configure and start run,
 and the pin's refusal fails the bring-up naming the port.
 `queue_split_one_queue.rs` does the same on a device given one queue
-pair, which configure refuses, naming the port and the pairs missing.
+pair, which configure refuses, naming the port and the pairs missing, and
+the runtime's `dpdk_veth` suite starts a primary in queue mode on a slot's
+one queue pair, which refuses to start with that error and leaves the slot
+clean for the next node.
 
 ## Several nodes in one process
 

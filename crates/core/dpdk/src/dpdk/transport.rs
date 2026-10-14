@@ -14,14 +14,15 @@ use smoltcp::socket::tcp::{self, OpaqueFrameHandle, State};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
+use crate::QueueCounters;
 use crate::config::{NicConfig, ReplicationNic};
 use crate::device::DpdkDevice;
-use crate::eal::Eal;
+use crate::eal::{Eal, LcoreRegisterError, LcoreRegistration};
 use crate::eal_sharing::{EalGroup, OnEal};
 use crate::mempool::Mempool;
 use crate::peer_liveness::{self, PeerLiveness, StackClock};
 use crate::port::{ChecksumOffloads, Port};
-use crate::steering::SteeringPlan;
+use crate::steering::{QueuePlan, SteeringPlan};
 
 // Defined outside the `dpdk-sys` gate (`crate::config`); re-exported here so
 // `melin_dpdk::transport::DpdkConfig` still names it.
@@ -200,8 +201,12 @@ pub struct DpdkShared {
     /// if the NIC doesn't support that many). In the replication split
     /// ([`ReplicationNic::Queue`]) this counts the replication queue too:
     /// it is 2, of which only queue 0 carries clients, so it is not the
-    /// number of client poll threads to spawn there.
+    /// number of client poll threads to spawn there: that is
+    /// [`Self::client_queues`].
     pub num_queues: u16,
+    /// The queue plan the ports were configured with, which says which of
+    /// those queues carry clients.
+    queue_plan: QueuePlan,
 }
 
 // Safety: DpdkShared fields are either DPDK thread-safe (mempool) or
@@ -585,7 +590,29 @@ impl DpdkShared {
             mac,
             mempool_raw,
             num_queues: actual_queues,
+            queue_plan: plan.queues,
         }))
+    }
+
+    /// How many client poll threads the group needs, on queues `0..` that
+    /// count: one per queue the default RSS spreads clients over, or, in
+    /// the replication split ([`ReplicationNic::Queue`]), the client queue
+    /// alone, whose neighbour is replication's (see
+    /// [`QueuePlan::client_queues`]).
+    pub fn client_queues(&self) -> u16 {
+        self.queue_plan.client_queues(self.num_queues)
+    }
+
+    /// Register the calling thread with the EAL this group sits on, as an
+    /// lcore of its own, for as long as the registration is held (see
+    /// [`LcoreRegistration`]): for a poll thread the node spawns itself,
+    /// which EAL otherwise gives no lcore id and so no mempool cache.
+    ///
+    /// # Errors
+    /// EAL refused; see [`LcoreRegistration`]. The thread still works
+    /// without one, through the pool's shared ring.
+    pub fn register_thread(self: &Arc<Self>) -> Result<LcoreRegistration, LcoreRegisterError> {
+        LcoreRegistration::register(Arc::clone(self))
     }
 }
 
@@ -614,6 +641,23 @@ impl DpdkTransport {
         queue_id: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Self::build(shared, &config.nic, queue_id, None)
+    }
+
+    /// Like [`Self::from_shared_unlistening`], on queue `queue_id` of the
+    /// NIC group `shared`, configured by `nic` rather than by a node's
+    /// whole configuration: the replication NIC's group and configuration
+    /// in [`ReplicationNic::Port`] mode ([`NodeNics::replication`]), which
+    /// a `DpdkConfig` does not hold as its NIC. The node's replication poll
+    /// thread builds its transport with it, in that mode and in
+    /// [`ReplicationNic::Queue`] mode (the client NIC's group and
+    /// configuration, on its replication queue), and adds the replication
+    /// listener.
+    pub fn on_nic_unlistening(
+        shared: &Arc<DpdkShared>,
+        nic: &NicConfig,
+        queue_id: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::build(shared, nic, queue_id, None)
     }
 
     /// The constructors' common body: `listen_port` is the port of the
@@ -1016,6 +1060,13 @@ impl DpdkTransport {
         self.device.poll_rx();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.device.flush_tx();
+    }
+
+    /// The packet counts of this transport's queue, one per port of its
+    /// NIC (see [`QueueCounters`]), for a node's `/metrics`. Shared with
+    /// the transport, which goes on counting into them.
+    pub fn queue_counters(&self) -> Vec<Arc<QueueCounters>> {
+        self.device.queue_counters()
     }
 
     /// The stack's time as of the latest poll.

@@ -48,7 +48,7 @@ use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::tick::TickSchedule;
 #[cfg(feature = "latency-trace")]
-use melin_transport_core::trace::mono_trace_ns;
+use melin_transport_core::trace::{WorkIterations, register_stage};
 use melin_wire_protocol::control::ConnectionId;
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
@@ -130,7 +130,9 @@ struct ConnectionState {
 /// emit ticks concurrently — re-introducing the multi-producer ordering
 /// race that embedding tick into the poll thread was designed to
 /// eliminate. Gate tick emission to a single thread (e.g.
-/// `thread_id == 0`) before scaling out client queues.
+/// `thread_id == 0`) before scaling out client queues. The replication
+/// poll thread, in queue and port modes, publishes nothing into the input
+/// ring and emits no tick, so it leaves the invariant whole.
 ///
 /// Top-level thread entry point — the wide arg list mirrors transport
 /// state owned elsewhere; bundling into a config struct adds indirection
@@ -159,9 +161,10 @@ pub fn run_dpdk_poll<A: Application>(
     // replication port are handed to the driver; per-iteration the
     // driver's `tick()` advances each replica slot's state machine
     // (handshake, journal catch-up, snapshot transfer, live streaming,
-    // ack processing). Replaces the separate replication-sender thread —
-    // see `feat/dpdk-single-queue` for the rationale (RSS routing on
-    // iavf made the previous multi-queue split unworkable).
+    // ack processing). This is replication's shared mode, the default.
+    // `None` too when replication has a queue or a NIC of its own: the
+    // replication poll thread (`crate::dpdk_repl_poll`) drives the driver
+    // there, on a transport of its own.
     repl_driver: Option<crate::replication::DpdkReplicationDriver<A>>,
     // TCP port the replication driver listens on. Used to filter
     // `AcceptedConnection::listen_port` so client connections go to the
@@ -249,27 +252,11 @@ pub fn run_dpdk_poll<A: Application>(
     }
 
     // Outer-loop wall-time histogram, gated on at least one byte received
-    // this iteration. Idle iterations would otherwise drown the percentiles
-    // in ~100ns samples; what we want is "how long does a poll cycle take
-    // when there's actual work to do" — which is the cycle an in-flight
-    // request experiences. Registered with the global stats registry; the
-    // /stats-dump endpoint snapshots it alongside the other stages.
+    // this iteration: see `WorkIterations`.
     #[cfg(feature = "latency-trace")]
-    let mut poll_iter_rec = melin_transport_core::trace::register_stage(
+    let mut poll_iterations = WorkIterations::new(register_stage(
         "dpdk poll: outer iteration (work-iterations only)",
-    );
-    #[cfg(feature = "latency-trace")]
-    let mut poll_iter_start = mono_trace_ns();
-    // Paces the recorder flush. The poll thread never idles — it
-    // busy-spins — but it stops *recording* as soon as traffic stops,
-    // which is enough to strand its samples in the thread-local buffer.
-    // Nanoseconds rather than `Instant` so the gate reuses the
-    // `mono_trace_ns` read the poll-iteration histogram already takes.
-    #[cfg(feature = "latency-trace")]
-    let stats_flush_interval_ns =
-        melin_transport_core::trace::IDLE_FLUSH_INTERVAL.as_nanos() as u64;
-    #[cfg(feature = "latency-trace")]
-    let mut last_stats_flush_ns = poll_iter_start;
+    ));
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -694,26 +681,14 @@ pub fn run_dpdk_poll<A: Application>(
             driver.tick(&mut transport, shutdown);
         }
 
+        // Hand the loop's other buffered samples to the stats registry
+        // with the iteration histogram's, so a /stats-dump taken after
+        // traffic stops still sees them.
         #[cfg(feature = "latency-trace")]
-        {
-            let now = mono_trace_ns();
-            // Skip records once shutdown has been observed: matches the
-            // gate on the journal / matching / response stages and keeps
-            // diagnostic numbers comparable across runs.
-            if work_done_this_iter && !shutdown.load(Ordering::Relaxed) {
-                poll_iter_rec.record_elapsed(poll_iter_start, now);
-            }
-            poll_iter_start = now;
-
-            // Hand buffered samples to the stats registry so a
-            // /stats-dump taken after traffic stops still sees them.
-            if now.saturating_sub(last_stats_flush_ns) >= stats_flush_interval_ns {
-                last_stats_flush_ns = now;
-                poll_iter_rec.flush();
-                publish_rec.flush();
-                #[cfg(feature = "tick-to-trade")]
-                ingest_rec.flush();
-            }
+        if poll_iterations.end(work_done_this_iter, shutdown) {
+            publish_rec.flush();
+            #[cfg(feature = "tick-to-trade")]
+            ingest_rec.flush();
         }
     }
 }

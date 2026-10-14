@@ -223,9 +223,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   group drops. A replication NIC with other EAL arguments or a port of the
   client NIC's is refused before EAL init, the port overlap by the new
   `NicConfig::port_shared_with`, which the node's
-  `--dpdk-replication-ports` check now uses too. Groundwork for
-  replication on a NIC of its own: no node runs it yet, and
-  `DpdkShared::init` still brings up the client NIC alone, as before.
+  `--dpdk-replication-ports` check now uses too. A DPDK node brings its
+  NICs up through it; `DpdkShared::init` still brings up the client NIC
+  alone, as before.
 - **`melin_dpdk::steering`**: how a NIC's ports split their traffic
   across queues, decided from the configuration alone and installed as
   decided. `SteeringPlan::for_client_nic` gives a node's client NIC its
@@ -241,16 +241,70 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   node from every host, not only the peer's. A NIC offering fewer than two
   queue pairs, or no redirection table to pin, fails the bring-up naming
   the port, and a rule the NIC refuses names the rule and the PMD's
-  reason. No node runs the mode yet (it is still refused at start).
+  reason. A primary runs the mode (below); a replica does not yet.
+- **DPDK replication on a queue or a NIC of its own, on a primary.** With
+  `--dpdk-replication-queue` (mlx5), or `--dpdk-replication-ports` and
+  `--dpdk-replication-ip` (a second ENI, any second port), a DPDK
+  primary serves its replicas from a poll thread of their own,
+  `repl-poll`, on the client NIC's second queue or on the replication
+  NIC, rather than from the client poll thread: client responses no
+  longer wait behind replication work in one loop. The thread is placed
+  by the `--cores` `repl-poll` entry and busy-polls, as the reader does
+  on DPDK; the boot log warns when it is unpinned, in the reader's words.
+  It registers with EAL as an lcore of its own, for a mempool cache,
+  which DPDK allows only with multi-process off: secondary-process tools
+  (`dpdk-proc-info`, `dpdk-dumpcap`, `dpdk-pdump`) cannot attach to a
+  primary in these modes. On a replication NIC of its own it announces
+  the NIC's MAC with a gratuitous ARP at boot; replicas dial the
+  primary's replication address
+  there (`--replica-of`). The replication ring, the ack cursors behind
+  the ack policy and the client clock ticks are unchanged. A primary
+  stopping closes its replicas' links from that thread, as from the
+  client poll thread before. A replica in either mode still refuses to
+  start, saying the mode is not implemented yet for a replica, before EAL
+  init; without the flags nothing changes. On a NIC with fewer than two
+  queue pairs, queue mode fails the boot naming the port.
+  - **Per-queue packet counts on `/metrics`**:
+    `melin_dpdk_queue_rx_packets_total` and
+    `melin_dpdk_queue_tx_packets_total`, labelled by DPDK port and queue,
+    on every DPDK primary, so a rig shows which queue carries what. They
+    are counted by each queue's poll thread at the burst rather than read
+    from the driver's statistics, which not every PMD makes safe to read
+    from another thread or fills per queue; packets the NIC dropped before
+    the queue are not in them.
+  - **A `latency-trace` stage for the replication poll thread's work
+    iterations**, `dpdk repl poll: outer iteration (work-iterations
+    only)`, beside the client poll loop's.
+  - In code: `melin_dpdk::QueueCounters`, `melin_dpdk::packets_moved`
+    and `DpdkTransport::queue_counters`; `DpdkTransport::on_nic_unlistening`,
+    a transport on a NIC group given its own `NicConfig`;
+    `DpdkShared::client_queues` and `QueuePlan::client_queues`, the client
+    poll thread count, which in queue mode is one, not the port's queue
+    count; `DpdkShared::register_thread`, returning a
+    `melin_dpdk::LcoreRegistration` (or a `LcoreRegisterError`);
+    `melin_transport_core::health::TransportMetrics`, a transport's own
+    `/metrics` series, with `TRANSPORT_METRICS_BUDGET`, the room kept for
+    them; `melin_transport_core::trace::WorkIterations` (under
+    `latency-trace`), a polling loop's work-iteration histogram; and
+    `PipelineCores::unpinned_poller_warnings`.
+  - For contributors: `melin_test_node::live_thread_names`, for a test of
+    a node's teardown.
+  - For contributors: `scripts/dpdk/netns-runner.sh` gives each node
+    slot a second veth pair, its replication seat, published in
+    `MELIN_NETNS_REPLICATION_IFACES`, `_IPS` and `_MACS`;
+    `melin_test_node::addrs_with_replication_nic` starts a node with its
+    replication NIC there, and the DPDK replication cases run with such a
+    primary as well.
 
 ### Changed
 
-- **The node's command line has `--dpdk-replication-*` flags, reserved
-  for running DPDK replication on a queue or a NIC of its own**:
+- **The node's command line has `--dpdk-replication-*` flags, for running
+  DPDK replication on a queue or a NIC of its own**:
   `--dpdk-replication-queue`, and `--dpdk-replication-ports`,
-  `--dpdk-replication-ip` and `--dpdk-replication-peer-mac` together. Not
-  usable yet: a DPDK node given any of them refuses to start, saying the
-  mode is not implemented, before EAL init. A contradictory set (queue and
+  `--dpdk-replication-ip` and `--dpdk-replication-peer-mac` together. A
+  primary runs them (see Added); a DPDK replica given any of them refuses
+  to start, saying the mode is not implemented yet for a replica, before
+  EAL init. A contradictory set (queue and
   port flags together, ports without an address or the reverse, a port or
   the address the client NIC already has, an address outside the client
   NIC's subnet) is refused with an error naming the flag. Without them a
@@ -266,9 +320,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `..Default::default()`.
 
 - **`--cores` has a new thread, `repl-poll`, which every layout must
-  name.** It is reserved for the DPDK replication poll thread that runs
-  when replication has a queue or a NIC of its own, which no
-  configuration runs yet. A `--cores` value from an earlier release no
+  name.** It places the DPDK replication poll thread, which a primary
+  runs when replication has a queue or a NIC of its own (see Added). A
+  `--cores` value from an earlier release no
   longer parses: add `repl-poll=5` (its default core, the default layout's
   free one), or `repl-poll=0` to leave it unpinned. Where it does not run
   it is checked like any other thread a node's flags leave unused (the
@@ -277,8 +331,9 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   refused, as on the DPDK reader. The default layout gains `repl-poll=5`
   and the boot log shows it. In code, `PipelineCores` gains a `repl_poll`
   field, and `ReaderThread` is replaced by `NodeTransport` (`KernelTcp`,
-  or `Dpdk { repl_poll }`, built from the replication mode by
-  `NodeTransport::dpdk`) as the argument of `PipelineCores::resolve` and
+  or `Dpdk { repl_poll }`, built by `NodeTransport::dpdk` from the
+  replication mode and whether the node replicates, that is has
+  `--replication-bind`) as the argument of `PipelineCores::resolve` and
   `ServerConfig::resolved_cores`. Source-breaking for a `PipelineCores`
   literal and for a caller of either function.
 
@@ -297,6 +352,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `PortError` gains `TooFewQueues` and `RetaPinFailed` and a `message` on
   `FlowRuleFailed`. Source-breaking for a direct user of `Port` and for a
   match on either error.
+
+- **`melin_transport_core::health::HealthState` has a new field,
+  `transport_metrics`**, a transport's own series appended to `/metrics`
+  (`None` on kernel TCP and on a replica). Source-breaking for a struct
+  literal of it: add the field.
 
 - **`melin_client::Error` has a new variant, `Error::Nic(io::Error)`**,
   for a DPDK NIC that cannot be brought up (EAL initialisation, a missing

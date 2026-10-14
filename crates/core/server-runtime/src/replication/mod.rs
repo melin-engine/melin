@@ -146,7 +146,7 @@ pub use melin_transport_core::replication::protocol::{
 pub use melin_transport_core::replication::{ReplicaCursors, ReplicationMetrics, SentHighWater};
 
 #[cfg(feature = "dpdk")]
-pub(crate) use dpdk::REPL_DISPATCH_BURST;
+pub(crate) use dpdk::add_replication_listener;
 #[cfg(feature = "dpdk")]
 pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
 pub use tcp_receiver::{ReceiverResult, run_receiver};

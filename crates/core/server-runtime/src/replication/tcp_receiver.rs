@@ -1922,25 +1922,11 @@ mod tests {
         use super::scripted::*;
         use super::*;
         use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+        use melin_test_node::live_thread_names;
         use melin_transport_core::replication::catchup::lineage_origin;
         use melin_transport_core::replication::protocol::encode_stream_start;
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
-
-        /// Names of every live thread in this process, via
-        /// `/proc/self/task` (Linux-only, like the runtime itself).
-        fn live_thread_names() -> Vec<String> {
-            std::fs::read_dir("/proc/self/task")
-                .expect("read /proc/self/task")
-                .filter_map(|entry| {
-                    // A thread may exit between readdir and the comm
-                    // read — skipping it is the correct outcome.
-                    let entry = entry.ok()?;
-                    let name = std::fs::read_to_string(entry.path().join("comm")).ok()?;
-                    Some(name.trim().to_string())
-                })
-                .collect()
-        }
 
         /// Set in the child process the test below runs its body in.
         const ISOLATED: &str = "MELIN_TEST_BACKOFF_SHUTDOWN_ISOLATED";

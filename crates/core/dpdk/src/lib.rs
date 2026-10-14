@@ -21,9 +21,9 @@
 //! libdpdk installed (and libclang, for the generated bindings). Without
 //! the feature the crate holds only what needs no libdpdk: the
 //! configuration ([`DpdkConfig`], [`NicConfig`]), MAC parsing and the
-//! peer-MAC convention ([`mac`]), the ARP frames ([`arp`]), and the
-//! policies tested on any host ([`rx_checksum`], [`peer_liveness`],
-//! [`steering`]). A
+//! peer-MAC convention ([`mac`]), the ARP frames ([`arp`]), the per-queue
+//! packet counts ([`QueueCounters`]), and the policies tested on any host
+//! ([`rx_checksum`], [`peer_liveness`], [`steering`]). A
 //! binary maps its flags onto the configuration in any build, and the
 //! crate lives in the workspace without requiring system dependencies.
 //!
@@ -64,6 +64,10 @@ pub use config::{DpdkConfig, NicConfig, ReplicationNic, ReplicationPorts};
 // configuration alone, and the gated port code installs what it says.
 pub mod steering;
 pub use steering::{QueuePlan, SteeringError, SteeringPlan, SteeringRule};
+// Ungated for the same reason: per-queue packet counts are plain atomics,
+// counted by the gated device and reported by whoever holds them.
+mod queue_counters;
+pub use queue_counters::{QueueCounters, packets_moved};
 // Ungated by `dpdk-sys` for the same reason, behind `clap` only: the flags
 // mapped onto that configuration, declared once for every binary.
 #[cfg(feature = "clap")]

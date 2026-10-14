@@ -93,9 +93,17 @@ plain data outside the `dpdk-sys` gate like the rest of the config.
   mode nothing changes.
 - **Observability:** a `latency-trace` stage for the replication loop's
   work iterations, beside the client loop's. Per-queue RX and TX packet
-  counts from `rte_eth_stats` go on `/metrics`. Misrouted steering is not
-  silent: a replication segment that lands on the client stack gets a
-  RST, and the link drops. The counters show which queue saw what.
+  counts go on `/metrics`, counted by each queue's poll thread at the
+  burst (`melin_dpdk::QueueCounters`) rather than read from
+  `rte_eth_stats`, as first planned: `rte_eth_stats_get` is not
+  guaranteed thread-safe on every PMD against the queue's poll thread or a
+  second reader of the port (queue mode puts two poll threads on each
+  port), covers the first `RTE_ETHDEV_QUEUE_STAT_CNTRS` queues only, and
+  some PMDs leave the per-queue fields unset. They count what the poll
+  thread took off and put on the queue, not the NIC's drops before it.
+  Misrouted steering is not silent: a replication segment that lands on
+  the client stack gets a RST, and the link drops. The counters show which
+  queue saw what.
 
 ### Steering in `queue` mode (mlx5)
 
@@ -213,9 +221,15 @@ unchanged after every step.
    (Added); `CLAUDE.md` if the crate descriptions change. Step 2 described
    `repl-poll` as reserved for a thread "no configuration runs yet", in its
    `CHANGELOG.md` entry under Changed and in `pipeline-architecture.md`
-   (the `--cores` row and the mixed-layout example): reword those once
-   step 5 runs the thread, so the release notes do not contradict
-   themselves.
+   (the `--cores` row and the mixed-layout example); step 5 reworded those
+   when the thread started running, and added the `CHANGELOG.md` entry for
+   a primary, so step 8 extends them for the replica rather than writes
+   them. The operator docs must also say that `queue` and `port` modes
+   lock out DPDK secondary-process tools (`dpdk-proc-info`,
+   `dpdk-dumpcap`, `dpdk-pdump`): `repl-poll` registers with EAL as an
+   lcore, and DPDK turns multi-process off for a primary that registers
+   one. The node's per-queue counters on `/metrics` take the place of
+   `dpdk-proc-info` for checking steering.
 
 ## The measurement
 

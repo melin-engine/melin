@@ -32,6 +32,14 @@ pub const ENV_DPDK_CLIENT_IFACE: &str = "MELIN_NETNS_DPDK_CLIENT_IFACE";
 pub const ENV_DPDK_CLIENT_IP: &str = "MELIN_NETNS_DPDK_CLIENT_IP";
 /// The MAC of the DPDK client's interface, which its port takes.
 pub const ENV_DPDK_CLIENT_MAC: &str = "MELIN_NETNS_DPDK_CLIENT_MAC";
+/// The interfaces of the node slots' second seats, one per slot, in slot
+/// order, space-separated: where a node whose replication has a NIC of
+/// its own attaches that NIC.
+pub const ENV_REPLICATION_IFACES: &str = "MELIN_NETNS_REPLICATION_IFACES";
+/// The IP each slot's replication NIC takes, in slot order.
+pub const ENV_REPLICATION_IPS: &str = "MELIN_NETNS_REPLICATION_IPS";
+/// The MAC of each slot's replication interface, in slot order.
+pub const ENV_REPLICATION_MACS: &str = "MELIN_NETNS_REPLICATION_MACS";
 
 /// The name of the DPDK client's af_packet device: not of the
 /// `net_af_packet<slot>` form a node slot's takes ([`vdev`]), so the two
@@ -72,6 +80,10 @@ pub struct Layout {
     /// project's copy): the node slots stand without it, and only a test
     /// that asks for a DPDK client fails, saying why.
     dpdk_client: Option<Slot>,
+    /// Each node slot's second seat, for a replication NIC of its own,
+    /// indexed by slot as `slots` is. `None` under a runner that publishes
+    /// none, as for `dpdk_client`: only a test that asks for one fails.
+    replication: Option<Vec<Slot>>,
 }
 
 impl Layout {
@@ -113,26 +125,13 @@ impl Layout {
         let client_ip = required(ENV_CLIENT_IP)?;
         let client_mac = required(ENV_CLIENT_MAC)?;
 
-        let parse_ip = |name: &str, ip: &str| {
-            ip.parse::<Ipv4Addr>()
-                .map_err(|e| format!("{name}: '{ip}' is not an IPv4 address: {e}"))
-        };
-        let ips = node_ips
-            .split_whitespace()
-            .map(|ip| parse_ip(ENV_NODE_IPS, ip))
-            .collect::<Result<Vec<_>, _>>()?;
-        let ifaces: Vec<&str> = ifaces.split_whitespace().collect();
-        let macs = macs
-            .split_whitespace()
-            .map(|mac| check_mac(ENV_NODE_MACS, mac))
-            .collect::<Result<Vec<_>, _>>()?;
-        if ips.is_empty() || ips.len() != ifaces.len() || ips.len() != macs.len() {
+        let slots = parse_seats(
+            [ENV_IFACES, ENV_NODE_IPS, ENV_NODE_MACS],
+            [&ifaces, &node_ips, &macs],
+        )?;
+        if slots.is_empty() {
             return Err(format!(
-                "{ENV_NODE_IPS} lists {} node IPs, {ENV_IFACES} {} interfaces and \
-                 {ENV_NODE_MACS} {} MACs: the runner publishes one of each per node slot",
-                ips.len(),
-                ifaces.len(),
-                macs.len()
+                "{ENV_NODE_IPS} lists no node IP: the runner publishes at least one node slot"
             ));
         }
         let prefix_len = match prefix_len.trim().parse::<u8>() {
@@ -143,16 +142,6 @@ impl Layout {
                 ));
             }
         };
-        let slots: Vec<Slot> = ifaces
-            .into_iter()
-            .zip(ips)
-            .zip(macs)
-            .map(|((iface, ip), mac)| Slot {
-                iface: iface.to_owned(),
-                ip,
-                mac,
-            })
-            .collect();
         let client_ip = parse_ip(ENV_CLIENT_IP, client_ip.trim())?;
 
         // All three or none: a runner without the seat publishes none of
@@ -195,13 +184,82 @@ impl Layout {
             }
         };
 
+        // All three or none, as the DPDK client's seat; one seat per node
+        // slot, each a pair of its own.
+        let replication = match (
+            var(ENV_REPLICATION_IFACES)?,
+            var(ENV_REPLICATION_IPS)?,
+            var(ENV_REPLICATION_MACS)?,
+        ) {
+            (None, None, None) => None,
+            (Some(ifaces), Some(ips), Some(macs)) => {
+                let seats = parse_seats(
+                    [
+                        ENV_REPLICATION_IFACES,
+                        ENV_REPLICATION_IPS,
+                        ENV_REPLICATION_MACS,
+                    ],
+                    [&ifaces, &ips, &macs],
+                )?;
+                if seats.len() != slots.len() {
+                    return Err(format!(
+                        "{ENV_REPLICATION_IPS} lists {} replication seats for {} node slots: \
+                         the runner publishes one per slot",
+                        seats.len(),
+                        slots.len()
+                    ));
+                }
+                let collides = |own: &Slot| {
+                    own.ip == client_ip
+                        || slots
+                            .iter()
+                            .chain(&dpdk_client)
+                            .any(|seat| seat.ip == own.ip || seat.iface == own.iface)
+                };
+                if let Some(seat) = seats.iter().find(|own| collides(own)) {
+                    return Err(format!(
+                        "{ENV_REPLICATION_IFACES}/{ENV_REPLICATION_IPS} ({} on {}) collide with \
+                         a node slot, the DPDK client or the kernel side: a replication seat is \
+                         a pair of its own",
+                        seat.ip, seat.iface
+                    ));
+                }
+                Some(seats)
+            }
+            _ => {
+                return Err(format!(
+                    "{ENV_REPLICATION_IFACES}, {ENV_REPLICATION_IPS} and {ENV_REPLICATION_MACS} \
+                     are published together or not at all: a partial runner layout"
+                ));
+            }
+        };
+
         Ok(Layout {
             slots,
             prefix_len,
             client_ip,
             client_mac: check_mac(ENV_CLIENT_MAC, client_mac.trim())?,
             dpdk_client,
+            replication,
         })
+    }
+
+    /// Node slot `index`'s replication seat, for a node whose replication
+    /// has a NIC of its own, or an error saying that this runner publishes
+    /// none. Panics past the last slot, as [`Self::slot`] does.
+    pub fn replication_seat(&self, index: usize) -> Result<&Slot, String> {
+        let seats = self.replication.as_ref().ok_or_else(|| {
+            format!(
+                "this test runs a node whose replication has a NIC of its own, but the runner \
+                 publishes no seat for one ({ENV_REPLICATION_IFACES}, {ENV_REPLICATION_IPS}, \
+                 {ENV_REPLICATION_MACS} unset): run it under this repository's \
+                 scripts/dpdk/netns-runner.sh, which builds one per node slot"
+            )
+        })?;
+        // The slot's own check and message first: there are as many seats
+        // as slots.
+        self.slot(index);
+        Ok(&seats[index])
     }
 
     /// The DPDK client's seat, or an error saying that this runner
@@ -232,8 +290,9 @@ impl Layout {
         })
     }
 
-    /// The MAC behind `ip` on this network (a slot's, the kernel side's,
-    /// or the DPDK client's), or `None` when `ip` is not on it.
+    /// The MAC behind `ip` on this network (a slot's, a slot's replication
+    /// seat's, the kernel side's, or the DPDK client's), or `None` when
+    /// `ip` is not on it.
     ///
     /// A replica on DPDK dials its primary, and a client on DPDK its node,
     /// with the peer's MAC already seeded (`--dpdk-peer-mac`,
@@ -246,9 +305,52 @@ impl Layout {
         self.slots
             .iter()
             .chain(&self.dpdk_client)
+            .chain(self.replication.iter().flatten())
             .find(|slot| slot.ip == ip)
             .map(|slot| slot.mac.as_str())
     }
+}
+
+/// `ip` as an IPv4 address, or an error naming variable `name`.
+fn parse_ip(name: &str, ip: &str) -> Result<Ipv4Addr, String> {
+    ip.parse::<Ipv4Addr>()
+        .map_err(|e| format!("{name}: '{ip}' is not an IPv4 address: {e}"))
+}
+
+/// Seats from three space-separated lists published together, paired in
+/// order: their interfaces, IPs and MACs (`values`, from the variables
+/// `names`). One of each per seat; none at all is no seat.
+fn parse_seats(names: [&str; 3], values: [&str; 3]) -> Result<Vec<Slot>, String> {
+    let [ifaces_name, ips_name, macs_name] = names;
+    let [ifaces, ips, macs] = values;
+    let ips = ips
+        .split_whitespace()
+        .map(|ip| parse_ip(ips_name, ip))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ifaces: Vec<&str> = ifaces.split_whitespace().collect();
+    let macs = macs
+        .split_whitespace()
+        .map(|mac| check_mac(macs_name, mac))
+        .collect::<Result<Vec<_>, _>>()?;
+    if ips.len() != ifaces.len() || ips.len() != macs.len() {
+        return Err(format!(
+            "{ips_name} lists {} IPs, {ifaces_name} {} interfaces and {macs_name} {} MACs: the \
+             runner publishes one of each per seat",
+            ips.len(),
+            ifaces.len(),
+            macs.len()
+        ));
+    }
+    Ok(ifaces
+        .into_iter()
+        .zip(ips)
+        .zip(macs)
+        .map(|((iface, ip), mac)| Slot {
+            iface: iface.to_owned(),
+            ip,
+            mac,
+        })
+        .collect())
 }
 
 /// `mac` as given, once it is checked to be six colon-separated hex
@@ -295,6 +397,17 @@ pub fn with_queue_pairs((name, args): (String, String), queue_pairs: u16) -> (St
         return (name, args);
     }
     (name, format!("{args},qpairs={queue_pairs}"))
+}
+
+/// The af_packet device for slot `index`'s replication seat on `iface`:
+/// its name, which is also its port's, and its driver arguments. Named
+/// apart from every slot's ([`vdev`]) and the DPDK client's
+/// ([`CLIENT_VDEV`]), keeping the driver's name as its prefix.
+pub fn replication_vdev(index: usize, iface: &str) -> (String, String) {
+    (
+        format!("net_af_packet_repl{index}"),
+        format!("iface={iface}"),
+    )
 }
 
 /// The DPDK client's af_packet device on `iface`: its name
@@ -363,6 +476,12 @@ mod tests {
             (ENV_DPDK_CLIENT_IFACE, "dpdkc"),
             (ENV_DPDK_CLIENT_IP, "10.99.0.100"),
             (ENV_DPDK_CLIENT_MAC, "02:99:00:00:00:64"),
+            (ENV_REPLICATION_IFACES, "dpdk0r dpdk1r dpdk2r"),
+            (ENV_REPLICATION_IPS, "10.99.0.12 10.99.0.13 10.99.0.14"),
+            (
+                ENV_REPLICATION_MACS,
+                "02:99:00:00:00:0c 02:99:00:00:00:0d 02:99:00:00:00:0e",
+            ),
         ];
         for &(name, value) in overrides {
             vars.retain(|(n, _)| *n != name);
@@ -444,6 +563,51 @@ mod tests {
         assert!(err.contains("netns-runner.sh"), "{err}");
     }
 
+    /// Each node slot has a replication seat of its own, apart from every
+    /// slot and the DPDK client, and its MAC is found by its IP.
+    #[test]
+    fn each_slot_has_a_replication_seat_of_its_own() {
+        let vars = runner_env(&[]);
+        let layout = Layout::parse(env(&vars)).expect("a full layout");
+        assert_eq!(
+            layout.replication_seat(1).expect("a replication seat"),
+            &Slot {
+                iface: "dpdk1r".into(),
+                ip: Ipv4Addr::new(10, 99, 0, 13),
+                mac: "02:99:00:00:00:0d".into(),
+            }
+        );
+        assert_eq!(layout.slot_count(), 3, "the seats add no slot");
+        assert_eq!(
+            layout.mac_of(Ipv4Addr::new(10, 99, 0, 14)),
+            Some("02:99:00:00:00:0e")
+        );
+    }
+
+    /// A runner that publishes no replication seats still runs every node
+    /// test; only asking for a seat fails, naming what is missing.
+    #[test]
+    fn a_layout_without_replication_seats_serves_the_nodes() {
+        let vars = runner_env(&[
+            (ENV_REPLICATION_IFACES, None),
+            (ENV_REPLICATION_IPS, None),
+            (ENV_REPLICATION_MACS, None),
+        ]);
+        let layout = Layout::parse(env(&vars)).expect("a layout without replication seats");
+        assert_eq!(layout.slot_count(), 3);
+        let err = layout.replication_seat(0).expect_err("no seat");
+        assert!(err.contains(ENV_REPLICATION_IPS), "{err}");
+        assert!(err.contains("netns-runner.sh"), "{err}");
+    }
+
+    #[test]
+    #[should_panic(expected = "node slot 3 requested")]
+    fn a_replication_seat_past_the_last_slot_panics() {
+        let vars = runner_env(&[]);
+        let layout = Layout::parse(env(&vars)).expect("a full layout");
+        let _ = layout.replication_seat(3);
+    }
+
     /// The MACs the runner publishes are not the `02:00:<ip>` convention a
     /// DPDK dialer falls back to without a peer MAC, so a test whose
     /// replica or client reaches its peer proves the MAC was passed
@@ -457,7 +621,15 @@ mod tests {
         let layout = Layout::parse(env(&vars)).expect("a full layout");
         let seat = layout.dpdk_client().expect("the DPDK client's seat");
         let ips = (0..layout.slot_count())
-            .map(|index| layout.slot(index).ip)
+            .flat_map(|index| {
+                [
+                    layout.slot(index).ip,
+                    layout
+                        .replication_seat(index)
+                        .expect("a replication seat")
+                        .ip,
+                ]
+            })
             .chain([layout.client_ip, seat.ip]);
         for ip in ips {
             let o = ip.octets();
@@ -538,6 +710,31 @@ mod tests {
                 ENV_NODE_MACS,
                 Some("02:99:00:00:00:02 02:99:00:00:00:03 02:99:00:00:00:zz"),
             )][..],
+            // Replication seats: partial, one short of the slots, a seat
+            // on a slot's, the DPDK client's or the kernel side's address
+            // or interface, a malformed entry.
+            &[(ENV_REPLICATION_MACS, None)][..],
+            &[
+                (ENV_REPLICATION_IFACES, Some("dpdk0r dpdk1r")),
+                (ENV_REPLICATION_IPS, Some("10.99.0.12 10.99.0.13")),
+                (
+                    ENV_REPLICATION_MACS,
+                    Some("02:99:00:00:00:0c 02:99:00:00:00:0d"),
+                ),
+            ][..],
+            &[(ENV_REPLICATION_IPS, Some("10.99.0.12 10.99.0.3 10.99.0.14"))][..],
+            &[(
+                ENV_REPLICATION_IPS,
+                Some("10.99.0.12 10.99.0.100 10.99.0.14"),
+            )][..],
+            &[(ENV_REPLICATION_IPS, Some("10.99.0.1 10.99.0.13 10.99.0.14"))][..],
+            &[(ENV_REPLICATION_IFACES, Some("dpdk0r dpdk1 dpdk2r"))][..],
+            &[(ENV_REPLICATION_IFACES, Some("dpdk0r dpdkc dpdk2r"))][..],
+            &[(ENV_REPLICATION_IPS, Some("10.99.0.12 10.99.0.13 10.99.0"))][..],
+            &[(
+                ENV_REPLICATION_MACS,
+                Some("02:99:00:00:00:0c 02:99:00:00:00:0d 02:99:00:00:00:0"),
+            )][..],
         ] {
             let vars = runner_env(overrides);
             assert!(Layout::parse(env(&vars)).is_err(), "{overrides:?}");
@@ -594,6 +791,22 @@ mod tests {
         );
         for index in [0, 1, 2, 9, 10, 255] {
             assert_ne!(vdev(index, "dpdkc").0, name);
+        }
+    }
+
+    /// A slot's replication device is named apart from every slot's and
+    /// the client's, with the driver's name as its prefix, and one per
+    /// slot.
+    #[test]
+    fn a_replication_device_is_named_apart_from_every_other() {
+        let (name, args) = replication_vdev(1, "dpdk1r");
+        assert_eq!(name, "net_af_packet_repl1");
+        assert_eq!(args, "iface=dpdk1r");
+        assert!(name.starts_with("net_af_packet"));
+        assert_ne!(name, CLIENT_VDEV);
+        assert_ne!(replication_vdev(0, "a").0, replication_vdev(1, "a").0);
+        for index in [0, 1, 2, 9, 10, 255] {
+            assert_ne!(vdev(index, "dpdk1r").0, name);
         }
     }
 

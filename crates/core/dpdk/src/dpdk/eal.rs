@@ -194,6 +194,93 @@ impl Drop for Eal {
     }
 }
 
+/// The calling thread, registered with EAL as an lcore of its own
+/// (`rte_thread_register`), until this drops, on the same thread.
+///
+/// A thread the node spawns itself is not one of EAL's, so it has no lcore
+/// id, and every mbuf it allocates or frees goes to its pool's shared ring
+/// instead of a per-lcore cache. Registered, it gets an id, and with it
+/// the cache every pool keeps for each lcore. The node's replication poll
+/// thread registers so (`DpdkShared::register_thread`).
+///
+/// Holds the NIC group it was taken through, and so the EAL under it:
+/// unregistering needs EAL alive, and the drop unregisters before letting
+/// the group go. Not `Send`: registration belongs to a thread, and the drop
+/// must run on the one that registered.
+///
+/// Registering shuts DPDK's multi-process mode off for the process
+/// (`rte_mp_disable`): once a primary process has registered a thread, no
+/// secondary process attaches to it, so tools that run as one
+/// (`dpdk-proc-info`, `dpdk-dumpcap`, `dpdk-pdump`) refuse to start against
+/// the node.
+pub struct LcoreRegistration {
+    lcore_id: u32,
+    _group: std::sync::Arc<crate::transport::DpdkShared>,
+    /// `!Send` and `!Sync`, as a raw pointer is.
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl LcoreRegistration {
+    /// Register the calling thread, through `group`, whose share of the
+    /// EAL proves it is up. Call it once the thread is pinned: EAL records
+    /// the thread's affinity at registration as the lcore's.
+    ///
+    /// # Errors
+    /// EAL refused: every lcore id is taken (`ENOMEM`), or the process
+    /// already serves a secondary process (`EINVAL`, as DPDK 22.11 sets it).
+    pub(crate) fn register(
+        group: std::sync::Arc<crate::transport::DpdkShared>,
+    ) -> Result<Self, LcoreRegisterError> {
+        // SAFETY: EAL is initialized and stays so: `group` holds its share
+        // of it. Registration touches only the calling thread's state.
+        let errno = unsafe { ffi::dpdk_thread_register() };
+        if errno != 0 {
+            return Err(LcoreRegisterError { errno });
+        }
+        // SAFETY: a read of the calling thread's own lcore id.
+        let lcore_id = unsafe { ffi::dpdk_lcore_id() };
+        Ok(LcoreRegistration {
+            lcore_id,
+            _group: group,
+            _thread_bound: std::marker::PhantomData,
+        })
+    }
+
+    /// The lcore id EAL gave the thread.
+    pub fn lcore_id(&self) -> u32 {
+        self.lcore_id
+    }
+}
+
+impl Drop for LcoreRegistration {
+    fn drop(&mut self) {
+        // SAFETY: on the thread that registered (the type is not `Send`),
+        // with EAL alive: `_group` drops only after this body.
+        unsafe { ffi::rte_thread_unregister() };
+    }
+}
+
+/// EAL refused to register a thread as an lcore: `errno` is its
+/// `rte_errno`, which names why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LcoreRegisterError {
+    /// `rte_errno` after `rte_thread_register` failed: `ENOMEM` when every
+    /// lcore id is taken, `EINVAL` when a secondary process is attached.
+    pub errno: i32,
+}
+
+impl std::fmt::Display for LcoreRegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rte_thread_register failed: {}",
+            std::io::Error::from_raw_os_error(self.errno)
+        )
+    }
+}
+
+impl std::error::Error for LcoreRegisterError {}
+
 /// Errors from EAL initialization and device hotplug.
 ///
 /// `Clone` because the process-wide EAL keeps the outcome of its one

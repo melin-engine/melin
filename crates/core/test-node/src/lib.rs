@@ -20,9 +20,15 @@
 //! starting any of them, so that it can point a replica at its primary
 //! (`replica_of`, `replication_bind`) the same way on both transports; on
 //! DPDK the launcher fills in what the replica needs on top (the
-//! primary's MAC). Endpoints that are kernel TCP by design (health,
-//! admin, events, raft) are left as the test configures them: under the
-//! runner they bind on the namespace's own loopback.
+//! primary's MAC). A primary whose replication runs on a NIC of its own
+//! takes its addresses from [`addrs_with_replication_nic`] instead: on
+//! DPDK that NIC is on the slot's replication seat, a second veth pair.
+//! Endpoints that are kernel TCP by design (health, admin, events, raft)
+//! are left as the test configures them: under the runner they bind on
+//! the namespace's own loopback.
+//!
+//! A test of a node's teardown checks which of its threads are still
+//! running with [`live_thread_names`].
 //!
 //! Without the runner, a DPDK build fails the first node it is asked for,
 //! saying how to run it.
@@ -74,6 +80,10 @@ pub struct Addrs {
     /// The runner's node slot these addresses are on.
     #[cfg(feature = "dpdk")]
     slot: usize,
+    /// Whether the node's replication has a NIC of its own, on the slot's
+    /// replication seat ([`addrs_with_replication_nic`]).
+    #[cfg(feature = "dpdk")]
+    replication_nic: bool,
 }
 
 impl Addrs {
@@ -117,8 +127,49 @@ pub fn addrs(slot: usize, free_addr: impl FnMut() -> SocketAddr) -> Addrs {
     #[cfg(feature = "dpdk")]
     {
         drop(free_addr);
-        dpdk::addrs(slot)
+        dpdk::addrs(slot, false)
     }
+}
+
+/// [`addrs`], for a node whose replication runs on a NIC of its own (port
+/// mode, `--dpdk-replication-ports`), where its replicas reach it.
+///
+/// - Kernel TCP: [`addrs`]' own, as kernel TCP has no such mode: the node
+///   replicates on its one network stack.
+/// - DPDK: the client address of [`addrs`], and the replication address on
+///   the slot's replication seat, a veth pair of its own beside the slot's.
+///   [`start_at`] attaches a device there and gives the node its port and
+///   IP as its replication NIC. A replica takes [`Addrs::replication`] as
+///   its `replica_of`, and dials it from its own client NIC (a replica on
+///   a NIC of its own is not run yet).
+pub fn addrs_with_replication_nic(slot: usize, free_addr: impl FnMut() -> SocketAddr) -> Addrs {
+    #[cfg(not(feature = "dpdk"))]
+    {
+        addrs(slot, free_addr)
+    }
+    #[cfg(feature = "dpdk")]
+    {
+        drop(free_addr);
+        dpdk::addrs(slot, true)
+    }
+}
+
+/// Names of every live thread in this process, via `/proc/self/task`
+/// (Linux-only, like the runtime itself): what a test of a node's teardown
+/// checks for the node's stage threads (`journal-seq`, `matching`, ...).
+/// Meaningful only where no other test shares the process, since other
+/// tests' nodes run threads of the same names.
+pub fn live_thread_names() -> Vec<String> {
+    std::fs::read_dir("/proc/self/task")
+        .expect("read /proc/self/task")
+        .filter_map(|entry| {
+            // A thread may exit between readdir and the comm read —
+            // skipping it is the correct outcome.
+            let entry = entry.ok()?;
+            let name = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+            Some(name.trim().to_string())
+        })
+        .collect()
 }
 
 /// The address a test's own sockets use to reach the nodes, and the one
@@ -272,6 +323,9 @@ pub struct Node {
     /// The runner slot the node holds until it is stopped or joined.
     #[cfg(feature = "dpdk")]
     slot: usize,
+    /// Whether the node also holds the slot's replication seat.
+    #[cfg(feature = "dpdk")]
+    replication_nic: bool,
 }
 
 impl Node {
@@ -300,7 +354,7 @@ impl Node {
     pub fn join(self) -> Result<(), String> {
         let result = self.thread.join().expect("node thread panicked");
         #[cfg(feature = "dpdk")]
-        dpdk::release(self.slot);
+        dpdk::release(self.slot, self.replication_nic);
         result
     }
 }
@@ -377,7 +431,7 @@ where
     #[cfg(feature = "dpdk")]
     {
         let claim = dpdk::claim_first_free();
-        let addrs = dpdk::addrs(claim.slot());
+        let addrs = dpdk::addrs(claim.slot(), false);
         dpdk::start_claimed::<A>(claim, &addrs, config, startup, sizing, decoder, encoder)
     }
 }
@@ -525,13 +579,29 @@ mod dpdk {
         }
     }
 
-    pub(super) fn addrs(slot: usize) -> Addrs {
+    /// Slot `slot`'s addresses; with `replication_nic`, the replication
+    /// address on the slot's replication seat.
+    pub(super) fn addrs(slot: usize, replication_nic: bool) -> Addrs {
         let ip = layout().slot(slot).ip;
+        let replication_ip = if replication_nic {
+            replication_seat(slot).ip
+        } else {
+            ip
+        };
         Addrs {
             client: SocketAddr::from((ip, layout::NODE_PORT)),
-            replication: SocketAddr::from((ip, layout::REPLICATION_PORT)),
+            replication: SocketAddr::from((replication_ip, layout::REPLICATION_PORT)),
             slot,
+            replication_nic,
         }
+    }
+
+    /// Slot `slot`'s replication seat. Panics under a runner that builds
+    /// none.
+    fn replication_seat(slot: usize) -> &'static layout::Slot {
+        layout()
+            .replication_seat(slot)
+            .unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// A slot claimed for a node that is still being started. Dropping it
@@ -603,14 +673,23 @@ mod dpdk {
         SlotClaim { slot }
     }
 
-    /// Detach the slot's device, which its node has closed, so that the
-    /// next node on the slot can attach it again, and free the slot.
-    pub(super) fn release(slot: usize) {
-        let (device, _) = layout::vdev(slot, &layout().slot(slot).iface);
-        if let Err(e) = eal().detach_vdev(&device) {
-            panic!("detach {device} after its node returned: {e}");
+    /// Detach the slot's device, and its replication seat's when the node
+    /// had a replication NIC there (`replication_nic`), which its node has
+    /// closed, so that the next node on the slot can attach them again, and
+    /// free the slot.
+    pub(super) fn release(slot: usize, replication_nic: bool) {
+        detach(&layout::vdev(slot, &layout().slot(slot).iface).0);
+        if replication_nic {
+            detach(&layout::replication_vdev(slot, &replication_seat(slot).iface).0);
         }
         in_use()[slot] = false;
+    }
+
+    /// Detach `device`, which a node that has returned closed.
+    fn detach(device: &str) {
+        if let Err(e) = eal().detach_vdev(device) {
+            panic!("detach {device} after its node returned: {e}");
+        }
     }
 
     /// The process-wide EAL, initialized by the first node.
@@ -812,9 +891,10 @@ mod dpdk {
         if let Some(bind) = config.replication_bind {
             assert_eq!(
                 bind.ip(),
-                IpAddr::V4(slot.ip),
-                "replication_bind {bind} is not on this node's slot: on DPDK the node replicates \
-                 from its own IP; take the address from melin_test_node::addrs"
+                addrs.replication.ip(),
+                "replication_bind {bind} is not this node's replication address: on DPDK the \
+                 node replicates from its own IP, or its replication NIC's; take the address \
+                 from melin_test_node::addrs or addrs_with_replication_nic"
             );
         }
         config.dpdk.peer_mac = config.replica_of.map(|primary| {
@@ -836,8 +916,32 @@ mod dpdk {
         let port = eal()
             .attach_vdev(&device, &device_args)
             .unwrap_or_else(|e| panic!("attach {device} for node slot {}: {e}", addrs.slot));
+        // The replication seat's device, for a node whose replication has a
+        // NIC of its own: its port and IP are that NIC's, everything else
+        // the client NIC's (`--dpdk-replication-ports`,
+        // `--dpdk-replication-ip`). No peer MAC: the node does not dial out
+        // on it, its replicas dial it.
+        if addrs.replication_nic {
+            let seat = replication_seat(addrs.slot);
+            let (repl_device, repl_args) = layout::replication_vdev(addrs.slot, &seat.iface);
+            let repl_port = match eal().attach_vdev(&repl_device, &repl_args) {
+                Ok(port) => port,
+                Err(e) => {
+                    // The slot's own device first, so that the claim,
+                    // dropped by the panic, frees a slot with nothing
+                    // attached.
+                    detach(&device);
+                    panic!(
+                        "attach {repl_device} for node slot {}'s replication NIC: {e}",
+                        addrs.slot
+                    );
+                }
+            };
+            config.dpdk_replication.ports = vec![repl_port];
+            config.dpdk_replication.ip = Some(seat.ip);
+        }
         // Attached: from here the slot is the node's, freed by `release`
-        // when it returns (which detaches the device too).
+        // when it returns (which detaches the devices too).
         let slot_id = claim.into_node();
 
         config.bind = addrs.client;
@@ -864,6 +968,7 @@ mod dpdk {
             thread,
             shutdown,
             slot: slot_id,
+            replication_nic: addrs.replication_nic,
         }
     }
 
@@ -896,10 +1001,17 @@ mod dpdk {
         /// as usual (its last words go nowhere).
         ///
         /// DPDK only: a kernel-TCP node shares the host's loopback with
-        /// every other, so there is no link of its own to cut.
+        /// every other, so there is no link of its own to cut. A node with
+        /// a replication NIC of its own loses both links.
         pub fn cut_off(&self) {
-            let port = format!("{}{BRIDGE_PORT_SUFFIX}", layout().slot(self.slot).iface);
-            set_link_down(&port).unwrap_or_else(|e| panic!("bring {port} down: {e}"));
+            let mut ifaces = vec![&layout().slot(self.slot).iface];
+            if self.replication_nic {
+                ifaces.push(&replication_seat(self.slot).iface);
+            }
+            for iface in ifaces {
+                let port = format!("{iface}{BRIDGE_PORT_SUFFIX}");
+                set_link_down(&port).unwrap_or_else(|e| panic!("bring {port} down: {e}"));
+            }
         }
     }
 

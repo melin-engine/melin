@@ -21,6 +21,9 @@ pub mod connection_limit;
 // Ungated: the node's replication flags are declared and mapped in every
 // build, as `--dpdk-*` are; re-exported from `server`, beside `DpdkArgs`.
 mod dpdk_replication_args;
+// Ungated for the same reason: the per-queue packet counts on `/metrics`
+// are plain text over atomics, tested on every host.
+mod dpdk_queue_metrics;
 mod durability_gate;
 pub mod halt;
 pub mod layout;
@@ -30,6 +33,8 @@ mod raft;
 mod raft_promotion;
 pub mod reader;
 pub mod replication;
+// Ungated, though only the DPDK build spawns one: tested on every host.
+mod reporting_thread;
 pub mod response;
 mod response_frame;
 pub mod server;
@@ -40,6 +45,8 @@ mod uring_teardown;
 
 pub use startup::StartupEvents;
 
+#[cfg(feature = "dpdk")]
+mod dpdk_repl_poll;
 #[cfg(feature = "dpdk")]
 pub mod dpdk_response;
 #[cfg(feature = "dpdk")]

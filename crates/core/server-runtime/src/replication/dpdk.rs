@@ -79,6 +79,36 @@ const ACK_RETRY_CAP: u32 = 32;
 /// durability gate.
 pub(crate) const REPL_DISPATCH_BURST: usize = 256;
 
+/// A primary's replication socket's transmit buffer. Replication needs
+/// larger transmit buffers than clients: journal batches can be 100-200
+/// KiB, far beyond the client sockets' 16 KiB.
+const PRIMARY_REPL_TX_BUF: usize = 512 * 1024;
+/// A primary's replication socket's transmit queue, the bytes queued above
+/// the stack before the socket counts as backed up: as large as its buffer.
+const PRIMARY_REPL_TX_QUEUE: usize = 512 * 1024;
+/// A primary's replication socket's receive buffer: it receives acks only.
+const PRIMARY_REPL_RX_BUF: usize = 64 * 1024;
+
+/// Listen for replicas on `port` of `transport`, with a primary's
+/// replication socket buffers and egress burst: on the client transport in
+/// shared mode, beside the client listener, or on the replication poll
+/// thread's own transport in queue and port modes. One definition, so that
+/// a replica sees the same primary whichever mode it runs.
+pub(crate) fn add_replication_listener(
+    transport: &mut melin_dpdk::DpdkTransport,
+    port: u16,
+) -> Result<(), String> {
+    transport
+        .add_listener_with_buffers(
+            port,
+            PRIMARY_REPL_RX_BUF,
+            PRIMARY_REPL_TX_BUF,
+            PRIMARY_REPL_TX_QUEUE,
+            REPL_DISPATCH_BURST,
+        )
+        .map_err(|e| format!("add replication listener: {e}"))
+}
+
 /// Soft cap on the bytes one replication slot hands to the transport per tick.
 ///
 /// Sized to roughly one in-flight window ([`REPL_DISPATCH_BURST`] segments at

@@ -9,7 +9,9 @@
 #      mount namespaces);
 #   2. builds a bridge carrying the client's address, with one veth pair
 #      per node slot: the node's end for DPDK, the other end on the
-#      bridge. One more pair, built the same way, is the DPDK client's: a
+#      bridge. A second pair per slot, built the same way, is the slot's
+#      replication seat: a node whose replication runs on a NIC of its own
+#      attaches that NIC there. One more pair is the DPDK client's: a
 #      test whose client runs on DPDK attaches its end. Every interface
 #      up, TX checksum offload off on every veth (veth-setup.py), `lo` up.
 #      The nodes reach each other (replication) and both clients, the
@@ -61,6 +63,12 @@
 #   MELIN_NETNS_DPDK_CLIENT_IP     the IP the DPDK client owns on it
 #   MELIN_NETNS_DPDK_CLIENT_MAC    its MAC, which the client's DPDK port
 #                                  takes
+#
+# and each node slot's replication seat, in slot order, as the slots are
+# (space-separated lists), apart from the slots for the same reason:
+#   MELIN_NETNS_REPLICATION_IFACES  interfaces a replication NIC attaches to
+#   MELIN_NETNS_REPLICATION_IPS     the IP each slot's replication NIC owns
+#   MELIN_NETNS_REPLICATION_MACS    each interface's MAC
 
 set -euo pipefail
 
@@ -125,11 +133,26 @@ done
 DPDK_CLIENT_IFACE=dpdkc
 DPDK_CLIENT_IP=10.99.0.100
 DPDK_CLIENT_MAC=02:99:00:00:00:64
+# Each node slot's replication seat: a second pair, for a node whose
+# replication runs on a NIC of its own (port mode). Ten addresses above the
+# slots', on the same MAC scheme.
+REPLICATION_IFACES=()
+REPLICATION_IPS=()
+REPLICATION_MACS=()
+for slot in 0 1 2; do
+    REPLICATION_IFACES+=("dpdk${slot}r")
+    REPLICATION_IPS+=("10.99.0.$((slot + 12))")
+    REPLICATION_MACS+=("$(printf '02:99:00:00:00:%02x' $((slot + 12)))")
+done
 
-# veth-setup.py builds every pair alike, the client's last.
+# veth-setup.py builds every pair alike: the slots', their replication
+# seats', and the client's last.
 slots=()
 for i in "${!DPDK_IFACES[@]}"; do
     slots+=("${DPDK_IFACES[$i]}=${NODE_MACS[$i]}")
+done
+for i in "${!REPLICATION_IFACES[@]}"; do
+    slots+=("${REPLICATION_IFACES[$i]}=${REPLICATION_MACS[$i]}")
 done
 slots+=("$DPDK_CLIENT_IFACE=$DPDK_CLIENT_MAC")
 if ! python3 "$SCRIPT_DIR/veth-setup.py" "$BRIDGE" "$CLIENT_IP/$PREFIX_LEN" "$CLIENT_MAC" "${slots[@]}"; then
@@ -161,5 +184,8 @@ export MELIN_NETNS_CLIENT_MAC="$CLIENT_MAC"
 export MELIN_NETNS_DPDK_CLIENT_IFACE="$DPDK_CLIENT_IFACE"
 export MELIN_NETNS_DPDK_CLIENT_IP="$DPDK_CLIENT_IP"
 export MELIN_NETNS_DPDK_CLIENT_MAC="$DPDK_CLIENT_MAC"
+export MELIN_NETNS_REPLICATION_IFACES="${REPLICATION_IFACES[*]}"
+export MELIN_NETNS_REPLICATION_IPS="${REPLICATION_IPS[*]}"
+export MELIN_NETNS_REPLICATION_MACS="${REPLICATION_MACS[*]}"
 
 exec "$@"

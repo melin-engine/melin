@@ -91,6 +91,11 @@ pub struct HealthState {
     /// thread. `None` when the node runs without control-plane raft
     /// (no `--raft-bind`).
     pub raft: Option<Arc<RaftStatus>>,
+    /// The transport's own series, appended to `/metrics`: a DPDK
+    /// primary's per-queue packet counts. `None` on kernel TCP. A `Box`:
+    /// one owner, the health thread, and dynamic so that this crate needs
+    /// no transport's types.
+    pub transport_metrics: Option<Box<dyn TransportMetrics>>,
 }
 
 /// A [`QueueCursor`] that always reads 0 — used for the pipeline-cursor
@@ -147,9 +152,32 @@ impl HealthState {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft,
+            // A replica serves no client queue: what its NIC carries is
+            // reported with its primary's, once promoted.
+            transport_metrics: None,
         }
     }
 }
+
+/// Series a transport adds to `/metrics` after the pipeline's own: a DPDK
+/// node's per-queue packet counts. Defined here, and implemented where the
+/// transport is, so that this endpoint knows nothing of any transport.
+///
+/// Written on the health thread at each scrape, so what it reads must be
+/// safe to read from there (atomics the transport's threads publish).
+pub trait TransportMetrics: Send + Sync {
+    /// Append Prometheus text exposition lines (`# HELP`, `# TYPE` and the
+    /// samples) to `out`. An error is the response buffer filling, which
+    /// truncates the body, as for the pipeline's own series.
+    fn write_prometheus(&self, out: &mut dyn Write) -> std::io::Result<()>;
+}
+
+/// Room, in bytes, `/metrics` keeps for a [`TransportMetrics`] block in
+/// its fixed response buffer, beside the pipeline's own series. Not
+/// enforced at runtime (a larger block is truncated, as any overflow is);
+/// the headroom test here counts it against the buffer, and a transport's
+/// own test checks that a representative block of its fits in it.
+pub const TRANSPORT_METRICS_BUDGET: usize = 4096;
 
 /// Control-plane raft election state exposed through `/metrics`.
 ///
@@ -1030,7 +1058,15 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
 
     let resp_len = match kind {
         RequestKind::Metrics => {
-            let body_len = snapshot.write_prometheus(&mut body_buf);
+            let mut body_len = snapshot.write_prometheus(&mut body_buf);
+            if let Some(transport) = &state.transport_metrics {
+                let mut c = Cursor::new(&mut body_buf[body_len..]);
+                // Best-effort like the pipeline's own series: an error
+                // only means the fixed buffer filled, which truncates the
+                // exposition rather than being actionable here.
+                let _ = transport.write_prometheus(&mut c);
+                body_len += c.position() as usize;
+            }
             write_http(
                 &mut resp_buf,
                 "text/plain; version=0.0.4; charset=utf-8",
@@ -1187,6 +1223,53 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// A transport's own series follow the pipeline's on `/metrics`, read
+    /// at each scrape, so a count that moved between two scrapes shows.
+    #[test]
+    fn a_transport_s_series_are_appended_at_each_scrape() {
+        struct Packets(Arc<AtomicU64>);
+        impl TransportMetrics for Packets {
+            fn write_prometheus(&self, out: &mut dyn Write) -> std::io::Result<()> {
+                writeln!(
+                    out,
+                    "melin_test_packets_total {}",
+                    self.0.load(Ordering::Relaxed)
+                )
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let packets = Arc::new(AtomicU64::new(7));
+        let mut state = HealthState::for_replica(
+            Arc::new(crate::fence::FenceState::new(0)),
+            None,
+            Arc::new(AtomicBool::new(true)),
+        );
+        state.transport_metrics = Some(Box::new(Packets(Arc::clone(&packets))));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn(addr, state, Arc::clone(&shutdown)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        let pipeline = body
+            .find("melin_pipeline_healthy 1\n")
+            .unwrap_or_else(|| panic!("the pipeline's series: {body}"));
+        let transport = body
+            .find("melin_test_packets_total 7\n")
+            .unwrap_or_else(|| panic!("the transport's series: {body}"));
+        assert!(pipeline < transport, "{body}");
+        assert!(body.ends_with("melin_test_packets_total 7\n"), "{body}");
+
+        packets.store(9, Ordering::Relaxed);
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(body.contains("melin_test_packets_total 9\n"), "{body}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
     #[test]
     fn raft_gauges_absent_without_raft() {
         // Standalone/non-raft nodes must not export the series at all.
@@ -1294,6 +1377,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1421,6 +1505,7 @@ mod tests {
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
                 raft: None,
+                transport_metrics: None,
             },
             Arc::clone(&shutdown),
         );
@@ -1457,6 +1542,7 @@ mod tests {
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
                 raft: None,
+                transport_metrics: None,
             },
             Arc::new(AtomicBool::new(false)),
         );
@@ -1619,6 +1705,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1686,6 +1773,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            transport_metrics: None,
         };
         let handle = std::thread::spawn(move || {
             health_loop(&listener, &state, &s);
@@ -1772,6 +1860,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1840,6 +1929,7 @@ mod tests {
             matching_utilization: matching_util,
             response_utilization: response_util,
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1919,6 +2009,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1972,6 +2063,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2229,6 +2321,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2313,6 +2406,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2390,6 +2484,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2555,6 +2650,7 @@ mod tests {
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: response_util,
             raft: None,
+            transport_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2668,9 +2764,12 @@ mod tests {
         const BODY_BUF: usize = 16384;
         const HEADROOM_LIMIT: usize = BODY_BUF * 3 / 4; // 12288
 
+        // With room for a transport's series on top (a DPDK node's
+        // per-queue packet counts), which this state has none of.
         assert!(
-            metrics_body.len() < HEADROOM_LIMIT,
-            "prometheus body ({} bytes) is past 75 % of the {BODY_BUF}-byte stack \
+            metrics_body.len() + TRANSPORT_METRICS_BUDGET < HEADROOM_LIMIT,
+            "prometheus body ({} bytes, plus {TRANSPORT_METRICS_BUDGET} for a \
+             transport's series) is past 75 % of the {BODY_BUF}-byte stack \
              buffer — adding more metrics will silently truncate the output. \
              Either trim the body or grow body_buf in handle_health_connection.",
             metrics_body.len()

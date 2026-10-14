@@ -13,11 +13,13 @@
 #   BRIDGE  (CLIENT_IP/PREFIX_LEN, MAC CLIENT_MAC: the kernel side)
 #     +-- <DPDK_IFACE>-br <-> DPDK_IFACE (MAC as given, no address: DPDK's
 #     |                                   userspace stack owns the IP)
-#     +-- ...one veth pair per node slot, and one for a DPDK client
+#     +-- ...one veth pair per node slot, one more per slot for its
+#            replication seat, and one for a DPDK client
 #
 # Every DPDK_IFACE=MAC argument is built alike, whoever attaches to it: the
-# runner passes the node slots' pairs and then the DPDK client's, which
-# differs from a slot only in what the runner publishes about it.
+# runner passes the node slots' pairs, their replication seats' and then
+# the DPDK client's, each of which differs from a slot only in what the
+# runner publishes about it.
 #
 # MACs are set rather than left random so the layout can be published
 # before any node runs: a DPDK replica dials its primary, and a DPDK

@@ -2001,6 +2001,8 @@ where
         &response_utilization,
         &shutdown,
         &raft_status,
+        // Kernel TCP: no NIC queue of the node's own to report.
+        None,
     )?;
 
     // Promotion fencing: the bump is the first entry of a promoted node's
@@ -2314,7 +2316,10 @@ where
 {
     check_keys_match_decoder(&*decoder, &authorized_keys)?;
     let dpdk_config = dpdk_config_from(&config)?;
-    crate::dpdk_replication_args::check_replication_nic_implemented(&dpdk_config.replication)?;
+    crate::dpdk_replication_args::check_replication_nic_implemented(
+        &dpdk_config.replication,
+        config.replica_of.is_some(),
+    )?;
 
     run_dpdk_impl::<A>(
         config,
@@ -2394,22 +2399,22 @@ where
     // As on the kernel-TCP path: resolve the layout once, up front. The
     // reader entry pins the NIC poll thread here, which never yields, and
     // the repl-poll entry the replication poll thread wherever this node's
-    // replication mode runs one.
+    // replication mode runs one: in queue and port modes, on a node that
+    // replicates (`run_as_primary_dpdk` drives replication only with
+    // `--replication-bind`).
+    let transport =
+        NodeTransport::dpdk(&dpdk_config.replication, config.replication_bind.is_some());
     let config = ServerConfig {
-        cores: config.resolved_cores(NodeTransport::dpdk(&dpdk_config.replication))?,
+        cores: config.resolved_cores(transport)?,
         ..config
     };
     log_layout(&config.cores);
-    // The one placement the layout check cannot make honest: the poll
+    // The one placement the layout check cannot make honest: a poll
     // thread polls flat out whatever its entry says, and unpinned it
     // does so wherever the scheduler puts it — next to whatever else is
     // there. Accepted (test hosts run this way), but said out loud.
-    if !config.cores.reader.is_pinned() {
-        warn!(
-            "--cores: the reader is unpinned, but on DPDK it is the NIC poll thread and \
-             busy-polls regardless; it will take a full core wherever the scheduler places \
-             it. Give it a core of its own"
-        );
+    for warning in config.cores.unpinned_poller_warnings(transport) {
+        warn!("{warning}");
     }
 
     // Mirrors the kernel-TCP `run` path: one atomic per
@@ -2421,10 +2426,11 @@ where
     // every role — a replica's configuration is the one it serves under
     // once promoted.
     validate_primary_config(&config)?;
-    // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
-    let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
-    // Actual queue count may be less than requested (TAP only supports 1).
-    let num_dpdk_threads = shared.num_queues as usize;
+    // Bring the node's NICs up on one EAL: the client NIC (with its
+    // replication queue in queue mode), and in port mode the replication
+    // NIC beside it.
+    let nics = melin_dpdk::NodeNics::init(&dpdk_config)?;
+    let shared = &nics.client;
 
     // --- Replica mode (DPDK) ---
     // If --replica-of is set, run the DPDK replication receiver instead
@@ -2549,7 +2555,7 @@ where
         // refuses a connection attempt — and gains its listeners at
         // promotion.
         let mut transport =
-            melin_dpdk::DpdkTransport::from_shared_unlistening(&shared, &dpdk_config, 0)?;
+            melin_dpdk::DpdkTransport::from_shared_unlistening(shared, &dpdk_config, 0)?;
         transport.send_gratuitous_arp();
 
         let primary_ipv4 = match primary_addr.ip() {
@@ -2629,6 +2635,10 @@ where
                     app,
                     writer,
                     transport,
+                    // A replica runs shared mode only (see
+                    // `check_replication_nic_implemented`): replication
+                    // stays on the transport it ran on.
+                    None,
                     &dpdk_config,
                     &config,
                     startup.on_primary,
@@ -2648,16 +2658,14 @@ where
         }
     }
 
-    // Create per-thread transports (each gets its own queue pair + smoltcp stack).
-    // The single-queue refactor (`feat/dpdk-single-queue`) collapsed
-    // replication onto the same queue/thread as client traffic — no
-    // separate queue is reserved any more, so `num_client_queues`
-    // simply tracks `num_dpdk_threads`.
-    let num_client_queues = num_dpdk_threads;
+    // Create per-thread transports (each gets its own queue pair + smoltcp
+    // stack), one per client queue: as many as the queue plan gives
+    // clients, which is not the port's queue count in queue mode, whose
+    // second queue is replication's and is polled by its own thread.
+    let num_client_queues = usize::from(shared.client_queues());
     let mut transports = Vec::with_capacity(num_client_queues);
     for q in 0..num_client_queues {
-        let mut transport =
-            melin_dpdk::DpdkTransport::from_shared(&shared, &dpdk_config, q as u16)?;
+        let mut transport = melin_dpdk::DpdkTransport::from_shared(shared, &dpdk_config, q as u16)?;
         // Send a gratuitous ARP from the first queue so the switch learns
         // our VF's MAC address. Without this, SR-IOV VFs that can't enable
         // promiscuous mode are unreachable — the switch has no forwarding
@@ -2680,6 +2688,9 @@ where
             .into());
         }
     };
+    // Where replication runs when it has a queue or a NIC of its own: the
+    // replication poll thread builds its transport there.
+    let replication_seat = crate::dpdk_repl_poll::ReplicationNicSeat::of(&nics, &dpdk_config)?;
 
     // The configuration was validated at the top of this function. Now
     // initialize or recover the application (journaling genesis on a new
@@ -2756,6 +2767,7 @@ where
         app,
         writer,
         transport,
+        replication_seat,
         &dpdk_config,
         &config,
         startup.on_primary,
@@ -2783,9 +2795,13 @@ where
 ///
 /// `transport` is queue 0's, listening on the client port: built at boot
 /// by a primary, or the transport a promoted replica ran on, with its
-/// client listener added. The replication listener is added here. The
-/// EAL, ports and pool behind the transport are left as they are, never
-/// re-initialised: EAL cannot be initialised twice in a process.
+/// client listener added. The replication listener is added here: to
+/// `transport` when `replication_seat` is `None` (shared mode), the client
+/// poll thread then driving replication too; otherwise to the transport
+/// the replication poll thread builds on `replication_seat` (queue and
+/// port modes), which it drives. The EAL, ports and pool behind the
+/// transports are left as they are, never re-initialised: EAL cannot be
+/// initialised twice in a process.
 ///
 /// The other parameters are [`run_as_primary`]'s, less the bring-up gate's
 /// `began_history` (a DPDK primary has none; see below).
@@ -2795,6 +2811,7 @@ fn run_as_primary_dpdk<A>(
     app: A,
     writer: BufferedWriter<A::Event>,
     mut transport: melin_dpdk::DpdkTransport,
+    replication_seat: Option<crate::dpdk_repl_poll::ReplicationNicSeat>,
     dpdk_config: &melin_dpdk::DpdkConfig,
     config: &ServerConfig,
     on_primary: Vec<A::Event>,
@@ -3034,17 +3051,13 @@ where
     // read per-slot cursors; the replication driver shares the same
     // instance.
     let replica_ready = Arc::new(AtomicBool::new(false));
-    // Replication, if enabled: build a `DpdkReplicationDriver` for the
-    // single client poll thread to drive. The driver's accept dispatch
-    // hangs off a second listener on the client transport, added below
-    // (port == repl_bind.port()).
-    let (repl_driver, repl_listen_port) = if let Some((repl_consumer_1, repl_consumer_2)) =
-        replication_consumers
-    {
+    // Replication, if enabled: build a `DpdkReplicationDriver`, and where
+    // it listens. Built here, on this thread, whichever thread drives it:
+    // it spawns its workers as it is built (see `DpdkReplicationDriver::new`).
+    let replication = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers {
         let repl_bind = config
             .replication_bind
             .ok_or("replication_bind must be set when replication is enabled")?;
-        let repl_port = repl_bind.port();
 
         let repl_slots = cursors.replica_slot_cursors();
         let ready_flag = Arc::clone(&replica_ready);
@@ -3086,24 +3099,6 @@ where
             });
         let journal_path = config.journal.clone();
 
-        // Add the replication listener to the client transport so the
-        // poll thread accepts both client and replication connections
-        // off the same queue.
-        // Replication needs larger TX buffers than clients: journal batches
-        // can be 100-200 KiB, far exceeding the 16 KiB client TX buffer.
-        const REPL_TX_BUF: usize = 512 * 1024;
-        const REPL_TX_QUEUE: usize = 512 * 1024;
-        const REPL_RX_BUF: usize = 64 * 1024;
-        transport
-            .add_listener_with_buffers(
-                repl_port,
-                REPL_RX_BUF,
-                REPL_TX_BUF,
-                REPL_TX_QUEUE,
-                crate::replication::REPL_DISPATCH_BURST,
-            )
-            .map_err(|e| format!("add replication listener: {e}"))?;
-
         let driver = crate::replication::DpdkReplicationDriver::new(
             [repl_consumer_1, repl_consumer_2],
             repl_slots,
@@ -3119,21 +3114,44 @@ where
             Arc::clone(&ack_policy_atomic),
             Arc::clone(&authorized_keys),
         )?;
-        // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
-        // off "DPDK replication sender started" to know the primary
-        // is ready to accept replicas. Kept verbatim for backward
-        // compatibility with existing bench tooling.
-        info!(addr = %repl_bind, "DPDK replication sender started (single-queue, in client poll thread)");
-        (Some(driver), repl_port)
+        Some((driver, repl_bind))
     } else {
         if !config.standalone && config.replica_of.is_none() {
             info!("running in standalone mode (no replication)");
         }
-        (None, 0)
+        None
     };
-    // The DPDK replication-sender thread used to be spawned here; with
-    // the single-queue / single-thread refactor the driver lives inside
-    // the client poll thread instead. Nothing to join.
+    // Who drives it. In shared mode the client poll thread, its accept
+    // dispatch hanging off a second listener on the client transport,
+    // added here. In queue and port modes the replication poll thread,
+    // spawned below with the driver, once the promotion's epoch bump and
+    // `on_primary` are journaled, as the client poll thread starts only
+    // then too.
+    let (repl_driver, repl_listen_port, split_replication) = match (replication, replication_seat) {
+        (Some((driver, repl_bind)), None) => {
+            crate::replication::add_replication_listener(&mut transport, repl_bind.port())?;
+            // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
+            // off "DPDK replication sender started" to know the primary
+            // is ready to accept replicas. Kept verbatim for backward
+            // compatibility with existing bench tooling.
+            info!(addr = %repl_bind, "DPDK replication sender started (single-queue, in client poll thread)");
+            (Some(driver), repl_bind.port(), None)
+        }
+        (Some((driver, repl_bind)), Some(seat)) => (None, 0, Some((driver, repl_bind, seat))),
+        (None, seat) => {
+            if seat.is_some() {
+                warn!(
+                    "DPDK replication has a queue or a NIC of its own (--dpdk-replication-*), \
+                     but this node replicates to nothing (no --replication-bind): the queue or \
+                     NIC is brought up and left unused"
+                );
+            }
+            (None, 0, None)
+        }
+    };
+    // The DPDK replication-sender thread is not one of the pipeline
+    // stages: in queue and port modes the replication poll thread is
+    // joined with the DPDK poll threads, below.
     let replication_handle: Option<std::thread::JoinHandle<()>> = None;
 
     // Promotion fencing, as on kernel TCP: the bump is the first entry of
@@ -3174,8 +3192,52 @@ where
     // while on_primary events are published — the same property the TCP
     // path achieves by deferring its `spawn_reader` call to after the drain.
 
+    // Every NIC queue the node polls, counted for `/metrics`: the client
+    // queue's, and the replication poll thread's, once it is up.
+    let mut queue_counters = transport.queue_counters();
     let pipeline_healthy = Arc::new(AtomicBool::new(true));
-    let health_handle = spawn_health_endpoint(
+    // Every stage running so far, in one value for each way out from here:
+    // an aborted boot below, and the drain once the client poll returns.
+    // The health endpoint joins it once it is up.
+    let mut stages = PipelineHandles {
+        journal: journal_handle,
+        matching: matching_handle,
+        response: response_handle,
+        replication: replication_handle,
+        event_publisher: None,
+        shadow: shadow_handle,
+        health: None,
+    };
+    // The replication poll thread, in queue and port modes: it serves
+    // replicas from here on, beside the client poll thread below. Held
+    // until joined after the client poll returns; should the boot fail
+    // before then, dropping it stops the thread.
+    let repl_poll = match split_replication {
+        Some((driver, repl_bind, seat)) => match crate::dpdk_repl_poll::spawn(
+            seat,
+            repl_bind.port(),
+            driver,
+            config.cores.repl_poll.core,
+            Arc::clone(&shutdown),
+        ) {
+            Ok((thread, queues)) => {
+                queue_counters.extend(queues);
+                // The bench tooling's legacy match, as in shared mode.
+                info!(addr = %repl_bind, "DPDK replication sender started (on its own queue or NIC, in the replication poll thread)");
+                Some(thread)
+            }
+            Err(e) => {
+                // No replication, no write is ever acknowledged under a
+                // policy that needs a replica: refuse to start, after
+                // stopping every stage already running.
+                abort_startup(stages, &pipeline_healthy, &shutdown);
+                return Err(e.into());
+            }
+        },
+        None => None,
+    };
+
+    let health_handle = match spawn_health_endpoint(
         config,
         &active_connections,
         &events_processed,
@@ -3193,7 +3255,21 @@ where
         &response_utilization,
         &shutdown,
         &raft_status,
-    )?;
+        Some(Box::new(crate::dpdk_queue_metrics::DpdkQueueMetrics::new(
+            queue_counters,
+        ))),
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // The replication poll thread first, as on a clean shutdown,
+            // where it is joined before the pipeline is drained; then
+            // every stage already running.
+            drop(repl_poll);
+            abort_startup(stages, &pipeline_healthy, &shutdown);
+            return Err(e);
+        }
+    };
+    stages.health = health_handle;
 
     info!(
         ip = %dpdk_config.nic.ip_addr,
@@ -3228,26 +3304,18 @@ where
         repl_listen_port,
     );
 
-    // The client poll runs on the main thread, so no extra DPDK threads
-    // to join here — replication sender (if enabled) is joined below.
-    let dpdk_extras: Vec<(String, std::thread::Result<()>)> = Vec::new();
+    // The client poll runs on the main thread; the replication poll thread,
+    // in queue and port modes, has seen the shutdown that ended it, and
+    // is joined here, its replicas' links closed. A `Vec`, as
+    // `shutdown_pipeline_stages` takes it.
+    let dpdk_extras: Vec<(String, std::thread::Result<()>)> = repl_poll
+        .map(|thread| ("repl-poll".to_owned(), thread.join()))
+        .into_iter()
+        .collect();
 
     // The caller's raft guard drops — stopping the driver — after this
     // returns.
-    shutdown_pipeline_stages(
-        PipelineHandles {
-            journal: journal_handle,
-            matching: matching_handle,
-            response: response_handle,
-            replication: replication_handle,
-            event_publisher: None,
-            shadow: shadow_handle,
-            health: health_handle,
-        },
-        dpdk_extras,
-        &pipeline_healthy,
-        &shutdown,
-    )
+    shutdown_pipeline_stages(stages, dpdk_extras, &pipeline_healthy, &shutdown)
 }
 
 /// Promotion fencing: journal the `EpochBump` that opens a promoted
@@ -3822,6 +3890,7 @@ fn spawn_health_endpoint(
     response_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
     shutdown: &Arc<AtomicBool>,
     raft_status: &Option<Arc<melin_transport_core::health::RaftStatus>>,
+    transport_metrics: Option<Box<dyn melin_transport_core::health::TransportMetrics>>,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
     let Some(health_addr) = config.health_bind else {
         return Ok(None);
@@ -3861,6 +3930,7 @@ fn spawn_health_endpoint(
             matching_utilization: Arc::clone(matching_utilization),
             response_utilization: Arc::clone(response_utilization),
             raft: raft_status.clone(),
+            transport_metrics,
         },
         Arc::clone(shutdown),
     )?))
@@ -5319,10 +5389,14 @@ mod dpdk_config_tests {
             )
             .expect("the flags parse");
             let dpdk = dpdk_config_from(&cfg).expect("valid config");
-            cfg.resolved_cores(NodeTransport::dpdk(&dpdk.replication))
+            cfg.resolved_cores(NodeTransport::dpdk(
+                &dpdk.replication,
+                cfg.replication_bind.is_some(),
+            ))
         };
 
-        let shared = resolve(&[]).expect("repl-poll places nothing in shared mode");
+        let shared = resolve(&["--replication-bind=10.0.0.1:9877"])
+            .expect("repl-poll places nothing in shared mode");
         assert_eq!(shared.repl_poll, Placement::yielding(5));
         for flags in [
             &[
@@ -5332,11 +5406,20 @@ mod dpdk_config_tests {
             &[
                 "--dpdk-replication-ports=1",
                 "--dpdk-replication-ip=10.0.0.2",
+                "--replication-bind=10.0.0.2:9877",
             ],
         ] {
             let err = resolve(flags).expect_err("the replication poll thread cannot yield");
             assert!(err.contains("repl-poll=5y"), "{flags:?}: {err}");
         }
+        // Nor on a node that replicates to nothing: it runs no
+        // replication poll thread, whatever NIC it is given.
+        let unused = resolve(&[
+            "--dpdk-replication-ports=1",
+            "--dpdk-replication-ip=10.0.0.2",
+        ])
+        .expect("repl-poll places nothing without --replication-bind");
+        assert_eq!(unused.repl_poll, Placement::yielding(5));
     }
 
     /// The replication NIC is checked against the client NIC as the node
@@ -5448,13 +5531,13 @@ mod dpdk_config_tests {
         assert!(err.starts_with("invalid --dpdk-peer-mac: "), "{err}");
     }
 
-    /// A DPDK node given a replication mode not implemented yet refuses to
-    /// start, through the public entry point, rather than run it as shared.
-    /// The refusal comes before EAL init, so no NIC or hugepage is needed;
-    /// the wording is pinned with the check itself.
+    /// A DPDK replica given a replication mode not implemented yet for a
+    /// replica refuses to start, through the public entry point, rather
+    /// than run it as shared. The refusal comes before EAL init, so no NIC
+    /// or hugepage is needed; the wording is pinned with the check itself.
     #[cfg(feature = "dpdk")]
     #[test]
-    fn a_dpdk_node_refuses_an_unimplemented_replication_mode() {
+    fn a_dpdk_replica_refuses_a_replication_mode_not_implemented_for_it() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
@@ -5486,9 +5569,13 @@ mod dpdk_config_tests {
                 authorized_keys: authorized_keys.clone(),
                 no_mlock: true,
                 ..ServerConfig::try_parse_from(
-                    ["melin-server", "--dpdk-ports=0"]
-                        .into_iter()
-                        .chain(flags.iter().copied()),
+                    [
+                        "melin-server",
+                        "--dpdk-ports=0",
+                        "--replica-of=10.0.0.9:9877",
+                    ]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
                 )
                 .expect("the flags parse")
             };
@@ -5507,7 +5594,9 @@ mod dpdk_config_tests {
             .expect_err("refused before EAL init")
             .to_string();
             assert!(
-                err.starts_with(&format!("DPDK replication {mode} is not implemented yet")),
+                err.starts_with(&format!(
+                    "DPDK replication {mode} is not implemented yet on a replica"
+                )),
                 "{err}"
             );
         }

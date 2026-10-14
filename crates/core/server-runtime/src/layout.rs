@@ -127,12 +127,15 @@ pub enum NodeTransport {
 impl NodeTransport {
     /// DPDK, with replication where `replication` puts it: on the client
     /// poll thread in shared mode, on a poll thread of its own on a queue
-    /// or a NIC of its own.
-    pub fn dpdk(replication: &ReplicationNic) -> Self {
-        let repl_poll = match replication {
-            ReplicationNic::Shared => false,
-            ReplicationNic::Queue(_) | ReplicationNic::Port(_) => true,
-        };
+    /// or a NIC of its own; but no replication poll thread at all on a
+    /// node that does not `replicate` (no `--replication-bind`), which
+    /// leaves the queue or NIC unused.
+    pub fn dpdk(replication: &ReplicationNic, replicates: bool) -> Self {
+        let repl_poll = replicates
+            && match replication {
+                ReplicationNic::Shared => false,
+                ReplicationNic::Queue(_) | ReplicationNic::Port(_) => true,
+            };
         Self::Dpdk { repl_poll }
     }
 }
@@ -141,9 +144,9 @@ impl NodeTransport {
 ///
 /// All fields are always stored; event-publisher is only used when
 /// `--event-bind` is set, shadow only when `--snapshot-interval-ms` > 0,
-/// and repl-poll only on DPDK with replication on a queue or a NIC of its
-/// own (see [`NodeTransport`]). repl-handler-0/1 are spawned on replica
-/// connect, not at startup.
+/// and repl-poll only on a DPDK node that replicates (`--replication-bind`)
+/// with replication on a queue or a NIC of its own (see [`NodeTransport`]).
+/// repl-handler-0/1 are spawned on replica connect, not at startup.
 /// A `core` of 0 = unpinned (OS scheduled) for any field.
 ///
 /// The thread that accepts replica connections (`repl-accept`) has no
@@ -337,21 +340,50 @@ impl PipelineCores {
     ///
     /// An `Err` is a configuration the node refuses to start with.
     pub fn resolve(self, transport: NodeTransport) -> Result<Self, String> {
-        match transport {
-            NodeTransport::KernelTcp => {}
-            NodeTransport::Dpdk { repl_poll } => {
-                refuse_a_yielding_poller("reader", "the NIC poll thread", self.reader)?;
-                if repl_poll {
-                    refuse_a_yielding_poller(
-                        "repl-poll",
-                        "the replication poll thread",
-                        self.repl_poll,
-                    )?;
-                }
-            }
+        for (name, what, placement) in self.pollers(transport) {
+            refuse_a_yielding_poller(name, what, placement)?;
         }
         self.validate()?;
         Ok(self)
+    }
+
+    /// The threads that poll a NIC on `transport`, each with its `--cores`
+    /// name, what it is, and its placement: on DPDK the reader, and the
+    /// replication poll thread where it runs; on kernel TCP none. The one
+    /// list [`resolve`](Self::resolve) and
+    /// [`unpinned_poller_warnings`](Self::unpinned_poller_warnings) go
+    /// through. A `Vec`: two entries at most, built at startup.
+    fn pollers(&self, transport: NodeTransport) -> Vec<(&'static str, &'static str, Placement)> {
+        match transport {
+            NodeTransport::KernelTcp => Vec::new(),
+            NodeTransport::Dpdk { repl_poll } => {
+                let mut pollers = vec![("reader", "the NIC poll thread", self.reader)];
+                if repl_poll {
+                    pollers.push(("repl-poll", "the replication poll thread", self.repl_poll));
+                }
+                pollers
+            }
+        }
+    }
+
+    /// What the boot log says about each NIC poll thread left unpinned on
+    /// `transport`, one warning each, in `--cores` order: the one
+    /// placement [`resolve`](Self::resolve) cannot make honest, accepted
+    /// (test hosts run this way) but said out loud. A poll thread polls flat
+    /// out whatever its entry says, and unpinned it does so wherever the
+    /// scheduler puts it, next to whatever else is there.
+    pub fn unpinned_poller_warnings(&self, transport: NodeTransport) -> Vec<String> {
+        self.pollers(transport)
+            .into_iter()
+            .filter(|(_, _, placement)| !placement.is_pinned())
+            .map(|(name, what, _)| {
+                format!(
+                    "--cores: {name} is unpinned, but on DPDK it is {what} and busy-polls \
+                     regardless; it will take a full core wherever the scheduler places it. \
+                     Give it a core of its own"
+                )
+            })
+            .collect()
     }
 
     /// Refuse a layout in which threads would starve each other: two
@@ -1128,24 +1160,73 @@ mod tests {
         }
     }
 
+    /// An unpinned NIC poll thread is warned about at boot wherever it
+    /// runs, in one wording for both: the reader on DPDK, and repl-poll in
+    /// queue and port modes. Nothing on kernel TCP, where neither polls a
+    /// NIC, and nothing for repl-poll where it does not run.
+    #[test]
+    fn an_unpinned_poll_thread_is_warned_about_where_it_runs() {
+        let unpinned = parse_cores(&complete("reader=0,repl-poll=0")).expect("parses");
+        let warning = |name: &str, what: &str| {
+            format!(
+                "--cores: {name} is unpinned, but on DPDK it is {what} and busy-polls \
+                 regardless; it will take a full core wherever the scheduler places it. Give it \
+                 a core of its own"
+            )
+        };
+        assert_eq!(
+            unpinned.unpinned_poller_warnings(NodeTransport::Dpdk { repl_poll: true }),
+            [
+                warning("reader", "the NIC poll thread"),
+                warning("repl-poll", "the replication poll thread"),
+            ]
+        );
+        assert_eq!(
+            unpinned.unpinned_poller_warnings(NodeTransport::Dpdk { repl_poll: false }),
+            [warning("reader", "the NIC poll thread")]
+        );
+        assert!(
+            unpinned
+                .unpinned_poller_warnings(NodeTransport::KernelTcp)
+                .is_empty()
+        );
+
+        // Pinned, each says nothing.
+        let repl_poll_unpinned = parse_cores(&complete("reader=4,repl-poll=0")).expect("parses");
+        assert_eq!(
+            repl_poll_unpinned.unpinned_poller_warnings(NodeTransport::Dpdk { repl_poll: true }),
+            [warning("repl-poll", "the replication poll thread")]
+        );
+        let pinned = parse_cores(&complete("reader=4,repl-poll=5")).expect("parses");
+        assert!(
+            pinned
+                .unpinned_poller_warnings(NodeTransport::Dpdk { repl_poll: true })
+                .is_empty()
+        );
+    }
+
     /// Which replication modes run the poll thread: queue and port, not
-    /// shared.
+    /// shared, and none on a node that does not replicate.
     #[test]
     fn node_transport_runs_repl_poll_on_its_own_queue_or_nic() {
+        let queue = ReplicationNic::Queue(melin_dpdk::ReplicationPorts::default());
+        let port = ReplicationNic::Port(melin_dpdk::NicConfig::default());
         assert_eq!(
-            NodeTransport::dpdk(&ReplicationNic::Shared),
+            NodeTransport::dpdk(&ReplicationNic::Shared, true),
             NodeTransport::Dpdk { repl_poll: false }
         );
-        assert_eq!(
-            NodeTransport::dpdk(&ReplicationNic::Queue(
-                melin_dpdk::ReplicationPorts::default()
-            )),
-            NodeTransport::Dpdk { repl_poll: true }
-        );
-        assert_eq!(
-            NodeTransport::dpdk(&ReplicationNic::Port(melin_dpdk::NicConfig::default())),
-            NodeTransport::Dpdk { repl_poll: true }
-        );
+        for split in [&queue, &port] {
+            assert_eq!(
+                NodeTransport::dpdk(split, true),
+                NodeTransport::Dpdk { repl_poll: true },
+                "{split:?}"
+            );
+            assert_eq!(
+                NodeTransport::dpdk(split, false),
+                NodeTransport::Dpdk { repl_poll: false },
+                "{split:?} on a node that does not replicate"
+            );
+        }
     }
 
     /// The disk thread's suffix has to reach the disk thread, and the
