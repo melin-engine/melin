@@ -27,7 +27,10 @@
 #               which needs qemu-user-static, to rehearse the x86_64
 #               build under emulation; slow, and not every kernel runs it)
 #   KEEP=1      leave the containers running afterwards
-# Any other suite setting (THROUGHPUT_CLIENTS, ...) passes through.
+# Any other suite setting (THROUGHPUT_CLIENTS, ...) passes through:
+# TRACE=1 rehearses a traced suite (the traced build, the primary's
+# /stats-dump after each run and its verdict), on kernel TCP, so with
+# no poll loop to summarise.
 
 set -euo pipefail
 

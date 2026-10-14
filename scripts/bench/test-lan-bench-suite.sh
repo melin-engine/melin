@@ -2,8 +2,11 @@
 # Tests for the LAN suite's host-free logic (lib.sh): the health and
 # steering verdicts that decide whether a run passed, the reading of a
 # host's DPDK configuration and whether it can run queue or port mode,
-# the DPDK_REPLICATION setting and the node flags each mode adds, and the
-# node log line the suite waits for.
+# the DPDK_REPLICATION setting and the node flags each mode adds, the
+# node log line the suite waits for, and TRACE=1: the setting, the
+# servers' trace feature, and the verdict on and summary of a traced
+# primary's /stats-dump, with the stage names and format it reads checked
+# against the node's source.
 # The rest of the suite drives hosts and is exercised by running it.
 #
 # Usage: ./scripts/bench/test-lan-bench-suite.sh
@@ -359,6 +362,157 @@ echo "=== the primary's readiness line ==="
 SERVER_RS="${SCRIPT_DIR}/../../crates/core/server-runtime/src/server.rs"
 check "both of the DPDK primary's replication lines carry the text waited for" "2" \
     "$(grep -c "info!(addr = %repl_bind, \"${DPDK_REPLICATION_READY}" "$SERVER_RS")"
+
+echo ""
+echo "=== trace_setting ==="
+check "unset is untraced, as before the setting" "0 0" "$(status trace_setting "")"
+check "0 is untraced" "0 0" "$(status trace_setting 0)"
+check "1 is traced" "0 1" "$(status trace_setting 1)"
+check "anything else is refused, not read as either" \
+    "1 error: TRACE must be 1, or 0 or unset (got 'yes')" "$(status trace_setting yes)"
+
+echo ""
+echo "=== with_trace_feature ==="
+check "untraced, the features are as given" "synthetic-seed" \
+    "$(with_trace_feature synthetic-seed melin-ec-server 0)"
+check "untraced, no features stay none" "" "$(with_trace_feature "" melin-example-echo 0)"
+check "traced, the server's own feature is added" \
+    "melin-example-echo/dpdk,melin-example-echo/latency-trace" \
+    "$(with_trace_feature melin-example-echo/dpdk melin-example-echo 1)"
+check "traced, with no features of its own, the trace feature alone" \
+    "melin-example-notary/latency-trace" "$(with_trace_feature "" melin-example-notary 1)"
+
+echo ""
+echo "=== refuse_untraced_server ==="
+# `metadata <package> <features JSON>`: the part of `cargo metadata
+# --no-deps --format-version 1` the refusal reads, for one package.
+metadata() {
+    printf '{"packages":[{"name":"other","features":{"latency-trace":[]}},{"name":"%s","features":%s}],"workspace_members":[],"version":1}' "$1" "$2"
+}
+check "a server with the feature is built traced" "0 " \
+    "$(status refuse_untraced_server melin-ec-server "$(metadata melin-ec-server '{"default":["hash-chain"],"latency-trace":["melin-server-runtime/latency-trace"]}')")"
+check "a server without it is refused, by package" \
+    "1 error: TRACE=1: melin-example-echo has no latency-trace feature, so its server cannot be built traced (refused rather than run untraced); add one forwarding to melin-server-runtime/latency-trace" \
+    "$(status refuse_untraced_server melin-example-echo "$(metadata melin-example-echo '{"dpdk":[]}')")"
+check "another package's feature does not count" \
+    "1 error: TRACE=1: melin-example-echo has no latency-trace feature, so its server cannot be built traced (refused rather than run untraced); add one forwarding to melin-server-runtime/latency-trace" \
+    "$(status refuse_untraced_server melin-example-echo "$(metadata melin-example-echo '{}')")"
+check "a package not in the workspace is refused" \
+    "1 error: TRACE=1: no package melin-ec-server in its workspace" \
+    "$(status refuse_untraced_server melin-ec-server "$(metadata melin-example-echo '{}')")"
+check "no metadata is refused" \
+    "1 error: TRACE=1: cannot read the features of melin-ec-server (cargo metadata gave no JSON)" \
+    "$(status refuse_untraced_server melin-ec-server "")"
+# This repository's servers, as the suite asks cargo about them: each has
+# the feature, forwarding to the runtime's (a feature that forwarded
+# nowhere would build a server whose dump is empty of stages).
+REPO_METADATA=$(cargo metadata --no-deps --format-version 1 --manifest-path "${SCRIPT_DIR}/../../Cargo.toml")
+for package in melin-example-echo melin-example-notary; do
+    check "${package} is built traced" "0 " "$(status refuse_untraced_server "$package" "$REPO_METADATA")"
+    check "${package}'s trace feature forwards to the runtime's" "melin-server-runtime/latency-trace" \
+        "$(python3 -I -c 'import json, sys; print(*[" ".join(p["features"]["latency-trace"]) for p in json.load(sys.stdin)["packages"] if p["name"] == sys.argv[1]])' "$package" <<< "$REPO_METADATA")"
+done
+
+# `stage <name> <samples> <min> <p50> <p90> <p99> <p99.9> <max>`: one
+# line of a /stats-dump body, as the health endpoint writes it, without
+# its newline.
+stage() {
+    printf 'stage\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$@"
+}
+# `dump <file> <lines...>`: a dump file, under TMP_ROOT, from its lines,
+# each newline-terminated as the endpoint's are; none is an empty body.
+# Prints its path.
+dump() {
+    local file="${TMP_ROOT}/$1"
+    shift
+    : > "$file"
+    (( $# > 0 )) && printf '%s\n' "$@" > "$file"
+    echo "$file"
+}
+# What a traced DPDK primary's dump holds besides its poll loops, in the
+# node's own stage names.
+PIPELINE_STAGES=(
+    "$(stage "journal: disruptor wakeup (publish → journal consume)" 120000 80 410 900 2100 5200 41000)"
+    "$(stage "journal: batch processing (write + sync)" 9000 3000 11000 19000 40000 81000 300000)"
+    "$(stage "matching: execute (dispatch)" 120000 20 60 90 200 900 12000)"
+    "$(stage "dpdk: publish (decode → disruptor publish)" 120000 30 90 150 400 1100 9000)"
+)
+CLIENT_POLL="$(stage "$TRACE_CLIENT_POLL_STAGE" 98000 210 640 1500 4100 9800 52000)"
+REPL_POLL="$(stage "$TRACE_REPL_POLL_STAGE" 41000 180 520 1100 2600 6100 30000)"
+
+echo ""
+echo "=== judge_trace ==="
+check "a shared-mode dump with the client poll loop passes" "0 ok: 5 stages" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}" "$CLIENT_POLL")" dpdk shared)"
+check "a queue-mode dump with both poll loops passes" "0 ok: 6 stages" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}" "$CLIENT_POLL" "$REPL_POLL")" dpdk queue)"
+check "a port-mode dump with both poll loops passes" "0 ok: 6 stages" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}" "$REPL_POLL" "$CLIENT_POLL")" dpdk port)"
+check "a queue-mode dump without the replication poll loop fails" \
+    "1 FAILED: 5 stages; no replication poll loop stage" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}" "$CLIENT_POLL")" dpdk queue)"
+check "a port-mode dump whose replication poll loop recorded nothing fails" \
+    "1 FAILED: 6 stages; the replication poll loop recorded nothing" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}" "$CLIENT_POLL" "$(stage "$TRACE_REPL_POLL_STAGE" 0 0 0 0 0 0 0)")" dpdk port)"
+check "a DPDK dump without the client poll loop fails, naming both missing" \
+    "1 FAILED: 4 stages; no client poll loop stage; no replication poll loop stage" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}")" dpdk queue)"
+check "a kernel dump needs no poll loop" "0 ok: 4 stages" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}")" kernel "")"
+check "an untraced primary's dump fails" \
+    "1 FAILED: the primary was built without latency-trace" \
+    "$(status judge_trace "$(dump d '# latency-trace disabled')" kernel "")"
+check "a dump before any stage registered fails" \
+    "1 FAILED: no stage in the /stats-dump of the primary" \
+    "$(status judge_trace "$(dump d '# no samples')" dpdk shared)"
+check "no answer from the primary fails" \
+    "1 FAILED: no /stats-dump from the primary" \
+    "$(status judge_trace "$(dump d)" dpdk shared)"
+check "a truncated dump says so" "0 ok: 5 stages, 3 more cut off by the endpoint" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}" "$CLIENT_POLL" $'# truncated\t3')" dpdk shared)"
+check "a truncated dump that lost a poll loop fails" \
+    "1 FAILED: 4 stages, 2 more cut off by the endpoint; no client poll loop stage" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}" $'# truncated\t2')" dpdk shared)"
+check "a stage line cut short is not a stage" \
+    "1 FAILED: 4 stages; no client poll loop stage" \
+    "$(status judge_trace "$(dump d "${PIPELINE_STAGES[@]}" $'stage\tdpdk poll: outer iteration (work-iterations only)\t98000\t210')" dpdk shared)"
+
+echo ""
+echo "=== trace_summary ==="
+mkdir -p "${TMP_ROOT}/run"
+SUMMARY_HEADER="run                          loop           iterations    p50 ns    p90 ns    p99 ns  p99.9 ns    max ns"
+dump run/dpdk-queue-throughput.stats "${PIPELINE_STAGES[@]}" "$REPL_POLL" "$CLIENT_POLL" >/dev/null
+dump run/dpdk-shared-throughput.stats "${PIPELINE_STAGES[@]}" "$CLIENT_POLL" >/dev/null
+dump run/kernel-throughput.stats "${PIPELINE_STAGES[@]}" >/dev/null
+dump run/dpdk-port-single.stats >/dev/null
+check "the poll loops side by side, client first, a run without them said so" \
+    "${SUMMARY_HEADER}
+dpdk-queue-throughput        client poll         98000       640      1500      4100      9800     52000
+dpdk-queue-throughput        repl poll           41000       520      1100      2600      6100     30000
+dpdk-shared-throughput       client poll         98000       640      1500      4100      9800     52000
+kernel-throughput            (no DPDK poll loop among its 4 stages)
+dpdk-port-single             (no DPDK poll loop among its 0 stages)" \
+    "$(trace_summary "${TMP_ROOT}/run/dpdk-queue-throughput.stats" "${TMP_ROOT}/run/dpdk-shared-throughput.stats" \
+        "${TMP_ROOT}/run/kernel-throughput.stats" "${TMP_ROOT}/run/dpdk-port-single.stats")"
+
+echo ""
+echo "=== the trace stages read ==="
+# The summary and the verdict find the poll loops by the names the node
+# registers them under.
+RUNTIME_SRC="${SCRIPT_DIR}/../../crates/core/server-runtime/src"
+check "the client poll loop's stage is the node's" "1" \
+    "$(grep -cF "\"${TRACE_CLIENT_POLL_STAGE}\"" "${RUNTIME_SRC}/dpdk_transport.rs")"
+check "the replication poll loop's stage is the node's" "1" \
+    "$(grep -cF "\"${TRACE_REPL_POLL_STAGE}\"" "${RUNTIME_SRC}/dpdk_repl_poll.rs")"
+# And the dump's line as the health endpoint formats it: tab-separated,
+# nine fields, beginning `stage`.
+HEALTH_RS="${SCRIPT_DIR}/../../crates/core/transport-core/src/health.rs"
+check "the dump's line format is the endpoint's" "1" \
+    "$(grep -cF '"stage\t{name}\t{samples}\t{min}\t{p50}\t{p90}\t{p99}\t{p99_9}\t{max}\n"' "$HEALTH_RS")"
+# And its markers, which judge_trace tells apart.
+for marker in '"# latency-trace disabled"' '"# no samples"' '"# truncated\t{}"'; do
+    check "the endpoint writes ${marker}" "1" "$(grep -cF "writeln!(c, ${marker}" "$HEALTH_RS")"
+done
 
 
 echo ""

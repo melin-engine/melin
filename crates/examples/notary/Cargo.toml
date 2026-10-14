@@ -75,3 +75,8 @@ tempfile = "3"
 # `scripts/dpdk/netns-runner.sh` (see `docs/internal/dpdk-testing.md`).
 # Needs libdpdk to build, so never on by default.
 dpdk = ["melin-server-runtime/dpdk", "melin-test-node/dpdk"]
+# The runtime's per-stage latency histograms, served on the health
+# endpoint's `/stats-dump`: what the LAN suite's `TRACE=1` builds the
+# server with. A pure forward. Recording perturbs what it measures, so
+# never on by default.
+latency-trace = ["melin-server-runtime/latency-trace"]

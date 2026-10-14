@@ -51,6 +51,9 @@
 #   # echo on DPDK, replication on the client queue and on its own, side by side:
 #   TRANSPORTS=dpdk DPDK_REPLICATION=shared,queue ./scripts/bench/lan-bench-suite.sh echo ...
 #
+#   # the same again on traced servers, for the poll loops' iteration times:
+#   TRACE=1 TRANSPORTS=dpdk DPDK_REPLICATION=shared,queue ./scripts/bench/lan-bench-suite.sh echo ...
+#
 # Environment:
 #   TRANSPORTS=<list>     comma-separated, or `all` (default: kernel)
 #   WORKLOADS=<list>      comma-separated, or `all` (default: throughput)
@@ -88,8 +91,16 @@
 #                         a build made elsewhere
 #   JOURNAL_DIR           where the nodes journal (default /mnt/journal)
 #   RESULTS_DIR           default bench-results/lan-<app>-<timestamp>
+#                         (lan-<app>-<timestamp>-trace under TRACE=1)
 #   RUST_LOG              the nodes' log filter (default info)
 #   SKIP_REBOOT=1         skip the reboot that follows SR-IOV DPDK runs
+#   TRACE=1               build the servers with their latency-trace
+#                         feature (refused up front for one without), save
+#                         the primary's /stats-dump after each run as
+#                         <run>.stats, and summarise the DPDK poll loops'
+#                         iteration times; tracing perturbs every figure,
+#                         so compare a traced run with traced runs only.
+#                         The load generators are built as without it
 #
 # Local prerequisites: rustup (the hosts' target, x86_64-unknown-linux-gnu
 # on bench hardware, is added if missing), clang, lld, python3, ssh. Remote: server-setup.sh on
@@ -162,28 +173,39 @@ BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"
 ECHO_SIZE="${ECHO_SIZE:-64}"
 EC_ACCOUNTS="${EC_ACCOUNTS:-100000}"
 NODE_RUST_LOG="${RUST_LOG:-info}"
+TRACE_ON=$(trace_setting "${TRACE:-}") || exit 1
+# A traced suite's results are named so, as its figures are perturbed.
+TRACE_SUFFIX=""
+[[ "$TRACE_ON" == 1 ]] && TRACE_SUFFIX=-trace
 
-RESULTS_DIR="${RESULTS_DIR:-${MELIN_REPO}/bench-results/lan-${APP}-$(date +%Y%m%d-%H%M%S)}"
+RESULTS_DIR="${RESULTS_DIR:-${MELIN_REPO}/bench-results/lan-${APP}-$(date +%Y%m%d-%H%M%S)${TRACE_SUFFIX}}"
 mkdir -p "$RESULTS_DIR"
 
 # ---------------------------------------------------------------------------
 # The application profile: which binaries, how they are built, and what
 # a node and the load generator are told beyond what every node is.
 # ---------------------------------------------------------------------------
+# SERVER_PKG is the server binary's package, in SERVER_REPO.
 case "$APP" in
     echo)
+        SERVER_PKG=melin-example-echo
+        SERVER_REPO="$MELIN_REPO"
         SERVER_BIN=echo-server
         BENCH_BIN=melin-bench
         CLIENT_ROLE=writer
         APP_SERVER_ARGS=""
         ;;
     notary)
+        SERVER_PKG=melin-example-notary
+        SERVER_REPO="$MELIN_REPO"
         SERVER_BIN=notary-server
         BENCH_BIN=melin-bench
         CLIENT_ROLE=submitter
         APP_SERVER_ARGS=""
         ;;
     ec)
+        SERVER_PKG=melin-ec-server
+        SERVER_REPO="$EC_REPO"
         SERVER_BIN=melin-ec-server
         BENCH_BIN=melin-ec-bench
         CLIENT_ROLE=trader
@@ -230,6 +252,8 @@ HOSTS=("$SERVER" "$BENCH" "$REPLICA" "$REPLICA2")
 BIN_PATTERN='[m]elin-bench/bin/'
 DPDK_RAN=0
 DEGRADED_RUNS=()
+# Each traced run's dump (TRACE=1), in the order the runs ran.
+STATS_FILES=()
 
 # `sample_metrics <file> <pattern>`: in the background, the primary's
 # /metrics lines matching `pattern` (an extended regex), every second
@@ -239,7 +263,7 @@ DEGRADED_RUNS=()
 # interrupts.
 SAMPLERS=()
 sample_metrics() {
-    rssh "$BENCH" "while :; do echo '# sample'; curl -s --max-time 1 http://${SERVER_VLAN}:${HEALTH_PORT}/metrics | grep -E '$2'; sleep 1; done" > "$1" 2>/dev/null &
+    rssh "$BENCH" "while :; do echo '# sample'; curl -s --max-time 1 ${HEALTH_URL}/metrics | grep -E '$2'; sleep 1; done" > "$1" 2>/dev/null &
     SAMPLERS+=("$!")
 }
 
@@ -318,6 +342,7 @@ echo "=== Melin LAN suite: ${APP} ==="
 echo "  transports: ${RUN_TRANSPORTS[*]}"
 [[ "$NEED_DPDK" == 1 ]] && echo "  dpdk replication: ${DPDK_REPLICATION_MODES[*]}"
 echo "  workloads:  ${REQ_WORKLOADS[*]}"
+[[ "$TRACE_ON" == 1 ]] && echo "  trace:      latency-trace servers (figures perturbed: compare with traced runs only)"
 echo "  results:    ${RESULTS_DIR}"
 echo ""
 
@@ -330,6 +355,16 @@ for tool in clang ld.lld python3 rustup; do
         exit 1
     fi
 done
+# A server without the trace feature is refused before any host is
+# touched: built without it, it would run untraced, and only its dumps
+# would say so, after every run.
+if [[ "$TRACE_ON" == 1 ]]; then
+    if ! metadata=$(cargo metadata --no-deps --format-version 1 --manifest-path "${SERVER_REPO}/Cargo.toml"); then
+        echo "error: TRACE=1: cargo metadata failed in ${SERVER_REPO}" >&2
+        exit 1
+    fi
+    refuse_untraced_server "$SERVER_PKG" "$metadata" || exit 1
+fi
 
 # What gcc on `host` takes `-march=native` to be: the host's CPU by the
 # name LLVM also uses. x86 only: elsewhere gcc names an architecture
@@ -448,15 +483,27 @@ fi
 OUT_DIR="${RESULTS_DIR}/bin"
 mkdir -p "$OUT_DIR"
 
-# `cargo build` in `repo` for the bench hosts. The target directory is
-# the suite's own, so these flags never invalidate a native build.
+# The cargo target directories, under each repository's `target/`: the
+# suite's own, so that these flags never invalidate a native build. A
+# traced server (TRACE=1) is built into one of its own, so that a traced
+# and an untraced invocation never take each other's binary. The load
+# generators are not traced: melin-bench has no trace feature, and the
+# Exchange Core's bench would time its own loop, perturbing the client's
+# figures too, while the suite reads the server's loops. So theirs is
+# the untraced build's.
+BUILD_TARGET=lan-bench
+SERVER_TARGET=lan-bench
+[[ "$TRACE_ON" == 1 ]] && SERVER_TARGET=lan-bench-trace
+
+# `cross_build <repo> <target dir> <cargo args...>`: `cargo build` in
+# `repo` for the bench hosts, into `target/<target dir>`.
 cross_build() {
-    local repo="$1"; shift
+    local repo="$1" target_dir="$2"; shift 2
     local ar=ar
     command -v llvm-ar >/dev/null && ar=llvm-ar
     (
         cd "$repo"
-        export CARGO_TARGET_DIR="${repo}/target/lan-bench"
+        export CARGO_TARGET_DIR="${repo}/target/${target_dir}"
         # Replaces `.cargo/config.toml`'s flags for the target (a set
         # RUSTFLAGS wins over them): its `target-cpu=native` would name
         # this machine.
@@ -477,49 +524,74 @@ cross_build() {
     )
 }
 
-# Copy `bin` out of `repo`'s build as `name`.
+# `take <repo> <target dir> <bin> <name>`: copy `bin` out of `repo`'s
+# build in `target/<target dir>` as `name`.
 take() {
-    local repo="$1" bin="$2" name="$3"
-    cp "${repo}/target/lan-bench/${TARGET}/release/${bin}" "${OUT_DIR}/${name}"
+    local repo="$1" target_dir="$2" bin="$3" name="$4"
+    cp "${repo}/target/${target_dir}/${TARGET}/release/${bin}" "${OUT_DIR}/${name}"
+}
+
+# This repository's server package (echo, notary); none for the
+# Exchange Core's, built from its own.
+APP_PKG=""
+[[ "$SERVER_REPO" == "$MELIN_REPO" ]] && APP_PKG="$SERVER_PKG"
+
+# `build_melin <suffix> <server features> <bench features>`: this
+# repository's server and melin-bench, with the cargo features given
+# (comma-separated `<package>/<feature>`, possibly empty), taken as
+# `<bin><suffix>`. One cargo invocation; under TRACE=1 the server, with
+# its trace feature, gets one of its own, as features unify across an
+# invocation and melin-bench links the examples (and so the runtime):
+# melin-bench is then built exactly as without TRACE=1. The traced
+# server, built alone, then differs from the untraced one by more than
+# the trace feature: it lacks what melin-bench's features unify into
+# their shared dependencies (notary on DPDK: melin-client's dpdk, std
+# on some third-party crates), features which only add code.
+build_melin() {
+    local suffix="$1" server_features bench_features="$3" features
+    server_features=$(with_trace_feature "$2" "$APP_PKG" "$TRACE_ON")
+    if [[ "$TRACE_ON" == 1 ]]; then
+        cross_build "$MELIN_REPO" "$SERVER_TARGET" -p "$APP_PKG" --bin "$SERVER_BIN" --features "$server_features"
+        cross_build "$MELIN_REPO" "$BUILD_TARGET" -p melin-bench --bin melin-bench \
+            ${bench_features:+--features "$bench_features"}
+    else
+        features="${server_features}${server_features:+${bench_features:+,}}${bench_features}"
+        cross_build "$MELIN_REPO" "$BUILD_TARGET" -p "$APP_PKG" --bin "$SERVER_BIN" -p melin-bench --bin melin-bench \
+            ${features:+--features "$features"}
+    fi
+    take "$MELIN_REPO" "$SERVER_TARGET" "$SERVER_BIN" "${SERVER_BIN}${suffix}"
+    take "$MELIN_REPO" "$BUILD_TARGET" melin-bench "melin-bench${suffix}"
 }
 
 echo ""
 echo "=== Building for ${TARGET_CPU} ==="
-case "$APP" in
-    echo) APP_PKG=melin-example-echo ;;
-    notary) APP_PKG=melin-example-notary ;;
-    ec) APP_PKG="" ;;
-esac
 # The kernel melin-bench in every case: it prints the authorized_keys
 # lines, and loads echo and notary over kernel TCP.
 if [[ -n "$APP_PKG" && "$NEED_KERNEL" == 1 ]]; then
-    cross_build "$MELIN_REPO" -p "$APP_PKG" --bin "$SERVER_BIN" -p melin-bench --bin melin-bench
-    take "$MELIN_REPO" "$SERVER_BIN" "$SERVER_BIN"
+    build_melin "" "" ""
 else
-    cross_build "$MELIN_REPO" -p melin-bench --bin melin-bench
+    cross_build "$MELIN_REPO" "$BUILD_TARGET" -p melin-bench --bin melin-bench
+    take "$MELIN_REPO" "$BUILD_TARGET" melin-bench melin-bench
 fi
-take "$MELIN_REPO" melin-bench melin-bench
 if [[ "$APP" == ec ]]; then
     if [[ "$NEED_KERNEL" == 1 ]]; then
-        cross_build "$EC_REPO" -p melin-ec-server --bin melin-ec-server --features synthetic-seed
-        take "$EC_REPO" melin-ec-server melin-ec-server
+        cross_build "$EC_REPO" "$SERVER_TARGET" -p melin-ec-server --bin melin-ec-server \
+            --features "$(with_trace_feature synthetic-seed "$SERVER_PKG" "$TRACE_ON")"
+        take "$EC_REPO" "$SERVER_TARGET" melin-ec-server melin-ec-server
     fi
     # In every case, as melin-bench is: it prints the clients' keys.
-    cross_build "$EC_REPO" -p melin-ec-bench --bin melin-ec-bench
-    take "$EC_REPO" melin-ec-bench melin-ec-bench
+    cross_build "$EC_REPO" "$BUILD_TARGET" -p melin-ec-bench --bin melin-ec-bench
+    take "$EC_REPO" "$BUILD_TARGET" melin-ec-bench melin-ec-bench
 fi
 if [[ "$NEED_DPDK" == 1 ]]; then
     if [[ -n "$APP_PKG" ]]; then
-        cross_build "$MELIN_REPO" -p "$APP_PKG" --bin "$SERVER_BIN" -p melin-bench --bin melin-bench \
-            --features "${APP_PKG}/dpdk,melin-bench/dpdk"
-        take "$MELIN_REPO" "$SERVER_BIN" "${SERVER_BIN}.dpdk"
-        take "$MELIN_REPO" melin-bench melin-bench.dpdk
+        build_melin .dpdk "${APP_PKG}/dpdk" melin-bench/dpdk
     else
-        cross_build "$EC_REPO" -p melin-ec-server --bin melin-ec-server --no-default-features \
-            --features dpdk,hash-chain,release-tracing,synthetic-seed
-        take "$EC_REPO" melin-ec-server melin-ec-server.dpdk
-        cross_build "$EC_REPO" -p melin-ec-bench --bin melin-ec-bench --features dpdk
-        take "$EC_REPO" melin-ec-bench melin-ec-bench.dpdk
+        cross_build "$EC_REPO" "$SERVER_TARGET" -p melin-ec-server --bin melin-ec-server --no-default-features \
+            --features "$(with_trace_feature dpdk,hash-chain,release-tracing,synthetic-seed "$SERVER_PKG" "$TRACE_ON")"
+        take "$EC_REPO" "$SERVER_TARGET" melin-ec-server melin-ec-server.dpdk
+        cross_build "$EC_REPO" "$BUILD_TARGET" -p melin-ec-bench --bin melin-ec-bench --features dpdk
+        take "$EC_REPO" "$BUILD_TARGET" melin-ec-bench melin-ec-bench.dpdk
     fi
 fi
 
@@ -614,10 +686,13 @@ wait_for_log() {
     fi
 }
 
-# The primary's health metrics, from the server host itself (the endpoint
-# is on the private network).
+# The primary's health endpoint, reached from the server host itself (it
+# is on the private network): /metrics, and /stats-dump under TRACE=1.
+HEALTH_URL="http://${SERVER_VLAN}:${HEALTH_PORT}"
+
+# The primary's health metrics.
 metrics() {
-    rssh "$SERVER" "curl -s --max-time 2 http://${SERVER_VLAN}:${HEALTH_PORT}/metrics"
+    rssh "$SERVER" "curl -s --max-time 2 ${HEALTH_URL}/metrics"
 }
 
 # Wait until `expected` replicas are connected and none is catching up.
@@ -855,6 +930,19 @@ run_workload() {
         | tee "${RESULTS_DIR}/${name}.txt" || rc=$?
     stop_samplers
 
+    # The primary's stage histograms, while it still runs: they are its
+    # process's own, cumulative since it started (the cluster's start, the
+    # warm-up and the cool-down included). The replicas' are not taken:
+    # their nodes serve no health endpoint here, and the loops compared
+    # are the primary's. Fetched even when the load generator failed, for
+    # the diagnosis.
+    local stats="${RESULTS_DIR}/${name}.stats"
+    if [[ "$TRACE_ON" == 1 ]]; then
+        # A failed fetch leaves the file empty, which judge_trace reports.
+        rssh "$SERVER" "curl -s --max-time 5 ${HEALTH_URL}/stats-dump" > "$stats" 2>/dev/null || true
+        STATS_FILES+=("$stats")
+    fi
+
     if (( rc != 0 )) || ! rscp "${BENCH}:${BENCH_JSON}" "${RESULTS_DIR}/${name}.json" 2>/dev/null; then
         echo "  FAILED: the load generator exited ${rc}"
         DEGRADED_RUNS+=("${name}: the load generator failed")
@@ -863,6 +951,7 @@ run_workload() {
     judge_run "$name" cluster judge_health "$samples" 2
     [[ "$transport" == dpdk ]] && judge_run "$name" steering judge_steering "$replication" "$queues" \
         "$SERVER_DPDK_PORTS" "$SERVER_DPDK_REPL_PORTS"
+    [[ "$TRACE_ON" == 1 ]] && judge_run "$name" trace judge_trace "$stats" "$transport" "$replication"
     return 0
 }
 
@@ -924,7 +1013,11 @@ fi
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Results (${RESULTS_DIR}) ==="
+if [[ "$TRACE_ON" == 1 ]]; then
+    echo "=== Results (${RESULTS_DIR}), TRACED: latency-trace servers, figures perturbed ==="
+else
+    echo "=== Results (${RESULTS_DIR}) ==="
+fi
 python3 - "$RESULTS_DIR" <<'EOF'
 import glob, json, os, sys
 rows = []
@@ -940,6 +1033,14 @@ if rows:
     for name, tput, *lat in rows:
         print(f"{name:<28} {tput:12.0f} " + " ".join(fmt(v) for v in lat))
 EOF
+
+# The poll loops' iteration times, from each traced run's dump, in the
+# order the runs ran (DPDK modes in DPDK_REPLICATION's order).
+if (( ${#STATS_FILES[@]} > 0 )); then
+    echo ""
+    echo "Poll loops, the iterations that did work (the primary's /stats-dump, <run>.stats):"
+    trace_summary "${STATS_FILES[@]}"
+fi
 
 if [[ ${#DEGRADED_RUNS[@]} -gt 0 ]]; then
     echo ""

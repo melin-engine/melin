@@ -381,6 +381,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   reported as degraded when replication did not move on its own queue
   (queue mode) or NIC (port mode), or its clients' traffic did not on
   theirs. See [docs/benchmarking.md](docs/benchmarking.md).
+- **Traced LAN suite runs.** `TRACE=1` builds the servers with their
+  `latency-trace` feature, apart from untraced builds (a server without
+  the feature is refused up front), saves the primary's `/stats-dump`
+  after each run as `<run>.stats`, and ends the summary with the DPDK
+  poll loops' work-iteration percentiles: the client poll loop's, and in
+  queue and port modes the replication poll loop's, side by side. A
+  traced run lacking its dump, or on DPDK its poll loops' stages, does
+  not pass. Tracing perturbs the figures, so the results directory takes
+  a `-trace` suffix and the summary's header says so. The echo and notary
+  examples gain a `latency-trace` feature, forwarding to the runtime's.
+  See [docs/benchmarking.md](docs/benchmarking.md#traced-runs).
 - **`scripts/dpdk/dpdk-setup.sh` sets up a second mlx5 port for
   replication.** Given `DPDK_REPL_NIC` and `DPDK_REPL_IP` (or
   `--repl-nic` and `--repl-ip`), it refuses a port carrying the default

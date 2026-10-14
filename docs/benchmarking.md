@@ -159,7 +159,9 @@ kernel TCP, with short phases: the sysroot, the build, the deployment,
 the cluster's start and the health verdict all run as they would on
 bench hosts. The containers use your machine's architecture, so on an
 ARM machine the build is for ARM rather than x86_64. The figures it
-prints measure nothing, and it does not exercise DPDK.
+prints measure nothing, and it does not exercise DPDK. Suite settings
+pass through: `TRACE=1` rehearses a traced suite (the traced build, the
+dumps and their verdict) on kernel TCP.
 
 ## Results
 
@@ -174,6 +176,8 @@ on DPDK, so that the summary lists the replication modes side by side):
   from the load-generating host;
 - `<run>.queues` (DPDK only): the primary's packet counts per NIC port
   and queue, received and sent, sampled every second alike;
+- `<run>.stats` (`TRACE=1` only): the primary's per-stage latency
+  histograms, see [Traced runs](#traced-runs);
 - `<run>.primary.log`, `.replica1.log` and `.replica2.log`: each node's
   log.
 
@@ -208,3 +212,55 @@ nothing to steer, and the counts are kept for reading only.
 After a run on SR-IOV the hosts are rebooted, to release the NIC's
 virtual functions before the kernel transport uses it again; set
 `SKIP_REBOOT=1` when chaining DPDK runs.
+
+## Traced runs
+
+`TRACE=1` builds the servers with per-stage latency histograms (each
+application server's `latency-trace` feature: the echo and notary
+examples', and the Exchange Core's), to see where a node spends its
+time: in particular how long the DPDK poll loops take per iteration,
+with replication on the client poll loop (`shared`) and on a loop of its
+own (`queue`, `port`). A server whose build has no such feature is
+refused before the suite touches a host, rather than run untraced. The
+load generator is built as without `TRACE=1`. `TRACE` must be `1`, `0`
+or unset: any other value (`true`, a typo, or a `TRACE` another tool
+left in the shell) stops the suite before it builds anything, rather
+than guess which was meant.
+
+**Tracing perturbs every figure.** Each recorded stage takes a clock
+read and a histogram update on its hot path, so a traced run's
+throughput and latencies are not those of the same build untraced.
+Compare a traced run with traced runs only: the results directory is
+named `lan-<app>-<timestamp>-trace` (unless `RESULTS_DIR` is set), and
+the summary's header says `TRACED`. Run the suite twice, untraced for
+the figures and traced for the breakdown, as in:
+
+```sh
+TRANSPORTS=dpdk DPDK_REPLICATION=shared,queue ./scripts/bench/lan-bench-suite.sh echo ...
+TRACE=1 TRANSPORTS=dpdk DPDK_REPLICATION=shared,queue ./scripts/bench/lan-bench-suite.sh echo ...
+```
+
+After each run, while the cluster still runs, the suite saves the
+primary's histograms, read from its health endpoint's `/stats-dump`, as
+`<run>.stats`: one line per stage, tab-separated, `stage`, the stage's
+name, its sample count, then its minimum, p50, p90, p99, p99.9 and
+maximum in nanoseconds. They cover the primary's whole life: the
+cluster's start, the warm-up and the cool-down are in them as well as
+the measured phase. The replicas' are not taken.
+
+A traced run does not pass, and the suite exits non-zero, when the
+primary's dump is missing or comes from an untraced build, or, on DPDK,
+when it lacks the client poll loop's stage, or in `queue` and `port`
+modes the replication poll loop's, or one of them recorded nothing: the
+run then did not measure what it was traced for.
+
+The summary ends with the poll loops, one line per loop per run: the
+client poll loop's and, in `queue` and `port` modes, the replication
+poll loop's (`repl poll`), each over the iterations that did work (an
+idle pass of a busy-polling loop is not counted), with their count and
+percentiles in nanoseconds. In `shared` mode the client poll loop
+carries replication too, so its line is the one to compare with the
+client poll line of the `queue` and `port` runs; the `repl poll` line
+is what replication costs on its own loop. A kernel TCP run has no poll
+loop, and the summary says so; its dump is in `<run>.stats` all the
+same.
