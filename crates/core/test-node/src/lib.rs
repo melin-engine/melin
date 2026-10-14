@@ -33,6 +33,10 @@
 //! process-wide EAL as the nodes. The peer MAC is the test's to pass
 //! (`mac_of`), as a replica's is the launcher's.
 //!
+//! A test of what a process owning its EAL does, as a deployed node does,
+//! takes EAL arguments for node slots' devices (`dpdk_slots_eal_args`) and
+//! brings its NICs up itself, in a test binary that starts no node.
+//!
 //! See `docs/internal/dpdk-testing.md`.
 
 #[cfg(any(test, feature = "dpdk"))]
@@ -132,25 +136,53 @@ pub fn local_ip() -> IpAddr {
     }
 }
 
-/// Where a client on DPDK sits on the runner's network: its own veth
-/// pair, apart from the node slots ([`dpdk_client`]).
+/// Where a DPDK NIC sits on the runner's network: a veth pair of its own.
+/// A client's, apart from the node slots ([`dpdk_client`]), or a node
+/// slot's, for a test that brings its NICs up itself ([`dpdk_slot`]).
 #[cfg(feature = "dpdk")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DpdkClient {
-    /// The IP the client's NIC takes ([`open_dpdk_client`] sets it).
+pub struct DpdkSeat {
+    /// The IP the NIC takes ([`open_dpdk_client`] sets it for the
+    /// client).
     pub ip: std::net::Ipv4Addr,
-    /// The MAC of the client's interface, which its DPDK port takes.
+    /// The MAC of the seat's interface, which its DPDK port takes.
     pub mac: [u8; 6],
-    /// The width of the runner's network, which the client's NIC takes
-    /// with its IP. `u8`, as `NicConfig::prefix_len` is.
+    /// The width of the runner's network, which the NIC takes with its
+    /// IP. `u8`, as `NicConfig::prefix_len` is.
     pub prefix_len: u8,
 }
 
 /// The runner's seat for a client on DPDK. Panics when the process is not
 /// under the runner, or under one that builds no such seat.
 #[cfg(feature = "dpdk")]
-pub fn dpdk_client() -> DpdkClient {
+pub fn dpdk_client() -> DpdkSeat {
     dpdk::client()
+}
+
+/// Node slot `slot`'s seat, for a test that brings DPDK NICs up itself on
+/// the slots' devices, in a process owning its EAL
+/// ([`dpdk_slots_eal_args`]), rather than starting nodes on them. Panics
+/// when the process is not under the runner, or past the last slot.
+#[cfg(feature = "dpdk")]
+pub fn dpdk_slot(slot: usize) -> DpdkSeat {
+    dpdk::slot_seat(slot)
+}
+
+/// EAL arguments for this process to initialize EAL itself, with node
+/// slots `slots`' af_packet devices as its ports: port `i` is
+/// `slots[i]`'s. The launcher's arguments otherwise (no hugepages, no PCI
+/// scan, the main lcore on the first CPU this process may use). For a test
+/// of what a process owning its EAL does, as a deployed node does, such as
+/// bringing up several NICs on it.
+///
+/// Such a process cannot also share the launcher's process-wide EAL (EAL
+/// initializes once per process), so it starts no node and opens no
+/// client NIC through this crate: panics if it already has, and makes a
+/// later attempt panic. Panics too when the process is not under the
+/// runner.
+#[cfg(feature = "dpdk")]
+pub fn dpdk_slots_eal_args(slots: &[usize]) -> Vec<String> {
+    dpdk::slots_eal_args(slots)
 }
 
 /// The MAC behind `addr`'s IP on the runner's network: a node's (from
@@ -462,7 +494,7 @@ mod dpdk {
     use melin_server_runtime::server::{self, ServerConfig};
 
     use super::layout::{self, Layout};
-    use super::{Addrs, DpdkClient, Node};
+    use super::{Addrs, DpdkSeat, Node};
 
     /// How long a clean shutdown may take.
     const SHUTDOWN_LIMIT: Duration = Duration::from_secs(20);
@@ -582,6 +614,12 @@ mod dpdk {
         if let Some(init) = Eal::process_wide() {
             return init.unwrap_or_else(|e| panic!("initialize the process-wide EAL: {e}"));
         }
+        assert!(
+            !OWN_EAL_HANDED_OUT.load(Ordering::Relaxed),
+            "this process initializes EAL itself (dpdk_slots_eal_args), so it cannot share the \
+             launcher's process-wide EAL too: start nodes and open the DPDK client in a test \
+             binary of their own"
+        );
         let args = layout::eal_args(first_allowed_cpu());
         let init = std::thread::Builder::new()
             .name("eal-init".into())
@@ -614,13 +652,42 @@ mod dpdk {
         layout().dpdk_client().unwrap_or_else(|e| panic!("{e}"))
     }
 
-    pub(super) fn client() -> DpdkClient {
-        let seat = client_seat();
-        DpdkClient {
+    fn seat(seat: &layout::Slot) -> DpdkSeat {
+        DpdkSeat {
             ip: seat.ip,
             mac: mac_bytes(&seat.mac),
             prefix_len: layout().prefix_len,
         }
+    }
+
+    pub(super) fn client() -> DpdkSeat {
+        seat(client_seat())
+    }
+
+    pub(super) fn slot_seat(slot: usize) -> DpdkSeat {
+        seat(layout().slot(slot))
+    }
+
+    /// Whether this process has been given EAL arguments to initialize EAL
+    /// itself ([`slots_eal_args`]), and so must never initialize the
+    /// process-wide one ([`eal`]). Never cleared: EAL initializes once per
+    /// process.
+    static OWN_EAL_HANDED_OUT: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn slots_eal_args(slots: &[usize]) -> Vec<String> {
+        assert!(
+            Eal::process_wide().is_none(),
+            "this process shares the launcher's process-wide EAL (it started a node or opened \
+             the DPDK client), so it cannot initialize EAL itself: run the test in a binary of \
+             its own"
+        );
+        OWN_EAL_HANDED_OUT.store(true, Ordering::Relaxed);
+        // A `Vec`, in the slots' order, which is their ports' order.
+        let devices: Vec<(String, String)> = slots
+            .iter()
+            .map(|&slot| layout::vdev(slot, &layout().slot(slot).iface))
+            .collect();
+        layout::own_eal_args(first_allowed_cpu(), &devices)
     }
 
     pub(super) fn client_process_eal_args(file_prefix: &str) -> Vec<String> {

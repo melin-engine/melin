@@ -9,8 +9,9 @@
 //! Two ways to hold it:
 //!
 //! - [`Eal::init`]: the node initializes EAL for itself and cleans it up
-//!   when it is done. One node per process, which is how a node is
-//!   deployed.
+//!   when it is done, after the last of its NIC groups (its client NIC,
+//!   and a replication NIC of its own if it has one: see `NodeNics`). One
+//!   node per process, which is how a node is deployed.
 //! - [`Eal::init_process_wide`]: initialized once for the whole process
 //!   and never cleaned up, so the process can host several nodes, one
 //!   after another or at once, each on a port of its own. A node started

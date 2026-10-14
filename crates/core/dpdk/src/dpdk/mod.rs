@@ -11,7 +11,7 @@ pub use mempool::{Mempool, MempoolError};
 pub use nic_handle::{NextHop, NicClock, NicHandle, NicStream, StreamId};
 pub use port::{Port, PortError};
 pub use smoltcp::iface::SocketHandle;
-pub use transport::{AcceptedConnection, DpdkShared, DpdkTransport, MAX_CONNECTIONS};
+pub use transport::{AcceptedConnection, DpdkShared, DpdkTransport, MAX_CONNECTIONS, NodeNics};
 
 // MAC parsing lives in `crate::mac`, outside the `dpdk-sys` gate, and is
 // re-exported from the crate root — so `melin_dpdk::parse_mac` still

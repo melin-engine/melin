@@ -14,9 +14,10 @@ use smoltcp::socket::tcp::{self, OpaqueFrameHandle, State};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-use crate::config::NicConfig;
+use crate::config::{NicConfig, ReplicationNic};
 use crate::device::DpdkDevice;
 use crate::eal::Eal;
+use crate::eal_sharing::{EalGroup, OnEal};
 use crate::mempool::Mempool;
 use crate::peer_liveness::{self, PeerLiveness, StackClock};
 use crate::port::{ChecksumOffloads, Port};
@@ -174,17 +175,19 @@ struct ListenerEntry {
     dispatch_burst_limit: usize,
 }
 
-/// Shared DPDK resources created once and shared across all poll threads.
+/// A NIC group: the ports of one NIC (one port, or an LACP bond's), the
+/// mbuf pool on their NUMA node, and the MAC every interface on them
+/// takes, created once and shared across the poll threads of its queues.
 ///
-/// Fields are ordered so that DPDK resources are dropped before EAL
-/// cleanup: ports → mempool → EAL. Rust drops fields in declaration
-/// order, and `rte_mempool_free` requires EAL to still be alive.
+/// It sits on an EAL it shares with every other group of the process
+/// built on it (see [`NodeNics`]), and holds its share of it: the ports
+/// and the pool are released first, ports then pool (`rte_mempool_free`
+/// requires EAL alive, and a port's queues hold the pool's mbufs), and
+/// an EAL the node owns is cleaned up when the last group on it drops.
 ///
 /// Held via `Arc` — the last poll thread to exit drops these resources.
 pub struct DpdkShared {
-    _ports: Vec<Port>,
-    _mempool: Mempool,
-    _eal: NodeEal,
+    _nic: OnEal<NicResources, NodeEal>,
     /// Intersection of all ports' checksum offload capabilities.
     pub offloads: ChecksumOffloads,
     /// MAC address of the first port (used for all smoltcp interfaces).
@@ -203,6 +206,72 @@ pub struct DpdkShared {
 unsafe impl Send for DpdkShared {}
 unsafe impl Sync for DpdkShared {}
 
+/// What a NIC group releases before its share of the EAL: its ports,
+/// then its pool (fields drop in declaration order).
+struct NicResources {
+    _ports: Vec<Port>,
+    _mempool: Mempool,
+}
+
+/// A node's NIC groups, all on one EAL: the client NIC's, and, when its
+/// replication has a NIC of its own ([`ReplicationNic::Port`]), that
+/// NIC's.
+///
+/// Each group has its own ports, its own mbuf pool on its own NUMA node,
+/// its own MAC and offloads, and its own queue count. The EAL is shared:
+/// acquired once, from the client NIC's EAL arguments, which must allow
+/// both NICs' devices (both PCI addresses, or both virtual devices), and,
+/// when the node owns it, cleaned up after the last group drops, whichever
+/// that is.
+pub struct NodeNics {
+    /// The client NIC's group, with the node's queue count
+    /// ([`DpdkConfig::num_queues`]): what [`DpdkShared::init`] brings up.
+    /// In [`ReplicationNic::Shared`] and [`ReplicationNic::Queue`] modes,
+    /// replication runs on it too.
+    pub client: Arc<DpdkShared>,
+    /// The replication NIC's group in [`ReplicationNic::Port`] mode, with
+    /// one queue (its one poll thread); `None` in the other modes.
+    pub replication: Option<Arc<DpdkShared>>,
+}
+
+impl NodeNics {
+    /// Bring up the NIC groups `config` asks for on one EAL: initialized
+    /// from the client NIC's EAL arguments, or, in a process that runs a
+    /// process-wide EAL, that one, shared, as [`DpdkShared::init`] does.
+    ///
+    /// A replication NIC is refused before EAL is touched when it names
+    /// EAL arguments other than the client NIC's (they could only be
+    /// ignored) or a port of the client NIC's.
+    pub fn init(config: &DpdkConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let replication_nic = match &config.replication {
+            ReplicationNic::Shared | ReplicationNic::Queue => None,
+            ReplicationNic::Port(nic) => {
+                crate::eal_sharing::check_further_group(&config.nic, nic)?;
+                Some(nic)
+            }
+        };
+        let eal = Arc::new(NodeEal::acquire(&config.nic)?);
+        // The client group first, as `DpdkShared::init` brings it up: it
+        // keeps the pool name of a node with one NIC. Should the
+        // replication group then fail, the client group drops here and
+        // with it the EAL, last.
+        let client = DpdkShared::init_on(
+            Arc::clone(&eal),
+            EalGroup::First,
+            &config.nic,
+            config.num_queues,
+        )?;
+        let replication = replication_nic
+            .map(|nic| DpdkShared::init_on(eal, EalGroup::Further, nic, 1))
+            .transpose()
+            .map_err(|e| format!("replication NIC: {e}"))?;
+        Ok(NodeNics {
+            client,
+            replication,
+        })
+    }
+}
+
 /// The EAL a node's resources sit on.
 ///
 /// An enum rather than always borrowing a process-wide EAL: a node that
@@ -210,7 +279,8 @@ unsafe impl Sync for DpdkShared {}
 /// that a deployed node's teardown is the one it has always had.
 pub(crate) enum NodeEal {
     /// Initialized for this node from its EAL arguments and cleaned up
-    /// when the node's resources drop: one node per process, as deployed.
+    /// when the last of the node's NIC groups drops: one node per process,
+    /// as deployed.
     Own(Eal),
     /// The process-wide EAL ([`Eal::init_process_wide`]), shared with the
     /// process's other nodes. Dropping the node leaves it be: it is never
@@ -365,7 +435,7 @@ impl TxQueue {
 }
 
 impl DpdkShared {
-    /// Initialize shared DPDK resources: EAL, mempool, ports.
+    /// Initialize the node's client NIC group: EAL, mempool, ports.
     /// Call once before spawning poll threads.
     ///
     /// EAL is initialized here from `config.nic.eal_args`, and cleaned up
@@ -373,25 +443,30 @@ impl DpdkShared {
     /// ([`Eal::init_process_wide`]), which the node then shares: its EAL
     /// arguments must be empty, its ports must be its own, and dropping it
     /// leaves EAL running for the process's other nodes.
+    ///
+    /// The client NIC only, whatever `config.replication` says:
+    /// [`NodeNics::init`] brings up a replication NIC of its own beside it.
     pub fn init(config: &DpdkConfig) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        Self::init_nic(&config.nic, config.num_queues)
+        Self::init_on(
+            Arc::new(NodeEal::acquire(&config.nic)?),
+            EalGroup::First,
+            &config.nic,
+            config.num_queues,
+        )
     }
 
-    /// [`Self::init`] from the NIC's configuration and a queue count: all
-    /// it takes of a node's configuration, so a transport that is not a
-    /// node's can bring its NIC up the same way.
-    pub(crate) fn init_nic(
-        config: &NicConfig,
-        num_queues: u16,
-    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        Self::init_on(NodeEal::acquire(config)?, config, num_queues)
-    }
-
-    /// [`Self::init_nic`] on an EAL already acquired, so a caller can tell
-    /// a failure to bring EAL up from a failure of the NIC on it (the
-    /// client's NIC handle names its file prefix for the first).
+    /// The NIC group for `config` with `num_queues` queue pairs, on an EAL
+    /// already acquired: shared with the other groups on it, and taken
+    /// apart from the group so that a caller can tell a failure to bring
+    /// EAL up from a failure of the NIC on it (the client's NIC handle
+    /// names its file prefix for the first). `group` says whether it is
+    /// the EAL's first group, which decides its pool's name.
+    ///
+    /// On failure, whatever the group had set up is released before its
+    /// share of `eal`: function parameters drop after the body's locals.
     pub(crate) fn init_on(
-        eal: NodeEal,
+        eal: Arc<NodeEal>,
+        group: EalGroup,
         config: &NicConfig,
         num_queues: u16,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
@@ -432,7 +507,8 @@ impl DpdkShared {
         let num_mbufs: u32 =
             8192 * (config.port_ids.len() as u32).max(1) * (num_queues as u32).max(1);
         let pool_name = crate::eal_sharing::mempool_name(
-            matches!(eal, NodeEal::ProcessWide(_)),
+            matches!(*eal, NodeEal::ProcessWide(_)),
+            group,
             config.port_ids[0],
         );
         let mempool = if config.mtu > 1500 {
@@ -476,9 +552,13 @@ impl DpdkShared {
         let actual_queues = ports[0].num_queues;
 
         Ok(Arc::new(DpdkShared {
-            _ports: ports,
-            _mempool: mempool,
-            _eal: eal,
+            _nic: OnEal::new(
+                NicResources {
+                    _ports: ports,
+                    _mempool: mempool,
+                },
+                eal,
+            ),
             offloads,
             mac,
             mempool_raw,
@@ -1456,5 +1536,42 @@ mod tests {
         let seeded = Instant::from_millis(600_000);
         assert!(gateway_reseed_due(Instant::from_millis(599_999), seeded));
         assert!(gateway_reseed_due(Instant::from_millis(0), seeded));
+    }
+
+    /// A replication NIC that cannot sit beside the client NIC is refused
+    /// before EAL is touched: this test initializes no EAL, so an attempt
+    /// to would fail it with EAL's error rather than this one.
+    #[test]
+    fn a_replication_nic_that_cannot_share_the_eal_is_refused_before_eal_init() {
+        let client = NicConfig {
+            eal_args: vec!["--this-is-not-an-eal-flag".into()],
+            port_ids: vec![0],
+            ..NicConfig::default()
+        };
+        let config = |replication: NicConfig| DpdkConfig {
+            nic: client.clone(),
+            replication: ReplicationNic::Port(replication),
+            ..DpdkConfig::default()
+        };
+        let refused = |config: DpdkConfig| match NodeNics::init(&config) {
+            Ok(_) => panic!("refused"),
+            Err(e) => e.to_string(),
+        };
+
+        let shared_port = refused(config(NicConfig {
+            port_ids: vec![1, 0],
+            ..client.clone()
+        }));
+        assert!(
+            shared_port.contains("port 0 is in both NICs"),
+            "{shared_port}"
+        );
+
+        let own_eal_args = refused(config(NicConfig {
+            eal_args: vec!["-l".into(), "2".into()],
+            port_ids: vec![1],
+            ..client.clone()
+        }));
+        assert!(own_eal_args.contains("(-l 2)"), "{own_eal_args}");
     }
 }

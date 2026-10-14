@@ -214,6 +214,18 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `shm-proxy` and `melin-bench` share it.
 - **`ByteStream` is implemented for `&mut S`** where `S: ByteStream`, so
   a caller holding its streams in a collection lends one per call.
+- **`melin_dpdk::NodeNics`**: a node's DPDK NIC groups on one EAL, the
+  client NIC's and, when `DpdkConfig::replication` is `Port`, a
+  replication NIC's beside it, each with its own ports, mbuf pool on its
+  own NUMA node, MAC and queue count (`NodeNics::init`). The EAL is
+  acquired once, from the client NIC's arguments, which must allow both
+  NICs' devices, and an EAL the node owns is cleaned up after the last
+  group drops. A replication NIC with other EAL arguments or a port of the
+  client NIC's is refused before EAL init, the port overlap by the new
+  `NicConfig::port_shared_with`, which the node's
+  `--dpdk-replication-ports` check now uses too. Groundwork for
+  replication on a NIC of its own: no node runs it yet, and
+  `DpdkShared::init` still brings up the client NIC alone, as before.
 
 ### Changed
 

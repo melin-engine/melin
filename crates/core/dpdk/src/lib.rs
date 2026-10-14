@@ -43,8 +43,9 @@ pub use mac::{
 // stack is decided from offload flags and frame bytes alone, so the
 // policy is tested on any host, with or without libdpdk.
 pub mod rx_checksum;
-// Ungated for the same reason: what a node does differently on a
-// process-wide EAL is decided from its configuration alone.
+// Ungated for the same reason: what a NIC group does differently on an
+// EAL it shares (the process-wide one, or its node's other group's) is
+// decided from its configuration alone.
 mod eal_sharing;
 // Ungated for the same reason: when a long-lived link's peer counts as
 // gone is TCP-stack logic, tested over an in-memory wire.

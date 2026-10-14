@@ -293,17 +293,29 @@ pub fn client_vdev(iface: &str) -> (String, String) {
     (CLIENT_VDEV.to_owned(), format!("iface={iface}"))
 }
 
+/// EAL arguments for a process that initializes EAL itself rather than
+/// sharing the launcher's: the launcher's own ([`eal_args`]) and
+/// `devices` (each a name and its driver arguments, from [`vdev`] or
+/// [`client_vdev`]), allowed at init, so that their ports are numbered
+/// from 0 in the order given.
+pub fn own_eal_args(cpu: usize, devices: &[(String, String)]) -> Vec<String> {
+    let mut args = eal_args(cpu);
+    args.extend(
+        devices
+            .iter()
+            .map(|(device, device_args)| format!("--vdev={device},{device_args}")),
+    );
+    args
+}
+
 /// EAL arguments for a process of its own on the DPDK client's pair: a
 /// sidecar a test runs as a child (the shm-proxy), which initializes EAL
-/// itself where the test process shares the launcher's. The launcher's
-/// own ([`eal_args`]), the client's af_packet device on `iface`
-/// ([`client_vdev`]) as the process's one port, and `file_prefix`, so
-/// that its EAL's runtime files stay apart from the test process's in the
-/// runner's private `/var/run`.
+/// itself where the test process shares the launcher's. [`own_eal_args`]
+/// with the client's af_packet device on `iface` ([`client_vdev`]) as the
+/// process's one port, and `file_prefix`, so that its EAL's runtime files
+/// stay apart from the test process's in the runner's private `/var/run`.
 pub fn client_process_eal_args(cpu: usize, iface: &str, file_prefix: &str) -> Vec<String> {
-    let (device, device_args) = client_vdev(iface);
-    let mut args = eal_args(cpu);
-    args.push(format!("--vdev={device},{device_args}"));
+    let mut args = own_eal_args(cpu, &[client_vdev(iface)]);
     args.extend(["--file-prefix".to_owned(), file_prefix.to_owned()]);
     args
 }
@@ -561,6 +573,18 @@ mod tests {
         for index in [0, 1, 2, 9, 10, 255] {
             assert_ne!(vdev(index, "dpdkc").0, name);
         }
+    }
+
+    /// A process owning its EAL with node slots' devices: each allowed at
+    /// init, in the order given, which is the order of their ports.
+    #[test]
+    fn an_owned_eal_allows_the_devices_in_order() {
+        assert_eq!(
+            own_eal_args(3, &[vdev(1, "dpdk1"), vdev(0, "dpdk0")]).join(" "),
+            "--no-huge -m 512 --no-pci -l 3 --vdev=net_af_packet1,iface=dpdk1 \
+             --vdev=net_af_packet0,iface=dpdk0"
+        );
+        assert_eq!(own_eal_args(3, &[]), eal_args(3));
     }
 
     /// A process of its own on the client pair: the launcher's arguments,

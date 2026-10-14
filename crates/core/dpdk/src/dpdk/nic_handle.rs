@@ -18,6 +18,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use smoltcp::iface::SocketHandle;
@@ -25,6 +26,7 @@ use smoltcp::time::Instant;
 
 use crate::config::{DpdkConfig, NicConfig};
 use crate::eal::Eal;
+use crate::eal_sharing::EalGroup;
 use crate::mac::{MacAddr, PeerMacSource, fmt_mac, resolve_peer_mac};
 use crate::nic::{
     self, DialProgress, LocalPorts, StackTime, dial_error, dial_progress, wait_for_dial,
@@ -180,8 +182,8 @@ impl NicHandle {
         let eal = NodeEal::acquire(&config).map_err(|e| {
             io::Error::other(nic::eal_init_failed(&config.eal_args, shared_eal, &e))
         })?;
-        let shared =
-            DpdkShared::init_on(eal, &config, 1).map_err(|e| io::Error::other(e.to_string()))?;
+        let shared = DpdkShared::init_on(Arc::new(eal), EalGroup::First, &config, 1)
+            .map_err(|e| io::Error::other(e.to_string()))?;
         let gateway = config.gateway.zip(config.gateway_mac);
         let peer_mac = config.peer_mac;
         let ip_addr = config.ip_addr;
