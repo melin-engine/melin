@@ -428,7 +428,9 @@ What was built (`server.rs`):
   function both call (`journal_promotion_epoch_bump`), so the two
   transports mint and order it the same way: after the pipeline is up,
   before `on_primary`, before the first client or replica is served.
-- **The replica's transport, reused.** The receiver borrows the queue-0
+- **The replica's transport, reused** (shared mode; in queue and port
+  modes the receiver runs on a transport of its own, see "Replication on
+  a queue or a NIC of its own" below). The receiver borrows the queue-0
   transport rather than consuming it, and resets every link it opened
   before it returns. The replica builds that transport with no listener
   (`DpdkTransport::from_shared_unlistening`), where it used to listen on a
@@ -455,7 +457,9 @@ What was built (`server.rs`):
   transport. On kernel TCP its listener is bound from boot, so a connect
   completes in the kernel's backlog and is served if the node is promoted
   while it waits; on DPDK there is no listener until the promotion, so a
-  connect is refused. Clients retry either way.
+  connect is refused (in shared mode: in queue and port modes nothing
+  polls the client queue until then, and a connect goes unanswered).
+  Clients retry either way.
 
 The normal DPDK primary startup behaves as before, with two changes of
 order, neither visible to a client or replica: the admin endpoint is
@@ -491,3 +495,179 @@ revived ex-primary fenced), and `replicated_failover` (an auto-promotion
 after the primary is cut off, every event acknowledged under `ram`
 present on the new primary). `dpdk_veth`'s
 `a_replica_refuses_clients_until_promoted` pins the refused connect.
+
+## Replication on a queue or a NIC of its own
+
+The problem: in the shared mode above, one poll thread serves the
+client queue and drives replication, and replication's work sits in the
+client loop's iterations (accepts by listen port, a `tick` mid-loop
+every `POLL_EVERY_N_CONNS` connections and another at the end of each
+iteration). Under client load the replica's stream waits for the loop,
+and the loop for the stream. The plan, with what each step found:
+[dpdk-replication-split-2026-10.md](dpdk-replication-split-2026-10.md).
+The operator view (modes, flags, costs) is in `docs/replication.md`
+("Replication on its own queue or NIC") and `docs/deployment.md`.
+
+### Configuration
+
+`ReplicationNic` (`melin-dpdk`'s config, plain data outside the
+`dpdk-sys` gate) is `Shared`, `Queue(ReplicationPorts)` or
+`Port(NicConfig)`. The node's `--dpdk-replication-*` flags
+(`DpdkReplicationArgs`, node-only, not in `DpdkArgs`, which clients
+flatten too) map onto it in `dpdk_replication_args.rs`, which refuses a
+contradictory set; `dpdk_config_from` then builds the client NIC's
+steering plan once, so that a queue-mode node with nothing to steer, or
+with its replication port equal to its client port, is refused before
+EAL init. A port-mode NIC is a struct literal of the client NIC's fields
+bar ports, address and peer MAC, so a field `NicConfig` gains must be
+decided there. `NodeTransport::dpdk` turns the mode and
+`--replication-bind` into whether `repl-poll` runs, for `--cores`.
+
+### Threads and transports
+
+| Mode | Client poll thread (`reader`) | Replication poll thread (`repl-poll`) |
+|---|---|---|
+| shared | client NIC queue 0: clients, the driver, the clock ticks | not spawned |
+| queue | client NIC queue 0: clients, the clock ticks | client NIC queue 1: the driver |
+| port | client NIC queue 0: clients, the clock ticks | replication NIC queue 0: the driver |
+
+- **One EAL, several NIC groups.** `NodeNics::init` acquires the EAL
+  once, from the client NIC's arguments, and brings up the client group
+  and, in port mode, the replication group: each with its own ports,
+  mbuf pool on its own NUMA node, MAC, queue count and steering plan
+  (the replication NIC takes one queue pair). The EAL is cleaned up
+  after the last group drops.
+- **The seat.** `ReplicationNicSeat::of` names where replication runs:
+  the client group's queue 1 in queue mode, the replication group's
+  queue 0 (announced with a gratuitous ARP, as its MAC is new to the
+  switch) in port mode, nothing in shared mode.
+- **`repl-poll`** (`dpdk_repl_poll.rs`) pins itself, registers with EAL
+  as an lcore (`DpdkShared::register_thread`), so that its mbufs go
+  through a mempool cache rather than the pool's ring, builds its own
+  transport on the seat on its own thread (a transport never crosses
+  threads), adds the replication listener, reports ready, and loops:
+  poll, hand accepts to the driver, `tick`. On shutdown it calls
+  `close_all_links`. A panic on it sets the node's shutdown, as one in
+  the driver ends the client poll thread in shared mode: the node must
+  not serve clients with no replication behind them. Registration turns
+  DPDK multi-process off (`rte_mp_disable`); it fails with `EINVAL` when
+  a secondary process is already attached, and the thread then runs
+  without the cache, with a warning.
+- **What did not move.** The driver is the shared mode's
+  (`DpdkReplicationDriver`), handed to the thread instead of to
+  `run_dpdk_poll`, which gets `repl_driver: None`. It is the replication
+  ring's one consumer either way; acks reach the response stage's gate
+  through the slot cursors, atomics, which a third thread reads no
+  differently from a second. The clock ticks stay on the client poll
+  thread, so the input ring keeps one producer.
+- **Observability.** Each queue's poll thread counts the packets it
+  takes off and puts on its queue at the burst (`QueueCounters`), and a
+  primary's `/metrics` shows them per port and queue
+  (`dpdk_queue_metrics.rs`, through `TransportMetrics`) rather than
+  reading `rte_eth_stats`, which not every PMD makes safe against the
+  queue's poller or fills per queue. Under `latency-trace` the loop's
+  work iterations are the stage `dpdk repl poll: outer iteration
+  (work-iterations only)`, beside the client loop's `dpdk poll`. Both
+  modes' "ready" lines begin `DPDK replication sender started`, which
+  the bench suite waits for.
+
+### Steering in queue mode
+
+`melin_dpdk::steering` decides, from the configuration alone and tested
+on every host, the client NIC's `SteeringPlan`: two queue pairs
+(`QueuePlan::ReplicationSplit`), RSS hashing nothing and, unless the
+port is isolated (bifurcated), its redirection table pinned to queue 0
+once the port starts, so that rule-versus-RSS precedence never matters.
+The rules, highest level first:
+
+1. On a replica: TCP to the client port → queue 0 (isolated: from the
+   peer only), above the next rule so that a client whose ephemeral port
+   is the primary's replication port stays on queue 0.
+2. TCP to the node's own replication port (`--replication-bind`) →
+   queue 1, and on a replica TCP from the primary's
+   (`--replica-of`) → queue 1, matched by port alone since the primary
+   changes on failover and the rules are installed once. Isolated, both
+   also match the node's own address.
+3. Isolated only: the peer capture of shared mode, below the
+   replication rules.
+
+Levels are numbered densely from 0, since mlx5's root table may offer as
+few as two. A replica dials from no port the plan steers by destination
+(`SteeringPlan::destination_ports`, through `ReplicaDialPorts`): in
+queue mode, the client port and, with `--replication-bind`, the node's
+own replication port. The gated port code installs exactly what
+the plan says, logging each rule; a NIC with fewer than two queue pairs
+or no redirection table fails the bring-up naming the port.
+
+### A replica, and its promotion
+
+A replica in queue or port mode brings up both transports at boot, each
+in the role it keeps once promoted, so that promotion swaps no queue:
+
+- the client transport (queue 0), unlistening and unpolled until
+  promotion. What reaches it waits in the RX ring and, once the ring is
+  full, the NIC drops the rest; no mbuf leaves the pool for it beyond the
+  ring's. Nothing the replica needs arrives only there: the primary's
+  MAC is seeded, a DPDK primary learns the replica's from its frames,
+  and ARP reaches the replication transport (below). A client connecting
+  meanwhile gets no answer;
+- the seat's transport, which carries the receiver
+  (`run_receiver_dpdk`), dialing the primary with the primary's MAC
+  from `--dpdk-replication-peer-mac` in port mode, `--dpdk-peer-mac`
+  otherwise.
+
+At promotion (`PROMOTE` and raft both end the receiver, which returns to
+`run_dpdk_impl`): the seat's transport is dropped, the replica's steering
+is ended (below), the client transport gains the client listener and
+sends a gratuitous ARP, and `run_as_primary_dpdk` gets the seat, exactly
+as at a primary's boot: `repl-poll` builds a new transport on the same
+queue with a new driver. Dropping a transport on a live queue is what
+made the leak in the Fixed entry visible: `DpdkTransport` now aborts its
+sockets on drop, and the device frees the frames it still holds, so the
+rebuilt transport finds the pool whole (`transport_rebuild`). A
+transport's first poll reads the clock, so frames the client queue held
+since boot are taken at the promotion's time. The replica's TCP rules
+stay installed after promotion; both are harmless to a primary (the
+client-port rule sends where the pinned RSS would; the source-port rule
+ranks below it and matches only replication).
+
+### The ARP rule on a queue-mode replica
+
+On a non-isolated port, queue 0 is the default queue, so ARP would land
+on the replica's unpolled client queue, and a kernel-TCP primary
+(`arp_accept=0`, no neighbour entry from a SYN) or a router could never
+resolve the replica. The plan adds `arp_until_promotion`, an
+`EtherTypeRule` (EtherType 0x0806 → queue 1) at level 0, beside the
+client-port rule: the two patterns match disjoint frames, so sharing a
+level is defined. Queue 1's transport has the node's address and MAC,
+answers requests and takes the replies to its own.
+
+Lifecycle: installed at boot after the TCP rules, one per port; its
+handle kept in the NIC group (`until_promotion`); removed at promotion by
+`DpdkShared::end_replica_steering`, once per process on the one path
+both promotions take, before the client queue is polled as a primary's.
+Removal takes every held rule, so a second call removes nothing; a rule
+a port refuses to remove is logged as a warning and stays until the port
+closes, the node serving on. It must go, rather than stay as harmless:
+left in place, it would send the replies to the client transport's own
+ARP requests to queue 1, and a client the stack had to resolve again
+would stall for the discovery timeout. No rule in isolated mode (the
+kernel keeps ARP), in shared or port mode, or on a queue-mode primary at
+boot. Matching only requests is not possible on mlx5 (no
+`ARP_ETH_IPV4` item), and matching broadcast would miss Linux's unicast
+`ucast_probes`.
+
+### Tests
+
+Unit tests on every host: the flag mapping and its refusals
+(`dpdk_replication_args.rs`), the `--cores` rules for `repl-poll`
+(`layout.rs`), and every plan, level and ARP rule
+(`melin_dpdk::steering`). Under the netns runner (`dpdk-testing.md`,
+"Replication on a NIC of its own", "Replication on a queue of its own",
+"Several NICs on one EAL"): port mode end to end, primaries and replicas,
+both promotions, mixed with a shared-mode primary, a client left
+unanswered by a port-mode replica; queue mode's refusals on one queue
+pair and without a redirection table; a transport rebuilt on its queue.
+Hardware only, and owed on the rig (the plan's status lists them): queue
+mode end to end, its rules and the ARP rule's installation and removal,
+an unpolled queue on mlx5, and the measurement itself.

@@ -285,8 +285,9 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
   unanswered (and is served if the replica is promoted while it waits);
   on DPDK it is refused, unless the replica's replication runs on a queue
   or a NIC of its own, where its client NIC is not read until promotion
-  and the connection is left unanswered. Either way the client retries,
-  or goes to the primary.
+  and the connection is left unanswered (see [Replicas in queue and
+  port modes](#replicas-in-queue-and-port-modes)). Either way the
+  client retries, or goes to the primary.
 
 If the primary disconnects or evicts the replica, the receiver
 reconnects with exponential backoff (1 s → 30 s cap), keeping the state
@@ -352,7 +353,9 @@ no journal re-replay, no snapshot reload. Sub-second switchover. The
 promoted node serves on the transport it ran on, at the addresses it was
 configured with: a DPDK replica becomes a DPDK primary, serving clients
 on its client port and accepting replicas on `--replication-bind`, with
-kernel bypass kept. The same holds for an automatic failover (below).
+kernel bypass kept, and with replication where its flags put it (on its
+own queue or NIC: see [Failover](#failover)). The same holds for an
+automatic failover (below).
 
 After promotion the new primary will halt new writes if it has no
 replicas connected (see above) — the operator's playbook is to either
@@ -537,7 +540,9 @@ for a data-plane connection to cross.
   automatically re-point `--replica-of` at a newly promoted primary —
   reconnecting them is still operator work after a failover. Give
   every candidate `--replication-bind` (see the flags section) so the
-  winner's listener is already up when you re-point them.
+  winner's listener is already up when you re-point them. A winner
+  whose replication runs on a NIC of its own takes its replicas at that
+  NIC's address (see [Failover](#failover)).
 - **Same peer list everywhere.** Identical `--raft-peer` lists
   (including each node's own entry) keep the first-boot membership
   consistent across the cluster.
@@ -723,6 +728,10 @@ requiring the full journal history.
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `ACK-POLICY <policy>`. Bound at startup; the server fails to start if the address cannot be bound, so a node never runs with its admin commands silently unavailable. |
 | `--ack-policy <policy>` | Primary | `disk+ram` | Active ack policy at startup: which copies of an event must exist before its response is released. `disk`, `ram`, `disk+ram`, or `two-disks`. Can be swapped at runtime via admin `ACK-POLICY`. |
 | `--dpdk-peer-mac <mac>` | Replica on DPDK | derived | Ethernet address of the primary named by `--replica-of`. Only consulted when replicating over DPDK. See below. |
+| `--dpdk-replication-queue` | No | off | DPDK only: run replication on a second queue of the client NIC (mlx5), on a poll thread of its own. See [Replication on its own queue or NIC](#replication-on-its-own-queue-or-nic-dpdk). |
+| `--dpdk-replication-ports <ids>` | No | — | DPDK only: the DPDK port id(s) of a second NIC, replication's own, on a poll thread of its own. Requires `--dpdk-replication-ip`. See [Replication on its own queue or NIC](#replication-on-its-own-queue-or-nic-dpdk). |
+| `--dpdk-replication-ip <ip>` | With `--dpdk-replication-ports` | — | The replication NIC's IPv4 address, in the client NIC's subnet. |
+| `--dpdk-replication-peer-mac <mac>` | Replica in port mode | derived | Ethernet address of the NIC the address in `--replica-of` is on, which the replica's replication NIC dials, as `--dpdk-peer-mac` is for the client NIC. |
 
 ### Addressing the primary over DPDK
 
@@ -752,6 +761,141 @@ candidate the same `--replication-bind` it would need as a primary, so
 a promoted winner is immediately ready to accept re-pointed replicas —
 no other process can have taken the port in the meantime. If none of
 these flags are specified, the server runs in standalone mode.
+
+## Replication on its own queue or NIC (DPDK)
+
+By default a DPDK node runs replication where it serves its clients: on
+the client NIC's queue, from the one poll thread that takes requests off
+the NIC and writes responses back. Under heavy client load the two
+compete for that loop: a client response can wait behind a replica's
+stream, and a replica's stream behind clients, until its ring fills and
+the replica is evicted (see "Fault isolation between replica slots").
+Two flag sets move replication onto a queue or a NIC of its own, served
+by a poll thread of its own, `repl-poll` in `--cores`:
+
+| Mode | Flags | Replication runs on | Choose it for |
+|---|---|---|---|
+| shared (default) | none | the client NIC's queue, on the client poll thread | any NIC, an SR-IOV virtual function included; no extra core |
+| queue | `--dpdk-replication-queue` | a second queue of the client NIC's ports, to which the NIC steers replication | a Mellanox (mlx5) NIC: no second port or address needed |
+| port | `--dpdk-replication-ports`, `--dpdk-replication-ip`, and on a replica `--dpdk-replication-peer-mac` | a second NIC, with its own address and MAC | a host with a second port: a second ENI on AWS, a second mlx5 port |
+
+On a primary in either split mode the client poll thread no longer does
+any replication work: the replication poll thread streams to the
+replicas and reads their acknowledgements. Nothing else changes: the
+same ring per replica, the same ack policies, the same wire protocol,
+and the application's clock still ticks from the client poll thread. The
+cost is one more core per node that polls flat out, and DPDK's
+multi-process tools can no longer attach to the node: see
+[Deployment](deployment.md#dpdk-replication-on-its-own-queue-or-nic),
+which also covers checking where the traffic goes. Kernel-TCP nodes,
+which give each replica a thread of its own anyway, ignore the flags.
+
+The modes are per node, and a cluster may mix them: a replica in any
+mode follows a primary in any mode. Give every failover candidate the
+flags it should serve with as a primary: a promoted node runs
+replication where its own flags put it.
+
+### Queue mode
+
+The client NIC is configured with two queue pairs: queue 0 for clients,
+queue 1 for replication. The NIC tells the two apart by TCP port, with
+flow rules installed at boot: traffic to the node's own replication port
+(`--replication-bind`'s, its replicas' links) and from its primary's
+(`--replica-of`'s, a replica's link to its primary) goes to queue 1, and
+everything else to queue 0, a client whose own port happens to be a
+replication port included. Each rule is logged as it is installed. So:
+
+- The NIC must offer two queue pairs and flow steering: an mlx5 NIC, in
+  dedicated or bifurcated (`--dpdk-peer-ip`) mode. A NIC with fewer
+  queue pairs, or one that refuses a rule, fails the boot with an error
+  naming the port or the rule. Not for SR-IOV virtual functions, whose
+  steering has stalled sustained streams: run them in shared mode.
+- The node needs a replication port to steer: `--replication-bind` or
+  `--replica-of`. A standalone node with the flag is refused, and so is a
+  `--replication-bind` on the same port as `--bind`.
+- Addresses are the client NIC's, as in shared mode: replicas point
+  `--replica-of` at the primary's client address with its replication
+  port, and `--dpdk-peer-mac` at its client NIC's MAC.
+- In bifurcated mode the rules capture replication addressed to the node
+  from every host, not only from `--dpdk-peer-ip`; the kernel keeps
+  everything else, as before, bar one thing on a replica: a connection
+  of the host's own whose remote port is the primary's replication port
+  is captured too, and lost to the kernel.
+- A replica dials its primary from local ports the NIC would not steer
+  elsewhere: never from the client port.
+
+### Port mode
+
+Replication gets a NIC of its own: `--dpdk-replication-ports` names its
+DPDK port id (both members of an LACP bond, as `--dpdk-ports` takes
+them), none of them one of `--dpdk-ports`, and `--dpdk-replication-ip`
+its address, which must be in the client NIC's subnet and differ from
+`--dpdk-ip`.
+Everything else is the client NIC's: prefix length, gateway and gateway
+MAC, MTU, VLAN, and the EAL arguments, which are the process's, so
+`--dpdk-eal-args` must allow both NICs' devices. A combination that does
+not hold is refused at startup with an error naming the flag. The
+replication NIC is DPDK's alone (`--dpdk-peer-ip`'s sharing with the
+kernel applies to the client NIC only), and it announces its MAC with a
+gratuitous ARP when it comes up.
+
+- A primary takes its replicas on its replication NIC: on
+  `--replication-bind`'s port, at `--dpdk-replication-ip` (on DPDK only
+  the port of `--replication-bind` is used). Clients still reach it on
+  its client NIC.
+- A replica dials from its own replication NIC. Point `--replica-of` at
+  the primary's replication address (its `--dpdk-replication-ip` and
+  replication port) and `--dpdk-replication-peer-mac` at the MAC of the
+  primary's replication NIC. Following a primary in shared or queue mode,
+  which has no replication NIC, use its client address and its client
+  NIC's MAC instead. Without the flag the replica derives the MAC as
+  described in "Addressing the primary over DPDK", which holds on the
+  SR-IOV path only.
+- A node in port mode that neither replicates (`--replication-bind`) nor
+  follows a primary brings the NIC up, leaves it unused, and says so at
+  boot.
+
+### Replicas in queue and port modes
+
+A replica follows its primary from its replication queue or NIC and
+does not read its client NIC until it is promoted. A client connecting
+to it meanwhile gets no answer at all, rather than the refusal a DPDK
+replica in shared mode sends; as with any replica, it should retry or
+go to the primary.
+
+The replica still answers ARP for the address its replication link
+runs from, so a primary or a router that resolves it by ARP (a
+kernel-TCP primary does) finds it as any host: in port mode its
+replication NIC answers for the replication address, and in queue mode,
+where the two share the client address, the NIC sends ARP to the
+replication queue until the node is promoted. In bifurcated mode the
+kernel answers, as always.
+
+With `--dpdk-vlan`, ARP reaches a queue-mode replica VLAN-tagged and may
+not be sent to the replication queue, so the replica may not answer it.
+A primary or router that resolves such a replica by ARP should be given
+a permanent neighbour entry for the replica's address and MAC
+(`ip neigh replace <address> lladdr <mac> dev <interface> nud permanent`
+on a Linux host), so the replica link does not depend on the replica
+answering ARP.
+
+### Failover
+
+A replica promoted in queue or port mode, by `PROMOTE` or by the control
+plane, serves exactly as a primary booted in that mode: clients on its
+client NIC, from the client poll thread; its own replicas on the queue
+or NIC its replica link ran on, from the replication poll thread, under
+the same ack policy. In queue mode the ARP rule goes at promotion, so
+that ARP reaches the client queue as on a primary booted in the mode
+(`replica steering removed at promotion` in the log). Should the NIC
+refuse to remove it, the node logs a warning and serves on; what it
+loses is the replies to its own ARP requests, so a response to a client
+whose address it has to resolve again can stall.
+
+Surviving replicas are re-pointed at the new primary as after any
+failover (see "Deployment rules"): in port mode at its replication
+address and its replication NIC's MAC, otherwise at its client address
+and client NIC's MAC.
 
 ## Wire protocol
 
@@ -919,6 +1063,11 @@ normal-case post-recovery state.
   service continues, but automatic failover is offline) and on a
   sustained absence of any node reporting `melin_raft_is_leader 1`
   (control-plane quorum lost).
+- On a DPDK primary, `melin_dpdk_queue_rx_packets_total` and
+  `melin_dpdk_queue_tx_packets_total` count packets per NIC port and
+  queue: with replication on its own queue or NIC, they show where
+  replication and client traffic actually go (see
+  [Deployment](deployment.md#checking-where-the-traffic-goes)).
 
 ## Limitations
 
