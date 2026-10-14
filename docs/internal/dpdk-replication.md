@@ -264,16 +264,22 @@ What was built:
   has since passed, and goes live after a batch a back-fill has since
   covered, and so does this. Dropping a slot (`go_idle`) releases a held
   read, so the idle drain can read on.
-- **Acks during the handoff.** The slot's cursors are seeded at the
+- **Acks during the join.** The slot's cursors are seeded at the
   handoff's start (before the activation, contract B2 as before), but a
   pass's entries count towards the sent high-water only when the pass
   ends, and the replica may ack them before, so recording acks then
   could evict a healthy replica for an ack "ahead" of what was sent. The
-  handoff keeps the newest ack read (acks are cumulative) and drops the
-  rest; the streaming arm records it on its first tick, as it recorded
-  the acks the inline bridge left unread on the socket. Reading them off
-  keeps the joiner's acks from backing up in its TX queue however long
-  the handoff takes.
+  join keeps the newest ack read (acks are cumulative), in the catch-up
+  and the handoff alike, and drops the rest; the streaming arm records it
+  on its first tick, as the kernel-TCP sender's live loop records the
+  acks its catch-up and bridge left unread on the socket. Reading them
+  off keeps the joiner's acks from backing up in its TX queue however
+  long the join takes. Keeping the newest through the catch-up matters: a
+  replica acks only when it holds something new, so on a quiet primary
+  its last ack of the join is never repeated, and dropping it left the
+  slot at its handshake position with a write held for its ack never
+  released (`dpdk_veth`'s
+  `an_ack_sent_during_the_catch_up_counts_once_the_joiner_is_live`).
 - **A deadline on a joiner that does not drain, once it has acked.** A
   join (the catch-up and the handoff alike) whose replica has acked
   anything, and whose socket has since refused what it has to send, with

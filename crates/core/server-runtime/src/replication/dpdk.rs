@@ -221,53 +221,32 @@ enum JoinFrames {
     /// A frame's length prefix is zero or over [`MAX_CONTROL_FRAME`]: a
     /// replica the caller disconnects, as the streaming arm does.
     Malformed,
-    /// Well formed. `acked`: an ack was among the complete frames — the
-    /// replica is in its streaming loop, which arms the join's
-    /// [`JoinStallWatch`].
+    /// Well formed. `acked`: an ack is kept: the replica is in its
+    /// streaming loop, which arms the join's [`JoinStallWatch`].
     Read { acked: bool },
 }
 
-/// Drop every complete control frame at the front of `buf`, keeping a
-/// trailing partial one for the next read.
-///
-/// Serves a `Joining` slot: the replica acks what it journals of the
-/// catch-up, and those acks must be read off the socket — left unread they
-/// fill the listener's receive buffer, and the replica's acks then back up
-/// in its own TX queue — but not recorded, since the slot's cursors are
-/// not seeded until the bridge. Acks are cumulative, so the first one read
-/// once streaming covers what is dropped here.
-fn discard_control_frames(buf: &mut Vec<u8>) -> JoinFrames {
-    let mut consumed = 0;
-    let mut acked = false;
-    let outcome = loop {
-        match try_extract_frame(&buf[consumed..], MAX_CONTROL_FRAME) {
-            FrameResult::Complete(payload_start, frame_end) => {
-                let payload = &buf[consumed + payload_start..consumed + frame_end];
-                acked |= matches!(decode_replica_message(payload), Ok(ReplicaMessage::Ack(_)));
-                consumed += frame_end;
-            }
-            FrameResult::Incomplete => break JoinFrames::Read { acked },
-            FrameResult::Oversized => break JoinFrames::Malformed,
-        }
-    };
-    compact_recv_buf(buf, consumed);
-    outcome
-}
-
 /// Keep only the newest complete ack at the front of `buf`, and a trailing
-/// partial frame for the next read. [`JoinFrames::Malformed`] as
-/// [`discard_control_frames`]; `acked` whenever an ack is kept, which,
-/// as one is kept across reads, is true again on every read after the
-/// first (arming the stall watch is idempotent).
+/// partial frame for the next read. `acked` whenever an ack is kept,
+/// which, as one is kept across reads, is true again on every read after
+/// the first (arming the stall watch is idempotent).
 ///
-/// Serves a slot in its handoff: its cursors are seeded, but the sent
-/// high-water an ack is checked against is only settled once the handoff
-/// is over (a journal pass's entries are counted when the pass ends, and
-/// the replica may ack them before), so acks are not recorded yet — the
-/// streaming arm records what is kept here, on its first tick. Acks are
-/// cumulative, so the newest carries everything the older ones did; the
-/// rest are read off the socket and dropped, so that they cannot back up
-/// in the replica's TX queue however long the handoff takes.
+/// Serves a `Joining` slot, in both phases. The replica acks what it
+/// journals of the join, and its acks must be read off the socket (left
+/// unread they fill the listener's receive buffer, and the replica's acks
+/// then back up in its own TX queue), but not recorded yet: the slot's
+/// cursors are seeded only once the catch-up ends, and the sent high-water
+/// an ack is checked against only once the handoff is over (a journal
+/// pass's entries are counted when the pass ends, and the replica may ack
+/// them before). The streaming arm records what is kept here, on its first
+/// tick. Acks are cumulative, so the newest carries everything the older
+/// ones did, and the rest are dropped.
+///
+/// Kept, not dropped, through the catch-up too: a replica acks only when
+/// it holds something new, so its last ack of the join is never repeated.
+/// On a quiet primary nothing more is journaled, and an ack dropped here
+/// would leave the slot at its handshake position, with a write held for
+/// the replica's ack never answered.
 fn keep_last_ack(buf: &mut Vec<u8>) -> JoinFrames {
     let mut consumed = 0;
     // The newest ack's byte range in `buf`.
@@ -1172,16 +1151,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                     let join = slot.join.as_mut().expect("join in progress while Joining");
 
-                    // Read the replica's acks off the socket: dropped during
-                    // the catch-up (see `discard_control_frames`), the newest
-                    // kept for the streaming arm during the handoff (see
-                    // `keep_last_ack`).
+                    // Read the replica's acks off the socket, the newest
+                    // kept for the streaming arm (see `keep_last_ack`).
                     transport.recv_into_vec(handle, &mut slot.recv_buf);
-                    let frames = match join.phase {
-                        JoinPhase::CatchUp(_) => discard_control_frames(&mut slot.recv_buf),
-                        JoinPhase::Handoff { .. } => keep_last_ack(&mut slot.recv_buf),
-                    };
-                    match frames {
+                    match keep_last_ack(&mut slot.recv_buf) {
                         JoinFrames::Malformed => {
                             warn!(
                                 slot = slot_idx,
@@ -1313,6 +1286,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         }
                         JoinTick::Live(sent) => {
                             transport.poll();
+                            super::log_replica_live(slot_idx, &sent);
                             // The sent high-water: heartbeats and the
                             // ack-sanity bound.
                             slot.sent = sent;
@@ -2266,82 +2240,6 @@ mod tests {
         f
     }
 
-    #[test]
-    fn discard_control_frames_drops_complete_frames_and_keeps_a_partial_one() {
-        let mut buf = frame(8);
-        buf.extend(frame(16));
-        let partial = frame(12);
-        buf.extend_from_slice(&partial[..7]);
-
-        assert_eq!(
-            discard_control_frames(&mut buf),
-            JoinFrames::Read { acked: false }
-        );
-        assert_eq!(buf, partial[..7]);
-
-        // The rest of the partial frame completes it; it goes next time.
-        buf.extend_from_slice(&partial[7..]);
-        assert_eq!(
-            discard_control_frames(&mut buf),
-            JoinFrames::Read { acked: false }
-        );
-        assert!(buf.is_empty());
-    }
-
-    /// An ack among the dropped frames is reported, a partial one only
-    /// once it completes.
-    #[test]
-    fn discard_control_frames_reports_an_ack() {
-        let mut buf = frame(8);
-        buf.extend(ack(3, 4));
-        buf.extend(frame(8));
-        assert_eq!(
-            discard_control_frames(&mut buf),
-            JoinFrames::Read { acked: true }
-        );
-        assert!(buf.is_empty());
-
-        let partial = ack(5, 6);
-        buf.extend_from_slice(&partial[..5]);
-        assert_eq!(
-            discard_control_frames(&mut buf),
-            JoinFrames::Read { acked: false }
-        );
-        buf.extend_from_slice(&partial[5..]);
-        assert_eq!(
-            discard_control_frames(&mut buf),
-            JoinFrames::Read { acked: true }
-        );
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn discard_control_frames_leaves_an_empty_or_short_buffer_alone() {
-        let mut buf = Vec::new();
-        assert_eq!(
-            discard_control_frames(&mut buf),
-            JoinFrames::Read { acked: false }
-        );
-        assert!(buf.is_empty());
-
-        let mut buf = vec![5, 0];
-        assert_eq!(
-            discard_control_frames(&mut buf),
-            JoinFrames::Read { acked: false }
-        );
-        assert_eq!(buf, [5, 0]);
-    }
-
-    #[test]
-    fn discard_control_frames_rejects_an_oversized_frame() {
-        let mut buf = frame(8);
-        buf.extend(((MAX_CONTROL_FRAME + 1) as u32).to_le_bytes());
-        assert_eq!(discard_control_frames(&mut buf), JoinFrames::Malformed);
-
-        let mut buf = 0u32.to_le_bytes().to_vec();
-        assert_eq!(discard_control_frames(&mut buf), JoinFrames::Malformed);
-    }
-
     fn ack(acked_sequence: u64, in_memory_sequence: u64) -> Vec<u8> {
         let mut buf = Vec::new();
         encode_ack(
@@ -2391,12 +2289,50 @@ mod tests {
         let mut buf = Vec::new();
         assert_eq!(keep_last_ack(&mut buf), none);
         assert!(buf.is_empty());
+
+        // Too short for a length prefix: left as it is.
+        let mut buf = vec![5, 0];
+        assert_eq!(keep_last_ack(&mut buf), none);
+        assert_eq!(buf, [5, 0]);
+
+        // A partial frame that completes as something other than an ack
+        // goes on the next read.
+        let partial = frame(12);
+        let mut buf = partial[..7].to_vec();
+        assert_eq!(keep_last_ack(&mut buf), none);
+        buf.extend_from_slice(&partial[7..]);
+        assert_eq!(keep_last_ack(&mut buf), none);
+        assert!(buf.is_empty());
+    }
+
+    /// The replica's only ack of a join, arriving in pieces, is reported
+    /// once complete and then kept, read after read, with nothing newer
+    /// behind it: a replica on a quiet primary acks the end of its catch-up
+    /// once, and the streaming arm must still find that ack when the join
+    /// is over, however many reads the rest of the join took.
+    #[test]
+    fn keep_last_ack_keeps_the_only_ack_until_the_join_is_over() {
+        let only = ack(1_560, 1_560);
+        let mut buf = only[..5].to_vec();
+        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Read { acked: false });
+        buf.extend_from_slice(&only[5..]);
+        for read in 0..3 {
+            assert_eq!(
+                keep_last_ack(&mut buf),
+                JoinFrames::Read { acked: true },
+                "read {read}"
+            );
+            assert_eq!(buf, only, "read {read}");
+        }
     }
 
     #[test]
-    fn keep_last_ack_rejects_an_oversized_frame() {
+    fn keep_last_ack_rejects_an_oversized_or_empty_frame() {
         let mut buf = ack(1, 1);
         buf.extend(((MAX_CONTROL_FRAME + 1) as u32).to_le_bytes());
+        assert_eq!(keep_last_ack(&mut buf), JoinFrames::Malformed);
+
+        let mut buf = 0u32.to_le_bytes().to_vec();
         assert_eq!(keep_last_ack(&mut buf), JoinFrames::Malformed);
     }
 

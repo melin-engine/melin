@@ -207,6 +207,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   or a `SpawnPlacedError` naming the thread and its core when it has not
   within 10 s. `with_child_context` runs the same handover around a spawn
   of the caller's own, such as a scoped thread.
+- **`melin_transport_core::replication::catchup::handoff_pass_from_journal`**:
+  one journal pass of a handoff into live streaming, which both senders
+  run. It streams as `catch_up_from_journal_with` does, and reports a
+  start point lost to a prune as an error rather than a snapshot verdict.
 
 ### Changed
 
@@ -367,6 +371,21 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   A process that exits on the error ends them with it; one that hosts
   several nodes through `run_with_shutdown` kept them past the node's
   failure. Every early return now stops and joins the threads started.
+- **A DPDK primary could hold a write forever after a replica joined.**
+  It read and dropped the replica's acks while the catch-up was still
+  being sent, counting on a later ack to cover them. A replica acks only
+  when it holds something new, so when its last ack of the join landed in
+  that window, which a primary thread descheduled for a moment opens, the
+  primary went on believing the replica held nothing past its handshake:
+  a write accepted during the join and waiting on that replica under
+  `ram` or `disk+ram` was released only by the next journaled event, a
+  tick with ticks on (up to the tick interval late), and never on a quiet
+  primary with ticks off. The newest ack is now kept through the whole
+  join and counted once the replica streams, as on kernel TCP, whose
+  catch-up leaves acks in the socket until then. The end of a replica's
+  join is now logged on both transports (`replica caught up, streaming
+  live`), and the handoff's journal passes, which were logged as further
+  catch-ups, are logged at debug as what they are.
 
 ## [0.19.0] - 2026-10-10
 
