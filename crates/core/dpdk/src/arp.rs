@@ -19,8 +19,12 @@ use crate::mac::MacAddr;
 /// IPv4-over-Ethernet ARP body (28 bytes).
 pub const FRAME_LEN: usize = 42;
 
+/// ARP's EtherType: what these frames carry in their Ethernet header, and
+/// what a steering rule matches ARP by (`steering::EtherTypeRule`).
+pub const ETHER_TYPE: u16 = 0x0806;
+
 const BROADCAST: MacAddr = [0xff; 6];
-const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
+const ETHERTYPE_ARP: [u8; 2] = ETHER_TYPE.to_be_bytes();
 const HARDWARE_ETHERNET: [u8; 2] = [0x00, 0x01];
 const PROTOCOL_IPV4: [u8; 2] = [0x08, 0x00];
 const OP_REQUEST: [u8; 2] = [0x00, 0x01];

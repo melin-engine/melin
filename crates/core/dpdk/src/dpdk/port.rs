@@ -11,7 +11,8 @@
 
 use crate::ffi;
 use crate::mempool::Mempool;
-use crate::steering::{QueuePlan, SteeringRule, TooFewQueues};
+use crate::steering::{EtherTypeRule, QueuePlan, SteeringRule, TooFewQueues};
+use std::ptr::NonNull;
 
 /// Number of RX descriptors per queue. Each descriptor holds one mbuf.
 /// 1024 is standard for 10GbE+ NICs; lower values reduce ring memory
@@ -316,38 +317,76 @@ impl Port {
                 .map_or(0, |ip| u32::from_ne_bytes(ip.octets())),
             tcp_src_port_be: rule.tcp_src_port.map_or(0, u16::to_be),
             tcp_dst_port_be: rule.tcp_dst_port.map_or(0, u16::to_be),
+            eth_type_be: 0,
             queue: rule.queue,
             has_src_ipv4: rule.src_ipv4.is_some().into(),
             has_dst_ipv4: rule.dst_ipv4.is_some().into(),
             has_tcp_src_port: rule.tcp_src_port.is_some().into(),
             has_tcp_dst_port: rule.tcp_dst_port.is_some().into(),
+            has_eth_type: 0,
         };
-        let mut err_type: i32 = 0;
-        // Room for the PMD's explanation, which names what it refused (a
-        // priority out of range, an unsupported item); longer is cut.
-        let mut err_msg = [0 as libc::c_char; 256];
+        self.create_flow(&ffi_rule, rule)?;
+        Ok(())
+    }
+
+    /// Install `rule`, an [`EtherTypeRule`], keeping its handle, so that
+    /// it can be removed before the port closes ([`RemovableRule::remove`]):
+    /// a replica's ARP rule, removed at promotion. Called as
+    /// [`Self::install_steering_rule`] is, after `start()` and the pin.
+    pub(crate) fn install_removable_rule(
+        &mut self,
+        rule: &EtherTypeRule,
+    ) -> Result<RemovableRule, PortError> {
+        let ffi_rule = ffi::dpdk_steering_rule {
+            priority: rule.priority,
+            eth_type_be: rule.ether_type.to_be(),
+            queue: rule.queue,
+            has_eth_type: 1,
+            ..Default::default()
+        };
+        let flow = self.create_flow(&ffi_rule, rule)?;
+        Ok(RemovableRule {
+            port_id: self.port_id,
+            flow,
+            rule: *rule,
+        })
+    }
+
+    /// The one call to the shim's install, for either kind of rule,
+    /// `shown` as the rule is logged: the flow's handle, or the PMD's
+    /// refusal.
+    fn create_flow(
+        &mut self,
+        ffi_rule: &ffi::dpdk_steering_rule,
+        shown: &dyn std::fmt::Display,
+    ) -> Result<NonNull<ffi::rte_flow>, PortError> {
+        let mut flow: *mut ffi::rte_flow = std::ptr::null_mut();
+        let mut error = FlowError::new();
         let ret = unsafe {
             ffi::dpdk_install_steering_rule(
                 self.port_id,
-                &ffi_rule,
-                &mut err_type,
-                err_msg.as_mut_ptr(),
-                err_msg.len(),
+                ffi_rule,
+                &mut flow,
+                &mut error.err_type,
+                error.message.as_mut_ptr(),
+                error.message.len(),
             )
         };
-        if ret != 0 {
-            // NUL-terminated by the shim, which truncates to fit.
-            let message = unsafe { std::ffi::CStr::from_ptr(err_msg.as_ptr()) }
-                .to_string_lossy()
-                .into_owned();
-            return Err(PortError::FlowRuleFailed {
-                ret,
-                err_type,
-                message,
-            });
-        }
-        tracing::info!(port_id = self.port_id, %rule, "rte_flow steering rule installed");
-        Ok(())
+        let flow = match NonNull::new(flow) {
+            Some(flow) if ret == 0 => flow,
+            // A success with no handle is not one the shim returns, and
+            // would leave a rule nothing can remove: reported as a failure.
+            _ => {
+                let (err_type, message) = error.into_parts();
+                return Err(PortError::FlowRuleFailed {
+                    ret,
+                    err_type,
+                    message,
+                });
+            }
+        };
+        tracing::info!(port_id = self.port_id, rule = %shown, "rte_flow steering rule installed");
+        Ok(flow)
     }
 
     /// Point every entry of the port's RSS redirection table at `queue`,
@@ -381,6 +420,95 @@ impl Port {
     /// The DPDK port index.
     pub fn port_id(&self) -> u16 {
         self.port_id
+    }
+}
+
+/// A steering rule installed with its handle kept
+/// ([`Port::install_removable_rule`]), so that it can be removed before
+/// its port closes. Dropped unremoved, it does nothing: the rule goes with
+/// the port, as every other rule does.
+///
+/// Crate-private, and held only beside the port it was installed on, in
+/// the NIC group that owns both (`NicResources`), so that whoever reaches
+/// the rule holds the port open: that is what makes [`Self::remove`]
+/// sound, the handle being valid only while its port is open.
+pub(crate) struct RemovableRule {
+    port_id: u16,
+    flow: NonNull<ffi::rte_flow>,
+    /// The rule as installed, to name it when it is removed.
+    rule: EtherTypeRule,
+}
+
+// SAFETY: the handle is a token for the `rte_flow` calls of its port, which
+// may be made from any thread: ethdev serializes them per port for a PMD
+// that does not declare them thread-safe itself.
+unsafe impl Send for RemovableRule {}
+
+impl RemovableRule {
+    /// Remove the rule from its port, which must still be open: the NIC
+    /// steers what it matched as if it had never been installed.
+    pub(crate) fn remove(self) -> Result<(), PortError> {
+        let mut error = FlowError::new();
+        // SAFETY: the flow was created on this port and not yet destroyed
+        // (`remove` takes the rule by value), and the port is open: see the
+        // type's documentation.
+        let ret = unsafe {
+            ffi::dpdk_remove_steering_rule(
+                self.port_id,
+                self.flow.as_ptr(),
+                &mut error.err_type,
+                error.message.as_mut_ptr(),
+                error.message.len(),
+            )
+        };
+        if ret != 0 {
+            let (err_type, message) = error.into_parts();
+            return Err(PortError::FlowRuleRemovalFailed {
+                ret,
+                err_type,
+                message,
+            });
+        }
+        tracing::info!(port_id = self.port_id, rule = %self.rule, "rte_flow steering rule removed");
+        Ok(())
+    }
+
+    /// The rule as installed.
+    pub(crate) fn rule(&self) -> &EtherTypeRule {
+        &self.rule
+    }
+
+    /// The port it was installed on.
+    pub(crate) fn port_id(&self) -> u16 {
+        self.port_id
+    }
+}
+
+/// Where the shim reports an `rte_flow` call's failure: the error type and
+/// the PMD's explanation.
+struct FlowError {
+    err_type: i32,
+    /// Room for the PMD's explanation, which names what it refused (a
+    /// priority out of range, an unsupported item); longer is cut.
+    message: [libc::c_char; 256],
+}
+
+impl FlowError {
+    fn new() -> Self {
+        FlowError {
+            err_type: 0,
+            message: [0; 256],
+        }
+    }
+
+    /// The error type and the message, as `PortError` carries them.
+    fn into_parts(self) -> (i32, String) {
+        // NUL-terminated by the shim, which truncates to fit, and zeroed
+        // here before the call when the shim writes nothing.
+        let message = unsafe { std::ffi::CStr::from_ptr(self.message.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        (self.err_type, message)
     }
 }
 
@@ -427,6 +555,14 @@ pub enum PortError {
         err_type: i32,
         message: String,
     },
+    /// `rte_flow_destroy` refused to remove a steering rule: its return,
+    /// the `rte_flow` error type, and the PMD's message (empty when it gave
+    /// none). The rule is still installed.
+    FlowRuleRemovalFailed {
+        ret: i32,
+        err_type: i32,
+        message: String,
+    },
     /// The port offers fewer queue pairs than its [`QueuePlan`] needs.
     TooFewQueues(TooFewQueues),
     /// The RSS redirection table could not be pinned to `queue`: the
@@ -450,13 +586,12 @@ impl std::fmt::Display for PortError {
                 ret,
                 err_type,
                 message,
-            } => {
-                write!(f, "rte_flow_create failed: ret={ret} err_type={err_type}")?;
-                if !message.is_empty() {
-                    write!(f, " ({message})")?;
-                }
-                Ok(())
-            }
+            } => write_flow_error(f, "rte_flow_create", *ret, *err_type, message),
+            PortError::FlowRuleRemovalFailed {
+                ret,
+                err_type,
+                message,
+            } => write_flow_error(f, "rte_flow_destroy", *ret, *err_type, message),
             PortError::TooFewQueues(e) => write!(f, "{e}"),
             PortError::RetaPinFailed { queue, ret } => write!(
                 f,
@@ -467,3 +602,19 @@ impl std::fmt::Display for PortError {
 }
 
 impl std::error::Error for PortError {}
+
+/// An `rte_flow` call's failure as [`PortError`] displays it: the call,
+/// its return and error type, and the PMD's message when it gave one.
+fn write_flow_error(
+    f: &mut std::fmt::Formatter<'_>,
+    call: &str,
+    ret: i32,
+    err_type: i32,
+    message: &str,
+) -> std::fmt::Result {
+    write!(f, "{call} failed: ret={ret} err_type={err_type}")?;
+    if !message.is_empty() {
+        write!(f, " ({message})")?;
+    }
+    Ok(())
+}

@@ -208,15 +208,31 @@ int dpdk_flow_isolate(uint16_t port_id) {
     return rte_flow_isolate(port_id, 1, &err);
 }
 
-/* Install `rule` (see steering_rule.h) on `port_id`. The pattern is ETH (any) / IPV4 (the
- * addresses given, or any) / TCP (the ports given; only when a port is)
- * / END, and the one action QUEUE. Without TCP ports this is the rule
- * bifurcated transports have always installed: IPv4 from the peer into
- * queue 0, so the kernel keeps SSH (different source IP), ARP, and
- * anything else.
+/* Store a failed rte_flow call's error type in *err_type and its message
+ * (`fallback` when the PMD gives none) in err_msg, NUL-terminated and
+ * truncated to err_msg_len bytes. */
+static void report_flow_error(const struct rte_flow_error *err,
+                              const char *fallback, int *err_type,
+                              char *err_msg, size_t err_msg_len) {
+    if (err_type) {
+        *err_type = (int)err->type;
+    }
+    if (err_msg && err_msg_len > 0) {
+        snprintf(err_msg, err_msg_len, "%s", err->message ? err->message : fallback);
+    }
+}
+
+/* Install `rule` (see steering_rule.h) on `port_id`. The pattern is ETH
+ * (any) / IPV4 (the addresses given, or any) / TCP (the ports given; only
+ * when a port is) / END, or, with an EtherType, ETH (that type) / END; and
+ * the one action QUEUE. Without TCP ports this is the rule bifurcated
+ * transports have always installed: IPv4 from the peer into queue 0, so
+ * the kernel keeps SSH (different source IP), ARP, and anything else.
  *
- * The flow handle is not kept: the rule lives as long as the port, and
- * goes when the port is closed.
+ * The flow handle is stored in *flow_out (when flow_out is not NULL), for
+ * a rule its caller removes before the port closes
+ * (dpdk_remove_steering_rule); every other rule lives as long as the port,
+ * and goes when the port is closed.
  *
  * Returns 0 on success, a negative value on failure; on failure stores
  * the rte_flow error type in *err_type and its message (empty when the
@@ -224,6 +240,7 @@ int dpdk_flow_isolate(uint16_t port_id) {
  * err_msg_len bytes. */
 int dpdk_install_steering_rule(uint16_t port_id,
                                const struct dpdk_steering_rule *rule,
+                               struct rte_flow **flow_out,
                                int *err_type, char *err_msg,
                                size_t err_msg_len) {
     struct rte_flow_attr attr;
@@ -237,12 +254,26 @@ int dpdk_install_steering_rule(uint16_t port_id,
     struct rte_flow *flow;
     int n = 0;
 
+    memset(&err, 0, sizeof(err));
+    if (rule->has_eth_type && (rule->has_src_ipv4 || rule->has_dst_ipv4 ||
+                               rule->has_tcp_src_port || rule->has_tcp_dst_port)) {
+        err.type = RTE_FLOW_ERROR_TYPE_ITEM;
+        report_flow_error(&err,
+                          "an EtherType rule matches no IPv4 or TCP field",
+                          err_type, err_msg, err_msg_len);
+        return -1;
+    }
+
     memset(&attr, 0, sizeof(attr));
     attr.ingress = 1;
     attr.priority = rule->priority;
 
     memset(&eth_spec, 0, sizeof(eth_spec));
     memset(&eth_mask, 0, sizeof(eth_mask));
+    if (rule->has_eth_type) {
+        eth_spec.hdr.ether_type = rule->eth_type_be;
+        eth_mask.hdr.ether_type = 0xffff;
+    }
 
     memset(&ipv4_spec, 0, sizeof(ipv4_spec));
     memset(&ipv4_mask, 0, sizeof(ipv4_mask));
@@ -271,10 +302,12 @@ int dpdk_install_steering_rule(uint16_t port_id,
     pattern[n].spec = &eth_spec;
     pattern[n].mask = &eth_mask;
     n++;
-    pattern[n].type = RTE_FLOW_ITEM_TYPE_IPV4;
-    pattern[n].spec = &ipv4_spec;
-    pattern[n].mask = &ipv4_mask;
-    n++;
+    if (!rule->has_eth_type) {
+        pattern[n].type = RTE_FLOW_ITEM_TYPE_IPV4;
+        pattern[n].spec = &ipv4_spec;
+        pattern[n].mask = &ipv4_mask;
+        n++;
+    }
     if (rule->has_tcp_src_port || rule->has_tcp_dst_port) {
         pattern[n].type = RTE_FLOW_ITEM_TYPE_TCP;
         pattern[n].spec = &tcp_spec;
@@ -291,18 +324,34 @@ int dpdk_install_steering_rule(uint16_t port_id,
     actions[0].conf = &queue;
     actions[1].type = RTE_FLOW_ACTION_TYPE_END;
 
-    memset(&err, 0, sizeof(err));
     flow = rte_flow_create(port_id, &attr, pattern, actions, &err);
     if (!flow) {
-        if (err_type) {
-            *err_type = (int)err.type;
-        }
-        if (err_msg && err_msg_len > 0) {
-            snprintf(err_msg, err_msg_len, "%s", err.message ? err.message : "");
-        }
+        report_flow_error(&err, "", err_type, err_msg, err_msg_len);
         return -1;
     }
+    if (flow_out) {
+        *flow_out = flow;
+    }
     return 0;
+}
+
+/* Remove a rule dpdk_install_steering_rule installed on `port_id`, whose
+ * handle it stored: before the port closes, which removes every rule
+ * itself. Returns 0 on success, rte_flow_destroy's negative error on
+ * failure, with the error reported as dpdk_install_steering_rule reports
+ * one. */
+int dpdk_remove_steering_rule(uint16_t port_id, struct rte_flow *flow,
+                              int *err_type, char *err_msg,
+                              size_t err_msg_len) {
+    struct rte_flow_error err;
+    int ret;
+
+    memset(&err, 0, sizeof(err));
+    ret = rte_flow_destroy(port_id, flow, &err);
+    if (ret != 0) {
+        report_flow_error(&err, "", err_type, err_msg, err_msg_len);
+    }
+    return ret;
 }
 
 /* Point every entry of `port_id`'s RSS redirection table at `queue`, so

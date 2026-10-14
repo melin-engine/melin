@@ -121,7 +121,7 @@ is not replication.
   replication rules, so that replication from the peer's host still
   reaches queue 1.
 
-The replication rules:
+The replication rules (and, on a replica, an ARP rule: see below):
 - TCP destination port = the node's own replication port (from
   `--replication-bind`) → queue 1 (its replicas, as primary or once
   promoted);
@@ -140,12 +140,26 @@ NIC: **a replica must not dial from the client port** (the dial loop
 starts at 40000 and wraps there, so a client port in that range could
 collide; step 6 made it skip every port the plan steers by destination).
 
+On a replica whose port is not isolated, one more rule, held until
+promotion: **every ARP frame (EtherType 0x0806) → queue 1**, whose
+transport has the node's address and MAC and answers for it while queue 0
+goes unpolled (see "ARP on a queue-mode replica" below). The node keeps
+its handle, one per port, and removes it at promotion. Isolated, the
+kernel keeps ARP and owns the address: no rule. A primary at boot polls
+queue 0 from the start: no rule.
+
 Priorities are numbered densely from 0 and only as many are used as the
-rules need: two in queue mode, three on an isolated replica. mlx5's root
-table offers few user levels (as few as two, depending on device and flow
-engine): check the isolated replica's third level on the rig. Queue mode
-with no replication port at all (a standalone node), or with the node's
-replication port equal to its client port, is refused before EAL init.
+rules need: two in queue mode, three on an isolated replica. The ARP rule
+takes none of its own: it shares level 0 with the replica's client-port
+rule, which every replica has, and since an IPv4 rule's pattern
+(ETH / IPV4 ...) never matches an ARP frame and the ARP rule's (ETH type
+0x0806 / END) never matches an IPv4 one, the two at one level cannot
+overlap, which `rte_flow` leaves undefined only for overlapping rules.
+mlx5's root table offers few user levels (as few as two, depending on
+device and flow engine): check the isolated replica's third level on the
+rig. Queue mode with no replication port at all (a standalone node), or
+with the node's replication port equal to its client port, is refused
+before EAL init.
 
 Which rules a mode installs is a pure function of (mode, client port,
 replication ports, peer IP, own IP), outside the gate and unit-tested
@@ -170,15 +184,17 @@ In `queue` and `port` modes, a replica brings up both transports at boot:
   from), `--dpdk-peer-mac` in queue mode.
 - **The client transport** stays unlistening and unpolled until promotion.
   Clients do not connect to replicas. What arrives meanwhile is dropped
-  at the RX ring.
+  at the RX ring, but ARP, which in queue mode a rule sends to queue 1
+  until promotion.
 
-At promotion, the client transport gains the client listener and becomes
-the client poll thread's. The replication transport is dropped on the
-receiver's thread, and the `repl-poll` thread builds a transport of its
-own on the same queue, with the replication listener and a new driver,
-exactly as at a primary's boot (step 6 corrected "moves to the
-`repl-poll` thread": a transport never crosses threads). Each queue keeps
-its role in both directions, so promotion swaps no queues.
+At promotion, a queue-mode replica's ARP rule is removed, and the client
+transport gains the client listener and becomes the client poll
+thread's. The replication transport is dropped on the receiver's thread,
+and the `repl-poll` thread builds a transport of its own on the same
+queue, with the replication listener and a new driver, exactly as at a
+primary's boot (step 6 corrected "moves to the `repl-poll` thread": a
+transport never crosses threads). Each queue keeps its role in both
+directions, so promotion swaps no queues.
 
 How a surviving replica finds the new primary is unchanged and outside
 this work. In `port` mode, the address it is given must be the new
@@ -194,7 +210,8 @@ What step 6 found, and settled:
   is flooded). No mbuf leaves the pool for it beyond the ring's. At
   promotion the client poll thread's first polls take whatever stale
   frames the ring held: old SYNs, answered and then reset by their
-  long-gone clients, and old ARP requests, answered late. They are taken
+  long-gone clients (not ARP, which a queue-mode replica's NIC sends to
+  queue 1 until promotion; see below). They are taken
   at the stack's time as of the promotion, not the transport's build: a
   transport's first poll reads the clock (it used to wait for the
   periodic refresh, so a neighbour learned from those frames was seeded
@@ -208,27 +225,17 @@ What step 6 found, and settled:
   primary** does not: Linux makes no neighbour entry from an incoming
   SYN, and with the default `arp_accept=0` ignores the replica's
   gratuitous ARP, so it ARPs for the replica. In port mode and shared
-  mode the replica's polled transport answers; in queue mode the request
-  lands on the unpolled queue 0 and the link never comes up. A
-  queue-mode DPDK replica of a kernel-TCP primary therefore needs a
-  static neighbour entry for the replica on the primary (or
-  `arp_accept=1` there, to take the gratuitous ARP). Reasoned from the
-  kernel's behaviour, not yet run on the rig (a kernel-TCP primary with
-  an empty ARP cache and a queue-mode replica would confirm it); step 8
-  must state it. Two further consequences, both in queue mode
-  only, where queue 0 is the port's default queue: ARP requests for the
-  replica's address go unanswered until promotion, so a **router between a
-  queue-mode replica and its primary cannot resolve the replica** unless
-  it has a static entry (or learns from the gratuitous ARP each transport
-  sends at boot); and in both split modes a **client connecting to a
-  replica sees no answer** rather than the refusal a shared-mode DPDK
-  replica sends (its stack is what refuses, and it is not polled), as a
-  kernel-TCP replica leaves it waiting. Port mode's replication NIC is
-  polled from boot and answers ARP for its own address. Neither is fixed
-  here: a replica could poll its client queue from the receiver's thread
-  (on every step of the receiver's loops, the replica's ack path), or an
-  ARP rule could send ARP to queue 1 on a replica; both are larger than
-  their gap, which the operator docs (step 8) must state instead.
+  mode the replica's polled transport answers. In queue mode, where queue
+  0 is the port's default queue, step 6 left the request on the unpolled
+  queue 0, so the link never came up, and a **router between the replica
+  and its primary** could not resolve it either: closed since by an ARP
+  rule (see "ARP on a queue-mode replica" below). In both split modes a
+  **client connecting to a replica sees no answer** rather than the
+  refusal a shared-mode DPDK replica sends (its stack is what refuses, and
+  it is not polled), as a kernel-TCP replica leaves it waiting; the
+  operator docs (step 8) must state it. Not fixed: a replica could poll
+  its client queue from the receiver's thread (on every step of the
+  receiver's loops, the replica's ack path), which is larger than the gap.
 - **A dropped transport gave back too little.** A zero-copy socket keeps
   the mbufs of received data not yet read until it is read, reset or
   aborted, and dropping it did none of these; nor did the device free the
@@ -251,9 +258,10 @@ What step 6 found, and settled:
   `destination_ports`): in queue mode the client port, and the node's own
   replication port, which steers to the right queue but is not the dial's
   to take. Shared and port modes steer by no port, and dial as before.
-- **A promoted queue-mode replica keeps its replica's rules.** Rules are
-  installed once, at boot, so the client-port rule and the rule on the
-  old primary's replication port stay. Both are harmless to a primary: the
+- **A promoted queue-mode replica keeps its replica's TCP rules.** They
+  are installed once, at boot, so the client-port rule and the rule on the
+  old primary's replication port stay (the ARP rule, added after step 6,
+  is removed at promotion: see below). Both are harmless to a primary: the
   client-port rule sends to the queue the default RSS would, and the
   source-port rule outranks no client (the client-port rule is above it)
   and matches nothing else a primary is sent but replication, which it
@@ -266,6 +274,86 @@ What step 6 found, and settled:
   replica's replication queue or NIC as any address is. In port mode the
   replica's replication NIC dials it with
   `--dpdk-replication-peer-mac` naming that primary's client NIC.
+
+### ARP on a queue-mode replica
+
+Closed after step 6, as its own change. On a replica in queue mode whose
+port is not isolated, the plan adds a rule sending every ARP frame
+(EtherType 0x0806) to queue 1 (`SteeringPlan::arp_until_promotion`); the
+node keeps the rule's handle, one per port, and removes it at promotion
+(`DpdkShared::end_replica_steering`), before the client queue is polled
+as a primary's. What decided it:
+
+- **ARP requests before promotion.** Queue 1's transport has the node's
+  address and MAC (one interface per queue, on the group's one MAC), and
+  smoltcp answers a request whose target is its address. So a kernel-TCP
+  primary (`arp_accept=0`) and a router resolve the replica, and the link
+  comes up with no static neighbour entry. The replica's queue 0 no longer
+  collects ARP while unpolled.
+- **ARP replies before promotion.** Queue 0's transport sends nothing
+  until promotion but its boot-time gratuitous ARP, an announcement that
+  expects no reply, so no reply is owed to it. Queue 1's transport ARPs
+  only when a neighbour it needs is missing: the primary's MAC is seeded
+  at every dial and re-seeded from the primary's frames (the device's MAC
+  learning, at most every 30 s while frames arrive), and the gateway's is
+  seeded and re-seeded every 20 s, so it ARPs when the primary's entry
+  expires (60 s with nothing heard from it, which the liveness deadline
+  ends sooner) or is evicted (the stack's neighbour cache holds 64
+  entries, and every request for the node's address fills one). Before the
+  rule its reply landed on the unpolled queue 0 and was lost; it now comes
+  back to queue 1, the transport that asked.
+- **Replies to requests a transport did not send.** smoltcp takes any ARP
+  frame whose target address is its own: a request is answered, and a
+  request or a reply fills the neighbour cache with the sender, nothing
+  more. A reply queue 1 did not ask for (none is expected before
+  promotion) costs a cache entry, the oldest to expire evicted when full,
+  as on every polled DPDK transport today.
+- **After promotion the rule must go.** Queue 0's transport then ARPs
+  for every on-link client the stack has forgotten (an entry expired, or
+  evicted once a primary has more on-link peers than its 64-entry cache),
+  and must read the replies. Left in place, the rule would send them to
+  queue 1, whose transport would fill its own cache from them and answer
+  nothing, and the client would stall for the stack's discovery timeout
+  each time. Removed, ARP goes to queue 0 through the pinned RSS table,
+  exactly as on a primary booted in queue mode, which has no ARP rule:
+  for ARP, a promoted node's steering is the boot-time primary's. Its TCP
+  rules still differ, harmlessly (see above). The removal runs once per
+  process, on the one path both promotions take (the operator's `PROMOTE`
+  and raft's both end the receiver, which returns to `run_dpdk_impl`). A
+  port that refuses it leaves the rule in place and the node serving,
+  with a warning: it still answers ARP (on queue 1) and still learns
+  every peer that sends it a packet, and what it loses is a stall for a
+  client it must resolve again, not its clients.
+- **Why not match only what is safe.** Steering only requests would make
+  the removal unnecessary, but `rte_flow` matches the ARP opcode only
+  through `ARP_ETH_IPV4`, which mlx5 does not support, and matching the
+  broadcast destination instead misses the unicast requests Linux sends to
+  confirm a stale neighbour entry (`ucast_probes`), so a kernel-TCP
+  primary's entry for the replica would fail once it went stale.
+- **The level.** Level 0, shared with the replica's client-port rule,
+  which every replica has: no new level, so the plans stay at two levels
+  (three on an isolated replica, which gets no ARP rule). The ARP rule's
+  pattern (ETH type 0x0806 / END) and every IPv4 rule's (ETH / IPV4 ...,
+  which carries EtherType 0x0800) match disjoint frames, and `rte_flow`
+  leaves only overlapping rules at one level undefined. mlx5 folds a
+  level into sub-priorities by the deepest layer matched, an L2-only rule
+  ranking lowest within it, which disjoint patterns make irrelevant.
+- **Isolated (bifurcated) mode:** no rule. The kernel owns the address
+  and answers ARP, as it always has; the plan's rules capture IPv4 only.
+  **Shared and port modes:** unchanged, no rule (shared polls queue 0 from
+  boot; port mode's replication NIC answers for its own address). **A
+  queue-mode primary at boot:** no rule, as queue 0 is polled from the
+  start.
+
+What runs where: which modes and roles get the rule, its level and its
+disjointness from the TCP rules, and that a promoted replica's ARP
+steering is the boot-time primary's are unit-tested on every host
+(`melin_dpdk::steering`). Under the netns runner the promotion's removal
+runs on every DPDK promotion (port and shared modes, the operator's and
+raft's), finding nothing to remove, and `transport_rebuild` calls it on
+both NIC groups of a port-mode node, twice. Hardware-only: the rule's
+installation, its handle and its removal (af_packet has no `rte_flow`,
+and queue mode does not come up there), checked on the rig.
 
 ## Order of work
 
@@ -304,7 +392,9 @@ unchanged after every step.
    in `shared` mode, the other replica rejoining the promoted node), a
    `queue`-mode replica refused on one queue pair, and a transport rebuilt
    on its queue. Hardware-only: a `queue`-mode replica end to end (the
-   rules, queue 1's receiver, the unpolled queue 0).
+   rules, queue 1's receiver, the unpolled queue 0). Followed by the
+   replica's ARP rule, removed at promotion (see "ARP on a queue-mode
+   replica"), its own change.
 7. **Bench suite.** `DPDK_REPLICATION=shared,queue[,port]` runs each value
    as its own pass of the DPDK transport, from one build. Results are
    named `dpdk-shared`, `dpdk-queue`, and so on. `port` mode reads
@@ -327,9 +417,10 @@ unchanged after every step.
    `dpdk-proc-info` for checking steering. And they must say what a
    replica in `queue` or `port` mode does differently (step 6): a client
    connecting to it is left unanswered rather than refused (the sentence
-   in `replication.md` step 6 qualified), and in `queue` mode it answers
-   no ARP until promoted, so its primary must reach it without a router
-   resolving it.
+   in `replication.md` step 6 qualified). In `queue` mode it answers ARP
+   from its replication queue until promoted, so a kernel-TCP primary or
+   a router resolves it as any host; nothing to say there beyond the
+   mode's mlx5 requirement.
 
 ## The measurement
 
@@ -364,11 +455,23 @@ cost is one more spinning core per node.
 - **Driver and transport `Send`.** The driver ran on its own thread
   before April. The transport is built on the thread that polls it, so it
   never crosses a thread boundary.
-- **A `queue`-mode replica behind a router** answers no ARP until it is
-  promoted (see "Replica and promotion"). Check whether the rig's
-  replicas reach their primary through one; if a deployment needs it,
-  steer ARP to queue 1 on a replica, or poll queue 0 from the receiver's
-  thread.
+- **A `queue`-mode replica's ARP rule** (see "ARP on a queue-mode
+  replica"), hardware-only. On the rig: that mlx5 accepts the
+  EtherType-only rule at level 0 beside the client-port rule (a refusal
+  fails the replica's boot naming the rule); that a kernel-TCP primary
+  with an empty ARP cache (`ip neigh flush`) resolves a queue-mode
+  replica and its link comes up, the replica's queue 1 counting the ARP
+  frames; the same with the replica run with `--dpdk-vlan`, where ARP
+  arrives 802.1Q-tagged and the rule (ETH type 0x0806, no VLAN item)
+  matches only if mlx5 compares the EtherType after the tag, as
+  `rte_flow` documents the field as "EtherType or TPID" and leaves it
+  open (if queue 1 counts nothing there, the shim needs an
+  ETH / VLAN(inner type 0x0806) variant of the rule for VLAN
+  deployments); and that at promotion the node's log names the rule
+  removed, and an `arping` of the promoted node is answered with
+  queue 0, not queue 1, counting it. That log line is the only check on
+  the promotion's removal call: the netns promotions run it with nothing
+  to remove, so no test fails if it is dropped.
 - **mlx5 with an unpolled queue**: confirm on the rig that a full queue 0
   drops per queue (`rx_out_of_buffer`) and never pauses the port, so a
   replica's queue 1 keeps flowing under a client flood to its address.

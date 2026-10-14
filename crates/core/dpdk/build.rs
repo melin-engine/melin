@@ -247,9 +247,12 @@ fn generate_bindings() {
         .allowlist_function("dpdk_eth_rss_ip")
         .allowlist_function("dpdk_eth_rss_tcp")
         .allowlist_function("dpdk_eth_mq_rx_rss")
-        // rte_flow steering for bifurcated PMD mode.
+        // rte_flow steering: bifurcated PMD mode, and replication on a
+        // queue of its own (with a replica's ARP rule, removed at
+        // promotion).
         .allowlist_function("dpdk_flow_isolate")
         .allowlist_function("dpdk_install_steering_rule")
+        .allowlist_function("dpdk_remove_steering_rule")
         .allowlist_function("dpdk_pin_rss_reta")
         // Types.
         .allowlist_type("dpdk_steering_rule")

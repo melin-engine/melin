@@ -2623,11 +2623,13 @@ where
         // ring does not hold anyway, and nothing the replica needs arrives
         // only there: the primary's MAC is seeded, not resolved (the
         // `--dpdk-peer-mac`, or `--dpdk-replication-peer-mac` in port
-        // mode), and a DPDK primary learns the replica's from its frames.
-        // A kernel-TCP primary ARPs for it instead, which in queue mode
-        // lands on the unpolled queue 0: it needs a static neighbour entry.
-        // See docs/internal/dpdk-replication-split-2026-10.md for that and
-        // for what a client and a router then see.
+        // mode), a DPDK primary learns the replica's from its frames, and
+        // ARP, which a kernel-TCP primary or a router resolves the replica
+        // by, reaches the replication transport: in port mode on its NIC
+        // of its own, in queue mode by a rule the NIC holds until
+        // promotion (`SteeringPlan::arp_until_promotion`). See
+        // docs/internal/dpdk-replication-split-2026-10.md for what a
+        // client then sees.
         let mut client_transport =
             melin_dpdk::DpdkTransport::from_shared_unlistening(shared, &dpdk_config, 0)?;
         client_transport.send_gratuitous_arp();
@@ -2679,6 +2681,12 @@ where
                 // replication poll thread builds its own on the seat's
                 // queue: one transport per queue at a time.
                 drop(seat_transport);
+                // ARP back to the client queue, as on a primary booted in
+                // this mode, before anything polls that queue as a
+                // primary's: left on the replication queue, the replies to
+                // the client transport's own requests would go unread
+                // there. In queue mode only; elsewhere nothing to remove.
+                end_replica_steering(shared);
                 // See the kernel-TCP promotion path.
                 check_promotable(&writer)?;
                 // Release --health-bind before run_as_primary_dpdk rebinds it.
@@ -2873,6 +2881,31 @@ where
         raft_status,
         journal_tip,
     )
+}
+
+/// Remove the steering a promoted DPDK replica's client NIC held for it as
+/// a replica (`DpdkShared::end_replica_steering`: in queue mode, ARP sent
+/// to the replication queue), so that the NIC steers as a primary's booted
+/// in the node's mode does. Both promotions, the operator's `PROMOTE` and
+/// raft's, end the receiver the same way and come through here.
+///
+/// A rule the NIC refuses to remove does not stop the promotion: the node
+/// still answers ARP (on its replication queue) and still learns every
+/// peer that sends it a packet, and what it loses, the replies to its
+/// client queue's own requests, costs a client the stack has forgotten a
+/// stall, not the node its clients. Said out loud, as a degraded node is.
+#[cfg(feature = "dpdk")]
+fn end_replica_steering(client_nic: &melin_dpdk::DpdkShared) {
+    match client_nic.end_replica_steering() {
+        Ok(0) => {}
+        Ok(removed) => info!(removed, "replica steering removed at promotion"),
+        Err(e) => warn!(
+            error = %e,
+            "replica steering not removed at promotion: ARP stays on the replication queue, \
+             so the client queue's own ARP requests go unanswered and a client it must \
+             resolve again stalls"
+        ),
+    }
 }
 
 /// Run the server as a DPDK primary: the DPDK twin of [`run_as_primary`],

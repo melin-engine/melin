@@ -22,7 +22,10 @@
 //! in shared mode (as before), two in queue mode, three only on an
 //! isolated (bifurcated) replica, the one case where three rankings are
 //! all needed (see [`SteeringPlan::for_client_nic`]). A level the device
-//! does not offer fails the rule's creation at boot, naming the rule.
+//! does not offer fails the rule's creation at boot, naming the rule. A
+//! replica's ARP rule ([`SteeringPlan::arp_until_promotion`]) takes no
+//! level of its own: it matches ARP frames, which no IPv4 rule matches, so
+//! it shares the first level without ambiguity.
 //!
 //! If a device refuses that third level: isolated mode is mlx5-only, and
 //! mlx5's per-layer folding already ranks the TCP-matching replication
@@ -30,6 +33,31 @@
 //! could share the replication rules' level there. That leans on a
 //! PMD-specific sub-priority rather than on `rte_flow`'s contract, which
 //! is why the plan does not do it unless the hardware forces it.
+//!
+//! # ARP on a queue-mode replica
+//!
+//! A replica in queue mode leaves its client queue unpolled until it is
+//! promoted, and a port that is not isolated sends every packet no rule
+//! takes there, ARP included. Its replication queue's transport has the
+//! node's address and MAC, so the plan sends ARP there instead, and the
+//! replica answers for its address before promotion: to a kernel-TCP
+//! primary, which resolves it by ARP, and to a router. The same rule brings
+//! back the replies to that transport's own requests (a neighbour evicted
+//! or expired), which would otherwise wait on the unpolled queue.
+//!
+//! The rule goes at promotion, before the client queue is polled as a
+//! primary's, so that a promoted node steers ARP as a primary booted in
+//! queue mode does: to the client queue. Left in place it would take the
+//! replies to the client transport's own requests (a client evicted from
+//! its neighbour cache, which a primary with more on-link peers than the
+//! cache holds meets in steady state) to the replication queue, where they
+//! answer nothing, and that client would stall for the stack's discovery
+//! timeout each time. Matching requests alone would avoid that, but
+//! `rte_flow` matches the ARP opcode only through its `ARP_ETH_IPV4` item,
+//! which mlx5 does not support, and matching the broadcast destination
+//! instead would miss the unicast requests Linux sends to confirm a stale
+//! neighbour entry. An isolated port leaves ARP to the kernel, which owns
+//! the address there: no rule.
 
 use std::net::Ipv4Addr;
 
@@ -186,9 +214,40 @@ impl std::fmt::Display for SteeringRule {
     }
 }
 
+/// One `rte_flow` rule matching every frame of one EtherType, whatever it
+/// carries, to [`queue`](Self::queue): a replica's ARP
+/// ([`SteeringPlan::arp_until_promotion`]).
+///
+/// A type of its own rather than an EtherType field on [`SteeringRule`],
+/// whose IPv4 and TCP fields would then be a combination the NIC has to
+/// refuse: each type can only describe a pattern the shim builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EtherTypeRule {
+    /// The rule's level in group 0, as [`SteeringRule::priority`].
+    pub priority: u32,
+    /// The EtherType matched, in host order. `u16`, as the Ethernet
+    /// header's field is.
+    pub ether_type: u16,
+    /// The RX queue matching frames go to.
+    pub queue: u16,
+}
+
+/// As the rule is logged at boot and named in a failure to install or
+/// remove it: `ether type 0x0806 -> queue 1 (priority 0)`.
+impl std::fmt::Display for EtherTypeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ether type {:#06x} -> queue {} (priority {})",
+            self.ether_type, self.queue, self.priority
+        )
+    }
+}
+
 /// How a NIC group's ports split their traffic: the queue pairs, whether
-/// the port is isolated, whether RSS is pinned to the client queue, and
-/// the rules, in the order they are installed.
+/// the port is isolated, whether RSS is pinned to the client queue, the
+/// rules, in the order they are installed, and the ARP rule a replica holds
+/// until it is promoted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SteeringPlan {
     /// The queue pairs each port is configured with.
@@ -207,6 +266,16 @@ pub struct SteeringPlan {
     /// ones in place. A `Vec`: ordered, built once at boot, and at most
     /// four.
     pub rules: Vec<SteeringRule>,
+    /// On a replica in queue mode whose port is not isolated: every ARP
+    /// frame to [`REPLICATION_QUEUE`], whose transport answers for the
+    /// node's address while the client queue goes unpolled, at the first
+    /// level (which the replica's client-port rule always takes; ARP
+    /// matches none of the IPv4 rules). Installed after [`Self::rules`]
+    /// and removed when the node is promoted, after which ARP goes where
+    /// it goes on a primary booted in queue mode: the client queue. See
+    /// the module's documentation for why it must go. `None` everywhere
+    /// else.
+    pub arp_until_promotion: Option<EtherTypeRule>,
 }
 
 impl SteeringPlan {
@@ -222,6 +291,7 @@ impl SteeringPlan {
             isolated: nic.peer_ip.is_some(),
             pin_rss_to_client_queue: false,
             rules: nic.peer_ip.map(peer_capture).into_iter().collect(),
+            arp_until_promotion: None,
         }
     }
 
@@ -253,6 +323,10 @@ impl SteeringPlan {
     ///
     /// Levels are numbered densely from 0 over the ranks present (see the
     /// module's documentation).
+    ///
+    /// And on a replica whose port is not isolated, ARP to
+    /// [`REPLICATION_QUEUE`] until promotion
+    /// ([`Self::arp_until_promotion`]), at the client-port rule's level.
     ///
     /// Refused: queue mode with more than one client queue (the second
     /// queue is replication's), with neither replication port (nothing to
@@ -355,12 +429,63 @@ impl SteeringPlan {
                 priority += 1;
             }
         }
+        // A replica's ARP, unless the port is isolated (the kernel's then):
+        // at the client-port rule's level, the first, which a replica
+        // always has.
+        let arp_until_promotion = match (client, peer) {
+            (Some(_), None) => Some(EtherTypeRule {
+                priority: 0,
+                ether_type: crate::arp::ETHER_TYPE,
+                queue: REPLICATION_QUEUE,
+            }),
+            _ => None,
+        };
         Ok(SteeringPlan {
             queues: QueuePlan::ReplicationSplit,
             isolated: peer.is_some(),
             pin_rss_to_client_queue: peer.is_none(),
             rules,
+            arp_until_promotion,
         })
+    }
+}
+
+/// Take the rules a NIC group holds until its node is promoted out of
+/// `held` and remove each with `remove`, which installs nothing and names
+/// a rule it could not remove in its error. Returns how many it removed.
+///
+/// Every rule is taken, so a second call finds none and succeeds with 0:
+/// a refused rule stays installed until its port closes rather than being
+/// tried again. One refusal does not stop the others' removal; the refusals
+/// come back together, joined by `; `.
+///
+/// Generic over the rule so that the gated port code's
+/// (`DpdkShared::end_replica_steering`) runs on every host's tests too.
+#[cfg_attr(not(feature = "dpdk-sys"), allow(dead_code))]
+pub(crate) fn remove_until_promotion<R>(
+    held: &std::sync::Mutex<Vec<R>>,
+    mut remove: impl FnMut(R) -> Result<(), String>,
+) -> Result<usize, String> {
+    let rules = std::mem::take(
+        &mut *held
+            .lock()
+            // Nothing panics while the lock is held (a take), so a
+            // poisoned lock still guards a whole list.
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let mut removed = 0;
+    // A `Vec`: the refusals in port order, joined once.
+    let mut refused = Vec::new();
+    for rule in rules {
+        match remove(rule) {
+            Ok(()) => removed += 1,
+            Err(e) => refused.push(e),
+        }
+    }
+    if refused.is_empty() {
+        Ok(removed)
+    } else {
+        Err(refused.join("; "))
     }
 }
 
@@ -480,6 +605,7 @@ mod tests {
                 isolated: false,
                 pin_rss_to_client_queue: false,
                 rules: vec![],
+                arp_until_promotion: None,
             }
         );
         assert_eq!(
@@ -489,6 +615,7 @@ mod tests {
                 isolated: true,
                 pin_rss_to_client_queue: false,
                 rules: vec![todays_peer_rule()],
+                arp_until_promotion: None,
             }
         );
     }
@@ -532,6 +659,8 @@ mod tests {
                     tcp_dst_port: Some(LISTEN_PORT),
                     ..rule(0, REPLICATION_QUEUE)
                 }],
+                // Its client queue is polled from boot, and takes ARP.
+                arp_until_promotion: None,
             }
         );
     }
@@ -582,6 +711,93 @@ mod tests {
         );
     }
 
+    /// The rule sending ARP to the replication queue.
+    const REPLICA_ARP: EtherTypeRule = EtherTypeRule {
+        priority: 0,
+        ether_type: 0x0806,
+        queue: REPLICATION_QUEUE,
+    };
+
+    /// A replica in queue mode on a port that is not isolated sends ARP to
+    /// the queue it polls, whatever its replication ports, at the first
+    /// level, beside its client-port rule.
+    #[test]
+    fn a_queue_mode_replica_sends_arp_to_its_replication_queue() {
+        for listen in [None, Some(LISTEN_PORT), Some(PRIMARY_PORT)] {
+            let plan = plan(None, queue_mode(listen, Some(PRIMARY_PORT)));
+            assert_eq!(plan.arp_until_promotion, Some(REPLICA_ARP), "{listen:?}");
+            assert_eq!(plan.rules[0].priority, REPLICA_ARP.priority);
+        }
+    }
+
+    /// No ARP rule where the client queue is polled from boot (a primary),
+    /// where the kernel keeps ARP (an isolated port, in any role), and in
+    /// the modes with no split (shared, port), in any role.
+    #[test]
+    fn no_arp_rule_but_on_a_queue_mode_replica_s_own_port() {
+        for peer_ip in [None, Some(PEER_IP)] {
+            let primary = plan(peer_ip, queue_mode(Some(LISTEN_PORT), None));
+            assert_eq!(primary.arp_until_promotion, None, "{peer_ip:?}");
+            for replication in [ReplicationNic::Shared, ReplicationNic::Port(nic(None))] {
+                let config = config(peer_ip, replication);
+                for plan in [
+                    SteeringPlan::for_client_nic(&config),
+                    SteeringPlan::for_replication(&config),
+                ] {
+                    assert_eq!(plan.expect("a plan").arp_until_promotion, None);
+                }
+            }
+        }
+        for listen in [None, Some(LISTEN_PORT)] {
+            let isolated_replica = plan(Some(PEER_IP), queue_mode(listen, Some(PRIMARY_PORT)));
+            assert_eq!(isolated_replica.arp_until_promotion, None, "{listen:?}");
+        }
+    }
+
+    /// What no rule takes, ARP included once a replica's ARP rule is
+    /// removed at promotion, lands on the client queue on a queue-mode
+    /// port that is not isolated, a primary's from boot as a replica's: the
+    /// RSS table is pinned there. So a promoted replica steers ARP as a
+    /// primary booted in queue mode does, and its client queue takes the
+    /// replies to its own requests.
+    #[test]
+    fn without_the_arp_rule_arp_lands_on_the_client_queue() {
+        let booted = plan(None, queue_mode(Some(LISTEN_PORT), None));
+        for plan in [
+            booted,
+            plan(None, queue_mode(Some(LISTEN_PORT), Some(PRIMARY_PORT))),
+        ] {
+            assert!(plan.pin_rss_to_client_queue && !plan.isolated, "{plan:?}");
+        }
+    }
+
+    /// Removal at promotion takes every held rule, removes all it can, and
+    /// names every refusal; a second promotion finds nothing to remove.
+    #[test]
+    fn removal_at_promotion_takes_every_rule_once() {
+        let held = std::sync::Mutex::new(vec![1, 2, 3]);
+        let mut tried = Vec::new();
+        let result = remove_until_promotion(&held, |rule: u16| {
+            tried.push(rule);
+            if rule == 2 {
+                Ok(())
+            } else {
+                Err(format!("rule {rule} refused"))
+            }
+        });
+        assert_eq!(result, Err("rule 1 refused; rule 3 refused".to_owned()));
+        assert_eq!(tried, [1, 2, 3]);
+        assert_eq!(
+            remove_until_promotion(&held, |_: u16| -> Result<(), String> {
+                panic!("a rule removed twice")
+            }),
+            Ok(0)
+        );
+
+        let held = std::sync::Mutex::new(vec![1, 2]);
+        assert_eq!(remove_until_promotion(&held, |_: u16| Ok(())), Ok(2));
+    }
+
     /// The usual deployment: every node replicates on the same port. Still
     /// two rules, one per direction.
     #[test]
@@ -618,6 +834,7 @@ mod tests {
                         ..rule(1, CLIENT_QUEUE)
                     },
                 ],
+                arp_until_promotion: None,
             }
         );
     }
@@ -929,6 +1146,10 @@ mod tests {
                 distinct.dedup();
                 let dense: Vec<u32> = (0..distinct.len() as u32).collect();
                 assert_eq!(distinct, dense);
+                // The ARP rule shares a level the rules take: it adds none.
+                if let Some(arp) = plan.arp_until_promotion {
+                    assert!(levels.contains(&arp.priority), "{arp} beside {levels:?}");
+                }
             }
         }
     }
@@ -1047,6 +1268,10 @@ mod tests {
         assert_eq!(
             SteeringRule::to_queue(0).to_string(),
             "any ipv4 -> queue 0 (priority 0)"
+        );
+        assert_eq!(
+            REPLICA_ARP.to_string(),
+            "ether type 0x0806 -> queue 1 (priority 0)"
         );
     }
 }
