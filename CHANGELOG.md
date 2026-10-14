@@ -192,6 +192,12 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   with it. The `shm-proxy` binary's DPDK path is tested there too, end to
   end, with `melin-test-node`'s `dpdk_client_process_eal_args` putting it
   on the client pair in a process of its own.
+- **`melin_dpdk::dial_addr`** (re-exported by `melin-client`'s `dpdk`
+  feature): the address check a DPDK dial needs before a NIC comes up,
+  IPv4 and not loopback, with the reason to print. The echo client and
+  the `shm-proxy` share it.
+- **`ByteStream` is implemented for `&mut S`** where `S: ByteStream`, so
+  a caller holding its streams in a collection lends one per call.
 
 ### Changed
 
@@ -284,6 +290,14 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   supply them. `response::run` returns a `bool` (whether the stage
   started) instead of `()`, so a `JoinHandle<()>` binding for its thread
   no longer compiles.
+- **`melin-dpdk`'s C wrapper is compiled for the target, not the build
+  machine.** The x86 ISA baseline applies only when building for x86_64,
+  and the CPU is the one rustc builds for (`-C target-cpu`), so a cross
+  build compiles the wrapper for the hosts that will run it rather than
+  dropping the build machine's CPU name.
+- **The `shm-proxy` refuses a loopback `--server` on DPDK** before
+  bringing the NIC up, as the echo client does; a NIC never reaches
+  loopback, and the dial used to wait out its timeout instead.
 
 ### Fixed
 

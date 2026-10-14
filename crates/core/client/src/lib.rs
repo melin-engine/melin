@@ -180,7 +180,7 @@ pub use dpdk::DpdkStream;
 #[cfg(feature = "dpdk")]
 pub use melin_dpdk::{
     MacParseError, NextHop, NicClock, NicConfig, NicHandle, NicStream, PeerMacSource, StreamId,
-    fmt_mac, try_parse_mac,
+    dial_addr, fmt_mac, try_parse_mac,
 };
 
 // The key types a caller needs to hold, so that depending on this crate

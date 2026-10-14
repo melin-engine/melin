@@ -55,22 +55,45 @@ fn generate_bindings() {
     for path in &dpdk.include_paths {
         cc.include(path);
     }
-    // DPDK's inline headers use SSSE3 and SSE4.2 intrinsics unconditionally
-    // (`rte_memcpy.h` reaches `_mm_alignr_epi8`), so an ISA baseline is a hard
-    // requirement rather than a tuning choice. x86-64-v2 — SSE3, SSSE3,
-    // SSE4.1, SSE4.2, POPCNT — is DPDK's own x86 minimum.
-    //
-    // This used to be `flag_if_supported("-march=native")` alone, which turned
-    // that requirement into a best-effort: clang cannot always probe the host
-    // CPU (hosted CI runners are the case that caught us), the flag was then
-    // dropped without comment, and the build failed deep inside DPDK's headers
-    // with "needs target feature ssse3" — on some machines and not others.
-    cc.flag("-march=x86-64-v2");
-    // Prefer the build machine's own ISA when clang can detect it, matching
-    // `.cargo/config.toml`'s `target-cpu=native`. A later `-march` wins, so
-    // this raises the baseline; losing it now costs codegen quality instead of
-    // breaking the build.
-    cc.flag_if_supported("-march=native");
+    // The target's ISA, not the build machine's: both are the same in a
+    // native build, and a cross build (the LAN suite builds on the operator's
+    // machine for the bench hosts) compiles for the CPU rustc is told about.
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+        // DPDK's inline headers use SSSE3 and SSE4.2 intrinsics
+        // unconditionally (`rte_memcpy.h` reaches `_mm_alignr_epi8`), so an
+        // ISA baseline is a hard requirement rather than a tuning choice.
+        // x86-64-v2 — SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT — is DPDK's own x86
+        // minimum.
+        //
+        // This used to be `flag_if_supported("-march=native")` alone, which
+        // turned that requirement into a best-effort: clang cannot always
+        // probe the host CPU (hosted CI runners are the case that caught us),
+        // the flag was then dropped without comment, and the build failed
+        // deep inside DPDK's headers with "needs target feature ssse3" — on
+        // some machines and not others.
+        cc.flag("-march=x86-64-v2");
+    }
+    // Then the CPU the Rust code is built for, so the wrapper matches it. A
+    // later `-march` wins, so this raises the baseline; losing it costs
+    // codegen quality instead of breaking the build.
+    match rust_target_cpu().as_deref() {
+        // `.cargo/config.toml`'s default: the build machine, when clang can
+        // detect it. Only meaningful in a native build; a cross build names
+        // its CPU.
+        Some("native") | None => {
+            if std::env::var("HOST") == std::env::var("TARGET") {
+                cc.flag_if_supported("-march=native");
+            }
+        }
+        // rustc's CPU names are LLVM's, which clang takes: as `-march` on
+        // x86, as `-mcpu` elsewhere.
+        Some(cpu) if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") => {
+            cc.flag(format!("-march={cpu}"));
+        }
+        Some(cpu) => {
+            cc.flag(format!("-mcpu={cpu}"));
+        }
+    }
     cc.compile("dpdk_wrappers");
 
     // Find the system clang's resource directory for system headers (stddef.h,
@@ -233,6 +256,28 @@ fn generate_bindings() {
     bindings
         .write_to_file(out_path.join("dpdk_bindings.rs"))
         .expect("failed to write dpdk_bindings.rs");
+}
+
+/// The CPU rustc builds this crate for (`-C target-cpu`), the last one
+/// given winning as it does for rustc, or `None` when none is.
+#[cfg(feature = "dpdk-sys")]
+fn rust_target_cpu() -> Option<String> {
+    // Cargo hands a build script the target's flags joined by 0x1f.
+    let flags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let mut cpu = None;
+    let mut after_c = false;
+    for flag in flags.split('\x1f') {
+        let codegen = if after_c {
+            Some(flag)
+        } else {
+            flag.strip_prefix("-C")
+        };
+        after_c = flag == "-C";
+        if let Some(value) = codegen.and_then(|c| c.strip_prefix("target-cpu=")) {
+            cpu = Some(value.to_string());
+        }
+    }
+    cpu
 }
 
 /// Find the system clang, preferring /usr/bin/clang over whatever is in PATH.

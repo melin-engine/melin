@@ -36,18 +36,7 @@ const SOCKET_BUFFER: usize = 64 * 1024;
 /// reaches and a NIC never does; left to the dial, that default would
 /// wait out the timeout and then blame the peer MAC.
 pub fn check_server(server: SocketAddr) -> Result<SocketAddrV4, Error> {
-    let server = match server {
-        SocketAddr::V4(v4) => v4,
-        SocketAddr::V6(_) => return Err("the DPDK transport is IPv4 only".into()),
-    };
-    if server.ip().is_loopback() {
-        return Err(format!(
-            "--server {server}: a DPDK NIC cannot reach loopback; give the node's address on \
-             the DPDK network"
-        )
-        .into());
-    }
-    Ok(server)
+    melin_client::dial_addr(server).map_err(|why| format!("--server {server}: {why}").into())
 }
 
 /// Bring the NIC up from `args`, dial `server` on it and authenticate:

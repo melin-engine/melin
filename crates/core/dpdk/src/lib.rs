@@ -67,6 +67,7 @@ pub use args::{DpdkArgs, DpdkArgsError};
 // clock, local ports, dial wait and stream I/O are TCP-stack logic, tested
 // over an in-memory wire. The handle itself is in the gated `dpdk` module.
 mod nic;
+pub use nic::dial_addr;
 #[cfg(test)]
 mod test_wire;
 

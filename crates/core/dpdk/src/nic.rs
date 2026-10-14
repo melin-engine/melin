@@ -337,6 +337,20 @@ impl std::fmt::Display for NextHop {
     }
 }
 
+/// `addr` as a dial on a NIC takes it, or why it cannot: the transport is
+/// IPv4 only, and no NIC reaches loopback. For a binary to refuse an
+/// address before it brings a NIC up; the reason reads after the flag
+/// that gave the address (`--server <addr>: <reason>`).
+pub fn dial_addr(addr: std::net::SocketAddr) -> Result<SocketAddrV4, &'static str> {
+    match addr {
+        std::net::SocketAddr::V4(v4) if v4.ip().is_loopback() => {
+            Err("a DPDK NIC cannot reach loopback; give the node's address on the DPDK network")
+        }
+        std::net::SocketAddr::V4(v4) => Ok(v4),
+        std::net::SocketAddr::V6(_) => Err("the DPDK transport is IPv4 only"),
+    }
+}
+
 /// Whether `peer` is on `ip`'s network: the two agree on the first
 /// `prefix_len` bits. A prefix of 0 takes every address, one of 32 or
 /// more only the address itself.
@@ -774,6 +788,18 @@ mod tests {
         let err = dial_error(peer(), DialFailure::Refused, next_hop);
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
         assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    #[test]
+    fn a_dial_takes_an_ipv4_address_a_nic_can_reach() {
+        let loopback = dial_addr("127.0.0.1:9876".parse().unwrap()).unwrap_err();
+        assert!(loopback.contains("loopback"), "{loopback}");
+        let v6 = dial_addr("[::1]:9876".parse().unwrap()).unwrap_err();
+        assert!(v6.contains("IPv4"), "{v6}");
+        assert_eq!(
+            dial_addr("10.0.0.1:9876".parse().unwrap()).unwrap(),
+            "10.0.0.1:9876".parse::<SocketAddrV4>().unwrap()
+        );
     }
 
     #[test]
