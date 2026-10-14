@@ -306,12 +306,15 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   `repl-poll` thread on the queue or NIC its receiver ran on, under the
   same ack policy. Its replicas point `--replica-of` at its replication
   address. A replica in either mode follows a primary in any mode, and the
-  reverse. Two differences from a shared-mode DPDK replica: a client
-  connecting to it is left unanswered rather than refused, and in queue
-  mode it answers no ARP until promoted. A DPDK primary on its subnet
-  learns its MAC from its frames; a kernel-TCP primary does not, and needs
-  a static neighbour entry for it (or `arp_accept=1`); a router between
-  them must already know its MAC. A
+  reverse. One difference from a shared-mode DPDK replica: a client
+  connecting to it is left unanswered rather than refused. In queue mode,
+  where its client queue is unread until promotion, the NIC sends ARP to
+  its replication queue instead, which answers for its address, so a
+  kernel-TCP primary or a router resolves it as any host; the rule is
+  removed at promotion, after which ARP goes to the client queue, as on a
+  primary booted in the mode (a rule the NIC refuses to remove is logged
+  as a warning, and the node serves on). Not in isolated (bifurcated)
+  mode, where the kernel answers ARP as before. A
   replica never dials its primary from a local port the NIC steers by
   destination (in queue mode, the client port), which would have the
   primary's answers steered to the client queue. In code:
@@ -319,9 +322,11 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   replication runs on) and `SteeringPlan::destination_ports`;
   `melin_dpdk::LocalPorts`, the local ports a dial takes, now public, with
   `LocalPorts::from_first` for a range of the caller's own;
-  `melin_server_runtime::replication::ReplicaDialPorts`, a replica's; and
+  `melin_server_runtime::replication::ReplicaDialPorts`, a replica's;
   `DpdkShared::mbufs_in_use`, how many of a NIC's mbufs are out of its
-  pool.
+  pool; `SteeringPlan::arp_until_promotion`, a `melin_dpdk::EtherTypeRule`,
+  and `DpdkShared::end_replica_steering`, which removes it; and
+  `melin_dpdk::arp::ETHER_TYPE`.
   - For contributors: `melin_test_node` passes a replica with a
     replication NIC its primary's MAC as `--dpdk-replication-peer-mac`,
     and brings a node's links back up when it has returned, so that a node
@@ -380,9 +385,10 @@ Anything source-breaking is called out under **Removed** or **Changed**.
   queue count (`QueuePlan::Rss(n)` is the old behaviour),
   `Port::install_src_ipv4_steering` is replaced by
   `Port::install_steering_rule`, `Port::pin_rss_reta` is new, and
-  `PortError` gains `TooFewQueues` and `RetaPinFailed` and a `message` on
-  `FlowRuleFailed`. Source-breaking for a direct user of `Port` and for a
-  match on either error.
+  `PortError` gains `TooFewQueues`, `RetaPinFailed` and
+  `FlowRuleRemovalFailed` and a `message` on `FlowRuleFailed`.
+  Source-breaking for a direct user of `Port` and for a match on either
+  error.
 
 - **`melin_transport_core::health::HealthState` has a new field,
   `transport_metrics`**, a transport's own series appended to `/metrics`

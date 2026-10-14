@@ -10,7 +10,8 @@
 //! the same queue, dials and carries TCP as a fresh one does. And a
 //! transport left unpolled after it is built, as the promoted replica's
 //! client transport was, polls first at the time it does so, not at its
-//! build's.
+//! build's. The promotion's removal of the steering a replica holds until
+//! then finds nothing to remove on these NICs, and succeeds.
 //!
 //! On the runner's first two slots' devices, both allowed at EAL init
 //! (`melin_test_node::dpdk_slots_eal_args`), brought up as a node in port
@@ -125,6 +126,15 @@ fn a_transport_dropped_with_data_unread_gives_its_mbufs_back_and_its_queue_serve
         idle,
         "a dropped transport gives back every mbuf it held ({held} were out)"
     );
+
+    // The promotion's steering removal, next on a promoted replica: in
+    // port mode neither NIC holds a rule until promotion (queue mode's ARP
+    // rule needs `rte_flow`, which af_packet lacks), so it removes nothing
+    // and succeeds, and so does every call after it.
+    for _ in 0..2 {
+        assert_eq!(nics.client.end_replica_steering(), Ok(0));
+        assert_eq!(replication.end_replica_steering(), Ok(0));
+    }
 
     // A new transport on the same queue carries TCP as a fresh one does,
     // from another local port: the peer still holds the first link.

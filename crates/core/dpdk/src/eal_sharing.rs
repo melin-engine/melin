@@ -105,7 +105,8 @@ pub(crate) fn check_further_group(first: &NicConfig, further: &NicConfig) -> Res
 /// this order is tested without libdpdk.
 pub(crate) struct OnEal<R, E> {
     /// Declared before `_eal`, so dropped before it: Rust drops fields in
-    /// declaration order. Held for their drop alone, hence the underscores.
+    /// declaration order. Held for their drop, hence the underscores (the
+    /// resources are lent out too, by [`Self::resources`]).
     _resources: R,
     _eal: Arc<E>,
 }
@@ -116,6 +117,13 @@ impl<R, E> OnEal<R, E> {
             _resources: resources,
             _eal: eal,
         }
+    }
+
+    /// The resources, for what they offer besides their drop (a NIC
+    /// group's steering rules to remove at promotion), while the EAL
+    /// under them is held.
+    pub(crate) fn resources(&self) -> &R {
+        &self._resources
     }
 }
 

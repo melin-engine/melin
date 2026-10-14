@@ -5,7 +5,7 @@
 //! DPDK poll thread calls `poll()` in a tight loop to drive all I/O.
 
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::ffi;
 
@@ -21,8 +21,8 @@ use crate::eal::{Eal, LcoreRegisterError, LcoreRegistration};
 use crate::eal_sharing::{EalGroup, OnEal};
 use crate::mempool::Mempool;
 use crate::peer_liveness::{self, PeerLiveness, StackClock};
-use crate::port::{ChecksumOffloads, Port};
-use crate::steering::{QueuePlan, SteeringPlan};
+use crate::port::{ChecksumOffloads, Port, RemovableRule};
+use crate::steering::{QueuePlan, SteeringPlan, remove_until_promotion};
 
 // Defined outside the `dpdk-sys` gate (`crate::config`); re-exported here so
 // `melin_dpdk::transport::DpdkConfig` still names it.
@@ -218,6 +218,15 @@ unsafe impl Sync for DpdkShared {}
 /// What a NIC group releases before its share of the EAL: its ports,
 /// then its pool (fields drop in declaration order).
 struct NicResources {
+    /// The steering rules the group holds until its node is promoted (a
+    /// queue-mode replica's ARP rule, one per port), removed then by
+    /// [`DpdkShared::end_replica_steering`]. Beside the ports they were
+    /// installed on, so that whoever reaches them holds the ports open;
+    /// dropped unremoved, they go with the ports. A `Mutex` because the
+    /// group is shared across its poll threads and the rules are taken
+    /// once, by whichever thread promotes the node, off every poll loop;
+    /// a `Vec`, one per port of the group, built once at bring-up.
+    until_promotion: Mutex<Vec<RemovableRule>>,
     _ports: Vec<Port>,
     _mempool: Mempool,
 }
@@ -570,8 +579,10 @@ impl DpdkShared {
         // the replication split, replication) into DPDK. Everything else
         // stays with the kernel. Not isolated, with the replication split,
         // the RSS redirection table is pinned to the client queue before
-        // the rules go in.
+        // the rules go in. A replica's ARP rule goes in last, its handle
+        // kept for its removal at promotion.
         let mut ports = Vec::with_capacity(config.port_ids.len());
+        let mut until_promotion = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
             // Each failure names its port: on an LACP bond, which member
@@ -586,7 +597,13 @@ impl DpdkShared {
             }
             for rule in &plan.rules {
                 port.install_steering_rule(rule)
-                    .map_err(|e| format!("port {pid} steering rule `{rule}`: {e}"))?;
+                    .map_err(|e| rule_error(pid, rule, e))?;
+            }
+            if let Some(rule) = &plan.arp_until_promotion {
+                until_promotion.push(
+                    port.install_removable_rule(rule)
+                        .map_err(|e| rule_error(pid, rule, e))?,
+                );
             }
             combined_offloads = Some(match combined_offloads {
                 None => port.offloads,
@@ -605,6 +622,7 @@ impl DpdkShared {
         Ok(Arc::new(DpdkShared {
             _nic: OnEal::new(
                 NicResources {
+                    until_promotion: Mutex::new(until_promotion),
                     _ports: ports,
                     _mempool: mempool,
                 },
@@ -625,6 +643,28 @@ impl DpdkShared {
     /// [`QueuePlan::client_queues`]).
     pub fn client_queues(&self) -> u16 {
         self.queue_plan.client_queues(self.num_queues)
+    }
+
+    /// Remove, from every port of the group, the steering rules it holds
+    /// until its node is promoted: in queue mode, a replica's rule sending
+    /// ARP to the replication queue ([`SteeringPlan::arp_until_promotion`]),
+    /// after which the group steers ARP as it does on a primary booted in
+    /// that mode, to the client queue, whose transport then takes the
+    /// replies to its own requests. Returns how many it removed.
+    ///
+    /// For a promoted replica, before its client queue is polled as a
+    /// primary's. Nothing to remove (every other mode and role, and every
+    /// call after the first) removes nothing and succeeds.
+    ///
+    /// # Errors
+    /// Every rule a port refused to remove, named with its port; the
+    /// others are removed regardless, and the refused ones stay installed
+    /// until the port closes.
+    pub fn end_replica_steering(&self) -> Result<usize, String> {
+        remove_until_promotion(&self._nic.resources().until_promotion, |rule| {
+            let (pid, shown) = (rule.port_id(), *rule.rule());
+            rule.remove().map_err(|e| rule_error(pid, &shown, e))
+        })
     }
 
     /// How many of the group's mbufs are out of its pool: held by its
@@ -649,6 +689,13 @@ impl DpdkShared {
     pub fn register_thread(self: &Arc<Self>) -> Result<LcoreRegistration, LcoreRegisterError> {
         LcoreRegistration::register(Arc::clone(self))
     }
+}
+
+/// A steering rule `rule` that port `pid` refused to install or remove, as
+/// a NIC group's error names it: the port first (on an LACP bond, which
+/// member refused), then the rule.
+fn rule_error(pid: u16, rule: &dyn std::fmt::Display, e: crate::port::PortError) -> String {
+    format!("port {pid} steering rule `{rule}`: {e}")
 }
 
 impl DpdkTransport {

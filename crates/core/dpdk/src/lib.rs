@@ -63,7 +63,7 @@ pub use config::{DpdkConfig, NicConfig, ReplicationNic, ReplicationPorts};
 // get and which flow rules steer traffic to them is decided from the
 // configuration alone, and the gated port code installs what it says.
 pub mod steering;
-pub use steering::{QueuePlan, SteeringError, SteeringPlan, SteeringRule};
+pub use steering::{EtherTypeRule, QueuePlan, SteeringError, SteeringPlan, SteeringRule};
 // Ungated for the same reason: per-queue packet counts are plain atomics,
 // counted by the gated device and reported by whoever holds them.
 mod queue_counters;

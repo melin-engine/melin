@@ -213,8 +213,9 @@ as the replication poll thread does; and `transport_rebuild.rs`, a
 transport dropped with a connection open and data unread, which gives
 every mbuf back to its pool (the pool's own count says so), and a new
 transport on the same queue carrying TCP after it, as a promoted replica's
-replication poll thread does. The binaries share their helpers in
-`tests/common/`.
+replication poll thread does (and the promotion's removal of a replica's
+steering, which finds nothing to remove on those NICs). The binaries
+share their helpers in `tests/common/`.
 
 ## Replication on a NIC of its own
 
@@ -257,6 +258,16 @@ never dials its primary from a port the NIC steers by destination (the
 client port) is unit-tested (`ReplicaDialPorts`, and the steering plan's
 `destination_ports`); its receiver on queue 1 and its unpolled queue 0 are
 checked on the rig.
+
+So is its ARP rule, which sends ARP to queue 1 until promotion and is
+removed then. Which modes and roles get it, at which level, and that a
+promoted replica's ARP steering is a boot-time primary's, are unit-tested
+in the steering plan. Under the runner, the removal runs on every DPDK
+promotion (port and shared modes, by `PROMOTE` and by raft) and finds
+nothing to remove, as it does in `transport_rebuild.rs` (above). The
+rule's installation, its kept handle and its removal need `rte_flow`,
+so the rig checks them: the checks are listed in the replication split's
+plan (`dpdk-replication-split-2026-10.md`, "Risks and open questions").
 
 ## Several nodes in one process
 
