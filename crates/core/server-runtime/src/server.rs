@@ -52,7 +52,7 @@ use crate::layout::{DEFAULT_CORES, parse_cores};
 /// The layout types live in [`crate::layout`]; re-exported here because
 /// `ServerConfig::cores` is one of them and callers reach the config
 /// through this module.
-pub use crate::layout::{PipelineCores, Placement, ReaderThread};
+pub use crate::layout::{NodeTransport, PipelineCores, Placement};
 /// The `--dpdk-*` flags' type, from `melin-dpdk`; re-exported here because
 /// `ServerConfig::dpdk` is one, so that a caller building a config in code
 /// needs no dependency of its own on that crate.
@@ -155,13 +155,16 @@ pub struct ServerConfig {
     pub snapshot: Option<PathBuf>,
     /// Where each pipeline thread runs, as comma-separated `thread=core`
     /// entries in any order. Threads: journal-seq, matching, response, reader,
-    /// event-publisher, shadow, repl-handler-0, repl-handler-1, journal-prep,
-    /// journal-disk. Every thread must be named: `0` leaves one unpinned,
+    /// repl-poll, event-publisher, shadow, repl-handler-0, repl-handler-1,
+    /// journal-prep, journal-disk. Every thread must be named: `0` leaves one unpinned,
     /// and `none` unpins every thread. The node warns at boot when
     /// journal-seq, matching, response, reader or journal-disk has no core:
     /// every request passes through them. Core 0 is reserved for OS/IRQ
     /// handling.
     /// reader pins the io_uring reader (TCP) or DPDK poll thread.
+    /// repl-poll pins the DPDK replication poll thread, run only when
+    /// replication has a queue or a NIC of its own; like the DPDK reader
+    /// it busy-polls, so a `y` on it is refused there.
     /// event-publisher applies when `--event-bind` is set, shadow when
     /// `--snapshot-interval-ms` > 0. repl-handler-0/1 are for the
     /// per-replica TCP handler threads. journal-disk pins the thread that
@@ -467,6 +470,7 @@ impl Default for ServerConfig {
                 matching: Placement::spinning(2),
                 response: Placement::spinning(3),
                 reader: Placement::spinning(4),
+                repl_poll: Placement::spinning(5),
                 event_publisher: Placement::spinning(6),
                 shadow: Placement::spinning(7),
                 repl_handler_0: Placement::spinning(8),
@@ -556,12 +560,13 @@ impl ServerConfig {
     }
 
     /// The per-thread layout this node actually runs — see
-    /// [`PipelineCores::resolve`]. `reader` says which thread the reader
-    /// entry pins on this transport, since one of the two cannot yield.
+    /// [`PipelineCores::resolve`]. `transport` says which threads the
+    /// reader and repl-poll entries pin on this node, since a thread that
+    /// polls a NIC cannot yield.
     ///
     /// An `Err` is a configuration the node refuses to start with.
-    pub fn resolved_cores(&self, reader: ReaderThread) -> Result<PipelineCores, String> {
-        self.cores.resolve(reader)
+    pub fn resolved_cores(&self, transport: NodeTransport) -> Result<PipelineCores, String> {
+        self.cores.resolve(transport)
     }
 }
 
@@ -896,7 +901,7 @@ where
     // The layout every spawn site below reads, refused outright if two
     // threads would starve each other.
     let config = ServerConfig {
-        cores: config.resolved_cores(ReaderThread::IoUring)?,
+        cores: config.resolved_cores(NodeTransport::KernelTcp)?,
         ..config
     };
     log_layout(&config.cores);
@@ -2374,9 +2379,11 @@ where
     warn_if_chain_disabled();
 
     // As on the kernel-TCP path: resolve the layout once, up front. The
-    // reader entry pins the NIC poll thread here, which never yields.
+    // reader entry pins the NIC poll thread here, which never yields, and
+    // the repl-poll entry the replication poll thread wherever this node's
+    // replication mode runs one.
     let config = ServerConfig {
-        cores: config.resolved_cores(ReaderThread::DpdkPoll)?,
+        cores: config.resolved_cores(NodeTransport::dpdk(&dpdk_config.replication))?,
         ..config
     };
     log_layout(&config.cores);
@@ -5134,7 +5141,10 @@ mod genesis_tests {
 /// host.
 #[cfg(test)]
 mod dpdk_config_tests {
-    use super::{DpdkArgs, DpdkReplicationArgs, NodeDpdkArgsError, ServerConfig, dpdk_config_from};
+    use super::{
+        DpdkArgs, DpdkReplicationArgs, NodeDpdkArgsError, NodeTransport, Placement, ServerConfig,
+        dpdk_config_from,
+    };
     use clap::Parser;
     use melin_dpdk::ReplicationNic;
     use std::net::Ipv4Addr;
@@ -5187,6 +5197,43 @@ mod dpdk_config_tests {
         assert_eq!(nic.port_ids, [1]);
         assert_eq!(nic.ip_addr, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(nic.mtu, 9000);
+    }
+
+    /// The layout is resolved against the replication mode the node's own
+    /// flags give, as the DPDK node does before spawning anything: a `y`
+    /// on repl-poll is refused in queue and port modes, where the thread
+    /// polls, and accepted in shared mode, where it places nothing.
+    #[test]
+    fn the_layout_is_resolved_against_the_replication_mode() {
+        let resolve = |flags: &[&str]| {
+            let cfg = ServerConfig::try_parse_from(
+                [
+                    "melin-server",
+                    "--cores",
+                    "journal-seq=1,matching=2,response=3,reader=4,repl-poll=5y,\
+                     event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,\
+                     journal-prep=10,journal-disk=11",
+                ]
+                .into_iter()
+                .chain(flags.iter().copied()),
+            )
+            .expect("the flags parse");
+            let dpdk = dpdk_config_from(&cfg).expect("valid config");
+            cfg.resolved_cores(NodeTransport::dpdk(&dpdk.replication))
+        };
+
+        let shared = resolve(&[]).expect("repl-poll places nothing in shared mode");
+        assert_eq!(shared.repl_poll, Placement::yielding(5));
+        for flags in [
+            &["--dpdk-replication-queue"][..],
+            &[
+                "--dpdk-replication-ports=1",
+                "--dpdk-replication-ip=10.0.0.2",
+            ],
+        ] {
+            let err = resolve(flags).expect_err("the replication poll thread cannot yield");
+            assert!(err.contains("repl-poll=5y"), "{flags:?}: {err}");
+        }
     }
 
     /// The replication NIC is checked against the client NIC as the node

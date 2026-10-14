@@ -167,7 +167,10 @@ unchanged after every step.
    function: say so in the commit, and check it first on the rig.
 5. **The replication poll thread on the primary.** Spawned in `queue` and
    `port` modes, with `rte_thread_register`, the trace stage, and the
-   per-queue counters on `/metrics`. Netns runner: a second veth per node
+   per-queue counters on `/metrics`, and the boot warning the DPDK reader
+   gets when unpinned (it busy-polls wherever the scheduler puts it)
+   extended to an unpinned `repl-poll`, sharing the reader's wording
+   rather than copying it. Netns runner: a second veth per node
    slot (`veth-setup.py`, the test-node layout), and the existing
    replication cases run in `port` mode as well as `shared`.
 6. **Replica and promotion.** Both transports at boot, the receiver on the
@@ -181,7 +184,12 @@ unchanged after every step.
 8. **Docs.** The modes, flags and the `repl-poll` core in the operator
    docs (`deployment.md`, `replication.md`); `dpdk-replication.md`; the
    roadmap item (removed or rewritten once measured); `CHANGELOG.md`
-   (Added); `CLAUDE.md` if the crate descriptions change.
+   (Added); `CLAUDE.md` if the crate descriptions change. Step 2 described
+   `repl-poll` as reserved for a thread "no configuration runs yet", in its
+   `CHANGELOG.md` entry under Changed and in `pipeline-architecture.md`
+   (the `--cores` row and the mixed-layout example): reword those once
+   step 5 runs the thread, so the release notes do not contradict
+   themselves.
 
 ## The measurement
 
