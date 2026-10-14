@@ -101,21 +101,47 @@ plain data outside the `dpdk-sys` gate like the rest of the config.
 
 Two queues, and no RSS: the client queue must take everything that
 is not replication.
-- **Non-isolated (dedicated port):** all RSS RETA entries point at queue 0.
-- **Isolated (bifurcated):** the existing source-IP rule.
+- **Non-isolated (dedicated port):** RSS mode (ethdev 22.11 refuses a
+  RETA update without it), and all RSS RETA entries pointed at queue 0,
+  after the port starts (mlx5 sizes its table then, and restarts the
+  port to apply an update) and before any rule. The port requests no
+  hash field, but that is not relied on: a PMD may read an empty set as
+  its default (mlx5 is believed to hash IP then), so until the pin a
+  packet can reach queue 1; once pinned, the hash no longer matters. On
+  the rig, check the per-queue counters right after start.
+- **Isolated (bifurcated):** the existing source-IP rule, below the
+  replication rules, so that replication from the peer's host still
+  reaches queue 1.
 
-On top, two rules at a higher priority:
-- TCP destination port = replication port → queue 1 (the primary's
-  listener);
-- TCP source port = replication port → queue 1 (a replica's link to its
-  primary).
+The replication rules:
+- TCP destination port = the node's own replication port (from
+  `--replication-bind`) → queue 1 (its replicas, as primary or once
+  promoted);
+- TCP source port = the primary's replication port (from `--replica-of`)
+  → queue 1 (a replica's link to its primary). It need not be the
+  replica's own replication port, so a replica may need both rules.
 
-A rule matching the client port, destination → queue 0, ranks above the
+In isolated mode both also match the node's own destination IPv4, so
+that replication from every replica host is captured, whatever the peer
+IP. On a replica, a rule matching the client port, destination → queue 0
+(isolated: from the peer only, capturing nothing new), ranks above the
 source-port rule, so a client whose ephemeral port happens to equal the
-replication port still lands on queue 0.
+primary's replication port still lands on queue 0. The mirror case, the
+replica dialing its primary from the client port, looks the same to the
+NIC: **step 6's replica must not dial from the client port** (today's
+dial loop starts at 40000 and wraps there, so a client port in that range
+can collide).
 
-Which rules a mode installs is a pure function of (mode, ports, peer IP),
-outside the gate and unit-tested. The FFI only installs what it returns.
+Priorities are numbered densely from 0 and only as many are used as the
+rules need: two in queue mode, three on an isolated replica. mlx5's root
+table offers few user levels (as few as two, depending on device and flow
+engine): check the isolated replica's third level on the rig. Queue mode
+with no replication port at all (a standalone node), or with the node's
+replication port equal to its client port, is refused before EAL init.
+
+Which rules a mode installs is a pure function of (mode, client port,
+replication ports, peer IP, own IP), outside the gate and unit-tested
+(`melin_dpdk::steering`). The FFI only installs what it returns.
 `Port::configure` takes the queue plan rather than a bare `num_queues`.
 
 ### `port` mode: one EAL, several NICs

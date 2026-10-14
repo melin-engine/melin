@@ -286,6 +286,16 @@ pub fn vdev(index: usize, iface: &str) -> (String, String) {
     (format!("net_af_packet{index}"), format!("iface={iface}"))
 }
 
+/// `device` (a name and its driver arguments, from [`vdev`]) with
+/// `queue_pairs` RX/TX queue pairs, each a socket on the interface, rather
+/// than the driver's one. One leaves the arguments as they are.
+pub fn with_queue_pairs((name, args): (String, String), queue_pairs: u16) -> (String, String) {
+    if queue_pairs == 1 {
+        return (name, args);
+    }
+    (name, format!("{args},qpairs={queue_pairs}"))
+}
+
 /// The DPDK client's af_packet device on `iface`: its name
 /// ([`CLIENT_VDEV`]), which is also its port's, and its driver arguments.
 pub fn client_vdev(iface: &str) -> (String, String) {
@@ -553,6 +563,18 @@ mod tests {
             ("net_af_packet1".to_owned(), "iface=dpdk1".to_owned())
         );
         assert_ne!(vdev(0, "dpdk0").0, vdev(1, "dpdk1").0);
+    }
+
+    #[test]
+    fn a_device_takes_more_queue_pairs_as_a_driver_argument() {
+        assert_eq!(
+            with_queue_pairs(vdev(1, "dpdk1"), 2),
+            (
+                "net_af_packet1".to_owned(),
+                "iface=dpdk1,qpairs=2".to_owned()
+            )
+        );
+        assert_eq!(with_queue_pairs(vdev(1, "dpdk1"), 1), vdev(1, "dpdk1"));
     }
 
     /// The client's device keeps the driver's name as its prefix, which is

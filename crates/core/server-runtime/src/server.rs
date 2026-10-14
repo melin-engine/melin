@@ -2379,7 +2379,8 @@ where
 /// `--dpdk-ip` is not given, listening on `--bind`'s port with one queue,
 /// its client connections sized by the `--dpdk-client-*-kib` flags, and
 /// replication where the `--dpdk-replication-*` flags put it beside that
-/// NIC.
+/// NIC: on a queue of its own, steered by the ports of `--replication-bind`
+/// and `--replica-of`, with the steering plan checked.
 ///
 /// The flags are validated by their own mappings, before EAL init and
 /// before any thread is spawned, and a bad value is returned as an error
@@ -2394,8 +2395,14 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, NodeDp
     let nic = cfg
         .dpdk
         .nic_config_or(melin_dpdk::NicConfig::default().ip_addr)?;
-    let replication = cfg.dpdk_replication.replication_nic(&nic)?;
-    Ok(melin_dpdk::DpdkConfig {
+    let replication_ports = melin_dpdk::ReplicationPorts {
+        listen: cfg.replication_bind.map(|addr| addr.port()),
+        primary: cfg.replica_of.map(|addr| addr.port()),
+    };
+    let replication = cfg
+        .dpdk_replication
+        .replication_nic(&nic, replication_ports)?;
+    let config = melin_dpdk::DpdkConfig {
         nic,
         listen_port: cfg.bind.port(),
         client_buffers: melin_dpdk::SocketBuffers {
@@ -2405,7 +2412,13 @@ fn dpdk_config_from(cfg: &ServerConfig) -> Result<melin_dpdk::DpdkConfig, NodeDp
         },
         num_queues: 1,
         replication,
-    })
+    };
+    // The plan the NIC is brought up with, refused here rather than at
+    // EAL init: replication on a queue of its own with nothing to steer (a
+    // standalone node) or nothing to tell apart (the replication port is
+    // the client port).
+    melin_dpdk::SteeringPlan::for_client_nic(&config).map_err(NodeDpdkArgsError::Steering)?;
+    Ok(config)
 }
 
 #[cfg(feature = "dpdk")]
@@ -5282,7 +5295,7 @@ mod dpdk_config_tests {
         dpdk_config_from,
     };
     use clap::Parser;
-    use melin_dpdk::ReplicationNic;
+    use melin_dpdk::{ReplicationNic, ReplicationPorts, SteeringError};
     use std::net::Ipv4Addr;
 
     #[test]
@@ -5316,8 +5329,18 @@ mod dpdk_config_tests {
         let shared = parse(&[]).expect("valid config");
         assert_eq!(shared.replication, ReplicationNic::Shared);
 
-        let queue = parse(&["--dpdk-replication-queue"]).expect("valid config");
-        assert_eq!(queue.replication, ReplicationNic::Queue);
+        let queue = parse(&[
+            "--dpdk-replication-queue",
+            "--replication-bind=10.0.0.1:9877",
+        ])
+        .expect("valid config");
+        assert_eq!(
+            queue.replication,
+            ReplicationNic::Queue(ReplicationPorts {
+                listen: Some(9877),
+                primary: None,
+            })
+        );
         // The client NIC is the same in every mode.
         assert_eq!(queue.nic, shared.nic);
 
@@ -5333,6 +5356,83 @@ mod dpdk_config_tests {
         assert_eq!(nic.port_ids, [1]);
         assert_eq!(nic.ip_addr, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(nic.mtu, 9000);
+    }
+
+    fn queue_mode(flags: &[&str]) -> Result<melin_dpdk::DpdkConfig, NodeDpdkArgsError> {
+        let cfg = ServerConfig::try_parse_from(
+            [
+                "melin-server",
+                "--dpdk-ports=0",
+                "--bind=10.0.0.1:9876",
+                "--dpdk-replication-queue",
+            ]
+            .into_iter()
+            .chain(flags.iter().copied()),
+        )
+        .expect("the flags parse");
+        dpdk_config_from(&cfg)
+    }
+
+    /// Queue mode steers the ports of `--replication-bind` and
+    /// `--replica-of`, which can differ: a replica's link to its primary
+    /// runs from the primary's port.
+    #[test]
+    fn queue_mode_steers_the_replication_bind_and_replica_of_ports() {
+        let replica = queue_mode(&[
+            "--replication-bind=10.0.0.1:9877",
+            "--replica-of=10.0.0.2:9900",
+        ])
+        .expect("valid config");
+        assert_eq!(
+            replica.replication,
+            ReplicationNic::Queue(ReplicationPorts {
+                listen: Some(9877),
+                primary: Some(9900),
+            })
+        );
+        // A replica that will serve no replicas once promoted still steers
+        // its link to its primary.
+        let replica = queue_mode(&["--replica-of=10.0.0.2:9900"]).expect("valid config");
+        assert_eq!(
+            replica.replication,
+            ReplicationNic::Queue(ReplicationPorts {
+                listen: None,
+                primary: Some(9900),
+            })
+        );
+    }
+
+    /// A node with no replication has nothing to steer: refused before
+    /// EAL init, naming the flags that would give it some.
+    #[test]
+    fn queue_mode_without_replication_is_refused() {
+        for flags in [&[][..], &["--standalone", "--ack-policy=disk"]] {
+            let err = queue_mode(flags).unwrap_err();
+            assert_eq!(
+                err,
+                NodeDpdkArgsError::Steering(SteeringError::NoReplicationPort),
+                "{flags:?}"
+            );
+            assert!(err.to_string().contains("--replication-bind"), "{err}");
+        }
+    }
+
+    #[test]
+    fn queue_mode_with_the_replication_port_on_the_client_port_is_refused() {
+        let err = queue_mode(&["--replication-bind=10.0.0.1:9876"]).unwrap_err();
+        assert_eq!(
+            err,
+            NodeDpdkArgsError::Steering(SteeringError::ReplicationPortIsClientPort { port: 9876 })
+        );
+        // Shared mode never steers by port, so it is no business of the
+        // DPDK configuration there.
+        let cfg = ServerConfig::try_parse_from([
+            "melin-server",
+            "--bind=10.0.0.1:9876",
+            "--replication-bind=10.0.0.1:9876",
+        ])
+        .expect("the flags parse");
+        assert!(dpdk_config_from(&cfg).is_ok());
     }
 
     /// The layout is resolved against the replication mode the node's own
@@ -5361,7 +5461,10 @@ mod dpdk_config_tests {
         let shared = resolve(&[]).expect("repl-poll places nothing in shared mode");
         assert_eq!(shared.repl_poll, Placement::yielding(5));
         for flags in [
-            &["--dpdk-replication-queue"][..],
+            &[
+                "--dpdk-replication-queue",
+                "--replication-bind=10.0.0.1:9877",
+            ][..],
             &[
                 "--dpdk-replication-ports=1",
                 "--dpdk-replication-ip=10.0.0.2",
@@ -5524,7 +5627,13 @@ mod dpdk_config_tests {
         let authorized_keys = dir.path().join("authorized_keys");
         std::fs::write(&authorized_keys, "").expect("write authorized_keys");
         for (flags, mode) in [
-            (&["--dpdk-replication-queue"][..], "on a queue of its own"),
+            (
+                &[
+                    "--dpdk-replication-queue",
+                    "--replication-bind=10.0.0.1:9877",
+                ][..],
+                "on a queue of its own",
+            ),
             (
                 &[
                     "--dpdk-replication-ports=1",

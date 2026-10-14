@@ -22,6 +22,7 @@ use crate::listen_backlog::{ListenerConfig, Listeners, MAX_LISTENING_SOCKETS, tu
 use crate::mempool::Mempool;
 use crate::peer_liveness::{self, PeerLiveness, StackClock};
 use crate::port::{ChecksumOffloads, Port};
+use crate::steering::SteeringPlan;
 
 // Defined outside the `dpdk-sys` gate (`crate::config`); re-exported here so
 // `melin_dpdk::transport::DpdkConfig` still names it.
@@ -160,7 +161,10 @@ pub struct DpdkShared {
     /// mempools use per-lcore caches for lock-free alloc/free.
     pub mempool_raw: *mut crate::ffi::rte_mempool,
     /// Actual number of queue pairs configured (may be less than requested
-    /// if the NIC doesn't support that many).
+    /// if the NIC doesn't support that many). In the replication split
+    /// ([`ReplicationNic::Queue`]) this counts the replication queue too:
+    /// it is 2, of which only queue 0 carries clients, so it is not the
+    /// number of client poll threads to spawn there.
     pub num_queues: u16,
 }
 
@@ -189,9 +193,14 @@ struct NicResources {
 /// that is.
 pub struct NodeNics {
     /// The client NIC's group, with the node's queue count
-    /// ([`DpdkConfig::num_queues`]): what [`DpdkShared::init`] brings up.
-    /// In [`ReplicationNic::Shared`] and [`ReplicationNic::Queue`] modes,
-    /// replication runs on it too.
+    /// ([`DpdkConfig::num_queues`]), or in [`ReplicationNic::Queue`] mode
+    /// with the client queue and the replication queue
+    /// ([`crate::steering::CLIENT_QUEUE`], [`crate::steering::REPLICATION_QUEUE`]),
+    /// each queue's transport built on it with the queue's id
+    /// ([`DpdkTransport::from_shared`], or
+    /// [`DpdkTransport::from_shared_unlistening`]): what
+    /// [`DpdkShared::init`] brings up. In [`ReplicationNic::Shared`]
+    /// and [`ReplicationNic::Queue`] modes, replication runs on it too.
     pub client: Arc<DpdkShared>,
     /// The replication NIC's group in [`ReplicationNic::Port`] mode, with
     /// one queue (its one poll thread); `None` in the other modes.
@@ -208,25 +217,24 @@ impl NodeNics {
     /// ignored) or a port of the client NIC's.
     pub fn init(config: &DpdkConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let replication_nic = match &config.replication {
-            ReplicationNic::Shared | ReplicationNic::Queue => None,
+            ReplicationNic::Shared | ReplicationNic::Queue(_) => None,
             ReplicationNic::Port(nic) => {
                 crate::eal_sharing::check_further_group(&config.nic, nic)?;
                 Some(nic)
             }
         };
+        let client_plan = SteeringPlan::for_client_nic(config)?;
         let eal = Arc::new(NodeEal::acquire(&config.nic)?);
         // The client group first, as `DpdkShared::init` brings it up: it
         // keeps the pool name of a node with one NIC. Should the
         // replication group then fail, the client group drops here and
         // with it the EAL, last.
-        let client = DpdkShared::init_on(
-            Arc::clone(&eal),
-            EalGroup::First,
-            &config.nic,
-            config.num_queues,
-        )?;
+        let client =
+            DpdkShared::init_on(Arc::clone(&eal), EalGroup::First, &config.nic, &client_plan)?;
         let replication = replication_nic
-            .map(|nic| DpdkShared::init_on(eal, EalGroup::Further, nic, 1))
+            .map(|nic| {
+                DpdkShared::init_on(eal, EalGroup::Further, nic, &SteeringPlan::for_nic(nic, 1))
+            })
             .transpose()
             .map_err(|e| format!("replication NIC: {e}"))?;
         Ok(NodeNics {
@@ -407,23 +415,28 @@ impl DpdkShared {
     /// arguments must be empty, its ports must be its own, and dropping it
     /// leaves EAL running for the process's other nodes.
     ///
-    /// The client NIC only, whatever `config.replication` says:
-    /// [`NodeNics::init`] brings up a replication NIC of its own beside it.
+    /// The client NIC only: [`NodeNics::init`] brings up a replication NIC
+    /// of its own beside it. In [`ReplicationNic::Queue`] mode, with both
+    /// its queues and the steering between them
+    /// ([`SteeringPlan::for_client_nic`], which refuses a configuration it
+    /// cannot steer before EAL is touched).
     pub fn init(config: &DpdkConfig) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let plan = SteeringPlan::for_client_nic(config)?;
         Self::init_on(
             Arc::new(NodeEal::acquire(&config.nic)?),
             EalGroup::First,
             &config.nic,
-            config.num_queues,
+            &plan,
         )
     }
 
-    /// The NIC group for `config` with `num_queues` queue pairs, on an EAL
-    /// already acquired: shared with the other groups on it, and taken
-    /// apart from the group so that a caller can tell a failure to bring
-    /// EAL up from a failure of the NIC on it (the client's NIC handle
-    /// names its file prefix for the first). `group` says whether it is
-    /// the EAL's first group, which decides its pool's name.
+    /// The NIC group for `config`, its ports' queues and steering as
+    /// `plan` says, on an EAL already acquired: shared with the other
+    /// groups on it, and taken apart from the group so that a caller can
+    /// tell a failure to bring EAL up from a failure of the NIC on it (the
+    /// client's NIC handle names its file prefix for the first). `group`
+    /// says whether it is the EAL's first group, which decides its pool's
+    /// name.
     ///
     /// On failure, whatever the group had set up is released before its
     /// share of `eal`: function parameters drop after the body's locals.
@@ -431,7 +444,7 @@ impl DpdkShared {
         eal: Arc<NodeEal>,
         group: EalGroup,
         config: &NicConfig,
-        num_queues: u16,
+        plan: &SteeringPlan,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let port_count = eal.eal().port_count();
         if config.port_ids.is_empty() {
@@ -467,8 +480,9 @@ impl DpdkShared {
         }
 
         // Scale mempool for number of queues and ports.
-        let num_mbufs: u32 =
-            8192 * (config.port_ids.len() as u32).max(1) * (num_queues as u32).max(1);
+        let num_mbufs: u32 = 8192
+            * (config.port_ids.len() as u32).max(1)
+            * (plan.queues.requested_queue_pairs() as u32).max(1);
         let pool_name = crate::eal_sharing::mempool_name(
             matches!(*eal, NodeEal::ProcessWide(_)),
             group,
@@ -481,24 +495,32 @@ impl DpdkShared {
         }
         .map_err(|e| format!("mempool {pool_name}: {e}"))?;
 
-        // Configure and start all ports with N queue pairs.
+        // Configure and start all ports as `plan` says, which decides
+        // everything; this only carries it out.
         //
-        // In bifurcated mode (peer_ip set), the port is configured with
-        // `rte_flow` isolation enabled BEFORE configure, and a steering
-        // rule is installed after start to capture the peer's traffic
-        // into DPDK queue 0. Everything else stays with the kernel.
-        let bifurcated = config.peer_ip.is_some();
+        // In bifurcated mode (`plan.isolated`), the port is configured with
+        // `rte_flow` isolation enabled BEFORE configure, and the steering
+        // rules installed after start capture the peer's traffic (and, with
+        // the replication split, replication) into DPDK. Everything else
+        // stays with the kernel. Not isolated, with the replication split,
+        // the RSS redirection table is pinned to the client queue before
+        // the rules go in.
         let mut ports = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
             // Each failure names its port: on an LACP bond, which member
             // failed is the first thing to know.
-            let mut port = Port::configure(pid, &mempool, config.vlan_id, num_queues, bifurcated)
-                .map_err(|e| format!("port {pid} configure: {e}"))?;
+            let mut port =
+                Port::configure(pid, &mempool, config.vlan_id, plan.queues, plan.isolated)
+                    .map_err(|e| format!("port {pid} configure: {e}"))?;
             port.start().map_err(|e| format!("port {pid} start: {e}"))?;
-            if let Some(peer) = config.peer_ip {
-                port.install_src_ipv4_steering(peer)
-                    .map_err(|e| format!("port {pid} steering rule for {peer}: {e}"))?;
+            if plan.pin_rss_to_client_queue {
+                port.pin_rss_reta(crate::steering::CLIENT_QUEUE)
+                    .map_err(|e| format!("port {pid}: {e}"))?;
+            }
+            for rule in &plan.rules {
+                port.install_steering_rule(rule)
+                    .map_err(|e| format!("port {pid} steering rule `{rule}`: {e}"))?;
             }
             combined_offloads = Some(match combined_offloads {
                 None => port.offloads,

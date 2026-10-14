@@ -181,7 +181,8 @@ impl NicHandle {
         let eal = NodeEal::acquire(&config).map_err(|e| {
             io::Error::other(nic::eal_init_failed(&config.eal_args, shared_eal, &e))
         })?;
-        let shared = DpdkShared::init_on(Arc::new(eal), EalGroup::First, &config, 1)
+        let plan = crate::SteeringPlan::for_nic(&config, 1);
+        let shared = DpdkShared::init_on(Arc::new(eal), EalGroup::First, &config, &plan)
             .map_err(|e| io::Error::other(e.to_string()))?;
         let gateway = config.gateway.zip(config.gateway_mac);
         let peer_mac = config.peer_mac;

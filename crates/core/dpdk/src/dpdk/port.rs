@@ -5,11 +5,13 @@
 //! features. The port must be started before traffic flows.
 //!
 //! For the sequencer we use a single RX queue and a single TX queue
-//! on a single port — all NIC I/O happens on one dedicated poll thread,
-//! matching the single-threaded LMAX architecture.
+//! on a single port — all client I/O happens on one dedicated poll
+//! thread, matching the single-threaded LMAX architecture — or, with
+//! replication on a queue of its own, a second queue pair for it.
 
 use crate::ffi;
 use crate::mempool::Mempool;
+use crate::steering::{QueuePlan, SteeringRule, TooFewQueues};
 
 /// Number of RX descriptors per queue. Each descriptor holds one mbuf.
 /// 1024 is standard for 10GbE+ NICs; lower values reduce ring memory
@@ -53,33 +55,38 @@ pub struct Port {
 }
 
 impl Port {
-    /// Configure a DPDK port with N RX/TX queue pairs.
+    /// Configure a DPDK port with the queue pairs `queues` asks for.
     ///
     /// `port_id` is the DPDK port index (typically 0 for the first NIC
     /// bound to DPDK). `mempool` provides the mbuf pool for RX DMA.
     /// `vlan_id` enables hardware VLAN strip (RX) and insert (TX) for
     /// dedicated NIC mode where the kernel isn't handling VLAN tags.
-    /// When `num_queues > 1`, RSS distributes TCP/IP flows across RX
-    /// queues.
+    /// With [`QueuePlan::Rss`] of more than one queue, RSS distributes
+    /// TCP/IP flows across RX queues; with one, as a node runs, there is
+    /// no RSS. With [`QueuePlan::ReplicationSplit`] the port gets two
+    /// queue pairs, or is refused when it offers fewer, and RSS requests
+    /// no hash field: the caller pins its redirection table to the client
+    /// queue after `start()` ([`Self::pin_rss_reta`]) unless the port is
+    /// isolated, and from then on the hash no longer matters.
     ///
     /// When `bifurcated` is true the PMD opens in isolated mode (mlx5
     /// requires `rte_flow_isolate()` as the very first operation), the
     /// kernel netdev keeps ownership of the device, and promiscuous
     /// mode is left off — the caller is then responsible for installing
-    /// explicit steering rules via `install_src_ipv4_steering()` after
+    /// explicit steering rules via [`Self::install_steering_rule`] after
     /// `start()`. Non-matching traffic stays with the kernel.
     pub fn configure(
         port_id: u16,
         mempool: &Mempool,
         vlan_id: Option<u16>,
-        num_queues: u16,
+        queues: QueuePlan,
         bifurcated: bool,
     ) -> Result<Self, PortError> {
         // For PMDs like mlx5, `rte_flow_isolate` must be called as the
         // very first operation on the port, before `rte_eth_dev_configure`.
         // Isolated mode means the PMD does not install any default
         // catch-all RSS rule — DPDK only sees traffic that matches
-        // explicit rules added later via `install_src_ipv4_steering`.
+        // explicit rules added later via `install_steering_rule`.
         if bifurcated {
             let ret = unsafe { ffi::dpdk_flow_isolate(port_id) };
             if ret != 0 {
@@ -95,10 +102,13 @@ impl Port {
         }
 
         // Clamp to NIC's maximum supported queues. TAP devices only
-        // support 1 queue; real NICs typically support 4-128.
-        let max_queues = dev_info.max_rx_queues.min(dev_info.max_tx_queues).max(1);
-        let requested_queues = num_queues;
-        let num_queues = num_queues.min(max_queues);
+        // support 1 queue; real NICs typically support 4-128. The
+        // replication split is refused instead: its second queue is not
+        // optional.
+        let requested_queues = queues.requested_queue_pairs();
+        let num_queues = queues
+            .queue_pairs_on(dev_info.max_rx_queues, dev_info.max_tx_queues)
+            .map_err(PortError::TooFewQueues)?;
         if num_queues < requested_queues {
             tracing::warn!(
                 port_id,
@@ -146,7 +156,29 @@ impl Port {
         // Enable RSS when multiple RX queues are requested. The NIC
         // hashes TCP/IP flows across queues so each poll thread handles
         // a disjoint set of connections.
-        if num_queues > 1 {
+        if queues == QueuePlan::ReplicationSplit {
+            // RSS mode, which ethdev requires for the redirection table
+            // update that pins it to the client queue, requesting no hash
+            // field. That request is not relied on: a PMD may read an
+            // empty set as its default (mlx5 is believed to hash IP
+            // then), so between `start()` and the pin a packet can still
+            // reach queue 1. Once the table is pinned, every entry is the
+            // client queue and the hash no longer matters.
+            port_conf.rxmode.mq_mode = unsafe { ffi::dpdk_eth_mq_rx_rss() } as _;
+            port_conf.rx_adv_conf.rss_conf.rss_hf = 0;
+            // Isolated mode delivers only what the flow rules capture, so
+            // the table is never pinned there; the line says so.
+            let default_rx = if bifurcated {
+                "isolated, unmatched traffic stays with the kernel"
+            } else {
+                "RSS table to be pinned to queue 0"
+            };
+            tracing::info!(
+                port_id,
+                default_rx,
+                "two queue pairs for the replication split"
+            );
+        } else if num_queues > 1 {
             let rss_hf = unsafe { ffi::dpdk_eth_rss_ip() | ffi::dpdk_eth_rss_tcp() };
             // Only request hash types the NIC supports.
             let supported_hf = dev_info.flow_type_rss_offloads;
@@ -257,34 +289,82 @@ impl Port {
         Ok(())
     }
 
-    /// Install a flow steering rule that captures all IPv4 packets with
-    /// the given source IPv4 address into RX queue 0. Used in bifurcated
-    /// mode (mlx5) to send traffic from the configured peer into DPDK
-    /// while leaving everything else (SSH, ARP, other tenants) with the
-    /// kernel. Must be called AFTER `start()`.
+    /// Install one `rte_flow` steering rule, as a [`SteeringPlan`] gives
+    /// it: in bifurcated mode (mlx5), the capture of the peer's traffic
+    /// into DPDK, leaving everything else (SSH, ARP, other tenants) with
+    /// the kernel; with the replication split, the rules sending
+    /// replication to its queue. Must be called AFTER `start()` (and after
+    /// [`Self::pin_rss_reta`], which may restart the port).
     ///
     /// The flow handle returned by `rte_flow_create` is intentionally
     /// dropped — the rule lives for the lifetime of the port and is
     /// torn down when `Port::drop` stops and closes the device.
-    pub fn install_src_ipv4_steering(
-        &mut self,
-        src_ipv4: std::net::Ipv4Addr,
-    ) -> Result<(), PortError> {
-        // `rte_flow_item_ipv4.hdr.src_addr` is a `rte_be32_t` (network
-        // byte order). Reading wire-order octets into a u32 using
-        // native-endian semantics produces the same in-memory byte
-        // layout the matcher expects on both LE and BE hosts.
-        let src_be = u32::from_ne_bytes(src_ipv4.octets());
+    ///
+    /// [`SteeringPlan`]: crate::SteeringPlan
+    pub fn install_steering_rule(&mut self, rule: &SteeringRule) -> Result<(), PortError> {
+        // Addresses and ports are big-endian on the wire and in the
+        // pattern's headers. Reading wire-order octets with native-endian
+        // semantics produces the in-memory layout the matcher expects on
+        // both LE and BE hosts.
+        let ffi_rule = ffi::dpdk_steering_rule {
+            priority: rule.priority,
+            src_ipv4_be: rule
+                .src_ipv4
+                .map_or(0, |ip| u32::from_ne_bytes(ip.octets())),
+            dst_ipv4_be: rule
+                .dst_ipv4
+                .map_or(0, |ip| u32::from_ne_bytes(ip.octets())),
+            tcp_src_port_be: rule.tcp_src_port.map_or(0, u16::to_be),
+            tcp_dst_port_be: rule.tcp_dst_port.map_or(0, u16::to_be),
+            queue: rule.queue,
+            has_src_ipv4: rule.src_ipv4.is_some().into(),
+            has_dst_ipv4: rule.dst_ipv4.is_some().into(),
+            has_tcp_src_port: rule.tcp_src_port.is_some().into(),
+            has_tcp_dst_port: rule.tcp_dst_port.is_some().into(),
+        };
         let mut err_type: i32 = 0;
-        let ret =
-            unsafe { ffi::dpdk_install_src_ipv4_steering(self.port_id, src_be, &mut err_type) };
+        // Room for the PMD's explanation, which names what it refused (a
+        // priority out of range, an unsupported item); longer is cut.
+        let mut err_msg = [0 as libc::c_char; 256];
+        let ret = unsafe {
+            ffi::dpdk_install_steering_rule(
+                self.port_id,
+                &ffi_rule,
+                &mut err_type,
+                err_msg.as_mut_ptr(),
+                err_msg.len(),
+            )
+        };
         if ret != 0 {
-            return Err(PortError::FlowRuleFailed { ret, err_type });
+            // NUL-terminated by the shim, which truncates to fit.
+            let message = unsafe { std::ffi::CStr::from_ptr(err_msg.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(PortError::FlowRuleFailed {
+                ret,
+                err_type,
+                message,
+            });
+        }
+        tracing::info!(port_id = self.port_id, %rule, "rte_flow steering rule installed");
+        Ok(())
+    }
+
+    /// Point every entry of the port's RSS redirection table at `queue`,
+    /// so that whatever the default RSS receives lands there. Must be
+    /// called after `start()`, and before the steering rules: a PMD may
+    /// restart the port to apply it (mlx5 does). The port must have been
+    /// configured with [`QueuePlan::ReplicationSplit`], whose RSS mode the
+    /// update needs.
+    pub fn pin_rss_reta(&mut self, queue: u16) -> Result<(), PortError> {
+        let ret = unsafe { ffi::dpdk_pin_rss_reta(self.port_id, queue) };
+        if ret != 0 {
+            return Err(PortError::RetaPinFailed { queue, ret });
         }
         tracing::info!(
             port_id = self.port_id,
-            peer_ip = %src_ipv4,
-            "rte_flow steering rule installed (src IPv4 -> queue 0)"
+            queue,
+            "RSS redirection table pinned to one queue"
         );
         Ok(())
     }
@@ -339,7 +419,22 @@ pub enum PortError {
     TxQueueFailed(i32),
     StartFailed(i32),
     FlowIsolateFailed(i32),
-    FlowRuleFailed { ret: i32, err_type: i32 },
+    /// `rte_flow_create` refused a steering rule: its return, the
+    /// `rte_flow` error type, and the PMD's message (empty when it gave
+    /// none).
+    FlowRuleFailed {
+        ret: i32,
+        err_type: i32,
+        message: String,
+    },
+    /// The port offers fewer queue pairs than its [`QueuePlan`] needs.
+    TooFewQueues(TooFewQueues),
+    /// The RSS redirection table could not be pinned to `queue`: the
+    /// negative error code (`-ENOTSUP` when the port has no table).
+    RetaPinFailed {
+        queue: u16,
+        ret: i32,
+    },
 }
 
 impl std::fmt::Display for PortError {
@@ -351,9 +446,22 @@ impl std::fmt::Display for PortError {
             PortError::TxQueueFailed(c) => write!(f, "rte_eth_tx_queue_setup failed: {c}"),
             PortError::StartFailed(c) => write!(f, "rte_eth_dev_start failed: {c}"),
             PortError::FlowIsolateFailed(c) => write!(f, "rte_flow_isolate failed: {c}"),
-            PortError::FlowRuleFailed { ret, err_type } => {
-                write!(f, "rte_flow_create failed: ret={ret} err_type={err_type}")
+            PortError::FlowRuleFailed {
+                ret,
+                err_type,
+                message,
+            } => {
+                write!(f, "rte_flow_create failed: ret={ret} err_type={err_type}")?;
+                if !message.is_empty() {
+                    write!(f, " ({message})")?;
+                }
+                Ok(())
             }
+            PortError::TooFewQueues(e) => write!(f, "{e}"),
+            PortError::RetaPinFailed { queue, ret } => write!(
+                f,
+                "pinning the RSS redirection table to queue {queue} failed: {ret}"
+            ),
         }
     }
 }

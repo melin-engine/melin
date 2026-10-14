@@ -131,7 +131,7 @@ impl NodeTransport {
     pub fn dpdk(replication: &ReplicationNic) -> Self {
         let repl_poll = match replication {
             ReplicationNic::Shared => false,
-            ReplicationNic::Queue | ReplicationNic::Port(_) => true,
+            ReplicationNic::Queue(_) | ReplicationNic::Port(_) => true,
         };
         Self::Dpdk { repl_poll }
     }
@@ -1137,7 +1137,9 @@ mod tests {
             NodeTransport::Dpdk { repl_poll: false }
         );
         assert_eq!(
-            NodeTransport::dpdk(&ReplicationNic::Queue),
+            NodeTransport::dpdk(&ReplicationNic::Queue(
+                melin_dpdk::ReplicationPorts::default()
+            )),
             NodeTransport::Dpdk { repl_poll: true }
         );
         assert_eq!(
