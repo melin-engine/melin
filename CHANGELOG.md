@@ -332,17 +332,30 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     and brings a node's links back up when it has returned, so that a node
     cut off (`Node::cut_off`) leaves its slot reachable for the next one,
     in a later test of the same process too.
-- **The LAN benchmark suite runs DPDK replication in shared and queue
-  modes.** `DPDK_REPLICATION=shared,queue` (or `all`; `shared` by
-  default) runs each mode as a pass of the DPDK transport of its own,
-  from one build, its runs named `dpdk-<mode>-<workload>` so that the
-  summary shows the modes side by side. Queue mode needs mlx5: a node
-  host set up for SR-IOV is refused before the build, by name. On DPDK
-  the primary's per-queue packet counters are saved beside the health
-  samples, and in queue mode a run whose replication did not move on
-  queue 1, or whose clients did not on queue 0, is reported as degraded.
-  Port mode is refused by the suite until it supports it. See
-  [docs/benchmarking.md](docs/benchmarking.md).
+- **The LAN benchmark suite runs DPDK replication in shared, queue and
+  port modes.** `DPDK_REPLICATION=shared,queue,port` (or `all`, every
+  mode; `shared` by default) runs each mode as a pass of the DPDK
+  transport of its own, from one build, its runs named
+  `dpdk-<mode>-<workload>` so that the summary shows the modes side by
+  side. Queue mode needs mlx5: a node host set up for SR-IOV is refused
+  before the build, by name. Port mode needs a second mlx5 port on every
+  node host, set up by `dpdk-setup.sh` (below): a node host without one
+  is refused before the build, by name. On DPDK the primary's per-queue
+  packet counters are saved beside the health samples, and a run is
+  reported as degraded when replication did not move on its own queue
+  (queue mode) or NIC (port mode), or its clients' traffic did not on
+  theirs. See [docs/benchmarking.md](docs/benchmarking.md).
+- **`scripts/dpdk/dpdk-setup.sh` sets up a second mlx5 port for
+  replication.** Given `DPDK_REPL_NIC` and `DPDK_REPL_IP` (or
+  `--repl-nic` and `--repl-ip`), it refuses a port carrying the default
+  route, the client port again, and an address outside the client
+  port's subnet, then allows both devices in `DPDK_EAL_ARGS` and writes
+  the second port's `DPDK_REPL_NIC`, `DPDK_REPL_PCI`, `DPDK_REPL_IP`,
+  `DPDK_REPL_MAC` and DPDK port id (`DPDK_REPL_PORT`) to
+  `/etc/melin-dpdk.conf`. DPDK numbers the two ports by PCI address, so
+  `DPDK_PORT` is then the client port's id among them, which may be 1.
+  Without the new settings the script writes what it did before. The
+  SR-IOV and L3 setups refuse them.
 
 ### Changed
 
