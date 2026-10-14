@@ -368,6 +368,17 @@ Anything source-breaking is called out under **Removed** or **Changed**.
     and brings a node's links back up when it has returned, so that a node
     cut off (`Node::cut_off`) leaves its slot reachable for the next one,
     in a later test of the same process too.
+- **The LAN benchmark suite runs DPDK replication in shared and queue
+  modes.** `DPDK_REPLICATION=shared,queue` (or `all`; `shared` by
+  default) runs each mode as a pass of the DPDK transport of its own,
+  from one build, its runs named `dpdk-<mode>-<workload>` so that the
+  summary shows the modes side by side. Queue mode needs mlx5: a node
+  host set up for SR-IOV is refused before the build, by name. On DPDK
+  the primary's per-queue packet counters are saved beside the health
+  samples, and in queue mode a run whose replication did not move on
+  queue 1, or whose clients did not on queue 0, is reported as degraded.
+  Port mode is refused by the suite until it supports it. See
+  [docs/benchmarking.md](docs/benchmarking.md).
 
 ### Changed
 

@@ -395,11 +395,34 @@ unchanged after every step.
    rules, queue 1's receiver, the unpolled queue 0). Followed by the
    replica's ARP rule, removed at promotion (see "ARP on a queue-mode
    replica"), its own change.
-7. **Bench suite.** `DPDK_REPLICATION=shared,queue[,port]` runs each value
-   as its own pass of the DPDK transport, from one build. Results are
-   named `dpdk-shared`, `dpdk-queue`, and so on. `port` mode reads
+7. **Bench suite, shared and queue modes.** `DPDK_REPLICATION=shared,queue`
+   (or `all`; `shared` by default, so an invocation without it runs as
+   before) runs each value as its own pass of the DPDK transport, from one
+   build, validated up front with the other settings. Runs are named
+   `dpdk-<mode>-<workload>` (kernel ones `kernel-<workload>`, as before).
+   In queue mode the primary (keeping `--replication-bind`, the port the
+   NIC steers) and the replicas (keeping `--replica-of`) add
+   `--dpdk-replication-queue`, and a node host whose
+   `/etc/melin-dpdk.conf` is SR-IOV's, or missing (the suite's unattended
+   setup can only configure SR-IOV; mlx5 needs `DPDK_IP`), is refused
+   before the build, by name. The readiness wait
+   needed no change: both of a DPDK primary's replication lines (shared
+   mode's, from the client poll thread, and the split modes', logged once
+   `repl-poll` listens) begin with "DPDK replication sender started",
+   which the suite's test checks in `server.rs`. On DPDK the primary's
+   per-queue counters are sampled beside the health samples (`.queues`),
+   and in queue mode judged (`judge_steering` in `lib.sh`): between the
+   first and last complete samples, queue 1 and queue 0 must each have
+   moved at least 100 packets per sampled second in each direction,
+   summed over ports, or the run is degraded. The counters cannot
+   attribute a packet to a flow, so a flow misrouted beside correctly
+   steered traffic is left to its consequences (a reset link: the health
+   verdict, or the load generator failing). Deferred, each its own
+   commit: `port` mode (refused by the suite until then; it is to read
    `DPDK_REPL_PORTS`, `DPDK_REPL_IP` and `DPDK_REPL_MAC` from
-   `/etc/melin-dpdk.conf`, and is skipped on a host without them.
+   `/etc/melin-dpdk.conf`, and skip a host without them), and a
+   `TRACE=1` pass on a `latency-trace` build. Untested until the rig:
+   the DPDK passes themselves (the podman rehearsal runs kernel TCP only).
 8. **Docs.** The modes, flags and the `repl-poll` core in the operator
    docs (`deployment.md`, `replication.md`); `dpdk-replication.md`; the
    roadmap item (removed or rewritten once measured); `CHANGELOG.md`
