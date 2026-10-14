@@ -296,3 +296,154 @@ judge_steering() {
             exit 1
         }' "$2"
 }
+
+# ---------------------------------------------------------------------------
+# TRACE=1: servers built with per-stage latency histograms, read after
+# each run from the primary's /stats-dump
+# ---------------------------------------------------------------------------
+
+# `trace_setting <TRACE>`: 1 when the suite runs traced servers (`1`), 0
+# when it does not (unset, empty or `0`). On anything else, says why on
+# stderr and fails, rather than reading a typo as either.
+trace_setting() {
+    case "${1:-}" in
+        "" | 0) echo 0 ;;
+        1) echo 1 ;;
+        *)
+            echo "error: TRACE must be 1, or 0 or unset (got '${1}')" >&2
+            return 1
+            ;;
+    esac
+}
+
+# The cargo feature a server is traced with: the runtime's per-stage
+# latency histograms, served on the health endpoint's /stats-dump. Every
+# application's server declares its own, forwarding to the runtime's.
+TRACE_FEATURE=latency-trace
+
+# `refuse_untraced_server <package> <cargo metadata JSON>`: whether the
+# server `package` can be built traced, which needs a TRACE_FEATURE
+# feature of its own, judged by `cargo metadata --no-deps` of its
+# workspace. Says why on stderr and fails for one that cannot: built
+# without it, the server would run untraced, and the suite would only
+# find out from its dump, after every run.
+refuse_untraced_server() {
+    python3 -I -c '
+import json, sys
+package, feature = sys.argv[1], sys.argv[2]
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(f"error: TRACE=1: cannot read the features of {package} (cargo metadata gave no JSON)")
+found = [p for p in doc.get("packages", []) if p.get("name") == package]
+if not found:
+    sys.exit(f"error: TRACE=1: no package {package} in its workspace")
+if feature not in found[0].get("features", {}):
+    sys.exit(f"error: TRACE=1: {package} has no {feature} feature, so its server cannot be built traced (refused rather than run untraced); add one forwarding to melin-server-runtime/{feature}")
+' "$1" "$TRACE_FEATURE" <<< "$2"
+}
+
+# `with_trace_feature <features> <package> <trace>`: a server build's
+# cargo features (comma-separated, possibly empty), with `package`'s
+# TRACE_FEATURE added when `trace` (trace_setting's) is 1, and as given
+# otherwise.
+with_trace_feature() {
+    local features="$1"
+    [[ "$3" == 1 ]] && features="${features:+${features},}${2}/${TRACE_FEATURE}"
+    echo "$features"
+}
+
+# The stages the trace summary reads, as the node registers them: the
+# DPDK client poll loop's, and in queue and port modes the replication
+# poll thread's, each timing the loop's iterations that did work.
+# test-lan-bench-suite.sh checks the node's source for both.
+TRACE_CLIENT_POLL_STAGE="dpdk poll: outer iteration (work-iterations only)"
+TRACE_REPL_POLL_STAGE="dpdk repl poll: outer iteration (work-iterations only)"
+
+# `judge_trace <dump> <transport> [<DPDK replication mode>]`: the verdict
+# on a run's /stats-dump, saved from the primary as it is served: one
+# line per registered stage,
+#   stage<TAB><name><TAB><samples><TAB><min><TAB><p50><TAB><p90><TAB><p99><TAB><p99.9><TAB><max>
+# in nanoseconds, or a single `# latency-trace disabled` line from an
+# untraced build, or `# no samples` before any stage registered, and a
+# `# truncated<TAB><count>` line when the stages outgrew the endpoint's
+# buffer. The dump must hold stages; on DPDK, the client poll loop's
+# with samples, and in queue and port modes the replication poll
+# thread's too (a run's load gives every loop work), or the trace pass
+# did not measure what it was run for. Prints the verdict; fails unless
+# it is `ok`.
+judge_trace() {
+    local transport="$2" mode="${3:-}" need_client=0 need_repl=0
+    if [[ "$transport" == dpdk ]]; then
+        need_client=1
+        [[ "$mode" == queue || "$mode" == port ]] && need_repl=1
+    fi
+    awk -F'\t' -v client="$TRACE_CLIENT_POLL_STAGE" -v repl="$TRACE_REPL_POLL_STAGE" \
+        -v need_client="$need_client" -v need_repl="$need_repl" '
+        # `require <stage> <what>`: why the dump fails for lack of `stage`,
+        # or nothing.
+        function require(stage, what) {
+            if (!(stage in samples)) return "; no " what " stage"
+            if (samples[stage] == 0) return "; the " what " recorded nothing"
+            return ""
+        }
+        /^# latency-trace disabled/ { disabled = 1 }
+        $1 == "# truncated" { truncated = $2 }
+        $1 == "stage" && NF == 9 { stages++; samples[$2] = $3 }
+        END {
+            if (NR == 0) { print "FAILED: no /stats-dump from the primary"; exit 1 }
+            if (disabled) { print "FAILED: the primary was built without latency-trace"; exit 1 }
+            if (!stages) { print "FAILED: no stage in the /stats-dump of the primary"; exit 1 }
+            summary = stages " stages"
+            if (truncated) summary = summary ", " truncated " more cut off by the endpoint"
+            if (need_client) reasons = reasons require(client, "client poll loop")
+            if (need_repl) reasons = reasons require(repl, "replication poll loop")
+            if (reasons != "") { print "FAILED: " summary reasons; exit 1 }
+            print "ok: " summary
+        }' "$1"
+}
+
+# `trace_summary <dump>...`: the poll loops' work-iteration percentiles
+# of each run's dump (judge_trace's format), a run being its dump's file
+# name without `.stats`: the client poll loop's, then the replication
+# poll thread's where the run had one, so that the modes read side by
+# side. A run with neither (kernel TCP, or a dump judge_trace failed)
+# says so in a line of its own.
+trace_summary() {
+    awk -F'\t' -v client="$TRACE_CLIENT_POLL_STAGE" -v repl="$TRACE_REPL_POLL_STAGE" '
+        # `run_of <path>`: the run a dump is of.
+        function run_of(path) {
+            sub(/.*\//, "", path)
+            sub(/\.stats$/, "", path)
+            return path
+        }
+        # `row <run> <loop> <stage line>`: one loop of one run.
+        function row(run, loop, line,   f) {
+            split(line, f, "\t")
+            printf fmt, run, loop, f[3], f[5], f[6], f[7], f[8], f[9]
+        }
+        # `fmt`: the one column format of the table, header and rows alike.
+        # Every dump named, in order, an empty one (no answer) included,
+        # which no input line would announce.
+        BEGIN {
+            fmt = "%-28s %-12s %12s %9s %9s %9s %9s %9s\n"
+            for (i = 1; i < ARGC; i++) order[i] = run_of(ARGV[i])
+            runs = ARGC - 1
+        }
+        FNR == 1 { run = run_of(FILENAME) }
+        $1 == "stage" && NF == 9 {
+            stages[run]++
+            if ($2 == client) client_line[run] = $0
+            if ($2 == repl) repl_line[run] = $0
+        }
+        END {
+            printf fmt, "run", "loop", "iterations", "p50 ns", "p90 ns", "p99 ns", "p99.9 ns", "max ns"
+            for (i = 1; i <= runs; i++) {
+                run = order[i]
+                if (run in client_line) row(run, "client poll", client_line[run])
+                if (run in repl_line) row(run, "repl poll", repl_line[run])
+                if (!(run in client_line) && !(run in repl_line))
+                    printf "%-28s (no DPDK poll loop among its %d stages)\n", run, stages[run]
+            }
+        }' "$@"
+}

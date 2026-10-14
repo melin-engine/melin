@@ -444,7 +444,30 @@ unchanged after every step.
    replication port. The counters judge volume only, so ports recorded
    the wrong way round pass the verdict: that shows as a cluster that
    does not start, each port then holding the other's address, so that
-   no replica connects. Still deferred: a `TRACE=1` pass on a `latency-trace` build.
+   no replica connects. `TRACE=1` followed as its own change: the servers
+   are built with `latency-trace` (the echo and notary examples gained the
+   feature, a forward to the runtime's; the Exchange Core's server had
+   it), each in a cargo invocation of its own and into
+   `target/lan-bench-trace`, so that a traced and an untraced invocation
+   never share a binary and melin-bench, which links the examples, is
+   built exactly as untraced (the traced server, built alone, lacks in
+   turn what melin-bench's features unify into their shared
+   dependencies, such as melin-client's `dpdk` for notary on DPDK:
+   features which only add code); a server without the feature is refused
+   before any host is touched (`refuse_untraced_server`, on `cargo
+   metadata`). The load generators stay untraced: melin-bench has no such
+   feature, and the Exchange Core's bench would time its own DPDK loop,
+   perturbing the client's figures. After each run, before the nodes
+   stop, the primary's `/stats-dump` (its health bind, tab-separated
+   stage lines) is saved as `<run>.stats` and judged (`judge_trace`: on
+   DPDK the client poll loop's stage, and in queue and port modes the
+   replication poll loop's, present with samples); the replicas' are not
+   taken, as they run no health endpoint in the suite and the loops
+   compared are the primary's. The summary ends with both loops'
+   work-iteration percentiles per run (`trace_summary`); the results
+   directory takes a `-trace` suffix and the summary's header says
+   `TRACED`. Untested until the rig: a traced DPDK pass; the podman
+   rehearsal (`TRACE=1 test-containers.sh`) covers the kernel path.
    The suite does not provision AWS ENIs; port mode there is for hosts
    with a second mlx5 port. Untested until the rig: the DPDK passes
    themselves (the podman rehearsal runs kernel TCP only) and
@@ -478,7 +501,12 @@ One Latitude.sh rig with mlx5: four hosts, one build. The suite runs
 single-client workloads. It compares p50, p99, p99.9 and throughput,
 and the health verdict (a degraded run means a replica was evicted or
 caught up). Then a second pass with a `latency-trace` build, for the
-client loop's iteration time in both modes. The first thing to check on
+client loop's iteration time in both modes: the same invocation with
+`TRACE=1`, whose summary lists the client poll loop's work-iteration
+percentiles per run and, in queue mode, the replication poll loop's
+beside them (its figures are perturbed by the tracing, so they are read
+for the breakdown only, against each other, never against the first
+pass's). The first thing to check on
 the rig is the per-queue counters: replication on queue 1 only, client
 traffic on queue 0 only. `port` mode is measured on a rig whose hosts
 have a second mlx5 port (`DPDK_REPLICATION=port`), or when an AWS rig
