@@ -38,3 +38,10 @@ tracing-subscriber = { workspace = true }
 ## Start nodes on the DPDK transport, on the network
 ## `scripts/dpdk/netns-runner.sh` builds. Needs libdpdk to build.
 dpdk = ["melin-server-runtime/dpdk", "dep:melin-dpdk"]
+
+# Two NIC groups on one EAL the process owns, under the netns runner (see
+# the file). Needs libdpdk and the runner, so only with `dpdk`.
+[[test]]
+name = "nic_groups"
+path = "tests/nic_groups.rs"
+required-features = ["dpdk"]

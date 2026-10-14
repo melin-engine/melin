@@ -258,9 +258,11 @@ jobs:
       # here on DPDK: with the runtime's `dpdk` feature every node they
       # start, clusters and restarts included, runs on DPDK, and the
       # `dpdk_veth` tests pin what the DPDK client path does differently.
+      # With them, the launcher's own suite (`melin-test-node`): a process
+      # owning its EAL, as a deployed node does, with two NICs on it.
       # The target runner gives each test process namespaces of its own
       # and builds the network (`scripts/dpdk/netns-runner.sh`).
-      # `kind(test)` because the library's unit tests start no node and
+      # `kind(test)` because the libraries' unit tests start no node and
       # already run in the test job. The `dpdk` profile in
       # `.config/nextest.toml` runs one test at a time, since every node
       # busy-polls a core, and leaves out the tests that fail on a known
@@ -269,7 +271,7 @@ jobs:
       - name: Runtime suites on DPDK
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/dpdk/netns-runner.sh
-        run: cargo nextest run --profile dpdk -p melin-server-runtime --features dpdk -E 'kind(test)' --no-fail-fast --locked
+        run: cargo nextest run --profile dpdk -p melin-server-runtime -p melin-test-node --features melin-server-runtime/dpdk,melin-test-node/dpdk -E 'kind(test)' --no-fail-fast --locked
 
       # The example suites, on DPDK the same way, each example's `dpdk`
       # feature being the switch. The echo and counter round trips include

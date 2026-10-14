@@ -43,9 +43,10 @@ pub use mac::{
 // stack is decided from offload flags and frame bytes alone, so the
 // policy is tested on any host, with or without libdpdk.
 pub mod rx_checksum;
-// What a node does differently on a process-wide EAL is decided from its
-// configuration alone, so it is tested on any host; only the gated
-// transport calls it, so it is compiled for that and for the tests.
+// What a NIC group does differently on an EAL it shares (the process-wide
+// one, or its node's other group's) is decided from its configuration
+// alone, so it is tested on any host; only the gated transport calls it, so
+// it is compiled for that and for the tests.
 #[cfg(any(test, feature = "dpdk-sys"))]
 mod eal_sharing;
 // Ungated for the same reason as `rx_checksum`: when a long-lived link's

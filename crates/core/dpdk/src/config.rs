@@ -191,6 +191,18 @@ impl Default for SocketBuffers {
     }
 }
 
+impl NicConfig {
+    /// The first of this NIC's ports that `other` drives too, if any. Two
+    /// NICs of one process cannot share a port: a port is configured and
+    /// started by one owner.
+    pub fn port_shared_with(&self, other: &NicConfig) -> Option<u16> {
+        self.port_ids
+            .iter()
+            .copied()
+            .find(|port| other.port_ids.contains(port))
+    }
+}
+
 /// Where a node's replication traffic runs on DPDK: on the client NIC's
 /// queue and poll thread, or on a queue or a NIC of its own.
 ///
@@ -298,5 +310,17 @@ mod tests {
         assert_eq!(peer_mac, None);
         assert_eq!(mtu, 1500);
         assert_eq!(vlan_id, None);
+    }
+
+    #[test]
+    fn a_shared_port_is_the_first_of_this_nics_in_the_others() {
+        let nic = |port_ids: &[u16]| NicConfig {
+            port_ids: port_ids.to_vec(),
+            ..NicConfig::default()
+        };
+        assert_eq!(nic(&[0, 1]).port_shared_with(&nic(&[2, 3])), None);
+        assert_eq!(nic(&[0, 1]).port_shared_with(&nic(&[])), None);
+        assert_eq!(nic(&[2, 1, 3]).port_shared_with(&nic(&[3, 1])), Some(1));
+        assert_eq!(nic(&[3, 1]).port_shared_with(&nic(&[2, 1, 3])), Some(3));
     }
 }

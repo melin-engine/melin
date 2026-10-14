@@ -227,22 +227,9 @@ impl DpdkReplicationArgs {
             (true, None) => return Err(requires(PORTS_AND_IP_FLAGS)),
         };
         let peer_mac = parse_mac_flag(peer_mac.as_deref(), PEER_MAC_FLAG)?;
-        if let Some(&port) = ports.iter().find(|port| client.port_ids.contains(port)) {
-            return Err(NodeDpdkArgsError::PortIsClientPort { port });
-        }
-        if ip == client.ip_addr {
-            return Err(NodeDpdkArgsError::IpIsClientIp { ip });
-        }
-        if !same_subnet(ip, client.ip_addr, client.prefix_len) {
-            return Err(NodeDpdkArgsError::IpOutsideClientSubnet {
-                ip,
-                client_ip: client.ip_addr,
-                prefix_len: client.prefix_len,
-            });
-        }
         // A struct literal, not `..client.clone()`: a field `NicConfig`
         // gains must be decided here, inherited or not.
-        Ok(ReplicationNic::Port(NicConfig {
+        let nic = NicConfig {
             // Process-wide: one EAL serves both NICs.
             eal_args: client.eal_args.clone(),
             port_ids: ports.clone(),
@@ -256,7 +243,24 @@ impl DpdkReplicationArgs {
             peer_mac,
             mtu: client.mtu,
             vlan_id: client.vlan_id,
-        }))
+        };
+        // The check `NodeNics::init` repeats on any configuration, so a
+        // configuration built in code is refused too; here it is reported
+        // in terms of the flags.
+        if let Some(port) = nic.port_shared_with(client) {
+            return Err(NodeDpdkArgsError::PortIsClientPort { port });
+        }
+        if ip == client.ip_addr {
+            return Err(NodeDpdkArgsError::IpIsClientIp { ip });
+        }
+        if !same_subnet(ip, client.ip_addr, client.prefix_len) {
+            return Err(NodeDpdkArgsError::IpOutsideClientSubnet {
+                ip,
+                client_ip: client.ip_addr,
+                prefix_len: client.prefix_len,
+            });
+        }
+        Ok(ReplicationNic::Port(nic))
     }
 }
 

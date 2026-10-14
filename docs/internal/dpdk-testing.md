@@ -23,7 +23,8 @@ The examples run the same way with their own feature
 (`-p melin-example-echo --features melin-example-echo/dpdk`). The `dpdk`
 nextest profile runs one test at a time and leaves out the tests that fail
 on a known divergence (below). The CI `dpdk` job runs both, on every push,
-and `melin-client`'s own suite with its `dpdk` feature
+with `melin-test-node`'s own suite beside the runtime's (see "Several NICs
+on one EAL"), and `melin-client`'s own suite with its `dpdk` feature
 (`-p melin-client --features melin-client/dpdk`), the build a DPDK client
 links.
 
@@ -157,6 +158,28 @@ own `dpdk` feature switches its tests over the same way.
   `dpdk_client_process_eal_args(file_prefix)` for it instead, and then
   opens no handle of its own: the launcher panics on either call after the
   other.
+- **A process owning its EAL.** `dpdk_slots_eal_args(&[slots])` (DPDK
+  only) gives EAL arguments that allow those node slots' af_packet devices
+  at init, port `i` being `slots[i]`'s, and `dpdk_slot(slot)` the slot's
+  IP, MAC and prefix length. For a test of what a deployed node does with
+  the EAL it owns, in a binary of its own: such a process cannot share the
+  launcher's process-wide EAL as well, and the launcher panics on a node
+  or a client NIC asked for after it, or on the arguments asked for after
+  either.
+
+## Several NICs on one EAL
+
+A node whose replication has a NIC of its own brings up two NIC groups
+(ports, mbuf pool, MAC) on the one EAL it owns (`NodeNics`, in
+`melin-dpdk`). `crates/core/test-node/tests/nic_groups.rs` runs that shape
+on the first two slots' devices, both allowed at EAL init: each group
+dials the other's listener and exchanges a message each way, which works
+only if each group transmits and receives on its own port (the bridge
+never sends a frame back out of the port it came in on). Then the client
+group is dropped and the replication group still serves a kernel-TCP
+client, so the EAL outlives the first group; it is cleaned up after the
+last. The `melin-test-node` suite runs it, with its `dpdk` feature, beside
+the runtime's suites in the CI `dpdk` job.
 
 ## Several nodes in one process
 
@@ -174,7 +197,7 @@ its port.
 This is opt-in and test-only. A deployed node never calls it, so
 `DpdkShared::init` takes exactly the old path: the node initialises EAL
 from its own arguments, owns it, and cleans it up last, after its ports and
-pool. The cost to a deployed node is one check at start.
+pools. The cost to a deployed node is one check at start.
 
 `server::run_with_shutdown` is what lets one node of several be stopped:
 `run` installs a process-wide signal handler, which would stop only the
