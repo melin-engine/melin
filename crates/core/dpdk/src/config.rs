@@ -27,7 +27,7 @@ const LISTEN_PORT: u16 = 9876;
 /// crate's `clap` feature), and mapped onto it; what an operator has to
 /// know about a field is written here, once, so the flags' help can stay
 /// short.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NicConfig {
     /// Arguments passed to `rte_eal_init`, one per element (`--dpdk-eal-args`,
     /// split on whitespace). Owned strings because they come from an
@@ -191,9 +191,33 @@ impl Default for SocketBuffers {
     }
 }
 
+/// Where a node's replication traffic runs on DPDK: on the client NIC's
+/// queue and poll thread, or on a queue or a NIC of its own.
+///
+/// A node's choice only; a client has no replication. Plain data like the
+/// rest of the configuration: the node maps its `--dpdk-replication-*`
+/// flags onto it in any build.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ReplicationNic {
+    /// On the client queue and its poll thread, beside client traffic. No
+    /// flag.
+    #[default]
+    Shared,
+    /// On a second queue of the client NIC's ports, steered to it by the
+    /// NIC (`--dpdk-replication-queue`). For a NIC with flow steering
+    /// (mlx5).
+    Queue,
+    /// On a NIC of its own, with its own ports, MAC and address
+    /// (`--dpdk-replication-ports`, `--dpdk-replication-ip`,
+    /// `--dpdk-replication-peer-mac`): a second ENI on AWS, or any second
+    /// port. The prefix length, gateway and its MAC, MTU and VLAN are the
+    /// client NIC's, and so are the EAL arguments, which are process-wide.
+    Port(NicConfig),
+}
+
 /// Configuration for the DPDK transport of a node: its NIC, the port it
-/// listens on, how its client connections are buffered, and how many queue
-/// pairs it polls.
+/// listens on, how its client connections are buffered, how many queue
+/// pairs it polls, and where its replication runs.
 #[derive(Clone, Debug)]
 pub struct DpdkConfig {
     /// The NIC the node's transport runs on.
@@ -206,6 +230,8 @@ pub struct DpdkConfig {
     /// by a separate thread. When > 1, RSS is enabled on the NIC to
     /// distribute TCP/IP flows across queues. Default: 1.
     pub num_queues: u16,
+    /// Where replication runs. Default: [`ReplicationNic::Shared`].
+    pub replication: ReplicationNic,
 }
 
 impl Default for DpdkConfig {
@@ -215,6 +241,7 @@ impl Default for DpdkConfig {
             listen_port: LISTEN_PORT,
             client_buffers: SocketBuffers::default(),
             num_queues: 1,
+            replication: ReplicationNic::Shared,
         }
     }
 }
@@ -227,17 +254,27 @@ mod tests {
     /// moved into a struct of their own, field by field.
     #[test]
     fn the_defaults_are_the_node_config_defaults() {
-        let config = DpdkConfig::default();
-        assert_eq!(config.listen_port, 9876);
-        assert_eq!(config.num_queues, 1);
+        // Destructured, so that a field added to either struct must be
+        // given its default here.
+        let DpdkConfig {
+            nic,
+            listen_port,
+            client_buffers,
+            num_queues,
+            replication,
+        } = DpdkConfig::default();
+        assert_eq!(listen_port, 9876);
+        assert_eq!(num_queues, 1);
         assert_eq!(
-            config.client_buffers,
+            client_buffers,
             SocketBuffers {
                 rx_buf_size: 64 * 1024,
                 tx_buf_size: 64 * 1024,
                 tx_queue_limit: 8 * 1024 * 1024,
             }
         );
+        assert_eq!(replication, ReplicationNic::Shared);
+        assert_eq!(ReplicationNic::default(), ReplicationNic::Shared);
 
         let NicConfig {
             eal_args,
@@ -250,7 +287,7 @@ mod tests {
             peer_mac,
             mtu,
             vlan_id,
-        } = config.nic;
+        } = nic;
         assert!(eal_args.is_empty());
         assert_eq!(port_ids, vec![0]);
         assert_eq!(ip_addr, Ipv4Addr::new(10, 0, 0, 1));

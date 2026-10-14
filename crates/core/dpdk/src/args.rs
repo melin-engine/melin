@@ -8,7 +8,7 @@
 use std::net::Ipv4Addr;
 
 use crate::config::NicConfig;
-use crate::mac::{MacParseError, try_parse_mac};
+use crate::mac::{MacAddr, MacParseError, try_parse_mac};
 
 /// The DPDK flags, one per field of [`NicConfig`], for a binary to
 /// flatten into its own command line (`#[command(flatten)]`).
@@ -252,15 +252,8 @@ impl DpdkArgs {
         if gateway_mac.is_some() && gateway.is_none() {
             return Err(DpdkArgsError::GatewayMacWithoutGateway);
         }
-        let parse_mac = |value: &Option<String>, flag: &'static str| {
-            value
-                .as_deref()
-                .map(try_parse_mac)
-                .transpose()
-                .map_err(|error| DpdkArgsError::InvalidMac { flag, error })
-        };
-        let gateway_mac = parse_mac(gateway_mac, "--dpdk-gateway-mac")?;
-        let peer_mac = parse_mac(peer_mac, "--dpdk-peer-mac")?;
+        let gateway_mac = parse_mac_flag(gateway_mac.as_deref(), "--dpdk-gateway-mac")?;
+        let peer_mac = parse_mac_flag(peer_mac.as_deref(), "--dpdk-peer-mac")?;
         Ok(NicConfig {
             eal_args: split_eal_args(eal_args),
             port_ids: ports.clone(),
@@ -316,6 +309,19 @@ impl DpdkArgs {
         .into_iter()
         .find_map(|(flag, given)| given.then_some(flag))
     }
+}
+
+/// An optional MAC flag's value, parsed, with a bad one reported as
+/// [`DpdkArgsError::InvalidMac`] naming `flag`: the one parse every
+/// `--dpdk-*-mac` flag goes through, this crate's and a binary's own.
+pub fn parse_mac_flag(
+    value: Option<&str>,
+    flag: &'static str,
+) -> Result<Option<MacAddr>, DpdkArgsError> {
+    value
+        .map(try_parse_mac)
+        .transpose()
+        .map_err(|error| DpdkArgsError::InvalidMac { flag, error })
 }
 
 /// `--dpdk-eal-args` as `rte_eal_init` takes it, one argument per element.
